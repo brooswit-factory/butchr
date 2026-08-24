@@ -9,6 +9,13 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.3.0] - 2026-08-24
+### Added
+- **The full daemon loop.** Every poll butchr fetches its assigned issues and reconciles the herd against the active set: it spawns a herdr agent for each In Progress / In Review ticket and **shuts off the agent for any ticket that has left those states** (`reconcile/plan`, `daemon/loop`). This is a periodic controller — correct after a restart, not just on deltas.
+- **Change notifications.** On any change between polls (`jira-watch/diff`), butchr nudges the agent working the affected issue over the thatch channel.
+- **Agent lifecycle** (`agents/herd`): each agent runs under a `butchr:<ISSUE>` name, is spawned with `--channels server:butchr` and a per-issue MCP config carrying its `x-issue` header, and is stopped by closing its pane.
+- **Blocking-prompt handling** (`agents/prompt`, `agents/blocked`, `agents/prompt-watch`): butchr detects agents that go `blocked` (polling `agent.list`), reads the prompt via herdr's detection region, parses the `❯ N. label` menu, and either auto-answers known launch prompts (trust / dev-channel / resume) or leaves a real decision exposed for a human. No PTY driver — herdr owns the terminal.
+
 ## [0.2.0] - 2026-08-24
 ### Added
 - Distribution: butchr builds to a single executable `dist/butchr.js` and publishes to npm with a `butchr` bin, so machines run it via `npm i -g @brooswit/butchr`. Releases publish on a version bump to `main` (OIDC provenance), matching the library repos.
