@@ -23,10 +23,19 @@ one Elysia process
 
 `src/`: `config` · `atlassian` (Jira client) · `daemon` (the app + notify) · `web` (live view). More loops land as their own modules.
 
-## Run
+## Install & run
+
+On each machine:
 
 ```
-cp .env.example .env      # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
+npm i -g @brooswit/butchr     # or pin a version
+cp .env.example .env          # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
+butchr                        # reads .env / the environment
+```
+
+From source (development):
+
+```
 bun run start
 ```
 

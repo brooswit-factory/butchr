@@ -5,7 +5,14 @@ import { buildApp } from "./app.js";
 
 // Entry point. Kept thin: parse config, build the app, listen. The watch and
 // reconcile loops are wired here as they land.
-const config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+let config;
+try {
+  config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+} catch (e) {
+  console.error(`butchr: ${(e as Error).message}`);
+  console.error("See .env.example for the required configuration.");
+  process.exit(1);
+}
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token);
 const { app } = buildApp();
 

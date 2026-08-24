@@ -1,9 +1,22 @@
 {
   "name": "@brooswit/butchr",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The software factory: watches your Jira, runs herdr agents on active tickets, pushes updates to them over MCP",
-  "private": true,
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brooswit/butchr.git"
+  },
+  "homepage": "https://github.com/brooswit/butchr#readme",
+  "bugs": {
+    "url": "https://github.com/brooswit/butchr/issues"
+  },
+  "bin": {
+    "butchr": "./dist/butchr.js"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "start": "bun run src/daemon/index.ts",
     "generate": "bun run scripts/load/generate.ts",
@@ -11,7 +24,8 @@
     "test": "bun test",
     "test:unit": "bun test test/unit test/load && bun run scripts/coverage/gate.ts",
     "release:check": "bun run scripts/release/check.ts",
-    "check": "bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts"
+    "check": "bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
+    "build": "bun build src/daemon/index.ts --outfile dist/butchr.js --target bun && printf '#!/usr/bin/env bun\\n' | cat - dist/butchr.js > dist/butchr.tmp && mv dist/butchr.tmp dist/butchr.js && chmod +x dist/butchr.js"
   },
   "dependencies": {
     "@brooswit/thatch": "^0.6.0",
@@ -19,6 +33,12 @@
     "@brooswit/sundry": "^0.2.1",
     "elysia": "^1.4.29"
   },
-  "devDependencies": { "@types/bun": "^1.2.0", "typescript": "^5.6.0" },
-  "engines": { "bun": ">=1.1" }
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "bun": ">=1.1"
+  },
+  "license": "MIT"
 }

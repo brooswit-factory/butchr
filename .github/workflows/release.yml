@@ -1,0 +1,33 @@
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write   # tag + GitHub Release
+  id-token: write   # npm trusted publishing (OIDC) + provenance
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
+      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5
+      - run: bun install --frozen-lockfile
+      - id: gate
+        run: bun run scripts/release/publish-needed.ts
+      - if: steps.gate.outputs.needed == 'true'
+        run: bun run check && bun run build
+      - if: steps.gate.outputs.needed == 'true'
+        name: publish to npm (OIDC, provenance)
+        run: npm publish --provenance --access public
+      - if: steps.gate.outputs.needed == 'true'
+        name: tag + GitHub Release with the changelog entry
+        env: { GH_TOKEN: "${{ github.token }}", V: "${{ steps.gate.outputs.version }}" }
+        run: |
+          bun run scripts/release/notes.ts "$V"
+          git tag "v$V" && git push origin "v$V"
+          gh release create "v$V" --title "v$V" --notes-file release-notes.md
