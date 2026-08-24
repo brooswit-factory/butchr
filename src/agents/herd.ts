@@ -15,10 +15,10 @@ export interface Herd {
   paneFor(issue: string): Promise<string | null>;
 }
 
-const AGENT_PREFIX = "butchr:";
-const nameFor = (issue: string) => AGENT_PREFIX + issue;
+const AGENT_PREFIX = "butchr-";
+const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
 const issueOf = (name: string | null | undefined) =>
-  name && name.startsWith(AGENT_PREFIX) ? name.slice(AGENT_PREFIX.length) : null;
+  name && name.startsWith(AGENT_PREFIX) ? name.slice(AGENT_PREFIX.length).toUpperCase() : null;
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
@@ -51,7 +51,14 @@ export class HerdrHerd implements Herd {
     mkdirSync(dir, { recursive: true });
     const cfg = join(dir, "mcp.json");
     writeFileSync(cfg, JSON.stringify({ mcpServers: { butchr: { type: "http", url: this.mcpUrl, headers: { "x-issue": issue } } } }));
+    // herdr needs a pane to start the agent in: create a workspace for the issue,
+    // then start the agent in its root pane.
+    const created = await this.herdr.workspace.create({ label: issue } as Parameters<HerdrClient["workspace"]["create"]>[0]);
+    const rp = (created as { root_pane?: unknown }).root_pane;
+    const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
+    if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
     await this.herdr.agent.start({
+      pane_id: paneId,
       name: nameFor(issue),
       kind: "claude",
       args: ["--mcp-config", cfg, "--channels", "server:butchr"],
