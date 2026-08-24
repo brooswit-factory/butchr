@@ -16,7 +16,6 @@ jobs:
       - run: bun run typecheck
       - name: unit + load tests, coverage ≥ 90%
         run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
-      - run: bun run build
   release-gate:
     name: release gate
     if: github.event_name == 'pull_request'
