@@ -11,6 +11,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async runningIssues() { return [...running]; },
     async spawn(i) { spawned.push(i); running.add(i); },
     async stop(i) { stopped.push(i); running.delete(i); },
+    async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
   };
 }
 const iss = (key: string, status: string): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", updated: "t" });

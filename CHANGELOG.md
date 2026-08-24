@@ -9,6 +9,12 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.4.0] - 2026-08-24
+### Added
+- **The webapp.** A single served page (`/`) lists the active agents with their live herdr status and ticket summary, polling `/state` every 2s. Clicking an agent POSTs `/agents/:issue/open`, and butchr **spawns a terminal window running `herdr agent attach <that agent>`** — so from no terminal you land in just that agent's live shell.
+- `terminal/open` — detects the desktop terminal emulator (gnome-terminal, konsole, alacritty, kitty, wezterm, xterm, …) or takes a `BUTCHR_TERMINAL` override, and builds the attach command.
+- `Herd.paneFor` — resolves an issue to its agent's current pane at click time (no stale pane ids).
+
 ## [0.3.0] - 2026-08-24
 ### Added
 - **The full daemon loop.** Every poll butchr fetches its assigned issues and reconciles the herd against the active set: it spawns a herdr agent for each In Progress / In Review ticket and **shuts off the agent for any ticket that has left those states** (`reconcile/plan`, `daemon/loop`). This is a periodic controller — correct after a restart, not just on deltas.

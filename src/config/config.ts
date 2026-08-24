@@ -12,6 +12,8 @@ export interface Config {
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
   herdrSocket?: string;
+  /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
+  terminalPrefix?: string[];
 }
 
 export interface ConfigEnv {
@@ -21,6 +23,7 @@ export interface ConfigEnv {
   ATLASSIAN_TOKEN_FILE?: string | undefined;
   BUTCHR_PORT?: string | undefined;
   HERDR_SOCKET?: string | undefined;
+  BUTCHR_TERMINAL?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -39,6 +42,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     atlassian: { site, email, token },
     port,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
+    ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
   };
 }
 

@@ -11,6 +11,8 @@ export interface Herd {
   spawn(issue: string): Promise<void>;
   /** Shut off the agent for an issue (idempotent). */
   stop(issue: string): Promise<void>;
+  /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
+  paneFor(issue: string): Promise<string | null>;
 }
 
 const AGENT_PREFIX = "butchr:";
@@ -59,6 +61,10 @@ export class HerdrHerd implements Herd {
   async stop(issue: string): Promise<void> {
     const pane = (await this.byIssue()).get(issue);
     if (pane) await this.herdr.pane.close(pane);
+  }
+
+  async paneFor(issue: string): Promise<string | null> {
+    return (await this.byIssue()).get(issue) ?? null;
   }
 }
 

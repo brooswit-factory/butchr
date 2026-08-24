@@ -3,10 +3,11 @@ import { HerdrClient } from "@brooswit/herdr-sdk";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
-import { HerdrHerd } from "../agents/herd.js";
+import { HerdrHerd, issueOfAgentName } from "../agents/herd.js";
 import { startLoop } from "./loop.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { watchBlocked } from "../agents/blocked.js";
+import { detectTerminalPrefix } from "../terminal/open.js";
 
 let config;
 try {
@@ -19,22 +20,43 @@ try {
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token);
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
-const { app, mcp } = buildApp();
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
+const summaries = new Map<string, string>();
+
+const { app, mcp } = buildApp({
+  state: async () => {
+    const { agents } = await herdr.agent.list();
+    return agents.flatMap((a) => {
+      const issue = issueOfAgentName((a as { name?: string }).name);
+      return issue ? [{ issue, status: a.agent_status, summary: summaries.get(issue) ?? "" }] : [];
+    });
+  },
+  open: async (issue) => {
+    const pane = await herd.paneFor(issue);
+    if (!pane) return { ok: false, error: "agent not running for " + issue };
+    if (!terminalPrefix) return { ok: false, error: "no terminal emulator found (set BUTCHR_TERMINAL)" };
+    Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
+    return { ok: true };
+  },
+});
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
+console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
-
 startLoop({
-  search: () => atlassian.search(JQL),
+  search: async () => {
+    const issues = await atlassian.search(JQL);
+    for (const i of issues) summaries.set(i.key, i.summary);
+    return issues;
+  },
   herd,
   notify: (issue) => void notifyIssue(mcp, issue, `Ticket ${issue} was updated — re-read it.`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });
 
-// Auto-answer the launch prompts that would otherwise block an unattended agent.
 watchPrompts({
   onBlocked: (cb) => watchBlocked(
     async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
@@ -42,14 +64,9 @@ watchPrompts({
   ),
   read: async (paneId) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text,
   send: async (paneId, text) => { await herdr.pane.sendText({ pane_id: paneId, text }); },
-  onPrompt: ({ prompt }) => {
-    const first = prompt.options[0] ?? "";
-    if (/trust this folder|local development|resume from summary/i.test(prompt.question + " " + first)) return 1;
-    return undefined; // a real decision — leave it for a human
-  },
+  onPrompt: ({ prompt }) => (/trust this folder|local development|resume from summary/i.test(prompt.question + " " + (prompt.options[0] ?? "")) ? 1 : undefined),
 });
 
-atlassian
-  .search(JQL)
+atlassian.search(JQL)
   .then((issues) => console.error(`  ${issues.length} active issue(s) assigned to this credential`))
   .catch((e) => console.error(`  WARNING: Atlassian credential check failed: ${e.message}`));
