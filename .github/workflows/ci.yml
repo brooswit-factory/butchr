@@ -1,0 +1,33 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - run: bun install --frozen-lockfile
+      - name: load tests up to date
+        run: bun run generate && bun run scripts/verify-generated-is-committed.ts
+      - run: bun run typecheck
+      - name: unit + load tests, coverage ≥ 90%
+        run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+      - run: bun run build
+  release-gate:
+    name: release gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: bun install --frozen-lockfile
+      - run: bun run scripts/release/check.ts
+        env: { RELEASE_BASE: "origin/${{ github.base_ref }}" }
