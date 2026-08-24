@@ -2,7 +2,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 
-const { app, mcp } = buildApp();
+const opened: string[] = [];
+const view = {
+  state: async () => [{ issue: "KAN-9", status: "working", summary: "do a thing" }],
+  open: async (issue: string) => { opened.push(issue); return issue === "KAN-BAD" ? { ok: false, error: "nope" } : { ok: true }; },
+};
+const { app, mcp } = buildApp(view);
 app.listen(0);
 const base = `http://localhost:${app.server!.port}`;
 afterAll(async () => { await mcp.closeAll(); app.stop(); });
@@ -28,5 +33,27 @@ describe("butchr daemon app", () => {
     expect(await a.nextFrame()).toMatchObject({ content: "hello", meta: { issue: "KAN-9" } });
     expect((await notifyIssue(mcp, "KAN-000", "x")).sent).toEqual([]);
     await a.disconnect(); await Bun.sleep(30);
+  });
+});
+
+describe("butchr webapp + open action", () => {
+  test("GET / serves the html page", async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    expect(html).toContain("butchr — active agents");
+    expect(html).toContain("/agents/");
+  });
+  test("GET /state returns the active agents", async () => {
+    expect(await (await fetch(`${base}/state`)).json()).toEqual([{ issue: "KAN-9", status: "working", summary: "do a thing" }]);
+  });
+  test("POST /agents/:issue/open invokes open and reports ok / 409", async () => {
+    const ok = await fetch(`${base}/agents/KAN-9/open`, { method: "POST" });
+    expect(ok.status).toBe(200); expect(await ok.json()).toEqual({ ok: true });
+    expect(opened).toContain("KAN-9");
+    const bad = await fetch(`${base}/agents/KAN-BAD/open`, { method: "POST" });
+    expect(bad.status).toBe(409); expect(((await bad.json()) as { ok: boolean }).ok).toBe(false);
+  });
+  test("open decodes the issue key from the path", async () => {
+    await fetch(`${base}/agents/${encodeURIComponent("KAN-9")}/open`, { method: "POST" });
+    expect(opened).toContain("KAN-9");
   });
 });

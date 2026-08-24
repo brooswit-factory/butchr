@@ -44,6 +44,12 @@ describe("HerdrHerd", () => {
     await new HerdrHerd(f2.client, "u").spawn("KAN-7");
     expect(f2.started.length).toBe(0);
   });
+  test("paneFor resolves the current pane, or null when not running", async () => {
+    const f = fakeHerdr([{ name: "butchr:KAN-5", pane_id: "w1:p5" }]);
+    const herd = new HerdrHerd(f.client, "u");
+    expect(await herd.paneFor("KAN-5")).toBe("w1:p5");
+    expect(await herd.paneFor("KAN-404")).toBeNull();
+  });
   test("stop closes the issue's pane; a no-op when nothing is running for it", async () => {
     const f = fakeHerdr([{ name: "butchr:KAN-9", pane_id: "w1:p9" }]);
     const herd = new HerdrHerd(f.client, "u");
