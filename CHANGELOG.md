@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.4.1] - 2026-08-24
+### Fixed
+- First real run against the live board (7 tickets → 7 agents) surfaced three defects, all fixed: `agent.start` needs a pane, so spawn now creates a workspace per issue and starts the agent in its root pane; agent names must be lowercase (`butchr-kan-7`, mapped back to `KAN-7`); and the prompt-watcher now sweeps agents ALREADY blocked at daemon start (a restart no longer strands them). Also auto-answers Claude's "Settings Warning" startup prompt (Continue).
+
 ## [0.4.0] - 2026-08-24
 ### Added
 - **The webapp.** A single served page (`/`) lists the active agents with their live herdr status and ticket summary, polling `/state` every 2s. Clicking an agent POSTs `/agents/:issue/open`, and butchr **spawns a terminal window running `herdr agent attach <that agent>`** — so from no terminal you land in just that agent's live shell.

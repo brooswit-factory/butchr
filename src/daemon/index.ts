@@ -64,7 +64,7 @@ watchPrompts({
   ),
   read: async (paneId) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text,
   send: async (paneId, text) => { await herdr.pane.sendText({ pane_id: paneId, text }); },
-  onPrompt: ({ prompt }) => (/trust this folder|local development|resume from summary/i.test(prompt.question + " " + (prompt.options[0] ?? "")) ? 1 : undefined),
+  onPrompt: ({ prompt }) => (/trust this folder|local development|resume from summary|settings warning/i.test(prompt.question + " " + (prompt.options[0] ?? "")) ? 1 : undefined),
 });
 
 atlassian.search(JQL)

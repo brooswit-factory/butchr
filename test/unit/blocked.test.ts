@@ -11,6 +11,13 @@ describe("newlyBlocked", () => {
   });
 });
 describe("watchBlocked", () => {
+  test("fires for agents ALREADY blocked at start (daemon-restart sweep)", async () => {
+    const blocked: string[] = [];
+    watchBlocked(async () => [row("p1", "blocked"), row("p2", "idle")], 1000, (p) => blocked.push(p));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(blocked).toContain("p1");
+    expect(blocked).not.toContain("p2");
+  });
   test("fires onBlocked when an agent becomes blocked (manual clock)", async () => {
     let cb: (() => void) | null = null;
     const clock = { setTimeout: (fn: () => void) => { cb = fn; return 1 as unknown; }, clearTimeout: () => {} };
