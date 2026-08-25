@@ -35,7 +35,9 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
 - **When the work involves a repo** (the ticket says so): branch from your
   parent's branch, PR back into it. The branch tree mirrors the ticket tree
   (`main ← story ← task`) whenever the work is code, and doesn't exist
-  otherwise. The reviewer accepts by merging.
+  otherwise. **The reviewer approves; the author merges its own approved PR**
+  — at both levels (story approves task PRs; epic approves the story's PR to
+  main).
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the parent's agent reads the child's result against what the
