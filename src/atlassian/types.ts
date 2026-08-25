@@ -4,6 +4,7 @@ export interface JiraIssue {
   status: string;
   issuetype: string;
   assignee: string | null;
+  parent: string | null;
   updated: string;
 }
 

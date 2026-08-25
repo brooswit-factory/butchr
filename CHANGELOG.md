@@ -9,6 +9,14 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.0] - 2026-08-25
+### Added
+- **The agent model (docs/agent-model.md) is implemented.** Agents now do things:
+  - **MCP tools**: a thin proxy over the de-facto SDKs (jira.js 6, confluence.js 3) with the shared credential — `jira_get_issue`, `jira_search`, `jira_add_comment`, `jira_transition`, `jira_create_issue`, `confluence_create_page`, `confluence_get_page`, `confluence_list_spaces`. Every call is audited by the caller's `x-issue`. (Found live: jira.js 6.x wants `auth: { type: "basic", … }` — the old `authentication:` shape is silently ignored and Jira then returns EMPTY searches, not a 401.)
+  - **Briefs + kickoff cascade**: `briefs/` (CLAUDE.md, epic, story, task, default — embedded into the build as text imports). Spawn builds `~/butchr-workspaces/<KEY>/` with CLAUDE.md + the interpolated brief + mcp.json, starts the herdr workspace with that cwd, and after the agent settles sends "follow your CLAUDE.md".
+  - **Models per type**: epic=fable, story=opus, task=sonnet via `--model`.
+  - **Parent notification**: a changed issue nudges its own agent AND its parent's — reviews flow upward.
+
 ## [0.4.1] - 2026-08-24
 ### Fixed
 - First real run against the live board (7 tickets → 7 agents) surfaced three defects, all fixed: `agent.start` needs a pane, so spawn now creates a workspace per issue and starts the agent in its root pane; agent names must be lowercase (`butchr-kan-7`, mapped back to `KAN-7`); and the prompt-watcher now sweeps agents ALREADY blocked at daemon start (a restart no longer strands them). Also auto-answers Claude's "Settings Warning" startup prompt (Continue).

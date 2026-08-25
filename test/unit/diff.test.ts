@@ -3,7 +3,7 @@ import { activeKeys, changedKeys } from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status = "In Progress", summary = "s", updated = "t"): JiraIssue =>
-  ({ key, status, summary, issuetype: "Task", assignee: "a", updated });
+  ({ key, status, summary, issuetype: "Task", assignee: "a", parent: null, updated });
 
 describe("activeKeys", () => {
   test("keeps only active-status issues", () => {

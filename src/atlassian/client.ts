@@ -28,7 +28,7 @@ export class AtlassianClient {
 
   /** Issues matching a JQL query, mapped to butchr's flat shape. */
   async search(jql: string, maxResults = 100): Promise<JiraIssue[]> {
-    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,updated" });
+    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated" });
     const body = await this.get(`/rest/api/3/search/jql?${q}`);
     return (body.issues ?? []).map(mapIssue);
   }
@@ -53,6 +53,7 @@ function mapIssue(i: any): JiraIssue {
     status: f.status?.name ?? "",
     issuetype: f.issuetype?.name ?? "",
     assignee: f.assignee?.displayName ?? null,
+    parent: f.parent?.key ?? null,
     updated: f.updated ?? "",
   };
 }
