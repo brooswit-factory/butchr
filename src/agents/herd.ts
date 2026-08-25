@@ -1,14 +1,13 @@
-import { writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { HerdrClient } from "@brooswit/herdr-sdk";
+import { buildWorkspace, modelFor, type SpawnSpec } from "./workspace.js";
+export type { SpawnSpec } from "./workspace.js";
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
 export interface Herd {
   /** Issues that currently have a butchr-managed agent running. */
   runningIssues(): Promise<string[]>;
   /** Start an agent for an issue (idempotent — a no-op if one is already running). */
-  spawn(issue: string): Promise<void>;
+  spawn(spec: SpawnSpec): Promise<void>;
   /** Shut off the agent for an issue (idempotent). */
   stop(issue: string): Promise<void>;
   /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
@@ -42,27 +41,33 @@ export class HerdrHerd implements Herd {
     return [...(await this.byIssue()).keys()];
   }
 
-  async spawn(issue: string): Promise<void> {
+  async spawn(spec: SpawnSpec): Promise<void> {
+    const issue = spec.key;
     if ((await this.byIssue()).has(issue)) return;
-    // Per-issue MCP config: the agent connects to butchr's channel and identifies
-    // the issue it works on via the x-issue header. --channels opts the session
-    // into receiving butchr's pushes (the server must be on the approved list).
-    const dir = join(tmpdir(), "butchr-agents", issue);
-    mkdirSync(dir, { recursive: true });
-    const cfg = join(dir, "mcp.json");
-    writeFileSync(cfg, JSON.stringify({ mcpServers: { butchr: { type: "http", url: this.mcpUrl, headers: { "x-issue": issue } } } }));
-    // herdr needs a pane to start the agent in: create a workspace for the issue,
-    // then start the agent in its root pane.
-    const created = await this.herdr.workspace.create({ label: issue } as Parameters<HerdrClient["workspace"]["create"]>[0]);
+    // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
+    // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
+    // which cascades into the brief.
+    const dir = buildWorkspace(spec, this.mcpUrl);
+    // herdr needs a pane: create a workspace WITH that cwd, start the agent in
+    // its root pane, with the model for this issue type.
+    const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
     const rp = (created as { root_pane?: unknown }).root_pane;
     const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
     if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
+    const name = nameFor(issue);
     await this.herdr.agent.start({
       pane_id: paneId,
-      name: nameFor(issue),
+      name,
       kind: "claude",
-      args: ["--mcp-config", cfg, "--channels", "server:butchr"],
+      args: ["--model", modelFor(spec.issuetype), "--mcp-config", dir + "/mcp.json", "--channels", "server:butchr"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
+    // Kickoff: once the agent settles to idle (startup prompts auto-answered by
+    // the prompt-watcher), tell it to follow its CLAUDE.md. Fire-and-forget —
+    // a timeout here must not wedge the reconcile loop.
+    void this.herdr.agent
+      .wait({ target: name, until: ["idle"], timeout_ms: 180_000 } as Parameters<HerdrClient["agent"]["wait"]>[0])
+      .then(() => this.herdr.agent.prompt({ target: name, text: "follow your CLAUDE.md" } as Parameters<HerdrClient["agent"]["prompt"]>[0]))
+      .catch((e) => console.error(`  kickoff for ${issue} failed: ${(e as Error)?.message ?? e}`));
   }
 
   async stop(issue: string): Promise<void> {

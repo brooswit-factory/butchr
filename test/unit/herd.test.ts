@@ -5,7 +5,7 @@ import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
   const client = {
-    agent: { list: async () => ({ agents }), start: async (p: any) => { started.push(p); } },
+    agent: { list: async () => ({ agents }), start: async (p: any) => { started.push(p); }, wait: async () => ({}), prompt: async () => ({}) },
     pane: { close: async (id: string) => { closed.push(id); } },
     workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
   };
@@ -30,7 +30,7 @@ describe("HerdrHerd", () => {
   test("spawn starts a claude agent with the channel flag + per-issue mcp config; is idempotent", async () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp");
-    await herd.spawn("KAN-7");
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: "KAN-1" });
     expect(f.started.length).toBe(1);
     expect(f.started[0].name).toBe("butchr-kan-7");
     expect(f.started[0].pane_id).toBe("w9:p1");   // started in the new workspace's root pane
@@ -43,7 +43,7 @@ describe("HerdrHerd", () => {
     expect(cfg.mcpServers.butchr.headers["x-issue"]).toBe("KAN-7");
     // idempotent: already-running issue is not started again
     const f2 = fakeHerdr([{ name: "butchr-kan-7", pane_id: "w1:p1" }]);
-    await new HerdrHerd(f2.client, "u").spawn("KAN-7");
+    await new HerdrHerd(f2.client, "u").spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(f2.started.length).toBe(0);
   });
   test("paneFor resolves the current pane, or null when not running", async () => {

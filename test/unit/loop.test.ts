@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { reconcileNow, startLoop } from "../../src/daemon/loop.js";
+import { desiredFrom, reconcileNow, startLoop } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
@@ -9,20 +9,38 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
   return {
     running, spawned, stopped,
     async runningIssues() { return [...running]; },
-    async spawn(i) { spawned.push(i); running.add(i); },
+    async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
   };
 }
-const iss = (key: string, status: string): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", updated: "t" });
+const iss = (key: string, status: string, parent: string | null = null): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", parent, updated: "t" });
 
 describe("reconcileNow", () => {
   test("spawns active-not-running and stops running-not-active", async () => {
     const herd = fakeHerd(["OLD", "KEEP"]);
-    await reconcileNow(herd, ["KEEP", "NEW"]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    await reconcileNow(herd, new Map([["KEEP", spec("KEEP")], ["NEW", spec("NEW")]]));
     expect(herd.spawned).toEqual(["NEW"]);
     expect(herd.stopped).toEqual(["OLD"]);
     expect([...herd.running].sort()).toEqual(["KEEP", "NEW"]);
+  });
+});
+
+describe("startLoop parent notification", () => {
+  test("a changed child notifies its own agent AND the parent's, deduped", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("KAN-1", "In Progress"), iss("KAN-2", "In Progress", "KAN-1")],
+      [iss("KAN-1", "In Progress"), iss("KAN-2", "In Review", "KAN-1")],   // child changed
+    ];
+    let n = 0;
+    const stop = startLoop({ search: async () => polls[Math.min(n++, 1)]!, herd, notify: (i) => { notified.push(i); }, intervalMs: 10 });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("KAN-2");   // the child
+    expect(notified).toContain("KAN-1");   // its parent (the reviewer)
   });
 });
 

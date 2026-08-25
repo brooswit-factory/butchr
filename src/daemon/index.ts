@@ -8,6 +8,8 @@ import { startLoop } from "./loop.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
+import { realAtlassian } from "../tools/atlassian-real.js";
+import { atlassianTools } from "../tools/defs.js";
 
 let config;
 try {
@@ -24,6 +26,7 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 const summaries = new Map<string, string>();
 
+const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -39,7 +42,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-});
+}, atlassianTools(ops));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
