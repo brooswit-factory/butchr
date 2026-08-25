@@ -1,88 +1,87 @@
 # The agent model
 
-Decided 2026-08-25. This is the plan of record for how butchr agents work per
-ticket type. Build order at the bottom.
+Decided 2026-08-25 (rev 2 — the canonical-types framing). This is the plan of
+record for how butchr agents work per issue type. Build order at the bottom.
 
-## The hierarchy
+## The principle
 
-| type | role | model |
+Agents are written to **complement what their issue type canonically is** in
+Jira — not to impose a workflow on top of it. Epics are large finite outcomes.
+Stories are deliverable increments of value. Tasks are concrete units of work.
+Nothing in the model assumes the work is code: repos, documents, and systems
+are all just *context*, and
+
+> **Context flows down through tickets; results flow up through review.
+> The ticket is the interface.**
+
+An agent knows only what its ticket (and its brief) tells it. Whoever files a
+ticket is responsible for putting the needed context in it — that is the
+system's main skill, and the briefs teach it.
+
+## The three agents
+
+| type | owns | model |
 |---|---|---|
-| **Epic** | Master of its domain — typically one project/repo. Creates stories to accomplish high-level ideas. Reviews story PRs into `main`. | fable |
-| **Story** | Takes a high-level idea and decomposes it into tasks. Keeps decomposing until its branch is complete and clean, then PRs its branch → `main` and moves itself to In Review until the **epic** reviews. | opus |
-| **Task** | Accomplishes one unit of work. Task *types* differ in their initial step and acceptance criteria (below). Moves itself to In Review until the **story** reviews. | sonnet |
+| **Epic** | One **outcome** — a large, finite initiative. Shapes it into stories, adjusts the plan as finished work teaches, guards its scope, reviews each story's result, verifies the outcome end-to-end, writes the closing summary, and **ends**. It does not own territory; if the outcome involves repos or systems, the epic is told about them in its description. | fable |
+| **Story** | One **increment of value** — observably true when done, per its acceptance criteria. Decomposes into tasks when the work divides (each task ticket carrying its own definition of done and the context to meet it); does directly what doesn't warrant a ticket. Reviews each task's result; verifies the whole increment; then In Review for the epic. | opus |
+| **Task** | One **unit of work** with a concrete definition of done stated on its ticket — code, research, writing, investigation, anything. Produces exactly the named artifact, comments what and where, then In Review for the story. | sonnet |
 
-Spawning is untouched by type: **assignment + status (In Progress / In Review)
-decide whether an agent runs** — issuetype only decides which brief, model, and
-duties it gets.
+Every level finishes the same way: verify against acceptance criteria, hand
+upward for review, end. **No agent is permanent.** Agent lifecycle mirrors
+work lifecycle via the reconcile loop: active ticket ⇒ running agent.
 
-## The branch tree mirrors the ticket tree
+## Conventions, not machinery
 
-```
-main
-└── KAN-<story>            the story's branch
-    ├── KAN-<taskA>        each code task: a worktree + branch named by its key
-    └── KAN-<taskB>
-```
-
-- A **code task** starts by creating a worktree named after its Jira key inside
-  the workspace; it ends with a **PR from its key-branch into the story's
-  key-branch**, and the ticket In Review until the story agent reviews.
-- A **research task** starts from a `draft.md`; it ends as a **Confluence doc**,
-  and the ticket In Review until the story agent reviews.
-- A **story** ends with a **PR from its key-branch into `main`**, In Review
-  until the epic reviews.
+- **When the work involves a repo** (the ticket says so): branch from your
+  parent's branch, PR back into it. The branch tree mirrors the ticket tree
+  (`main ← story ← task`) whenever the work is code, and doesn't exist
+  otherwise. The reviewer accepts by merging.
+- **When the work is a document**: the artifact lands where the ticket says
+  (e.g. Confluence); the reviewer accepts by saying so on the ticket.
+- **Review** = the parent's agent reads the child's result against what the
+  child's ticket asked. Changes are requested as ticket comments — the watch
+  loop nudges the child's agent.
 
 ## Briefs and the kickoff cascade
 
-- `briefs/` in this repo: `epic.md`, `story.md`, `task-code.md`,
-  `task-research.md` (+ `default.md`). Short — the role model, the tools that
-  actually exist, the handoff conventions. Growth is a smell; the old briefs
-  hit 4,880 lines by accreting workarounds for delivery failures this
-  architecture doesn't have.
-- A generic `CLAUDE.md` that says: *read `brief.md` and follow it.*
-- On spawn, butchr creates the agent's workspace directory, copies `CLAUDE.md`
-  + the right brief in as `brief.md` (interpolated: key, summary, parent,
-  repo), and starts the herdr workspace with `cwd` = that directory — Claude
-  Code auto-reads `CLAUDE.md` from cwd.
-- The kickoff prompt is one line: **"follow your CLAUDE.md"** — which cascades
-  into the brief.
+- `briefs/` in this repo: `epic.md`, `story.md`, `task.md`, `default.md`.
+  Short — role model, the tools that actually exist, the conventions above.
+  Growth is a smell (the old system's briefs hit 4,880 lines by accreting
+  workarounds for delivery failures this architecture doesn't have).
+- A generic `CLAUDE.md`: *read `brief.md` and follow it.*
+- On spawn, butchr creates `~/butchr-workspaces/<KEY>/`, copies in `CLAUDE.md`
+  + the type's brief as `brief.md` (interpolated: key, summary, parent), and
+  starts the herdr workspace with that `cwd` — Claude Code auto-reads
+  `CLAUDE.md` there. Kickoff prompt: **"follow your CLAUDE.md"**.
 
 ## Tools: the daemon MCP is a thin proxy
 
-The thatch server's tools proxy the **de-facto SDKs** — `jira.js` and
-`confluence.js` — executed daemon-side with the shared credential (agents never
-hold the token; attribution is free via each connection's `x-issue`). No
-scoping machinery: any agent may call any tool; the daemon logs who did what.
+thatch tools proxy the de-facto SDKs — `jira.js` and `confluence.js` —
+executed daemon-side with the shared credential. No scoping machinery; the
+daemon logs which connection (`x-issue`) did what.
 
-## Review flow over the existing loop
+## Spawning
 
-No supervision machinery. The watch loop already notifies the agent on a
-changed issue; it additionally notifies the **parent's** agent, so a task
-moving to In Review nudges its story, and a story moving to In Review nudges
-its epic. Review = the supervisor reads the child's PR/doc, requests changes
-(comment → child's agent is nudged) or accepts (merge the PR / approve the
-doc, move the child to Done).
+Assignment + status (In Progress / In Review) decide whether an agent runs.
+Issue type decides only brief, model, and duties.
 
-## Open questions (to settle before building)
+## Dissolved questions (rev 1 asked these; rev 2 removes the need)
 
-1. **Where does a task's *type* (code vs research) live?** Proposal: a label
-   (`code`, `research`), defaulting to code when absent. Alternative: parse
-   from summary/description.
-2. **Where does an epic's repo mapping live?** "Master of one repo" needs
-   KEY→repo. Proposal: a line in the epic's description
-   (`repo: github.com/org/name`), inherited by its stories/tasks.
-3. **Who merges a reviewed PR?** Story merges task PRs into its branch; epic
-   merges story PRs into main — or does the human hold the main merge?
-4. **Workspace location + lifecycle**: proposal `~/butchr-workspaces/<KEY>/`,
-   removed when the ticket leaves the active statuses (worktrees pruned).
+- ~~Task types (code/research labels)~~ — a task's "type" is its ticket's own
+  definition of done. One task brief.
+- ~~Epic repo mapping~~ — repos are context, delivered in ticket descriptions.
+- ~~Who merges~~ — the reviewer accepts in the work's own medium.
+
+## Open
+
+- **Workspace lifecycle**: `~/butchr-workspaces/<KEY>/` — removed when the
+  ticket leaves the active statuses? (Safe for merged work; abandons
+  uncommitted work with the ticket.)
 
 ## Build order
 
-1. **Daemon tools** — jira.js/confluence.js proxied through thatch (nothing
-   works until agents have hands).
-2. **Workspace builder + briefs** — CLAUDE.md, the five briefs, interpolation,
+1. **Daemon tools** — jira.js/confluence.js proxied through thatch.
+2. **Workspace builder + briefs** — CLAUDE.md, the four briefs, interpolation,
    `workspace.create({cwd})`, the kickoff prompt.
-3. **Per-type models** — `--model` from a type table (epic=fable, story=opus,
-   task=sonnet).
+3. **Per-type models** — epic=fable, story=opus, task=sonnet via spawn args.
 4. **Parent notification** — extend the diff/notify loop with the parent field.
-5. **Repo mapping + worktree conventions** in the code-task brief.
