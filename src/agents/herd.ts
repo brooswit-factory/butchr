@@ -63,15 +63,11 @@ export class HerdrHerd implements Herd {
       // must be able to run git/gh without a human to approve each command. Without
       // it the permission classifier denies `git add/commit/push` and the agent
       // completes its work but cannot deliver it (measured, KAN-679).
-      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
+      // The trailing positional is Claude Code's initial prompt: it is queued at
+      // startup and submitted once the startup dialogs are answered, so the agent
+      // kicks itself off. No wait-for-idle + prompt round trip to fail or time out.
+      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr", "follow your CLAUDE.md"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
-    // Kickoff: once the agent settles to idle (startup prompts auto-answered by
-    // the prompt-watcher), tell it to follow its CLAUDE.md. Fire-and-forget —
-    // a timeout here must not wedge the reconcile loop.
-    void this.herdr.agent
-      .wait({ target: name, until: ["idle"], timeout_ms: 180_000 } as Parameters<HerdrClient["agent"]["wait"]>[0])
-      .then(() => this.herdr.agent.prompt({ target: name, text: "follow your CLAUDE.md" } as Parameters<HerdrClient["agent"]["prompt"]>[0]))
-      .catch((e) => console.error(`  kickoff for ${issue} failed: ${(e as Error)?.message ?? e}`));
   }
 
   async stop(issue: string): Promise<void> {

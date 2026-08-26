@@ -5,7 +5,7 @@ import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
   const client = {
-    agent: { list: async () => ({ agents }), start: async (p: any) => { started.push(p); }, wait: async () => ({}), prompt: async () => ({}) },
+    agent: { list: async () => ({ agents }), start: async (p: any) => { started.push(p); } },
     pane: { close: async (id: string) => { closed.push(id); } },
     workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
   };
@@ -27,7 +27,7 @@ describe("HerdrHerd", () => {
     const herd = new HerdrHerd(client, "http://localhost:7717/mcp");
     expect(await herd.runningIssues()).toEqual(["KAN-1"]);
   });
-  test("spawn starts a claude agent with the channel flag + per-issue mcp config; is idempotent", async () => {
+  test("spawn starts a claude agent with the channel flag + per-issue mcp config + kickoff prompt; is idempotent", async () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp");
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: "KAN-1" });
@@ -39,6 +39,8 @@ describe("HerdrHerd", () => {
     expect(f.started[0].args).toContain("bypassPermissions");
     expect(f.started[0].args).toContain("--dangerously-load-development-channels");
     expect(f.started[0].args).toContain("server:butchr");
+    // the kickoff prompt is the trailing positional argument — no wait/prompt round trip
+    expect(f.started[0].args[f.started[0].args.length - 1]).toBe("follow your CLAUDE.md");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
     expect(cfg.mcpServers.butchr.url).toBe("http://localhost:7717/mcp");
