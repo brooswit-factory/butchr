@@ -82,3 +82,29 @@ describe("spawn failure", () => {
     expect(closed).toEqual(["wX:p1"]);
   });
 });
+
+describe("nudge", () => {
+  const base = (prompts: any[], fail = false) => ({
+    agent: {
+      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: "idle" }] }),
+      start: async () => {},
+      prompt: async (p: any) => { if (fail) throw new Error("pane is blocked"); prompts.push(p); },
+    },
+    workspace: { create: async () => ({ root_pane: "w1:p1" }) },
+    pane: { close: async () => {} },
+  });
+  test("delivers a prompt to the issue's agent and reports true", async () => {
+    const prompts: any[] = [];
+    const herd = new HerdrHerd(base(prompts) as any, "http://x/mcp");
+    expect(await herd.nudge("KAN-7", "[butchr] hi")).toBe(true);
+    expect(prompts[0]).toEqual({ target: "butchr-kan-7", text: "[butchr] hi" });
+  });
+  test("false when no agent runs for the issue", async () => {
+    const herd = new HerdrHerd(base([]) as any, "http://x/mcp");
+    expect(await herd.nudge("KAN-999", "x")).toBe(false);
+  });
+  test("false when the pane refuses (blocked)", async () => {
+    const herd = new HerdrHerd(base([], true) as any, "http://x/mcp");
+    expect(await herd.nudge("KAN-7", "x")).toBe(false);
+  });
+});

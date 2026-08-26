@@ -12,6 +12,12 @@ export interface Herd {
   stop(issue: string): Promise<void>;
   /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
   paneFor(issue: string): Promise<string | null>;
+  /**
+   * Deliver `text` to the issue's agent as a prompt — this STARTS a turn on an
+   * idle agent (a channel push renders mid-turn but cannot wake one). Queues on
+   * a busy agent. False if no agent is running or the pane refused (blocked).
+   */
+  nudge(issue: string, text: string): Promise<boolean>;
 }
 
 const AGENT_PREFIX = "butchr-";
@@ -88,6 +94,16 @@ export class HerdrHerd implements Herd {
 
   async paneFor(issue: string): Promise<string | null> {
     return (await this.byIssue()).get(issue) ?? null;
+  }
+
+  async nudge(issue: string, text: string): Promise<boolean> {
+    if (!(await this.byIssue()).has(issue)) return false;
+    try {
+      await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<HerdrClient["agent"]["prompt"]>[0]);
+      return true;
+    } catch {
+      return false; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
+    }
   }
 }
 
