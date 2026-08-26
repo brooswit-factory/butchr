@@ -35,6 +35,8 @@ describe("HerdrHerd", () => {
     expect(f.started[0].name).toBe("butchr-kan-7");
     expect(f.started[0].pane_id).toBe("w9:p1");   // started in the new workspace's root pane
     expect(f.started[0].kind).toBe("claude");
+    expect(f.started[0].args).toContain("--permission-mode");
+    expect(f.started[0].args).toContain("bypassPermissions");
     expect(f.started[0].args).toContain("--channels");
     expect(f.started[0].args).toContain("server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
