@@ -40,6 +40,9 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           ...(p.description ? { description: adf(p.description) } : {}),
           ...(p.parent ? { parent: { key: p.parent } } : {}),
           ...(p.labels?.length ? { labels: p.labels } : {}),
+          // An unassigned ticket is never staffed: the board reconciler needs an
+          // assignee AND an active status before an agent runs for it.
+          ...(p.assignee ? { assignee: { accountId: p.assignee } } : {}),
         },
       }),
     createPage: (p) => wiki.page.createPage({ spaceId: p.spaceId, status: "current", title: p.title, body: { representation: "storage", value: p.body } }),

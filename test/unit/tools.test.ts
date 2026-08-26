@@ -30,12 +30,13 @@ describe("atlassianTools", () => {
     await tools.jira_search!.handler({ jql: "project = KAN", maxResults: 5 }, conn);
     await tools.jira_add_comment!.handler({ key: "KAN-1", text: "hi" }, conn);
     await tools.jira_transition!.handler({ key: "KAN-1", status: "In Review" }, conn);
-    await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s", parent: "KAN-2" }, conn);
+    await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s", parent: "KAN-2", assignee: "acct-1" }, conn);
     await tools.confluence_create_page!.handler({ spaceId: "1", title: "t", body: "<p/>" }, conn);
     await tools.confluence_get_page!.handler({ id: "9" }, conn);
     await tools.confluence_list_spaces!.handler({}, conn);
     expect(calls.map(([n]) => n)).toEqual(["getIssue", "search", "addComment", "transition", "createIssue", "createPage", "getPage", "listSpaces"]);
     expect(calls[1]![1]).toEqual(["project = KAN", 5]);
+    expect((calls[4]![1][0] as { assignee?: string }).assignee).toBe("acct-1");   // assignee reaches the op
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
     expect(audits.length).toBe(8);
   });
