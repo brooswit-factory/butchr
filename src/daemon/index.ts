@@ -4,7 +4,7 @@ import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { HerdrHerd, issueOfAgentName } from "../agents/herd.js";
-import { startLoop } from "./loop.js";
+import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
@@ -48,14 +48,48 @@ console.error(`butchr daemon on http://localhost:${config.port}  (${describeConf
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 
 const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
+const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
+
+// Related work for the active set: children of each active ticket, plus the
+// tickets linked to it. Watched regardless of assignee — the assigned-issues
+// query above is per-credential, but a reviewer must hear about its child's
+// progress even when another account (another machine's daemon) staffs it.
+const related = async (active: readonly string[]): Promise<RelatedIssue[]> => {
+  const keys = active.filter((k) => KEY_RE.test(k));
+  if (!keys.length) return [];
+  const out = new Map<string, { issue: import("../atlassian/types.js").JiraIssue; watchers: Set<string> }>();
+  const add = (issue: import("../atlassian/types.js").JiraIssue, watcher: string) => {
+    const e = out.get(issue.key) ?? { issue, watchers: new Set<string>() };
+    e.issue = issue;
+    e.watchers.add(watcher);
+    out.set(issue.key, e);
+  };
+  for (const c of await atlassian.search(`parent IN (${keys.join(",")})`))
+    if (c.parent) add(c, c.parent);
+  const linkWatchers = new Map<string, Set<string>>();
+  for (const k of keys)
+    for (const l of await atlassian.links(k)) {
+      if (!KEY_RE.test(l.key) || keys.includes(l.key)) continue; // active ends are already watched
+      (linkWatchers.get(l.key) ?? linkWatchers.set(l.key, new Set()).get(l.key)!).add(k);
+    }
+  const linked = [...linkWatchers.keys()];
+  if (linked.length)
+    for (const i of await atlassian.search(`key IN (${linked.join(",")})`))
+      for (const w of linkWatchers.get(i.key) ?? []) add(i, w);
+  return [...out.values()].map((e) => ({ issue: e.issue, watchers: [...e.watchers] }));
+};
+
 startLoop({
   search: async () => {
     const issues = await atlassian.search(JQL);
     for (const i of issues) summaries.set(i.key, i.summary);
     return issues;
   },
+  related,
   herd,
-  notify: (issue) => void notifyIssue(mcp, issue, `Ticket ${issue} was updated — re-read it.`),
+  notify: (issue, about) => void notifyIssue(mcp, issue, about === issue
+    ? `Ticket ${issue} was updated — re-read it.`
+    : `${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });

@@ -32,12 +32,13 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
       handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status); },
     },
     jira_create_issue: {
-      description: "Create a Jira issue. Set parent to nest a Story under an Epic or a Task under a Story. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
+      description: "Create a Jira issue. Set parent to nest a Story under an Epic or a Task under a Story. Set assignee to an Atlassian accountId — an unassigned ticket is never staffed, so a ticket you intend to be worked MUST have one. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
       input: {
         projectKey: z.string(), issuetype: z.enum(["Epic", "Story", "Task"]), summary: z.string(),
         description: z.string().optional(), parent: z.string().optional(), labels: z.array(z.string()).optional(),
+        assignee: z.string().optional(),
       },
-      handler: (a, c) => { const p = a as { projectKey: string; issuetype: "Epic" | "Story" | "Task"; summary: string; description?: string; parent?: string; labels?: string[] }; audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"}`); return ops.createIssue(p); },
+      handler: (a, c) => { const p = a as { projectKey: string; issuetype: "Epic" | "Story" | "Task"; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string }; audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"}`); return ops.createIssue(p); },
     },
     confluence_create_page: {
       description: "Create a Confluence page (storage/XHTML body) in a space.",

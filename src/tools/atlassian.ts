@@ -5,7 +5,7 @@ export interface AtlassianOps {
   addComment(key: string, text: string): Promise<unknown>;
   /** Transition by target status name (e.g. "In Review"). */
   transition(key: string, statusName: string): Promise<unknown>;
-  createIssue(p: { projectKey: string; issuetype: string; summary: string; description?: string; parent?: string; labels?: string[] }): Promise<unknown>;
+  createIssue(p: { projectKey: string; issuetype: string; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string }): Promise<unknown>;
   createPage(p: { spaceId: string; title: string; body: string }): Promise<unknown>;
   getPage(id: string): Promise<unknown>;
   listSpaces(): Promise<unknown>;

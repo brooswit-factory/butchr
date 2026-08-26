@@ -9,6 +9,12 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.5] - 2026-08-26
+### Added
+- `jira_create_issue` accepts an `assignee` (accountId). A ticket filed without one is never staffed — the board reconciler needs an assignee *and* an active status — so a parent filing work for a child must be able to say who works it. This also lets a hierarchy span machines: stories on one account can file tasks assigned to another.
+### Changed
+- **The daemon watches related work.** Each poll now also fetches the children of every active ticket and the tickets linked to it, and a change to one — including a newly filed child — notifies the active ticket's agent, naming what changed. The assigned-issues query is per-credential, so without this a task assigned to another account (another machine's daemon) could move to In Review and its story's reviewer would never hear; now the wake-up is mechanical, not etiquette.
+
 ## [0.5.4] - 2026-08-26
 ### Changed
 - **Spawned agents are kicked off by a command-line argument, not a wait-then-prompt chain.** `spawn()` now appends the positional prompt `follow your CLAUDE.md` to the args passed to `agent.start`; Claude Code queues it as the first message and submits it once the startup dialogs are answered. The fire-and-forget `agent.wait({until:["idle"], timeout_ms: 180_000})` → `agent.prompt(...)` chain that followed `agent.start` is gone, and with it its failure modes (a missed idle transition, a 180s timeout, a prompt racing the startup dialogs).
