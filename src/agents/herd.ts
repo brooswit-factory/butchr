@@ -59,7 +59,11 @@ export class HerdrHerd implements Herd {
       pane_id: paneId,
       name,
       kind: "claude",
-      args: ["--model", modelFor(spec.issuetype), "--mcp-config", dir + "/mcp.json", "--channels", "server:butchr"],
+      // bypassPermissions: a spawned agent works unattended in its own workspace and
+      // must be able to run git/gh without a human to approve each command. Without
+      // it the permission classifier denies `git add/commit/push` and the agent
+      // completes its work but cannot deliver it (measured, KAN-679).
+      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--channels", "server:butchr"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
     // Kickoff: once the agent settles to idle (startup prompts auto-answered by
     // the prompt-watcher), tell it to follow its CLAUDE.md. Fire-and-forget —
