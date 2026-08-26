@@ -55,7 +55,8 @@ export class HerdrHerd implements Herd {
     const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
     if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
     const name = nameFor(issue);
-    await this.herdr.agent.start({
+    try {
+      await this.herdr.agent.start({
       pane_id: paneId,
       name,
       kind: "claude",
@@ -63,11 +64,21 @@ export class HerdrHerd implements Herd {
       // must be able to run git/gh without a human to approve each command. Without
       // it the permission classifier denies `git add/commit/push` and the agent
       // completes its work but cannot deliver it (measured, KAN-679).
-      // The trailing positional is Claude Code's initial prompt: it is queued at
-      // startup and submitted once the startup dialogs are answered, so the agent
-      // kicks itself off. No wait-for-idle + prompt round trip to fail or time out.
-      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr", "follow your CLAUDE.md"],
+      // The positional is Claude Code's initial prompt: queued at startup and
+      // submitted once the startup dialogs are answered, so the agent kicks
+      // itself off. It MUST come FIRST: --dangerously-load-development-channels
+      // (and --mcp-config) are variadic and swallow a trailing positional as
+      // another entry — "entries must be tagged: follow your CLAUDE.md", claude
+      // exits, and the daemon retry-loops leaking a workspace per poll
+      // (measured live on KAN-681's first spawn).
+      args: ["follow your CLAUDE.md", "--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
+    } catch (e) {
+      // A failed start must not leak the workspace we just created: the next
+      // reconcile would create another, forever (measured: 7 in 2 minutes).
+      await this.herdr.pane.close(paneId).catch(() => {});
+      throw e;
+    }
   }
 
   async stop(issue: string): Promise<void> {

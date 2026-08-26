@@ -39,8 +39,10 @@ describe("HerdrHerd", () => {
     expect(f.started[0].args).toContain("bypassPermissions");
     expect(f.started[0].args).toContain("--dangerously-load-development-channels");
     expect(f.started[0].args).toContain("server:butchr");
-    // the kickoff prompt is the trailing positional argument — no wait/prompt round trip
-    expect(f.started[0].args[f.started[0].args.length - 1]).toBe("follow your CLAUDE.md");
+    // the kickoff prompt is the FIRST argument: the variadic channel/mcp flags
+    // swallow a trailing positional as one of their own entries
+    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args[f.started[0].args.length - 1]).toBe("server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
     expect(cfg.mcpServers.butchr.url).toBe("http://localhost:7717/mcp");
@@ -63,5 +65,20 @@ describe("HerdrHerd", () => {
     expect(f.closed).toEqual(["w1:p9"]);
     await herd.stop("KAN-404");   // not running
     expect(f.closed).toEqual(["w1:p9"]);
+  });
+});
+
+describe("spawn failure", () => {
+  test("closes the just-created workspace pane when agent.start fails", async () => {
+    const closed: string[] = [];
+    const f = {
+      started: [] as any[],
+      agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+      pane: { close: async (p: string) => { closed.push(p); } },
+    };
+    const herd = new HerdrHerd(f as any, "http://x/mcp");
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(closed).toEqual(["wX:p1"]);
   });
 });
