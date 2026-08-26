@@ -9,6 +9,11 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.6] - 2026-08-26
+### Fixed
+- **The kickoff prompt is now the first spawn argument.** `--dangerously-load-development-channels` is variadic, so the trailing positional from 0.5.4 was swallowed as a second channel entry — claude rejected it ("entries must be tagged: follow your CLAUDE.md") and exited, and every agent spawn failed. Found on KAN-681's first live spawn; proven red/green by running claude both ways.
+- **A failed `agent.start` closes the workspace it created.** Without this the reconcile loop retried into a fresh herdr workspace every poll — 7 leaked in 2 minutes.
+
 ## [0.5.5] - 2026-08-26
 ### Added
 - `jira_create_issue` accepts an `assignee` (accountId). A ticket filed without one is never staffed — the board reconciler needs an assignee *and* an active status — so a parent filing work for a child must be able to say who works it. This also lets a hierarchy span machines: stories on one account can file tasks assigned to another.
