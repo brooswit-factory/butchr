@@ -9,6 +9,11 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.7] - 2026-08-26
+### Fixed
+- **The prompt-watcher retries while an agent stays blocked** (KAN-682). It fired once on the transition into blocked: if the dialog wasn't parseable at that instant, or one read failed (e.g. during a spawn-retry storm), nothing ever retried and the agent sat blocked forever — measured on KAN-681 and KAN-683, both needing a manual Enter. Now every poll re-fires for every blocked pane (handlers re-parse, so re-answering is idempotent), which also answers chains of startup dialogs where only the first raises a transition.
+- **The watcher logs.** Every prompt seen, every answer sent, every error — its failure paths were fully silenced before, so a dead watcher was indistinguishable from a quiet one.
+
 ## [0.5.6] - 2026-08-26
 ### Fixed
 - **The kickoff prompt is now the first spawn argument.** `--dangerously-load-development-channels` is variadic, so the trailing positional from 0.5.4 was swallowed as a second channel entry — claude rejected it ("entries must be tagged: follow your CLAUDE.md") and exited, and every agent spawn failed. Found on KAN-681's first live spawn; proven red/green by running claude both ways.

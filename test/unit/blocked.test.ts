@@ -1,31 +1,35 @@
 import { describe, expect, test } from "bun:test";
-import { newlyBlocked, watchBlocked } from "../../src/agents/blocked.js";
+import { blockedNow, watchBlocked } from "../../src/agents/blocked.js";
 
 const row = (pane_id: string, agent_status: string) => ({ pane_id, agent_status });
 
-describe("newlyBlocked", () => {
-  test("only panes that transitioned INTO blocked", () => {
-    const prev = [row("p1", "working"), row("p2", "blocked"), row("p3", "idle")];
-    const next = [row("p1", "blocked"), row("p2", "blocked"), row("p3", "working"), row("p4", "blocked")];
-    expect(newlyBlocked(prev, next)).toEqual(["p1", "p4"]); // p1 became blocked, p4 new+blocked; p2 already was
+describe("blockedNow", () => {
+  test("all currently blocked panes, sorted", () => {
+    expect(blockedNow([row("p2", "blocked"), row("p1", "blocked"), row("p3", "idle")])).toEqual(["p1", "p2"]);
   });
 });
 describe("watchBlocked", () => {
-  test("fires for agents ALREADY blocked at start (daemon-restart sweep)", async () => {
+  test("fires EVERY poll while a pane stays blocked (the KAN-682 retry)", async () => {
     const blocked: string[] = [];
-    watchBlocked(async () => [row("p1", "blocked"), row("p2", "idle")], 1000, (p) => blocked.push(p));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(blocked).toContain("p1");
+    const stop = watchBlocked(async () => [row("p1", "blocked"), row("p2", "idle")], 10, (p) => blocked.push(p));
+    await new Promise((r) => setTimeout(r, 45));
+    stop();
+    expect(blocked.filter((p) => p === "p1").length).toBeGreaterThanOrEqual(2); // retried, not one-shot
     expect(blocked).not.toContain("p2");
+    const n = blocked.length;
+    await new Promise((r) => setTimeout(r, 30));
+    expect(blocked.length).toBe(n); // stop() ends it
   });
-  test("fires onBlocked when an agent becomes blocked (manual clock)", async () => {
-    let cb: (() => void) | null = null;
-    const clock = { setTimeout: (fn: () => void) => { cb = fn; return 1 as unknown; }, clearTimeout: () => {} };
-    const states = [[row("p1", "working")], [row("p1", "working")], [row("p1", "blocked")]];
-    let n = 0; const blocked: string[] = [];
-    watchBlocked(async () => states[Math.min(n++, 2)]!, 5, (p) => blocked.push(p));
-    // watchBlocked uses sundry.watch which uses global timers; drive with real time instead
+  test("a failing list() reports onError and the loop survives to the next poll", async () => {
+    const errs: unknown[] = []; const blocked: string[] = [];
+    let n = 0;
+    const stop = watchBlocked(
+      async () => { if (n++ === 0) throw new Error("storm"); return [row("p1", "blocked")]; },
+      10, (p) => blocked.push(p), (e) => errs.push(e),
+    );
     await new Promise((r) => setTimeout(r, 40));
-    expect(blocked).toContain("p1");
+    stop();
+    expect(errs.length).toBe(1);
+    expect(blocked).toContain("p1");   // survived the failed poll
   });
 });
