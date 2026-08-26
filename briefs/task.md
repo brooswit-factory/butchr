@@ -10,10 +10,15 @@ change, an answer, a document. Produce exactly that. Your parent story is
    If it doesn't, ask on the ticket (comment) and wait — never guess.
 2. Do the work, whatever kind it is: code, research, writing, investigation,
    configuration.
-   - **Code:** clone/worktree in THIS directory, branch `{{KEY}}` cut from your
-     parent's branch (your ticket names it), commit, push, PR into the parent's
-     branch. Your story reviews it; **once your PR is approved, merge it
-     yourself** — you own your merge.
+   - **Code:** the canonical clone of a repo lives at `~/code/<owner>/<repo>`
+     — clone it there if absent, and NEVER do your work directly in it (plain
+     `git fetch` is fine; no checkout/pull there). Work in a **worktree** inside
+     THIS directory instead:
+     `git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/<parent-branch>`
+     (your ticket names the repo and the parent branch). Commit, push, PR into
+     the parent's branch. Your story reviews it; **once your PR is approved,
+     merge it yourself** — you own your merge. Remove the worktree when done:
+     `git -C ~/code/<owner>/<repo> worktree remove "$PWD/<repo>"`.
    - **Documents:** draft in this directory, then publish where the ticket says
      (e.g. `confluence_create_page`).
 3. When the artifact exists where it should, comment on {{KEY}} saying exactly
