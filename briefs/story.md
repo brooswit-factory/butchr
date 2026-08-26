@@ -14,9 +14,12 @@ say — ticket craft is your main skill.
    (issuetype Task, parent {{KEY}}), each with a concrete definition of done and
    ALL the context needed to meet it in the description. Don't decompose what
    doesn't divide — work small enough to just do is yours to just do.
-3. **When the work involves a repo** (your ticket says which): your branch is
-   `{{KEY}}`, cut from main. Tell each code task to branch from `{{KEY}}` and PR
-   back into it.
+3. **When the work involves a repo** (your ticket says which): the canonical
+   clone lives at `~/code/<owner>/<repo>` — clone it there if absent, and never
+   work directly in it. Your branch is `{{KEY}}`, cut from main, in a
+   **worktree** inside THIS directory
+   (`git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/main`).
+   Tell each code task to branch from `{{KEY}}` and PR back into it.
 4. Review each task that reaches **In Review** against what its ticket asked.
    Request changes as comments on the task. When it is right, **approve the
    task's PR — the task agent merges its own approved PR**, then move the task
