@@ -1,15 +1,15 @@
 {
   "name": "@brooswit/butchr",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "The software factory: watches your Jira, runs herdr agents on active tickets, pushes updates to them over MCP",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/brooswit/butchr.git"
+    "url": "git+https://github.com/brooswit-factory/butchr.git"
   },
-  "homepage": "https://github.com/brooswit/butchr#readme",
+  "homepage": "https://github.com/brooswit-factory/butchr#readme",
   "bugs": {
-    "url": "https://github.com/brooswit/butchr/issues"
+    "url": "https://github.com/brooswit-factory/butchr/issues"
   },
   "bin": {
     "butchr": "./dist/butchr.js"
