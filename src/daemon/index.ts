@@ -87,9 +87,16 @@ startLoop({
   },
   related,
   herd,
-  notify: (issue, about) => void notifyIssue(mcp, issue, about === issue
-    ? `Ticket ${issue} was updated — re-read it.`
-    : `${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`),
+  notify: async (issue, about) => {
+    const msg = about === issue
+      ? `[butchr] Ticket ${issue} was updated — re-read it.`
+      : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
+    // Channel push renders mid-turn; the prompt is what STARTS a turn on an
+    // idle agent (measured: an idle epic never woke on the push alone).
+    void notifyIssue(mcp, issue, msg);
+    const woke = await herd.nudge(issue, msg).catch(() => false);
+    console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+  },
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });

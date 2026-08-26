@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.8] - 2026-08-26
+### Fixed
+- **Notifications now wake idle agents.** A channel push renders mid-turn but cannot START a turn — measured live: the KAN-681 epic, idle and explicitly waiting to hear that its child reached In Review, never woke on the push. `notify` now also delivers the message as a herdr agent prompt (tagged `[butchr]`), which starts a turn on an idle agent and queues on a busy one; a blocked pane refuses it, which the prompt-watcher owns. Every delivery is logged with both outcomes.
+
 ## [0.5.7] - 2026-08-26
 ### Fixed
 - **The prompt-watcher retries while an agent stays blocked** (KAN-682). It fired once on the transition into blocked: if the dialog wasn't parseable at that instant, or one read failed (e.g. during a spawn-retry storm), nothing ever retried and the agent sat blocked forever — measured on KAN-681 and KAN-683, both needing a manual Enter. Now every poll re-fires for every blocked pane (handlers re-parse, so re-answering is idempotent), which also answers chains of startup dialogs where only the first raises a transition.
