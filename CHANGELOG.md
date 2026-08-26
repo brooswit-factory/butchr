@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.4] - 2026-08-26
+### Changed
+- **Spawned agents are kicked off by a command-line argument, not a wait-then-prompt chain.** `spawn()` now appends the positional prompt `follow your CLAUDE.md` to the args passed to `agent.start`; Claude Code queues it as the first message and submits it once the startup dialogs are answered. The fire-and-forget `agent.wait({until:["idle"], timeout_ms: 180_000})` → `agent.prompt(...)` chain that followed `agent.start` is gone, and with it its failure modes (a missed idle transition, a 180s timeout, a prompt racing the startup dialogs).
+
 ## [0.5.3] - 2026-08-26
 ### Fixed
 - **Channel pushes now render in agent sessions.** Agents were spawned with `--channels server:butchr`, but Claude Code silently skips channel registration for servers that are not on its approved allowlist — so butchr's pushed notifications never reached the agent. Spawn now passes `--dangerously-load-development-channels server:butchr` instead; the dev-load confirmation dialog it shows at startup is already auto-answered by the prompt-watcher.
