@@ -63,7 +63,7 @@ export class HerdrHerd implements Herd {
       // must be able to run git/gh without a human to approve each command. Without
       // it the permission classifier denies `git add/commit/push` and the agent
       // completes its work but cannot deliver it (measured, KAN-679).
-      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--channels", "server:butchr"],
+      args: ["--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
     // Kickoff: once the agent settles to idle (startup prompts auto-answered by
     // the prompt-watcher), tell it to follow its CLAUDE.md. Fire-and-forget —

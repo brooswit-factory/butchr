@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.3] - 2026-08-26
+### Fixed
+- **Channel pushes now render in agent sessions.** Agents were spawned with `--channels server:butchr`, but Claude Code silently skips channel registration for servers that are not on its approved allowlist — so butchr's pushed notifications never reached the agent. Spawn now passes `--dangerously-load-development-channels server:butchr` instead; the dev-load confirmation dialog it shows at startup is already auto-answered by the prompt-watcher.
+
 ## [0.5.2] - 2026-08-26
 ### Fixed
 - Spawned agents now run with `--permission-mode bypassPermissions`. Without it Claude Code's permission classifier denies `git add/commit/push`, so an agent does its work and then cannot deliver it — found live on KAN-679, where the agent made the change, ran the full check suite green, and stalled at the commit.

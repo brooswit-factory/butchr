@@ -37,7 +37,7 @@ describe("HerdrHerd", () => {
     expect(f.started[0].kind).toBe("claude");
     expect(f.started[0].args).toContain("--permission-mode");
     expect(f.started[0].args).toContain("bypassPermissions");
-    expect(f.started[0].args).toContain("--channels");
+    expect(f.started[0].args).toContain("--dangerously-load-development-channels");
     expect(f.started[0].args).toContain("server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
