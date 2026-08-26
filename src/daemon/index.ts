@@ -98,10 +98,16 @@ watchPrompts({
   onBlocked: (cb) => watchBlocked(
     async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
     5_000, cb,
+    (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),
   ),
   read: async (paneId) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text,
   send: async (paneId, text) => { await herdr.pane.sendText({ pane_id: paneId, text }); },
-  onPrompt: ({ prompt }) => (/trust this folder|local development|resume from summary|settings warning/i.test(prompt.question + " " + (prompt.options[0] ?? "")) ? 1 : undefined),
+  onPrompt: ({ paneId, prompt }) => {
+    const auto = /trust this folder|local development|resume from summary|settings warning/i.test(prompt.question + " " + (prompt.options[0] ?? ""));
+    console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${auto ? "answer 1" : "left for a human"}`);
+    return auto ? 1 : undefined;
+  },
+  onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
 atlassian.search(JQL)
