@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.1] - 2026-08-26
+### Changed
+- Repository moved to the brooswit-factory org; package.json repository/homepage/bugs URLs updated (npm provenance verifies repository.url against the building repo).
+
 ## [0.5.0] - 2026-08-25
 ### Added
 - **The agent model (docs/agent-model.md) is implemented.** Agents now do things:
