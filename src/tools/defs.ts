@@ -21,6 +21,11 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
       input: { jql: z.string(), maxResults: z.number().int().min(1).max(100).default(25) },
       handler: (a, c) => { const { jql, maxResults } = a as { jql: string; maxResults: number }; audit(c, `search ${jql.slice(0, 60)}`); return ops.search(jql, maxResults ?? 25); },
     },
+    jira_link_issues: {
+      description: "Link two issues (default type Relates). REQUIRED when a story files a task: Jira rejects a Story as a Task's parent (tasks parent to the epic), and the LINK is what makes butchr route the task's events — In Review, comments — to the story for review. Link your story to each task you file, immediately.",
+      input: { from: z.string(), to: z.string(), type: z.string().default("Relates") },
+      handler: (a, c) => { const { from, to, type } = a as { from: string; to: string; type?: string }; audit(c, `link ${from} → ${to}`); return ops.linkIssues(from, to, type ?? "Relates"); },
+    },
     jira_add_comment: {
       description: "Add a plain-text comment to a Jira issue.",
       input: { key: z.string(), text: z.string() },

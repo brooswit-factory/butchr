@@ -20,7 +20,12 @@ say — ticket craft is your main skill.
    carries the assignment policy with accountIds; `jira_create_issue` takes
    `assignee`) — reviewer and implementor must never be the same account. File
    a task with an assignee and move it to **In Progress** when it should start;
-   an unassigned or To Do ticket is never staffed.
+   an unassigned or To Do ticket is never staffed. **Immediately link your story
+   to each task you file** with `jira_link_issues` (from {{KEY}} to the task):
+   Jira rejects a Story as a Task's parent — tasks parent to the epic — and the
+   LINK is what makes butchr route the task's events (In Review, comments) to
+   YOU for review. Note the owning story in the task's summary too, like
+   "[{{KEY}}] <what it does>".
 3. **When the work involves a repo** (your ticket says which): the canonical
    clone lives at `~/code/<owner>/<repo>` — clone it there if absent, and never
    work directly in it. Your branch is `{{KEY}}`, cut from main, in a
