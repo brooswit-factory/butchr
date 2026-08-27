@@ -31,6 +31,8 @@ export class HerdrHerd implements Herd {
     private readonly herdr: HerdrClient,
     /** Where the daemon serves its MCP endpoint, so spawned agents can connect back. */
     private readonly mcpUrl: string,
+    /** Injectable wait, for tests. */
+    private readonly wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   ) {}
 
   private async byIssue(): Promise<Map<string, string>> {
@@ -96,14 +98,29 @@ export class HerdrHerd implements Herd {
     return (await this.byIssue()).get(issue) ?? null;
   }
 
+  private async statusOf(issue: string): Promise<string | null> {
+    const { agents } = await this.herdr.agent.list();
+    for (const a of agents) if (issueOf((a as { name?: string }).name) === issue) return a.agent_status ?? null;
+    return null;
+  }
+
   async nudge(issue: string, text: string): Promise<boolean> {
     if (!(await this.byIssue()).has(issue)) return false;
     try {
       await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<HerdrClient["agent"]["prompt"]>[0]);
-      return true;
     } catch {
       return false; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
     }
+    // "Delivered" is not "a turn started": a prompt landing as a turn ends
+    // strands in the composer unsubmitted (KAN-691 sat 2.5h on an approved PR).
+    // Verify a turn starts; if the agent is still IDLE — never blocked, where
+    // enter would select a dialog option — submit the stranded composer text.
+    await this.wait(8_000);
+    if ((await this.statusOf(issue)) === "idle") {
+      const pane = (await this.byIssue()).get(issue); // re-resolve: panes renumber
+      if (pane) await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+    }
+    return true;
   }
 }
 
