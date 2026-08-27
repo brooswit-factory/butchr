@@ -41,7 +41,7 @@ describe("atlassianTools", () => {
     expect(calls[5]![0]).toBe("linkIssues");
     expect(calls[5]![1]).toEqual(["KAN-2", "KAN-9", "Relates"]);                  // default link type applied
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
-    expect(audits.length).toBe(8);
+    expect(audits.length).toBe(9);
   });
   test("search defaults maxResults when omitted", async () => {
     const { tools, calls, conn } = rig();
