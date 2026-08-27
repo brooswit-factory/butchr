@@ -22,7 +22,12 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     getIssue: (key) => jira.issues.getIssue({ issueIdOrKey: key }),
     search: (jql, maxResults) =>
       jira.issueSearch.searchAndReconsileIssuesUsingJqlPost({ jql, maxResults, fields: ["summary", "status", "issuetype", "assignee", "labels", "parent", "description"] }),
-    addComment: (key, text) => jira.issueComments.addComment({ issueIdOrKey: key, comment: adf(text) }),
+    // AddComment spreads CommentInputSchema at the TOP level: the document goes
+    // in `body`, not nested under `comment` — the nested shape 400s with
+    // "Comment body can not be empty!" (red/green proven live; found by a task
+    // agent reporting the error inside a PR comment because it could not
+    // comment on Jira).
+    addComment: (key, text) => jira.issueComments.addComment({ issueIdOrKey: key, body: adf(text) }),
     linkIssues: (from, to, type) => jira.issueLinks.linkIssues({ type: { name: type }, outwardIssue: { key: from }, inwardIssue: { key: to } }),
     transition: async (key, statusName) => {
       const t = await jira.issues.getTransitions({ issueIdOrKey: key });
