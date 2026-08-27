@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.10] - 2026-08-27
+### Fixed
+- **`jira_add_comment` works again.** jira.js's `addComment` takes the comment fields spread at the top level (`body: <ADF>`), not nested under `comment:` — the nested shape returned 400 "Comment body can not be empty!" on every call, so no agent could comment on any ticket; the fleet coordinated through PR comments and status transitions alone. Found by a task agent reporting the failing tool inside a PR comment. Red/green proven against the live API before shipping.
+
 ## [0.5.9] - 2026-08-26
 ### Added
 - `jira_link_issues` tool (default type Relates), and the story brief now requires linking the story to each task it files. Jira rejects a Story as a Task's parent — Story and Task sit at the same hierarchy level, so tasks parent to the epic (probed live: 400 "Please select valid parent issue") — which mis-routed task events to the epic. The related-work watcher already follows links of active issues; the link is what routes a task's In Review to the story that must review it.
