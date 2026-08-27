@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.11] - 2026-08-27
+### Fixed
+- **`nudge` verifies a turn actually starts.** A prompt delivered in the dying seconds of a turn strands in the composer unsubmitted — herdr reports success, no turn starts, and the agent stalls until an unrelated change re-fires notify (measured: KAN-691 idle 2.5h on an approved PR). After delivery, nudge waits ~8s and, if the agent is still idle, sends a bare enter to submit the stranded text — never when blocked, where enter would select a dialog option.
+
 ## [0.5.10] - 2026-08-27
 ### Fixed
 - **`jira_add_comment` works again.** jira.js's `addComment` takes the comment fields spread at the top level (`body: <ADF>`), not nested under `comment:` — the nested shape returned 400 "Comment body can not be empty!" on every call, so no agent could comment on any ticket; the fleet coordinated through PR comments and status transitions alone. Found by a task agent reporting the failing tool inside a PR comment. Red/green proven against the live API before shipping.

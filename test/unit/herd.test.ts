@@ -84,27 +84,41 @@ describe("spawn failure", () => {
 });
 
 describe("nudge", () => {
-  const base = (prompts: any[], fail = false) => ({
+  const base = (prompts: any[], opts: { fail?: boolean; statusAfter?: string; keys?: any[] } = {}) => ({
     agent: {
-      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: "idle" }] }),
+      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: opts.statusAfter ?? "idle" }] }),
       start: async () => {},
-      prompt: async (p: any) => { if (fail) throw new Error("pane is blocked"); prompts.push(p); },
+      prompt: async (p: any) => { if (opts.fail) throw new Error("pane is blocked"); prompts.push(p); },
     },
     workspace: { create: async () => ({ root_pane: "w1:p1" }) },
-    pane: { close: async () => {} },
+    pane: { close: async () => {}, sendKeys: async (k: any) => { (opts.keys ?? []).push(k); } },
   });
-  test("delivers a prompt to the issue's agent and reports true", async () => {
-    const prompts: any[] = [];
-    const herd = new HerdrHerd(base(prompts) as any, "http://x/mcp");
+  const instant = () => Promise.resolve();
+  test("delivers a prompt; still idle after the wait → submits the stranded composer", async () => {
+    const prompts: any[] = []; const keys: any[] = [];
+    const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-7", "[butchr] hi")).toBe(true);
     expect(prompts[0]).toEqual({ target: "butchr-kan-7", text: "[butchr] hi" });
+    expect(keys[0]).toEqual({ pane_id: "w1:p1", keys: ["enter"] });   // delivered ≠ turn started
+  });
+  test("agent went working → no enter is sent", async () => {
+    const keys: any[] = [];
+    const herd = new HerdrHerd(base([], { statusAfter: "working", keys }) as any, "http://x/mcp", instant);
+    expect(await herd.nudge("KAN-7", "x")).toBe(true);
+    expect(keys.length).toBe(0);
+  });
+  test("agent blocked after prompt → never send enter (it would pick a dialog option)", async () => {
+    const keys: any[] = [];
+    const herd = new HerdrHerd(base([], { statusAfter: "blocked", keys }) as any, "http://x/mcp", instant);
+    expect(await herd.nudge("KAN-7", "x")).toBe(true);
+    expect(keys.length).toBe(0);
   });
   test("false when no agent runs for the issue", async () => {
-    const herd = new HerdrHerd(base([]) as any, "http://x/mcp");
+    const herd = new HerdrHerd(base([]) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-999", "x")).toBe(false);
   });
-  test("false when the pane refuses (blocked)", async () => {
-    const herd = new HerdrHerd(base([], true) as any, "http://x/mcp");
+  test("false when the pane refuses (blocked at prompt time)", async () => {
+    const herd = new HerdrHerd(base([], { fail: true }) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-7", "x")).toBe(false);
   });
 });
