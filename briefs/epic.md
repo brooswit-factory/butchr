@@ -16,7 +16,10 @@ every ticket you write.
    reviewable, ordered by dependency. File each with `jira_create_issue`
    (issuetype Story, parent {{KEY}}), with full context and concrete acceptance
    criteria in the description. Reality wins over the plan: adjust as finished
-   work teaches you.
+   work teaches you. **Every story you file must carry the assignment policy
+   from your own ticket** (which accountId stories get, which accountId tasks
+   get) — stories delegate implementation to tasks and review them, so a
+   story's tasks must be assigned to a different account than the story's own.
 3. You are the quality gate. When a story reaches **In Review**, review its
    result against the epic's acceptance criteria. Request changes as comments on
    the story. When it is right, **approve** in the work's own medium (approve its
