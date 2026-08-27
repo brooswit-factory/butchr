@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.9] - 2026-08-26
+### Added
+- `jira_link_issues` tool (default type Relates), and the story brief now requires linking the story to each task it files. Jira rejects a Story as a Task's parent — Story and Task sit at the same hierarchy level, so tasks parent to the epic (probed live: 400 "Please select valid parent issue") — which mis-routed task events to the epic. The related-work watcher already follows links of active issues; the link is what routes a task's In Review to the story that must review it.
+
 ## [0.5.8] - 2026-08-26
 ### Fixed
 - **Notifications now wake idle agents.** A channel push renders mid-turn but cannot START a turn — measured live: the KAN-681 epic, idle and explicitly waiting to hear that its child reached In Review, never woke on the push. `notify` now also delivers the message as a herdr agent prompt (tagged `[butchr]`), which starts a turn on an idle agent and queues on a busy one; a blocked pane refuses it, which the prompt-watcher owns. Every delivery is logged with both outcomes.

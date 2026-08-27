@@ -23,6 +23,7 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     search: (jql, maxResults) =>
       jira.issueSearch.searchAndReconsileIssuesUsingJqlPost({ jql, maxResults, fields: ["summary", "status", "issuetype", "assignee", "labels", "parent", "description"] }),
     addComment: (key, text) => jira.issueComments.addComment({ issueIdOrKey: key, comment: adf(text) }),
+    linkIssues: (from, to, type) => jira.issueLinks.linkIssues({ type: { name: type }, outwardIssue: { key: from }, inwardIssue: { key: to } }),
     transition: async (key, statusName) => {
       const t = await jira.issues.getTransitions({ issueIdOrKey: key });
       const want = statusName.toLowerCase();
