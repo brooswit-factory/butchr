@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AtlassianClient } from "../../src/atlassian/client.js";
+import { AtlassianClient, adfToText } from "../../src/atlassian/client.js";
 
 function fakeFetch(routes: Record<string, unknown>, seen: { url: string; auth: string | undefined }[] = []) {
   return async (url: string, init?: RequestInit): Promise<Response> => {
@@ -41,5 +41,45 @@ describe("AtlassianClient", () => {
   test("a non-2xx response throws with the status", async () => {
     const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 401 }));
     await expect(c.search("x")).rejects.toThrow(/401/);
+  });
+
+  test("comments() maps id/body/created off a faked fetch, flattening ADF bodies", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/issue/KAN-1/comment": {
+        comments: [
+          { id: "10", created: "2026-08-28T00:00:00.000Z", body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Looks good" }] }] } },
+          { id: "9", created: "2026-08-27T00:00:00.000Z", body: { type: "doc", content: [] } },
+        ],
+      },
+    }));
+    expect(await c.comments("KAN-1")).toEqual([
+      { id: "10", body: "Looks good", created: "2026-08-28T00:00:00.000Z" },
+      { id: "9", body: "", created: "2026-08-27T00:00:00.000Z" },
+    ]);
+  });
+});
+
+describe("adfToText", () => {
+  test("flattens a nested fixture: paragraph, bullet list, hardBreak", () => {
+    const doc = {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "Hello world" }] },
+        {
+          type: "bulletList",
+          content: [
+            { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: "Item one" }] }] },
+            { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: "Item two" }] }] },
+          ],
+        },
+        { type: "paragraph", content: [{ type: "text", text: "Line one" }, { type: "hardBreak" }, { type: "text", text: "Line two" }] },
+      ],
+    };
+    expect(adfToText(doc)).toBe("Hello world\nItem one\nItem two\nLine one\nLine two");
+  });
+  test("tolerates a missing/empty body", () => {
+    expect(adfToText(undefined)).toBe("");
+    expect(adfToText(null)).toBe("");
+    expect(adfToText({ type: "doc" })).toBe("");
   });
 });

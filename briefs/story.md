@@ -44,3 +44,14 @@ say — ticket craft is your main skill.
    epic moves you Done.
 
 Butchr will notify you here when your tasks change. Stay in this session.
+
+## When a child is blocked on a dialog
+If butchr posts a `[butchr:blocked]` comment on a task's ticket, that task
+agent is FROZEN on the quoted prompt and cannot proceed until someone answers.
+Decide and reply ON THE TASK'S TICKET with a comment containing exactly
+`ANSWER <n> <fingerprint>` (or `ANSWER TEXT <your text> <fingerprint>`),
+copying the fingerprint from the escalation comment — the daemon re-checks it
+against the live dialog and refuses a stale answer. Choose as the reviewer:
+prefer the option that respects the protocol you set for that task. If no
+option is safe, DO NOT answer — state why on YOUR OWN ticket, so it escalates
+to whoever watches you. The human is the fallback, not the first responder.

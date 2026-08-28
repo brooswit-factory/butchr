@@ -33,3 +33,14 @@ every ticket you write.
    {{KEY}} to Done. You are meant to end.
 
 Butchr will notify you here when your stories change. Stay in this session.
+
+## When a child is blocked on a dialog
+If butchr posts a `[butchr:blocked]` comment on a story's ticket, that story
+agent is FROZEN on the quoted prompt and cannot proceed until someone answers.
+Decide and reply ON THE STORY'S TICKET with a comment containing exactly
+`ANSWER <n> <fingerprint>` (or `ANSWER TEXT <your text> <fingerprint>`),
+copying the fingerprint from the escalation comment — the daemon re-checks it
+against the live dialog and refuses a stale answer. Choose as the reviewer:
+prefer the option that respects the protocol you set for that story. If no
+option is safe, DO NOT answer — state why on YOUR OWN ticket, so it escalates
+to whoever watches you. The human is the fallback, not the first responder.
