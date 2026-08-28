@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.12] - 2026-08-27
+### Fixed
+- **The new un-numbered trust dialog is parsed and answered safely.** A Claude Code update changed the folder-trust dialog: options lost their numbers (so the parser returned null and the watcher silently skipped it — KAN-706 sat blocked) and "No, exit" became option 1 (so the old hardcoded "answer 1" would have KILLED any agent it did match). parsePrompt now recognizes the un-numbered shape (gated on the "Enter to confirm/select" footer), and answers are chosen by option CONTENT via chooseStartupAnswer — scanning every option for the affirmative wording, never assuming its position, and leaving anything unrecognized for a human.
+
 ## [0.5.11] - 2026-08-27
 ### Fixed
 - **`nudge` verifies a turn actually starts.** A prompt delivered in the dying seconds of a turn strands in the composer unsubmitted — herdr reports success, no turn starts, and the agent stalls until an unrelated change re-fires notify (measured: KAN-691 idle 2.5h on an approved PR). After delivery, nudge waits ~8s and, if the agent is still idle, sends a bare enter to submit the stranded text — never when blocked, where enter would select a dialog option.

@@ -6,6 +6,7 @@ import { buildApp, notifyIssue } from "./app.js";
 import { HerdrHerd, issueOfAgentName } from "../agents/herd.js";
 import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
+import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -110,9 +111,9 @@ watchPrompts({
   read: async (paneId) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text,
   send: async (paneId, text) => { await herdr.pane.sendText({ pane_id: paneId, text }); },
   onPrompt: ({ paneId, prompt }) => {
-    const auto = /trust this folder|local development|resume from summary|settings warning/i.test(prompt.question + " " + (prompt.options[0] ?? ""));
-    console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${auto ? "answer 1" : "left for a human"}`);
-    return auto ? 1 : undefined;
+    const choice = chooseStartupAnswer(prompt);
+    console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${choice != null ? `answer ${choice} ("${prompt.options[choice - 1]?.slice(0, 40)}")` : "left for a human"}`);
+    return choice ?? undefined;
   },
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
