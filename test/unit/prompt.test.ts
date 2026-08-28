@@ -26,6 +26,30 @@ describe("parsePrompt", () => {
     expect(parsePrompt("just some output, no options")).toBeNull();
     expect(parsePrompt("❯ 1. only one option")).toBeNull(); // needs >= 2
   });
+  // Regression: KAN-736. Real probe against dcdecbf — the numbered branch
+  // pushed EVERY preceding line into `question`, unbounded, so command output
+  // (and any secrets in it) that scrolled above the dialog leaked all the way
+  // into a permanent, project-readable Jira comment via escalationComment().
+  test("does not absorb unbounded preceding pane output", () => {
+    // The bound's job is volume, not content — dropping lines older than the
+    // tail. Scrubbing what's still inside the tail is redact()'s job, tested
+    // end-to-end (against this exact pane) in test/unit/escalate.test.ts.
+    const pane = `$ some earlier command
+$ another earlier command
+$ cat .env
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+DATABASE_URL=postgres://admin:hunter2@prod-db.internal:5432/main
+GITHUB_TOKEN=ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA
+$ deploy --prod
+Choose deployment target:
+❯ 1. Production
+  2. Staging
+Enter to confirm · Esc to cancel`;
+    const p = parsePrompt(pane)!;
+    expect(p.question).toContain("Choose deployment target:");
+    expect(p.question).not.toContain("some earlier command");
+    expect(p.question).not.toContain("another earlier command");
+  });
 });
 describe("keysToSelect", () => {
   test("arrows down for a higher target, up for lower, and always confirms", () => {
@@ -75,5 +99,28 @@ describe("un-numbered trust dialog (Claude Code 2.x)", () => {
   });
   test("prose without the footer never parses as a menu", () => {
     expect(parsePrompt("❯ some shell prompt\n  indented continuation line\n  another line")).toBeNull();
+  });
+  // Regression: KAN-736. The un-numbered branch already bounded with
+  // .slice(-6), but that alone still let 6 lines of command output through —
+  // the shared QUESTION_TAIL bound is what makes both branches safe together.
+  test("7 lines of junk above the dialog keep the real question, drop the oldest", () => {
+    const pane = [
+      "line1 oldest junk",
+      "SECRET_THREE=ccc",
+      "line3",
+      "line4",
+      "line5",
+      "line6",
+      "line7",
+      "Trust this folder?",
+      "❯ No, exit",
+      "  Yes, I trust this folder",
+      "Enter to confirm · Esc to cancel",
+    ].join("\n");
+    const p = parsePrompt(pane)!;
+    expect(p).not.toBeNull();
+    expect(p.question).toContain("Trust this folder?");
+    expect(p.question).not.toContain("line1 oldest junk");
+    expect(p.question).not.toContain("SECRET_THREE");
   });
 });

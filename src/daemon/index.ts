@@ -8,6 +8,7 @@ import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
+import { createEscalator } from "../agents/escalation-loop.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
@@ -102,18 +103,48 @@ startLoop({
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });
 
+const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
+const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
+
+// Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
+// ticket (see src/agents/escalation-loop.ts) — comments are only fetched for
+// issues that are currently blocked AND already escalated, never on the 15s
+// Jira loop above.
+const escalator = createEscalator({
+  read: readPane,
+  send: sendPane,
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  now: () => Date.now(),
+  log: (line) => console.error(`  ${line}`),
+});
+
 watchPrompts({
   onBlocked: (cb) => watchBlocked(
     async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
     5_000, cb,
     (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),
   ),
-  read: async (paneId) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text,
-  send: async (paneId, text) => { await herdr.pane.sendText({ pane_id: paneId, text }); },
+  read: readPane,
+  send: sendPane,
   onPrompt: ({ paneId, prompt }) => {
     const choice = chooseStartupAnswer(prompt);
     console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${choice != null ? `answer ${choice} ("${prompt.options[choice - 1]?.slice(0, 40)}")` : "left for a human"}`);
     return choice ?? undefined;
+  },
+  // onExposed is typed void — this async body's promise goes unawaited by the
+  // caller, so a rejection here (e.g. herdr.agent.list() failing) would
+  // otherwise surface as an unhandled rejection instead of a [prompts] line.
+  onExposed: ({ paneId, prompt }) => {
+    void (async () => {
+      try {
+        const { agents } = await herdr.agent.list();
+        const issue = issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
+        await escalator.onBlocked(paneId, issue, prompt);
+      } catch (e) {
+        console.error(`  [prompts] onExposed error: ${(e as Error)?.message ?? e}`);
+      }
+    })();
   },
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
