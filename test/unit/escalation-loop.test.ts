@@ -32,7 +32,7 @@ const FREE_TEXT_MENU = `Proceed with the deploy?
   3. No, exit
 Enter to confirm · Esc to cancel`;
 
-function harness(opts: { commentsFail?: boolean } = {}) {
+function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -41,15 +41,18 @@ function harness(opts: { commentsFail?: boolean } = {}) {
   let commentRows: CommentRow[] = [];
   let nextId = 1;
   let readCalls = 0;
+  const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
 
   const escalator = createEscalator({
     read: async () => { readCalls++; return paneText; },
     send: async (pane, text) => { sent.push({ pane, text }); },
     addComment: async (issue, text) => {
+      await delay();
       posted.push({ issue, text });
       commentRows = [{ id: String(nextId++), body: text, created: new Date(clock).toISOString() }, ...commentRows];
     },
     comments: async () => {
+      await delay();
       if (opts.commentsFail) throw new Error("jira unreachable");
       return commentRows;
     },
@@ -268,5 +271,105 @@ describe("createEscalator — no resolvable issue", () => {
     expect(h.posted).toEqual([]);
     expect(h.sent).toEqual([]);
     expect(h.logs.filter((l) => /no issue key — cannot escalate/.test(l)).length).toBe(3);
+  });
+});
+
+// Regression coverage for the KAN-732 review of PR #27 (blocking findings 1 & 2).
+describe("createEscalator — an answer is consumed exactly once", () => {
+  test("a delivered directive is never replayed while the pane stays blocked on the same dialog", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const prompt = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", "KAN-1", prompt); // debounce
+    await h.escalator.onBlocked("p1", "KAN-1", prompt); // escalate
+    const fp = fingerprint(prompt);
+    h.addHumanComment(`ANSWER 2 ${fp}`);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt); // delivers — 1 send
+    expect(h.sent.length).toBe(1);
+
+    // The keystroke didn't dismiss the dialog (herdr swallowed it, or the
+    // agent is slow to re-render) — the pane reports blocked on the SAME
+    // dialog on every later poll. Previously this walked debounce → escalate
+    // (adopting the prior comment) → directive-found → deliver, forever.
+    for (let i = 0; i < 5; i++) await h.escalator.onBlocked("p1", "KAN-1", prompt);
+
+    expect(h.sent.length).toBe(1); // not replayed
+    expect(h.posted.length).toBe(1); // no duplicate escalation posted either
+  });
+
+  test("ANSWER TEXT delivery is also consumed exactly once", async () => {
+    const h = harness();
+    h.setPaneText(FREE_TEXT_MENU);
+    const prompt = parsePrompt(FREE_TEXT_MENU)!;
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    const fp = fingerprint(prompt);
+    h.addHumanComment(`ANSWER TEXT run the migration first ${fp}`);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    expect(h.sent.length).toBe(3);
+
+    for (let i = 0; i < 5; i++) await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    expect(h.sent.length).toBe(3); // not replayed
+  });
+
+  test("a new dialog on the same pane starts over (fingerprint change still resets state)", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const dialogA = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", "KAN-1", dialogA);
+    await h.escalator.onBlocked("p1", "KAN-1", dialogA);
+    const fpA = fingerprint(dialogA);
+    h.addHumanComment(`ANSWER 2 ${fpA}`);
+    await h.escalator.onBlocked("p1", "KAN-1", dialogA);
+    expect(h.sent.length).toBe(1);
+
+    // Now a genuinely NEW dialog blocks the same pane.
+    h.setPaneText(TRUST);
+    const dialogB = parsePrompt(TRUST)!;
+    await h.escalator.onBlocked("p1", "KAN-1", dialogB); // debounce for the new fingerprint
+    await h.escalator.onBlocked("p1", "KAN-1", dialogB); // escalates fresh
+    expect(h.posted.length).toBe(2);
+  });
+});
+
+describe("createEscalator — overlapping polls never double-post", () => {
+  test("two concurrent onBlocked() calls for the same pane escalate exactly once", async () => {
+    const h = harness({ delayMs: 30 });
+    const prompt = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", "KAN-1", prompt); // debounce (poll 1)
+    // Two overlapping polls both past debounce, both racing to escalate.
+    await Promise.all([
+      h.escalator.onBlocked("p1", "KAN-1", prompt),
+      h.escalator.onBlocked("p1", "KAN-1", prompt),
+    ]);
+    expect(h.posted.length).toBe(1);
+    expect(h.logs.some((l) => /skipped overlapping poll/.test(l))).toBe(true);
+  });
+});
+
+describe("createEscalator — a quoted marker doesn't silently eat a real answer", () => {
+  test("an ANSWER quoting the escalation marker mid-body (not at the start) is still honored", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const prompt = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    const fp = fingerprint(prompt);
+    h.addHumanComment(`Replying to the escalation:\n> [butchr:blocked] KAN-1 is waiting...\nANSWER 2 ${fp}`);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    expect(h.sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+  });
+
+  test("a comment that genuinely STARTS with the marker and quotes an ANSWER line is ignored, and logged rather than silently dropped", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const prompt = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    const fp = fingerprint(prompt);
+    h.addHumanComment(`[butchr:blocked] KAN-1 is waiting on a decision:\n...\nANSWER 2 ${fp}`);
+    await h.escalator.onBlocked("p1", "KAN-1", prompt);
+    expect(h.sent).toEqual([]);
+    expect(h.logs.some((l) => /ignored an answer on KAN-1 .* quotes the escalation marker/.test(l))).toBe(true);
   });
 });

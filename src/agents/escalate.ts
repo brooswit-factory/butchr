@@ -10,7 +10,7 @@ export type Directive =
   | { kind: "option"; n: number; fp: string | null }
   | { kind: "text"; text: string; fp: string | null };
 
-const MARKER = "[butchr:blocked]";
+export const MARKER = "[butchr:blocked]";
 
 /**
  * Stable 8-hex-char fingerprint of a dialog's question + options. A
@@ -50,12 +50,16 @@ export function escalationComment(issue: string, prompt: Prompt, fp: string): st
 
 /**
  * Parse the first `ANSWER ...` directive line out of a comment body. Returns
- * null for prose, an unparseable ANSWER line, or (CRITICAL) any comment that
- * quotes butchr's own escalation marker — otherwise the daemon would read its
- * own escalation comment back as an answer to itself.
+ * null for prose, an unparseable ANSWER line, or (CRITICAL) a comment that IS
+ * one of butchr's own — every comment butchr writes (escalation, follow-up,
+ * no-free-text notice) STARTS with the marker, so the daemon would otherwise
+ * read its own comment back as an answer to itself. Deliberately checks only
+ * the START of the (trimmed) text, not merely that it appears somewhere: a
+ * reviewer replying "quoting the dialog above: [butchr:blocked] ... ANSWER 2
+ * abc12345" is a perfectly good answer and must not be silently dropped.
  */
 export function parseDirective(commentText: string): Directive | null {
-  if (commentText.includes(MARKER)) return null;
+  if (commentText.trimStart().startsWith(MARKER)) return null;
   const line = commentText.split("\n").map((l) => l.trim()).find((l) => l.startsWith("ANSWER "));
   if (!line) return null;
   const rest = line.slice("ANSWER ".length).trim();
@@ -80,7 +84,11 @@ export function parseDirective(commentText: string): Directive | null {
  * keystroke into the wrong control.
  */
 export function freeTextOption(prompt: Prompt): number | null {
-  const RE = /tell .* what to do|type .* instructions|write|other|custom|different|feedback/i;
+  // NOTE: bare "write" is deliberately excluded — Claude Code permission
+  // dialogs routinely offer options like "Yes, allow Claude to read and
+  // write files here", which would wrongly classify a permission grant as
+  // the free-text entry and then type prose into it.
+  const RE = /tell .* what to do|type .* instructions|write .* instructions|other|custom|different|feedback/i;
   const hits: number[] = [];
   prompt.options.forEach((o, i) => { if (RE.test(o)) hits.push(i + 1); });
   return hits.length === 1 ? hits[0]! : null;

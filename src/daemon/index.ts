@@ -132,10 +132,19 @@ watchPrompts({
     console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${choice != null ? `answer ${choice} ("${prompt.options[choice - 1]?.slice(0, 40)}")` : "left for a human"}`);
     return choice ?? undefined;
   },
-  onExposed: async ({ paneId, prompt }) => {
-    const { agents } = await herdr.agent.list();
-    const issue = issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
-    await escalator.onBlocked(paneId, issue, prompt);
+  // onExposed is typed void — this async body's promise goes unawaited by the
+  // caller, so a rejection here (e.g. herdr.agent.list() failing) would
+  // otherwise surface as an unhandled rejection instead of a [prompts] line.
+  onExposed: ({ paneId, prompt }) => {
+    void (async () => {
+      try {
+        const { agents } = await herdr.agent.list();
+        const issue = issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
+        await escalator.onBlocked(paneId, issue, prompt);
+      } catch (e) {
+        console.error(`  [prompts] onExposed error: ${(e as Error)?.message ?? e}`);
+      }
+    })();
   },
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });

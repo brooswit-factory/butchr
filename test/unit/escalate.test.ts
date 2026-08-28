@@ -65,6 +65,12 @@ describe("parseDirective", () => {
     const own = escalationComment("KAN-1", prompt("Q", ["A", "B"]), "a1b2c3d4");
     expect(parseDirective(own)).toBeNull();
   });
+  test("a reply that quotes the marker mid-body (not at the start) is still a valid answer", () => {
+    // Regression: KAN-732 review of PR #27 — `.includes(MARKER)` was too broad
+    // and silently dropped answers that quote what they're replying to.
+    const reply = "Replying to the escalation:\n> [butchr:blocked] KAN-1 is waiting...\nANSWER 2 a1b2c3d4";
+    expect(parseDirective(reply)).toEqual({ kind: "option", n: 2, fp: "a1b2c3d4" });
+  });
   test("finds the first ANSWER line among other prose", () => {
     expect(parseDirective("I looked at this.\nANSWER 3 deadbeef\nThanks.")).toEqual({ kind: "option", n: 3, fp: "deadbeef" });
   });
@@ -79,5 +85,11 @@ describe("freeTextOption", () => {
   });
   test("returns null rather than guessing when more than one option matches", () => {
     expect(freeTextOption(prompt("Pick", ["Write custom instructions", "Other feedback"]))).toBeNull();
+  });
+  test("a bare 'write' in a permission grant is NOT mistaken for the free-text option", () => {
+    // Regression: KAN-732 review of PR #27 — Claude Code permission dialogs
+    // routinely offer "...read and write files here", which a bare /write/i
+    // wrongly classified as the free-text entry.
+    expect(freeTextOption(prompt("Proceed?", ["Yes, allow Claude to read and write files here", "No, exit"]))).toBeNull();
   });
 });
