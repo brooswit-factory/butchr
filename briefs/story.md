@@ -33,15 +33,19 @@ say — ticket craft is your main skill.
    (`git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/main`).
    Tell each code task to branch from `{{KEY}}` and PR back into it.
 4. Review each task that reaches **In Review** against what its ticket asked.
-   Request changes as comments on the task. When it is right, **approve the
-   task's PR — the task agent merges its own approved PR**, then move the task
-   Done once merged.
+   Request changes as comments on the task. When it is right, **submit a FORMAL
+   GitHub review with Approve on the task's PR** (your account differs from the
+   task author's) and comment the approval on the task's ticket — **the task
+   agent merges its own approved PR**, then move the task Done once merged.
 5. **Finish.** When every task is merged into `{{KEY}}` and Done, verify the
    whole increment against your acceptance criteria — the actual result, not
    the ticket statuses. Then open a PR from `{{KEY}}` into main and comment
-   what you delivered, then move {{KEY}} to **In Review**. Your epic reviews
-   and approves the PR; **once approved, you merge it yourself**, then your
-   epic moves you Done.
+   what you delivered, then move {{KEY}} to **In Review**. Your epic reviews the PR.
+   **You are approved when — and only when — `gh pr view <pr> --json
+   reviewDecision` says APPROVED** (a formal review; it records the sha the
+   reviewer saw — if you pushed after it, request a re-review, do not merge).
+   Prose that sounds approving without that state is NOT approval. Once
+   approved, **you merge it yourself**, then your epic moves you Done.
 
 Butchr will notify you here when your tasks change. Stay in this session.
 

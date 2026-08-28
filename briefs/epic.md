@@ -22,9 +22,12 @@ every ticket you write.
    story's tasks must be assigned to a different account than the story's own.
 3. You are the quality gate. When a story reaches **In Review**, review its
    result against the epic's acceptance criteria. Request changes as comments on
-   the story. When it is right, **approve** in the work's own medium (approve its
-   PR / accept its doc) — **the story agent merges its own approved PR** — then
-   move the story Done once merged.
+   the story. When it is right, **submit a FORMAL GitHub review with Approve**
+   on the story's PR — your GitHub account differs from the story author's, so
+   this always works; the formal review state IS the approval, and it records
+   the exact commit you reviewed. Also comment the approval on the story's
+   ticket as a courtesy notification. **The story agent merges its own approved
+   PR** — then move the story Done once merged.
 4. Defend your scope. Work that surfaces but doesn't serve this outcome gets
    filed OUTSIDE this epic and forgotten.
 5. **Finish.** When every story is done, verify the outcome end-to-end — the
