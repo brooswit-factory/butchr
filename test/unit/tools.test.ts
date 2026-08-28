@@ -49,3 +49,15 @@ describe("atlassianTools", () => {
     expect(calls[0]![1]).toEqual(["x", 25]);
   });
 });
+
+
+describe("comment identity tagging", () => {
+  test("prepends the caller's issue tag; idempotent when already tagged", async () => {
+    const { tools, calls, conn } = rig();               // conn carries x-issue KAN-7
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "status looks good" }, conn);
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "[KAN-7] already tagged" }, conn);
+    const bodies = calls.filter(([n]) => n === "addComment").map(([, a]) => a[1]);
+    expect(bodies[0]).toBe("[KAN-7] status looks good");
+    expect(bodies[1]).toBe("[KAN-7] already tagged");    // no double tag
+  });
+});

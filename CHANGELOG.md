@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.14] - 2026-08-28
+### Changed
+- **Every agent comment is identity-tagged by the daemon.** `jira_add_comment` prepends `[<issue>]` from the caller's x-issue header — enforced at the MCP layer, not by agent etiquette — so on a shared Jira account an untagged comment is, by convention, the human. Idempotent when the agent already tagged itself. (Found when the human asked a ticket for a status update and an agent replied as the same account: attribution's only channel is self-report, so the tool now self-reports for everyone.)
+
 ## [0.5.13] - 2026-08-28
 ### Added
 - **Blocked-prompt escalation: an unanswerable dialog becomes a ticket comment, not a stuck agent.** Before this, `chooseStartupAnswer` returning null just left the dialog exposed with nothing watching it — a human had to notice the pane sitting idle. Now, once a dialog stays blocked for 2 poll cycles (~10s) with no recognized auto-answer, butchr posts ONE `[butchr:blocked]` comment on the blocked agent's OWN ticket: the question, the numbered options, and a fingerprint (a self-contained FNV-1a hash of question+options — independent of which option is highlighted). Posting on the child's ticket is what routes it: the existing story/epic watcher wakes the reviewer automatically, no new transport. The comment is built ONLY from the question and options — never the surrounding pane, which may hold command output or secrets.

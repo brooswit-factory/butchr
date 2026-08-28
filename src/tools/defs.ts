@@ -29,7 +29,17 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
     jira_add_comment: {
       description: "Add a plain-text comment to a Jira issue.",
       input: { key: z.string(), text: z.string() },
-      handler: (a, c) => { const { key, text } = a as { key: string; text: string }; audit(c, `comment ${key}`); return ops.addComment(key, text); },
+      handler: (a, c) => {
+        const { key, text } = a as { key: string; text: string };
+        audit(c, `comment ${key}`);
+        // Attribution is enforced HERE, not by agent etiquette: every comment an
+        // agent posts is prefixed with its identity tag, so on a shared Jira
+        // account a bare untagged comment is, by convention, the human.
+        const who = c.headers["x-issue"];
+        const tag = who ? `[${who}] ` : "";
+        const body = tag && !text.startsWith(`[${who}]`) ? tag + text : text;
+        return ops.addComment(key, body);
+      },
     },
     jira_transition: {
       description: 'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
