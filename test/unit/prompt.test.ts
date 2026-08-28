@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parsePrompt, keysToSelect } from "../../src/agents/prompt.js";
+import { parsePrompt, keysToSelect, chooseStartupAnswer } from "../../src/agents/prompt.js";
 
 // The real prompt captured from a blocked herdr agent (pane.read source:detection).
 const REAL = `This session is 2d 12h old and 673.2k tokens.
@@ -32,5 +32,48 @@ describe("keysToSelect", () => {
     expect(keysToSelect(1, 1)).toBe("\r");
     expect(keysToSelect(1, 3)).toBe("\x1b[B\x1b[B\r");
     expect(keysToSelect(3, 1)).toBe("\x1b[A\x1b[A\r");
+  });
+});
+
+describe("un-numbered trust dialog (Claude Code 2.x)", () => {
+  const TRUST = `──────────────────────────────
+ Accessing workspace:
+ /home/brooswit/butchr-workspaces/KAN-706
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review
+ what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel`;
+  test("parses: two options, exit highlighted first", () => {
+    const p = parsePrompt(TRUST)!;
+    expect(p).not.toBeNull();
+    expect(p.options).toEqual(["No, exit", "Yes, I trust this folder"]);
+    expect(p.current).toBe(1);
+  });
+  test("chooseStartupAnswer picks the trust option BY CONTENT (option 2, not 1)", () => {
+    const p = parsePrompt(TRUST)!;
+    expect(chooseStartupAnswer(p)).toBe(2);
+    expect(keysToSelect(p.current, 2)).toBe("\x1b[B\r"); // one down + enter
+  });
+  test("numbered dev-channels dialog still answers its matching option", () => {
+    const p = parsePrompt(`  WARNING: Loading development channels
+  Channels: server:butchr
+  ❯ 1. I am using this for local development
+    2. Exit
+  Enter to confirm · Esc to cancel`)!;
+    expect(chooseStartupAnswer(p)).toBe(1);
+  });
+  test("an unrecognized un-numbered menu is left for a human", () => {
+    const p = parsePrompt(` Choose deployment target:
+ ❯ Production
+   Staging
+ Enter to select · ↑/↓ to navigate · Esc to cancel`);
+    if (p) expect(chooseStartupAnswer(p)).toBeNull();
+  });
+  test("prose without the footer never parses as a menu", () => {
+    expect(parsePrompt("❯ some shell prompt\n  indented continuation line\n  another line")).toBeNull();
   });
 });
