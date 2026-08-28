@@ -1,4 +1,25 @@
-import type { JiraIssue, IssueLink } from "./types.js";
+import type { JiraIssue, IssueLink, JiraComment } from "./types.js";
+
+/** ADF node shape is large and mostly irrelevant here; walk it structurally. */
+interface AdfNode { type?: string; text?: string; content?: AdfNode[] }
+
+/** Block-level node types whose children are distinct lines, not one run of text. */
+const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList"]);
+
+/**
+ * Flatten an ADF document (or any node within one) to plain text: every
+ * `text` node concatenated, block-level nodes (doc, lists) joined with "\n",
+ * inline containers (paragraphs, list items) concatenated directly so a
+ * `hardBreak` supplies the only newline within them. This is the piece most
+ * likely to silently return "" and kill the whole comment-reading path.
+ */
+export function adfToText(node: AdfNode | null | undefined): string {
+  if (!node || typeof node !== "object") return "";
+  if (node.type === "text") return node.text ?? "";
+  if (node.type === "hardBreak") return "\n";
+  const parts = (node.content ?? []).map(adfToText);
+  return node.type && ADF_BLOCK_TYPES.has(node.type) ? parts.join("\n") : parts.join("");
+}
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -42,6 +63,13 @@ export class AtlassianClient {
       else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", direction: "inward", key: l.inwardIssue.key });
     }
     return out;
+  }
+
+  /** Recent comments on a ticket, newest-first, ADF bodies flattened to plain text. */
+  async comments(issueKey: string, maxResults = 20): Promise<JiraComment[]> {
+    const q = new URLSearchParams({ orderBy: "-created", maxResults: String(maxResults) });
+    const body = await this.get(`/rest/api/3/issue/${issueKey}/comment?${q}`);
+    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "" }));
   }
 }
 

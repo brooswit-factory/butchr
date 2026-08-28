@@ -13,3 +13,9 @@ export interface IssueLink {
   direction: "inward" | "outward";
   key: string;          // the OTHER issue's key
 }
+
+export interface JiraComment {
+  id: string;
+  body: string;      // ADF flattened to plain text
+  created: string;
+}
