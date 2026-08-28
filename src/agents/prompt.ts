@@ -6,6 +6,15 @@ export interface Prompt {
 }
 
 /**
+ * How many lines immediately preceding the menu can be the "question". A real
+ * dialog question is short and sits directly above its options; anything
+ * further up is prior pane output (command output, previous turns) by
+ * definition and must never reach `question`. Shared by both branches below
+ * so they cannot drift apart on how much they leak.
+ */
+const QUESTION_TAIL = 6;
+
+/**
  * Parse herdr's `pane.read source:detection` text of a blocked Claude prompt.
  * Recognizes the `❯ N. label` / `  N. label` numbered-menu shape. Returns null
  * if the text is not a selection prompt.
@@ -27,7 +36,11 @@ export function parsePrompt(text: string): Prompt | null {
   }
   const opts = options.filter((o) => o !== undefined);
   if (opts.length < 2) return parseUnnumbered(lines);
-  return { question: questionLines.join(" ").trim(), options: opts, current: Math.min(Math.max(current, 1), opts.length) };
+  return {
+    question: questionLines.slice(-QUESTION_TAIL).join(" ").trim(),
+    options: opts,
+    current: Math.min(Math.max(current, 1), opts.length),
+  };
 }
 
 /**
@@ -65,7 +78,7 @@ function parseUnnumbered(lines: string[]): Prompt | null {
     if (/^\s*(❯|>)\s+/.test(lines[j]!)) { cur = options.length - seen + 1; break; }
   }
   const question = lines.slice(0, footerIdx - options.length).map((l) => l.trim())
-    .filter((t) => t && !/^(─+|·)/.test(t)).slice(-6).join(" ").trim();
+    .filter((t) => t && !/^(─+|·)/.test(t)).slice(-QUESTION_TAIL).join(" ").trim();
   return { question, options, current: cur };
 }
 
