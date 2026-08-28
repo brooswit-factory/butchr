@@ -12,6 +12,61 @@ export type Directive =
 
 export const MARKER = "[butchr:blocked]";
 
+/** Max length of the question posted in an escalation comment, after redaction. */
+const QUESTION_CAP = 600;
+
+/**
+ * A single alternation over every secret shape `redact` recognizes, tried
+ * left-to-right at each position so the more specific shapes (Authorization
+ * header, URL credentials, provider tokens, KEY=VALUE) win over the opaque-
+ * blob catch-all — this keeps a `KEY=<token>` pair from being redacted twice
+ * (once as KEY=VALUE, once as its own blob).
+ */
+const SECRET = new RegExp(
+  [
+    /Authorization:\s*(?:Bearer|Basic)\s+\S+/.source,
+    /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/.source,
+    /gh[pousr]_[A-Za-z0-9]{20,}/.source,
+    /sk-[A-Za-z0-9]{20,}/.source,
+    /xox[abprs]-[A-Za-z0-9-]{10,}/.source,
+    /AKIA[0-9A-Z]{16}/.source,
+    /[A-Za-z][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|BEARER|API[_-]?KEY)[A-Za-z0-9_]*\s*[:=]\s*\S+/.source,
+    /[A-Za-z0-9+/=_-]{32,}/.source,
+  ].join("|"),
+  "gi",
+);
+
+/** A path-shaped run (segments of word chars joined by `/`, no `+`/`=`) is not a secret blob. */
+function looksLikePath(s: string): boolean {
+  return /^\/?[\w.-]+(?:\/[\w.-]+)+$/.test(s);
+}
+
+/**
+ * Mask the VALUE of a matched secret shape, keeping enough of the surrounding
+ * text that the shape stays legible (e.g. `AWS_SECRET_ACCESS_KEY=[redacted]`).
+ */
+function maskMatch(m: string): string {
+  let mm: RegExpExecArray | null;
+  if ((mm = /^Authorization:\s*(Bearer|Basic)\s+\S+$/i.exec(m))) return `Authorization: ${mm[1]} [redacted]`;
+  if ((mm = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s:@/]+):[^\s@/]+@$/.exec(m))) return `${mm[1]}:[redacted]@`;
+  if ((mm = /^([A-Za-z][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|BEARER|API[_-]?KEY)[A-Za-z0-9_]*)(\s*[:=]\s*)\S+$/i.exec(m)))
+    return `${mm[1]}${mm[2]}[redacted]`;
+  if (looksLikePath(m)) return m;
+  return "[redacted]";
+}
+
+/**
+ * Mask credential-shaped values in `text`, keeping their surrounding shape
+ * legible. Applied to the question and every option in `escalationComment`
+ * before assembly — the last line of defence against a secret that scrolled
+ * through the pane above a blocked dialog. Deliberately over-eager: a false
+ * positive costs nothing (a reviewer can still ask), a missed credential is a
+ * permanent leak into a project-readable Jira comment.
+ */
+export function redact(text: string): string {
+  return text.replace(SECRET, maskMatch);
+}
+
 /**
  * Stable 8-hex-char fingerprint of a dialog's question + options. A
  * self-contained FNV-1a 32-bit hash — no dependency, trivially testable.
@@ -31,14 +86,19 @@ export function fingerprint(prompt: Prompt): string {
 /**
  * The comment butchr posts on a blocked agent's own ticket. Built ONLY from
  * `prompt.question` and `prompt.options` — never the surrounding pane text,
- * which may carry command output or secrets.
+ * which may carry command output or secrets. Both are redacted and the
+ * question is capped at `QUESTION_CAP` chars: `parsePrompt` bounds how much
+ * pane text can reach `question`, but a bound is not a scrub, and a dialog
+ * question longer than the cap is not a question.
  */
 export function escalationComment(issue: string, prompt: Prompt, fp: string): string {
-  const options = prompt.options.map((o, i) => `${i + 1}. ${o}`).join("\n");
+  let question = redact(prompt.question);
+  if (question.length > QUESTION_CAP) question = question.slice(0, QUESTION_CAP) + " …[truncated]";
+  const options = prompt.options.map((o, i) => `${i + 1}. ${redact(o)}`).join("\n");
   return [
     `${MARKER} ${issue} is waiting on a decision:`,
     "",
-    prompt.question,
+    question,
     "",
     options,
     "",
