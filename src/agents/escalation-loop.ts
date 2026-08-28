@@ -24,6 +24,9 @@ export interface EscalatorDeps {
 interface PaneState {
   fp: string;
   blockedPolls: number;
+  /** Timestamps of escalation comments for this pane (rate cap window). */
+  escalations?: number[];
+  capNoticePosted?: boolean;
   escalatedAt: number | undefined;
   followedUpAt: number | undefined;
   /** Comment ids already acted on for this fingerprint — an answer is consumed exactly once. */
@@ -52,6 +55,8 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   // on a Jira round-trip. Without this guard two overlapping polls can both
   // observe `escalatedAt === undefined` and both post the escalation comment.
   const inFlight = new Set<string>();
+  const paneEscalations = new Map<string, number[]>();
+  const cappedIssues = new Set<string>();
   const log = (line: string) => deps.log(`[prompts] ${line}`);
 
   async function escalate(issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
@@ -65,6 +70,23 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       log(`adopted existing escalation ${issue} fp=${fp} from comment ${existing.id} (daemon restart)`);
       return;
     }
+    // Rate cap: at most 3 escalation comments per pane per hour. Beyond that,
+    // one summary notice, then log-only — a misbehaving parser must never be
+    // able to spam a ticket unboundedly.
+    const HOUR = 60 * 60_000;
+    const recent = (paneEscalations.get(issue) ?? []).filter((t) => deps.now() - t < HOUR);
+    if (recent.length >= 3) {
+      if (!cappedIssues.has(issue)) {
+        cappedIssues.add(issue);
+        await deps.addComment(issue, `${MARKER} ${issue}: escalation rate cap reached (3/hour) — further blocked-prompt changes are being logged only. An operator or parent can still reply ANSWER <n> <fingerprint> against the latest logged fingerprint.`);
+      }
+      s.escalatedAt = deps.now();
+      log(`RATE-CAPPED escalation ${issue} fp=${fp} (log-only) "${prompt.question.slice(0, 60)}"`);
+      return;
+    }
+    recent.push(deps.now());
+    paneEscalations.set(issue, recent);
+    cappedIssues.delete(issue);
     await deps.addComment(issue, escalationComment(issue, prompt, fp));
     s.escalatedAt = deps.now();
     log(`escalated ${issue} fp=${fp} "${prompt.question.slice(0, 60)}"`);
@@ -86,10 +108,11 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       log(`REFUSED directive on ${issue}: fingerprint ${directiveFp} no longer matches pane (${freshFp ?? "no prompt"}) — re-escalating`);
       state.delete(paneId);
       if (fresh) {
-        const newFp = freshFp!;
-        const fresh_s = newState(newFp, DEBOUNCE_POLLS);
-        state.set(paneId, fresh_s);
-        await escalate(issue, fresh, newFp, fresh_s);
+        // Do NOT escalate the fresh dialog immediately: a moving pane is how
+        // transient prose masquerades as dialogs (measured: 3 escalations in
+        // 2 minutes). The fresh fingerprint must re-earn the debounce through
+        // handleBlocked like any other.
+        state.set(paneId, newState(freshFp!, 0));
       }
       return;
     }
