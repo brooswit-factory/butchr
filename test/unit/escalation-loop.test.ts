@@ -220,8 +220,14 @@ describe("createEscalator — stale fingerprint guard", () => {
     await h.escalator.onBlocked("p1", "KAN-1", dialogA); // outer poll still reports dialog A
     expect(h.sent).toEqual([]);
     expect(h.logs.some((l) => /REFUSED directive on KAN-1: fingerprint/.test(l))).toBe(true);
+    // v0.5.16: the fresh dialog is NOT escalated instantly — it must re-earn
+    // the debounce like any other observation (spam containment).
+    expect(h.posted.length).toBe(1);
+    const dialogB = parsePrompt(TRUST)!;
+    await h.escalator.onBlocked("p1", "KAN-1", dialogB); // debounce 1
+    await h.escalator.onBlocked("p1", "KAN-1", dialogB); // debounce 2 → escalate B
     expect(h.posted.length).toBe(2);
-    const fpB = fingerprint(parsePrompt(TRUST)!);
+    const fpB = fingerprint(dialogB);
     expect(h.posted[1]!.text).toContain(`fingerprint: ${fpB}`);
   });
 });
@@ -371,5 +377,54 @@ describe("createEscalator — a quoted marker doesn't silently eat a real answer
     await h.escalator.onBlocked("p1", "KAN-1", prompt);
     expect(h.sent).toEqual([]);
     expect(h.logs.some((l) => /ignored an answer on KAN-1 .* quotes the escalation marker/.test(l))).toBe(true);
+  });
+});
+
+describe("escalation spam containment (v0.5.16)", () => {
+  const BYPASS = `You are running in Bypass
+ Permissions mode.
+ ❯ No, exit
+   Yes, I accept
+ Enter to confirm · Esc to cancel`;
+  async function earn(h: ReturnType<typeof harness>, pane: string, issue: string, text: string) {
+    h.setPaneText(text);
+    const d = parsePrompt(text)!;
+    await h.escalator.onBlocked(pane, issue, d);
+    await h.escalator.onBlocked(pane, issue, d);
+  }
+  test("rate cap: 4th distinct escalation within an hour becomes one notice then log-only", async () => {
+    const h = harness();
+    h.setClock(1_000_000);
+    await earn(h, "p1", "KAN-1", REAL);
+    await earn(h, "p1", "KAN-1", TRUST);
+    await earn(h, "p1", "KAN-1", FREE_TEXT_MENU);
+    await earn(h, "p1", "KAN-1", BYPASS);
+    const escalations = h.posted.filter((c) => c.text.includes("fingerprint:"));
+    const notices = h.posted.filter((c) => c.text.includes("rate cap reached"));
+    expect(escalations.length).toBe(3);
+    expect(notices.length).toBe(1);
+    expect(h.logs.some((l) => /RATE-CAPPED/.test(l))).toBe(true);
+    // a 5th change inside the hour posts nothing further at all
+    const before = h.posted.length;
+    await earn(h, "p1", "KAN-1", REAL);
+    expect(h.posted.length).toBe(before);
+  });
+  test("cap window slides: after an hour, escalations post again", async () => {
+    const h = harness();
+    h.setClock(0);
+    await earn(h, "p1", "KAN-1", REAL);
+    await earn(h, "p1", "KAN-1", TRUST);
+    await earn(h, "p1", "KAN-1", FREE_TEXT_MENU);
+    await earn(h, "p1", "KAN-1", BYPASS);                 // capped
+    h.setClock(61 * 60_000);
+    // a FIFTH distinct dialog (re-using an earlier one would be adopted from
+    // its existing escalation comment — correct behavior, wrong probe)
+    const FIFTH = `Overwrite the existing file?
+❯ 1. Yes, overwrite
+  2. No, keep both
+Enter to confirm · Esc to cancel`;
+    await earn(h, "p1", "KAN-1", FIFTH);
+    const escalations = h.posted.filter((c) => c.text.includes("fingerprint:"));
+    expect(escalations.length).toBe(4);                    // posts again post-window
   });
 });

@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.16] - 2026-08-28
+### Fixed
+- **Escalation spam contained.** A refused (stale-fingerprint) directive no longer escalates the fresh dialog instantly — the new fingerprint re-earns the debounce like any other observation; and escalation comments are rate-capped at 3 per pane per hour (then one summary notice + log-only). Measured trigger: transient pane prose parsing as dialogs put 13 comments on a live ticket in minutes. Deeper parser hardening remains with the operability epic's stability story.
+
 ## [0.5.15] - 2026-08-28
 ### Fixed
 - **"Press Enter to continue" screens are auto-acknowledged.** First-run onboarding and update notices have no options to select, so they escaped both the menu parser and the escalator — a silently idle-blocked agent (found on the booswrit fleet's first spawns). Any blocked pane whose text contains the literal continue wording now just gets enter; real selection dialogs never use that phrasing.
