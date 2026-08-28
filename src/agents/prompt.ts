@@ -89,6 +89,13 @@ function parseUnnumbered(lines: string[]): Prompt | null {
  * option index, or null to leave the prompt for a human.
  */
 export function chooseStartupAnswer(prompt: Prompt): number | null {
+  // The Bypass-Permissions first-run acceptance: our fleet runs bypass by
+  // design, and "No, exit" is listed first — match the accept option by content.
+  if (/Bypass Permissions/i.test(prompt.question)) {
+    for (let i = 0; i < prompt.options.length; i++)
+      if (/accept/i.test(prompt.options[i]!) && !/exit|no,/i.test(prompt.options[i]!)) return i + 1;
+    return null;
+  }
   const ANSWER = /I trust this folder|local development|resume from summary/i;
   for (let i = 0; i < prompt.options.length; i++)
     if (ANSWER.test(prompt.options[i]!)) return i + 1;

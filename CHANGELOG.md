@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.15] - 2026-08-28
+### Fixed
+- **"Press Enter to continue" screens are auto-acknowledged.** First-run onboarding and update notices have no options to select, so they escaped both the menu parser and the escalator — a silently idle-blocked agent (found on the booswrit fleet's first spawns). Any blocked pane whose text contains the literal continue wording now just gets enter; real selection dialogs never use that phrasing.
+
 ## [0.5.14] - 2026-08-28
 ### Changed
 - **Every agent comment is identity-tagged by the daemon.** `jira_add_comment` prepends `[<issue>]` from the caller's x-issue header — enforced at the MCP layer, not by agent etiquette — so on a shared Jira account an untagged comment is, by convention, the human. Idempotent when the agent already tagged itself. (Found when the human asked a ticket for a status update and an agent replied as the same account: attribution's only channel is self-report, so the tool now self-reports for everyone.)

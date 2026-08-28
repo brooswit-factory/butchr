@@ -42,3 +42,19 @@ describe("watchPrompts", () => {
     expect(r.sent).toEqual([]); expect(r.exposed).toEqual([]);
   });
 });
+
+describe("continue screens", () => {
+  test("'Press Enter to continue' gets a bare enter, no parsing needed", async () => {
+    const sent: Array<[string, string]> = [];
+    let cb: (p: string) => void = () => {};
+    watchPrompts({
+      onBlocked: (f) => { cb = f; return () => {}; },
+      read: async () => "Security notes:\n blah blah\n Press Enter to continue…",
+      send: async (p, t) => { sent.push([p, t]); },
+      onPrompt: () => { throw new Error("should not be consulted"); },
+    });
+    cb("p9");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sent).toEqual([["p9", "\r"]]);
+  });
+});

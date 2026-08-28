@@ -124,3 +124,16 @@ describe("un-numbered trust dialog (Claude Code 2.x)", () => {
     expect(p.question).not.toContain("SECRET_THREE");
   });
 });
+
+describe("bypass-permissions acceptance dialog", () => {
+  test("accepts by content (option 2), never the leading exit", () => {
+    const p = parsePrompt(` You are running in Bypass
+ Permissions mode.
+ https://code.claude.com/docs/en/security
+ ❯ No, exit
+   Yes, I accept
+ Enter to confirm · Esc to cancel`)!;
+    expect(p).not.toBeNull();
+    expect(chooseStartupAnswer(p)).toBe(2);
+  });
+});

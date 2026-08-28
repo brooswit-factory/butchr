@@ -22,7 +22,16 @@ export interface PromptWatchDeps {
 export function watchPrompts(deps: PromptWatchDeps): () => void {
   return deps.onBlocked(async (paneId) => {
     try {
-      const prompt = parsePrompt(await deps.read(paneId));
+      const text = await deps.read(paneId);
+      // Pure acknowledgment screens (first-run onboarding, update notices) have
+      // no options to choose — just press enter. Safe by construction: the
+      // pattern requires the literal continue wording, and a real selection
+      // dialog never uses it.
+      if (/Press Enter to continue/i.test(text)) {
+        await deps.send(paneId, "\r");
+        return;
+      }
+      const prompt = parsePrompt(text);
       if (!prompt) return;
       const choice = await deps.onPrompt({ paneId, prompt });
       if (typeof choice === "number") await deps.send(paneId, keysToSelect(prompt.current, choice));
