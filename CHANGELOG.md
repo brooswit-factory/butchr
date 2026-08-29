@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.7.1] - 2026-08-28
+### Fixed
+- **Label writes never silently 403 anymore.** `updateLabels` PUTs `notifyUsers=false` so board label sync doesn't spam watchers — but Jira Cloud 403s the WHOLE write for any account lacking Administer Jira/Projects on the ticket's project, and nothing said so. The daemon now preflights `ADMINISTER_PROJECTS`/`ADMINISTER` per project on first sight (cached for the run) and logs the verdict once, naming the account, project, and remedy. An account lacking the role now gets quiet label sync gracefully degraded to notifying writes (watchers get a Jira notification per label change, but labels always land) instead of every write failing. If a write still 403s at runtime, that project flips to notifying writes for the rest of the run and the write is retried so labels land — logged once, never a per-poll spin. README documents the Administrator-project-role requirement.
+
 ## [0.7.0] - 2026-08-28
 ### Added
 - **Priority flows down the command chain.** `jira_create_issue` gains an optional `priority` (a Jira priority name, passed through verbatim — omitted, Jira's site default applies) so a boss sets a child's priority at filing, and a new `jira_set_priority` tool lets a boss re-prioritize its children as reality shifts. Priority is command metadata, not staffing: no daemon behavior reads it, only assignee + status do. `briefs/epic.md` and `briefs/story.md` now carry the duty to set and maintain their children's priority (and never their own); `briefs/task.md` notes a task's priority is set by its story.

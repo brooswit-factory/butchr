@@ -14,6 +14,7 @@ import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
+import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
 
@@ -26,7 +27,14 @@ try {
   process.exit(1);
 }
 
-const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token);
+const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// Label writes must never silently 403: Jira only honours notifyUsers=false
+// for an account holding Administer Jira/Projects on the ticket's project.
+// This gate preflights that per project (first sight, cached for the run)
+// and falls back to notifying writes — loudly, once — when it's absent.
+// Shared between the poll loop and the one-time startup sweep below so both
+// see the same cached verdict per project.
+const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
@@ -56,7 +64,7 @@ if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined;
 const syncLabels = createLabelSync({
-  jira: atlassian,
+  jira: labelWriter,
   agentStatuses: async () => {
     const { agents } = await herdr.agent.list();
     const m = new Map<string, string>();
@@ -76,7 +84,7 @@ const syncLabels = createLabelSync({
 // this. Not a new polling timer — runs once, here, and never again.
 void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
-  jira: atlassian,
+  jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
 }).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
