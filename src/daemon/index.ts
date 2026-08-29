@@ -53,9 +53,9 @@ console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE �
 const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
 const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
 
-// Related work for the active set: the Implements chain (a task watches what
-// implements it — i.e. its implementing story/task — up through the boss
-// chain), plus the Relates deprecation window (see src/jira-watch/routes.ts).
+// Related work for the active set: the Implements chain (a boss watches what
+// implements it — a story hears its tasks, an epic hears its stories), plus
+// the Relates deprecation window (see src/jira-watch/routes.ts).
 // Watched regardless of assignee — the assigned-issues query above is
 // per-credential, but a boss must hear about its implementer's progress even
 // when another account (another machine's daemon) staffs it. A thin I/O
