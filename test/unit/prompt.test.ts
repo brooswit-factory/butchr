@@ -137,3 +137,17 @@ describe("bypass-permissions acceptance dialog", () => {
     expect(chooseStartupAnswer(p)).toBe(2);
   });
 });
+
+describe("fullscreen renderer offer", () => {
+  test("auto-answers Not now by content", () => {
+    const p = parsePrompt(`  Try the new fullscreen renderer?
+  · Flicker-free output
+  · Mouse support — click to move your cursor or expand results
+  · Selected text auto-copies to your clipboard
+  ❯ 1. Yes, try it
+    2. Not now
+  Enter to confirm · Esc to cancel`)!;
+    expect(p).not.toBeNull();
+    expect(chooseStartupAnswer(p)).toBe(2);
+  });
+});
