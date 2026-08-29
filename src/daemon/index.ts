@@ -16,6 +16,7 @@ import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 
 let config;
 try {
@@ -33,6 +34,33 @@ const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.
 const summaries = new Map<string, string>();
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
+
+// The own-write ledger (src/jira-watch/own-writes.ts): every daemon-side
+// write (agent tool calls, and this daemon's own label sync) records the
+// target's read-back `updated` here, so startLoop can recognize its own
+// echoes instead of nudging an agent to re-read a change it made itself.
+const ownWrites = createOwnWriteLedger();
+
+/**
+ * Read each key's `updated` back after a write and record it under `writer`.
+ * Batches all the given keys into one search call. Failures are swallowed
+ * and logged — a read-back miss must never surface as a tool error, and at
+ * worst it just costs one un-suppressed nudge.
+ */
+const recordOwnWrite = (keys: readonly string[], writer: string) => {
+  void (async () => {
+    try {
+      const uniq = [...new Set(keys)];
+      if (!uniq.length) return;
+      const issues = await atlassian.search(`key IN (${uniq.join(",")})`);
+      const now = Date.now();
+      for (const i of issues) ownWrites.record(i.key, i.updated, writer, now);
+    } catch (e) {
+      console.error(`  WARNING: own-write read-back failed for ${keys.join(",")} (${writer}): ${(e as Error)?.message ?? e}`);
+    }
+  })();
+};
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -48,7 +76,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-}, atlassianTools(ops));
+}, atlassianTools(ops, undefined, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -67,6 +95,7 @@ const syncLabels = createLabelSync({
     return m;
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
+  onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
 
@@ -137,6 +166,8 @@ startLoop({
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
   },
   syncLabels,
+  suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
+  comments: (key) => atlassian.comments(key),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });

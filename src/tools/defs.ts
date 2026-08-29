@@ -6,10 +6,26 @@ import type { AtlassianOps } from "./atlassian.js";
  * The daemon's MCP tools: a thin proxy over the de-facto Atlassian SDKs,
  * executed daemon-side with the shared credential. No scoping — any agent may
  * call any tool; `log` records which connection (x-issue) did what.
+ *
+ * `onWrite`, when given, fires after each MUTATING tool resolves, with the
+ * key(s) it wrote and the caller's `x-issue` as writer — feeds the own-write
+ * ledger (src/jira-watch/own-writes.ts) so the notify loop can recognize its
+ * own echoes. Read tools call nothing; this stays free of Jira reads on
+ * purpose (only src/daemon/index.ts talks to Jira for that read-back).
+ * Omitted when the caller's `x-issue` is missing (an untagged/human call) —
+ * we never record a write under an unknown writer.
  */
-export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = console.error): Record<string, ToolDef<any>> {
+export function atlassianTools(
+  ops: AtlassianOps,
+  log: (line: string) => void = console.error,
+  onWrite?: (keys: readonly string[], writer: string) => void,
+): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
+  const noted = (c: { headers: Record<string, string> }, keys: readonly string[]) => {
+    const writer = c.headers["x-issue"];
+    if (writer) onWrite?.(keys, writer);
+  };
   return {
     jira_get_issue: {
       description: "Read a Jira issue (fields incl. description, status, parent, labels).",
@@ -32,7 +48,10 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         // resolves undefined even though the link was created — an MCP result
         // with content[0].text === undefined is invalid and the client rejects
         // the whole call (KAN-764). Substitute a real value in that case.
-        return ops.linkIssues(from, to, resolvedType).then((r) => r ?? { ok: true, from, to, type: resolvedType });
+        return ops.linkIssues(from, to, resolvedType).then((r) => {
+          noted(c, [from, to]); // a link bumps `updated` on BOTH ends
+          return r ?? { ok: true, from, to, type: resolvedType };
+        });
       },
     },
     jira_add_comment: {
@@ -47,13 +66,13 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         const who = c.headers["x-issue"];
         const tag = who ? `[${who}] ` : "";
         const body = tag && !text.startsWith(`[${who}]`) ? tag + text : text;
-        return ops.addComment(key, body);
+        return ops.addComment(key, body).then((r) => { noted(c, [key]); return r; });
       },
     },
     jira_transition: {
       description: 'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
-      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status); },
+      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description: "Create a Jira issue. Set parent to nest a Story under an Epic or a Task under a Story. Set assignee to an Atlassian accountId — an unassigned ticket is never staffed, so a ticket you intend to be worked MUST have one. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
@@ -62,12 +81,20 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         description: z.string().optional(), parent: z.string().optional(), labels: z.array(z.string()).optional(),
         assignee: z.string().optional(), priority: z.string().optional(),
       },
-      handler: (a, c) => { const p = a as { projectKey: string; issuetype: "Epic" | "Story" | "Task"; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string; priority?: string }; audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"}`); return ops.createIssue(p); },
+      handler: (a, c) => {
+        const p = a as { projectKey: string; issuetype: "Epic" | "Story" | "Task"; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string; priority?: string };
+        audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"}`);
+        return ops.createIssue(p).then((r) => {
+          const key = (r as { key?: string } | undefined)?.key;
+          if (key) noted(c, [key]);
+          return r;
+        });
+      },
     },
     jira_set_priority: {
       description: "Set a Jira issue's priority by name. For a boss re-prioritizing its children as reality shifts — YOUR OWN priority is set by your boss, so never call this on your own ticket.",
       input: { key: z.string(), priority: z.string() },
-      handler: (a, c) => { const { key, priority } = a as { key: string; priority: string }; audit(c, `priority ${key} → ${priority}`); return ops.setPriority(key, priority); },
+      handler: (a, c) => { const { key, priority } = a as { key: string; priority: string }; audit(c, `priority ${key} → ${priority}`); return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return r; }); },
     },
     confluence_create_page: {
       description: "Create a Confluence page (storage/XHTML body) in a space.",
