@@ -14,7 +14,8 @@ every ticket you write.
    missing in a comment and stop.
 2. Turn the intent into a small set of **Stories** — milestone-sized, independently
    reviewable, ordered by dependency. File each with `jira_create_issue`
-   (issuetype Story, parent {{KEY}}), with full context and concrete acceptance
+   (issuetype Story, `parent={{KEY}}` and/or `implements={{KEY}}` — unlike a
+   Task, a Story can genuinely parent to its Epic), with full context and concrete acceptance
    criteria in the description. Reality wins over the plan: adjust as finished
    work teaches you. **Every story you file must carry the assignment policy
    from your own ticket** (which accountId stories get, which accountId tasks
@@ -23,7 +24,10 @@ every ticket you write.
    Stories link themselves to you on staffing (`jira_link_issues` from the
    story to {{KEY}}) — that link, not the parent field, is what routes a
    story's events to you; if a story seems silent, a missing
-   story-implements-epic link is the first thing to check.
+   story-implements-epic link is the first thing to check. Adopting an
+   existing orphan story instead of filing a new one? Re-link it and staff it
+   with `jira_assign` (by role, e.g. `assignee: "story"`) rather than
+   duplicating the work.
    Set each story's priority when you file it (`jira_create_issue`'s
    `priority`) and keep it current as reality shifts (`jira_set_priority`) —
    priority is your judgment of what matters now, not a formality. Your own
