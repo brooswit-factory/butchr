@@ -22,7 +22,7 @@
 <ul>
 <li><strong>Status.</strong> That's what the ticket is for.</li>
 <li><strong>Deliverables.</strong> That's what the PR or document is for.</li>
-<li><strong>Secrets.</strong> Never write tokens, credentials, API keys, <code>.env</code> contents, or private URLs with embedded auth into a log entry. This is absolute &mdash; pages cannot be edited or deleted once created.</li>
+<li><strong>Secrets.</strong> Never write tokens, credentials, API keys, <code>.env</code> contents, or private URLs with embedded auth into a log entry. This is absolute. <code>confluence_update_page</code> can replace a page's body, but Confluence keeps every previous version in the page's history &mdash; a secret written into an entry stays readable there even after the body is overwritten. There is no un-publishing it.</li>
 </ul>
 
 <h2>Cadence &mdash; encouraged, never mandatory</h2>

@@ -100,7 +100,10 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // title/body/version; the API 400s without it there. Optimistic locking
     // is handled inside this wrapper, not by callers: read the current
     // version, PUT version.number + 1, with a version message so the edit
-    // history says who/why.
+    // history says who/why. UpdatePageSchema declares `id: z.ZodNumber`, but
+    // the string we pass here is harmless: the core client only validates the
+    // RESPONSE against a schema (core/createClient.js), never the outgoing
+    // parameters — `id` is only ever interpolated into the URL, never parsed.
     updatePage: async (p) => {
       const current: any = await wiki.page.getPageById({ id: p.id, bodyFormat: "storage" });
       const nextVersion = (current?.version?.number ?? 0) + 1;
