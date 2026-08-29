@@ -33,6 +33,8 @@ cp .env.example .env          # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
 butchr                        # reads .env / the environment
 ```
 
+As of 0.9.0, also set `BUTCHR_ASSIGNEE_STORY` and `BUTCHR_ASSIGNEE_TASK` (Atlassian accountIds) in `.env` before deploying — `jira_create_issue` assigns a Story/Task by role from these, and REFUSES to create one of that type if its role is unset and the caller passed no explicit `assignee`. Epics are unaffected.
+
 From source (development):
 
 ```
