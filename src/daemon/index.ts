@@ -16,6 +16,7 @@ import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { respawnComment } from "../agents/respawn.js";
 
 let config;
 try {
@@ -135,6 +136,12 @@ startLoop({
     void notifyIssue(mcp, issue, msg);
     const woke = await herd.nudge(issue, msg).catch(() => false);
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+  },
+  onRespawn: async (issue, reason, observedArgv) => {
+    console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    // A failed notice must not undo the respawn that already happened — log and move on.
+    await ops.addComment(issue, respawnComment(issue, reason, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
   },
   syncLabels,
   intervalMs: 15_000,
