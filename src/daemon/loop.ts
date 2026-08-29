@@ -15,11 +15,11 @@ export interface LoopDeps {
   /** Fetch the assigned issues (active + recently changed) each poll. */
   search: () => Promise<JiraIssue[]>;
   /**
-   * Fetch tickets related to the active set via the Implements chain (plus
-   * the Relates deprecation window — see src/jira-watch/routes.ts), with the
-   * active keys that watch each. Related tickets are watched regardless of
-   * assignee, so a hierarchy can span credentials (and machines): a boss
-   * hears about its implementer's progress even when another daemon staffs it.
+   * Fetch tickets related to the active set via the Implements chain (see
+   * src/jira-watch/routes.ts), with the active keys that watch each. Related
+   * tickets are watched regardless of assignee, so a hierarchy can span
+   * credentials (and machines): a boss hears about its implementer's
+   * progress even when another daemon staffs it.
    */
   related?: (active: readonly string[]) => Promise<RelatedIssue[]>;
   herd: Herd;
@@ -94,8 +94,7 @@ export function startLoop(deps: LoopDeps): Stop {
         if (isOwnLabelBump(prev, next, key)) continue;
         await send(key, key);
       }
-      // Related work (the Implements chain, plus the Relates deprecation window):
-      // notify every watcher of what changed.
+      // Related work (the Implements chain): notify every watcher of what changed.
       const watchersOf = (k: string) =>
         next.related.find((r) => r.issue.key === k)?.watchers ?? prev.related.find((r) => r.issue.key === k)?.watchers ?? [];
       for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)))
