@@ -12,8 +12,8 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Task")).toContain("one unit of work");
     expect(briefFor("Bug")).toContain("Read your ticket");
   });
-  test("models: epic=fable story=opus task=sonnet, default sonnet", () => {
-    expect(modelFor("Epic")).toBe("fable");
+  test("models: epic=opus story=opus task=sonnet, default sonnet", () => {
+    expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
