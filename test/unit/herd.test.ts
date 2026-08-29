@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd.js";
-import { reconcileNow } from "../../src/daemon/loop.js";
+import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
-import type { ProcessEntry } from "../../src/agents/proctable.js";
+
+/** One foreground process, as herdr's `pane.process_info` reports it. */
+interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
@@ -128,55 +130,132 @@ describe("nudge", () => {
 });
 
 describe("staleIssues", () => {
-  function fakeHerdrWithCwd(agents: Array<{ name?: string; pane_id: string; cwd?: string | null }>) {
-    return { agent: { list: async () => ({ agents }) } } as any;
+  /** `processInfo` responds per-pane; default to "no such pane" for any pane not given a canned response. */
+  function fakeHerdrWithCwd(
+    agents: Array<{ name?: string; pane_id: string; cwd?: string | null }>,
+    responses: Record<string, () => Promise<{ process_info?: { pane_id: string; foreground_processes?: FakeProcess[] } }>>,
+  ) {
+    const calls: string[] = [];
+    const client = {
+      agent: { list: async () => ({ agents }) },
+      pane: {
+        processInfo: async (p: { pane_id: string }) => {
+          calls.push(p.pane_id);
+          const r = responses[p.pane_id];
+          if (!r) throw new Error(`no fake response for pane ${p.pane_id}`);
+          return r();
+        },
+      },
+    };
+    return { client: client as any, calls };
   }
   const instant = () => Promise.resolve();
+  const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
 
-  test("a claude process at the reported cwd with a bare `claude --resume` argv -> stale, naming the missing flags", async () => {
+  test("a claude process at the reported pane with a bare `claude --resume` argv -> stale, naming the missing flags", async () => {
     const cwd = "/w/KAN-783";
-    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
-    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd, argv: ["claude", "--resume", "8e5164dc"] }];
-    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => table);
+    const argv = ["claude", "--resume", "8e5164dc"];
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
     const stale = await herd.staleIssues();
     expect(stale.length).toBe(1);
     expect(stale[0]!.issue).toBe("KAN-783");
     expect(stale[0]!.reason).toContain("--permission-mode bypassPermissions");
     expect(stale[0]!.reason).toContain(`--mcp-config ${cwd}/mcp.json`);
     expect(stale[0]!.reason).toContain("--dangerously-load-development-channels server:butchr");
-    expect(stale[0]!.observedArgv).toEqual(table[0]!.argv);
+    expect(stale[0]!.observedArgv).toEqual(argv);
   });
 
   test("a claude process carrying the full flag set -> not stale", async () => {
     const cwd = "/w/KAN-783";
-    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
-    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd, argv: ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"] }];
-    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => table);
+    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
   });
 
-  test("no cwd reported for the agent -> unknown, not stale (never even consults the process table)", async () => {
-    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }]);
-    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => [{ pid: 1, ppid: 0, cwd: "/w/KAN-783", argv: ["claude", "--resume", "x"] }]);
+  test("no cwd reported for the agent -> unknown, not stale (never even calls pane.process_info)", async () => {
+    const { client, calls } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }], { "w1:p1": ok([{ pid: 1, argv: ["claude", "--resume", "x"], name: "claude" }]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
+    expect(calls).toEqual([]);
   });
 
-  test("no claude process found for the cwd -> unknown, not stale", async () => {
+  test("pane.process_info rejects -> unknown, not stale, and does not abort the sweep for other issues", async () => {
     const cwd = "/w/KAN-783";
-    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
-    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => []);
+    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", "/w/KAN-9/mcp.json", "--dangerously-load-development-channels", "server:butchr"];
+    const { client } = fakeHerdrWithCwd(
+      [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }, { name: "butchr-kan-9", pane_id: "w1:p2", cwd: "/w/KAN-9" }],
+      { "w1:p1": async () => { throw new Error("herdr socket hiccup"); }, "w1:p2": ok([{ pid: 2, argv: goodArgv, name: "claude" }]) },
+    );
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]); // KAN-783's failure didn't stop KAN-9 from being (correctly) cleared
+  });
+
+  test("no process_info in the result -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": async () => ({}) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("foreground_processes absent from process_info -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": async () => ({ process_info: { pane_id: "w1:p1" } }) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("foreground_processes is empty -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("no foreground process is a claude -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: ["zsh"], name: "zsh" }]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("the matched claude process reports no argv -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: null, name: "claude" }]) });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("KAN-816 measured storm: a stray bare `claude --resume` at the SAME cwd, outside this pane's own foreground list, never taints the verdict", async () => {
+    // The exact shape measured live 2026-08-29 00:14 PDT on KAN-811: a stray
+    // unnamed pane's bare `claude --resume` process shared a cwd with the
+    // healthy named pane. The old /proc-by-cwd scan would find both and, with
+    // both processes' parents non-claude, pick the lower pid — the stray —
+    // and call the healthy pane stale. Nothing here ever looks at cwd-shared
+    // processes outside the pane's OWN foreground list, so the stray is
+    // structurally invisible to the verdict.
+    const cwd = "/w/KAN-811";
+    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const { client } = fakeHerdrWithCwd(
+      [{ name: "butchr-kan-811", pane_id: "w1:p1", cwd }],
+      // Only w1:p1 (the named, healthy pane) is ever queried — a stray pane
+      // (e.g. w2K:p1) at the same cwd is not even a butchr-managed agent, so
+      // byIssue() never surfaces it and staleIssues() never asks about it.
+      { "w1:p1": ok([{ pid: 999999, argv: goodArgv, name: "claude" }]) },
+    );
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
   });
 });
 
 describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
   // The real workspace directory buildWorkspace() would use for KAN-783 —
-  // the same one a herdr-reported agent cwd must match for selectClaudeProcess
-  // to find its process.
+  // the same one a herdr-reported agent cwd must match for the expected argv.
   const dir = join(workspaceRoot(), "KAN-783");
   const desired = new Map([["KAN-783", { key: "KAN-783", issuetype: "Task", summary: "s", parent: null }]]);
 
-  function fakeHerdrStale() {
+  function fakeHerdrStale(processInfo: (paneId: string) => Promise<{ process_info?: { pane_id: string; foreground_processes?: FakeProcess[] } }>) {
     let agents: Array<{ name: string; pane_id: string; cwd: string }> = [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: dir }];
     const started: any[] = []; const closed: string[] = [];
     const client = {
@@ -187,16 +266,20 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
       // Closing a pane retires its agent — herdr's list no longer carries it,
       // exactly what makes spawn() (which no-ops when the name already
       // exists) actually start a fresh one on the stop-then-spawn respawn path.
-      pane: { close: async (id: string) => { closed.push(id); agents = agents.filter((a) => a.pane_id !== id); } },
+      pane: {
+        close: async (id: string) => { closed.push(id); agents = agents.filter((a) => a.pane_id !== id); },
+        processInfo: (p: { pane_id: string }) => processInfo(p.pane_id),
+      },
       workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
     };
     return { client: client as any, started, closed };
   }
+  const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
 
-  test("a stale pane (bare `claude --resume`) is closed and a fresh agent started with the full spawn argv; the [butchr:respawn] notice fires exactly once", async () => {
-    const f = fakeHerdrStale();
-    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd: dir, argv: ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"] }];
-    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => table);
+  test("a) a stale pane (bare `claude --resume`) is closed and a fresh agent started with the full spawn argv; the [butchr:respawn] notice fires exactly once", async () => {
+    const argv = ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"];
+    const f = fakeHerdrStale(ok([{ pid: 1, argv, name: "claude" }]));
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: Array<{ issue: string; reason: string; observedArgv: string[] }> = [];
     await reconcileNow(herd, desired, { onRespawn: (issue, reason, observedArgv) => { notices.push({ issue, reason, observedArgv }); } });
 
@@ -212,14 +295,13 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     expect(notices.length).toBe(1);
     expect(notices[0]!.issue).toBe("KAN-783");
     expect(notices[0]!.reason.startsWith("argv lacks")).toBe(true);
-    expect(notices[0]!.observedArgv).toEqual(table[0]!.argv);
+    expect(notices[0]!.observedArgv).toEqual(argv);
   });
 
-  test("c) a second pass, now with the process table showing the full argv, closes/starts nothing", async () => {
-    const f = fakeHerdrStale();
+  test("b) a second pass, now with process-info showing the full argv, closes/starts nothing", async () => {
     const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
-    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd: dir, argv: goodArgv }];
-    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => table);
+    const f = fakeHerdrStale(ok([{ pid: 1, argv: goodArgv, name: "claude" }]));
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];
     await reconcileNow(herd, desired, { onRespawn: (...a) => { notices.push(a); } });
     expect(f.closed).toEqual([]);
@@ -227,9 +309,28 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     expect(notices).toEqual([]);
   });
 
-  test("d) a process table with NO claude process for that cwd closes/starts nothing (unknown, not stale)", async () => {
-    const f = fakeHerdrStale();
-    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => []);
+  test("c) no claude in the pane's foreground closes/starts nothing (unknown, not stale)", async () => {
+    const f = fakeHerdrStale(ok([]));
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
+    const notices: unknown[] = [];
+    await reconcileNow(herd, desired, { onRespawn: (...a) => { notices.push(a); } });
+    expect(f.closed).toEqual([]);
+    expect(f.started).toEqual([]);
+    expect(notices).toEqual([]);
+  });
+
+  test("KAN-816 measured storm, end to end: a stray bare `claude --resume` sharing this issue's cwd but OUTSIDE its pane's own foreground list never causes a respawn — zero pane.close, zero agent.start, zero onRespawn", async () => {
+    // The measured incident (2026-08-29 00:14 PDT, KAN-811): a stray unnamed
+    // pane's bare `claude --resume` shared a cwd with the healthy named pane.
+    // The retired /proc-by-cwd scan found both processes there and, with
+    // neither's parent itself claude, picked the lower pid — the stray — and
+    // called the healthy pane STALE, closing and respawning it every poll.
+    // pane.process_info is scoped to ONE pane, so the stray (which lives on
+    // some other, non-butchr-managed pane) is never even asked about here —
+    // there is no cwd-based lookup left for it to pollute.
+    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const f = fakeHerdrStale(ok([{ pid: 999999, argv: goodArgv, name: "claude" }]));
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];
     await reconcileNow(herd, desired, { onRespawn: (...a) => { notices.push(a); } });
     expect(f.closed).toEqual([]);
