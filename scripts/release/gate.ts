@@ -4,8 +4,10 @@ import { hasContent, parseChangelog, type Entry } from "./changelog.js";
 export interface Facts {
   /** package.json version on this branch */
   version: string;
-  /** package.json version on the base (main) */
+  /** package.json version at the merge-base of this branch and the base (main) */
   baseVersion: string;
+  /** package.json version at the base's TIP (main HEAD), for informational "branch is behind" hints only */
+  baseTipVersion?: string;
   /** npm registry `latest`, or null if unpublished */
   registryLatest: string | null;
   /** files changed vs base */
@@ -34,7 +36,13 @@ export function evaluate(f: Facts): GateResult {
 
   const bumped = f.version !== f.baseVersion;
   if (!required) {
-    v(!bumped, bumped ? `version changed (${f.baseVersion} → ${f.version}) but no gated file changed — bump only with a real change` : "no gated files changed; no release required");
+    const baseTip = f.baseTipVersion ? parse(f.baseTipVersion) : null;
+    const behindBase = baseTip && compare(baseTip, to) > 0;
+    v(!bumped, bumped
+      ? `version changed (${f.baseVersion} → ${f.version}) but no gated file changed — bump only with a real change`
+      : behindBase
+        ? `no gated files changed; no release required (branch is behind base ${f.baseTipVersion} — merge main when convenient)`
+        : "no gated files changed; no release required");
     return { required, bump: null, verdicts, ok: verdicts.every((x) => x.ok) };
   }
 

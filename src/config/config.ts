@@ -21,6 +21,13 @@ export interface Config {
    * BUTCHR_GITHUB_ORGS are set; otherwise pr:* discovery is skipped entirely.
    */
   github?: { token: string; orgs: string[] };
+  /**
+   * Role -> Atlassian accountId, for staffing `jira_create_issue` by
+   * issuetype. Both are optional so a daemon that only ever reads Jira still
+   * boots; the refusal for an unstaffable Story/Task happens per-call, at
+   * create time (see src/tools/defs.ts), not here.
+   */
+  assignees: { story?: string; task?: string };
 }
 
 export interface ConfigEnv {
@@ -33,6 +40,8 @@ export interface ConfigEnv {
   BUTCHR_TERMINAL?: string | undefined;
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
+  BUTCHR_ASSIGNEE_STORY?: string | undefined;
+  BUTCHR_ASSIGNEE_TASK?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -51,12 +60,19 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
 
+  const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
+  const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
+
   return {
     atlassian: { site, email, token },
     port,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
+    assignees: {
+      ...(assigneeStory ? { story: assigneeStory } : {}),
+      ...(assigneeTask ? { task: assigneeTask } : {}),
+    },
   };
 }
 
@@ -65,7 +81,15 @@ function required(v: string | undefined, name: string): string {
   return v.trim();
 }
 
+/** AccountIds are not secrets; truncate them only for readability, never redact. */
+const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
+
+/** Names the consequence, not just the fact of being unset — an operator should see this before an agent trips over it. */
+const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
+  id ? truncAccountId(id) : `unset — ${role} creation will be refused`;
+
 /** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
-  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"}`;
+  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
+  `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)}`;

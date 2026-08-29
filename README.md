@@ -33,17 +33,29 @@ cp .env.example .env          # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
 butchr                        # reads .env / the environment
 ```
 
+As of 0.10.0, also set `BUTCHR_ASSIGNEE_STORY` and `BUTCHR_ASSIGNEE_TASK` (Atlassian accountIds) in `.env` before deploying — `jira_create_issue` assigns a Story/Task by role from these, and REFUSES to create one of that type if its role is unset and the caller passed no explicit `assignee`. Epics are unaffected.
+
 From source (development):
 
 ```
 bun run start
 ```
 
+**Label-write permission.** butchr writes `agent:*`/`pr:*` labels quietly (`notifyUsers=false`) so watchers aren't spammed on every status flip — but Jira Cloud only honours that for an account holding the **Administrator** project role (or global Administer Jira) on the board's project. Grant the daemon's Atlassian account that role on each project it labels tickets in. Without it, labels still sync — nothing is disabled — but every label change sends the ticket's watchers a Jira notification, and the daemon says so once at startup, e.g.:
+
+```
+[labels] KAN: account booswrit@gmail.com lacks ADMINISTER_PROJECTS — label writes will NOTIFY watchers. Remedy: grant booswrit@gmail.com the Administrator project role on KAN, or accept notifying label writes.
+```
+
+No config knob is needed — the daemon detects this per project automatically. Current state as of 2026-08-28: `brooswit` is a site admin (has it everywhere); `booswrit` was granted the KAN Administrator role.
+
 ## Development
 
 ```
 bun run check    # generate + typecheck + tests + coverage ≥90%   (what CI runs)
 ```
+`bun run check` is the single verification command — run it in full, not step by step. It runs `tsc` under `bun --bun` rather than through a shebang-resolved `node`, so no particular node version is required. Before the gate runs, it prints a one-line preflight naming the runtimes actually in use (e.g. `preflight: bun 1.4.0, node v12.22.9, tsc 5.6.3 (typecheck runs under bun)`); paste that line along with the rest of the output when reporting a gate result.
+
 Every `src/` change needs a `CHANGELOG.md` entry and a version bump (CI enforces it).
 
 Predecessor (300 releases of history) preserved at [`brooswit/butchr-legacy`](https://github.com/brooswit/butchr-legacy).

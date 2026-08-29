@@ -4,12 +4,13 @@ import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-wr
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
 
-function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
+function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
   const running = new Set(initial);
   const spawned: string[] = [], stopped: string[] = [];
   return {
     running, spawned, stopped,
     async runningIssues() { return [...running]; },
+    async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
     async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
@@ -26,6 +27,24 @@ describe("reconcileNow", () => {
     expect(herd.spawned).toEqual(["NEW"]);
     expect(herd.stopped).toEqual(["OLD"]);
     expect([...herd.running].sort()).toEqual(["KEEP", "NEW"]);
+  });
+
+  test("a stale-but-desired issue is stopped then spawned fresh, and onRespawn fires once with its reason + observed argv", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const calls: any[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), { onRespawn: (issue, reason, observedArgv) => { calls.push({ issue, reason, observedArgv }); } });
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
+    expect(calls).toEqual([{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+  });
+
+  test("no onRespawn callback provided → stale issue still gets stopped and spawned", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]));
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
   });
 });
 
@@ -201,6 +220,55 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     await new Promise((r) => setTimeout(r, 100));
     stop();
     expect(notified.filter((x) => x === "A").length).toBe(1); // both self-writes swallowed; poll 3's real change delivered
+  });
+
+  test("a notifying (non-quiet) label write still gets exactly one own-write `updated` bump swallowed", async () => {
+    // The ledger records the daemon's own label write by the `updated` it read
+    // back, and knows nothing about whether that write was quiet
+    // (notifyUsers=false) or notifying (KAN-801) — a notifying write bumps
+    // `updated` exactly the same way, so the swallow is unaffected.
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const ledger = createOwnWriteLedger();
+    ledger.record("A", "t2", DAEMON_WRITER, Date.now());
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],
+      [{ ...iss("A", "In Progress"), updated: "t2" }], // our own notifying write bumped `updated`
+      [{ ...iss("A", "In Review"), updated: "t3" }],   // a real subsequent change
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once, nudged once for the real change
+  });
+
+  test("a poll whose only change is the daemon's own label write produces no nudge at all", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const ledger = createOwnWriteLedger();
+    ledger.record("A", "t2", DAEMON_WRITER, Date.now());
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],
+      [{ ...iss("A", "In Progress"), updated: "t2" }],
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toEqual([]);
   });
 
   test("a self-write and a foreign change landing in the same poll window (updated moves past the recorded value) is delivered", async () => {
@@ -513,5 +581,24 @@ describe("startLoop task->story delivery (Part B, pinned)", () => {
     stop();
     expect(notified).toContain("KAN-STORY<-KAN-TASK");
     expect(notified).not.toContain("KAN-EPIC<-KAN-TASK");
+  });
+});
+
+describe("startLoop respawn wiring", () => {
+  test("deps.onRespawn is invoked through reconcileNow on each poll a stale agent is found", async () => {
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
+    const respawns: any[] = [];
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      herd,
+      notify: () => {},
+      onRespawn: (issue, reason, observedArgv) => { respawns.push({ issue, reason, observedArgv }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+    expect(respawns[0]).toEqual({ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] });
+    expect(herd.stopped).toContain("A");
+    expect(herd.spawned).toContain("A");
   });
 });
