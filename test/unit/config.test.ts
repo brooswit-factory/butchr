@@ -46,4 +46,29 @@ describe("loadConfig", () => {
     expect(d).not.toContain("s3cr3t-gh-tok");
     expect(d).toContain("orgs=acme");
   });
+
+  test("stalledMinutes defaults to 10, honours BUTCHR_STALLED_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).stalledMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "20" }, noRead).stalledMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+  });
+
+  test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
+    const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
+    expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });
+  });
+  test("loadConfig does not throw when BUTCHR_ASSIGNEE_STORY/TASK are absent; roles are undefined", () => {
+    const c = loadConfig(base, noRead);
+    expect(c.assignees.story).toBeUndefined();
+    expect(c.assignees.task).toBeUndefined();
+  });
+  test("describeConfig includes the resolved accountIds and names the consequence when a role is unset, never a token", () => {
+    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:e160cf60-6480-44de-8554-af5b81c584e2", BUTCHR_ASSIGNEE_TASK: "712020:619ec5ec-2e92-492f-8979-91ccda318230" }, noRead));
+    expect(both).toContain("assignees=story:712020:e160");
+    expect(both).toContain("task:712020:619e");
+    const none = describeConfig(loadConfig(base, noRead));
+    expect(none).toContain("story:unset — Story creation will be refused");
+    expect(none).toContain("task:unset — Task creation will be refused");
+  });
 });

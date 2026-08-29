@@ -1,6 +1,7 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrState } from "./plan.js";
+import type { StalledCheck } from "../agents/stalled.js";
 
 export interface LabelWriter {
   updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }): Promise<void>;
@@ -12,6 +13,8 @@ export interface SyncDeps {
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
   prState?: (key: string) => Promise<PrState>;
+  /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
+  stalled?: StalledCheck;
   log?: (line: string) => void;
 }
 
@@ -71,6 +74,10 @@ class AgentLabelStabilizer {
 export function createLabelSync(deps: SyncDeps) {
   const lastLabels = new Map<string, string[]>();
   const stabilizer = new AgentLabelStabilizer();
+  // Last failure reason logged per key, so a PERMANENT condition (e.g. a
+  // write that keeps 403ing) logs once instead of once per 15s poll; a
+  // failure whose reason actually changes still gets its own line.
+  const loggedFailure = new Map<string, string>();
 
   // Isolated per issue: syncLabels runs inside startLoop's snapshot function,
   // so an uncaught throw here would abort the WHOLE poll — no snapshot, no
@@ -82,8 +89,13 @@ export function createLabelSync(deps: SyncDeps) {
     if (!diff.add.length && !diff.remove.length) return true;
     try {
       await deps.jira.updateLabels(key, diff);
+      loggedFailure.delete(key);
     } catch (e) {
-      deps.log?.(`[labels] ${key} write failed: ${(e as Error)?.message ?? e}`);
+      const reason = (e as Error)?.message ?? String(e);
+      if (loggedFailure.get(key) !== reason) {
+        loggedFailure.set(key, reason);
+        deps.log?.(`[labels] ${key} write failed: ${reason}`);
+      }
       return false;
     }
     written.add(key);
@@ -99,18 +111,31 @@ export function createLabelSync(deps: SyncDeps) {
 
     for (const issue of issues) {
       let agentStatus: string | null;
+      let stalled = false;
       if (!isActive(issue.status)) {
         stabilizer.clear(issue.key);
+        deps.stalled?.forget(issue.key);
         agentStatus = null;
       } else {
         const observed = mapAgentStatus(agents.get(issue.key) ?? null);
+        // Always observed (even when not idle), so the tracker's "since
+        // spawn, continuously idle" streak sees every poll, not just the
+        // ones where the result might matter.
+        const stalledNow = deps.stalled ? await deps.stalled.check(issue.key, observed) : false;
+        // Logged unconditionally, every poll it holds — unlike the LABEL
+        // below, which is deliberately delayed by the stabilizer so a single
+        // flickering poll never writes Jira. An operator watching the log
+        // should see this the instant it's true, not two polls later.
+        if (stalledNow) deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since first observed, zero comments from this account for the configured window`);
+        const candidate: AgentLabel = observed === "idle" && stalledNow ? "stalled" : observed;
         const applied = agentLabelOf(issue.labels);
-        const { label, suppressed } = stabilizer.resolve(issue.key, applied, observed);
-        if (suppressed) deps.log?.(`[labels] ${issue.key} agent:${observed} unconfirmed (holding agent:${applied}) — flip suppressed`);
-        agentStatus = rawFor(label);
+        const { label, suppressed } = stabilizer.resolve(issue.key, applied, candidate);
+        if (suppressed) deps.log?.(`[labels] ${issue.key} agent:${candidate} unconfirmed (holding agent:${applied}) — flip suppressed`);
+        stalled = label === "stalled";
+        agentStatus = stalled ? "idle" : rawFor(label);
       }
       const prState = deps.prState ? await deps.prState(issue.key) : null;
-      const desired = desiredLabels({ status: issue.status, agentStatus, prState });
+      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled });
       const ok = await write(written, issue.key, issue.labels, desired);
       if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }
@@ -118,6 +143,7 @@ export function createLabelSync(deps: SyncDeps) {
     for (const key of [...lastLabels.keys()]) {
       if (seen.has(key)) continue;
       stabilizer.clear(key);
+      deps.stalled?.forget(key);
       const current = lastLabels.get(key)!;
       const desired = current.filter((l) => !l.startsWith(AGENT_PREFIX));
       const ok = await write(written, key, current, desired);

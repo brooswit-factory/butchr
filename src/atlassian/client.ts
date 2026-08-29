@@ -23,6 +23,14 @@ export function adfToText(node: AdfNode | null | undefined): string {
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
+/** A non-2xx Atlassian response, carrying the status so callers can act on it (e.g. retry a 403 differently). */
+export class AtlassianHttpError extends Error {
+  constructor(readonly status: number, method: string, path: string, bodySnippet: string) {
+    super(`Atlassian ${status} on ${method} ${path}: ${bodySnippet}`);
+    this.name = "AtlassianHttpError";
+  }
+}
+
 /**
  * A thin Jira Cloud REST client using classic-token Basic auth. `fetch` is
  * injectable so the client is testable without the network. Small on purpose —
@@ -35,6 +43,7 @@ export class AtlassianClient {
     email: string,
     token: string,
     private readonly fetchImpl: FetchLike = globalThis.fetch,
+    private readonly log: (line: string) => void = () => {},
   ) {
     this.auth = "Basic " + Buffer.from(`${email}:${token}`).toString("base64");
   }
@@ -43,8 +52,26 @@ export class AtlassianClient {
     const res = await this.fetchImpl(`${this.site}${path}`, {
       headers: { authorization: this.auth, accept: "application/json" },
     });
-    if (!res.ok) throw new Error(`Atlassian ${res.status} on ${path}: ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) throw new AtlassianHttpError(res.status, "GET", path, (await res.text()).slice(0, 200));
     return res.json();
+  }
+
+  /**
+   * Whether this account may suppress notifications (`notifyUsers=false`) on
+   * `projectKey` — Jira Cloud requires Administer Jira (global) or Administer
+   * Projects on that project for it, otherwise the whole write 403s. A failed
+   * check (network error, non-2xx) never throws: it's logged once, naming the
+   * request, and treated as "no" — degrading to notifying writes is always
+   * safe, assuming permission and 403ing every write is not.
+   */
+  async canSuppressNotifications(projectKey: string): Promise<boolean> {
+    try {
+      const body = await this.get(`/rest/api/3/mypermissions?projectKey=${encodeURIComponent(projectKey)}&permissions=ADMINISTER_PROJECTS,ADMINISTER`);
+      return Boolean(body.permissions?.ADMINISTER_PROJECTS?.havePermission || body.permissions?.ADMINISTER?.havePermission);
+    } catch (e) {
+      this.log(`[atlassian] mypermissions check for project ${projectKey} failed: ${(e as Error)?.message ?? e}`);
+      return false;
+    }
   }
 
   /** Issues matching a JQL query, mapped to butchr's flat shape. */
@@ -58,19 +85,26 @@ export class AtlassianClient {
    * Add/remove labels on a ticket in one request — never a wholesale field
    * set, so labels outside the caller's add/remove lists (human labels) are
    * left untouched. A no-op (no request) when both lists are empty.
+   *
+   * `notify` defaults to false (quiet, `notifyUsers=false`) — Jira Cloud
+   * honours that only for an account holding Administer Jira/Projects on the
+   * ticket's project, and 403s the WHOLE request for anyone else. Callers
+   * that don't hold the permission must pass `notify: true` (a normal,
+   * watcher-notifying write) or every label write fails.
    */
-  async updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }): Promise<void> {
+  async updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }, opts?: { notify?: boolean }): Promise<void> {
     const update = [
       ...(ops.add ?? []).map((label) => ({ add: label })),
       ...(ops.remove ?? []).map((label) => ({ remove: label })),
     ];
     if (!update.length) return;
-    const res = await this.fetchImpl(`${this.site}/rest/api/3/issue/${key}?notifyUsers=false`, {
+    const path = `/rest/api/3/issue/${key}${opts?.notify ? "" : "?notifyUsers=false"}`;
+    const res = await this.fetchImpl(`${this.site}${path}`, {
       method: "PUT",
       headers: { authorization: this.auth, "content-type": "application/json" },
       body: JSON.stringify({ update: { labels: update } }),
     });
-    if (!res.ok) throw new Error(`Atlassian ${res.status} on PUT /rest/api/3/issue/${key}: ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) throw new AtlassianHttpError(res.status, "PUT", path, (await res.text()).slice(0, 200));
   }
 
   /** The issue links on a ticket, as the other end's key + relationship. */
@@ -88,7 +122,7 @@ export class AtlassianClient {
   async comments(issueKey: string, maxResults = 20): Promise<JiraComment[]> {
     const q = new URLSearchParams({ orderBy: "-created", maxResults: String(maxResults) });
     const body = await this.get(`/rest/api/3/issue/${issueKey}/comment?${q}`);
-    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "" }));
+    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "", authorEmail: c.author?.emailAddress ?? null }));
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@brooswit/butchr",
-  "version": "0.8.0",
+  "version": "0.11.0",
   "description": "The software factory: watches your Jira, runs herdr agents on active tickets, pushes updates to them over MCP",
   "type": "module",
   "repository": {
@@ -20,11 +20,11 @@
   "scripts": {
     "start": "bun run src/daemon/index.ts",
     "generate": "bun run scripts/load/generate.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "bun --bun x tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "test:unit": "bun test test/unit test/load && bun run scripts/coverage/gate.ts",
     "release:check": "bun run scripts/release/check.ts",
-    "check": "bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
+    "check": "bun run scripts/preflight.ts && bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
     "build": "bun build src/daemon/index.ts --outfile dist/butchr.js --target bun && printf '#!/usr/bin/env bun\\n' | cat - dist/butchr.js > dist/butchr.tmp && mv dist/butchr.tmp dist/butchr.js && chmod +x dist/butchr.js"
   },
   "dependencies": {

@@ -21,9 +21,21 @@ export interface DesiredInput {
   agentStatus: string | null;
   /** Discovered PR state for the ticket, or null when no PR is known/tracked. */
   prState: PrState;
+  /**
+   * True when this ticket's agent has been idle/done continuously since it
+   * was first observed running, with zero comments from the daemon's own
+   * account, for at least the configured stall window (see
+   * src/agents/stalled.ts). Only meaningful when the mapped agent label would
+   * otherwise be "idle" — stalled takes precedence over idle so a swallowed
+   * kickoff can never look like a completed agent (KAN-804/807).
+   */
+  stalled?: boolean;
 }
 
-export type AgentLabel = "working" | "idle" | "blocked" | "none";
+export type AgentLabel = "working" | "idle" | "blocked" | "stalled" | "none";
+
+/** What a raw herdr status ever maps to — "stalled" is a separate overlay (see src/agents/stalled.ts), never mapAgentStatus's own output. */
+export type ObservedAgentLabel = Exclude<AgentLabel, "stalled">;
 
 /**
  * idle and blocked map directly. "done" — herdr's status for an agent sitting
@@ -35,7 +47,7 @@ export type AgentLabel = "working" | "idle" | "blocked" | "none";
  * when the agent is running but its state isn't one we specifically know is
  * idle-shaped.
  */
-export const mapAgentStatus = (raw: string | null): AgentLabel => {
+export const mapAgentStatus = (raw: string | null): ObservedAgentLabel => {
   if (raw === "idle" || raw === "done") return "idle";
   if (raw === "blocked") return "blocked";
   if (raw == null) return "none";
@@ -43,9 +55,12 @@ export const mapAgentStatus = (raw: string | null): AgentLabel => {
 };
 
 /** The desired daemon-owned label set for a ticket, given its current known state. Pure. */
-export function desiredLabels({ status, agentStatus, prState }: DesiredInput): string[] {
+export function desiredLabels({ status, agentStatus, prState, stalled }: DesiredInput): string[] {
   const out: string[] = [];
-  if (isActive(status)) out.push(AGENT_PREFIX + mapAgentStatus(agentStatus));
+  if (isActive(status)) {
+    const label = mapAgentStatus(agentStatus);
+    out.push(AGENT_PREFIX + (label === "idle" && stalled ? "stalled" : label));
+  }
   if (prState) out.push(PR_PREFIX + prState);
   return out;
 }

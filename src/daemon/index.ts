@@ -14,8 +14,12 @@ import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
+import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { watchSessionLimits } from "../agents/session-limit-watch.js";
+import { createStalledCheck } from "../agents/stalled.js";
+import { respawnComment } from "../agents/respawn.js";
 
 let config;
 try {
@@ -26,7 +30,14 @@ try {
   process.exit(1);
 }
 
-const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token);
+const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// Label writes must never silently 403: Jira only honours notifyUsers=false
+// for an account holding Administer Jira/Projects on the ticket's project.
+// This gate preflights that per project (first sight, cached for the run)
+// and falls back to notifying writes — loudly, once — when it's absent.
+// Shared between the poll loop and the one-time startup sweep below so both
+// see the same cached verdict per project.
+const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
@@ -48,15 +59,28 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-}, atlassianTools(ops));
+}, atlassianTools(ops, undefined, config.assignees));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
+const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
+const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
+
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined;
+// KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
+// for issues that already satisfy the cheap preconditions (see stalled.ts),
+// never on every poll.
+const stalled = createStalledCheck({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  comments: (issue) => atlassian.comments(issue),
+  accountEmail: config.atlassian.email,
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
-  jira: atlassian,
+  jira: labelWriter,
   agentStatuses: async () => {
     const { agents } = await herdr.agent.list();
     const m = new Map<string, string>();
@@ -67,8 +91,27 @@ const syncLabels = createLabelSync({
     return m;
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
+  stalled,
   log: (line) => console.error(`  ${line}`),
 });
+
+// KAN-804/807: a session-limit refusal is not a dialog — the prompt-watcher
+// and escalator never see it (agent_status stays idle/done, not blocked).
+// Level-triggered: every poll, for every idle/done agent, check the pane for
+// the refusal and close it once past its printed reset time plus margin so
+// the reconciler respawns with a fresh kickoff. Nothing persisted; a restart
+// re-reads the same pane and reaches the same decision.
+watchSessionLimits({
+  list: async () => (await herdr.agent.list()).agents.map((a) => ({
+    pane_id: a.pane_id,
+    agent_status: a.agent_status ?? "",
+    issue: issueOfAgentName((a as { name?: string }).name),
+  })),
+  read: readPane,
+  close: (issue) => herd.stop(issue),
+  now: () => Date.now(),
+  log: (line) => console.error(`  ${line}`),
+}, 15_000);
 
 // One-time startup sweep: agent:* stranded by a ticket that went inactive
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
@@ -76,7 +119,7 @@ const syncLabels = createLabelSync({
 // this. Not a new polling timer — runs once, here, and never again.
 void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
-  jira: atlassian,
+  jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
 }).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
@@ -136,13 +179,16 @@ startLoop({
     const woke = await herd.nudge(issue, msg).catch(() => false);
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
   },
+  onRespawn: async (issue, reason, observedArgv) => {
+    console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    // A failed notice must not undo the respawn that already happened — log and move on.
+    await ops.addComment(issue, respawnComment(issue, reason, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
+  },
   syncLabels,
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });
-
-const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
-const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for

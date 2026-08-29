@@ -26,6 +26,12 @@ export interface LoopDeps {
   /** Nudge the agent working `issue`; `about` is the ticket that changed (not always its own). */
   notify: (issue: string, about: string) => void | Promise<void>;
   /**
+   * Called once per respawned agent, right after it's back up. Jira knowledge
+   * (the [butchr:respawn] notice) lives OUTSIDE loop.ts — this is the seam
+   * src/daemon/index.ts wires it through.
+   */
+  onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /**
    * Reconcile daemon-owned (agent:*, pr:*) labels on this poll's `issues`.
    * Returns the keys it wrote to — their own `updated` bump must not, by
    * itself, count as a change worth nudging an agent over (see below).
@@ -35,11 +41,36 @@ export interface LoopDeps {
   onError?: (error: unknown) => void;
 }
 
-/** Bring the herd in line with the desired active set: spawn the missing, stop the rest. */
-export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>): Promise<void> {
-  const plan = planReconcile(desired.keys(), await herd.runningIssues());
-  for (const issue of plan.spawn) await herd.spawn(desired.get(issue)!);
+export interface ReconcileOptions {
+  onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+}
+
+/**
+ * Bring the herd in line with the desired active set: spawn the missing, stop
+ * the rest, and replace any stale agent (running, but its process argv lacks
+ * butchr's spawn flags) with a fresh one — treated as stop-then-spawn, so
+ * buildWorkspace rewrites its CLAUDE.md/brief.md/mcp.json exactly as a normal
+ * spawn would.
+ */
+export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const stale = await herd.staleIssues();
+  const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
+  const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys());
+  // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
+  // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
+  // burst of N new spawns (e.g. several stories activating in one poll)
+  // would stall this ENTIRE poll — label sync and every ticket's
+  // notifications included — for N times that wait. Each issue's spawn is
+  // independent (its own workspace directory, its own pane), so nothing
+  // requires them to run one after another.
+  await Promise.all(plan.spawn.map((issue) => herd.spawn(desired.get(issue)!)));
   for (const issue of plan.stop) await herd.stop(issue);
+  for (const issue of plan.respawn) {
+    const info = staleByIssue.get(issue)!;
+    await herd.stop(issue);
+    await herd.spawn(desired.get(issue)!);
+    if (opts.onRespawn) await opts.onRespawn(issue, info.reason, info.observedArgv);
+  }
 }
 
 /** The desired active set as spawn specs, keyed by issue. */
@@ -74,7 +105,7 @@ export function startLoop(deps: LoopDeps): Stop {
     async () => {
       const issues = await deps.search();
       const desired = desiredFrom(issues);
-      await reconcileNow(deps.herd, desired);
+      await reconcileNow(deps.herd, desired, deps.onRespawn ? { onRespawn: deps.onRespawn } : {});
       const related = deps.related ? await deps.related([...desired.keys()]) : [];
       const labelWrites = deps.syncLabels ? await deps.syncLabels(issues) : new Set<string>();
       return { issues, related, labelWrites };

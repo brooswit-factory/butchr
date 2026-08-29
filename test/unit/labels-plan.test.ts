@@ -29,6 +29,19 @@ describe("desiredLabels", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: "open" })).toEqual(["agent:idle", "pr:open"]);
     expect(desiredLabels({ status: "Done", agentStatus: null, prState: "merged" })).toEqual(["pr:merged"]);
   });
+  test("stalled takes precedence over idle (KAN-804/807): exactly one agent:* label, never both", () => {
+    expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null, stalled: true })).toEqual(["agent:stalled"]);
+    expect(desiredLabels({ status: "In Progress", agentStatus: "done", prState: null, stalled: true })).toEqual(["agent:stalled"]); // done maps to idle first
+  });
+  test("stalled is ignored (never applied) unless the mapped label is idle", () => {
+    expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: null, stalled: true })).toEqual(["agent:working"]);
+    expect(desiredLabels({ status: "In Progress", agentStatus: "blocked", prState: null, stalled: true })).toEqual(["agent:blocked"]);
+    expect(desiredLabels({ status: "In Progress", agentStatus: null, prState: null, stalled: true })).toEqual(["agent:none"]);
+  });
+  test("stalled false/omitted never changes idle's output", () => {
+    expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null, stalled: false })).toEqual(["agent:idle"]);
+    expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null })).toEqual(["agent:idle"]);
+  });
 });
 
 describe("diffLabels", () => {

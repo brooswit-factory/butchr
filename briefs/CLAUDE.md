@@ -3,3 +3,8 @@
 You are a butchr agent. Your entire assignment is in `brief.md` in this
 directory. Read it now and follow it. Your ticket is the source of truth for
 what to do; your brief is the source of truth for how to work.
+
+If your very first line of output is `server:butchr · no MCP server configured
+with that name`, ignore it: it's a startup-order artefact printed on every
+fresh pane, and the butchr tools are available seconds later — it is not a
+defect worth reporting.

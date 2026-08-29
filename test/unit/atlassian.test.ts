@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AtlassianClient, adfToText } from "../../src/atlassian/client.js";
+import { AtlassianClient, AtlassianHttpError, adfToText } from "../../src/atlassian/client.js";
 
 function fakeFetch(routes: Record<string, unknown>, seen: { url: string; auth: string | undefined }[] = []) {
   return async (url: string, init?: RequestInit): Promise<Response> => {
@@ -86,18 +86,70 @@ describe("AtlassianClient", () => {
     await expect(c.updateLabels("KAN-1", { add: ["agent:idle"] })).rejects.toThrow(/400/);
   });
 
-  test("comments() maps id/body/created off a faked fetch, flattening ADF bodies", async () => {
+  test("updateLabels defaults to a quiet write (notifyUsers=false)", async () => {
+    const seen: string[] = [];
+    const c = new AtlassianClient("https://x", "a", "t", async (url) => { seen.push(url); return new Response("", { status: 204 }); });
+    await c.updateLabels("KAN-1", { add: ["agent:idle"] });
+    expect(seen[0]).toContain("notifyUsers=false");
+  });
+
+  test("updateLabels sends a notifying write (no notifyUsers param) when told to", async () => {
+    const seen: string[] = [];
+    const c = new AtlassianClient("https://x", "a", "t", async (url) => { seen.push(url); return new Response("", { status: 204 }); });
+    await c.updateLabels("KAN-1", { add: ["agent:idle"] }, { notify: true });
+    expect(seen[0]).not.toContain("notifyUsers");
+  });
+
+  test("a failed updateLabels rejects with an AtlassianHttpError naming method, path, and status", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", async () => new Response("forbidden", { status: 403 }));
+    const err = await c.updateLabels("KAN-1", { add: ["agent:idle"] }).catch((e) => e);
+    expect(err).toBeInstanceOf(AtlassianHttpError);
+    expect((err as AtlassianHttpError).status).toBe(403);
+    expect((err as Error).message).toContain("PUT");
+    expect((err as Error).message).toContain("/rest/api/3/issue/KAN-1");
+  });
+
+  test("canSuppressNotifications is true when ADMINISTER_PROJECTS is held", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/mypermissions": { permissions: { ADMINISTER_PROJECTS: { havePermission: true }, ADMINISTER: { havePermission: false } } },
+    }));
+    expect(await c.canSuppressNotifications("KAN")).toBe(true);
+  });
+
+  test("canSuppressNotifications is true when only global ADMINISTER is held", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/mypermissions": { permissions: { ADMINISTER: { havePermission: true } } },
+    }));
+    expect(await c.canSuppressNotifications("KAN")).toBe(true);
+  });
+
+  test("canSuppressNotifications is false when neither permission is held", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/mypermissions": { permissions: { ADMINISTER_PROJECTS: { havePermission: false }, ADMINISTER: { havePermission: false } } },
+    }));
+    expect(await c.canSuppressNotifications("KAN")).toBe(false);
+  });
+
+  test("canSuppressNotifications never throws: an erroring request degrades to false and logs once, naming the project", async () => {
+    const logs: string[] = [];
+    const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 500 }), (line) => logs.push(line));
+    expect(await c.canSuppressNotifications("KAN")).toBe(false);
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("KAN");
+  });
+
+  test("comments() maps id/body/created/authorEmail off a faked fetch, flattening ADF bodies", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
       "/issue/KAN-1/comment": {
         comments: [
-          { id: "10", created: "2026-08-28T00:00:00.000Z", body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Looks good" }] }] } },
+          { id: "10", created: "2026-08-28T00:00:00.000Z", author: { emailAddress: "agent@example.com" }, body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Looks good" }] }] } },
           { id: "9", created: "2026-08-27T00:00:00.000Z", body: { type: "doc", content: [] } },
         ],
       },
     }));
     expect(await c.comments("KAN-1")).toEqual([
-      { id: "10", body: "Looks good", created: "2026-08-28T00:00:00.000Z" },
-      { id: "9", body: "", created: "2026-08-27T00:00:00.000Z" },
+      { id: "10", body: "Looks good", created: "2026-08-28T00:00:00.000Z", authorEmail: "agent@example.com" },
+      { id: "9", body: "", created: "2026-08-27T00:00:00.000Z", authorEmail: null },
     ]);
   });
 });
