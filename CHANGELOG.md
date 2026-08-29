@@ -9,6 +9,18 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.6.0] - 2026-08-28
+### Changed
+- **Deploy this only after the Implements links are in place (KAN-768).** Any active story or epic that lacks a story-implements-epic (or task-implements-story) link goes silent the moment parent-based notification is removed below — backfill those links first, then roll this release out. Do not deploy blind off this changelog entry alone.
+- **A ticket's events now route to whatever it implements, not to its Jira parent.** The notify loop follows the Implements link exclusively (task→story→epic); the parent field is membership only — which epic a story belongs to, used for staffing and brief interpolation — and triggers no notification. For this one release, Relates links are ALSO honored as a deprecation bridge so existing links keep routing; Relates routing is removed in the next release, KAN-769.
+- **`jira_link_issues` defaults to link type "Implements"** (was "Relates"). The IMPLEMENTER is the `from` side — the outward side: task implements story ⇒ from=task, to=story; story implements epic ⇒ from=story, to=epic — and that link is what routes a ticket's events (In Review, comments) to its boss, nothing else. An explicit `type` still works for other link kinds (Blocks, Relates, …), and the tool's audit line now records the resolved type.
+
+### Fixed
+- **`jira_link_issues` no longer returns an invalid MCP result.** Jira answers `POST /rest/api/3/issueLink` with 201 and an empty body, so the op resolved `undefined` and the tool result carried a `content[0].text` of `undefined` — the MCP client rejected the whole call ("Invalid tools/call result … expected string, received undefined") even though the link had actually been created (reproduced live 8/8 times: link ids 10599, 10614, 10615, 10616). The handler now substitutes `{ok: true, from, to, type}` when the op resolves undefined. `jira_transition` was checked for the same failure mode and needed no change — it already returns `{transitioned, to}`. (KAN-764)
+
+### Removed
+- **Parent-based notification.** The daemon no longer treats the Jira parent field as a notification channel; see "Changed" above for what replaces it.
+
 ## [0.5.17] - 2026-08-28
 ### Fixed
 - **The fullscreen-renderer offer is auto-answered "Not now".** It stranded stories at the composer, and after the v0.5.16 rate cap engaged, new dialogs on capped panes were log-only — so parents were never told (the cap's blind spot; two stories sat stranded). The offer is a non-work UI opt-in with an established fleet answer, so it now belongs to the auto-answerer and never reaches escalation at all.
