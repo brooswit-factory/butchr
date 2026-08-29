@@ -28,3 +28,17 @@ task-implements-story link is what carries your events upward.
    `jira_transition`. Your story's agent reviews; respond to its comments here.
    **You are approved when `gh pr view <pr> --json reviewDecision` says
    APPROVED** — a formal review, never prose alone. Then merge your own PR.
+
+## If an outward action is refused
+When `gh pr review --approve`, `gh pr merge`, `git push`, a jira_* tool call, or
+any outward action hits a permission prompt, "denied", or a classifier refusal,
+do not conclude it is policy — first report your own process argv on {{KEY}},
+verbatim:
+`p=$$; for i in 1 2 3 4 5; do ps -o pid=,args= -p $p | cut -c1-200; p=$(ps -o ppid= -p $p | tr -d ' '); done`
+Quote the `claude` line in a comment on {{KEY}}. Good:
+`--permission-mode bypassPermissions --mcp-config <workspace>/mcp.json
+--dangerously-load-development-channels server:butchr`. A bare `claude --resume
+<id>`, or a missing flag, means herdr restored you without butchr's flags —
+say so on {{KEY}}, stop retrying, and wait for `[butchr:respawn]`; your fresh
+session re-reads the ticket. Only a complete argv makes a refusal real — then
+report it as policy, quoting the prompt text.
