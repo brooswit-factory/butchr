@@ -60,6 +60,21 @@ describe("desiredLabels", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null, stalled: false })).toEqual(["agent:idle"]);
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null })).toEqual(["agent:idle"]);
   });
+
+  // KAN-832/837 case 8: "unknown" re-emits whatever pr:* label the ticket already carries,
+  // instead of reading as "no PR" and having diffLabels strip it.
+  describe("prState: \"unknown\" (KAN-832/837)", () => {
+    test("re-emits the ticket's existing pr:* label", () => {
+      expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: "unknown", currentLabels: ["pr:approved", "agent:working"] })).toEqual(["agent:working", "pr:approved"]);
+    });
+    test("with no currentLabels pr:* entry, emits no pr:* label — nothing to preserve", () => {
+      expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: "unknown", currentLabels: [] })).toEqual(["agent:working"]);
+      expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: "unknown" })).toEqual(["agent:working"]);
+    });
+    test("a genuine null prState (confirmed no PR) does NOT preserve an existing pr:* label — the guard against KAN-814-style stickiness", () => {
+      expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: null, currentLabels: ["pr:approved", "agent:working"] })).toEqual(["agent:working"]);
+    });
+  });
 });
 
 describe("diffLabels", () => {
