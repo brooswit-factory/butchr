@@ -24,20 +24,52 @@ export interface EscalatorDeps {
 interface PaneState {
   fp: string;
   blockedPolls: number;
-  /** Timestamps of escalation comments for this pane (rate cap window). */
-  escalations?: number[];
-  capNoticePosted?: boolean;
+  /**
+   * The pollSeq (see watchBlocked) at which `blockedPolls` was last
+   * incremented for this exact fingerprint. undefined means "not yet
+   * observed via a real poll" — freshly reset, waiting to re-earn the
+   * debounce from zero. Consecutive means the next call's pollSeq is
+   * EXACTLY one more than this: any gap (the pane wasn't blocked, or didn't
+   * parse, on an intervening poll) or a different fp resets the count.
+   */
+  lastPollSeq: number | undefined;
   escalatedAt: number | undefined;
   followedUpAt: number | undefined;
-  /** Comment ids already acted on for this fingerprint — an answer is consumed exactly once. */
-  actedCommentIds: Set<string>;
 }
 
-const newState = (fp: string, blockedPolls: number): PaneState =>
-  ({ fp, blockedPolls, escalatedAt: undefined, followedUpAt: undefined, actedCommentIds: new Set() });
+const newState = (fp: string): PaneState =>
+  ({ fp, blockedPolls: 0, lastPollSeq: undefined, escalatedAt: undefined, followedUpAt: undefined });
 
 export interface Escalator {
-  onBlocked: (paneId: string, issue: string | null, prompt: Prompt) => Promise<void>;
+  onBlocked: (paneId: string, issue: string | null, prompt: Prompt, pollSeq: number) => Promise<void>;
+  /**
+   * Called once per watchBlocked tick, synchronously, with the full set of
+   * currently-blocked pane ids (see watchBlocked's onTick). Resets the
+   * debounce for any tracked pane that is NOT in that set: a poll on which
+   * the herd no longer reports a pane blocked is exactly as much a "this
+   * fingerprint was not observed on a consecutive poll" event as a
+   * different fingerprint would be, and nothing else can deliver that
+   * signal — onBlocked is only ever called for panes that ARE blocked.
+   */
+  onPoll: (pollSeq: number, blockedPaneIds: readonly string[]) => void;
+  /**
+   * A pane the herd reports blocked whose text does not parse as a dialog
+   * (see prompt-watch's onUnparseable). Resets the debounce like any other
+   * gap, and logs — deduplicated by distinct text, never one line per poll
+   * — so a real dialog the parser wrongly rejects shows up instead of
+   * silently sitting stuck (KAN-682, applied to the parser).
+   */
+  onNoPrompt: (paneId: string, issue: string | null, text: string, pollSeq: number) => void;
+}
+
+/** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
+function hashText(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
 /**
@@ -58,6 +90,22 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   const paneEscalations = new Map<string, number[]>();
   const cappedIssues = new Set<string>();
   const log = (line: string) => deps.log(`[prompts] ${line}`);
+
+  // KAN-756, item (D): consumed directive comment ids, kept PER PANE but
+  // OUTSIDE PaneState so they survive every reset (a REFUSED directive, a
+  // flicker, an unparseable poll, a fresh fingerprint) — not just the one
+  // mechanism-2 originally reset. Without this a stale ANSWER comment is
+  // re-read and re-refused on a loop for as long as the pane stays blocked.
+  const consumedComments = new Map<string, Set<string>>();
+  function consumedFor(paneId: string): Set<string> {
+    let s = consumedComments.get(paneId);
+    if (!s) { s = new Set(); consumedComments.set(paneId, s); }
+    return s;
+  }
+
+  // KAN-756, item (C): one log line per pane per DISTINCT unparseable text,
+  // not one per poll.
+  const lastUnparseableHash = new Map<string, string>();
 
   async function escalate(issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
     const rows = await deps.comments(issue).catch((e) => {
@@ -111,8 +159,10 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
         // Do NOT escalate the fresh dialog immediately: a moving pane is how
         // transient prose masquerades as dialogs (measured: 3 escalations in
         // 2 minutes). The fresh fingerprint must re-earn the debounce through
-        // handleBlocked like any other.
-        state.set(paneId, newState(freshFp!, 0));
+        // handleBlocked like any other. consumedComments is untouched here —
+        // it lives outside PaneState precisely so this reset cannot forget a
+        // comment id already acted on (item D).
+        state.set(paneId, newState(freshFp!));
       }
       return;
     }
@@ -141,14 +191,32 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     log(`submitted (Enter) to ${issue} pane ${paneId}`);
   }
 
-  async function handleBlocked(paneId: string, issue: string, prompt: Prompt): Promise<void> {
+  async function handleBlocked(paneId: string, issue: string, prompt: Prompt, pollSeq: number): Promise<void> {
     const fp = fingerprint(prompt);
-    let s = state.get(paneId);
-    if (!s || s.fp !== fp) {
-      s = newState(fp, 0);
-      state.set(paneId, s);
+    const prior = state.get(paneId);
+
+    // Out-of-order async guard: onExposed/onBlocked are fire-and-forget, so a
+    // LATER poll's result can resolve before an EARLIER one's. A pollSeq at
+    // or behind what this pane has already processed is stale — a more
+    // current observation has already superseded it — and must never be
+    // allowed to fabricate or destroy a reset by being applied out of order.
+    if (prior && prior.lastPollSeq !== undefined && pollSeq <= prior.lastPollSeq) {
+      log(`ignored stale poll ${pollSeq} for ${issue} pane=${paneId} (already at ${prior.lastPollSeq})`);
+      return;
     }
 
+    // "Consecutive" means consecutive polls OF THE WATCHER: the same
+    // fingerprint, observed on the very next pollSeq. Any gap — the pane
+    // wasn't blocked, or didn't parse, on an intervening poll (both reset
+    // via onPoll/onNoPrompt below, which delete the pane's state) — or a
+    // different fingerprint, resets the count to a fresh first observation.
+    const consecutive = !!prior && prior.fp === fp && prior.lastPollSeq !== undefined && pollSeq === prior.lastPollSeq + 1;
+    if (!consecutive && prior) {
+      log(`debounce reset ${issue} pane=${paneId}: ${prior.fp !== fp ? `fp changed (${prior.fp} -> ${fp})` : "poll gap"}`);
+    }
+    const s: PaneState = consecutive ? prior! : newState(fp);
+    state.set(paneId, s);
+    s.lastPollSeq = pollSeq;
     s.blockedPolls++;
     if (s.blockedPolls < DEBOUNCE_POLLS) {
       log(`debounce ${issue} fp=${fp} (poll ${s.blockedPolls}/${DEBOUNCE_POLLS})`);
@@ -165,11 +233,12 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       return [] as CommentRow[];
     });
     const escalatedAtMs = s.escalatedAt;
+    const consumed = consumedFor(paneId);
     let directive: Directive | null = null;
     let directiveCommentId: string | null = null;
     for (const r of rows) {
       if (Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS) continue;
-      if (s.actedCommentIds.has(r.id)) continue; // an answer is consumed exactly once
+      if (consumed.has(r.id)) continue; // an answer is consumed exactly once, across fingerprint resets
       const d = parseDirective(r.body);
       if (d) { directive = d; directiveCommentId = r.id; break; } // newest-first comments(); first match wins
       if (r.body.trimStart().startsWith(MARKER) && /^\s*ANSWER /m.test(r.body)) {
@@ -180,7 +249,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     if (directive && directiveCommentId) {
       // Record BEFORE the delivery side effects run: a send() that throws must
       // never leave the directive re-armed for the next poll to replay.
-      s.actedCommentIds.add(directiveCommentId);
+      consumed.add(directiveCommentId);
       log(`directive seen on ${issue}: ${JSON.stringify(directive)}`);
       await handleDirective(paneId, issue, directive, s);
       return;
@@ -196,7 +265,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
   }
 
-  async function onBlocked(paneId: string, issue: string | null, prompt: Prompt): Promise<void> {
+  async function onBlocked(paneId: string, issue: string | null, prompt: Prompt, pollSeq: number): Promise<void> {
     if (issue === null) {
       log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
       return;
@@ -207,7 +276,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
     inFlight.add(paneId);
     try {
-      await handleBlocked(paneId, issue, prompt);
+      await handleBlocked(paneId, issue, prompt, pollSeq);
     } catch (e) {
       log(`error handling ${paneId}: ${(e as Error)?.message ?? e}`);
     } finally {
@@ -215,5 +284,30 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
   }
 
-  return { onBlocked };
+  function onPoll(_pollSeq: number, blockedPaneIds: readonly string[]): void {
+    const blocked = new Set(blockedPaneIds);
+    for (const paneId of state.keys()) {
+      if (!blocked.has(paneId)) {
+        log(`debounce reset pane=${paneId}: not blocked`);
+        state.delete(paneId);
+      }
+    }
+  }
+
+  function onNoPrompt(paneId: string, issue: string | null, text: string, pollSeq: number): void {
+    const s = state.get(paneId);
+    // Same staleness rule as handleBlocked: don't let a late-arriving "no
+    // prompt" for an already-superseded poll destroy newer state.
+    if (s && !(s.lastPollSeq !== undefined && pollSeq <= s.lastPollSeq)) {
+      log(`debounce reset ${issue ?? paneId} pane=${paneId}: no prompt`);
+      state.delete(paneId);
+    }
+    const h = hashText(text);
+    if (lastUnparseableHash.get(paneId) !== h) {
+      lastUnparseableHash.set(paneId, h);
+      log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
+    }
+  }
+
+  return { onBlocked, onPoll, onNoPrompt };
 }

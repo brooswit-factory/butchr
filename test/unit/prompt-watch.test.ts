@@ -4,14 +4,14 @@ import { watchPrompts } from "../../src/agents/prompt-watch.js";
 const MENU = "Trust this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm";
 
 function rig(readText: string) {
-  let fire: ((p: string) => void) | null = null;
+  let fire: ((p: string, seq: number) => void) | null = null;
   const sent: Array<{ pane: string; text: string }> = [];
   const exposed: unknown[] = [];
   return {
-    fire: (p: string) => fire!(p),
+    fire: (p: string) => fire!(p, 1),
     sent, exposed,
     deps: (onPrompt: any) => ({
-      onBlocked: (cb: (p: string) => void) => { fire = cb; return () => {}; },
+      onBlocked: (cb: (p: string, seq: number) => void) => { fire = cb; return () => {}; },
       read: async () => readText,
       send: async (pane: string, text: string) => { sent.push({ pane, text }); },
       onPrompt,
@@ -80,14 +80,14 @@ describe("unparseable blocked panes are never silently dropped (KAN-756, item C)
 describe("continue screens", () => {
   test("'Press Enter to continue' gets a bare enter, no parsing needed", async () => {
     const sent: Array<[string, string]> = [];
-    let cb: (p: string) => void = () => {};
+    let cb: (p: string, seq: number) => void = () => {};
     watchPrompts({
       onBlocked: (f) => { cb = f; return () => {}; },
       read: async () => "Security notes:\n blah blah\n Press Enter to continue…",
       send: async (p, t) => { sent.push([p, t]); },
       onPrompt: () => { throw new Error("should not be consulted"); },
     });
-    cb("p9");
+    cb("p9", 1);
     await new Promise((r) => setTimeout(r, 10));
     expect(sent).toEqual([["p9", "\r"]]);
   });
