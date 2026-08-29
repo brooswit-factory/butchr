@@ -14,6 +14,13 @@ export interface Config {
   herdrSocket?: string;
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
   terminalPrefix?: string[];
+  /**
+   * GitHub PR discovery (pr:* labels). Both a token and at least one org are
+   * required — an unscoped GitHub search spans all of GitHub, not just ours —
+   * so this is present only when BOTH GITHUB_TOKEN_FILE and
+   * BUTCHR_GITHUB_ORGS are set; otherwise pr:* discovery is skipped entirely.
+   */
+  github?: { token: string; orgs: string[] };
 }
 
 export interface ConfigEnv {
@@ -24,6 +31,8 @@ export interface ConfigEnv {
   BUTCHR_PORT?: string | undefined;
   HERDR_SOCKET?: string | undefined;
   BUTCHR_TERMINAL?: string | undefined;
+  GITHUB_TOKEN_FILE?: string | undefined;
+  BUTCHR_GITHUB_ORGS?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -38,11 +47,16 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
 
+  const githubToken = env.GITHUB_TOKEN_FILE ? readFile(env.GITHUB_TOKEN_FILE).trim() : undefined;
+  const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
+  const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
+
   return {
     atlassian: { site, email, token },
     port,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
+    ...(github ? { github } : {}),
   };
 }
 
@@ -51,6 +65,7 @@ function required(v: string | undefined, name: string): string {
   return v.trim();
 }
 
-/** Never logs the token; use this to describe a config safely. */
+/** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
-  `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port}`;
+  `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
+  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"}`;
