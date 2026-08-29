@@ -121,6 +121,96 @@ describe("computePlan", () => {
   });
 });
 
+describe("computePlan — delete-backwards-implements", () => {
+  test("10617-style: an Epic recorded as implementing a Story, with a correct Story->Epic counterpart, is planned for deletion", () => {
+    const epic = issue({ key: "KAN-100", issuetype: "Epic", issuelinks: [link("Implements", "inward", "KAN-101", "back-1")] });
+    const story = issue({ key: "KAN-101", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-100", "correct-1")] });
+    const plan = computePlan([epic, story]);
+    expect(plan.actions).toEqual([
+      {
+        ticket: "KAN-100",
+        action: "delete-backwards-implements",
+        otherEnd: "KAN-101",
+        linkId: "back-1",
+        reason: "KAN-100 (Epic) is recorded as implementing KAN-101 (Story) — backwards; a correct-direction Implements link exists between the same two tickets",
+      },
+    ]);
+    expect(plan.unresolved).toEqual([]);
+  });
+
+  test("10620-style: a Story recorded as implementing its Task, with a correct Task->Story counterpart, is planned for deletion", () => {
+    const story = issue({ key: "KAN-110", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-111", "back-2")] });
+    const task = issue({ key: "KAN-111", issuetype: "Task", issuelinks: [link("Implements", "inward", "KAN-110", "correct-2")] });
+    const plan = computePlan([story, task]);
+    expect(plan.actions).toEqual([
+      {
+        ticket: "KAN-110",
+        action: "delete-backwards-implements",
+        otherEnd: "KAN-111",
+        linkId: "back-2",
+        reason: "KAN-110 (Story) is recorded as implementing KAN-111 (Task) — backwards; a correct-direction Implements link exists between the same two tickets",
+      },
+    ]);
+    expect(plan.unresolved).toEqual([]);
+  });
+
+  test("10618-style: a Story recorded as implementing a DONE Task, with a correct counterpart, is still found and planned (Done-fetch regression guard)", () => {
+    const story = issue({ key: "KAN-120", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-121", "back-3")] });
+    const doneTask = issue({ key: "KAN-121", issuetype: "Task", statusCategory: "Done", issuelinks: [link("Implements", "inward", "KAN-120", "correct-3")] });
+    // the Done task must be passed in allIssues (it is excluded from iteration but its level must still resolve)
+    const plan = computePlan([story, doneTask]);
+    expect(plan.actions).toEqual([
+      {
+        ticket: "KAN-120",
+        action: "delete-backwards-implements",
+        otherEnd: "KAN-121",
+        linkId: "back-3",
+        reason: "KAN-120 (Story) is recorded as implementing KAN-121 (Task) — backwards; a correct-direction Implements link exists between the same two tickets",
+      },
+    ]);
+    expect(plan.unresolved).toEqual([]);
+  });
+
+  test("a backwards Implements link with no correct-direction counterpart is unresolved, not deleted", () => {
+    // KAN-131's real owning story is KAN-129 (correctly implemented) so the pre-existing task-resolution
+    // loop stays silent; KAN-130's backwards Implements link to KAN-131 has no counterpart of its own.
+    const storyOwner = issue({ key: "KAN-129", issuetype: "Story" });
+    const story = issue({ key: "KAN-130", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-131", "back-4")] });
+    const task = issue({ key: "KAN-131", issuetype: "Task", issuelinks: [link("Implements", "inward", "KAN-129", "own-1")] });
+    const plan = computePlan([storyOwner, story, task]);
+    expect(plan.actions).toEqual([]);
+    expect(plan.unresolved).toEqual([{ ticket: "KAN-130", reason: "backwards Implements link without a correct counterpart" }]);
+  });
+
+  test("correct-direction Implements links (Task->Story, Story->Epic) are never flagged as backwards", () => {
+    const epic = issue({ key: "KAN-140", issuetype: "Epic" });
+    const story = issue({ key: "KAN-141", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-140", "si-140")] });
+    const task = issue({ key: "KAN-142", issuetype: "Task", issuelinks: [link("Implements", "inward", "KAN-141", "ti-141")] });
+    const plan = computePlan([epic, story, task]);
+    expect(plan.actions).toEqual([]);
+    expect(plan.unresolved).toEqual([]);
+  });
+
+  test("a backwards link appearing on BOTH ends' issuelinks (same link id) is planned exactly once", () => {
+    const epic = issue({ key: "KAN-150", issuetype: "Epic", issuelinks: [link("Implements", "inward", "KAN-151", "dup-1")] });
+    const story = issue({
+      key: "KAN-151",
+      issuetype: "Story",
+      issuelinks: [link("Implements", "outward", "KAN-150", "dup-1"), link("Implements", "inward", "KAN-150", "correct-dup")],
+    });
+    const plan = computePlan([epic, story]);
+    const backDeletes = plan.actions.filter((a) => a.action === "delete-backwards-implements");
+    expect(backDeletes).toEqual([{ ticket: "KAN-150", action: "delete-backwards-implements", otherEnd: "KAN-151", linkId: "dup-1", reason: expect.any(String) }]);
+  });
+
+  test("idempotence: computing the plan after the backwards link has been deleted plans nothing new", () => {
+    const epic = issue({ key: "KAN-160", issuetype: "Epic" });
+    const story = issue({ key: "KAN-161", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-160", "correct-160")] });
+    const plan = computePlan([epic, story]);
+    expect(plan).toEqual({ actions: [], unresolved: [] });
+  });
+});
+
 describe("summarize / formatTable", () => {
   test("summarize reports an empty plan explicitly, and a non-empty one with counts", () => {
     expect(summarize({ actions: [], unresolved: [] })).toBe("plan is empty — nothing to migrate");
@@ -145,6 +235,25 @@ describe("summarize / formatTable", () => {
     expect(table).toContain("KAN-4");
     expect(table).toContain("unresolved");
     expect(table).toContain("no owner");
+  });
+
+  test("summarize includes the delete-backwards-implements count when present", () => {
+    const plan: Plan = {
+      actions: [{ ticket: "KAN-1", action: "delete-backwards-implements", otherEnd: "KAN-2", linkId: "9", reason: "r" }],
+      unresolved: [],
+    };
+    expect(summarize(plan)).toBe("plan: 0 add-implements, 0 delete-relates, 1 delete-backwards-implements, 0 unresolved");
+  });
+
+  test("formatTable shows the link id for a delete-backwards-implements row", () => {
+    const plan: Plan = {
+      actions: [{ ticket: "KAN-1", action: "delete-backwards-implements", otherEnd: "KAN-2", linkId: "9", reason: "backwards" }],
+      unresolved: [],
+    };
+    const table = formatTable(plan);
+    expect(table).toContain("delete-backwards-implements");
+    expect(table).toContain("9");
+    expect(table).toContain("backwards");
   });
 });
 
