@@ -30,4 +30,20 @@ describe("loadConfig", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
     expect(d).not.toContain("s3cr3t-VALUE"); expect(d).toContain("***"); expect(d).toContain("12 chars");
   });
+
+  test("github is absent when GITHUB_TOKEN_FILE or BUTCHR_GITHUB_ORGS is missing", () => {
+    expect(loadConfig(base, noRead).github).toBeUndefined();
+    expect(loadConfig({ ...base, BUTCHR_GITHUB_ORGS: "acme" }, noRead).github).toBeUndefined();
+    expect(loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh" }, (p) => { expect(p).toBe("/gh"); return "ghtok\n"; }).github).toBeUndefined();
+  });
+  test("github is populated when both are set; orgs are comma-split and trimmed", () => {
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme, other-org" }, () => "ghtok\n");
+    expect(c.github).toEqual({ token: "ghtok", orgs: ["acme", "other-org"] });
+  });
+  test("describeConfig reports github as disabled or its orgs, never the token value", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("github=disabled");
+    const d = describeConfig(loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme" }, () => "s3cr3t-gh-tok"));
+    expect(d).not.toContain("s3cr3t-gh-tok");
+    expect(d).toContain("orgs=acme");
+  });
 });
