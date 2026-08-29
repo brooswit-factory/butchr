@@ -380,7 +380,7 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     ({ key: "S", status, summary, issuetype: "Story", assignee: "a", parent: null, updated, labels });
   const relOf = (labels: string[], updated: string, status = "In Progress", summary = "s") =>
     [{ issue: story(labels, updated, status, summary), watchers: ["E"] }];
-  const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c" }];
+  const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c", authorEmail: null }];
 
   test("a label-only daemon-namespaced diff with no recorded comment baseline is delivered (fail-safe), and exactly one comments() call is made", async () => {
     const herd = fakeHerd();
