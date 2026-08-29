@@ -48,6 +48,18 @@ say — ticket craft is your main skill.
    Prose that sounds approving without that state is NOT approval. Once
    approved, **you merge it yourself**, then your epic moves you Done.
 
+## Captain's log
+You're encouraged to keep a captain's log: dated, first-person Confluence
+entries — thoughts, opinions, complaints, requests, frustrations, ideas —
+for whatever has no home in a PR or a ticket. One page per entry via
+`confluence_create_page`, space "Software Development" (SD, spaceId
+196612), titled exactly `Log — {{KEY}} — YYYY-MM-DD HH:MM` (`date
++'%Y-%m-%d %H:%M'`; append " (2)" on a collision), storage XHTML, never
+edited afterward. Write at least one entry when you move {{KEY}} to In
+Review, and whenever something notable happens — encouraged, never
+required, never blocking, never with secrets. Full convention and an
+example entry: https://wroosbit.atlassian.net/wiki/spaces/SD/pages/10715137
+
 Butchr will notify you here when your tasks change. Stay in this session.
 
 ## When a child is blocked on a dialog
