@@ -21,9 +21,13 @@ export interface MigrateIssue {
 
 export interface AddAction { ticket: string; action: "add-implements"; otherEnd: string; reason: string }
 export interface DeleteAction { ticket: string; action: "delete-relates"; otherEnd: string; linkId: string; reason: string }
-export type Action = AddAction | DeleteAction;
+export interface DeleteBackwardsImplementsAction { ticket: string; action: "delete-backwards-implements"; otherEnd: string; linkId: string; reason: string }
+export type Action = AddAction | DeleteAction | DeleteBackwardsImplementsAction;
 export interface Unresolved { ticket: string; reason: string }
 export interface Plan { actions: Action[]; unresolved: Unresolved[] }
+
+/** Epic > Story > Task. An Implements link is valid only when the implementer's level is strictly lower than the boss's. */
+const LEVEL: Record<string, number> = { Epic: 2, Story: 1, Task: 0 };
 
 const SUMMARY_PREFIX = /^\[(KAN-\d+)\]/;
 
@@ -40,6 +44,70 @@ const implementsBoss = (issue: MigrateIssue, bossKey: string): boolean =>
 
 const relatesTo = (issue: MigrateIssue, otherKey: string): MigrateLink | undefined =>
   issue.issuelinks.find((l) => l.type === "Relates" && l.key === otherKey);
+
+/**
+ * Translates one Implements link entry, as seen from `owner`'s own
+ * issuelinks row, into the (implementer, boss) pair it records — regardless
+ * of which end we're reading from. direction "outward" means the OTHER end
+ * is the implementer; "inward" means the OTHER end is the boss (same
+ * convention as implementsBoss above).
+ */
+const recordedRoles = (owner: MigrateIssue, link: MigrateLink): { implementerKey: string; bossKey: string } =>
+  link.direction === "outward" ? { implementerKey: link.key, bossKey: owner.key } : { implementerKey: owner.key, bossKey: link.key };
+
+/**
+ * Finds Implements links whose recorded implementer sits at the same or a
+ * higher hierarchy level than its recorded boss (Task->Story is valid;
+ * Epic->Story is not — see LEVEL). A backwards link is planned for deletion
+ * only when a correct-direction Implements link between the SAME two
+ * tickets already exists; otherwise it is reported unresolved, since
+ * deleting it would strand the only wake path between the two tickets.
+ * Iterates ALL issues, Done included: a backwards link is never a valid
+ * wake path regardless of either endpoint's status, so cleaning it up must
+ * not depend on when the operator happens to run --apply relative to when
+ * its endpoints close. `byKeyAll` is used both to resolve levels and to
+ * look up the counterpart.
+ */
+function planBackwardsImplements(allIssues: MigrateIssue[], byKeyAll: Map<string, MigrateIssue>): { actions: DeleteBackwardsImplementsAction[]; unresolved: Unresolved[] } {
+  const actions: DeleteBackwardsImplementsAction[] = [];
+  const unresolved: Unresolved[] = [];
+  const seen = new Set<string>(); // link id — a link between two issues appears on both ends' issuelinks
+
+  for (const owner of allIssues) {
+    for (const l of owner.issuelinks) {
+      if (l.type !== "Implements" || seen.has(l.id)) continue;
+      const { implementerKey, bossKey } = recordedRoles(owner, l);
+      const implementer = byKeyAll.get(implementerKey);
+      const boss = byKeyAll.get(bossKey);
+      const implementerLevel = implementer ? LEVEL[implementer.issuetype] : undefined;
+      const bossLevel = boss ? LEVEL[boss.issuetype] : undefined;
+
+      if (implementerLevel === undefined || bossLevel === undefined) {
+        seen.add(l.id);
+        unresolved.push({ ticket: owner.key, reason: `cannot resolve hierarchy level of ${implementerLevel === undefined ? implementerKey : bossKey}: not present in fetched issue set` });
+        continue;
+      }
+      if (implementerLevel < bossLevel) continue; // correctly directed — leave untouched
+
+      seen.add(l.id);
+      // the REAL implementer is whichever ticket is actually strictly lower — bossKey here; look for it implementing implementerKey
+      const hasCorrectCounterpart = implementsBoss(byKeyAll.get(bossKey)!, implementerKey);
+      if (!hasCorrectCounterpart) {
+        unresolved.push({ ticket: owner.key, reason: "backwards Implements link without a correct counterpart" });
+        continue;
+      }
+      actions.push({
+        ticket: implementerKey,
+        action: "delete-backwards-implements",
+        otherEnd: bossKey,
+        linkId: l.id,
+        reason: `${implementerKey} (${implementer!.issuetype}) is recorded as implementing ${bossKey} (${boss!.issuetype}) — backwards; a correct-direction Implements link exists between the same two tickets`,
+      });
+    }
+  }
+
+  return { actions, unresolved };
+}
 
 /** Resolve a task's owning story: existing Implements > Relates > "[KAN-nnn]" summary fallback. */
 function resolveOwningStory(task: MigrateIssue, byKey: Map<string, MigrateIssue>): { storyKey: string; viaSummary: boolean } | null {
@@ -68,6 +136,7 @@ function resolveOwningStory(task: MigrateIssue, byKey: Map<string, MigrateIssue>
 export function computePlan(allIssues: MigrateIssue[]): Plan {
   const issues = allIssues.filter((i) => i.statusCategory !== "Done");
   const byKey = new Map(issues.map((i) => [i.key, i]));
+  const byKeyAll = new Map(allIssues.map((i) => [i.key, i]));
   const actions: Action[] = [];
   const unresolved: Unresolved[] = [];
 
@@ -106,6 +175,10 @@ export function computePlan(allIssues: MigrateIssue[]): Plan {
     }
   }
 
+  const backwards = planBackwardsImplements(allIssues, byKeyAll);
+  actions.push(...backwards.actions);
+  unresolved.push(...backwards.unresolved);
+
   return { actions, unresolved };
 }
 
@@ -113,13 +186,17 @@ export function computePlan(allIssues: MigrateIssue[]): Plan {
 export function summarize(plan: Plan): string {
   const adds = plan.actions.filter((a) => a.action === "add-implements").length;
   const dels = plan.actions.filter((a) => a.action === "delete-relates").length;
-  if (adds === 0 && dels === 0 && plan.unresolved.length === 0) return "plan is empty — nothing to migrate";
-  return `plan: ${adds} add-implements, ${dels} delete-relates, ${plan.unresolved.length} unresolved`;
+  const backDels = plan.actions.filter((a) => a.action === "delete-backwards-implements").length;
+  if (adds === 0 && dels === 0 && backDels === 0 && plan.unresolved.length === 0) return "plan is empty — nothing to migrate";
+  const parts = [`${adds} add-implements`, `${dels} delete-relates`];
+  if (backDels > 0) parts.push(`${backDels} delete-backwards-implements`);
+  parts.push(`${plan.unresolved.length} unresolved`);
+  return `plan: ${parts.join(", ")}`;
 }
 
 export function formatTable(plan: Plan): string {
   const rows: string[][] = [["ticket", "action", "other end", "link id", "reason"]];
-  for (const a of plan.actions) rows.push([a.ticket, a.action, a.otherEnd, a.action === "delete-relates" ? a.linkId : "-", a.reason]);
+  for (const a of plan.actions) rows.push([a.ticket, a.action, a.otherEnd, a.action === "delete-relates" || a.action === "delete-backwards-implements" ? a.linkId : "-", a.reason]);
   for (const u of plan.unresolved) rows.push([u.ticket, "unresolved", "-", "-", u.reason]);
   const widths = rows[0]!.map((_, i) => Math.max(...rows.map((r) => r[i]!.length)));
   return rows.map((r) => r.map((c, i) => c.padEnd(widths[i]!)).join("  ")).join("\n");
@@ -146,10 +223,14 @@ function mapIssue(raw: any): MigrateIssue {
 }
 
 /**
- * Fetches every non-Done KAN issue with the fields the plan needs, paginating
- * via nextPageToken until exhausted. client.ts's search() hardcodes a
- * different fields list and its links() drops link IDs (needed to delete), so
- * this is its own small typed helper rather than a bent reuse of the client.
+ * Fetches every KAN issue (Done included — a backwards Implements link's
+ * other end may be Done, and its level must still be resolvable) with the
+ * fields the plan needs, paginating via nextPageToken until exhausted.
+ * computePlan() is responsible for filtering Done issues out of the set it
+ * iterates while still resolving levels from the full set. client.ts's
+ * search() hardcodes a different fields list and its links() drops link IDs
+ * (needed to delete), so this is its own small typed helper rather than a
+ * bent reuse of the client.
  */
 export async function fetchAllIssues(cfg: Config, fetchImpl: FetchLike): Promise<MigrateIssue[]> {
   const auth = basicAuth(cfg);
@@ -157,7 +238,7 @@ export async function fetchAllIssues(cfg: Config, fetchImpl: FetchLike): Promise
   let nextPageToken: string | undefined;
   do {
     const params = new URLSearchParams({
-      jql: "project = KAN AND statusCategory != Done",
+      jql: "project = KAN",
       fields: "issuetype,parent,status,summary,issuelinks",
       maxResults: "100",
     });
@@ -190,9 +271,11 @@ async function deleteLink(site: string, auth: string, fetchImpl: FetchLike, link
 }
 
 /**
- * Executes a plan: every add-implements before any delete-relates: if an add
- * fails, the delete-relates that depended on it (matched by ticket+otherEnd)
- * is skipped and reported rather than stranding the ticket with neither link.
+ * Executes a plan: every add-implements before any delete (delete-relates or
+ * delete-backwards-implements). If an add fails, the delete-relates that
+ * depended on it (matched by ticket+otherEnd) is skipped and reported rather
+ * than stranding the ticket with neither link. A delete-backwards-implements
+ * never depends on an add, so failedAdds never suppresses it.
  */
 export async function applyPlan(plan: Plan, cfg: Config, fetchImpl: FetchLike): Promise<ApplyOutcome[]> {
   const auth = basicAuth(cfg);
@@ -211,8 +294,8 @@ export async function applyPlan(plan: Plan, cfg: Config, fetchImpl: FetchLike): 
   }
 
   for (const d of plan.actions) {
-    if (d.action !== "delete-relates") continue;
-    if (failedAdds.has(`${d.ticket}->${d.otherEnd}`)) {
+    if (d.action !== "delete-relates" && d.action !== "delete-backwards-implements") continue;
+    if (d.action === "delete-relates" && failedAdds.has(`${d.ticket}->${d.otherEnd}`)) {
       outcomes.push({ ticket: d.ticket, action: d.action, otherEnd: d.otherEnd, ok: false, error: `skipped — Implements add to ${d.otherEnd} failed` });
       continue;
     }
