@@ -9,6 +9,8 @@ export interface AtlassianOps {
   createIssue(p: { projectKey: string; issuetype: string; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string; priority?: string }): Promise<unknown>;
   /** Set priority by name (e.g. "High"). */
   setPriority(key: string, priority: string): Promise<unknown>;
+  /** Assign to an accountId. Never writes any other field. */
+  assign(key: string, accountId: string): Promise<unknown>;
   createPage(p: { spaceId: string; title: string; body: string }): Promise<unknown>;
   getPage(id: string): Promise<unknown>;
   listSpaces(): Promise<unknown>;

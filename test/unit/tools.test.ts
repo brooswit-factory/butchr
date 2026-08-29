@@ -8,7 +8,7 @@ function rig(roles: { story?: string; task?: string } = {}) {
   const ops: AtlassianOps = {
     getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
     transition: rec("transition"), createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
-    createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+    assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -21,7 +21,7 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces",
-      "jira_add_comment", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
+      "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
     ]);
   });
@@ -67,7 +67,7 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
     const ops: AtlassianOps = {
       getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
       linkIssues: async () => undefined, transition: async () => ({}), createIssue: async () => ({}),
-      setPriority: async () => ({}),
+      setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
     };
     const tools = atlassianTools(ops, () => {});
@@ -119,7 +119,7 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
       getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"),
       linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
-      createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
       ...opsOverrides,
     };
     const audits: string[] = [];
@@ -300,11 +300,81 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
     const ops: AtlassianOps = {
       getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
       linkIssues: async () => ({}), transition: async () => ({}), createIssue: async () => ({ key: "KAN-1" }),
-      setPriority: async () => undefined,
+      setPriority: async () => undefined, assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
     expect(result).toEqual({ ok: true, key: "KAN-1", priority: "High" });
+  });
+});
+
+describe("jira_assign (KAN-810)", () => {
+  const STORY_ID = "712020:e160cf60-6480-44de-8554-af5b81c584e2";
+  const TASK_ID = "712020:619ec5ec-2e92-492f-8979-91ccda318230";
+  const roles = { story: STORY_ID, task: TASK_ID };
+
+  function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
+    const calls: Array<[string, unknown[]]> = [];
+    const rec = (name: string, result: unknown = { ok: name }) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
+    const ops: AtlassianOps = {
+      getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"),
+      linkIssues: rec("linkIssues"), transition: rec("transition"),
+      createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+      ...opsOverrides,
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    return { tools, calls, audits, conn };
+  }
+
+  test("accountId passthrough: a non-role string reaches ops.assign unchanged, and only the assignee field is touched", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.jira_assign!.handler({ key: "KAN-1", assignee: "acct-explicit" }, conn);
+    expect(calls).toEqual([["assign", ["KAN-1", "acct-explicit"]]]);
+  });
+
+  test('role resolution: "story" resolves through the roles map to its configured accountId', async () => {
+    const { tools, calls, conn } = rig();
+    await tools.jira_assign!.handler({ key: "KAN-1", assignee: "story" }, conn);
+    expect(calls).toEqual([["assign", ["KAN-1", STORY_ID]]]);
+  });
+  test('role resolution: "task" resolves through the roles map to its configured accountId', async () => {
+    const { tools, calls, conn } = rig();
+    await tools.jira_assign!.handler({ key: "KAN-1", assignee: "task" }, conn);
+    expect(calls).toEqual([["assign", ["KAN-1", TASK_ID]]]);
+  });
+  test("role resolution is case-insensitive", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.jira_assign!.handler({ key: "KAN-1", assignee: "STORY" }, conn);
+    expect(calls).toEqual([["assign", ["KAN-1", STORY_ID]]]);
+  });
+
+  test("unset role refuses, names the env var, does not call ops.assign, and audits the refusal", async () => {
+    const { tools, calls, audits, conn } = rig({});
+    await expect(tools.jira_assign!.handler({ key: "KAN-1", assignee: "story" }, conn))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_STORY/);
+    expect(calls.find(([n]) => n === "assign")).toBeUndefined();
+    expect(audits.some((a) => a.includes("REFUSED: no assignee (BUTCHR_ASSIGNEE_STORY unset)"))).toBe(true);
+  });
+  test("unset TASK role refuses and names BUTCHR_ASSIGNEE_TASK", async () => {
+    const { tools, audits, conn } = rig({});
+    await expect(tools.jira_assign!.handler({ key: "KAN-1", assignee: "task" }, conn))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_TASK/);
+    expect(audits.some((a) => a.includes("REFUSED: no assignee (BUTCHR_ASSIGNEE_TASK unset)"))).toBe(true);
+  });
+
+  test("undefined-result guard: ops.assign resolving undefined (Jira's empty editIssue body) still produces a defined, ok:true MCP result", async () => {
+    const { tools, conn } = rig(roles, { assign: async () => undefined });
+    const result = await tools.jira_assign!.handler({ key: "KAN-1", assignee: "acct-x" }, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-1", assignee: "acct-x" });
+  });
+
+  test("audits every call, including a successful one, with the caller's issue", async () => {
+    const { tools, audits, conn } = rig();
+    await tools.jira_assign!.handler({ key: "KAN-1", assignee: "acct-x" }, conn);
+    expect(audits.some((a) => a.includes("KAN-7") && a.includes("assign KAN-1 →"))).toBe(true);
   });
 });
