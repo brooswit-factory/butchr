@@ -1,4 +1,4 @@
-import type { PrState } from "./plan.js";
+import type { PrLookup } from "./plan.js";
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -78,9 +78,17 @@ interface PullPayload {
   head: { ref: string };
 }
 
-async function fetchPull(deps: GithubDeps, ref: PrRef): Promise<PullPayload | null> {
+/**
+ * "unavailable" (a non-OK response) is kept distinct from a genuine miss —
+ * there is no such thing as a genuine miss here, only "got the payload" or
+ * "could not look" (KAN-832/837 site 2). Callers must not treat the two the
+ * same: a candidate confirmation during discovery skips the candidate either
+ * way, but the WARM path (an already-cached ref) must surface "unavailable"
+ * as "unknown", not as evidence the PR is gone.
+ */
+async function fetchPull(deps: GithubDeps, ref: PrRef): Promise<PullPayload | "unavailable"> {
   const res = await deps.fetchImpl(`https://api.github.com/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`, { headers: ghHeaders(deps.token) });
-  if (!res.ok) return null;
+  if (!res.ok) return "unavailable";
   return (await res.json()) as PullPayload;
 }
 
@@ -133,6 +141,18 @@ interface SearchOutcome {
    * latched as "no PR" (a 403 is not evidence of anything about the key).
    */
   nonOk?: { status: number; remaining: number | undefined; resetEpochSec: number | undefined };
+  /**
+   * Set (only when `found` is absent) if at least one candidate hit's own
+   * `/pulls/N` confirmation fetch was non-OK (KAN-832/837 review, PR #89) —
+   * distinct from a genuine prefix collision, which is silently skipped and
+   * never sets this. A candidate we could not confirm is "could not look" at
+   * THAT candidate, not evidence it wasn't a match, so the caller must not
+   * treat an all-unconfirmed round the same as a clean miss: it must not
+   * advance the negative-cache backoff and must not be latched as "no PR".
+   * An unconfirmed candidate followed by a later exact match is still a
+   * legitimate `found` — this only matters when nothing matched.
+   */
+  unconfirmed?: true;
 }
 
 /**
@@ -152,6 +172,7 @@ interface SearchOutcome {
  * try the remaining orgs, and the caller must not treat it as a miss.
  */
 async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "merged", onSearch: (res: Response) => void): Promise<SearchOutcome> {
+  let unconfirmed = false;
   for (const org of deps.orgs) {
     const q = new URLSearchParams({ q: `is:pr is:${status} head:${key} org:${org}` });
     const res = await deps.fetchImpl(`https://api.github.com/search/issues?${q}`, { headers: ghHeaders(deps.token) });
@@ -171,16 +192,24 @@ async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "m
       if (!m) continue;
       const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
       const pull = await fetchPull(deps, ref);
-      if (!pull || pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
+      if (pull === "unavailable") { unconfirmed = true; continue; } // could not confirm this candidate — not a collision, not a match either
+      if (pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
       return { found: { ref, pull } };
     }
   }
-  return {};
+  return unconfirmed ? { unconfirmed: true } : {};
 }
 
-async function fetchReviews(deps: GithubDeps, ref: PrRef): Promise<Review[]> {
+/**
+ * "unavailable" is kept distinct from "no reviews" (KAN-832/837 site 3): an
+ * empty array legitimately means "open, unreviewed", but a non-OK response
+ * means we don't know that — falling through to `reviewState([]) === "open"`
+ * would silently DOWNGRADE a possibly-approved PR. The caller must return
+ * "unknown" here rather than treat the two the same.
+ */
+async function fetchReviews(deps: GithubDeps, ref: PrRef): Promise<Review[] | "unavailable"> {
   const res = await deps.fetchImpl(`https://api.github.com/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/reviews`, { headers: ghHeaders(deps.token) });
-  if (!res.ok) return [];
+  if (!res.ok) return "unavailable";
   return (await res.json()) as Review[];
 }
 
@@ -257,36 +286,53 @@ export class PrTracker {
     this.deps.log?.(`[pr] ${key} search ${outcome.status}: ${remainingPart} ${resetPart}`);
   }
 
-  async stateFor(key: string): Promise<PrState> {
+  async stateFor(key: string): Promise<PrLookup> {
     if (this.merged.has(key)) return "merged"; // terminal: no further requests for this key, ever
     let ref = this.cache.get(key);
-    let pull: PullPayload | null;
+    let pull: PullPayload | "unavailable";
     if (ref) {
+      // WARM path (KAN-832/837 site 2): a 403/429/5xx/network blip on this
+      // already-discovered PR's direct fetch is "could not look", not "gone" —
+      // the cached ref stays valid and must NOT be evicted, so the next poll
+      // resolves without re-searching.
       pull = await fetchPull(this.deps, ref);
     } else {
       const now = this.now();
-      if (now < this.throttledUntil) return null; // tracker-wide throttle: no searches at all
+      if (now < this.throttledUntil) return "unknown"; // tracker-wide throttle: no searches at all
       const ks = this.keyState.get(key);
-      if (ks && now < ks.nextSearchAt) return null; // this key's own backoff hasn't elapsed
+      if (ks && now < ks.nextSearchAt) return "unknown"; // this key's own backoff hasn't elapsed
 
       const runMerged = !ks || ks.rounds === 0 || ks.rounds % MERGED_SWEEP_EVERY_ROUNDS === 0;
 
       const openOutcome = await discoverStatus(this.deps, key, "open", this.onSearch);
       if (openOutcome.nonOk) {
         this.handleNonOk(key, openOutcome.nonOk, now);
-        return null;
+        return "unknown";
       }
       let found = openOutcome.found;
+      let unconfirmed = openOutcome.unconfirmed ?? false;
       if (!found && runMerged) {
         const mergedOutcome = await discoverStatus(this.deps, key, "merged", this.onSearch);
         if (mergedOutcome.nonOk) {
           this.handleNonOk(key, mergedOutcome.nonOk, now);
-          return null;
+          return "unknown";
         }
         found = mergedOutcome.found;
+        unconfirmed = unconfirmed || (mergedOutcome.unconfirmed ?? false);
       }
 
+      if (!found && unconfirmed) {
+        // KAN-832/837 review (PR #89): at least one candidate hit's own /pulls/N
+        // confirmation was non-OK and nothing else matched — could not look at
+        // that candidate, not evidence it wasn't a match. Must not be recorded as
+        // a miss (the negative-cache backoff must not advance) and must not be
+        // latched as "no PR" the way a clean miss below is.
+        return "unknown";
+      }
       if (!found) {
+        // Genuine miss: both searches that ran came back OK with no exact match,
+        // and every candidate that was checked was successfully confirmed — this
+        // IS evidence of absence, unlike every "unknown" return above.
         const misses = (ks?.misses ?? 0) + 1;
         const rounds = (ks?.rounds ?? 0) + 1;
         const delay = BACKOFF_MS[Math.min(misses - 1, BACKOFF_MS.length - 1)]!;
@@ -298,7 +344,7 @@ export class PrTracker {
       pull = found.pull;
       this.cache.set(key, ref);
     }
-    if (!pull) return null;
+    if (pull === "unavailable") return "unknown"; // site 2: cached ref left in place, see comment above
     if (pull.merged) {
       this.merged.add(key);
       this.cache.delete(key);
@@ -309,6 +355,10 @@ export class PrTracker {
       return null;
     }
     const reviews = await fetchReviews(this.deps, ref);
+    // site 3: a could-not-fetch here would otherwise fall through to
+    // reviewState([]) === "open", an active downgrade of a possibly-approved
+    // PR. "unknown" preserves whatever is on the ticket instead.
+    if (reviews === "unavailable") return "unknown";
     return reviewState(reviews);
   }
 
