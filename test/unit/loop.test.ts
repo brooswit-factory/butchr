@@ -3,12 +3,13 @@ import { desiredFrom, reconcileNow, startLoop } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
-function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
+function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
   const running = new Set(initial);
   const spawned: string[] = [], stopped: string[] = [];
   return {
     running, spawned, stopped,
     async runningIssues() { return [...running]; },
+    async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
     async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
@@ -25,6 +26,24 @@ describe("reconcileNow", () => {
     expect(herd.spawned).toEqual(["NEW"]);
     expect(herd.stopped).toEqual(["OLD"]);
     expect([...herd.running].sort()).toEqual(["KEEP", "NEW"]);
+  });
+
+  test("a stale-but-desired issue is stopped then spawned fresh, and onRespawn fires once with its reason + observed argv", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const calls: any[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), { onRespawn: (issue, reason, observedArgv) => { calls.push({ issue, reason, observedArgv }); } });
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
+    expect(calls).toEqual([{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+  });
+
+  test("no onRespawn callback provided → stale issue still gets stopped and spawned", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]));
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
   });
 });
 
@@ -199,6 +218,31 @@ describe("startLoop own-label-write nudge suppression", () => {
     expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once (poll 1), nudged once (poll 2's real change)
   });
 
+  test("a notifying (non-quiet) label write still gets exactly one own-write `updated` bump swallowed", async () => {
+    // startLoop only sees the written-keys set syncLabels returns — it has no idea
+    // whether the write behind it was quiet (notifyUsers=false) or notifying (KAN-801):
+    // a notifying write bumps `updated` exactly the same way, so the swallow is unaffected.
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],
+      [{ ...iss("A", "In Progress"), updated: "t2" }], // our own notifying write bumped `updated`
+      [{ ...iss("A", "In Review"), updated: "t3" }],   // a real subsequent change
+    ];
+    const writes: Array<ReadonlySet<string>> = [new Set(["A"]), new Set(), new Set()];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      syncLabels: async () => { const w = writes[Math.min(n, writes.length - 1)]!; n++; return w; },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once, nudged once for the real change
+  });
+
   test("a poll whose only change is the daemon's own label write produces no nudge at all", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -218,5 +262,24 @@ describe("startLoop own-label-write nudge suppression", () => {
     await new Promise((r) => setTimeout(r, 60));
     stop();
     expect(notified).toEqual([]);
+  });
+});
+
+describe("startLoop respawn wiring", () => {
+  test("deps.onRespawn is invoked through reconcileNow on each poll a stale agent is found", async () => {
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
+    const respawns: any[] = [];
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      herd,
+      notify: () => {},
+      onRespawn: (issue, reason, observedArgv) => { respawns.push({ issue, reason, observedArgv }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+    expect(respawns[0]).toEqual({ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] });
+    expect(herd.stopped).toContain("A");
+    expect(herd.spawned).toContain("A");
   });
 });

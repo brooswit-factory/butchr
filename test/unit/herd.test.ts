@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd.js";
+import { reconcileNow } from "../../src/daemon/loop.js";
+import { workspaceRoot } from "../../src/agents/workspace.js";
+import type { ProcessEntry } from "../../src/agents/proctable.js";
 
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
@@ -177,5 +181,116 @@ describe("nudge", () => {
   test("false when the pane refuses (blocked at prompt time)", async () => {
     const herd = new HerdrHerd(base([], { fail: true }) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-7", "x")).toBe(false);
+  });
+});
+
+describe("staleIssues", () => {
+  function fakeHerdrWithCwd(agents: Array<{ name?: string; pane_id: string; cwd?: string | null }>) {
+    return { agent: { list: async () => ({ agents }) } } as any;
+  }
+  const instant = () => Promise.resolve();
+
+  test("a claude process at the reported cwd with a bare `claude --resume` argv -> stale, naming the missing flags", async () => {
+    const cwd = "/w/KAN-783";
+    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
+    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd, argv: ["claude", "--resume", "8e5164dc"] }];
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => table);
+    const stale = await herd.staleIssues();
+    expect(stale.length).toBe(1);
+    expect(stale[0]!.issue).toBe("KAN-783");
+    expect(stale[0]!.reason).toContain("--permission-mode bypassPermissions");
+    expect(stale[0]!.reason).toContain(`--mcp-config ${cwd}/mcp.json`);
+    expect(stale[0]!.reason).toContain("--dangerously-load-development-channels server:butchr");
+    expect(stale[0]!.observedArgv).toEqual(table[0]!.argv);
+  });
+
+  test("a claude process carrying the full flag set -> not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
+    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd, argv: ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"] }];
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => table);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("no cwd reported for the agent -> unknown, not stale (never even consults the process table)", async () => {
+    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }]);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => [{ pid: 1, ppid: 0, cwd: "/w/KAN-783", argv: ["claude", "--resume", "x"] }]);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("no claude process found for the cwd -> unknown, not stale", async () => {
+    const cwd = "/w/KAN-783";
+    const client = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }]);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, async () => []);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+});
+
+describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
+  // The real workspace directory buildWorkspace() would use for KAN-783 —
+  // the same one a herdr-reported agent cwd must match for selectClaudeProcess
+  // to find its process.
+  const dir = join(workspaceRoot(), "KAN-783");
+  const desired = new Map([["KAN-783", { key: "KAN-783", issuetype: "Task", summary: "s", parent: null }]]);
+
+  function fakeHerdrStale() {
+    let agents: Array<{ name: string; pane_id: string; cwd: string }> = [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: dir }];
+    const started: any[] = []; const closed: string[] = [];
+    const client = {
+      agent: {
+        list: async () => ({ agents }),
+        start: async (p: any) => { started.push(p); agents = [...agents, { name: "butchr-kan-783", pane_id: "w9:p1", cwd: dir }]; },
+      },
+      // Closing a pane retires its agent — herdr's list no longer carries it,
+      // exactly what makes spawn() (which no-ops when the name already
+      // exists) actually start a fresh one on the stop-then-spawn respawn path.
+      pane: { close: async (id: string) => { closed.push(id); agents = agents.filter((a) => a.pane_id !== id); } },
+      workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
+    };
+    return { client: client as any, started, closed };
+  }
+
+  test("a stale pane (bare `claude --resume`) is closed and a fresh agent started with the full spawn argv; the [butchr:respawn] notice fires exactly once", async () => {
+    const f = fakeHerdrStale();
+    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd: dir, argv: ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"] }];
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => table);
+    const notices: Array<{ issue: string; reason: string; observedArgv: string[] }> = [];
+    await reconcileNow(herd, desired, { onRespawn: (issue, reason, observedArgv) => { notices.push({ issue, reason, observedArgv }); } });
+
+    // a) pane closed AND a new agent started whose args equal the full spawn argv
+    expect(f.closed).toEqual(["w1:p1"]);
+    expect(f.started.length).toBe(1);
+    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args).toContain("--permission-mode");
+    expect(f.started[0].args).toContain("bypassPermissions");
+    expect(f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1]).toBe(dir + "/mcp.json");
+
+    // b) the notice was posted exactly once and starts with [butchr:respawn]'s reason shape
+    expect(notices.length).toBe(1);
+    expect(notices[0]!.issue).toBe("KAN-783");
+    expect(notices[0]!.reason.startsWith("argv lacks")).toBe(true);
+    expect(notices[0]!.observedArgv).toEqual(table[0]!.argv);
+  });
+
+  test("c) a second pass, now with the process table showing the full argv, closes/starts nothing", async () => {
+    const f = fakeHerdrStale();
+    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const table: ProcessEntry[] = [{ pid: 1, ppid: 0, cwd: dir, argv: goodArgv }];
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => table);
+    const notices: unknown[] = [];
+    await reconcileNow(herd, desired, { onRespawn: (...a) => { notices.push(a); } });
+    expect(f.closed).toEqual([]);
+    expect(f.started).toEqual([]);
+    expect(notices).toEqual([]);
+  });
+
+  test("d) a process table with NO claude process for that cwd closes/starts nothing (unknown, not stale)", async () => {
+    const f = fakeHerdrStale();
+    const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve(), async () => []);
+    const notices: unknown[] = [];
+    await reconcileNow(herd, desired, { onRespawn: (...a) => { notices.push(a); } });
+    expect(f.closed).toEqual([]);
+    expect(f.started).toEqual([]);
+    expect(notices).toEqual([]);
   });
 });

@@ -74,6 +74,10 @@ class AgentLabelStabilizer {
 export function createLabelSync(deps: SyncDeps) {
   const lastLabels = new Map<string, string[]>();
   const stabilizer = new AgentLabelStabilizer();
+  // Last failure reason logged per key, so a PERMANENT condition (e.g. a
+  // write that keeps 403ing) logs once instead of once per 15s poll; a
+  // failure whose reason actually changes still gets its own line.
+  const loggedFailure = new Map<string, string>();
 
   // Isolated per issue: syncLabels runs inside startLoop's snapshot function,
   // so an uncaught throw here would abort the WHOLE poll — no snapshot, no
@@ -85,8 +89,13 @@ export function createLabelSync(deps: SyncDeps) {
     if (!diff.add.length && !diff.remove.length) return true;
     try {
       await deps.jira.updateLabels(key, diff);
+      loggedFailure.delete(key);
     } catch (e) {
-      deps.log?.(`[labels] ${key} write failed: ${(e as Error)?.message ?? e}`);
+      const reason = (e as Error)?.message ?? String(e);
+      if (loggedFailure.get(key) !== reason) {
+        loggedFailure.set(key, reason);
+        deps.log?.(`[labels] ${key} write failed: ${reason}`);
+      }
       return false;
     }
     written.add(key);

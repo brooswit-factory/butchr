@@ -263,6 +263,18 @@ describe("createLabelSync", () => {
     expect(forgotten).toEqual(["KAN-1"]);
   });
 
+  test("a permanently failing write logs 'write failed' exactly once, not once per poll; a change in reason logs again", async () => {
+    const jira: LabelWriter = {
+      async updateLabels() { throw new Error("403 forbidden"); },
+    };
+    const logs: string[] = [];
+    const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]), log: (l) => logs.push(l) });
+    await sync([iss("KAN-1", "In Progress", [])]);
+    await sync([iss("KAN-1", "In Progress", [])]);
+    await sync([iss("KAN-1", "In Progress", [])]);
+    expect(logs.filter((l) => l.includes("KAN-1") && l.includes("write failed")).length).toBe(1);
+  });
+
   test("a failing write on the disappearance-cleanup path is retried on a later poll instead of being dropped", async () => {
     const failing = { on: false };
     const calls: Array<{ key: string; add: string[]; remove: string[] }> = [];

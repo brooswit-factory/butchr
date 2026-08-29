@@ -14,10 +14,12 @@ import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
+import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { respawnComment } from "../agents/respawn.js";
 
 let config;
 try {
@@ -28,7 +30,14 @@ try {
   process.exit(1);
 }
 
-const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token);
+const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// Label writes must never silently 403: Jira only honours notifyUsers=false
+// for an account holding Administer Jira/Projects on the ticket's project.
+// This gate preflights that per project (first sight, cached for the run)
+// and falls back to notifying writes — loudly, once — when it's absent.
+// Shared between the poll loop and the one-time startup sweep below so both
+// see the same cached verdict per project.
+const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
@@ -50,7 +59,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-}, atlassianTools(ops));
+}, atlassianTools(ops, undefined, config.assignees));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -71,7 +80,7 @@ const stalled = createStalledCheck({
   log: (line) => console.error(`  ${line}`),
 });
 const syncLabels = createLabelSync({
-  jira: atlassian,
+  jira: labelWriter,
   agentStatuses: async () => {
     const { agents } = await herdr.agent.list();
     const m = new Map<string, string>();
@@ -110,7 +119,7 @@ watchSessionLimits({
 // this. Not a new polling timer — runs once, here, and never again.
 void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
-  jira: atlassian,
+  jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
 }).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
@@ -169,6 +178,12 @@ startLoop({
     void notifyIssue(mcp, issue, msg);
     const woke = await herd.nudge(issue, msg).catch(() => false);
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+  },
+  onRespawn: async (issue, reason, observedArgv) => {
+    console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    // A failed notice must not undo the respawn that already happened — log and move on.
+    await ops.addComment(issue, respawnComment(issue, reason, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
   },
   syncLabels,
   intervalMs: 15_000,
