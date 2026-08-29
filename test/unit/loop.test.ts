@@ -747,6 +747,39 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     stop();
     expect(notified.filter((e) => e.issue === "K").length).toBe(0);
   });
+
+  test("fail-open pin: a pr:* transition leaves the comment cursor stale (never advanced), and a LATER agent:*-only diff whose newest comment moved on since that stale baseline is still DELIVERED, not wrongly suppressed (KAN-819 epic ruling)", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const responses = [[{ id: "5", body: "x", created: "c", authorEmail: null }], [{ id: "6", body: "x", created: "c", authorEmail: null }]];
+    let commentCalls = 0;
+    const comments = async () => { const r = responses[Math.min(commentCalls, 1)]!; commentCalls++; return r; };
+    const polls: JiraIssue[][] = [
+      [withPr(["agent:working", "pr:open"], "t0")],    // baseline poll
+      [withPr(["agent:idle", "pr:open"], "t1")],        // agent:*-only diff: establishes the comment-cursor baseline ("5")
+      [withPr(["agent:idle", "pr:approved"], "t2")],    // P: pr:* transition — delivered past suppression, cursor NOT touched (stays "5")
+      [withPr(["agent:working", "pr:approved"], "t3")], // Q: agent:*-only diff again; newest comment has moved to "6" since the stale "5" baseline
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    expect(kEvents.length).toBe(3); // poll1 (baseline set), poll2 (the transition, exempted), poll3 (delivered despite the stale cursor)
+    expect(kEvents[0]!.reason).toBeUndefined();
+    expect(kEvents[1]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
+    expect(kEvents[2]!.reason).toBeUndefined();
+    // Exactly 2 comments() calls (poll1 and poll3) — poll2's transition never
+    // consulted crossDaemonSuppressed at all, so the cursor genuinely never
+    // advanced during it; the swap to "6" is discovered only at poll3.
+    expect(commentCalls).toBe(2);
+  });
 });
 
 describe("startLoop respawn wiring", () => {
