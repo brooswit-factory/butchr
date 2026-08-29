@@ -6,6 +6,7 @@ export interface JiraIssue {
   assignee: string | null;
   parent: string | null;
   updated: string;
+  labels: string[];
 }
 
 export interface IssueLink {

@@ -13,6 +13,9 @@ import { createEscalator } from "../agents/escalation-loop.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
+import { createLabelSync } from "../labels/sync.js";
+import { PrTracker } from "../labels/pr.js";
+import { sweepStaleAgentLabels } from "../labels/sweep.js";
 
 let config;
 try {
@@ -49,6 +52,33 @@ const { app, mcp } = buildApp({
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
+if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
+
+const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined;
+const syncLabels = createLabelSync({
+  jira: atlassian,
+  agentStatuses: async () => {
+    const { agents } = await herdr.agent.list();
+    const m = new Map<string, string>();
+    for (const a of agents) {
+      const issue = issueOfAgentName((a as { name?: string }).name);
+      if (issue) m.set(issue, a.agent_status ?? "unknown");
+    }
+    return m;
+  },
+  ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
+  log: (line) => console.error(`  ${line}`),
+});
+
+// One-time startup sweep: agent:* stranded by a ticket that went inactive
+// while the daemon was down. createLabelSync's bookkeeping is in-memory and
+// the 15s poll only ever sees active tickets, so nothing else ever revisits
+// this. Not a new polling timer — runs once, here, and never again.
+void sweepStaleAgentLabels({
+  search: (jql) => atlassian.search(jql),
+  jira: atlassian,
+  log: (line) => console.error(`  ${line}`),
+}).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
 const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
 const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
@@ -102,6 +132,7 @@ startLoop({
     const woke = await herd.nudge(issue, msg).catch(() => false);
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
   },
+  syncLabels,
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });
