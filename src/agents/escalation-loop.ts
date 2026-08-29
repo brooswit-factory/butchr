@@ -88,7 +88,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   // observe `escalatedAt === undefined` and both post the escalation comment.
   const inFlight = new Set<string>();
   const paneEscalations = new Map<string, number[]>();
-  const cappedIssues = new Set<string>();
+  const cappedPanes = new Set<string>();
   const log = (line: string) => deps.log(`[prompts] ${line}`);
 
   // KAN-756, item (D): consumed directive comment ids, kept PER PANE but
@@ -107,25 +107,38 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   // not one per poll.
   const lastUnparseableHash = new Map<string, string>();
 
-  async function escalate(issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
+  async function escalate(paneId: string, issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
     const rows = await deps.comments(issue).catch((e) => {
       log(`comments fetch failed for ${issue}: ${(e as Error)?.message ?? e}`);
       return [] as CommentRow[];
     });
     const existing = rows.find((r) => r.body.startsWith(MARKER) && r.body.includes(`fingerprint: ${fp}`));
     if (existing) {
-      s.escalatedAt = Date.parse(existing.created) || deps.now();
+      const adoptedAt = Date.parse(existing.created) || deps.now();
+      s.escalatedAt = adoptedAt;
+      // KAN-756, item (F): an escalation adopted after a daemon restart is
+      // still an escalation comment that exists on the ticket — the spec is
+      // explicit that it counts toward the hourly budget. Recorded at the
+      // COMMENT's own timestamp, not deps.now(), so a restart adopting three
+      // hour-old escalations doesn't grant a fresh budget it didn't earn.
+      const recent = (paneEscalations.get(paneId) ?? []).filter((t) => deps.now() - t < 60 * 60_000);
+      recent.push(adoptedAt);
+      paneEscalations.set(paneId, recent);
       log(`adopted existing escalation ${issue} fp=${fp} from comment ${existing.id} (daemon restart)`);
       return;
     }
     // Rate cap: at most 3 escalation comments per pane per hour. Beyond that,
     // one summary notice, then log-only — a misbehaving parser must never be
-    // able to spam a ticket unboundedly.
+    // able to spam a ticket unboundedly. KAN-756, item (E): keyed by PANE,
+    // not issue — a pane can outlive an issue key in the herd (e.g. an
+    // agent's pane is recreated under the same ticket), and a budget tied to
+    // the issue would wrongly carry over to what is, from the daemon's
+    // perspective, a fresh pane.
     const HOUR = 60 * 60_000;
-    const recent = (paneEscalations.get(issue) ?? []).filter((t) => deps.now() - t < HOUR);
+    const recent = (paneEscalations.get(paneId) ?? []).filter((t) => deps.now() - t < HOUR);
     if (recent.length >= 3) {
-      if (!cappedIssues.has(issue)) {
-        cappedIssues.add(issue);
+      if (!cappedPanes.has(paneId)) {
+        cappedPanes.add(paneId);
         await deps.addComment(issue, `${MARKER} ${issue}: escalation rate cap reached (3/hour) — further blocked-prompt changes are being logged only. An operator or parent can still reply ANSWER <n> <fingerprint> against the latest logged fingerprint.`);
       }
       s.escalatedAt = deps.now();
@@ -133,8 +146,8 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       return;
     }
     recent.push(deps.now());
-    paneEscalations.set(issue, recent);
-    cappedIssues.delete(issue);
+    paneEscalations.set(paneId, recent);
+    cappedPanes.delete(paneId);
     await deps.addComment(issue, escalationComment(issue, prompt, fp));
     s.escalatedAt = deps.now();
     log(`escalated ${issue} fp=${fp} "${prompt.question.slice(0, 60)}"`);
@@ -224,7 +237,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
 
     if (s.escalatedAt === undefined) {
-      await escalate(issue, prompt, fp, s);
+      await escalate(paneId, issue, prompt, fp, s);
       return;
     }
 

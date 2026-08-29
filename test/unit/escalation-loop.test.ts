@@ -494,6 +494,78 @@ Enter to confirm · Esc to cancel`;
   });
 });
 
+// KAN-756, items (E) and (F): conformance to the story's original spec that
+// v0.5.16 did not fully meet (KAN-755 comment 14869, ruled in scope by the
+// epic). The cap is per PANE — v0.5.16 keyed it by issue despite the spec
+// and despite the variable being named paneEscalations — and an escalation
+// ADOPTED after a daemon restart counts toward the budget, which v0.5.16's
+// adoption branch skipped entirely (it returned before the cap block).
+describe("escalation spam containment (KAN-756, items E and F)", () => {
+  const BYPASS = `You are running in Bypass
+ Permissions mode.
+ ❯ No, exit
+   Yes, I accept
+ Enter to confirm · Esc to cancel`;
+  async function earn(h: ReturnType<typeof harness>, pane: string, issue: string, text: string) {
+    h.setPaneText(text);
+    const d = parsePrompt(text)!;
+    await h.poll(pane, issue, d);
+    await h.poll(pane, issue, d);
+  }
+
+  test("(E) the cap is keyed per PANE, not per issue: a second pane on the SAME issue is unaffected by the first pane's cap", async () => {
+    const h = harness();
+    h.setClock(1_000_000);
+    // p1 gets capped on KAN-1: 3 escalations + 1 summary notice.
+    await earn(h, "p1", "KAN-1", REAL);
+    await earn(h, "p1", "KAN-1", TRUST);
+    await earn(h, "p1", "KAN-1", FREE_TEXT_MENU);
+    await earn(h, "p1", "KAN-1", BYPASS);
+    expect(h.posted.filter((c) => c.text.includes("rate cap reached")).length).toBe(1);
+    const before = h.posted.length;
+
+    // p2 — a DIFFERENT pane, e.g. the same agent's pane recreated by the
+    // herd — but the SAME issue key. Under per-ISSUE keying this would
+    // still be capped (0.5.16's bug); under per-PANE keying it is a fresh
+    // budget.
+    const FRESH = `Overwrite the existing file?
+❯ 1. Yes, overwrite
+  2. No, keep both
+Enter to confirm · Esc to cancel`;
+    await earn(h, "p2", "KAN-1", FRESH);
+    const newEscalations = h.posted.slice(before).filter((c) => c.text.includes("fingerprint:"));
+    expect(newEscalations.length).toBe(1); // p2 escalated normally, not capped
+    expect(h.posted.filter((c) => c.text.includes("rate cap reached")).length).toBe(1); // still just the one notice, from p1
+  });
+
+  test("(F) an escalation ADOPTED after a restart counts toward the cap: 3 adopted + a 4th distinct dialog posts the summary, not a 4th escalation", async () => {
+    const h = harness();
+    h.setClock(1_000_000);
+    const dialogs = [REAL, TRUST, FREE_TEXT_MENU];
+    const fps = dialogs.map((t) => fingerprint(parsePrompt(t)!));
+    // Simulate a restart: these 3 escalation comments already exist on the
+    // issue (posted by a prior daemon instance) BEFORE this daemon instance
+    // ever calls onBlocked for them.
+    for (const fp of fps) {
+      h.addHumanComment(`[butchr:blocked] KAN-1 is waiting on a decision:\n\nQ\n\n1. a\n2. b\n\nfingerprint: ${fp}\n\nReply...`);
+    }
+    for (const text of dialogs) {
+      await earn(h, "p1", "KAN-1", text); // each hits the "adopted" branch — zero NEW posts
+    }
+    expect(h.posted.length).toBe(0); // nothing posted yet — all 3 were adopted, not posted
+    expect(h.logs.filter((l) => /adopted existing escalation/.test(l)).length).toBe(3);
+
+    // A 4th, genuinely DISTINCT dialog: the budget is already spent by the
+    // 3 adoptions, so this must be capped, not escalated.
+    await earn(h, "p1", "KAN-1", BYPASS);
+    const escalations = h.posted.filter((c) => c.text.includes("fingerprint:"));
+    const notices = h.posted.filter((c) => c.text.includes("rate cap reached"));
+    expect(escalations.length).toBe(0);
+    expect(notices.length).toBe(1);
+    expect(h.logs.some((l) => /RATE-CAPPED/.test(l))).toBe(true);
+  });
+});
+
 // KAN-756, item (A): consecutive-poll debounce. "Consecutive" means
 // consecutive polls OF THE WATCHER — a poll on which the pane is not
 // blocked, or does not parse, must reset the debounce exactly like a
