@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.8.1] - 2026-08-28
+### Fixed
+- **`bun run check` no longer depends on the pane's `node`.** `typecheck` ran `tsc` through a package.json bare-script invocation, which resolves `node_modules/.bin/tsc`'s shebang against whatever `node` the pane's PATH happens to give — on panes where that resolves to node v12, tsc's own `??` syntax fails to parse (`SyntaxError: Unexpected token '?'`) even though the code being checked is fine. `typecheck` now runs `bun --bun x tsc -p tsconfig.json --noEmit`, which forces the bun runtime instead of honoring the shebang. `check` also now prints a one-line `scripts/preflight.ts` diagnostic (bun/node/tsc versions in use) before the gate runs, so a pasted gate result is self-describing; it degrades to `node: not found` rather than failing when `node` is absent, and never fails the gate on its own.
+
 ## [0.8.0] - 2026-08-28
 ### Removed
 - **Relates-link routing (deprecated in 0.6.0).** The one-release deprecation bridge that let a "Relates" link route notifications alongside "Implements" is gone — `watchedKeys()` now routes only an outward-end "Implements" link, exactly as documented. `jira_link_issues` still accepts an explicit `type` for other link kinds (Blocks, Relates, …); it just no longer routes them.
