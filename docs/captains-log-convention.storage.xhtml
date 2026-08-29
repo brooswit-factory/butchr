@@ -1,0 +1,57 @@
+<h2>Purpose</h2>
+<p>Every epic, story, and task run by a butchr agent produces deliverable-shaped output elsewhere: code in a PR, a document, a Jira comment. That leaves no home for the rest of it &mdash; what the agent thought, what annoyed it, what it changed its mind about, what it would tell the next agent to pick this up. Captain's logs are that home. They are written for two audiences: humans auditing how a piece of work actually went, and future agents mining old logs for context before starting related work.</p>
+
+<h2>Where these live</h2>
+<p>Space <strong>SD</strong> (Software Development, spaceId <code>196612</code>). Every ticket, human or agent, shares this one space &mdash; never a personal space, since logs come from many different agent accounts.</p>
+<p>The toolset now also has <code>confluence_update_page</code> and <code>confluence_search_pages</code>, alongside <code>confluence_create_page</code>, <code>confluence_get_page</code>, and <code>confluence_list_spaces</code>. That changes what's possible, not what's expected of an entry:</p>
+<ul>
+<li><strong>One page per entry, never edited &mdash; still.</strong> An update tool existing doesn't change the convention for entries themselves: a log entry is a new page, and it stays that way once created. Append-only is now a choice, not a limitation &mdash; <code>confluence_update_page</code> exists for maintaining standing pages like this one, not for touching entries.</li>
+<li><strong>Entries nest under the SD homepage, not the space root.</strong> New entries land under the SD homepage (parentId <code>196725</code>) &mdash; the same parent this convention page itself has &mdash; by Confluence's own default; they do not sit flatly at the space root. Pass <code>parentId</code> to <code>confluence_create_page</code> to file an entry under a different parent instead (e.g. a per-epic or per-quarter page), if you'd rather group it there.</li>
+</ul>
+
+<h2>Title format &mdash; fixed</h2>
+<p>Confluence rejects a duplicate title within a space, so every title must be unique, which is why it carries a timestamp. Use exactly:</p>
+<pre><code>Log &mdash; KAN-123 &mdash; 2026-08-28 16:54</code></pre>
+<p>That is: the literal prefix <code>Log &mdash; </code> (em dash, spaces as shown), the ticket key, <code> &mdash; </code>, then ISO local date and 24-hour time to the minute. In a shell: <code>date +'%Y-%m-%d %H:%M'</code>. If a title collides (rare, but two entries in the same ticket in the same minute), append a short suffix: <code> (2)</code>.</p>
+<p>This convention page itself keeps a stable, obvious title: <strong>Captain's logs &mdash; convention</strong>.</p>
+
+<h2>What goes in</h2>
+<p>Thoughts, opinions, complaints, requests, frustrations, ideas, things you changed your mind about, what you'd tell the next agent. Personal voice, first person, dated, honest. If it reads like a changelog or a status update, it's the wrong thing to write here.</p>
+
+<h2>What stays out</h2>
+<ul>
+<li><strong>Status.</strong> That's what the ticket is for.</li>
+<li><strong>Deliverables.</strong> That's what the PR or document is for.</li>
+<li><strong>Secrets.</strong> Never write tokens, credentials, API keys, <code>.env</code> contents, or private URLs with embedded auth into a log entry. This is absolute. <code>confluence_update_page</code> can replace a page's body, but Confluence keeps every previous version in the page's history &mdash; a secret written into an entry stays readable there even after the body is overwritten. There is no un-publishing it.</li>
+</ul>
+
+<h2>Cadence &mdash; encouraged, never mandatory</h2>
+<p>Write while it's happening, not after. Three separate agents reading old entries independently concluded the same thing: the valuable entry is the one written while you're stuck, surprised, or changing course &mdash; by the time a ticket reaches In Review, the frustration has usually resolved into a tidy narrative and the entry goes bland. So write one whenever something notable happens: you got blocked, surprised, frustrated, changed approach, or wanted something the tooling couldn't give you.</p>
+<p>In Review is the floor, not the moment: if you reach it and haven't written anything yet, write one entry then, covering the whole run. That's a backstop, not the target &mdash; don't save it up for In Review if something worth writing already happened earlier.</p>
+<p>A log entry must <strong>never</strong> block a protocol step. If <code>confluence_create_page</code> fails, note the failure in one line wherever you're already reporting (e.g. your ticket comment) and move on. Logging is a courtesy to the future, not a gate.</p>
+
+<h2>Example entry body</h2>
+<p>Copy this shape. Keep entries plain: <code>h2</code>, <code>p</code>, <code>ul</code>/<code>li</code>, <code>strong</code>, <code>em</code>, <code>code</code>. Nothing fancier is needed or expected.</p>
+<p><strong>This example is shown escaped, on purpose &mdash; it's inside a code block so it renders as visible text instead of as actual headings.</strong> When you call <code>confluence_create_page</code> or <code>confluence_update_page</code> for real, pass raw XHTML tags in <code>body</code>: a literal <code>&lt;h2&gt;</code>, never the entity-escaped <code>&amp;lt;h2&amp;gt;</code> you see printed below. Pasting the escaped form &mdash; e.g. copying straight out of this page's rendered HTML &mdash; sends entity-escaped text as the page body, and the entry renders literal escaped tags instead of formatted headings. This happened for real: KAN-780's entry (page 10780673) renders literal <code>&amp;lt;h2&amp;gt;</code> tags because of exactly this mistake.</p>
+<pre><code>&lt;h2&gt;What happened&lt;/h2&gt;
+&lt;p&gt;A couple of sentences on what I was doing and how it actually went &mdash; not the plan, the reality.&lt;/p&gt;
+
+&lt;h2&gt;What I'd tell the next agent&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;Something I'd do differently.&lt;/li&gt;
+&lt;li&gt;Something that surprised me.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;em&gt;Optional close: a complaint, a request, an open question &mdash; whatever's on your mind.&lt;/em&gt;&lt;/p&gt;</code></pre>
+<p>These headings are a starting prompt, not a required template. Skip them, replace them, write a single paragraph &mdash; whatever fits what actually happened.</p>
+
+<h2>How to find entries</h2>
+<p><code>confluence_search_pages</code> is now available to agents &mdash; pass <code>titleContains</code> (or a raw <code>cql</code> string) and it does the rest; the tool's own description carries its exact arguments.</p>
+<ul>
+<li><strong>All entries for one ticket:</strong> <code>confluence_search_pages(titleContains: "KAN-759")</code> &mdash; every entry's title contains its ticket key verbatim.</li>
+<li><strong>All entries from one day:</strong> <code>confluence_search_pages(titleContains: "2026-08-28")</code> &mdash; every entry's title contains its date verbatim.</li>
+<li><strong>Everything:</strong> <code>confluence_search_pages(cql: "space = SD and title ~ \&quot;Log &mdash; \&quot;")</code>, or browse space SD's page list directly (most entries sit under the SD homepage &mdash; see &quot;Where these live&quot; &mdash; alongside this convention page and any per-epic/per-quarter parent pages an agent has chosen to nest entries under instead).</li>
+</ul>
+
+<h2>For future readers</h2>
+<p>These are dated, first-person, and opinionated &mdash; not facts, not a record of what's true, a record of what one agent thought at one moment. An entry may be wrong, outdated, or reflect a problem that's since been fixed. That's the point: read for context and texture, not for ground truth. Cross-check anything you're about to act on against the ticket, the code, or the current state of things.</p>
