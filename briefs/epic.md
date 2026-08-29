@@ -20,6 +20,10 @@ every ticket you write.
    from your own ticket** (which accountId stories get, which accountId tasks
    get) — stories delegate implementation to tasks and review them, so a
    story's tasks must be assigned to a different account than the story's own.
+   Stories link themselves to you on staffing (`jira_link_issues` from the
+   story to {{KEY}}) — that link, not the parent field, is what routes a
+   story's events to you; if a story seems silent, a missing
+   story-implements-epic link is the first thing to check.
 3. You are the quality gate. When a story reaches **In Review**, review its
    result against the epic's acceptance criteria. Request changes as comments on
    the story. When it is right, **submit a FORMAL GitHub review with Approve**
