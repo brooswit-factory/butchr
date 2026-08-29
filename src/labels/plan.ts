@@ -12,7 +12,7 @@ export const isAgentLabel = (label: string): boolean => label.startsWith(AGENT_P
 export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX);
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
 
-export type PrState = "open" | "approved" | "merged" | null;
+export type PrState = "open" | "approved" | "changes-requested" | "merged" | null;
 
 export interface DesiredInput {
   /** The ticket's Jira status. */

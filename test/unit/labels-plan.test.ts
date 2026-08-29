@@ -29,6 +29,9 @@ describe("desiredLabels", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: "open" })).toEqual(["agent:idle", "pr:open"]);
     expect(desiredLabels({ status: "Done", agentStatus: null, prState: "merged" })).toEqual(["pr:merged"]);
   });
+  test("pr:changes-requested is emitted like any other pr state (KAN-819/823)", () => {
+    expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: "changes-requested" })).toEqual(["agent:working", "pr:changes-requested"]);
+  });
   test("stalled takes precedence over idle (KAN-804/807): exactly one agent:* label, never both", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null, stalled: true })).toEqual(["agent:stalled"]);
     expect(desiredLabels({ status: "In Progress", agentStatus: "done", prState: null, stalled: true })).toEqual(["agent:stalled"]); // done maps to idle first

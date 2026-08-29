@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { activeKeys, changedKeys, isDaemonLabelOnlyDiff } from "../../src/jira-watch/diff.js";
+import { activeKeys, changedKeys, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status = "In Progress", summary = "s", updated = "t", labels: string[] = []): JiraIssue =>
@@ -57,5 +57,41 @@ describe("isDaemonLabelOnlyDiff", () => {
     const before = iss("A", "In Progress", "s", "t1", []);
     const after = iss("A", "In Progress", "s", "t2", ["urgent"]);
     expect(isDaemonLabelOnlyDiff(before, after)).toBe(false);
+  });
+});
+
+describe("prTransition", () => {
+  const withPr = (label: string | null) => iss("A", "In Progress", "s", "t", label ? [`pr:${label}`] : []);
+
+  test("none -> open counts", () => {
+    expect(prTransition(withPr(null), withPr("open"))).toEqual({ from: null, to: "open" });
+  });
+  test("open -> approved counts", () => {
+    expect(prTransition(withPr("open"), withPr("approved"))).toEqual({ from: "open", to: "approved" });
+  });
+  test("open -> changes-requested counts", () => {
+    expect(prTransition(withPr("open"), withPr("changes-requested"))).toEqual({ from: "open", to: "changes-requested" });
+  });
+  test("changes-requested -> approved counts", () => {
+    expect(prTransition(withPr("changes-requested"), withPr("approved"))).toEqual({ from: "changes-requested", to: "approved" });
+  });
+  test("approved -> merged counts", () => {
+    expect(prTransition(withPr("approved"), withPr("merged"))).toEqual({ from: "approved", to: "merged" });
+  });
+  test("a pure removal (pr:x -> no pr:* label at all) never counts, even though the label set changed", () => {
+    expect(prTransition(withPr("approved"), withPr(null))).toBeNull();
+  });
+  test("an agent:*-only diff (no pr:* label involved at all) is not a transition", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:idle"]);
+    expect(prTransition(before, after)).toBeNull();
+  });
+  test("no label change at all -> null", () => {
+    expect(prTransition(withPr("open"), withPr("open"))).toBeNull();
+  });
+  test("a transition nested inside a status change still counts — status/summary are irrelevant to this rule", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["pr:open"]);
+    const after = iss("A", "In Review", "s", "t2", ["pr:approved"]);
+    expect(prTransition(before, after)).toEqual({ from: "open", to: "approved" });
   });
 });

@@ -1,7 +1,7 @@
 import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
-import { activeKeys, changedKeys, isDaemonLabelOnlyDiff } from "../jira-watch/diff.js";
+import { activeKeys, changedKeys, isDaemonLabelOnlyDiff, prTransition } from "../jira-watch/diff.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
 
 /** A ticket watched on behalf of active issues via the Implements chain (see src/jira-watch/routes.ts). */
@@ -10,6 +10,14 @@ export interface RelatedIssue {
   /** Active issue keys whose agents should hear when this ticket changes. */
   watchers: readonly string[];
 }
+
+/**
+ * Why an agent is being nudged, when it is more than "your ticket changed" —
+ * currently only a pr:* transition on the ticket's OWN agent (see
+ * `prTransition`, src/jira-watch/diff.ts). Omitted/undefined for every other
+ * nudge, so existing callers and tests are unaffected.
+ */
+export type NotifyReason = { pr: { from: string | null; to: string } };
 
 export interface LoopDeps {
   /** Fetch the assigned issues (active + recently changed) each poll. */
@@ -23,8 +31,12 @@ export interface LoopDeps {
    */
   related?: (active: readonly string[]) => Promise<RelatedIssue[]>;
   herd: Herd;
-  /** Nudge the agent working `issue`; `about` is the ticket that changed (not always its own). */
-  notify: (issue: string, about: string) => void | Promise<void>;
+  /**
+   * Nudge the agent working `issue`; `about` is the ticket that changed (not
+   * always its own). `reason`, when present, names WHY beyond the default
+   * "your ticket changed" — see `NotifyReason`.
+   */
+  notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
   /**
    * Called once per respawned agent, right after it's back up. Jira knowledge
    * (the [butchr:respawn] notice) lives OUTSIDE loop.ts — this is the seam
@@ -156,7 +168,9 @@ interface Snapshot { issues: JiraIssue[]; related: RelatedIssue[] }
  * each affected agent, naming the ticket that changed — unless it is
  * suppressed as an echo of a write the daemon itself made (own-write ledger,
  * `deps.suppress`) or a cross-daemon label-only echo (`isDaemonLabelOnlyDiff`
- * + `deps.comments`).
+ * + `deps.comments`) — EXCEPT a pr:* transition on a ticket's own agent
+ * (`prTransition`), which is delivered past both suppressions and names the
+ * transition in the third `notify` argument.
  */
 export function startLoop(deps: LoopDeps): Stop {
   // Persists ACROSS polls (unlike `sent`, reset each poll below): the last
@@ -188,11 +202,11 @@ export function startLoop(deps: LoopDeps): Stop {
     },
     async (next, prev) => {
       const sent = new Set<string>();
-      const send = async (issue: string, about: string) => {
+      const send = async (issue: string, about: string, reason?: NotifyReason) => {
         const id = `${issue}|${about}`;
         if (sent.has(id)) return;
         sent.add(id);
-        await deps.notify(issue, about);
+        await deps.notify(issue, about, reason);
       };
 
       // Memoized per key, per poll: the label-only branch makes at most one
@@ -244,6 +258,26 @@ export function startLoop(deps: LoopDeps): Stop {
       for (const key of changedKeys(prev.issues, next.issues)) {
         const before = issueOf(prev.issues, key);
         const after = issueOf(next.issues, key);
+        // A pr:* transition on the ticket's OWN agent is delivered BEFORE
+        // either suppression is consulted (KAN-691/KAN-819/KAN-823): neither
+        // the own-write ledger (writer "daemon" — a label sync write) nor
+        // isDaemonLabelOnlyDiff may swallow it, because it's the one label
+        // flip an approved/changes-requested author is actually waiting on.
+        // This deliberately SKIPS crossDaemonSuppressed too, so the per-key
+        // comment cursor does not advance this poll for this key when no
+        // watcher also touches it. That is safe: the cursor is used only as
+        // an EQUALITY check against a monotonically-growing newest-comment
+        // id (see crossDaemonSuppressed below), so leaving it one poll stale
+        // only ever biases a LATER comparison toward "not suppressed"
+        // (delivered) — it can never manufacture a match that wrongly
+        // suppresses a genuine later change. This mirrors the existing
+        // tolerance in `suppressed()` itself: an own-write-ledger hit already
+        // short-circuits before crossDaemonSuppressed ever runs.
+        const transition = before && after ? prTransition(before, after) : null;
+        if (transition) {
+          await send(key, key, { pr: transition });
+          continue;
+        }
         if (await suppressed(key, before, after, key)) continue;
         await send(key, key);
       }
