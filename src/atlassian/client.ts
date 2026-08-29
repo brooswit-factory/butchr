@@ -59,8 +59,8 @@ export class AtlassianClient {
     const body = await this.get(`/rest/api/3/issue/${issueKey}?fields=issuelinks`);
     const out: IssueLink[] = [];
     for (const l of body.fields?.issuelinks ?? []) {
-      if (l.outwardIssue) out.push({ type: l.type?.name ?? "", direction: "outward", key: l.outwardIssue.key });
-      else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", direction: "inward", key: l.inwardIssue.key });
+      if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key });
+      else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key });
     }
     return out;
   }
