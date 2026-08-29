@@ -13,6 +13,17 @@ function fakeJira(): LabelWriter & { calls: Array<{ key: string; add: string[]; 
   };
 }
 
+function fakeJiraFailingFor(badKey: string): LabelWriter & { calls: Array<{ key: string; add: string[]; remove: string[] }> } {
+  const calls: Array<{ key: string; add: string[]; remove: string[] }> = [];
+  return {
+    calls,
+    async updateLabels(key, ops) {
+      if (key === badKey) throw new Error("403 forbidden");
+      calls.push({ key, add: [...(ops.add ?? [])], remove: [...(ops.remove ?? [])] });
+    },
+  };
+}
+
 describe("createLabelSync", () => {
   test("working -> idle -> blocked -> none: each confirmed transition is exactly one Jira update", async () => {
     const jira = fakeJira();
@@ -154,5 +165,62 @@ describe("createLabelSync", () => {
     const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"], ["KAN-2", "idle"]]) });
     const written = await sync([iss("KAN-1", "In Progress", []), iss("KAN-2", "In Progress", ["agent:idle"])]);
     expect([...written]).toEqual(["KAN-1"]);
+  });
+
+  test("done maps to agent:idle, not agent:working (herdr's done = sitting at its prompt)", async () => {
+    const jira = fakeJira();
+    const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "done"]]) });
+    await sync([iss("KAN-1", "In Progress", [])]);
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:idle"], remove: [] }]);
+  });
+
+  test("a persistently failing write for one issue is isolated: other issues still get written, one log line, no throw", async () => {
+    const jira = fakeJiraFailingFor("KAN-BAD");
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-BAD", "idle"], ["KAN-GOOD", "idle"]]),
+      log: (line) => logs.push(line),
+    });
+    const written = await sync([iss("KAN-BAD", "In Progress", []), iss("KAN-GOOD", "In Progress", [])]);
+    expect(jira.calls).toEqual([{ key: "KAN-GOOD", add: ["agent:idle"], remove: [] }]);
+    expect([...written]).toEqual(["KAN-GOOD"]);
+    expect(logs.some((l) => l.includes("KAN-BAD") && l.includes("write failed") && l.includes("403 forbidden"))).toBe(true);
+  });
+
+  test("a failed write is not recorded as applied: the key is retried, not treated as already-labeled", async () => {
+    const failing = { on: true };
+    const calls: Array<{ key: string; add: string[]; remove: string[] }> = [];
+    const jira: LabelWriter = {
+      async updateLabels(key, ops) {
+        if (failing.on) throw new Error("timeout");
+        calls.push({ key, add: [...(ops.add ?? [])], remove: [...(ops.remove ?? [])] });
+      },
+    };
+    const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]), log: () => {} });
+    await sync([iss("KAN-1", "In Progress", [])]); // write fails; not recorded in lastLabels
+    failing.on = false;
+    await sync([iss("KAN-1", "In Progress", [])]); // retried from the same starting labels, now succeeds
+    expect(calls).toEqual([{ key: "KAN-1", add: ["agent:idle"], remove: [] }]);
+  });
+
+  test("a failing write on the disappearance-cleanup path is retried on a later poll instead of being dropped", async () => {
+    const failing = { on: false };
+    const calls: Array<{ key: string; add: string[]; remove: string[] }> = [];
+    const jira: LabelWriter = {
+      async updateLabels(key, ops) {
+        if (failing.on) throw new Error("503 unavailable");
+        calls.push({ key, add: [...(ops.add ?? [])], remove: [...(ops.remove ?? [])] });
+      },
+    };
+    const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]), log: () => {} });
+    await sync([iss("KAN-1", "In Progress", [])]); // establishes agent:idle
+    calls.length = 0;
+    failing.on = true;
+    await sync([]); // disappears; cleanup write fails
+    expect(calls).toEqual([]);
+    failing.on = false;
+    await sync([]); // still gone; cleanup retried, now succeeds
+    expect(calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:idle"] }]);
   });
 });

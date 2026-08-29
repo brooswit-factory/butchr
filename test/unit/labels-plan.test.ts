@@ -14,11 +14,11 @@ describe("desiredLabels", () => {
   test("active ticket, no agent running -> agent:none", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: null, prState: null })).toEqual(["agent:none"]);
   });
-  test("idle and blocked map directly; any other non-empty status is working", () => {
+  test("idle and blocked map directly; done is idle (an agent sitting at its prompt); unknown is working", () => {
     expect(desiredLabels({ status: "In Progress", agentStatus: "idle", prState: null })).toEqual(["agent:idle"]);
     expect(desiredLabels({ status: "In Review", agentStatus: "blocked", prState: null })).toEqual(["agent:blocked"]);
     expect(desiredLabels({ status: "In Progress", agentStatus: "working", prState: null })).toEqual(["agent:working"]);
-    expect(desiredLabels({ status: "In Progress", agentStatus: "done", prState: null })).toEqual(["agent:working"]);
+    expect(desiredLabels({ status: "In Progress", agentStatus: "done", prState: null })).toEqual(["agent:idle"]);
     expect(desiredLabels({ status: "In Progress", agentStatus: "unknown", prState: null })).toEqual(["agent:working"]);
   });
   test("inactive status carries no agent:* label, regardless of agentStatus", () => {

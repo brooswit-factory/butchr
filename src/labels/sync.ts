@@ -72,13 +72,24 @@ export function createLabelSync(deps: SyncDeps) {
   const lastLabels = new Map<string, string[]>();
   const stabilizer = new AgentLabelStabilizer();
 
-  const write = async (written: Set<string>, key: string, current: readonly string[], desired: readonly string[]) => {
+  // Isolated per issue: syncLabels runs inside startLoop's snapshot function,
+  // so an uncaught throw here would abort the WHOLE poll — no snapshot, no
+  // change detection, no nudges for any ticket — every 15s until whatever
+  // Jira rejected about this one write is fixed. A failed write must also
+  // never be recorded in lastLabels, since Jira's actual state didn't change.
+  const write = async (written: Set<string>, key: string, current: readonly string[], desired: readonly string[]): Promise<boolean> => {
     const diff = diffLabels(desired, current);
-    if (!diff.add.length && !diff.remove.length) return;
-    await deps.jira.updateLabels(key, diff);
+    if (!diff.add.length && !diff.remove.length) return true;
+    try {
+      await deps.jira.updateLabels(key, diff);
+    } catch (e) {
+      deps.log?.(`[labels] ${key} write failed: ${(e as Error)?.message ?? e}`);
+      return false;
+    }
     written.add(key);
     const parts = [...diff.add.map((l) => `+${l}`), ...diff.remove.map((l) => `-${l}`)];
     deps.log?.(`[labels] ${key} ${parts.join(" ")}`);
+    return true;
   };
 
   return async function syncLabels(issues: readonly JiraIssue[]): Promise<ReadonlySet<string>> {
@@ -100,8 +111,8 @@ export function createLabelSync(deps: SyncDeps) {
       }
       const prState = deps.prState ? await deps.prState(issue.key) : null;
       const desired = desiredLabels({ status: issue.status, agentStatus, prState });
-      await write(written, issue.key, issue.labels, desired);
-      lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
+      const ok = await write(written, issue.key, issue.labels, desired);
+      if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }
 
     for (const key of [...lastLabels.keys()]) {
@@ -109,8 +120,8 @@ export function createLabelSync(deps: SyncDeps) {
       stabilizer.clear(key);
       const current = lastLabels.get(key)!;
       const desired = current.filter((l) => !l.startsWith(AGENT_PREFIX));
-      await write(written, key, current, desired);
-      lastLabels.delete(key);
+      const ok = await write(written, key, current, desired);
+      if (ok) lastLabels.delete(key);
     }
 
     return written;

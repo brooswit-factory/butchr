@@ -25,9 +25,18 @@ export interface DesiredInput {
 
 export type AgentLabel = "working" | "idle" | "blocked" | "none";
 
-/** idle/blocked map directly; any other non-empty status (working/done/unknown/…) is "working". */
+/**
+ * idle and blocked map directly. "done" — herdr's status for an agent sitting
+ * at its prompt after finishing a turn (confirmed against a live `herdr agent
+ * list`: several done agents doing nothing) — is idle in every sense this
+ * board cares about, so it maps to idle too; labelling it "working" would be
+ * the exact lie this feature exists to prevent. Any other non-empty status
+ * (unknown, or a future herdr value) is "working" — the conservative default
+ * when the agent is running but its state isn't one we specifically know is
+ * idle-shaped.
+ */
 export const mapAgentStatus = (raw: string | null): AgentLabel => {
-  if (raw === "idle") return "idle";
+  if (raw === "idle" || raw === "done") return "idle";
   if (raw === "blocked") return "blocked";
   if (raw == null) return "none";
   return "working";
