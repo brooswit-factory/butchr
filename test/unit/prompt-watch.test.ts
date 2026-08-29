@@ -43,6 +43,40 @@ describe("watchPrompts", () => {
   });
 });
 
+describe("unparseable blocked panes are never silently dropped (KAN-756, item C)", () => {
+  test("a blocked pane whose text never parses is reported via onUnparseable, not dropped", async () => {
+    let fire: ((p: string, seq: number) => void) | null = null;
+    const reported: Array<{ paneId: string; text: string; pollSeq: number }> = [];
+    watchPrompts({
+      onBlocked: (cb) => { fire = cb; return () => {}; },
+      read: async () => "just working, tool output, no dialog here",
+      send: async () => {},
+      onPrompt: () => { throw new Error("should not be consulted — nothing parsed"); },
+      onUnparseable: (e) => reported.push(e),
+    });
+    fire!("p1", 7);
+    await Bun.sleep(5);
+    expect(reported).toEqual([{ paneId: "p1", text: "just working, tool output, no dialog here", pollSeq: 7 }]);
+  });
+
+  test("pollSeq threads through onExposed and onPrompt for a parseable prompt", async () => {
+    let fire: ((p: string, seq: number) => void) | null = null;
+    const exposed: unknown[] = [];
+    let promptSeq: number | undefined;
+    watchPrompts({
+      onBlocked: (cb) => { fire = cb; return () => {}; },
+      read: async () => MENU,
+      send: async () => {},
+      onPrompt: (e) => { promptSeq = e.pollSeq; return undefined; },
+      onExposed: (e) => exposed.push(e),
+    });
+    fire!("p1", 3);
+    await Bun.sleep(5);
+    expect(promptSeq).toBe(3);
+    expect((exposed[0] as { pollSeq: number }).pollSeq).toBe(3);
+  });
+});
+
 describe("continue screens", () => {
   test("'Press Enter to continue' gets a bare enter, no parsing needed", async () => {
     const sent: Array<[string, string]> = [];
