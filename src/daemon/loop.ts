@@ -99,7 +99,11 @@ export function startLoop(deps: LoopDeps): Stop {
       };
 
       // Memoized per key, per poll: the label-only branch makes at most one
-      // comments() call per key, however many watchers consult it.
+      // comments() call per key, however many watchers consult it. Fails
+      // OPEN: a rejected comments() call (a transient network error — this is
+      // a live Jira call) must never suppress and must never write the
+      // comment cursor, or a failed poll would install a wrong baseline and
+      // could cause a LATER poll to wrongly suppress a real change.
       const crossDaemonCache = new Map<string, Promise<boolean>>();
       const crossDaemonSuppressed = (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined): Promise<boolean> => {
         let p = crossDaemonCache.get(key);
@@ -107,7 +111,12 @@ export function startLoop(deps: LoopDeps): Stop {
           p = (async () => {
             if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
             if (!deps.comments) return false;
-            const comments = await deps.comments(key);
+            let comments: readonly JiraComment[];
+            try {
+              comments = await deps.comments(key);
+            } catch {
+              return false; // cannot look -> do not suppress; cursor left untouched
+            }
             const newest = comments[0]?.id ?? null;
             const hadBaseline = commentCursor.has(key);
             const baseline = commentCursor.get(key) ?? null;
@@ -120,15 +129,25 @@ export function startLoop(deps: LoopDeps): Stop {
         return p;
       };
 
+      // Both suppression checks require an ACTUAL before/after pair — a key
+      // appearing or disappearing is still a real change (the old
+      // isOwnLabelBump made this explicit; crossDaemonSuppressed already
+      // requires both above). Consulting the ledger with a stale previous
+      // `updated` for a now-gone key would check a value nothing this poll
+      // actually observed, so appear/disappear always delivers, unchecked.
+      const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
+        if (!before || !after) return false;
+        if (deps.suppress?.(key, after.updated, watcher)) return true;
+        return crossDaemonSuppressed(key, before, after);
+      };
+
       // Assigned issues: notify the issue's own agent only. Parent is membership
       // only (not an event to listen for) — a boss hears change only through
       // the Implements chain below, via routes.ts.
       for (const key of changedKeys(prev.issues, next.issues)) {
         const before = issueOf(prev.issues, key);
         const after = issueOf(next.issues, key);
-        const updated = after?.updated ?? before?.updated ?? "";
-        if (deps.suppress?.(key, updated, key)) continue;
-        if (await crossDaemonSuppressed(key, before, after)) continue;
+        if (await suppressed(key, before, after, key)) continue;
         await send(key, key);
       }
       // Related work (the Implements chain): notify every watcher of what changed.
@@ -137,11 +156,8 @@ export function startLoop(deps: LoopDeps): Stop {
       for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue))) {
         const before = relatedIssueOf(prev.related, key);
         const after = relatedIssueOf(next.related, key);
-        const updated = after?.updated ?? before?.updated ?? "";
-        const suppressedCrossDaemon = await crossDaemonSuppressed(key, before, after);
         for (const w of watchersOf(key)) {
-          if (deps.suppress?.(key, updated, w)) continue;
-          if (suppressedCrossDaemon) continue;
+          if (await suppressed(key, before, after, w)) continue;
           await send(w, key);
         }
       }

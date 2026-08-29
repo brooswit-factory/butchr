@@ -406,6 +406,87 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     expect(notified).toContain("E<-S");
     expect(commentCalls).toBe(0); // the extra call belongs only to the label-only branch
   });
+
+  test("a rejected comments() call fails OPEN: delivered (not suppressed), and does not corrupt the comment baseline for the next poll", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    let commentCalls = 0;
+    // poll 1: comments() rejects (transient network error) -> must still deliver
+    // poll 2: comments() succeeds with an unknown baseline (poll 1 never
+    // recorded one) -> still delivers, per the unknown-baseline fail-safe
+    const comments = async () => {
+      commentCalls++;
+      if (commentCalls === 1) throw new Error("503 unavailable");
+      return oneComment("5");
+    };
+    const polls = [[story(["agent:working"], "t")], [story(["agent:idle"], "t2")], [story(["agent:working"], "t3")]];
+    const relatedPolls = [relOf(["agent:working"], "t"), relOf(["agent:idle"], "t2"), relOf(["agent:working"], "t3")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    // Both label-only polls delivered: poll 1 despite the rejection, poll 2
+    // because the failed poll never wrote a baseline (still unknown).
+    expect(notified.filter((x) => x === "S<-S").length).toBe(2);
+    expect(notified.filter((x) => x === "E<-S").length).toBe(2);
+  });
+
+  test("an appearing/disappearing key is never checked against the label-only rule at all: no comments() call, always delivered", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    let commentCalls = 0;
+    const comments = async () => { commentCalls++; return oneComment("5"); };
+    const polls = [[story(["agent:working"], "t")], []]; // S disappears from the feed
+    const relatedPolls: ReturnType<typeof relOf>[] = [relOf(["agent:working"], "t"), []];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, 1)]!,
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("S<-S");
+    expect(notified).toContain("E<-S"); // the watcher hears the disappearance too — never checked against the label-only rule
+    expect(commentCalls).toBe(0);
+  });
+});
+
+describe("startLoop own-write ledger: appear/disappear bypasses suppression entirely", () => {
+  test("a disappearing key is never checked against the ledger with a stale `updated` — always delivered even if that stale value happens to match a recorded write", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const ledger = createOwnWriteLedger();
+    // A self-write was recorded for "t" (A's ORIGINAL updated) — if the
+    // suppression check ran on the stale previous value after A disappears,
+    // this would wrongly match and suppress a real, informative change.
+    ledger.record("A", "t", "A", Date.now());
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")], // updated "t" — matches the ledger entry above
+      [],                        // A disappears
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("A"); // disappearing is still a real change — delivered regardless
+  });
 });
 
 describe("startLoop task->story delivery (Part B, pinned)", () => {
