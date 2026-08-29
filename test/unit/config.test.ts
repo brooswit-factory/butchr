@@ -47,6 +47,13 @@ describe("loadConfig", () => {
     expect(d).toContain("orgs=acme");
   });
 
+  test("stalledMinutes defaults to 10, honours BUTCHR_STALLED_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).stalledMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "20" }, noRead).stalledMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+  });
+
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
     const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
     expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });

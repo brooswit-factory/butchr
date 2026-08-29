@@ -46,6 +46,31 @@ describe("reconcileNow", () => {
     expect(herd.stopped).toEqual(["STALE"]);
     expect(herd.spawned).toEqual(["STALE"]);
   });
+
+  // PR #68 review: HerdrHerd.spawn() now waits out KICKOFF_VERIFY_MS
+  // (KAN-804/807) before resolving. A serial spawn loop over a burst of new
+  // issues (several stories activating in one poll) would stall the entire
+  // 15s poll — label sync and every ticket's notifications included — for N
+  // times that wait. Prove they run concurrently instead: three spawns each
+  // taking DELAY_MS finish in ~one DELAY_MS, not three.
+  test("spawns a burst of new issues concurrently, not serially", async () => {
+    const DELAY_MS = 30;
+    const running = new Set<string>();
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(sp) { await new Promise((r) => setTimeout(r, DELAY_MS)); running.add(sp.key); },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return true; },
+    };
+    const start = Date.now();
+    await reconcileNow(herd, new Map([["A", spec("A")], ["B", spec("B")], ["C", spec("C")]]));
+    const elapsed = Date.now() - start;
+    expect([...running].sort()).toEqual(["A", "B", "C"]);
+    expect(elapsed).toBeLessThan(DELAY_MS * 2); // well under 3x if they ran serially
+  });
 });
 
 describe("startLoop: parent is membership only — never notified", () => {
@@ -355,7 +380,7 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     ({ key: "S", status, summary, issuetype: "Story", assignee: "a", parent: null, updated, labels });
   const relOf = (labels: string[], updated: string, status = "In Progress", summary = "s") =>
     [{ issue: story(labels, updated, status, summary), watchers: ["E"] }];
-  const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c" }];
+  const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c", authorEmail: null }];
 
   test("a label-only daemon-namespaced diff with no recorded comment baseline is delivered (fail-safe), and exactly one comments() call is made", async () => {
     const herd = fakeHerd();
