@@ -56,7 +56,11 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // is silently dropped) — the flat shape sent an empty spaceId and
     // Atlassian 400'd with "spaceId: must not be null" (red/green proven).
     createPage: (p) => wiki.page.createPage({ body: { spaceId: p.spaceId, status: "current", title: p.title, body: { representation: "storage", value: p.body } } }),
-    getPage: (id) => wiki.page.getPageById({ id, "body-format": "storage" }),
+    // GetPageById reads parameters.bodyFormat (not "body-format") and maps it
+    // to the 'body-format' search param itself — the old key never reached
+    // the request, so every read came back with an empty body (red/green
+    // proven).
+    getPage: (id) => wiki.page.getPageById({ id, bodyFormat: "storage" }),
     listSpaces: () => wiki.space?.getSpaces?.({ limit: 50 }) ?? wiki.spaces?.getSpaces?.({ limit: 50 }),
   };
 }
