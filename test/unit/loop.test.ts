@@ -28,8 +28,8 @@ describe("reconcileNow", () => {
   });
 });
 
-describe("startLoop parent notification", () => {
-  test("a changed child notifies its own agent AND the parent's, deduped", async () => {
+describe("startLoop: parent is membership only — never notified", () => {
+  test("a changed child notifies its own agent only; its parent is NOT notified", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     const polls: JiraIssue[][] = [
@@ -40,8 +40,8 @@ describe("startLoop parent notification", () => {
     const stop = startLoop({ search: async () => polls[Math.min(n++, 1)]!, herd, notify: (i) => { notified.push(i); }, intervalMs: 10 });
     await new Promise((r) => setTimeout(r, 60));
     stop();
-    expect(notified).toContain("KAN-2");   // the child
-    expect(notified).toContain("KAN-1");   // its parent (the reviewer)
+    expect(notified).toContain("KAN-2");       // the child
+    expect(notified).not.toContain("KAN-1");   // its parent is membership only — not notified
   });
 });
 

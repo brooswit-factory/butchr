@@ -34,9 +34,27 @@ describe("AtlassianClient", () => {
       { type: { name: "x" } },
     ] } } }));
     expect(await c.links("KAN-1")).toEqual([
-      { type: "Blocks", direction: "outward", key: "KAN-2" },
-      { type: "Relates", direction: "inward", key: "KAN-3" },
+      { type: "Blocks", otherEnd: "outward", key: "KAN-2" },
+      { type: "Relates", otherEnd: "inward", key: "KAN-3" },
     ]);
+  });
+
+  // Real-payload fixtures for BOTH ends of ONE Implements link (link id 10595,
+  // created by jira_link_issues(from=KAN-757, to=KAN-759), i.e. KAN-757
+  // implements KAN-759): on the boss (KAN-759), the implementer appears as
+  // outwardIssue; on the implementer (KAN-757), the boss appears as
+  // inwardIssue. This pins the DIRECTION CONTRACT from src/atlassian/types.ts.
+  test("links maps the boss's view of an Implements link: the implementer is otherEnd 'outward'", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-759": { fields: { issuelinks: [
+      { id: "10595", type: { name: "Implements" }, outwardIssue: { key: "KAN-757" } },
+    ] } } }));
+    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757" }]);
+  });
+  test("links maps the implementer's view of an Implements link: the boss is otherEnd 'inward'", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-757": { fields: { issuelinks: [
+      { id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } },
+    ] } } }));
+    expect(await c.links("KAN-757")).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759" }]);
   });
   test("a non-2xx response throws with the status", async () => {
     const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 401 }));
