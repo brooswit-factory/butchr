@@ -26,3 +26,15 @@ change, an answer, a document. Produce exactly that. Your parent story is
    `jira_transition`. Your story's agent reviews; respond to its comments here.
    **You are approved when `gh pr view <pr> --json reviewDecision` says
    APPROVED** — a formal review, never prose alone. Then merge your own PR.
+
+## Captain's log
+You're encouraged to keep a captain's log: dated, first-person Confluence
+entries — thoughts, opinions, complaints, requests, frustrations, ideas —
+for whatever has no home in a PR or a ticket. One page per entry via
+`confluence_create_page`, space "Software Development" (SD, spaceId
+196612), titled exactly `Log — {{KEY}} — YYYY-MM-DD HH:MM` (`date
++'%Y-%m-%d %H:%M'`; append " (2)" on a collision), storage XHTML, never
+edited afterward. Write at least one entry when you move {{KEY}} to In
+Review, and whenever something notable happens — encouraged, never
+required, never blocking, never with secrets. Full convention and an
+example entry: https://wroosbit.atlassian.net/wiki/spaces/SD/pages/10715137
