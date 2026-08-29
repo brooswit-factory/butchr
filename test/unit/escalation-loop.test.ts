@@ -41,6 +41,7 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
   let commentRows: CommentRow[] = [];
   let nextId = 1;
   let readCalls = 0;
+  let commentsCalls = 0;
   const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
 
   const escalator = createEscalator({
@@ -52,6 +53,7 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
       commentRows = [{ id: String(nextId++), body: text, created: new Date(clock).toISOString() }, ...commentRows];
     },
     comments: async () => {
+      commentsCalls++;
       await delay();
       if (opts.commentsFail) throw new Error("jira unreachable");
       return commentRows;
@@ -72,6 +74,7 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
     setClock: (ms: number) => { clock = ms; },
     setPaneText: (t: string) => { paneText = t; },
     get readCalls() { return readCalls; },
+    get commentsCalls() { return commentsCalls; },
     addHumanComment: (body: string) => {
       commentRows = [{ id: String(nextId++), body, created: new Date(clock).toISOString() }, ...commentRows];
     },
@@ -563,6 +566,157 @@ Enter to confirm · Esc to cancel`;
     expect(escalations.length).toBe(0);
     expect(notices.length).toBe(1);
     expect(h.logs.some((l) => /RATE-CAPPED/.test(l))).toBe(true);
+  });
+});
+
+// KAN-756 PR #40 review, Finding 2 (comments 14969/14976/14983): item (A)'s
+// onPoll/onNoPrompt used to fully DELETE a pane's PaneState the moment it
+// was reported not-blocked (or unparseable) — including escalatedAt and
+// followedUpAt, which have nothing to do with the debounce. On a pane that
+// had ALREADY escalated, one flickering poll made it forget entirely:
+// - the 15-minute follow-up (KAN-732's contract) never fires on a
+//   flickering pane, because the adoption branch `return`s as soon as it
+//   sets escalatedAt, so the follow-up check further down handleBlocked is
+//   never reached on that poll — and the NEXT flicker deletes the state
+//   again before any later poll can reach it either. Measured on the
+//   pre-fix branch: 1 escalation, 3 flickers, clock past 15 minutes, 3 more
+//   flickers → zero follow-ups, ever.
+// - the re-discovery round-trip through escalate()'s "adopted existing"
+//   branch on every flicker double-counts the rate-cap budget (found
+//   first; the id-dedupe alone was the initially proposed fix, but the
+//   epic ruled the deeper fix — state must survive the flicker at all —
+//   is what closes it, since a re-adoption should not need to happen for
+//   an in-memory pane in the first place).
+//
+// FIX: a poll on which the pane is not reported blocked (or is blocked but
+// unparseable) resets ONLY the debounce fields (blockedPolls, lastPollSeq)
+// in place — never deletes the entry. handleBlocked carries escalatedAt/
+// followedUpAt forward whenever the SAME fingerprint reappears after such
+// a gap (newState() alone would zero them right back out). A genuinely
+// DIFFERENT fingerprint still gets a full, clean reset — that contract is
+// unchanged and pinned below. The id-dedupe from the first round of review
+// stays as the backstop for a genuine daemon restart, which has no
+// in-memory state to preserve in the first place.
+describe("createEscalator — escalated state survives a flicker (KAN-756 PR #40 review, Finding 2)", () => {
+  test("the 15-minute follow-up fires exactly once on a pane that flickers repeatedly, not zero and not once per flicker", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates at clock=0
+    expect(h.posted.length).toBe(1);
+
+    // Flicker: not blocked, then blocked again with the SAME dialog — three
+    // times, before the follow-up window elapses.
+    for (let i = 0; i < 3; i++) {
+      h.notBlocked([]);
+      await h.poll("p1", "KAN-1", prompt);
+    }
+    expect(h.posted.length).toBe(1); // still just the one escalation
+
+    h.setClock(15 * 60_000);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(2); // exactly one follow-up
+    expect(h.posted[1]!.text).toMatch(/still waiting on the decision/);
+
+    // Three more flickers past the follow-up: still exactly one, not a
+    // second.
+    for (let i = 0; i < 3; i++) {
+      h.notBlocked([]);
+      await h.poll("p1", "KAN-1", prompt);
+    }
+    expect(h.posted.length).toBe(2);
+  });
+
+  test("flickers on an already-escalated pane cost exactly one comments() fetch per blocked poll — no extra re-adoption round-trip on top", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt); // debounce — no comments() call yet
+    expect(h.commentsCalls).toBe(0);
+    await h.poll("p1", "KAN-1", prompt); // escalates — 1 comments() call (idempotency check)
+    expect(h.commentsCalls).toBe(1);
+
+    for (let i = 1; i <= 5; i++) {
+      h.notBlocked([]); // no comments() call — nothing blocked this tick
+      await h.poll("p1", "KAN-1", prompt); // directive-check phase — exactly 1 more
+      expect(h.commentsCalls).toBe(1 + i);
+    }
+    // If escalatedAt had been lost on any flicker, that poll would instead
+    // re-enter escalate() and ALSO adopt — still one comments() call, but
+    // with an "adopted existing escalation" log line and a second entry in
+    // the rate-cap budget. Neither happened.
+    expect(h.logs.filter((l) => /adopted existing escalation/.test(l)).length).toBe(0);
+    expect(h.posted.length).toBe(1); // never re-escalated
+  });
+
+  test("a flicker followed by a NEW distinct dialog escalates it normally, with no rate-cap notice (the original Finding 2 probe)", async () => {
+    const h = harness();
+    const dialogA = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", dialogA);
+    await h.poll("p1", "KAN-1", dialogA); // escalate A
+    expect(h.posted.length).toBe(1);
+
+    for (let i = 0; i < 3; i++) {
+      h.notBlocked([]);
+      await h.poll("p1", "KAN-1", dialogA);
+    }
+    expect(h.posted.length).toBe(1); // still just A, no re-adoption round-trips
+
+    const dialogB = parsePrompt(TRUST)!;
+    await h.poll("p1", "KAN-1", dialogB);
+    await h.poll("p1", "KAN-1", dialogB); // escalate B — genuinely new fp
+    const escalations = h.posted.filter((c) => c.text.includes("fingerprint:"));
+    const notices = h.posted.filter((c) => c.text.includes("rate cap reached"));
+    expect(escalations.length).toBe(2); // A and B, both real escalations
+    expect(notices.length).toBe(0); // budget was never inflated by the flickers
+  });
+
+  test("a DIFFERENT fingerprint after a gap still starts over completely — the carry-over is keyed on the SAME fp, nothing looser", async () => {
+    const h = harness();
+    const dialogA = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", dialogA);
+    await h.poll("p1", "KAN-1", dialogA); // escalate A
+    expect(h.posted.length).toBe(1);
+
+    h.notBlocked([]); // gap
+    const dialogB = parsePrompt(TRUST)!;
+    await h.poll("p1", "KAN-1", dialogB); // a DIFFERENT fp after the gap
+    expect(h.posted.length).toBe(1); // does not inherit A's escalatedAt — must re-earn the debounce
+    await h.poll("p1", "KAN-1", dialogB);
+    expect(h.posted.length).toBe(2); // B escalates fresh, on its own two consecutive polls
+  });
+
+  test("re-adopting the SAME comment (dialog A, then B, then A again) counts toward the rate-cap budget only once — the id-dedupe backstop", async () => {
+    const h = harness();
+    h.setClock(1_000_000);
+    const dialogA = parsePrompt(REAL)!;
+    const dialogB = parsePrompt(TRUST)!;
+    await h.poll("p1", "KAN-1", dialogA);
+    await h.poll("p1", "KAN-1", dialogA); // escalate A — 1 posted, 1 budget entry
+    await h.poll("p1", "KAN-1", dialogB);
+    await h.poll("p1", "KAN-1", dialogB); // escalate B — 2 posted, 2 budget entries (genuinely distinct)
+    expect(h.posted.filter((c) => c.text.includes("fingerprint:")).length).toBe(2);
+
+    // Dialog A reappears (fp changed away and back — a real, reachable
+    // sequence, not a restart): its escalation comment already exists, so
+    // this ADOPTS rather than reposts. Without the id-dedupe backstop this
+    // would push a THIRD entry into the budget for only two real comments.
+    await h.poll("p1", "KAN-1", dialogA);
+    await h.poll("p1", "KAN-1", dialogA);
+    expect(h.logs.some((l) => /adopted existing escalation/.test(l))).toBe(true);
+    expect(h.posted.filter((c) => c.text.includes("fingerprint:")).length).toBe(2); // no new comment
+
+    // Two more genuinely distinct dialogs: the budget has room for exactly
+    // ONE more (2 real entries so far, cap is 3) before the notice fires —
+    // proving the A-re-adoption above did NOT count as a third.
+    const dialogC = `Deploy to prod?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`;
+    const dialogD = `Overwrite the file?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`;
+    await h.poll("p1", "KAN-1", parsePrompt(dialogC)!);
+    await h.poll("p1", "KAN-1", parsePrompt(dialogC)!); // 3rd real entry — still escalates, no cap yet
+    expect(h.posted.filter((c) => c.text.includes("fingerprint:")).length).toBe(3);
+    await h.poll("p1", "KAN-1", parsePrompt(dialogD)!);
+    await h.poll("p1", "KAN-1", parsePrompt(dialogD)!); // 4th — now the cap engages
+    expect(h.posted.filter((c) => c.text.includes("fingerprint:")).length).toBe(3);
+    expect(h.posted.filter((c) => c.text.includes("rate cap reached")).length).toBe(1);
   });
 });
 

@@ -107,12 +107,33 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   // not one per poll.
   const lastUnparseableHash = new Map<string, string>();
 
+  // PR #40 review (comments 14969/14983): backstop against counting the
+  // SAME escalation toward the budget more than once — a genuine daemon
+  // restart (no in-memory PaneState) adopts every escalation it discovers,
+  // and even in-session a fingerprint can be re-escalated after the pane
+  // moved to a different dialog and back (a full, correct reset — the
+  // carry-over above is deliberately keyed on the SAME fp only), which
+  // re-adopts its own earlier comment. Keyed on FINGERPRINT, not comment
+  // id: the freshly-posted path below has no id to key on either (addComment
+  // returns void), and fp already has the right property — one escalation
+  // comment ever exists per (pane, fp). Finding 2's deeper fix (escalatedAt
+  // survives a flicker) closes the common case where adoption used to be
+  // re-entered at all; this Set only ever needs to stop a fp from being
+  // counted twice, never more.
+  const countedFingerprints = new Map<string, Set<string>>();
+  function countedFor(paneId: string): Set<string> {
+    let s = countedFingerprints.get(paneId);
+    if (!s) { s = new Set(); countedFingerprints.set(paneId, s); }
+    return s;
+  }
+
   async function escalate(paneId: string, issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
     const rows = await deps.comments(issue).catch((e) => {
       log(`comments fetch failed for ${issue}: ${(e as Error)?.message ?? e}`);
       return [] as CommentRow[];
     });
     const existing = rows.find((r) => r.body.startsWith(MARKER) && r.body.includes(`fingerprint: ${fp}`));
+    const counted = countedFor(paneId);
     if (existing) {
       const adoptedAt = Date.parse(existing.created) || deps.now();
       s.escalatedAt = adoptedAt;
@@ -121,9 +142,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       // explicit that it counts toward the hourly budget. Recorded at the
       // COMMENT's own timestamp, not deps.now(), so a restart adopting three
       // hour-old escalations doesn't grant a fresh budget it didn't earn.
-      const recent = (paneEscalations.get(paneId) ?? []).filter((t) => deps.now() - t < 60 * 60_000);
-      recent.push(adoptedAt);
-      paneEscalations.set(paneId, recent);
+      // Counted at most once per fingerprint (the backstop above).
+      if (!counted.has(fp)) {
+        counted.add(fp);
+        const recent = (paneEscalations.get(paneId) ?? []).filter((t) => deps.now() - t < 60 * 60_000);
+        recent.push(adoptedAt);
+        paneEscalations.set(paneId, recent);
+      }
       log(`adopted existing escalation ${issue} fp=${fp} from comment ${existing.id} (daemon restart)`);
       return;
     }
@@ -147,6 +172,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
     recent.push(deps.now());
     paneEscalations.set(paneId, recent);
+    counted.add(fp);
     cappedPanes.delete(paneId);
     await deps.addComment(issue, escalationComment(issue, prompt, fp));
     s.escalatedAt = deps.now();
@@ -221,17 +247,42 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // "Consecutive" means consecutive polls OF THE WATCHER: the same
     // fingerprint, observed on the very next pollSeq. Any gap — the pane
     // wasn't blocked, or didn't parse, on an intervening poll (both reset
-    // via onPoll/onNoPrompt below, which delete the pane's state) — or a
-    // different fingerprint, resets the count to a fresh first observation.
+    // the debounce fields in place via onPoll/onNoPrompt below, WITHOUT
+    // discarding the rest of the pane's state) — or a different
+    // fingerprint, resets the debounce count to a fresh first observation.
     const consecutive = !!prior && prior.fp === fp && prior.lastPollSeq !== undefined && pollSeq === prior.lastPollSeq + 1;
     if (!consecutive && prior) {
       log(`debounce reset ${issue} pane=${paneId}: ${prior.fp !== fp ? `fp changed (${prior.fp} -> ${fp})` : "poll gap"}`);
     }
-    const s: PaneState = consecutive ? prior! : newState(fp);
+    let s: PaneState;
+    if (consecutive) {
+      s = prior!;
+    } else {
+      s = newState(fp);
+      // PR #40 review, Finding 2: a gap (flicker, unparseable poll) must
+      // reset ONLY the debounce fields. If the SAME dialog reappears after
+      // one, it is not a new escalation attempt — carrying escalatedAt/
+      // followedUpAt forward is what lets handleBlocked skip straight past
+      // the (now irrelevant) debounce below and into the directive/
+      // follow-up phase, instead of re-entering escalate() and adopting
+      // the same comment again (which used to double-count the rate-cap
+      // budget) and silently losing the 15-minute follow-up timer on every
+      // flicker. A genuinely DIFFERENT fingerprint (prior.fp !== fp) does
+      // NOT carry over — that is a new dialog and must start clean.
+      if (prior && prior.fp === fp) {
+        s.escalatedAt = prior.escalatedAt;
+        s.followedUpAt = prior.followedUpAt;
+      }
+    }
     state.set(paneId, s);
     s.lastPollSeq = pollSeq;
     s.blockedPolls++;
-    if (s.blockedPolls < DEBOUNCE_POLLS) {
+    // Once escalated, the debounce is irrelevant — a carried-over
+    // escalatedAt (same fp, reappeared after a gap) must fall straight
+    // through to the directive/follow-up phase below regardless of
+    // blockedPolls, or the carry-over above would be pointless: the pane
+    // would sit "debouncing" a dialog it already escalated.
+    if (s.escalatedAt === undefined && s.blockedPolls < DEBOUNCE_POLLS) {
       log(`debounce ${issue} fp=${fp} (poll ${s.blockedPolls}/${DEBOUNCE_POLLS})`);
       return;
     }
@@ -297,12 +348,33 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
   }
 
+  // PR #40 review, Finding 2 (comments 14976/14983): a gap resets ONLY the
+  // debounce fields (blockedPolls, lastPollSeq), in place — it must never
+  // discard escalatedAt/followedUpAt. Deleting the whole entry (the
+  // original shape) silently regressed KAN-732's 15-minute follow-up on
+  // any pane whose herd status flickers — measured on a flickering,
+  // already-escalated pane: zero follow-ups, ever, because the adoption
+  // branch `return`s as soon as it re-sets escalatedAt, so the follow-up
+  // check further down handleBlocked was never reached, and the NEXT
+  // flicker deleted the state again before any later poll could reach it
+  // either. It also forced escalate() to re-adopt the same comment on
+  // every flicker, which is what caused item (F)'s rate-cap budget to
+  // double-count in the first place. consumedComments/paneEscalations/
+  // cappedPanes are unaffected either way — they already lived outside
+  // PaneState (item D).
+  function resetDebounce(paneId: string): void {
+    const s = state.get(paneId);
+    if (!s) return;
+    s.blockedPolls = 0;
+    s.lastPollSeq = undefined;
+  }
+
   function onPoll(_pollSeq: number, blockedPaneIds: readonly string[]): void {
     const blocked = new Set(blockedPaneIds);
     for (const paneId of state.keys()) {
       if (!blocked.has(paneId)) {
         log(`debounce reset pane=${paneId}: not blocked`);
-        state.delete(paneId);
+        resetDebounce(paneId);
       }
     }
   }
@@ -313,7 +385,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // prompt" for an already-superseded poll destroy newer state.
     if (s && !(s.lastPollSeq !== undefined && pollSeq <= s.lastPollSeq)) {
       log(`debounce reset ${issue ?? paneId} pane=${paneId}: no prompt`);
-      state.delete(paneId);
+      resetDebounce(paneId);
     }
     const h = hashText(text);
     if (lastUnparseableHash.get(paneId) !== h) {
