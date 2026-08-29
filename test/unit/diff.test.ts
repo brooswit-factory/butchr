@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { activeKeys, changedKeys, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
+import { activeKeys, changedKeys, daemonLabelsChanged, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status = "In Progress", summary = "s", updated = "t", labels: string[] = []): JiraIssue =>
@@ -57,6 +57,39 @@ describe("isDaemonLabelOnlyDiff", () => {
     const before = iss("A", "In Progress", "s", "t1", []);
     const after = iss("A", "In Progress", "s", "t2", ["urgent"]);
     expect(isDaemonLabelOnlyDiff(before, after)).toBe(false);
+  });
+});
+
+describe("daemonLabelsChanged", () => {
+  test("an agent:* flip (working -> idle) counts, even with nothing else changed", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:idle"]);
+    expect(daemonLabelsChanged(before, after)).toBe(true);
+  });
+  test("a daemon label flip nested inside a status change still counts — unlike isDaemonLabelOnlyDiff, this never gates on status/summary equality", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Review", "s", "t2", ["agent:idle"]);
+    expect(daemonLabelsChanged(before, after)).toBe(true);
+  });
+  test("no label change at all -> false — e.g. a pure comment bump (updated moved, labels didn't)", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:working"]);
+    expect(daemonLabelsChanged(before, after)).toBe(false);
+  });
+  test("only a non-daemon (human) label changed -> false", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:working", "urgent"]);
+    expect(daemonLabelsChanged(before, after)).toBe(false);
+  });
+  test("a daemon label added alongside a human label -> true (need not be the ONLY changed label, unlike isDaemonLabelOnlyDiff)", () => {
+    const before = iss("A", "In Progress", "s", "t1", []);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:working", "urgent"]);
+    expect(daemonLabelsChanged(before, after)).toBe(true);
+  });
+  test("a pr:* label added counts too, not just agent:*", () => {
+    const before = iss("A", "In Progress", "s", "t1", []);
+    const after = iss("A", "In Progress", "s", "t2", ["pr:open"]);
+    expect(daemonLabelsChanged(before, after)).toBe(true);
   });
 });
 

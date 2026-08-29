@@ -41,6 +41,26 @@ export function isDaemonLabelOnlyDiff(before: JiraIssue, after: JiraIssue): bool
 }
 
 /**
+ * Whether `before` -> `after` (same ticket) changed AT LEAST ONE daemon-owned
+ * label (agent:*, pr:* — see isDaemonLabel, src/labels/plan.ts), added or
+ * removed. Unlike isDaemonLabelOnlyDiff, this does NOT gate on status/summary
+ * equality and does NOT require every changed label to be daemon-owned — a
+ * daemon label write nested inside a larger diff (a status change alongside
+ * it, or a human label touched in the same write) still counts. Used by
+ * src/daemon/loop.ts to scope the DAEMON_WRITER ledger-hit comment-cursor
+ * check (KAN-828) to writes that could plausibly be a daemon LABEL write —
+ * the ledger's AGENT-writer arm (an agent's own comment) never changes
+ * daemon labels, so this gate is what keeps that arm's behaviour untouched.
+ * False whenever there is no label change at all — e.g. a pure comment bump.
+ * Pure.
+ */
+export function daemonLabelsChanged(before: JiraIssue, after: JiraIssue): boolean {
+  const b = new Set(before.labels), a = new Set(after.labels);
+  const changedLabels = [...b].filter((l) => !a.has(l)).concat([...a].filter((l) => !b.has(l)));
+  return changedLabels.some(isDaemonLabel);
+}
+
+/**
  * The ticket's single pr:* label value (the suffix after "pr:"), or null when
  * it carries none. Two pr:* labels shouldn't happen — `desiredLabels`
  * (src/labels/plan.ts) emits at most one — but if it ever did, the
