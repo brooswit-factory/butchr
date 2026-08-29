@@ -96,6 +96,14 @@ export function chooseStartupAnswer(prompt: Prompt): number | null {
       if (/accept/i.test(prompt.options[i]!) && !/exit|no,/i.test(prompt.options[i]!)) return i + 1;
     return null;
   }
+  // The fullscreen-renderer offer: non-work UI opt-in that strands agents at
+  // the composer. Fleet's standing answer (given by an epic three times before
+  // this was automated): Not now.
+  if (/fullscreen renderer/i.test(prompt.question)) {
+    for (let i = 0; i < prompt.options.length; i++)
+      if (/not now/i.test(prompt.options[i]!)) return i + 1;
+    return null;
+  }
   const ANSWER = /I trust this folder|local development|resume from summary/i;
   for (let i = 0; i < prompt.options.length; i++)
     if (ANSWER.test(prompt.options[i]!)) return i + 1;

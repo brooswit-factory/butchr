@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.17] - 2026-08-28
+### Fixed
+- **The fullscreen-renderer offer is auto-answered "Not now".** It stranded stories at the composer, and after the v0.5.16 rate cap engaged, new dialogs on capped panes were log-only — so parents were never told (the cap's blind spot; two stories sat stranded). The offer is a non-work UI opt-in with an established fleet answer, so it now belongs to the auto-answerer and never reaches escalation at all.
+
 ## [0.5.16] - 2026-08-28
 ### Fixed
 - **Escalation spam contained.** A refused (stale-fingerprint) directive no longer escalates the fresh dialog instantly — the new fingerprint re-earns the debounce like any other observation; and escalation comments are rate-capped at 3 per pane per hour (then one summary notice + log-only). Measured trigger: transient pane prose parsing as dialogs put 13 comments on a live ticket in minutes. Deeper parser hardening remains with the operability epic's stability story.
