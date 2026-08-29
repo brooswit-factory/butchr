@@ -301,30 +301,55 @@ export function startLoop(deps: LoopDeps): Stop {
       // whether the ticket's newest comment id moved since the recorded
       // baseline.
       //
-      // Scoped to DAEMON label writes only (daemonLabelsChanged), and
-      // deliberately NOT applied to the ledger's AGENT-writer arm (an
-      // agent's own write suppressing the ping to that agent alone). The
-      // DAEMON arm's write is a LABEL write, which creates no comment, so a
-      // moved newest-comment-id there means something foreign was folded in.
-      // The AGENT arm's write is typically the agent's OWN COMMENT, so the
-      // newest comment id moving is EXPECTED — it IS that agent's own
-      // comment — and a blanket cursor check would wake every agent on its
-      // own comment, every poll. Author-based discrimination isn't available
-      // either: agents share accounts by role (every Task is the same
-      // accountId), so "was the newest comment mine?" is unanswerable from
-      // `deps.comments`. The two arms can't be told apart from
-      // `deps.suppress`'s boolean without modifying own-writes.ts, which is
-      // out of scope — so the scoping is done on the diff shape instead: a
-      // daemon label write always changes daemon labels; a bare agent
-      // comment never does. Known residual, stated rather than hidden: a
-      // ledger hit whose folded-in foreign event was a status change with NO
-      // comment is still suppressed — outside this discriminator's reach.
+      // `daemonLabelsChanged` decides WHICH arm to run, not what the cursor
+      // means (KAN-838 — a prior version of this comment claimed a moved
+      // newest-comment-id on the DAEMON arm meant something foreign was
+      // folded in, treating that as proof the cursor could only be checked,
+      // never advanced, on the AGENT arm; that reasoning was false). The
+      // cursor's real invariant is "the newest comment id this daemon has
+      // OBSERVED for this key", not "the newest it has DELIVERED" — every
+      // path that learns the newest id must advance it, including a
+      // suppression. The AGENT arm (an agent's own write, typically its own
+      // comment, changing no daemon label) still always suppresses — that
+      // part of KAN-828's reasoning holds — but it must ALSO resolve and
+      // record the newest comment id before returning, via the same
+      // per-poll `fetchComments` memo the DAEMON arm uses, so a stale
+      // baseline never survives past the write that actually moved it.
+      // Skipping that step is exactly what caused the regression this
+      // ticket fixes: the NEXT daemon label write (agent:working<->idle,
+      // every turn) would see the agent's own already-suppressed comment as
+      // "new" and wake the agent about it. Fail-open discipline is
+      // unchanged either way: a rejected/unwired fetch leaves the cursor
+      // untouched, never installing a baseline nothing this poll observed.
+      //
+      // Two residuals, carried forward rather than silently dropped (KAN-828
+      // documented the first; this ticket must not let the rewrite lose it):
+      //
+      // Known residual, stated rather than hidden: a ledger hit whose
+      // folded-in foreign event was a status change with NO comment is still
+      // suppressed — outside this discriminator's reach, on the DAEMON arm,
+      // unchanged since KAN-828.
+      //
+      // Second known residual (KAN-838): on the AGENT arm, a foreign comment
+      // landing in the SAME fetch window as the agent's own write is folded
+      // into the cursor advance below and is never delivered to the ticket's
+      // own agent that poll (it still reaches any WATCHER via
+      // crossDaemonSuppressed, which never consults this cursor for a pure
+      // comment diff) — the arm's job is only to keep the cursor honest for
+      // later polls, not to reconsider what it suppresses on its own poll.
       const ledgerHitCache = new Map<string, Promise<boolean>>();
       const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
         let p = ledgerHitCache.get(key);
         if (!p) {
           p = (async () => {
-            if (!daemonLabelsChanged(before, after)) return true; // agent-writer arm / pure comment path — unchanged
+            if (!daemonLabelsChanged(before, after)) {
+              // Agent-writer arm / pure comment path: always suppressed, but
+              // the cursor must still learn the newest id it just observed
+              // (KAN-838) — see the block comment above.
+              const result = await fetchComments(key);
+              if (result.ok) commentCursor.set(key, result.newest);
+              return true;
+            }
             const result = await fetchComments(key);
             if (!result.ok) return false; // fail open: deliver, cursor untouched
             const baseline = commentCursor.get(key) ?? null;
