@@ -238,7 +238,16 @@ export class HerdrHerd implements Herd {
     if ((await this.statusOf(issue)) === "idle") {
       const entry = (await this.byIssue()).get(issue); // re-resolve: panes renumber
       if (entry) {
-        const refusal = detectSessionLimitRefusal(await this.readPane(entry.pane), new Date());
+        // A transient herdr hiccup here must not propagate: before this
+        // refusal check existed, nudge() could no longer throw once
+        // agent.prompt succeeded (sendKeys below is already .catch(() => {})),
+        // and daemon/index.ts's caller turns a throw into `{ delivered: false }`
+        // — inverting the honesty fix (a DELIVERED prompt logged as refused)
+        // and skipping the stranded-composer enter (KAN-691's 2.5h stall,
+        // reopened via an unrelated transient). Same treatment as
+        // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
+        const text = await this.readPane(entry.pane).catch(() => "");
+        const refusal = detectSessionLimitRefusal(text, new Date());
         if (refusal) return { delivered: true, refusal };
         await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
       }
