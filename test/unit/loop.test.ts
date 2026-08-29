@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { desiredFrom, reconcileNow, startLoop } from "../../src/daemon/loop.js";
+import { desiredFrom, reconcileNow, startLoop, RespawnGuard } from "../../src/daemon/loop.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
@@ -45,6 +45,60 @@ describe("reconcileNow", () => {
     await reconcileNow(herd, new Map([["STALE", spec("STALE")]]));
     expect(herd.stopped).toEqual(["STALE"]);
     expect(herd.spawned).toEqual(["STALE"]);
+  });
+});
+
+describe("reconcileNow storm guard (RespawnGuard)", () => {
+  test("an issue that stays stale across many consecutive polls is respawned ONCE, then suppressed, with the WARNING logged and exactly ONE [butchr:respawn] notice for the window — then a NEW window opens once RESPAWN_SUPPRESS_POLLS have passed", async () => {
+    // Same fake issue "stale" on every poll, forever — the shape a genuinely
+    // broken/misbehaving agent would produce, and exactly what the OLD code
+    // would have respawned every 15s, killing a healthy agent each time
+    // (measured on KAN-811, CHANGELOG). One RespawnGuard instance threaded
+    // through every call, standing in for the ONE instance startLoop creates
+    // and keeps alive across its polls.
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const desired = new Map([["A", spec("A")]]);
+    const guard = new RespawnGuard();
+    const notices: Array<{ issue: string; reason: string; observedArgv: string[] }> = [];
+    const warnings: string[] = [];
+    const poll = () => reconcileNow(herd, desired, {
+      guard,
+      onRespawn: (issue, reason, observedArgv) => { notices.push({ issue, reason, observedArgv }); },
+      onSuppressed: (_issue, message) => { warnings.push(message); },
+    });
+
+    await poll(); // poll 1: respawned — the window opens
+    for (let i = 0; i < 4; i++) await poll(); // polls 2-5: still stale, still inside the 5-poll window — suppressed
+
+    expect(herd.stopped).toEqual(["A"]);       // exactly one stop across all 5 polls
+    expect(herd.spawned).toEqual(["A"]);       // exactly one spawn across all 5 polls
+    expect(notices.length).toBe(1);            // exactly ONE [butchr:respawn]-worthy notice for the window
+    expect(notices[0]!.issue).toBe("A");
+    expect(warnings.length).toBe(4);           // logged on every suppressed poll (2-5)
+    for (const w of warnings) {
+      expect(w).toBe("WARNING: [reconcile] A respawned again within 5 polls — suppressing further respawns until poll 6");
+    }
+
+    await poll(); // poll 6: RESPAWN_SUPPRESS_POLLS have now passed — a fresh window, a real second respawn
+    expect(herd.stopped).toEqual(["A", "A"]);
+    expect(herd.spawned).toEqual(["A", "A"]);
+    expect(notices.length).toBe(2);
+    expect(warnings.length).toBe(4);           // no new warning on the poll that actually respawns
+  });
+
+  test("a fresh RespawnGuard (the reconcileNow default) never suppresses — each direct call starts un-suppressed", async () => {
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "x", observedArgv: [] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const desired = new Map([["A", spec("A")]]);
+    const warnings: string[] = [];
+    // No `guard` passed — each call gets its OWN fresh guard, so nothing ever suppresses.
+    for (let i = 0; i < 3; i++) {
+      await reconcileNow(herd, desired, { onSuppressed: (_issue, message) => warnings.push(message) });
+    }
+    expect(herd.stopped).toEqual(["A", "A", "A"]);
+    expect(herd.spawned).toEqual(["A", "A", "A"]);
+    expect(warnings).toEqual([]);
   });
 });
 
@@ -585,7 +639,7 @@ describe("startLoop task->story delivery (Part B, pinned)", () => {
 });
 
 describe("startLoop respawn wiring", () => {
-  test("deps.onRespawn is invoked through reconcileNow on each poll a stale agent is found", async () => {
+  test("deps.onRespawn is invoked through reconcileNow when a stale agent is found", async () => {
     const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
     const respawns: any[] = [];
     const stop = startLoop({
@@ -600,5 +654,31 @@ describe("startLoop respawn wiring", () => {
     expect(respawns[0]).toEqual({ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] });
     expect(herd.stopped).toContain("A");
     expect(herd.spawned).toContain("A");
+  });
+
+  test("the storm guard persists ACROSS polls: an issue stale on EVERY poll is still respawned only once in the suppression window, and deps.log receives the WARNING", async () => {
+    // Same shape as the measured KAN-811 storm: staleIssues() keeps reporting
+    // "A" stale every single poll (a genuinely broken agent, or the old bug's
+    // stray-process misread). startLoop must create ONE RespawnGuard for its
+    // whole lifetime — a guard freshly constructed per poll (module-level
+    // state done wrong, or no guard at all) would respawn it every 10ms poll.
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
+    const respawns: any[] = [];
+    const logged: string[] = [];
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      herd,
+      notify: () => {},
+      onRespawn: (issue, reason, observedArgv) => { respawns.push({ issue, reason, observedArgv }); },
+      log: (line) => logged.push(line),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 45)); // well inside the 5-poll suppression window at a 10ms interval
+    stop();
+    expect(respawns.length).toBe(1);                 // respawned once, not once per poll
+    expect(herd.stopped).toEqual(["A"]);
+    expect(herd.spawned).toEqual(["A"]);
+    expect(logged.length).toBeGreaterThan(0);         // the storm-guard WARNING made it out through deps.log
+    for (const line of logged) expect(line).toContain("respawned again within 5 polls — suppressing further respawns");
   });
 });

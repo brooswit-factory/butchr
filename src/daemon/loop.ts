@@ -50,12 +50,58 @@ export interface LoopDeps {
    * never suppresses (never guess without the ability to look).
    */
   comments?: (key: string) => Promise<readonly JiraComment[]>;
+  /** Free-text daemon log line, e.g. the storm guard's suppression WARNING. Optional; omitted, that line is simply never emitted. */
+  log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
 }
 
+/** How many polls a just-respawned issue is shielded from a further respawn. */
+const RESPAWN_SUPPRESS_POLLS = 5;
+
+/**
+ * Per-issue respawn cooldown, threaded explicitly through `ReconcileOptions`
+ * (no module-level mutable state) — `startLoop` creates ONE instance that
+ * persists across polls, while a direct `reconcileNow` call (existing tests
+ * included) defaults to a fresh instance every time, i.e. never suppressed.
+ *
+ * Rule implemented: a respawn for `issue` at poll P starts a window running
+ * through poll `P + RESPAWN_SUPPRESS_POLLS - 1`; `issue` found stale again at
+ * any poll inside that window is suppressed (no stop, no spawn, no
+ * `onRespawn`) rather than respawned again. This guarantees in particular
+ * that two consecutive polls never both respawn the same issue — that's just
+ * the P+1 case of the same window. A poll at `P + RESPAWN_SUPPRESS_POLLS` or
+ * later is outside the window: a normal respawn, opening its own new window.
+ */
+export class RespawnGuard {
+  private poll = 0;
+  private lastRespawnAt = new Map<string, number>();
+
+  /** Advance to the next poll and return its number — call ONCE per reconcileNow(). */
+  nextPoll(): number {
+    return ++this.poll;
+  }
+
+  /** Whether `issue`, found stale at `poll`, should actually be respawned now. Records the respawn (opening a fresh window) when true. */
+  admit(issue: string, poll: number): boolean {
+    const last = this.lastRespawnAt.get(issue);
+    if (last !== undefined && poll - last < RESPAWN_SUPPRESS_POLLS) return false;
+    this.lastRespawnAt.set(issue, poll);
+    return true;
+  }
+
+  /** The poll at/after which `issue` is next eligible for a respawn — for the suppression WARNING's "until …". */
+  eligibleAgainAt(issue: string): number {
+    return (this.lastRespawnAt.get(issue) ?? 0) + RESPAWN_SUPPRESS_POLLS;
+  }
+}
+
 export interface ReconcileOptions {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** Storm-guard state; see RespawnGuard. Defaults to a fresh (never-suppressing) instance. */
+  guard?: RespawnGuard;
+  /** Called, with the exact line to log, when the storm guard suppresses a would-be respawn. */
+  onSuppressed?: (issue: string, message: string) => void;
 }
 
 /**
@@ -63,9 +109,12 @@ export interface ReconcileOptions {
  * the rest, and replace any stale agent (running, but its process argv lacks
  * butchr's spawn flags) with a fresh one — treated as stop-then-spawn, so
  * buildWorkspace rewrites its CLAUDE.md/brief.md/mcp.json exactly as a normal
- * spawn would.
+ * spawn would. A repeat respawn of the same issue within RESPAWN_SUPPRESS_POLLS
+ * polls is suppressed by `opts.guard` instead — see RespawnGuard.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const guard = opts.guard ?? new RespawnGuard();
+  const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
   const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys());
@@ -73,6 +122,14 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   for (const issue of plan.stop) await herd.stop(issue);
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
+    if (!guard.admit(issue, poll)) {
+      const until = guard.eligibleAgainAt(issue);
+      opts.onSuppressed?.(
+        issue,
+        `WARNING: [reconcile] ${issue} respawned again within ${RESPAWN_SUPPRESS_POLLS} polls — suppressing further respawns until poll ${until}`,
+      );
+      continue;
+    }
     await herd.stop(issue);
     await herd.spawn(desired.get(issue)!);
     if (opts.onRespawn) await opts.onRespawn(issue, info.reason, info.observedArgv);
@@ -100,6 +157,11 @@ export function startLoop(deps: LoopDeps): Stop {
   // Absence of a key means "no baseline yet" — the fail-safe case that
   // always delivers rather than suppresses on an unknown baseline.
   const commentCursor = new Map<string, string | null>();
+  // Also persists across polls: the respawn storm guard (see RespawnGuard).
+  // One instance for the whole loop's lifetime — NOT module-level state — so
+  // it survives across polls without leaking between independent startLoop
+  // calls (e.g. separate tests).
+  const respawnGuard = new RespawnGuard();
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedIssue[], key: string) => list.find((r) => r.issue.key === key)?.issue;
@@ -108,7 +170,11 @@ export function startLoop(deps: LoopDeps): Stop {
     async () => {
       const issues = await deps.search();
       const desired = desiredFrom(issues);
-      await reconcileNow(deps.herd, desired, deps.onRespawn ? { onRespawn: deps.onRespawn } : {});
+      await reconcileNow(deps.herd, desired, {
+        ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+        guard: respawnGuard,
+        ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
+      });
       const related = deps.related ? await deps.related([...desired.keys()]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
       return { issues, related };
