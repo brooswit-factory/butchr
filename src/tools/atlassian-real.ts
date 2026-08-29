@@ -49,8 +49,13 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           // An unassigned ticket is never staffed: the board reconciler needs an
           // assignee AND an active status before an agent runs for it.
           ...(p.assignee ? { assignee: { accountId: p.assignee } } : {}),
+          ...(p.priority ? { priority: { name: p.priority } } : {}),
         },
       }),
+    // editIssue's `fields` is a loose Record<string, any> (confirmed in
+    // node_modules/jira.js/dist/cloud/parameters/editIssue.d.ts) — no wrapper
+    // gotcha here, unlike addComment/createPage.
+    setPriority: (key, priority) => jira.issues.editIssue({ issueIdOrKey: key, fields: { priority: { name: priority } } }),
     // CreatePage spreads CreatePageSchema at the TOP level: only `body` is
     // forwarded (zod, $strip — every other top-level key, including spaceId,
     // is silently dropped) — the flat shape sent an empty spaceId and

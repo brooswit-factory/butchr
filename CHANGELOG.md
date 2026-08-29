@@ -9,12 +9,16 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
-## [0.7.0] - 2026-08-28
+## [0.8.0] - 2026-08-28
 ### Removed
 - **Relates-link routing (deprecated in 0.6.0).** The one-release deprecation bridge that let a "Relates" link route notifications alongside "Implements" is gone — `watchedKeys()` now routes only an outward-end "Implements" link, exactly as documented. `jira_link_issues` still accepts an explicit `type` for other link kinds (Blocks, Relates, …); it just no longer routes them.
 
 ### Fixed
 - **A boss staffed by the same daemon as its implementer heard nothing.** `related()`'s active-set filter used to skip any other-end key that was itself already in the daemon's active set, on the assumption that "active ends are already watched" — true while the Jira parent field routed notifications (release A removed that), but false once routing moved entirely onto the Implements link: a boss (story/epic) and its implementer (task/story) staffed by the SAME daemon credential are unrelated as far as the assigned-issues loop is concerned, so the boss's own agent never saw the implementer's change go by. The active-end skip is dropped; the loop's existing `sent` dedupe (`${issue}|${about}`) still keeps the implementer's own agent from being notified about itself twice.
+
+## [0.7.0] - 2026-08-28
+### Added
+- **Priority flows down the command chain.** `jira_create_issue` gains an optional `priority` (a Jira priority name, passed through verbatim — omitted, Jira's site default applies) so a boss sets a child's priority at filing, and a new `jira_set_priority` tool lets a boss re-prioritize its children as reality shifts. Priority is command metadata, not staffing: no daemon behavior reads it, only assignee + status do. `briefs/epic.md` and `briefs/story.md` now carry the duty to set and maintain their children's priority (and never their own); `briefs/task.md` notes a task's priority is set by its story.
 
 ## [0.6.1] - 2026-08-28
 ### Fixed
