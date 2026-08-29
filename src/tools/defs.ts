@@ -239,12 +239,67 @@ export function atlassianTools(
       },
     },
     confluence_create_page: {
-      description: "Create a Confluence page (storage/XHTML body) in a space.",
-      input: { spaceId: z.string(), title: z.string(), body: z.string() },
-      handler: (a, c) => { const p = a as { spaceId: string; title: string; body: string }; audit(c, `page "${p.title}"`); return ops.createPage(p); },
+      description:
+        "Create a Confluence page (storage/XHTML body) in a space. Pass raw XHTML tags in `body`, NOT entity-escaped text — write <h2>Heading</h2>, never &lt;h2&gt;Heading&lt;/h2&gt;; escaped text renders on the page as literal escaped tags, not as formatting. Optional `parentId` nests the new page under that page id; omitted, Confluence files it under the space's own default parent (unchanged from today).",
+      input: { spaceId: z.string(), title: z.string(), body: z.string(), parentId: z.string().optional() },
+      handler: (a, c) => {
+        const p = a as { spaceId: string; title: string; body: string; parentId?: string };
+        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""}`);
+        return ops.createPage(p);
+      },
+    },
+    confluence_update_page: {
+      description:
+        "Full-body replace of an existing Confluence page (storage/XHTML). Pass raw XHTML tags in `body`, NOT entity-escaped text — write <h2>Heading</h2>, never &lt;h2&gt;Heading&lt;/h2&gt;. Optimistic locking (Confluence's version number) is handled INTERNALLY — never pass or compute a version yourself. Omit `title` to keep the page's current title. Convention entries stay one-page-per-entry, never edited — this tool is for maintaining a standing page (like a convention/reference page), not for rewriting log entries.",
+      input: { id: z.string(), body: z.string(), title: z.string().optional() },
+      handler: (a, c) => {
+        const p = a as { id: string; body: string; title?: string };
+        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""}`);
+        return ops.updatePage(p).then((r) => orOk(r, { ok: true, id: p.id }));
+      },
+    },
+    confluence_search_pages: {
+      description:
+        'Find Confluence pages without the UI. Pass `titleContains` (a plain substring — CQL is built for you, quotes escaped) and/or a raw `cql` string (used as-is when given; `titleContains`/space scoping are ignored alongside it — put everything you need in the raw query yourself). Scope by space with `spaceKey` (preferred) or `spaceId` (resolved to a key via a spaces lookup first — CQL only filters by key) — scoping only applies when building from `titleContains`, not alongside raw `cql`. `limit` defaults to 25. Each hit returns `id`, `title`, and `webui` (a relative link) — pass the `id` to confluence_get_page to read it.',
+      input: {
+        titleContains: z.string().optional(), cql: z.string().optional(),
+        spaceId: z.string().optional(), spaceKey: z.string().optional(),
+        limit: z.number().int().min(1).max(100).default(25),
+      },
+      handler: async (a, c) => {
+        const p = a as { titleContains?: string; cql?: string; spaceId?: string; spaceKey?: string; limit?: number };
+        if (!p.titleContains && !p.cql) {
+          throw new Error("confluence_search_pages: pass `titleContains` or `cql` — at least one is required");
+        }
+        const escape = (s: string) => s.replace(/"/g, '\\"');
+        let cql: string;
+        if (p.cql) {
+          cql = p.cql;
+        } else {
+          const clauses = [`title ~ "${escape(p.titleContains!)}"`];
+          if (p.spaceKey) {
+            clauses.push(`space = "${escape(p.spaceKey)}"`);
+          } else if (p.spaceId) {
+            // CQL's `space` field takes a key, never a numeric id (confirmed against
+            // Atlassian's CQL field reference) — resolve id -> key via the spaces list
+            // rather than emit a clause that would silently match nothing.
+            const spaces = (await ops.listSpaces()) as { results?: Array<{ id?: string; key?: string }> };
+            const match = spaces?.results?.find((s) => s.id === p.spaceId);
+            if (!match?.key) throw new Error(`confluence_search_pages: no space found with id ${p.spaceId}`);
+            clauses.push(`space = "${escape(match.key)}"`);
+          }
+          cql = clauses.join(" AND ");
+        }
+        audit(c, `search ${cql.slice(0, 80)}`);
+        const result = (await ops.searchPages(cql, p.limit ?? 25)) as {
+          results?: Array<{ content?: { id?: string }; title?: string; url?: string }>;
+        };
+        return { results: (result?.results ?? []).map((r) => ({ id: r.content?.id, title: r.title, webui: r.url })) };
+      },
     },
     confluence_get_page: {
-      description: "Read a Confluence page by id (storage body).",
+      description:
+        "Read a Confluence page by id (storage body). The result adds `bodyRequested: true` and `bodyLength` (the storage body's character count) to the usual fields — `bodyLength: 0` means the page genuinely has an empty body, distinguishable from a body the API never returned at all.",
       input: { id: z.string() },
       handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id}`); return ops.getPage(id); },
     },

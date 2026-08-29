@@ -8,7 +8,7 @@ function rig(roles: { story?: string; task?: string } = {}) {
   const ops: AtlassianOps = {
     getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
     transition: rec("transition"), createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
-    assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+    assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages", { results: [] }), listSpaces: rec("listSpaces"),
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -20,7 +20,7 @@ describe("atlassianTools", () => {
   test("exposes the full proxy surface", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
-      "confluence_create_page", "confluence_get_page", "confluence_list_spaces",
+      "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
     ]);
@@ -39,15 +39,17 @@ describe("atlassianTools", () => {
     await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, conn);
     await tools.confluence_create_page!.handler({ spaceId: "1", title: "t", body: "<p/>" }, conn);
     await tools.confluence_get_page!.handler({ id: "9" }, conn);
+    await tools.confluence_update_page!.handler({ id: "9", body: "<p/>" }, conn);
+    await tools.confluence_search_pages!.handler({ titleContains: "log" }, conn);
     await tools.confluence_list_spaces!.handler({}, conn);
-    expect(calls.map(([n]) => n)).toEqual(["getIssue", "search", "addComment", "transition", "createIssue", "linkIssues", "linkIssues", "setPriority", "createPage", "getPage", "listSpaces"]);
+    expect(calls.map(([n]) => n)).toEqual(["getIssue", "search", "addComment", "transition", "createIssue", "linkIssues", "linkIssues", "setPriority", "createPage", "getPage", "updatePage", "searchPages", "listSpaces"]);
     expect(calls[1]![1]).toEqual(["project = KAN", 5]);
     expect((calls[4]![1][0] as { assignee?: string }).assignee).toBe("acct-1");   // assignee reaches the op
     expect(calls[5]![1]).toEqual(["KAN-999", "KAN-2", "Implements"]);             // create's own auto-link, to the parent
     expect(calls[6]![0]).toBe("linkIssues");
     expect(calls[6]![1]).toEqual(["KAN-2", "KAN-9", "Implements"]);               // the explicit jira_link_issues call; default type applied
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
-    expect(audits.length).toBe(10);
+    expect(audits.length).toBe(12);
   });
   test("search defaults maxResults when omitted", async () => {
     const { tools, calls, conn } = rig();
@@ -68,7 +70,7 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
       getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
       linkIssues: async () => undefined, transition: async () => ({}), createIssue: async () => ({}),
       setPriority: async () => ({}), assign: async () => ({}),
-      createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
@@ -103,7 +105,7 @@ describe("onWrite hook (own-write ledger feed)", () => {
       linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
       createIssue: async (p) => ({ key: `KAN-${p.summary.length}` }), setPriority: async () => ({ ok: true }),
       assign: async () => ({ ok: true }),
-      createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -181,7 +183,7 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
       getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"),
       linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
-      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...opsOverrides,
     };
     const audits: string[] = [];
@@ -363,11 +365,111 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
       getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
       linkIssues: async () => ({}), transition: async () => ({}), createIssue: async () => ({ key: "KAN-1" }),
       setPriority: async () => undefined, assign: async () => ({}),
-      createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
     expect(result).toEqual({ ok: true, key: "KAN-1", priority: "High" });
+  });
+});
+
+describe("confluence_update_page result normalization", () => {
+  test("ops.updatePage resolving undefined still produces a defined MCP result (same orOk shape as the other write tools)", async () => {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
+      linkIssues: async () => ({}), transition: async () => ({}), createIssue: async () => ({}),
+      setPriority: async () => ({}), assign: async () => ({}), createPage: async () => ({}), getPage: async () => ({}),
+      updatePage: async () => undefined, searchPages: async () => ({}), listSpaces: async () => ({}),
+    };
+    const tools = atlassianTools(ops, () => {});
+    const result = await tools.confluence_update_page!.handler({ id: "10715137", body: "<p>x</p>" }, { headers: {} } as any);
+    expect(result).toEqual({ ok: true, id: "10715137" });
+  });
+});
+
+describe("confluence_search_pages", () => {
+  function rig(opsOverrides: Partial<AtlassianOps> = {}) {
+    const calls: Array<[string, unknown[]]> = [];
+    const rec = (name: string, result: unknown = { results: [] }) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
+    const ops: AtlassianOps = {
+      getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
+      transition: rec("transition"), createIssue: rec("createIssue"), setPriority: rec("setPriority"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"),
+      searchPages: rec("searchPages", { results: [{ content: { id: "10715137" }, title: "The captain's log convention", url: "/spaces/SD/pages/10715137" }] }),
+      listSpaces: rec("listSpaces", { results: [{ id: "196612", key: "SD" }] }),
+      ...opsOverrides,
+    };
+    const tools = atlassianTools(ops, () => {});
+    const conn = { headers: {} } as any;
+    return { tools, calls, conn };
+  }
+
+  test("refuses when neither titleContains nor cql is given", async () => {
+    const { tools, conn } = rig();
+    await expect(tools.confluence_search_pages!.handler({}, conn)).rejects.toThrow(/titleContains.*cql|cql.*titleContains/);
+  });
+
+  test("titleContains builds a title ~ CQL clause, quotes escaped, and maps hits to id/title/webui", async () => {
+    const { tools, calls, conn } = rig();
+    const result = await tools.confluence_search_pages!.handler({ titleContains: 'a "quoted" word' }, conn);
+    const [, args] = calls.find(([n]) => n === "searchPages")!;
+    expect(args[0]).toBe('title ~ "a \\"quoted\\" word"');
+    expect(args[1]).toBe(25); // default limit
+    expect(result).toEqual({ results: [{ id: "10715137", title: "The captain's log convention", webui: "/spaces/SD/pages/10715137" }] });
+  });
+
+  test("spaceKey given: appended directly as a space = clause, no listSpaces lookup", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.confluence_search_pages!.handler({ titleContains: "log", spaceKey: "SD" }, conn);
+    expect(calls.find(([n]) => n === "listSpaces")).toBeUndefined();
+    const [, args] = calls.find(([n]) => n === "searchPages")!;
+    expect(args[0]).toBe('title ~ "log" AND space = "SD"');
+  });
+
+  test("spaceId given (no spaceKey): resolved to a key via listSpaces before building the space clause", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.confluence_search_pages!.handler({ titleContains: "log", spaceId: "196612" }, conn);
+    expect(calls.find(([n]) => n === "listSpaces")).toBeDefined();
+    const [, args] = calls.find(([n]) => n === "searchPages")!;
+    expect(args[0]).toBe('title ~ "log" AND space = "SD"');
+  });
+
+  test("spaceId with no matching space: refuses with a clear message, never calls searchPages", async () => {
+    const { tools, calls, conn } = rig();
+    await expect(tools.confluence_search_pages!.handler({ titleContains: "log", spaceId: "999999" }, conn)).rejects.toThrow(/no space found with id 999999/);
+    expect(calls.find(([n]) => n === "searchPages")).toBeUndefined();
+  });
+
+  test("raw cql is used as-is; titleContains/space scoping never applied alongside it", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.confluence_search_pages!.handler({ cql: "type = page AND space = SD", titleContains: "ignored", spaceKey: "IGNORED" }, conn);
+    const [, args] = calls.find(([n]) => n === "searchPages")!;
+    expect(args[0]).toBe("type = page AND space = SD");
+  });
+
+  test("limit passes through to ops.searchPages", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.confluence_search_pages!.handler({ titleContains: "log", limit: 5 }, conn);
+    const [, args] = calls.find(([n]) => n === "searchPages")!;
+    expect(args[1]).toBe(5);
+  });
+});
+
+describe("confluence_create_page parentId", () => {
+  test("parentId reaches ops.createPage when given; omitted when not", async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    const rec = (name: string, result: unknown = {}) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
+    const ops: AtlassianOps = {
+      getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
+      transition: rec("transition"), createIssue: rec("createIssue"), setPriority: rec("setPriority"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
+    };
+    const tools = atlassianTools(ops, () => {});
+    const conn = { headers: {} } as any;
+    await tools.confluence_create_page!.handler({ spaceId: "196612", title: "t", body: "<p/>", parentId: "196725" }, conn);
+    await tools.confluence_create_page!.handler({ spaceId: "196612", title: "t2", body: "<p/>" }, conn);
+    expect((calls[0]![1][0] as { parentId?: string }).parentId).toBe("196725");
+    expect((calls[1]![1][0] as { parentId?: string }).parentId).toBeUndefined();
   });
 });
 
@@ -383,7 +485,7 @@ describe("jira_assign (KAN-810)", () => {
       getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"),
       linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
-      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), listSpaces: rec("listSpaces"),
+      assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...opsOverrides,
     };
     const audits: string[] = [];
