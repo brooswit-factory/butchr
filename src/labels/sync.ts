@@ -15,6 +15,13 @@ export interface SyncDeps {
   prState?: (key: string) => Promise<PrState>;
   /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
   stalled?: StalledCheck;
+  /**
+   * Called once per poll with the keys this poll wrote daemon-owned labels
+   * for (only when non-empty), so the caller can feed the own-write ledger
+   * (src/jira-watch/own-writes.ts) with writer "daemon" — generalizes the
+   * old isOwnLabelBump swallow into the same mechanism agent writes use.
+   */
+  onWrite?: (keys: readonly string[]) => void;
   log?: (line: string) => void;
 }
 
@@ -150,6 +157,7 @@ export function createLabelSync(deps: SyncDeps) {
       if (ok) lastLabels.delete(key);
     }
 
+    if (written.size) deps.onWrite?.([...written]);
     return written;
   };
 }
