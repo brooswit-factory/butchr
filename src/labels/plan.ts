@@ -23,8 +23,10 @@ export interface DesiredInput {
   prState: PrState;
 }
 
+export type AgentLabel = "working" | "idle" | "blocked" | "none";
+
 /** idle/blocked map directly; any other non-empty status (working/done/unknown/…) is "working". */
-const mapAgentStatus = (raw: string | null): "working" | "idle" | "blocked" | "none" => {
+export const mapAgentStatus = (raw: string | null): AgentLabel => {
   if (raw === "idle") return "idle";
   if (raw === "blocked") return "blocked";
   if (raw == null) return "none";
@@ -47,15 +49,18 @@ export interface LabelDiff {
 /**
  * Diff the desired daemon-owned labels against the ticket's CURRENT full label
  * set. Only daemon-prefixed labels are ever added or removed — non-daemon
- * (human) labels in `current` never appear in the result. Idempotent: an
- * already-correct label set diffs to `{ add: [], remove: [] }`.
+ * (human) labels never appear in the result, even if one accidentally ends up
+ * in `desired` (both sides are filtered here, in the one place this rule
+ * lives, rather than trusted to every caller). Idempotent: an already-correct
+ * label set diffs to `{ add: [], remove: [] }`.
  */
 export function diffLabels(desired: readonly string[], current: readonly string[]): LabelDiff {
+  const desiredDaemon = desired.filter(isDaemonLabel);
   const currentDaemon = current.filter(isDaemonLabel);
-  const desiredSet = new Set(desired);
+  const desiredSet = new Set(desiredDaemon);
   const currentSet = new Set(currentDaemon);
   return {
-    add: desired.filter((label) => !currentSet.has(label)),
+    add: desiredDaemon.filter((label) => !currentSet.has(label)),
     remove: currentDaemon.filter((label) => !desiredSet.has(label)),
   };
 }

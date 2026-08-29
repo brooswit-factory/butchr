@@ -14,6 +14,7 @@ import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
 import { PrTracker } from "../labels/pr.js";
+import { sweepStaleAgentLabels } from "../labels/sweep.js";
 
 let config;
 try {
@@ -67,6 +68,16 @@ const syncLabels = createLabelSync({
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
   log: (line) => console.error(`  ${line}`),
 });
+
+// One-time startup sweep: agent:* stranded by a ticket that went inactive
+// while the daemon was down. createLabelSync's bookkeeping is in-memory and
+// the 15s poll only ever sees active tickets, so nothing else ever revisits
+// this. Not a new polling timer — runs once, here, and never again.
+void sweepStaleAgentLabels({
+  search: (jql) => atlassian.search(jql),
+  jira: atlassian,
+  log: (line) => console.error(`  ${line}`),
+}).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
 const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
 const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;

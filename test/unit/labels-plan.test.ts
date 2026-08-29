@@ -49,4 +49,9 @@ describe("diffLabels", () => {
   test("leaving active status: agent:* fully removed", () => {
     expect(diffLabels([], ["agent:working", "pr:approved"])).toEqual({ add: [], remove: ["agent:working", "pr:approved"] });
   });
+  test("a human label that ends up in `desired` (a caller bug) is still never added — both sides are filtered", () => {
+    const diff = diffLabels(["needs-design", "pr:approved"], ["agent:idle", "pr:approved"]);
+    expect(diff.add).toEqual([]); // "needs-design" is not daemon-owned, so it's dropped, not added
+    expect(diff.remove).toEqual(["agent:idle"]);
+  });
 });

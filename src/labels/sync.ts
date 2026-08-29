@@ -1,5 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
-import { AGENT_PREFIX, desiredLabels, diffLabels, isDaemonLabel, type PrState } from "./plan.js";
+import { isActive } from "../reconcile/plan.js";
+import { AGENT_PREFIX, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrState } from "./plan.js";
 
 export interface LabelWriter {
   updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }): Promise<void>;
@@ -12,6 +13,47 @@ export interface SyncDeps {
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
   prState?: (key: string) => Promise<PrState>;
   log?: (line: string) => void;
+}
+
+/** A representative raw agent_status that maps back to `label` via mapAgentStatus. */
+const rawFor = (label: AgentLabel): string | null => (label === "none" ? null : label);
+
+const agentLabelOf = (labels: readonly string[]): AgentLabel | undefined => {
+  const found = labels.find(isAgentLabel);
+  return found ? (found.slice(AGENT_PREFIX.length) as AgentLabel) : undefined;
+};
+
+/**
+ * herdr's agent_status is not reliable moment-to-moment (observed flapping
+ * working/blocked/working within seconds). A candidate change is only
+ * applied once the SAME new value has been observed on two consecutive
+ * polls; a flip that reverts before that is suppressed — zero Jira writes,
+ * one [labels] log line. The ticket's OWN current agent:* label (read fresh
+ * from Jira each poll) is the source of truth for "currently applied", so
+ * this only needs to track the in-flight candidate, not the applied value.
+ */
+class AgentLabelStabilizer {
+  private readonly pending = new Map<string, { value: AgentLabel; count: number }>();
+
+  /** The label to actually use this poll, plus whether a flip was suppressed. */
+  resolve(key: string, applied: AgentLabel | undefined, observed: AgentLabel): { label: AgentLabel; suppressed: boolean } {
+    if (applied === observed) {
+      this.pending.delete(key);
+      return { label: observed, suppressed: false };
+    }
+    const p = this.pending.get(key);
+    const count = p && p.value === observed ? p.count + 1 : 1;
+    if (count >= 2 || applied === undefined) {
+      this.pending.delete(key);
+      return { label: observed, suppressed: false };
+    }
+    this.pending.set(key, { value: observed, count });
+    return { label: applied, suppressed: true };
+  }
+
+  clear(key: string): void {
+    this.pending.delete(key);
+  }
 }
 
 /**
@@ -28,6 +70,7 @@ export interface SyncDeps {
  */
 export function createLabelSync(deps: SyncDeps) {
   const lastLabels = new Map<string, string[]>();
+  const stabilizer = new AgentLabelStabilizer();
 
   const write = async (written: Set<string>, key: string, current: readonly string[], desired: readonly string[]) => {
     const diff = diffLabels(desired, current);
@@ -44,14 +87,26 @@ export function createLabelSync(deps: SyncDeps) {
     const agents = await deps.agentStatuses();
 
     for (const issue of issues) {
+      let agentStatus: string | null;
+      if (!isActive(issue.status)) {
+        stabilizer.clear(issue.key);
+        agentStatus = null;
+      } else {
+        const observed = mapAgentStatus(agents.get(issue.key) ?? null);
+        const applied = agentLabelOf(issue.labels);
+        const { label, suppressed } = stabilizer.resolve(issue.key, applied, observed);
+        if (suppressed) deps.log?.(`[labels] ${issue.key} agent:${observed} unconfirmed (holding agent:${applied}) — flip suppressed`);
+        agentStatus = rawFor(label);
+      }
       const prState = deps.prState ? await deps.prState(issue.key) : null;
-      const desired = desiredLabels({ status: issue.status, agentStatus: agents.get(issue.key) ?? null, prState });
+      const desired = desiredLabels({ status: issue.status, agentStatus, prState });
       await write(written, issue.key, issue.labels, desired);
       lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }
 
     for (const key of [...lastLabels.keys()]) {
       if (seen.has(key)) continue;
+      stabilizer.clear(key);
       const current = lastLabels.get(key)!;
       const desired = current.filter((l) => !l.startsWith(AGENT_PREFIX));
       await write(written, key, current, desired);
