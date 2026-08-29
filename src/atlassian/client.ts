@@ -49,9 +49,28 @@ export class AtlassianClient {
 
   /** Issues matching a JQL query, mapped to butchr's flat shape. */
   async search(jql: string, maxResults = 100): Promise<JiraIssue[]> {
-    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated" });
+    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated,labels" });
     const body = await this.get(`/rest/api/3/search/jql?${q}`);
     return (body.issues ?? []).map(mapIssue);
+  }
+
+  /**
+   * Add/remove labels on a ticket in one request — never a wholesale field
+   * set, so labels outside the caller's add/remove lists (human labels) are
+   * left untouched. A no-op (no request) when both lists are empty.
+   */
+  async updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }): Promise<void> {
+    const update = [
+      ...(ops.add ?? []).map((label) => ({ add: label })),
+      ...(ops.remove ?? []).map((label) => ({ remove: label })),
+    ];
+    if (!update.length) return;
+    const res = await this.fetchImpl(`${this.site}/rest/api/3/issue/${key}?notifyUsers=false`, {
+      method: "PUT",
+      headers: { authorization: this.auth, "content-type": "application/json" },
+      body: JSON.stringify({ update: { labels: update } }),
+    });
+    if (!res.ok) throw new Error(`Atlassian ${res.status} on PUT /rest/api/3/issue/${key}: ${(await res.text()).slice(0, 200)}`);
   }
 
   /** The issue links on a ticket, as the other end's key + relationship. */
@@ -83,5 +102,6 @@ function mapIssue(i: any): JiraIssue {
     assignee: f.assignee?.displayName ?? null,
     parent: f.parent?.key ?? null,
     updated: f.updated ?? "",
+    labels: f.labels ?? [],
   };
 }

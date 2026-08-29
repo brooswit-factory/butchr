@@ -15,7 +15,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async nudge() { return true; },
   };
 }
-const iss = (key: string, status: string, parent: string | null = null): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", parent, updated: "t" });
+const iss = (key: string, status: string, parent: string | null = null): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", parent, updated: "t", labels: [] });
 
 describe("reconcileNow", () => {
   test("spawns active-not-running and stops running-not-active", async () => {
@@ -76,7 +76,7 @@ describe("startLoop", () => {
 
 describe("startLoop related-work watch", () => {
   const rel = (key: string, status: string, watchers: string[], updated = "t") =>
-    ({ issue: { key, status, summary: "s", issuetype: "Task", assignee: "other", parent: null, updated }, watchers });
+    ({ issue: { key, status, summary: "s", issuetype: "Task", assignee: "other", parent: null, updated, labels: [] }, watchers });
   test("a changed related ticket notifies each watcher, naming what changed", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -120,5 +120,50 @@ describe("startLoop related-work watch", () => {
     await new Promise((r) => setTimeout(r, 80));
     stop();
     expect(notified.filter((x) => x === "KAN-1<-KAN-9").length).toBe(1);
+  });
+});
+
+describe("startLoop own-label-write nudge suppression", () => {
+  test("the daemon's own label write bumping `updated` does not itself nudge; a real subsequent change still does", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],                                       // poll 0: baseline
+      [{ ...iss("A", "In Progress"), updated: "t2" }],                  // poll 1: only `updated` bumped — our own write
+      [{ ...iss("A", "In Review"), updated: "t3" }],                    // poll 2: a REAL change (status)
+    ];
+    const writes: Array<ReadonlySet<string>> = [new Set(["A"]), new Set(), new Set()];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      syncLabels: async () => { const w = writes[Math.min(n, writes.length - 1)]!; n++; return w; },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once (poll 1), nudged once (poll 2's real change)
+  });
+
+  test("a poll whose only change is the daemon's own label write produces no nudge at all", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],
+      [{ ...iss("A", "In Progress"), updated: "t2" }],
+    ];
+    const writes: Array<ReadonlySet<string>> = [new Set(["A"]), new Set()];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      syncLabels: async () => { const w = writes[Math.min(n, writes.length - 1)]!; n++; return w; },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toEqual([]);
   });
 });

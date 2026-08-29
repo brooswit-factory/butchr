@@ -24,6 +24,12 @@ export interface LoopDeps {
   herd: Herd;
   /** Nudge the agent working `issue`; `about` is the ticket that changed (not always its own). */
   notify: (issue: string, about: string) => void | Promise<void>;
+  /**
+   * Reconcile daemon-owned (agent:*, pr:*) labels on this poll's `issues`.
+   * Returns the keys it wrote to — their own `updated` bump must not, by
+   * itself, count as a change worth nudging an agent over (see below).
+   */
+  syncLabels?: (issues: readonly JiraIssue[]) => Promise<ReadonlySet<string>>;
   intervalMs: number;
   onError?: (error: unknown) => void;
 }
@@ -39,7 +45,22 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
 export const desiredFrom = (issues: readonly JiraIssue[]): Map<string, SpawnSpec> =>
   new Map(issues.filter((i) => activeKeys([i]).length).map((i) => [i.key, { key: i.key, issuetype: i.issuetype, summary: i.summary, parent: i.parent }]));
 
-interface Snapshot { issues: JiraIssue[]; related: RelatedIssue[] }
+interface Snapshot { issues: JiraIssue[]; related: RelatedIssue[]; labelWrites: ReadonlySet<string> }
+
+/**
+ * A key the daemon itself wrote daemon-owned labels for on the poll that
+ * produced `prev`: on the FOLLOWING poll, that write's own `updated` bump
+ * shows up as the only difference (status/summary unchanged) — swallow it, so
+ * the daemon's own writes never wake an agent. A real subsequent change to
+ * the same ticket still has a differing status/summary and nudges normally.
+ */
+function isOwnLabelBump(prev: Snapshot, next: Snapshot, key: string): boolean {
+  if (!prev.labelWrites.has(key)) return false;
+  const before = prev.issues.find((i) => i.key === key);
+  const after = next.issues.find((i) => i.key === key);
+  if (!before || !after) return false; // appearing/disappearing is still a real change
+  return before.status === after.status && before.summary === after.summary;
+}
 
 /**
  * The daemon's core loop. Every poll: fetch assigned issues, reconcile the herd
@@ -54,7 +75,8 @@ export function startLoop(deps: LoopDeps): Stop {
       const desired = desiredFrom(issues);
       await reconcileNow(deps.herd, desired);
       const related = deps.related ? await deps.related([...desired.keys()]) : [];
-      return { issues, related };
+      const labelWrites = deps.syncLabels ? await deps.syncLabels(issues) : new Set<string>();
+      return { issues, related, labelWrites };
     },
     async (next, prev) => {
       const sent = new Set<string>();
@@ -67,6 +89,7 @@ export function startLoop(deps: LoopDeps): Stop {
       // Assigned issues: the issue's own agent, and its parent's — results flow upward.
       const byKey = new Map(next.issues.map((i) => [i.key, i]));
       for (const key of changedKeys(prev.issues, next.issues)) {
+        if (isOwnLabelBump(prev, next, key)) continue;
         await send(key, key);
         const parent = byKey.get(key)?.parent ?? prev.issues.find((i) => i.key === key)?.parent;
         if (parent) await send(parent, key);
