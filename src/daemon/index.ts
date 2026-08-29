@@ -198,15 +198,18 @@ startLoop({
   },
   related,
   herd,
-  notify: async (issue, about) => {
-    const msg = about === issue
-      ? `[butchr] Ticket ${issue} was updated — re-read it.`
-      : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
+  notify: async (issue, about, reason) => {
+    const msg = reason?.pr
+      ? `[butchr] ${issue}: your PR's review state changed pr:${reason.pr.from ?? "none"} → pr:${reason.pr.to}. Verify with gh pr view <n> --json reviewDecision,headRefOid and act: approved → merge your own PR; changes-requested → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.`
+      : about === issue
+        ? `[butchr] Ticket ${issue} was updated — re-read it.`
+        : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
     // Channel push renders mid-turn; the prompt is what STARTS a turn on an
     // idle agent (measured: an idle epic never woke on the push alone).
     void notifyIssue(mcp, issue, msg);
     const woke = await herd.nudge(issue, msg).catch(() => false);
-    console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+    const transitionTag = reason?.pr ? ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})` : "";
+    console.error(`  [notify] ${issue} ← ${about}${transitionTag}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
   },
   onRespawn: async (issue, reason, observedArgv) => {
     console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);

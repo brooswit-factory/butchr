@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PrTracker, isApproved } from "../../src/labels/pr.js";
+import { PrTracker, isApproved, reviewState } from "../../src/labels/pr.js";
 
 function fakeFetch(handlers: Array<{ match: RegExp; respond: () => unknown | null }>) {
   const calls: string[] = [];
@@ -43,6 +43,28 @@ describe("isApproved", () => {
   });
 });
 
+describe("reviewState", () => {
+  test("no votes at all -> open", () => {
+    expect(reviewState([])).toBe("open");
+    expect(reviewState([{ user: { login: "a" }, state: "COMMENTED" }])).toBe("open");
+  });
+  test("at least one APPROVED, no outstanding CHANGES_REQUESTED -> approved", () => {
+    expect(reviewState([{ user: { login: "a" }, state: "APPROVED" }])).toBe("approved");
+  });
+  test("an outstanding CHANGES_REQUESTED -> changes-requested, even alongside another reviewer's APPROVED", () => {
+    expect(reviewState([
+      { user: { login: "a" }, state: "APPROVED" },
+      { user: { login: "b" }, state: "CHANGES_REQUESTED" },
+    ])).toBe("changes-requested");
+  });
+  test("a reviewer who requested changes and later re-approves resolves to approved", () => {
+    expect(reviewState([
+      { user: { login: "a" }, state: "CHANGES_REQUESTED" },
+      { user: { login: "a" }, state: "APPROVED" },
+    ])).toBe("approved");
+  });
+});
+
 describe("PrTracker", () => {
   test("discovers, then polls directly — the search runs once, not every call", async () => {
     const { fetchImpl, calls } = fakeFetch([
@@ -64,6 +86,15 @@ describe("PrTracker", () => {
     ]);
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
     expect(await tracker.stateFor("KAN-1")).toBe("approved");
+  });
+  test("an outstanding CHANGES_REQUESTED resolves to changes-requested (KAN-819/823), not open", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("acme", "widgets", 5) },
+      { match: /pulls\/5$/, respond: () => ({ state: "open", merged: false }) },
+      { match: /pulls\/5\/reviews/, respond: () => [{ user: { login: "bob" }, state: "CHANGES_REQUESTED" }] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-1")).toBe("changes-requested");
   });
   test("merged -> pr:merged, and never polls that PR again", async () => {
     let pullCalls = 0;
