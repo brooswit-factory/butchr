@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gatherFacts } from "../../scripts/release/facts.js";
+import { evaluate } from "../../scripts/release/gate.js";
 
 /** A throwaway git repo: main has 0.1.0; a branch bumps to 0.1.1 and touches src/ + the schema. */
 function repo() {
@@ -40,5 +41,55 @@ describe("gatherFacts reads git + registry", () => {
     sh("git add -A && git commit -qm add-pkg");
     const cwd = process.cwd(); process.chdir(d);
     try { expect(gatherFacts("main", "@probe/none-such-pkg-zz").baseVersion).toBe("0.0.0"); } finally { process.chdir(cwd); }
+  }, 20_000);
+});
+
+describe("gatherFacts.baseVersion is merge-base relative (KAN-788)", () => {
+  test("a stale branch (base moved ahead while the branch only touched an ungated file) reads as no-release-required, not a downgrade", () => {
+    const d = mkdtempSync(join(tmpdir(), "facts-stale-")); const sh = (c: string) => execSync(c, { cwd: d, stdio: "ignore" });
+    sh("git init -q -b main && git config user.email t@t && git config user.name t");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.5.0" }));
+    writeFileSync(join(d, "CHANGELOG.md"), "# C\n## [0.5.0] - 2026-01-01\n### Added\n- a\n");
+    sh("git add -A && git commit -qm base");
+    sh("git checkout -qb feat");
+    writeFileSync(join(d, "README.md"), "docs only\n"); // ungated — branch's own diff never touches package.json/src/schema
+    sh("git add -A && git commit -qm docs");
+    sh("git checkout -q main");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.6.0" }));
+    writeFileSync(join(d, "CHANGELOG.md"), "# C\n## [0.6.0] - 2026-01-02\n### Added\n- b\n## [0.5.0] - 2026-01-01\n### Added\n- a\n");
+    sh("git add -A && git commit -qm main-bump"); // main moves on while feat sits still
+    sh("git checkout -q feat");
+    const cwd = process.cwd(); process.chdir(d);
+    try {
+      const f = gatherFacts("main", "@probe/none-such-pkg-zz");
+      expect(f.version).toBe("0.5.0");
+      expect(f.baseVersion).toBe("0.5.0"); // merge-base version, NOT main's tip 0.6.0
+      expect(f.baseTipVersion).toBe("0.6.0");
+      const r = evaluate(f);
+      expect(r.required).toBe(false);
+      expect(r.ok, JSON.stringify(r.verdicts)).toBe(true);
+      expect(r.verdicts[0]!.reason).not.toMatch(/version changed/);
+      expect(r.verdicts[0]!.reason).toMatch(/no gated files changed; no release required/);
+    } finally { process.chdir(cwd); }
+  }, 20_000);
+
+  test("a genuine downgrade on a branch that IS at the merge-base still fails — the fix must not blunt the real check", () => {
+    const d = mkdtempSync(join(tmpdir(), "facts-downgrade-")); const sh = (c: string) => execSync(c, { cwd: d, stdio: "ignore" });
+    sh("git init -q -b main && git config user.email t@t && git config user.name t");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.5.0" }));
+    writeFileSync(join(d, "CHANGELOG.md"), "# C\n## [0.5.0] - 2026-01-01\n### Added\n- a\n");
+    sh("git add -A && git commit -qm base");
+    sh("git checkout -qb feat");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.4.0" })); // own commit lowers the version
+    sh("git add -A && git commit -qm oops-downgrade"); // main never moves — branch IS at the merge-base
+    const cwd = process.cwd(); process.chdir(d);
+    try {
+      const f = gatherFacts("main", "@probe/none-such-pkg-zz");
+      expect(f.baseVersion).toBe("0.5.0");
+      expect(f.baseTipVersion).toBe("0.5.0"); // not stale: merge-base === base tip
+      const r = evaluate(f);
+      expect(r.ok).toBe(false);
+      expect(r.verdicts.some((v) => !v.ok && /0\.5\.0 → 0\.4\.0/.test(v.reason))).toBe(true);
+    } finally { process.chdir(cwd); }
   }, 20_000);
 });
