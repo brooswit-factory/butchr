@@ -29,4 +29,11 @@ describe("release gate", () => {
     expect(evaluate({ ...base, baseVersion: "0.9.0", version: "1.0.0", changelog: log("1.0.0", "### BREAKING\n- all new") }).ok).toBe(true);
     expect(failing({ changelog: log("0.1.1", "### BREAKING\n- oops") })[0]).toMatch(/it is a MAJOR/);
   });
+  test("ungated pass hints when the branch is behind base's tip, and stays silent when it isn't", () => {
+    const behind = evaluate({ ...base, changedFiles: ["README.md"], version: "0.1.0", baseTipVersion: "0.2.0" });
+    expect(behind.ok).toBe(true);
+    expect(behind.verdicts[0]!.reason).toBe("no gated files changed; no release required (branch is behind base 0.2.0 — merge main when convenient)");
+    const current = evaluate({ ...base, changedFiles: ["README.md"], version: "0.1.0", baseTipVersion: "0.1.0" });
+    expect(current.verdicts[0]!.reason).toBe("no gated files changed; no release required");
+  });
 });
