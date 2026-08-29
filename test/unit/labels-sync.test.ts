@@ -153,6 +153,17 @@ describe("createLabelSync", () => {
     expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:working"] }]); // pr:approved kept
   });
 
+  test("restart durability: an active ticket already carrying pr:merged, whose PR is confirmed merged again after a cold-cache rediscovery, gets zero label writes (no remove/re-add cycle)", async () => {
+    const jira = fakeJira();
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "working"]]),
+      prState: async () => "merged", // fresh PrTracker after a restart, cold-cache merged-search rediscovers the same PR
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:working", "pr:merged"])]);
+    expect(jira.calls).toEqual([]);
+  });
+
   test("pr:* disabled (no prState dep) never adds a pr:* label, agent:* unaffected", async () => {
     const jira = fakeJira();
     const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]) });
