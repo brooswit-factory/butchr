@@ -157,7 +157,6 @@ describe("computePlan — delete-backwards-implements", () => {
   test("10618-style: a Story recorded as implementing a DONE Task, with a correct counterpart, is still found and planned (Done-fetch regression guard)", () => {
     const story = issue({ key: "KAN-120", issuetype: "Story", issuelinks: [link("Implements", "inward", "KAN-121", "back-3")] });
     const doneTask = issue({ key: "KAN-121", issuetype: "Task", statusCategory: "Done", issuelinks: [link("Implements", "inward", "KAN-120", "correct-3")] });
-    // the Done task must be passed in allIssues (it is excluded from iteration but its level must still resolve)
     const plan = computePlan([story, doneTask]);
     expect(plan.actions).toEqual([
       {
@@ -166,6 +165,24 @@ describe("computePlan — delete-backwards-implements", () => {
         otherEnd: "KAN-121",
         linkId: "back-3",
         reason: "KAN-120 (Story) is recorded as implementing KAN-121 (Task) — backwards; a correct-direction Implements link exists between the same two tickets",
+      },
+    ]);
+    expect(plan.unresolved).toEqual([]);
+  });
+
+  test("BOTH ends Done: a backwards link is still planned even when neither endpoint is open (time-independence regression guard)", () => {
+    // e.g. 10622 on the live board: KAN-757 and KAN-759 both went Done after the backwards link was created,
+    // yet the link is still a stranded non-wake-path that must be cleanable regardless of when --apply runs.
+    const doneStory = issue({ key: "KAN-150", issuetype: "Story", statusCategory: "Done", issuelinks: [link("Implements", "inward", "KAN-151", "back-5")] });
+    const doneTask = issue({ key: "KAN-151", issuetype: "Task", statusCategory: "Done", issuelinks: [link("Implements", "inward", "KAN-150", "correct-5")] });
+    const plan = computePlan([doneStory, doneTask]);
+    expect(plan.actions).toEqual([
+      {
+        ticket: "KAN-150",
+        action: "delete-backwards-implements",
+        otherEnd: "KAN-151",
+        linkId: "back-5",
+        reason: "KAN-150 (Story) is recorded as implementing KAN-151 (Task) — backwards; a correct-direction Implements link exists between the same two tickets",
       },
     ]);
     expect(plan.unresolved).toEqual([]);

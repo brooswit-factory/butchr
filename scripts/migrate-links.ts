@@ -62,15 +62,18 @@ const recordedRoles = (owner: MigrateIssue, link: MigrateLink): { implementerKey
  * only when a correct-direction Implements link between the SAME two
  * tickets already exists; otherwise it is reported unresolved, since
  * deleting it would strand the only wake path between the two tickets.
- * `byKeyAll` must include Done issues so a link to a Done ticket (its level
- * unresolvable from the open set alone) can still be evaluated.
+ * Iterates ALL issues, Done included: a backwards link is never a valid
+ * wake path regardless of either endpoint's status, so cleaning it up must
+ * not depend on when the operator happens to run --apply relative to when
+ * its endpoints close. `byKeyAll` is used both to resolve levels and to
+ * look up the counterpart.
  */
-function planBackwardsImplements(issues: MigrateIssue[], byKeyAll: Map<string, MigrateIssue>): { actions: DeleteBackwardsImplementsAction[]; unresolved: Unresolved[] } {
+function planBackwardsImplements(allIssues: MigrateIssue[], byKeyAll: Map<string, MigrateIssue>): { actions: DeleteBackwardsImplementsAction[]; unresolved: Unresolved[] } {
   const actions: DeleteBackwardsImplementsAction[] = [];
   const unresolved: Unresolved[] = [];
-  const seen = new Set<string>(); // link id — a link between two open tickets appears on both ends' issuelinks
+  const seen = new Set<string>(); // link id — a link between two issues appears on both ends' issuelinks
 
-  for (const owner of issues) {
+  for (const owner of allIssues) {
     for (const l of owner.issuelinks) {
       if (l.type !== "Implements" || seen.has(l.id)) continue;
       const { implementerKey, bossKey } = recordedRoles(owner, l);
@@ -172,7 +175,7 @@ export function computePlan(allIssues: MigrateIssue[]): Plan {
     }
   }
 
-  const backwards = planBackwardsImplements(issues, byKeyAll);
+  const backwards = planBackwardsImplements(allIssues, byKeyAll);
   actions.push(...backwards.actions);
   unresolved.push(...backwards.unresolved);
 
