@@ -45,6 +45,29 @@ export function isApproved(reviews: readonly Review[]): boolean {
   return votes.includes("APPROVED") && !votes.includes("CHANGES_REQUESTED");
 }
 
+/**
+ * Three-way outcome over the same latest-vote map as `isApproved`, so a
+ * changes-requested review is no longer folded into "open" and invisible to
+ * the author (KAN-819/823) — the same deadlock `isApproved` exists to avoid,
+ * with the opposite sign. An outstanding CHANGES_REQUESTED wins over any
+ * APPROVED (the reviewer must re-approve before the PR is mergeable);
+ * otherwise "approved" if at least one reviewer's latest vote is one;
+ * otherwise "open". Kept as a SIBLING to `isApproved`, not folded into it, so
+ * `isApproved`'s existing boolean signature and its callers/tests are
+ * untouched. Pure.
+ */
+export function reviewState(reviews: readonly Review[]): "approved" | "changes-requested" | "open" {
+  const latest = new Map<string, string>();
+  for (const r of reviews) {
+    if (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED") continue;
+    latest.set(r.user?.login ?? "", r.state);
+  }
+  const votes = [...latest.values()];
+  if (votes.includes("CHANGES_REQUESTED")) return "changes-requested";
+  if (votes.includes("APPROVED")) return "approved";
+  return "open";
+}
+
 interface PullPayload {
   state: string;
   merged: boolean;
@@ -141,6 +164,6 @@ export class PrTracker {
       return null;
     }
     const reviews = await fetchReviews(this.deps, ref);
-    return isApproved(reviews) ? "approved" : "open";
+    return reviewState(reviews);
   }
 }

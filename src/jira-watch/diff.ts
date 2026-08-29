@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { isDaemonLabel } from "../labels/plan.js";
+import { isDaemonLabel, isPrLabel, PR_PREFIX } from "../labels/plan.js";
 
 /** Keys of issues currently in an active status. */
 export const activeKeys = (issues: readonly JiraIssue[]): string[] =>
@@ -38,4 +38,35 @@ export function isDaemonLabelOnlyDiff(before: JiraIssue, after: JiraIssue): bool
   const b = new Set(before.labels), a = new Set(after.labels);
   const changedLabels = [...b].filter((l) => !a.has(l)).concat([...a].filter((l) => !b.has(l)));
   return changedLabels.length > 0 && changedLabels.every(isDaemonLabel);
+}
+
+/**
+ * The ticket's single pr:* label value (the suffix after "pr:"), or null when
+ * it carries none. Two pr:* labels shouldn't happen — `desiredLabels`
+ * (src/labels/plan.ts) emits at most one — but if it ever did, the
+ * sorted-first is used deterministically rather than guessing intent.
+ */
+function prLabelValue(issue: JiraIssue): string | null {
+  const values = issue.labels.filter(isPrLabel).sort();
+  return values.length ? values[0]!.slice(PR_PREFIX.length) : null;
+}
+
+/**
+ * Whether `before` -> `after` (same ticket) is a pr:* TRANSITION: the
+ * ticket's pr:* label after the poll differs from before, AND there IS a
+ * pr:* label after. Counts none->open, open->approved, open->changes-requested,
+ * changes-requested->approved, approved->merged, etc. A pure REMOVAL (pr:x ->
+ * no pr:* label at all — a PR closed unmerged, or the KAN-814 restart
+ * artefact) is deliberately NOT a transition and returns null — it never
+ * wakes anyone. Status/summary changes are irrelevant to this rule: a pr:*
+ * transition nested inside a larger diff (status changed too) still counts —
+ * unlike isDaemonLabelOnlyDiff, this never gates on status/summary equality.
+ * Pure.
+ */
+export function prTransition(before: JiraIssue, after: JiraIssue): { from: string | null; to: string } | null {
+  const to = prLabelValue(after);
+  if (to === null) return null;
+  const from = prLabelValue(before);
+  if (from === to) return null;
+  return { from, to };
 }
