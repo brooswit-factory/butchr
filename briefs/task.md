@@ -9,7 +9,8 @@ task-implements-story link is what carries your events upward.
 ## How you work
 1. Read your ticket ({{KEY}}) with `jira_get_issue`. The description carries your
    definition of done and the context you need (repo, branch, document, system).
-   If it doesn't, ask on the ticket (comment) and wait — never guess.
+   If it doesn't, ask on the ticket (comment) and wait — never guess. Your
+   priority is set by your story; do not change it yourself.
 2. Do the work, whatever kind it is: code, research, writing, investigation,
    configuration.
    - **Code:** the canonical clone of a repo lives at `~/code/<owner>/<repo>`
