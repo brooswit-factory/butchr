@@ -1,9 +1,20 @@
-import type { HerdrClient } from "@brooswit/herdr-sdk";
+import type { HerdrClient, results } from "@brooswit/herdr-sdk";
 import { buildWorkspace, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
-import { selectClaudeProcess, realProcessTable, type ProcessEntry } from "./proctable.js";
 import { detectSessionLimitRefusal } from "./session-limit.js";
 export type { SpawnSpec } from "./workspace.js";
+
+const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
+/**
+ * Identifies the claude process among a pane's foreground processes. Checked
+ * against BOTH argv[0] (tolerating a bun/node wrapper in front of the real
+ * binary, same predicate proctable.ts used against /proc) and `name` (always
+ * present on the wire, unlike `argv`) — so a process herdr identifies as
+ * claude by name but couldn't report argv for is still recognized as THE
+ * claude process, just one whose argv (and therefore its health) is unknown.
+ */
+const isClaude = (p: { argv?: readonly string[] | null; name?: string | null }): boolean =>
+  basename(p.argv?.[0] ?? "") === "claude" || basename(p.name ?? "") === "claude";
 
 /** A running agent found to be stale: its process argv lacks butchr's spawn flags. */
 export interface StaleAgent {
@@ -21,8 +32,11 @@ export interface Herd {
   /**
    * Running agents whose claude process was found, but its argv lacks
    * butchr's spawn flags — e.g. a pane herdr restored as a bare
-   * `claude --resume <id>` after a server restart. An agent whose process
-   * can't be found at all is NOT stale (unknown ≠ stale — see proctable.ts).
+   * `claude --resume <id>` after a server restart. Resolved from the pane's
+   * OWN foreground process (herdr's `pane.process_info`) — never by scanning
+   * /proc for a process sharing the cwd, which a stray process at that cwd
+   * could confuse (see CHANGELOG). An agent whose process can't be found at
+   * all is NOT stale (unknown ≠ stale).
    */
   staleIssues(): Promise<StaleAgent[]>;
   /** Start an agent for an issue (idempotent — a no-op if one is already running). */
@@ -70,8 +84,6 @@ export class HerdrHerd implements Herd {
     private readonly mcpUrl: string,
     /** Injectable wait, for tests. */
     private readonly wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-    /** Injectable process table reader, for tests — defaults to walking /proc. */
-    private readonly processSource: () => Promise<ProcessEntry[]> = realProcessTable,
   ) {}
 
   private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
@@ -89,12 +101,22 @@ export class HerdrHerd implements Herd {
   }
 
   async staleIssues(): Promise<StaleAgent[]> {
-    const table = await this.processSource();
     const out: StaleAgent[] = [];
-    for (const [issue, { cwd }] of await this.byIssue()) {
-      if (!cwd) continue; // no cwd reported — can't locate its process — unknown, not stale
-      const proc = selectClaudeProcess(cwd, table);
-      if (!proc) continue; // no claude process found — unknown, not stale
+    for (const [issue, { pane, cwd }] of await this.byIssue()) {
+      if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
+      let info: results.PaneProcessInfo | undefined;
+      try {
+        info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
+      } catch {
+        continue; // herdr hiccup / pane gone — unknown, not stale — and this issue alone, not the whole sweep
+      }
+      // foreground_processes/argv are both optional/nullable on the wire: a
+      // shell still starting, a claude that already exited, or a pane
+      // blocked on a dialog can all report none of this — every such gap is
+      // UNKNOWN, never stale (a fresh respawn must never itself be
+      // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
+      const proc = info?.foreground_processes?.find((p) => isClaude(p));
+      if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
       // issuetype/summary/parent don't matter here: --model (the only thing
       // issuetype affects) is deliberately excluded from the comparison.
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd);
