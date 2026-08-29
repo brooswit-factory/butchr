@@ -157,33 +157,39 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
     expect((calls[0]![1][0] as { assignee?: string }).assignee).toBe("acct-explicit");
   });
 
-  // (c) missing role config + no explicit assignee -> refuses, ops.createIssue NOT called, error names the env var.
-  test("missing BUTCHR_ASSIGNEE_STORY + no explicit assignee refuses and names the env var", async () => {
-    const { tools, calls, conn } = rig({});
+  // (c) missing role config + no explicit assignee -> refuses, ops.createIssue NOT called, error names the env var,
+  // AND the refusal itself leaves a trace in the daemon log (a refused create is still something a connection did).
+  test("missing BUTCHR_ASSIGNEE_STORY + no explicit assignee refuses, names the env var, and audits the refusal", async () => {
+    const { tools, calls, audits, conn } = rig({});
     await expect(tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "KAN-794" }, conn))
       .rejects.toThrow(/BUTCHR_ASSIGNEE_STORY/);
     expect(calls.find(([n]) => n === "createIssue")).toBeUndefined();
+    expect(audits.some((a) => a.includes("REFUSED: no assignee (BUTCHR_ASSIGNEE_STORY unset)"))).toBe(true);
   });
-  test("missing BUTCHR_ASSIGNEE_TASK + no explicit assignee refuses and names the env var", async () => {
-    const { tools, calls, conn } = rig({});
+  test("missing BUTCHR_ASSIGNEE_TASK + no explicit assignee refuses, names the env var, and audits the refusal", async () => {
+    const { tools, calls, audits, conn } = rig({});
     await expect(tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s", implements: "KAN-795" }, conn))
       .rejects.toThrow(/BUTCHR_ASSIGNEE_TASK/);
     expect(calls.find(([n]) => n === "createIssue")).toBeUndefined();
+    expect(audits.some((a) => a.includes("REFUSED: no assignee (BUTCHR_ASSIGNEE_TASK unset)"))).toBe(true);
   });
 
   // (d) no parent and no implements -> refuses. Story and Task get DIFFERENT wording:
   // a Story can genuinely parent to an Epic, a Task cannot parent to a Story in this project.
-  test("Story: no parent and no implements refuses with the generic Story/Task contract message", async () => {
-    const { tools, calls, conn } = rig();
+  // Both refusals also leave a trace in the daemon log before throwing.
+  test("Story: no parent and no implements refuses with the generic Story/Task contract message, and audits the refusal", async () => {
+    const { tools, calls, audits, conn } = rig();
     await expect(tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s" }, conn))
       .rejects.toThrow(/a Story implements an Epic and a Task implements a Story/);
     expect(calls.find(([n]) => n === "createIssue")).toBeUndefined();
+    expect(audits.some((a) => a.includes("REFUSED: no implements target"))).toBe(true);
   });
-  test("Task: no parent and no implements refuses with the Task-specific message (cannot parent to a Story)", async () => {
-    const { tools, calls, conn } = rig();
+  test("Task: no parent and no implements refuses with the Task-specific message (cannot parent to a Story), and audits the refusal", async () => {
+    const { tools, calls, audits, conn } = rig();
     await expect(tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s" }, conn))
       .rejects.toThrow(/a Task cannot have a Story parent in this project/);
     expect(calls.find(([n]) => n === "createIssue")).toBeUndefined();
+    expect(audits.some((a) => a.includes("REFUSED: no implements target"))).toBe(true);
   });
 
   // (e) implements given -> ops.linkIssues called from=new key, to=target, type Implements.
@@ -240,10 +246,21 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
   });
 
   // (j) ops.linkIssues resolving undefined (the real 201-empty-body case) -> reports the link as OK, not a failure.
-  test("ops.linkIssues resolving undefined reports the link as OK, not a failure", async () => {
+  // On THIS path (unlike jira_link_issues) the op's resolved value is never returned to the caller — only a
+  // REJECTION signals a link failure here, so a resolved `undefined` needs no KAN-764 substitution to read as ok:true.
+  test("ops.linkIssues resolving undefined (a resolved promise, not a rejection) is reported as a successful link", async () => {
     const { tools, conn } = rig(roles, { linkIssues: async () => undefined });
     const result = (await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "KAN-794" }, conn)) as { implements: unknown };
     expect(result.implements).toEqual({ ok: true, to: "KAN-794" });
+  });
+
+  // ops.createIssue's contract doesn't guarantee `key` is present — never call linkIssues with an undefined `from`.
+  test("ops.createIssue resolving without a key: link is never attempted, result explains why, handler does not throw", async () => {
+    const { tools, calls, conn } = rig(roles, { createIssue: async () => ({ ok: "createIssue" }) });
+    const result = (await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "KAN-794" }, conn)) as { key?: string; implements: unknown };
+    expect(result.key).toBeUndefined();
+    expect(result.implements).toEqual({ ok: false, to: "KAN-794", error: "create response carried no issue key; link not attempted" });
+    expect(calls.find(([n]) => n === "linkIssues")).toBeUndefined();
   });
 
   // (k) Epic unchanged: no role assignee applied, no target required, no link created, creates with neither parent nor implements.

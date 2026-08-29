@@ -106,10 +106,16 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         };
 
         // (1) Assign by role, regardless of parent — an explicit `assignee` always wins.
+        // A refusal is still something a connection did, so it gets its own audit line
+        // before the throw — otherwise the operator watching the daemon log sees nothing.
         let assignee = p.assignee;
         if (!assignee && p.issuetype !== "Epic") {
           assignee = p.issuetype === "Story" ? roles.story : roles.task;
-          if (!assignee) throw new Error(noAssigneeMsg(p.issuetype));
+          if (!assignee) {
+            const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
+            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset)`);
+            throw new Error(noAssigneeMsg(p.issuetype));
+          }
         }
 
         // (2)/(3) Resolve the Implements target: implements > parent > refuse; "none" opts out (still assigned, no link).
@@ -124,6 +130,7 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
           } else if (p.parent) {
             target = p.parent;
           } else {
+            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target`);
             throw new Error(noTargetMsg(p.issuetype));
           }
         }
@@ -141,16 +148,25 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
           ...(p.labels?.length ? { labels: p.labels } : {}),
           ...(assignee ? { assignee } : {}),
           ...(p.priority ? { priority: p.priority } : {}),
-        })) as { key: string } & Record<string, unknown>;
+        })) as { key?: string } & Record<string, unknown>;
         const key = created.key;
 
         if (p.issuetype === "Epic" || orphan) return created;
 
+        // ops.createIssue's own contract (AtlassianOps) doesn't guarantee `key` —
+        // never call linkIssues with an undefined `from`; skip the link and say why.
+        if (!key) {
+          return { ...created, implements: { ok: false, to: target, error: "create response carried no issue key; link not attempted" } };
+        }
+
         // Never let a link failure surface as if the create failed — an agent
         // that retries a "failed" create makes a duplicate ticket. The key is
-        // always returned; only the link outcome can be ok:false.
+        // always returned; only the link outcome can be ok:false. Unlike
+        // jira_link_issues, this path never returns the op's resolved value to
+        // the caller, so KAN-764's empty-201-body case needs no substitution
+        // here — only a REJECTION distinguishes a link failure on this path.
         try {
-          await ops.linkIssues(key, target!, "Implements").then((r) => orOk(r, { ok: true, from: key, to: target!, type: "Implements" }));
+          await ops.linkIssues(key, target!, "Implements");
           return { ...created, key, implements: { ok: true, to: target } };
         } catch (e) {
           return { ...created, key, implements: { ok: false, to: target, error: (e as Error).message } };
