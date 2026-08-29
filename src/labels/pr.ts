@@ -8,6 +8,10 @@ export interface GithubDeps {
   token?: string;
   /** Org logins to search; an unscoped search would span all of GitHub. */
   orgs: readonly string[];
+  /** Injectable clock, so tests can drive negative-cache backoff and throttle timing without sleeping. Defaults to Date.now. */
+  now?: () => number;
+  /** Diagnostic line sink: a non-OK search response (KAN-824 item 4) and the per-poll search-count summary (item 5). Matches how sync.ts/stalled.ts are wired. */
+  log?: (line: string) => void;
 }
 
 interface PrRef {
@@ -84,6 +88,54 @@ async function fetchPull(deps: GithubDeps, ref: PrRef): Promise<PullPayload | nu
 const DISCOVER_CANDIDATES = 5;
 
 /**
+ * BACKOFF_MS[i] is the delay before a key with (i+1) consecutive misses may
+ * be searched again, doubling 15s -> 30s -> 60s -> 120s and holding at the
+ * cap thereafter (KAN-824). 120s, not the ~5min the epic first suggested,
+ * because the cap IS the worst-case pr:none -> pr:open discovery latency,
+ * and pr:open is the label that wakes the PR's author (KAN-819). At the cap,
+ * 6 PR-less non-epic tickets x 2 orgs issue 12 searches per 120s round =
+ * 6 searches/min steady state against a 30/min bucket — 5x headroom, and it
+ * holds without assuming this daemon owns the whole bucket (the bucket is
+ * per GitHub user, shared with `gh` and possibly a second daemon).
+ */
+const BACKOFF_MS = [15_000, 30_000, 60_000, 120_000];
+
+/**
+ * How many search rounds apart the merged-search sweep reruns for a key,
+ * after its first cold round. The merged search exists for exactly one
+ * thing — KAN-814's restart-durability case, an already-merged PR whose
+ * in-memory `merged` Set was lost on restart — so the first cold round must
+ * still run it (a fresh process has no other way to learn a key is already
+ * merged), but every round after that is pure waste unless a PR was both
+ * opened and merged since the last sweep. Accepted edge: a PR opened and
+ * merged entirely between two merged sweeps is picked up by the NEXT sweep,
+ * not instantly — acceptable because the open->merged transition without an
+ * intervening open poll is rare, and the sweep still runs at most 20 rounds
+ * (a few minutes at the 120s cap) apart.
+ */
+const MERGED_SWEEP_EVERY_ROUNDS = 20;
+
+/** Absent or unparseable X-RateLimit-Reset on a non-OK search response falls back to this fixed throttle (KAN-824 item 4). */
+const THROTTLE_FALLBACK_MS = 60_000;
+
+function parseIntHeader(v: string | null): number | undefined {
+  if (v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+interface SearchOutcome {
+  found?: { ref: PrRef; pull: PullPayload };
+  /**
+   * A non-OK response was hit on one org's search. The caller must stop —
+   * no further orgs or statuses are tried this round, this is not a miss
+   * (the negative-cache backoff must not advance), and it must not be
+   * latched as "no PR" (a 403 is not evidence of anything about the key).
+   */
+  nonOk?: { status: number; remaining: number | undefined; resetEpochSec: number | undefined };
+}
+
+/**
  * Searches GitHub for a PR whose head branch is EXACTLY `key`, within
  * `status` ("open" or "merged"), across the configured orgs. GitHub's
  * `head:` search qualifier matches by PREFIX — the search result shape
@@ -94,12 +146,25 @@ const DISCOVER_CANDIDATES = 5;
  * PR on the same key stays discoverable on a subsequent poll even if this
  * org never turns one up. The validated pull is returned alongside the ref
  * so the caller can reuse it instead of re-fetching.
+ *
+ * A non-OK response from any org aborts the whole call immediately (KAN-824
+ * item 4: "back off rather than burn the rest of the window") — it does not
+ * try the remaining orgs, and the caller must not treat it as a miss.
  */
-async function discover(deps: GithubDeps, key: string, status: "open" | "merged"): Promise<{ ref: PrRef; pull: PullPayload } | null> {
+async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "merged", onSearch: (res: Response) => void): Promise<SearchOutcome> {
   for (const org of deps.orgs) {
     const q = new URLSearchParams({ q: `is:pr is:${status} head:${key} org:${org}` });
     const res = await deps.fetchImpl(`https://api.github.com/search/issues?${q}`, { headers: ghHeaders(deps.token) });
-    if (!res.ok) continue;
+    onSearch(res);
+    if (!res.ok) {
+      return {
+        nonOk: {
+          status: res.status,
+          remaining: parseIntHeader(res.headers.get("x-ratelimit-remaining")),
+          resetEpochSec: parseIntHeader(res.headers.get("x-ratelimit-reset")),
+        },
+      };
+    }
     const body = (await res.json()) as { items?: Array<{ number: number; repository_url: string }> };
     for (const item of body.items?.slice(0, DISCOVER_CANDIDATES) ?? []) {
       const m = /\/repos\/([^/]+)\/([^/]+)$/.exec(item.repository_url);
@@ -107,10 +172,10 @@ async function discover(deps: GithubDeps, key: string, status: "open" | "merged"
       const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
       const pull = await fetchPull(deps, ref);
       if (!pull || pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
-      return { ref, pull };
+      return { found: { ref, pull } };
     }
   }
-  return null;
+  return {};
 }
 
 async function fetchReviews(deps: GithubDeps, ref: PrRef): Promise<Review[]> {
@@ -119,26 +184,74 @@ async function fetchReviews(deps: GithubDeps, ref: PrRef): Promise<Review[]> {
   return (await res.json()) as Review[];
 }
 
+interface KeyState {
+  /** Consecutive miss count for this key — indexes BACKOFF_MS (capped at its last entry). */
+  misses: number;
+  /** Epoch ms; this key is not searched again before this. */
+  nextSearchAt: number;
+  /** Completed cold search rounds for this key, this process — drives the merged-sweep cadence. */
+  rounds: number;
+}
+
 /**
  * Discovers the PR whose head branch is EXACTLY a ticket key (the fleet's
  * branch convention), then polls it directly once found — caching
  * owner/repo/number so discovery (an org-wide search) runs at most once per
- * key. `gh` and GraphQL are unavailable to the daemon; this is REST only.
+ * key while it's warm. `gh` and GraphQL are unavailable to the daemon; this
+ * is REST only.
  *
  * A cold cache (no ref cached, key not yet known merged) searches OPEN PRs
- * first; if that finds nothing, it ALSO searches MERGED PRs before giving up.
- * This is what makes pr:merged durable across a daemon restart: the `merged`
- * Set below is in-memory only and is lost on restart, but a merge is a fact
- * GitHub itself remembers, so re-discovering it there (rather than trusting
- * the ticket's own current pr:merged label as "sticky") can't latch a wrong
- * state the way the prefix-match bug did — it's re-verified against GitHub
- * every time the cache is cold, not merely re-asserted from prior output.
+ * first; if that finds nothing, it searches MERGED PRs too — but only on the
+ * key's first cold round and then every MERGED_SWEEP_EVERY_ROUNDS rounds
+ * (see that constant) rather than every round, and only when the open search
+ * came back OK with no match (never after a non-OK response). This is what
+ * makes pr:merged durable across a daemon restart: the `merged` Set below is
+ * in-memory only and is lost on restart, but a merge is a fact GitHub itself
+ * remembers, so re-discovering it there (rather than trusting the ticket's
+ * own current pr:merged label as "sticky") can't latch a wrong state the way
+ * the prefix-match bug did — it's re-verified against GitHub every time the
+ * cache is cold, not merely re-asserted from prior output.
+ *
+ * A key with no PR is search load forever unless bounded (KAN-824): a MISS
+ * (both searches that ran came back OK with no exact match) opens a
+ * negative-cache backoff window (BACKOFF_MS) before the key is searched
+ * again, cleared the instant the key is discovered. A non-OK response is
+ * never a miss and never advances the backoff — instead it sets a
+ * tracker-wide throttle (`throttledUntil`) during which NO key is searched,
+ * so a 403 costs zero further searches and self-heals at GitHub's own reset
+ * instead of burning the rest of the window.
  */
 export class PrTracker {
   private readonly cache = new Map<string, PrRef>();
   private readonly merged = new Set<string>();
+  private readonly keyState = new Map<string, KeyState>();
+  /** Last-logged non-OK status per key, so a PERMANENT throttle logs once instead of once per poll (the `loggedFailure` pattern in src/labels/sync.ts); a status that actually changes for that key still gets its own line. */
+  private readonly loggedStatus = new Map<string, number>();
+  /** Tracker-wide: while now() < this, stateFor issues no searches for any key. */
+  private throttledUntil = 0;
+  private searchesThisPoll = 0;
+  private lastRemaining: number | undefined;
+  private readonly now: () => number;
 
-  constructor(private readonly deps: GithubDeps) {}
+  constructor(private readonly deps: GithubDeps) {
+    this.now = deps.now ?? Date.now;
+  }
+
+  private readonly onSearch = (res: Response): void => {
+    this.searchesThisPoll++;
+    const remaining = parseIntHeader(res.headers.get("x-ratelimit-remaining"));
+    if (remaining !== undefined) this.lastRemaining = remaining;
+  };
+
+  private handleNonOk(key: string, outcome: NonNullable<SearchOutcome["nonOk"]>, now: number): void {
+    const resetMs = outcome.resetEpochSec != null ? outcome.resetEpochSec * 1000 : undefined;
+    this.throttledUntil = resetMs ?? now + THROTTLE_FALLBACK_MS;
+    if (this.loggedStatus.get(key) === outcome.status) return; // same key, same status: already logged
+    this.loggedStatus.set(key, outcome.status);
+    const remainingPart = outcome.remaining != null ? `remaining=${outcome.remaining}` : "remaining=absent";
+    const resetPart = resetMs != null ? `reset=${new Date(resetMs).toISOString()}` : "reset=absent";
+    this.deps.log?.(`[pr] ${key} search ${outcome.status}: ${remainingPart} ${resetPart}`);
+  }
 
   async stateFor(key: string): Promise<PrState> {
     if (this.merged.has(key)) return "merged"; // terminal: no further requests for this key, ever
@@ -147,8 +260,36 @@ export class PrTracker {
     if (ref) {
       pull = await fetchPull(this.deps, ref);
     } else {
-      const found = (await discover(this.deps, key, "open")) ?? (await discover(this.deps, key, "merged"));
-      if (!found) return null;
+      const now = this.now();
+      if (now < this.throttledUntil) return null; // tracker-wide throttle: no searches at all
+      const ks = this.keyState.get(key);
+      if (ks && now < ks.nextSearchAt) return null; // this key's own backoff hasn't elapsed
+
+      const runMerged = !ks || ks.rounds === 0 || ks.rounds % MERGED_SWEEP_EVERY_ROUNDS === 0;
+
+      const openOutcome = await discoverStatus(this.deps, key, "open", this.onSearch);
+      if (openOutcome.nonOk) {
+        this.handleNonOk(key, openOutcome.nonOk, now);
+        return null;
+      }
+      let found = openOutcome.found;
+      if (!found && runMerged) {
+        const mergedOutcome = await discoverStatus(this.deps, key, "merged", this.onSearch);
+        if (mergedOutcome.nonOk) {
+          this.handleNonOk(key, mergedOutcome.nonOk, now);
+          return null;
+        }
+        found = mergedOutcome.found;
+      }
+
+      if (!found) {
+        const misses = (ks?.misses ?? 0) + 1;
+        const rounds = (ks?.rounds ?? 0) + 1;
+        const delay = BACKOFF_MS[Math.min(misses - 1, BACKOFF_MS.length - 1)]!;
+        this.keyState.set(key, { misses, rounds, nextSearchAt: now + delay });
+        return null;
+      }
+      this.keyState.delete(key); // discovered: negative-cache state cleared
       ref = found.ref;
       pull = found.pull;
       this.cache.set(key, ref);
@@ -165,5 +306,20 @@ export class PrTracker {
     }
     const reviews = await fetchReviews(this.deps, ref);
     return reviewState(reviews);
+  }
+
+  /**
+   * Poll boundary (KAN-824 item 5): logs and resets the searches issued
+   * since the last call, so at rest (zero searches this poll) the journal
+   * stays quiet and `journalctl --user -u butchr.service` shows the rate in
+   * a minute instead of requiring it to be inferred. `remaining` is the
+   * last-seen X-RateLimit-Remaining across any search this poll (from any
+   * key, ok or non-ok), "?" if this process has never seen the header.
+   */
+  endPoll(): void {
+    if (this.searchesThisPoll > 0) {
+      this.deps.log?.(`[pr] searches=${this.searchesThisPoll} remaining=${this.lastRemaining ?? "?"}`);
+    }
+    this.searchesThisPoll = 0;
   }
 }

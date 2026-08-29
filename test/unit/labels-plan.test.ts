@@ -1,5 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { desiredLabels, diffLabels, isDaemonLabel } from "../../src/labels/plan.js";
+import { canHavePr, desiredLabels, diffLabels, isDaemonLabel } from "../../src/labels/plan.js";
+
+describe("canHavePr", () => {
+  test("epics never have a branch, so they can never have a PR (case-insensitive)", () => {
+    expect(canHavePr("Epic")).toBe(false);
+    expect(canHavePr("epic")).toBe(false);
+    expect(canHavePr("EPIC")).toBe(false);
+  });
+  test("every other issue type, including unknown/empty, can have a PR (conservative default: keeps today's behaviour)", () => {
+    expect(canHavePr("Story")).toBe(true);
+    expect(canHavePr("Task")).toBe(true);
+    expect(canHavePr("Bug")).toBe(true);
+    expect(canHavePr("SomeFutureType")).toBe(true);
+    expect(canHavePr("")).toBe(true);
+  });
+});
 
 describe("isDaemonLabel", () => {
   test("only agent: and pr: prefixed labels are daemon-owned", () => {
