@@ -30,4 +30,6 @@ export interface JiraComment {
   id: string;
   body: string;      // ADF flattened to plain text
   created: string;
+  /** The commenting account's email, or null if Jira didn't return one (e.g. a deactivated/anonymized user). */
+  authorEmail: string | null;
 }

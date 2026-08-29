@@ -10,7 +10,7 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
   const client = {
     agent: { list: async () => ({ agents }), start: async (p: any) => { started.push(p); } },
-    pane: { close: async (id: string) => { closed.push(id); } },
+    pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
     workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
   };
   return { client: client as any, started, closed };
@@ -25,6 +25,8 @@ describe("agent name convention", () => {
   });
 });
 
+const instant = () => Promise.resolve();
+
 describe("HerdrHerd", () => {
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
     const { client } = fakeHerdr([{ name: "butchr-kan-1", pane_id: "w1:p1" }, { name: "someone-else", pane_id: "w1:p2" }, { pane_id: "w1:p3" }]);
@@ -33,7 +35,7 @@ describe("HerdrHerd", () => {
   });
   test("spawn starts a claude agent with the channel flag + per-issue mcp config + kickoff prompt; is idempotent", async () => {
     const f = fakeHerdr([]);
-    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp");
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: "KAN-1" });
     expect(f.started.length).toBe(1);
     expect(f.started[0].name).toBe("butchr-kan-7");
@@ -53,7 +55,7 @@ describe("HerdrHerd", () => {
     expect(cfg.mcpServers.butchr.headers["x-issue"]).toBe("KAN-7");
     // idempotent: already-running issue is not started again
     const f2 = fakeHerdr([{ name: "butchr-kan-7", pane_id: "w1:p1" }]);
-    await new HerdrHerd(f2.client, "u").spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    await new HerdrHerd(f2.client, "u", instant).spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(f2.started.length).toBe(0);
   });
   test("paneFor resolves the current pane, or null when not running", async () => {
@@ -69,6 +71,62 @@ describe("HerdrHerd", () => {
     expect(f.closed).toEqual(["w1:p9"]);
     await herd.stop("KAN-404");   // not running
     expect(f.closed).toEqual(["w1:p9"]);
+  });
+});
+
+describe("spawn: kickoff verification (KAN-804/807)", () => {
+  // After agent.start, the fake herdr's agent.list() must report the new
+  // agent so statusOf()/byIssue() can see it — real herdr does this
+  // immediately once the pane exists, unlike the plain fakeHerdr() above
+  // (whose `agents` array is fixed at construction, before start() runs).
+  function fakeHerdrWithLiveAgent(opts: { statusAfterStart: string; paneText?: string; fail?: boolean }) {
+    const started: any[] = []; const closed: string[] = []; const prompts: any[] = []; const keys: any[] = [];
+    let agents: Array<{ name?: string; pane_id: string; agent_status?: string }> = [];
+    const client = {
+      agent: {
+        list: async () => ({ agents }),
+        start: async (p: any) => { started.push(p); agents = [{ name: p.name, pane_id: p.pane_id, agent_status: opts.statusAfterStart }]; },
+        prompt: async (p: any) => { if (opts.fail) throw new Error("blocked"); prompts.push(p); },
+      },
+      pane: {
+        close: async (id: string) => { closed.push(id); },
+        read: async () => ({ read: { text: opts.paneText ?? "" } }),
+        sendKeys: async (k: any) => { keys.push(k); },
+      },
+      workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
+    };
+    return { client: client as any, started, closed, prompts, keys };
+  }
+
+  test("a turn started (agent went working) → no recovery action", async () => {
+    const f = fakeHerdrWithLiveAgent({ statusAfterStart: "working" });
+    const herd = new HerdrHerd(f.client, "u", instant);
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.prompts.length).toBe(0);
+    expect(f.closed.length).toBe(0);
+  });
+
+  test("kickoff swallowed (still idle) and NOT a session-limit refusal → recovers via nudge() (re-sends the kickoff, then Enter if still idle)", async () => {
+    const f = fakeHerdrWithLiveAgent({ statusAfterStart: "idle", paneText: "some ordinary idle pane, no refusal here" });
+    const herd = new HerdrHerd(f.client, "u", instant);
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.prompts).toEqual([{ target: "butchr-kan-7", text: "follow your CLAUDE.md" }]);
+    expect(f.keys[0]).toEqual({ pane_id: "w9:p1", keys: ["enter"] }); // still idle after the nudge's own wait too
+  });
+
+  test("kickoff swallowed by a session-limit refusal → NOT re-sent (a limited session can't be nudged back to life)", async () => {
+    const f = fakeHerdrWithLiveAgent({ statusAfterStart: "idle", paneText: "You've hit your session limit · resets 9:50pm" });
+    const herd = new HerdrHerd(f.client, "u", instant);
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.prompts.length).toBe(0);
+    expect(f.closed.length).toBe(0); // spawn() itself never closes — that's session-limit-watch.ts's job
+  });
+
+  test("done (sitting at its prompt) is treated the same as idle for verification", async () => {
+    const f = fakeHerdrWithLiveAgent({ statusAfterStart: "done", paneText: "no refusal" });
+    const herd = new HerdrHerd(f.client, "u", instant);
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.prompts.length).toBe(1);
   });
 });
 
@@ -97,7 +155,6 @@ describe("nudge", () => {
     workspace: { create: async () => ({ root_pane: "w1:p1" }) },
     pane: { close: async () => {}, sendKeys: async (k: any) => { (opts.keys ?? []).push(k); } },
   });
-  const instant = () => Promise.resolve();
   test("delivers a prompt; still idle after the wait → submits the stranded composer", async () => {
     const prompts: any[] = []; const keys: any[] = [];
     const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);

@@ -1,5 +1,8 @@
 import { modelFor, type SpawnSpec } from "./workspace.js";
 
+/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
+export const KICKOFF_PROMPT = "follow your CLAUDE.md";
+
 /**
  * The exact argv butchr spawns a claude agent with, for `spec` running in
  * `dir`. The ONE place this array is built — HerdrHerd.spawn() and the
@@ -11,7 +14,7 @@ import { modelFor, type SpawnSpec } from "./workspace.js";
  */
 export function spawnArgs(spec: SpawnSpec, dir: string): string[] {
   return [
-    "follow your CLAUDE.md",
+    KICKOFF_PROMPT,
     "--model", modelFor(spec.issuetype),
     "--permission-mode", "bypassPermissions",
     "--mcp-config", dir + "/mcp.json",
