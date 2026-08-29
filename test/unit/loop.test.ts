@@ -436,7 +436,7 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     [{ issue: story(labels, updated, status, summary), watchers: ["E"] }];
   const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c", authorEmail: null }];
 
-  test("a label-only daemon-namespaced diff with no recorded comment baseline is delivered (fail-safe), and exactly one comments() call is made", async () => {
+  test("a label-only daemon-namespaced diff on a key's first sighting is suppressed by the KAN-828 seed (seeding wins the race for a baseline before this branch ever sees 'unknown'), still exactly one comments() call", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     let commentCalls = 0;
@@ -454,8 +454,15 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 60));
     stop();
-    expect(notified).toContain("S<-S");
-    expect(notified).toContain("E<-S");
+    // KAN-828: this is S's first sighting AND its first label-only diff, in
+    // the SAME poll. Baseline seeding runs first, records "5" from the same
+    // memoized comments() call this branch then consults — so it finds a
+    // real baseline that matches, not an unknown one, and correctly
+    // suppresses rather than delivering an echo right after this key first
+    // appears. See the "newer than the recorded baseline" test below for the
+    // branch's fail-safe still firing when a real change follows.
+    expect(notified).not.toContain("S<-S");
+    expect(notified).not.toContain("E<-S");
     expect(commentCalls).toBe(1);
   });
 
@@ -477,10 +484,12 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 100));
     stop();
-    // poll 1 (t2): unknown baseline -> delivered, baseline recorded as "5"
-    // poll 2 (t3): baseline "5", newest still "5" -> no new comment -> suppressed
-    expect(notified.filter((x) => x === "S<-S").length).toBe(1);
-    expect(notified.filter((x) => x === "E<-S").length).toBe(1);
+    // KAN-828: poll 1 (t2) is S's first sighting AND first label-only diff —
+    // baseline seeding records "5" before this branch consults it, so it
+    // already finds a real (matching) baseline and suppresses, same as
+    // poll 2 (t3): baseline "5", newest still "5" -> no new comment -> suppressed.
+    expect(notified.filter((x) => x === "S<-S").length).toBe(0);
+    expect(notified.filter((x) => x === "E<-S").length).toBe(0);
     expect(commentCalls).toBe(2);
   });
 
@@ -503,9 +512,11 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 100));
     stop();
-    // poll 1: unknown baseline -> delivered, baseline "5". poll 2: newest "6" != baseline "5" -> delivered.
-    expect(notified.filter((x) => x === "S<-S").length).toBe(2);
-    expect(notified.filter((x) => x === "E<-S").length).toBe(2);
+    // KAN-828: poll 1 is S's first sighting — baseline seeding records "5"
+    // before this branch consults it, so it suppresses (matching baseline)
+    // rather than delivering on "unknown". poll 2: newest "6" != baseline "5" -> delivered.
+    expect(notified.filter((x) => x === "S<-S").length).toBe(1);
+    expect(notified.filter((x) => x === "E<-S").length).toBe(1);
   });
 
   test("a diff touching a non-daemon (human) label is not treated as a daemon write: delivered normally, no comments() call", async () => {
@@ -528,10 +539,14 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     stop();
     expect(notified).toContain("S<-S");
     expect(notified).toContain("E<-S");
-    expect(commentCalls).toBe(0);
+    // KAN-828: baseline seeding calls comments() once for S's first sighting
+    // regardless of what kind of diff it is — this diff isn't label-only
+    // (isDaemonLabelOnlyDiff is false, "urgent" isn't daemon-owned), so
+    // crossDaemonSuppressed itself never calls comments(), but seeding does.
+    expect(commentCalls).toBe(1);
   });
 
-  test("a status change alongside a label change is delivered normally, and the extra comments() call is NOT made", async () => {
+  test("a status change alongside a label change is delivered normally, and crossDaemonSuppressed itself makes no extra call (only baseline seeding does)", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     let commentCalls = 0;
@@ -551,7 +566,10 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     stop();
     expect(notified).toContain("S<-S");
     expect(notified).toContain("E<-S");
-    expect(commentCalls).toBe(0); // the extra call belongs only to the label-only branch
+    // KAN-828: isDaemonLabelOnlyDiff is false here (status also changed), so
+    // crossDaemonSuppressed's OWN branch never calls comments() — but
+    // baseline seeding still does, once, for S's first sighting.
+    expect(commentCalls).toBe(1);
   });
 
   test("a rejected comments() call fails OPEN: delivered (not suppressed), and does not corrupt the comment baseline for the next poll", async () => {
@@ -579,10 +597,15 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 100));
     stop();
-    // Both label-only polls delivered: poll 1 despite the rejection, poll 2
-    // because the failed poll never wrote a baseline (still unknown).
-    expect(notified.filter((x) => x === "S<-S").length).toBe(2);
-    expect(notified.filter((x) => x === "E<-S").length).toBe(2);
+    // poll 1 delivers despite the rejection (fail-open) — both baseline
+    // seeding and this branch share the same rejected memoized call, so the
+    // cursor is left unset. KAN-828: poll 2's baseline seeding RETRIES (still
+    // unseeded) and this time succeeds ("5"), recording it before this
+    // branch consults it in the SAME poll — so poll 2 now finds a real,
+    // matching baseline and suppresses, rather than delivering on "unknown"
+    // as it did pre-KAN-828.
+    expect(notified.filter((x) => x === "S<-S").length).toBe(1);
+    expect(notified.filter((x) => x === "E<-S").length).toBe(1);
   });
 
   test("an appearing/disappearing key is never checked against the label-only rule at all: no comments() call, always delivered", async () => {
@@ -692,6 +715,14 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
       herd,
       notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
       suppress: (key, updated) => key === "K" && updated === "t2",
+      // KAN-828: K's watcher-loop consult of the ledger hit now runs the
+      // daemonLabelsChanged comment-cursor check (pr:open->pr:approved IS a
+      // daemon label change). This is K's FIRST sighting, so baseline
+      // seeding and the ledger-hit check draw from the SAME poll's SAME
+      // memoized comments() call — trivially "no new comment" — so W stays
+      // suppressed exactly as before. Any stub that resolves proves that;
+      // the id's value doesn't matter here.
+      comments: async () => [{ id: "x", body: "b", created: "c", authorEmail: null }],
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 100));
@@ -708,7 +739,7 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     const oneComment = () => [{ id: "5", body: "x", created: "c", authorEmail: null }];
     const polls: JiraIssue[][] = [
       [withPr(["agent:working", "pr:open"], "t0")],   // baseline poll
-      [withPr(["agent:idle", "pr:open"], "t1")],       // agent:*-only diff: establishes the comment-cursor baseline ("5")
+      [withPr(["agent:idle", "pr:open"], "t1")],       // agent:*-only diff: K's first sighting — KAN-828 baseline seeding fetches "5" HERE, before crossDaemonSuppressed ever runs, so this poll is suppressed rather than delivered on an "unknown baseline"
       [withPr(["agent:idle", "pr:approved"], "t2")],   // pr:* transition, ALSO a label-only diff with a MATCHING baseline
     ];
     let n = 0;
@@ -723,9 +754,15 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     await new Promise((r) => setTimeout(r, 60));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
-    expect(kEvents.length).toBe(2); // poll1 (unknown baseline, label-only, no reason) + poll2 (the transition, WOULD be suppressed by the matching baseline but isn't)
-    expect(kEvents[0]!.reason).toBeUndefined();
-    expect(kEvents[1]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
+    // KAN-828: poll1 no longer contributes an event — baseline seeding
+    // already populated the cursor with "5" before crossDaemonSuppressed
+    // consulted it this same poll, so it correctly suppresses (no new
+    // comment) rather than delivering on what used to be an unknown
+    // baseline. The point this test pins — poll2's pr:* transition is
+    // delivered PAST a matching cross-daemon baseline that would otherwise
+    // suppress it — is unaffected.
+    expect(kEvents.length).toBe(1); // poll2 (the transition, WOULD be suppressed by the matching baseline but isn't)
+    expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
   });
 
   test("control: an agent:*-only diff with the ledger suppressing it produces zero wakes — unchanged behaviour", async () => {
@@ -741,6 +778,12 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
       herd,
       notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
       suppress: (key, updated) => key === "K" && updated === "t2",
+      // KAN-828: agent:working->agent:idle IS a daemon label change, so the
+      // ledger hit now runs the comment-cursor check. This is K's FIRST
+      // sighting, so baseline seeding and the check draw from the SAME
+      // poll's SAME memoized comments() call — trivially "no new comment" —
+      // so this stays suppressed exactly as before, unchanged behaviour.
+      comments: async () => [{ id: "x", body: "b", created: "c", authorEmail: null }],
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 60));
@@ -756,7 +799,7 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     const comments = async () => { const r = responses[Math.min(commentCalls, 1)]!; commentCalls++; return r; };
     const polls: JiraIssue[][] = [
       [withPr(["agent:working", "pr:open"], "t0")],    // baseline poll
-      [withPr(["agent:idle", "pr:open"], "t1")],        // agent:*-only diff: establishes the comment-cursor baseline ("5")
+      [withPr(["agent:idle", "pr:open"], "t1")],        // agent:*-only diff: K's first sighting — KAN-828 baseline seeding fetches "5" HERE, before crossDaemonSuppressed ever runs
       [withPr(["agent:idle", "pr:approved"], "t2")],    // P: pr:* transition — delivered past suppression, cursor NOT touched (stays "5")
       [withPr(["agent:working", "pr:approved"], "t3")], // Q: agent:*-only diff again; newest comment has moved to "6" since the stale "5" baseline
     ];
@@ -771,14 +814,214 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     await new Promise((r) => setTimeout(r, 80));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
-    expect(kEvents.length).toBe(3); // poll1 (baseline set), poll2 (the transition, exempted), poll3 (delivered despite the stale cursor)
+    // KAN-828 changes poll1's outcome from the pre-KAN-828 baseline: baseline
+    // seeding now populates K's comment cursor (with "5") BEFORE
+    // crossDaemonSuppressed ever consults it, on this same first-sighting
+    // poll — so crossDaemonSuppressed no longer finds an "unknown baseline"
+    // there (that was always a some-signal-is-better-than-none compromise);
+    // it finds a real one that matches, and correctly suppresses. Poll2 (the
+    // transition) and poll3 (the stale-cursor catch-up) are unchanged.
+    expect(kEvents.length).toBe(2); // poll2 (the transition, exempted), poll3 (delivered despite the stale cursor)
+    expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
+    expect(kEvents[1]!.reason).toBeUndefined();
+    // Exactly 2 comments() calls: poll1 (baseline seeding) and poll3
+    // (crossDaemonSuppressed) — poll2's transition never consults the cursor
+    // at all, so it genuinely never advances during it; the swap to "6" is
+    // discovered only at poll3.
+    expect(commentCalls).toBe(2);
+  });
+});
+
+describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-828, KAN-793/799/804 race)", () => {
+  // A non-pr label throughout — so KAN-819's prTransition exemption cannot
+  // mask the behaviour under test (per the ticket's test instructions).
+  const withLabels = (labels: string[], updated: string): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const relK = (labels: string[], updated: string) => [{ issue: withLabels(labels, updated), watchers: ["W"] }];
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("(a) THE RACE: a foreign comment folded into a daemon label write's read-back is delivered once the newest comment id has moved, to both K's own agent and its watcher", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    const responses = [[comment("c1")], [comment("c2"), comment("c1")]];
+    let commentCalls = 0;
+    const comments = async () => { const r = responses[Math.min(commentCalls, responses.length - 1)]!; commentCalls++; return r; };
+    // idx0: silent baseline (K absent — watch()'s first fetch never invokes
+    // the diff callback, see @brooswit/sundry's watcher.ts). idx1: K appears
+    // — this is K's first sighting, so baseline seeding fetches "c1" here
+    // (an appear always delivers unconditionally, unrelated to the race).
+    // idx2: the RACE — labels flip (a daemon write, ledger records it), but
+    // a foreign comment "c2" landed first and is folded into the read-back.
+    const polls: JiraIssue[][] = [[], [withLabels(["agent:working"], "t1")], [withLabels(["agent:idle"], "t2")]];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:idle"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      suppress: (key, updated) => key === "K" && updated === "t2", // the ledger hit, exactly as own-writes.ts would report it
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    // idx1 contributes one appear-delivery each (always delivered,
+    // unconditionally, regardless of the race); idx2 contributes exactly one
+    // more each — the race event itself: the ledger hit is not final because
+    // daemonLabelsChanged is true, and the newest comment id moved ("c1" ->
+    // "c2"), so it is delivered rather than swallowed.
+    expect(kEvents.length).toBe(2); // idx1 appear + idx2 THE RACE
+    expect(wEvents.length).toBe(2); // idx1 appear + idx2 THE RACE, reaching the watcher too
+    // Exactly one comments() call per key per poll, TOTAL — idx1's seed and
+    // idx2's ledger-hit check each make exactly one, shared by BOTH K's own
+    // agent's consult and W's consult within the same poll.
+    expect(commentCalls).toBe(2);
+  });
+
+  test("(b) CONTROL: a DAEMON_WRITER ledger hit whose newest comment id has NOT moved stays suppressed — the echo suppression is intact", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    let commentCalls = 0;
+    const comments = async () => { commentCalls++; return [comment("c1")]; }; // same newest id every call — no new comment, ever
+    const polls: JiraIssue[][] = [[], [withLabels(["agent:working"], "t1")], [withLabels(["agent:idle"], "t2")]];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:idle"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      suppress: (key, updated) => key === "K" && updated === "t2",
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    expect(kEvents.length).toBe(1); // just idx1's appear; idx2's ledger hit has no new comment -> suppressed
+    expect(wEvents.length).toBe(1); // same for the watcher
+    expect(commentCalls).toBe(2);
+  });
+
+  test("(c) FAIL-OPEN: comments() rejecting on the ledger-hit poll delivers anyway and leaves the cursor untouched; the FOLLOWING poll with a genuine new comment still delivers", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    let commentCalls = 0;
+    // call 1 (idx1 seed): succeeds, "c1". call 2 (idx2 ledger hit): REJECTS.
+    // call 3 (idx3 ledger hit): succeeds, "c2" — genuinely new since the
+    // STILL-"c1" baseline (idx2's rejection never touched the cursor).
+    const comments = async () => {
+      commentCalls++;
+      if (commentCalls === 2) throw new Error("503 unavailable");
+      return commentCalls < 3 ? [comment("c1")] : [comment("c2"), comment("c1")];
+    };
+    const polls: JiraIssue[][] = [
+      [],
+      [withLabels(["agent:working"], "t1")],
+      [withLabels(["agent:idle"], "t2")],
+      [withLabels(["agent:working"], "t3")],
+    ];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:idle"], "t2"), relK(["agent:working"], "t3")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      suppress: (key, updated) => key === "K" && (updated === "t2" || updated === "t3"),
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    // idx1: appear. idx2: comments() rejects on the ledger hit -> FAIL OPEN,
+    // delivered, cursor left at "c1" (untouched). idx3: a genuine new
+    // comment ("c2") since that still-"c1" baseline -> delivered.
+    expect(kEvents.length).toBe(3);
+    expect(wEvents.length).toBe(3);
+    expect(commentCalls).toBe(3);
+  });
+
+  test("(d) SEEDING: a key first sighted mid-run is seeded on the poll it appears; a daemon label write on the VERY NEXT poll with no new comment produces zero wakes — the seed prevents the first-hit echo", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    let commentCalls = 0;
+    const comments = async () => { commentCalls++; return [comment("c1")]; }; // no new comment, ever
+    // "Z" is present from the start and changes on its own — this forces an
+    // onChange poll BEFORE K ever exists, proving K is untouched by it (K
+    // isn't in next.issues/next.related that poll, so nothing seeds it yet).
+    // K then appears mid-run (idx2) — a newly staffed ticket — and gets
+    // seeded right there. idx3 is a pure daemon agent:* write on K, and
+    // ONLY on K (Z holds still) — the ledger hit this test is about.
+    const zIss = (status: string): JiraIssue => ({ key: "Z", status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated: status, labels: [] });
+    const polls: JiraIssue[][] = [
+      [zIss("In Progress")],
+      [zIss("In Review")],                                                     // Z changes; K still doesn't exist
+      [zIss("In Review"), withLabels(["agent:working"], "t1")],                 // K appears mid-run — seeded here
+      [zIss("In Review"), withLabels(["agent:idle"], "t2")],                    // K: a daemon label write only, no new comment
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      suppress: (key, updated) => key === "K" && updated === "t2",
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    expect(kEvents.length).toBe(1); // just K's mid-run appear; the seed it gets there prevents an echo on the very next poll's ledger hit
+    // 3 total: Z's own first-sighting seed (idx1, unrelated to K — proves
+    // seeding runs for every key in the snapshot, not just ones with a
+    // daemon-label ledger hit), K's first-sighting seed (idx2), and K's
+    // ledger-hit check (idx3).
+    expect(commentCalls).toBe(3);
+  });
+
+  test("(e) DEDUPE: a pr:* transition AND a daemon-recorded ledger hit in the same poll deliver exactly ONE nudge to K, carrying the pr reason — the transition exemption short-circuits before the cursor is ever consulted", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    let commentCalls = 0;
+    const comments = async () => { commentCalls++; return [comment("c1")]; };
+    const polls: JiraIssue[][] = [
+      [],
+      [withLabels(["agent:working", "pr:open"], "t1")],
+      [withLabels(["agent:working", "pr:approved"], "t2")], // BOTH a pr:* transition AND a ledger hit (the label sync write that flipped pr:open->pr:approved)
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      suppress: (key, updated) => key === "K" && updated === "t2",
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    // idx1 contributes K's appear (always delivered, no reason); idx2 is the
+    // event under test — exactly ONE nudge, not two, despite the poll
+    // carrying both a pr:* transition AND a ledger hit that (were the
+    // transition exemption absent) the comment-cursor check would ALSO have
+    // independently evaluated.
+    expect(kEvents.length).toBe(2);
     expect(kEvents[0]!.reason).toBeUndefined();
     expect(kEvents[1]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
-    expect(kEvents[2]!.reason).toBeUndefined();
-    // Exactly 2 comments() calls (poll1 and poll3) — poll2's transition never
-    // consulted crossDaemonSuppressed at all, so the cursor genuinely never
-    // advanced during it; the swap to "6" is discovered only at poll3.
-    expect(commentCalls).toBe(2);
+    // The transition branch sends and `continue`s BEFORE suppressed() (and
+    // so the comment-cursor check) is ever consulted for K's own site — only
+    // the idx1 seed ever calls comments(), proving the cursor genuinely
+    // wasn't consulted for the transition poll, not just that its result was
+    // discarded by the `sent` dedupe.
+    expect(commentCalls).toBe(1);
   });
 });
 

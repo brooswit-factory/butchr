@@ -1,7 +1,7 @@
 import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
-import { activeKeys, changedKeys, isDaemonLabelOnlyDiff, prTransition } from "../jira-watch/diff.js";
+import { activeKeys, changedKeys, daemonLabelsChanged, isDaemonLabelOnlyDiff, prTransition } from "../jira-watch/diff.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
 
 /** A ticket watched on behalf of active issues via the Implements chain (see src/jira-watch/routes.ts). */
@@ -55,11 +55,14 @@ export interface LoopDeps {
    */
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   /**
-   * Recent comments on a ticket, newest first — used ONLY on the label-only
-   * daemon-namespaced diff branch (a cross-daemon label echo, see
-   * isDaemonLabelOnlyDiff) to check for a foreign comment invisible to the
-   * status/summary/updated fields alone. Optional; omitted, that branch
-   * never suppresses (never guess without the ability to look).
+   * Recent comments on a ticket, newest first — used to check for a foreign
+   * comment invisible to the status/summary/updated fields alone: on the
+   * label-only daemon-namespaced diff branch (a cross-daemon label echo, see
+   * isDaemonLabelOnlyDiff), on a DAEMON_WRITER ledger hit that also changed a
+   * daemon label (see daemonLabelsChanged, KAN-828), and to seed a key's
+   * comment-cursor baseline on its first sighting each poll. Optional;
+   * omitted, none of those ever suppress (never guess without the ability to
+   * look) and seeding never records a baseline.
    */
   comments?: (key: string) => Promise<readonly JiraComment[]>;
   /** Free-text daemon log line, e.g. the storm guard's suppression WARNING. Optional; omitted, that line is simply never emitted. */
@@ -170,13 +173,17 @@ interface Snapshot { issues: JiraIssue[]; related: RelatedIssue[] }
  * `deps.suppress`) or a cross-daemon label-only echo (`isDaemonLabelOnlyDiff`
  * + `deps.comments`) — EXCEPT a pr:* transition on a ticket's own agent
  * (`prTransition`), which is delivered past both suppressions and names the
- * transition in the third `notify` argument.
+ * transition in the third `notify` argument. A DAEMON_WRITER own-write-ledger
+ * hit that also changed a daemon label (`daemonLabelsChanged`) is itself not
+ * final either — see `ledgerHitSuppressed` below (KAN-828).
  */
 export function startLoop(deps: LoopDeps): Stop {
   // Persists ACROSS polls (unlike `sent`, reset each poll below): the last
-  // comment id observed per key, for the cross-daemon label-echo check.
-  // Absence of a key means "no baseline yet" — the fail-safe case that
-  // always delivers rather than suppresses on an unknown baseline.
+  // comment id observed per key — for the cross-daemon label-echo check, the
+  // DAEMON_WRITER ledger-hit check (KAN-828), and first-sighting baseline
+  // seeding (KAN-828). Absence of a key means "no baseline yet" — the
+  // fail-safe case that always delivers rather than suppresses on an unknown
+  // baseline; seeding is what keeps a ledger hit from ever meeting that case.
   const commentCursor = new Map<string, string | null>();
   // Also persists across polls: the respawn storm guard (see RespawnGuard).
   // One instance for the whole loop's lifetime — NOT module-level state — so
@@ -209,6 +216,55 @@ export function startLoop(deps: LoopDeps): Stop {
         await deps.notify(issue, about, reason);
       };
 
+      // ONE deps.comments(key) call per key, per poll — shared by baseline
+      // seeding below, the DAEMON_WRITER ledger-hit comment-cursor check, and
+      // the cross-daemon label-only echo check (KAN-828 item 4). Fails OPEN:
+      // a rejected call (a transient network error — this is a live Jira
+      // call), or `deps.comments` simply not being wired up, is never treated
+      // as "no new comment" and never advances the cursor, so a failed poll
+      // can never install a wrong baseline.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null } | { ok: false }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null } | { ok: false }> => {
+        let p = commentsCache.get(key);
+        if (!p) {
+          p = (async () => {
+            if (!deps.comments) return { ok: false as const };
+            try {
+              const comments = await deps.comments(key);
+              return { ok: true as const, newest: comments[0]?.id ?? null };
+            } catch {
+              return { ok: false as const };
+            }
+          })();
+          commentsCache.set(key, p);
+        }
+        return p;
+      };
+
+      // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
+      // no recorded comment-cursor entry yet gets one seeded now, from its
+      // CURRENT newest comment id, so its first-ever ledger hit already has a
+      // baseline to compare against — without this, the "unknown baseline"
+      // fail-safe would turn every key's first daemon-label ledger hit into
+      // a one-time echo nudge, noise this ticket must not add. Fail-open: a
+      // rejected/unavailable call leaves the key unseeded, retried on a
+      // later poll, never installing a baseline it did not observe. A key
+      // that appears mid-run (a newly staffed ticket) is seeded right here,
+      // on the poll it first appears — safe, because `suppressed()` already
+      // delivers unconditionally on appear/disappear (no `before`), and a
+      // ledger hit requires both `before` and `after`, so by the time a key
+      // can ever hit the ledger it was necessarily present — and thus
+      // seeded — on the previous poll. A ledger hit therefore always has a
+      // baseline.
+      const seenKeys = new Set<string>([...next.issues.map((i) => i.key), ...next.related.map((r) => r.issue.key)]);
+      await Promise.all(
+        [...seenKeys].map(async (key) => {
+          if (commentCursor.has(key)) return;
+          const result = await fetchComments(key);
+          if (result.ok) commentCursor.set(key, result.newest);
+        }),
+      );
+
       // Memoized per key, per poll: the label-only branch makes at most one
       // comments() call per key, however many watchers consult it. Fails
       // OPEN: a rejected comments() call (a transient network error — this is
@@ -221,21 +277,62 @@ export function startLoop(deps: LoopDeps): Stop {
         if (!p) {
           p = (async () => {
             if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
-            if (!deps.comments) return false;
-            let comments: readonly JiraComment[];
-            try {
-              comments = await deps.comments(key);
-            } catch {
-              return false; // cannot look -> do not suppress; cursor left untouched
-            }
-            const newest = comments[0]?.id ?? null;
+            const result = await fetchComments(key);
+            if (!result.ok) return false; // cannot look -> do not suppress; cursor left untouched
             const hadBaseline = commentCursor.has(key);
             const baseline = commentCursor.get(key) ?? null;
-            commentCursor.set(key, newest);
+            commentCursor.set(key, result.newest);
             if (!hadBaseline) return false; // unknown baseline: never suppress
-            return newest === baseline;
+            return result.newest === baseline;
           })();
           crossDaemonCache.set(key, p);
+        }
+        return p;
+      };
+
+      // DAEMON_WRITER ledger-hit comment-cursor check (KAN-828). The own-write
+      // ledger's exact-`updated`-match discriminator (own-writes.ts, not
+      // modified here) treats a foreign write folded into our read-back the
+      // same as a pure self-write, which swallows a reviewer/boss/human
+      // comment landing in that round-trip (KAN-793/799/804). That guarantee
+      // is corrected HERE, not in own-writes.ts (out of scope): a
+      // DAEMON_WRITER hit is no longer the final verdict — it means "our
+      // write bumped `updated` — was anything else folded in?", answered by
+      // whether the ticket's newest comment id moved since the recorded
+      // baseline.
+      //
+      // Scoped to DAEMON label writes only (daemonLabelsChanged), and
+      // deliberately NOT applied to the ledger's AGENT-writer arm (an
+      // agent's own write suppressing the ping to that agent alone). The
+      // DAEMON arm's write is a LABEL write, which creates no comment, so a
+      // moved newest-comment-id there means something foreign was folded in.
+      // The AGENT arm's write is typically the agent's OWN COMMENT, so the
+      // newest comment id moving is EXPECTED — it IS that agent's own
+      // comment — and a blanket cursor check would wake every agent on its
+      // own comment, every poll. Author-based discrimination isn't available
+      // either: agents share accounts by role (every Task is the same
+      // accountId), so "was the newest comment mine?" is unanswerable from
+      // `deps.comments`. The two arms can't be told apart from
+      // `deps.suppress`'s boolean without modifying own-writes.ts, which is
+      // out of scope — so the scoping is done on the diff shape instead: a
+      // daemon label write always changes daemon labels; a bare agent
+      // comment never does. Known residual, stated rather than hidden: a
+      // ledger hit whose folded-in foreign event was a status change with NO
+      // comment is still suppressed — outside this discriminator's reach.
+      const ledgerHitCache = new Map<string, Promise<boolean>>();
+      const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
+        let p = ledgerHitCache.get(key);
+        if (!p) {
+          p = (async () => {
+            if (!daemonLabelsChanged(before, after)) return true; // agent-writer arm / pure comment path — unchanged
+            const result = await fetchComments(key);
+            if (!result.ok) return false; // fail open: deliver, cursor untouched
+            const baseline = commentCursor.get(key) ?? null;
+            if (result.newest === baseline) return true; // no new comment -> suppress
+            commentCursor.set(key, result.newest);
+            return false; // newest comment moved -> deliver
+          })();
+          ledgerHitCache.set(key, p);
         }
         return p;
       };
@@ -248,7 +345,7 @@ export function startLoop(deps: LoopDeps): Stop {
       // actually observed, so appear/disappear always delivers, unchecked.
       const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
         if (!before || !after) return false;
-        if (deps.suppress?.(key, after.updated, watcher)) return true;
+        if (deps.suppress?.(key, after.updated, watcher)) return ledgerHitSuppressed(key, before, after);
         return crossDaemonSuppressed(key, before, after);
       };
 
