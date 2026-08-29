@@ -17,6 +17,7 @@ import { createLabelSync } from "../labels/sync.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { respawnComment } from "../agents/respawn.js";
 
 let config;
 try {
@@ -92,8 +93,7 @@ const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review")
 const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
 
 // Related work for the active set: the Implements chain (a boss watches what
-// implements it — a story hears its tasks, an epic hears its stories), plus
-// the Relates deprecation window (see src/jira-watch/routes.ts).
+// implements it — a story hears its tasks, an epic hears its stories).
 // Watched regardless of assignee — the assigned-issues query above is
 // per-credential, but a boss must hear about its implementer's progress even
 // when another account (another machine's daemon) staffs it. A thin I/O
@@ -112,7 +112,12 @@ const related = async (active: readonly string[]): Promise<RelatedIssue[]> => {
   const linkWatchers = new Map<string, Set<string>>();
   for (const k of keys)
     for (const other of watchedKeys(await atlassian.links(k))) {
-      if (!KEY_RE.test(other) || keys.includes(other)) continue; // active ends are already watched
+      // Active ends are NOT skipped: a boss and its implementer can both be
+      // staffed by this same daemon (same assignee credential), and the boss
+      // must still hear its implementer's changes through this link. The
+      // loop's `sent` dedupe (`${issue}|${about}`) already prevents the
+      // implementer's own agent being notified twice about itself.
+      if (!KEY_RE.test(other)) continue;
       (linkWatchers.get(other) ?? linkWatchers.set(other, new Set()).get(other)!).add(k);
     }
   const linked = [...linkWatchers.keys()];
@@ -139,6 +144,12 @@ startLoop({
     void notifyIssue(mcp, issue, msg);
     const woke = await herd.nudge(issue, msg).catch(() => false);
     console.error(`  [notify] ${issue} ← ${about}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+  },
+  onRespawn: async (issue, reason, observedArgv) => {
+    console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    // A failed notice must not undo the respawn that already happened — log and move on.
+    await ops.addComment(issue, respawnComment(issue, reason, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
   },
   syncLabels,
   intervalMs: 15_000,

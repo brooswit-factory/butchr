@@ -3,12 +3,13 @@ import { desiredFrom, reconcileNow, startLoop } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
-function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
+function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
   const running = new Set(initial);
   const spawned: string[] = [], stopped: string[] = [];
   return {
     running, spawned, stopped,
     async runningIssues() { return [...running]; },
+    async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
     async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
@@ -25,6 +26,24 @@ describe("reconcileNow", () => {
     expect(herd.spawned).toEqual(["NEW"]);
     expect(herd.stopped).toEqual(["OLD"]);
     expect([...herd.running].sort()).toEqual(["KEEP", "NEW"]);
+  });
+
+  test("a stale-but-desired issue is stopped then spawned fresh, and onRespawn fires once with its reason + observed argv", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const calls: any[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), { onRespawn: (issue, reason, observedArgv) => { calls.push({ issue, reason, observedArgv }); } });
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
+    expect(calls).toEqual([{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
+  });
+
+  test("no onRespawn callback provided → stale issue still gets stopped and spawned", async () => {
+    const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]));
+    expect(herd.stopped).toEqual(["STALE"]);
+    expect(herd.spawned).toEqual(["STALE"]);
   });
 });
 
@@ -123,6 +142,59 @@ describe("startLoop related-work watch", () => {
   });
 });
 
+describe("startLoop related-work watch: same-daemon boss/implementer", () => {
+  const rel = (key: string, status: string, watchers: string[], updated = "t") =>
+    ({ issue: { key, status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels: [] }, watchers });
+  test("boss B and implementer I both active on this daemon: I changing notifies B about I, and I about itself exactly once", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    // B (a story) and I (its task) are both in the assigned/active set — the
+    // gap this closes: I used to be skipped out of `related` entirely
+    // because it was already in `keys`, so B never heard about it.
+    const assignedPolls = [
+      [iss("B", "In Progress"), iss("I", "In Progress")],
+      [iss("B", "In Progress"), iss("I", "In Review")],   // I changed
+    ];
+    const relatedPolls = [
+      [rel("I", "In Progress", ["B"])],
+      [rel("I", "In Review", ["B"])],       // I changed
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => assignedPolls[Math.min(n, 1)]!,
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("B<-I");                                  // boss notified about its implementer
+    expect(notified.filter((x) => x === "I<-I").length).toBe(1);         // I's own agent notified about itself exactly once (sent dedupe)
+  });
+
+  test("mirror: B changing does NOT notify I", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("B", "In Progress"), iss("I", "In Progress")],
+      [iss("B", "In Review"), iss("I", "In Progress")],   // B changed
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, 1)]!,
+      related: async () => [rel("I", "In Progress", ["B"])],
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("B<-B");        // B's own agent hears its own change
+    expect(notified).not.toContain("I<-B");    // I never hears about its boss through this link
+  });
+});
+
 describe("startLoop own-label-write nudge suppression", () => {
   test("the daemon's own label write bumping `updated` does not itself nudge; a real subsequent change still does", async () => {
     const herd = fakeHerd();
@@ -190,5 +262,24 @@ describe("startLoop own-label-write nudge suppression", () => {
     await new Promise((r) => setTimeout(r, 60));
     stop();
     expect(notified).toEqual([]);
+  });
+});
+
+describe("startLoop respawn wiring", () => {
+  test("deps.onRespawn is invoked through reconcileNow on each poll a stale agent is found", async () => {
+    const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
+    const respawns: any[] = [];
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      herd,
+      notify: () => {},
+      onRespawn: (issue, reason, observedArgv) => { respawns.push({ issue, reason, observedArgv }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+    expect(respawns[0]).toEqual({ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] });
+    expect(herd.stopped).toContain("A");
+    expect(herd.spawned).toContain("A");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { watchedKeys, ROUTE_RELATES_DEPRECATED } from "../../src/jira-watch/routes.js";
+import { watchedKeys } from "../../src/jira-watch/routes.js";
 import type { IssueLink } from "../../src/atlassian/types.js";
 
 const link = (type: string, otherEnd: "inward" | "outward", key: string): IssueLink => ({ type, otherEnd, key });
@@ -40,10 +40,9 @@ describe("watchedKeys", () => {
     expect(watchedKeys(storyLinks)).toEqual([]);
   });
 
-  test("DEPRECATED (remove in release B, KAN-769): a Relates link routes during the deprecation window", () => {
-    expect(ROUTE_RELATES_DEPRECATED).toBe(true);
-    expect(watchedKeys([link("Relates", "outward", "KAN-A")])).toEqual(["KAN-A"]);
-    expect(watchedKeys([link("Relates", "inward", "KAN-B")])).toEqual(["KAN-B"]);
+  test("a Relates link (either direction) is not routed", () => {
+    expect(watchedKeys([link("Relates", "outward", "KAN-A")])).toEqual([]);
+    expect(watchedKeys([link("Relates", "inward", "KAN-B")])).toEqual([]);
   });
 
   test("a Blocks link is not routed", () => {
@@ -62,6 +61,6 @@ describe("watchedKeys", () => {
       link("Implements", "inward", "KAN-4"),
       link("Duplicate", "outward", "KAN-5"),
     ];
-    expect(watchedKeys(links)).toEqual(["KAN-1", "KAN-3"]);
+    expect(watchedKeys(links)).toEqual(["KAN-1"]);
   });
 });
