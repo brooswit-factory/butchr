@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.5.18] - 2026-08-28
+### Fixed
+- **`confluence_create_page` nests the page payload under `body`.** confluence.js 3.2.0's `CreatePage` parameter schema is zod `$strip` — only the top-level `body` key is forwarded to the request; `spaceId`/`status`/`title` sent alongside it were silently dropped, so Atlassian received an empty `spaceId` and every call 400'd with `"spaceId: must not be null"`. Same class of bug as `jira_add_comment` (#24): the wrapper now nests the whole page payload — `spaceId`, `status`, `title`, and the storage-format `body` — under the one key the library actually reads.
+
 ## [0.5.17] - 2026-08-28
 ### Fixed
 - **The fullscreen-renderer offer is auto-answered "Not now".** It stranded stories at the composer, and after the v0.5.16 rate cap engaged, new dialogs on capped panes were log-only — so parents were never told (the cap's blind spot; two stories sat stranded). The offer is a non-work UI opt-in with an established fleet answer, so it now belongs to the auto-answerer and never reaches escalation at all.
