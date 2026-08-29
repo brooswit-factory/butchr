@@ -1,6 +1,6 @@
 {
   "name": "@brooswit/butchr",
-  "version": "0.5.20",
+  "version": "0.6.1",
   "description": "The software factory: watches your Jira, runs herdr agents on active tickets, pushes updates to them over MCP",
   "type": "module",
   "repository": {

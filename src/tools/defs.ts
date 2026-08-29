@@ -22,9 +22,18 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
       handler: (a, c) => { const { jql, maxResults } = a as { jql: string; maxResults: number }; audit(c, `search ${jql.slice(0, 60)}`); return ops.search(jql, maxResults ?? 25); },
     },
     jira_link_issues: {
-      description: "Link two issues (default type Relates). REQUIRED when a story files a task: Jira rejects a Story as a Task's parent (tasks parent to the epic), and the LINK is what makes butchr route the task's events — In Review, comments — to the story for review. Link your story to each task you file, immediately.",
-      input: { from: z.string(), to: z.string(), type: z.string().default("Relates") },
-      handler: (a, c) => { const { from, to, type } = a as { from: string; to: string; type?: string }; audit(c, `link ${from} → ${to}`); return ops.linkIssues(from, to, type ?? "Relates"); },
+      description: "Link two issues. The IMPLEMENTER is `from` — the outward side: task implements story ⇒ from=task, to=story; story implements epic ⇒ from=story, to=epic. This link is what routes a ticket's events (In Review, comments) to its boss — nothing else is listened to (the Jira parent field is membership only). Defaults to type \"Implements\"; pass an explicit `type` for other link kinds (Blocks, Relates, …).",
+      input: { from: z.string(), to: z.string(), type: z.string().default("Implements") },
+      handler: (a, c) => {
+        const { from, to, type } = a as { from: string; to: string; type?: string };
+        const resolvedType = type ?? "Implements";
+        audit(c, `link ${from} → ${to} (${resolvedType})`);
+        // Jira's POST /issueLink answers 201 with an EMPTY body, so the op
+        // resolves undefined even though the link was created — an MCP result
+        // with content[0].text === undefined is invalid and the client rejects
+        // the whole call (KAN-764). Substitute a real value in that case.
+        return ops.linkIssues(from, to, resolvedType).then((r) => r ?? { ok: true, from, to, type: resolvedType });
+      },
     },
     jira_add_comment: {
       description: "Add a plain-text comment to a Jira issue.",
