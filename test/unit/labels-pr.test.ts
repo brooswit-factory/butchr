@@ -206,6 +206,102 @@ describe("PrTracker", () => {
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
     expect(await tracker.stateFor("KAN-790")).toBeNull();
   });
+
+  // KAN-832/837 case 2 — the guard against overshooting into KAN-814-style stickiness:
+  // an OK search that genuinely finds nothing is evidence of absence, not "could not look".
+  test("a confirmed no-PR search (OK, zero exact-head matches, both orgs) still yields null", async () => {
+    const { fetchImpl } = fakeFetch([{ match: /search\/issues/, respond: () => ({ items: [] }) }]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-1")).toBeNull();
+  });
+
+  // KAN-832/837 case 9: closed-unmerged is genuine evidence of absence, not "could not look" —
+  // must still strip and still allow rediscovery (already covered by name above at "closed
+  // unmerged is treated as no PR, and allows rediscovery"; this asserts the same shape returns
+  // null specifically alongside a merged=true sibling to guard against a careless `pull.merged ||
+  // pull.state === "closed"` collapse that would return "unknown" for closed-unmerged too).
+  test("closed unmerged yields null, distinctly from merged (case 9 guard)", async () => {
+    const { fetchImpl: closedFetch } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("acme", "widgets", 5) },
+      { match: /pulls\/5$/, respond: pull("closed", false, "KAN-1") },
+    ]);
+    const closedTracker = new PrTracker({ fetchImpl: closedFetch, orgs: ["acme"] });
+    expect(await closedTracker.stateFor("KAN-1")).toBeNull();
+
+    const { fetchImpl: mergedFetch } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("acme", "widgets", 5) },
+      { match: /pulls\/5$/, respond: pull("closed", true, "KAN-1") },
+    ]);
+    const mergedTracker = new PrTracker({ fetchImpl: mergedFetch, orgs: ["acme"] });
+    expect(await mergedTracker.stateFor("KAN-1")).toBe("merged");
+  });
+
+  // KAN-832/837 case 3: the throttle set by ONE key's 403 is tracker-wide — a DIFFERENT cold key
+  // polled while it holds must also see "unknown", not null (the fleet-wide spurious-strip case
+  // that makes this ticket High).
+  test("a 403 on key A's search makes key B's next stateFor return 'unknown' (not null) while the tracker-wide throttle holds", async () => {
+    let now = 0;
+    const statusFetch = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) return new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "5" } });
+      return new Response("not found", { status: 404 });
+    };
+    const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now });
+
+    expect(await tracker.stateFor("KAN-A")).toBe("unknown"); // A's own search 403s
+    expect(await tracker.stateFor("KAN-B")).toBe("unknown"); // B never searched at all — tracker-wide throttle
+  });
+
+  // KAN-832/837 case 4: a key still inside its own negative-cache backoff window (KAN-824) is
+  // "could not look" too — no search ran for it this poll.
+  test("a key inside its own negative-cache backoff window yields 'unknown', not null", async () => {
+    let now = 0;
+    const { fetchImpl } = fakeFetch([{ match: /search\/issues/, respond: () => ({ items: [] }) }]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"], now: () => now });
+
+    expect(await tracker.stateFor("KAN-1")).toBeNull(); // round 1: genuine miss, opens the 15s backoff
+    now = 5_000; // still inside the 15s backoff window
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // no search ran this poll: could not look
+  });
+
+  // KAN-832/837 case 5 (WARM path, site 2): a 403 on an already-discovered PR's direct fetch must
+  // not evict the cached ref — the ref is still valid, only our view of it failed this poll.
+  test("a cached-ref key whose /pulls/N fetch 403s yields 'unknown', and the cached ref is not evicted", async () => {
+    let pullAttempts = 0;
+    const fetchImpl = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) return new Response(JSON.stringify({ items: [{ number: 5, repository_url: "https://api.github.com/repos/acme/widgets" }] }), { status: 200 });
+      if (/pulls\/5\/reviews/.test(url)) return new Response(JSON.stringify([]), { status: 200 });
+      if (/pulls\/5$/.test(url)) {
+        pullAttempts++;
+        if (pullAttempts === 1) return new Response(JSON.stringify({ state: "open", merged: false, head: { ref: "KAN-1" } }), { status: 200 }); // discovery's own validation fetch
+        if (pullAttempts === 2) return new Response("{}", { status: 403 }); // warm poll: could not look
+        return new Response(JSON.stringify({ state: "open", merged: false, head: { ref: "KAN-1" } }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const searchAttempts = { n: 0 };
+    const countingFetch = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) searchAttempts.n++;
+      return fetchImpl(url);
+    };
+    const tracker = new PrTracker({ fetchImpl: countingFetch, orgs: ["acme"] });
+
+    expect(await tracker.stateFor("KAN-1")).toBe("open"); // discovers and caches the ref
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // warm poll's /pulls/5 403s
+    expect(await tracker.stateFor("KAN-1")).toBe("open"); // next poll's /pulls/5 succeeds — ref was never evicted
+    expect(searchAttempts.n).toBe(1); // no re-search was ever triggered by the 403
+  });
+
+  // KAN-832/837 case 6 (site 3): a failed reviews fetch must not silently downgrade to "open" —
+  // that would be an active downgrade of a possibly-approved PR.
+  test("fetchReviews non-OK on an open PR yields 'unknown', not 'open'", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("acme", "widgets", 5) },
+      { match: /pulls\/5$/, respond: pull("open", false, "KAN-1") },
+    ]);
+    // fakeFetch's default handler falls through to 404 for the reviews endpoint since no handler matches it.
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown");
+  });
 });
 
 // KAN-824: bound pr:* discovery to GitHub's 30/min search budget — negative
@@ -358,10 +454,10 @@ describe("PrTracker — KAN-824 search budget", () => {
     const logs: string[] = [];
     const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now, log: (l) => logs.push(l) });
 
-    expect(await tracker.stateFor("KAN-1")).toBeNull(); // throttled: cannot discover yet
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // throttled: cannot discover yet
     expect(logs.filter((l) => l.includes("KAN-1") && l.includes("403")).length).toBe(1);
 
-    expect(await tracker.stateFor("KAN-1")).toBeNull(); // still throttled, same tick — no new search, no new log
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // still throttled, same tick — no new search, no new log
     expect(searchAttempts).toBe(1);
     expect(logs.filter((l) => l.includes("KAN-1") && l.includes("403")).length).toBe(1);
 
@@ -387,15 +483,15 @@ describe("PrTracker — KAN-824 search budget", () => {
     };
     const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now });
 
-    expect(await tracker.stateFor("KAN-1")).toBeNull(); // 403 with an already-past reset
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // 403 with an already-past reset
     expect(searchAttempts).toBe(1);
 
     now = 10_001; // the very next poll — a bare `resetMs ?? fallback` would NOT be throttled here
-    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown");
     expect(searchAttempts).toBe(1); // still suppressed: no new search issued
 
     now = 10_000 + 60_000 - 1; // just before the 60s fallback throttle elapses
-    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown");
     expect(searchAttempts).toBe(1);
 
     now = 10_000 + 60_000; // fallback throttle elapsed: searches resume
@@ -417,11 +513,11 @@ describe("PrTracker — KAN-824 search budget", () => {
     };
     const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now });
 
-    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown");
     expect(searchAttempts).toBe(1);
 
     now = 10_001; // an empty header must not act as resetMs=0, i.e. "already elapsed" — no new search
-    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown");
     expect(searchAttempts).toBe(1);
   });
 

@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrState } from "./plan.js";
+import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 
 export interface LabelWriter {
@@ -12,7 +12,7 @@ export interface SyncDeps {
   /** issue key -> raw herdr agent_status, for every currently running butchr agent. */
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
-  prState?: (key: string) => Promise<PrState>;
+  prState?: (key: string) => Promise<PrLookup>;
   /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
   stalled?: StalledCheck;
   /**
@@ -151,7 +151,7 @@ export function createLabelSync(deps: SyncDeps) {
       // KAN-824: epics never have a branch, so a search for one can only ever
       // miss — skip the call entirely rather than let it burn a GitHub search.
       const prState = deps.prState && canHavePr(issue.issuetype) ? await deps.prState(issue.key) : null;
-      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled });
+      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, currentLabels: issue.labels });
       const ok = await write(written, issue.key, issue.labels, desired);
       if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }

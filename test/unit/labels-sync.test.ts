@@ -164,6 +164,35 @@ describe("createLabelSync", () => {
     expect(jira.calls).toEqual([]);
   });
 
+  // KAN-832/837 case 8, end-to-end: an "unknown" lookup on a ticket already carrying pr:merged
+  // must issue ZERO updateLabels calls — the re-emitted pr:merged diffs to no-op against Jira's
+  // current state, same as the existing "restart durability" case above, but from "unknown"
+  // rather than a re-confirmed "merged".
+  test("an 'unknown' lookup on a ticket carrying pr:merged issues zero updateLabels calls", async () => {
+    const jira = fakeJira();
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "working"]]),
+      prState: async () => "unknown", // e.g. tracker-wide throttle mid-poll
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:working", "pr:merged"])]);
+    expect(jira.calls).toEqual([]);
+  });
+
+  // KAN-832/837 sharpening (epic comment on this ticket): cases 2 and 9 are the load-bearing
+  // guard against a fix that never removes pr:* at all — assert the actual `remove:` Jira call,
+  // not merely that stateFor returned null, so a suite-passing "always preserve" mutation fails.
+  test("a genuine null prState (confirmed no PR / closed-unmerged) actually strips an existing pr:* label — case 2/9 guard", async () => {
+    const jira = fakeJira();
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "working"]]),
+      prState: async () => null, // a confirmed miss or a closed-unmerged PR — genuine evidence of absence
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:working", "pr:approved"])]);
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["pr:approved"] }]);
+  });
+
   test("an Epic never triggers pr:* discovery (KAN-824): prState is never called for issuetype Epic", async () => {
     const jira = fakeJira();
     let called = false;
