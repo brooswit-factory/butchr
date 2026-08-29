@@ -141,6 +141,18 @@ interface SearchOutcome {
    * latched as "no PR" (a 403 is not evidence of anything about the key).
    */
   nonOk?: { status: number; remaining: number | undefined; resetEpochSec: number | undefined };
+  /**
+   * Set (only when `found` is absent) if at least one candidate hit's own
+   * `/pulls/N` confirmation fetch was non-OK (KAN-832/837 review, PR #89) —
+   * distinct from a genuine prefix collision, which is silently skipped and
+   * never sets this. A candidate we could not confirm is "could not look" at
+   * THAT candidate, not evidence it wasn't a match, so the caller must not
+   * treat an all-unconfirmed round the same as a clean miss: it must not
+   * advance the negative-cache backoff and must not be latched as "no PR".
+   * An unconfirmed candidate followed by a later exact match is still a
+   * legitimate `found` — this only matters when nothing matched.
+   */
+  unconfirmed?: true;
 }
 
 /**
@@ -160,6 +172,7 @@ interface SearchOutcome {
  * try the remaining orgs, and the caller must not treat it as a miss.
  */
 async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "merged", onSearch: (res: Response) => void): Promise<SearchOutcome> {
+  let unconfirmed = false;
   for (const org of deps.orgs) {
     const q = new URLSearchParams({ q: `is:pr is:${status} head:${key} org:${org}` });
     const res = await deps.fetchImpl(`https://api.github.com/search/issues?${q}`, { headers: ghHeaders(deps.token) });
@@ -179,11 +192,12 @@ async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "m
       if (!m) continue;
       const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
       const pull = await fetchPull(deps, ref);
-      if (pull === "unavailable" || pull.head.ref !== key) continue; // couldn't confirm this candidate, or it's a prefix collision: not this ticket's PR
+      if (pull === "unavailable") { unconfirmed = true; continue; } // could not confirm this candidate — not a collision, not a match either
+      if (pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
       return { found: { ref, pull } };
     }
   }
-  return {};
+  return unconfirmed ? { unconfirmed: true } : {};
 }
 
 /**
@@ -296,6 +310,7 @@ export class PrTracker {
         return "unknown";
       }
       let found = openOutcome.found;
+      let unconfirmed = openOutcome.unconfirmed ?? false;
       if (!found && runMerged) {
         const mergedOutcome = await discoverStatus(this.deps, key, "merged", this.onSearch);
         if (mergedOutcome.nonOk) {
@@ -303,11 +318,21 @@ export class PrTracker {
           return "unknown";
         }
         found = mergedOutcome.found;
+        unconfirmed = unconfirmed || (mergedOutcome.unconfirmed ?? false);
       }
 
+      if (!found && unconfirmed) {
+        // KAN-832/837 review (PR #89): at least one candidate hit's own /pulls/N
+        // confirmation was non-OK and nothing else matched — could not look at
+        // that candidate, not evidence it wasn't a match. Must not be recorded as
+        // a miss (the negative-cache backoff must not advance) and must not be
+        // latched as "no PR" the way a clean miss below is.
+        return "unknown";
+      }
       if (!found) {
-        // Genuine miss: both searches that ran came back OK with no exact match —
-        // this IS evidence of absence, unlike every "unknown" return above.
+        // Genuine miss: both searches that ran came back OK with no exact match,
+        // and every candidate that was checked was successfully confirmed — this
+        // IS evidence of absence, unlike every "unknown" return above.
         const misses = (ks?.misses ?? 0) + 1;
         const rounds = (ks?.rounds ?? 0) + 1;
         const delay = BACKOFF_MS[Math.min(misses - 1, BACKOFF_MS.length - 1)]!;

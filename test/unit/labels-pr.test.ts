@@ -302,6 +302,52 @@ describe("PrTracker", () => {
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
     expect(await tracker.stateFor("KAN-1")).toBe("unknown");
   });
+
+  // KAN-832/837 review (PR #89): a fourth site the fix missed — discoverStatus collapsed
+  // "couldn't confirm this candidate" (fetchPull came back "unavailable") and "genuine prefix
+  // collision" into the same continue, so an unconfirmed sole candidate fell all the way through
+  // to the miss branch: null (a real label stripped) AND the negative-cache backoff advanced,
+  // violating KAN-824's "a non-OK is never a miss and never advances the backoff".
+  test("a cold key's only search hit fails its /pulls/N confirmation (403): yields 'unknown', not null, and does NOT advance the negative-cache backoff", async () => {
+    let now = 0;
+    let openPullAttempts = 0;
+    const fetchImpl = async (url: string): Promise<Response> => {
+      if (/is%3Aopen/.test(url)) return new Response(JSON.stringify({ items: [{ number: 5, repository_url: "https://api.github.com/repos/acme/widgets" }] }), { status: 200 });
+      if (/is%3Amerged/.test(url)) return new Response(JSON.stringify({ items: [] }), { status: 200 }); // merged search: clean miss, contributes nothing
+      if (/pulls\/5$/.test(url)) {
+        openPullAttempts++;
+        return new Response("{}", { status: 403 }); // the open search's sole candidate can never be confirmed
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const searchAttempts = { n: 0 };
+    const countingFetch = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) searchAttempts.n++;
+      return fetchImpl(url);
+    };
+    const tracker = new PrTracker({ fetchImpl: countingFetch, orgs: ["acme"], now: () => now });
+
+    expect(await tracker.stateFor("KAN-1")).toBe("unknown"); // round 1: sole candidate unconfirmed, no exact match — could not look, not a miss
+    expect(openPullAttempts).toBe(1);
+    const searchesAfterRound1 = searchAttempts.n;
+
+    now = 1_000; // well inside what a 15s miss-backoff would have been, had one wrongly opened
+    await tracker.stateFor("KAN-1");
+    expect(searchAttempts.n).toBeGreaterThan(searchesAfterRound1); // a new search WAS issued — backoff never advanced
+  });
+
+  // An unconfirmed candidate must not shadow a LATER candidate that does match — the taint only
+  // matters when nothing matched at all.
+  test("an unconfirmed candidate followed by a later exact match still yields the match, not 'unknown'", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /search\/issues/, respond: searchHits("acme", "widgets", [6, 5]) },
+      { match: /pulls\/6$/, respond: () => null }, // 404: candidate 6 unconfirmed
+      { match: /pulls\/5$/, respond: pull("open", false, "KAN-1") },
+      { match: /pulls\/5\/reviews/, respond: () => [] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-1")).toBe("open");
+  });
 });
 
 // KAN-824: bound pr:* discovery to GitHub's 30/min search budget — negative
