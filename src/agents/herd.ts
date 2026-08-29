@@ -1,7 +1,7 @@
 import type { HerdrClient, results } from "@brooswit/herdr-sdk";
 import { buildWorkspace, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
-import { detectSessionLimitRefusal } from "./session-limit.js";
+import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 export type { SpawnSpec } from "./workspace.js";
 
 const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
@@ -15,6 +15,23 @@ const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?
  */
 const isClaude = (p: { argv?: readonly string[] | null; name?: string | null }): boolean =>
   basename(p.argv?.[0] ?? "") === "claude" || basename(p.name ?? "") === "claude";
+
+/**
+ * What nudge() actually accomplished — plain "delivered: true" (KAN-829) hid
+ * a prompt that landed on a session-limit refusal, so `[notify] … prompt
+ * delivered` was logged for a prompt that was, in fact, refused. `delivered`
+ * still means "the send call itself succeeded" (agent.prompt did not throw —
+ * distinct from `false`, where no agent was running or the pane rejected the
+ * send outright, e.g. blocked on a dialog); `refusal` is set in addition,
+ * after the verify wait, when the pane shows the session's refusal rather
+ * than a started turn — the caller (daemon/index.ts) uses this to log
+ * `refused (session limit, resets …)` instead of a bare "delivered", so the
+ * operator can `grep` the journal for it.
+ */
+export interface NudgeResult {
+  delivered: boolean;
+  refusal?: SessionLimitRefusal;
+}
 
 /** A running agent found to be stale: its process argv lacks butchr's spawn flags. */
 export interface StaleAgent {
@@ -48,9 +65,11 @@ export interface Herd {
   /**
    * Deliver `text` to the issue's agent as a prompt — this STARTS a turn on an
    * idle agent (a channel push renders mid-turn but cannot wake one). Queues on
-   * a busy agent. False if no agent is running or the pane refused (blocked).
+   * a busy agent. `delivered: false` if no agent is running or the pane
+   * refused the send outright (blocked); `refusal` set if the send succeeded
+   * but the pane shows a session-limit refusal rather than a started turn.
    */
-  nudge(issue: string, text: string): Promise<boolean>;
+  nudge(issue: string, text: string): Promise<NudgeResult>;
 }
 
 const AGENT_PREFIX = "butchr-";
@@ -200,23 +219,40 @@ export class HerdrHerd implements Herd {
     return null;
   }
 
-  async nudge(issue: string, text: string): Promise<boolean> {
-    if (!(await this.byIssue()).has(issue)) return false;
+  async nudge(issue: string, text: string): Promise<NudgeResult> {
+    if (!(await this.byIssue()).has(issue)) return { delivered: false };
     try {
       await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<HerdrClient["agent"]["prompt"]>[0]);
     } catch {
-      return false; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
+      return { delivered: false }; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
     }
     // "Delivered" is not "a turn started": a prompt landing as a turn ends
-    // strands in the composer unsubmitted (KAN-691 sat 2.5h on an approved PR).
+    // strands in the composer unsubmitted (KAN-691 sat 2.5h on an approved PR)
+    // — or, per KAN-829, lands on a session-limit refusal, which looks
+    // identical from here (still idle) but must not be treated the same way.
     // Verify a turn starts; if the agent is still IDLE — never blocked, where
-    // enter would select a dialog option — submit the stranded composer text.
+    // enter would select a dialog option — check for a refusal before
+    // submitting the stranded composer text: sending enter into a refused
+    // session accomplishes nothing and only muddies what actually happened.
     await this.wait(NUDGE_VERIFY_MS);
     if ((await this.statusOf(issue)) === "idle") {
-      const pane = (await this.byIssue()).get(issue)?.pane; // re-resolve: panes renumber
-      if (pane) await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+      const entry = (await this.byIssue()).get(issue); // re-resolve: panes renumber
+      if (entry) {
+        // A transient herdr hiccup here must not propagate: before this
+        // refusal check existed, nudge() could no longer throw once
+        // agent.prompt succeeded (sendKeys below is already .catch(() => {})),
+        // and daemon/index.ts's caller turns a throw into `{ delivered: false }`
+        // — inverting the honesty fix (a DELIVERED prompt logged as refused)
+        // and skipping the stranded-composer enter (KAN-691's 2.5h stall,
+        // reopened via an unrelated transient). Same treatment as
+        // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
+        const text = await this.readPane(entry.pane).catch(() => "");
+        const refusal = detectSessionLimitRefusal(text, new Date());
+        if (refusal) return { delivered: true, refusal };
+        await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+      }
     }
-    return true;
+    return { delivered: true };
   }
 }
 
