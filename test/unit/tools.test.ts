@@ -39,7 +39,7 @@ describe("atlassianTools", () => {
     expect(calls[1]![1]).toEqual(["project = KAN", 5]);
     expect((calls[4]![1][0] as { assignee?: string }).assignee).toBe("acct-1");   // assignee reaches the op
     expect(calls[5]![0]).toBe("linkIssues");
-    expect(calls[5]![1]).toEqual(["KAN-2", "KAN-9", "Relates"]);                  // default link type applied
+    expect(calls[5]![1]).toEqual(["KAN-2", "KAN-9", "Implements"]);               // default link type applied
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
     expect(audits.length).toBe(9);
   });
@@ -47,6 +47,25 @@ describe("atlassianTools", () => {
     const { tools, calls, conn } = rig();
     await tools.jira_search!.handler({ jql: "x" }, conn);
     expect(calls[0]![1]).toEqual(["x", 25]);
+  });
+  test("jira_link_issues honors an explicit type over the default", async () => {
+    const { tools, calls, conn } = rig();
+    await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9", type: "Blocks" }, conn);
+    expect(calls[0]![1]).toEqual(["KAN-2", "KAN-9", "Blocks"]);
+  });
+});
+
+describe("jira_link_issues invalid MCP result (KAN-764)", () => {
+  test("substitutes a real value when the op resolves undefined (Jira's empty 201 body)", async () => {
+    const { conn } = rig();
+    const ops: AtlassianOps = {
+      getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({}),
+      linkIssues: async () => undefined, transition: async () => ({}), createIssue: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
+    };
+    const tools = atlassianTools(ops, () => {});
+    const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
+    expect(result).toEqual({ ok: true, from: "KAN-2", to: "KAN-9", type: "Implements" });
   });
 });
 

@@ -4,7 +4,7 @@ import { planReconcile } from "../reconcile/plan.js";
 import { activeKeys, changedKeys } from "../jira-watch/diff.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
 
-/** A ticket watched on behalf of active issues: children and linked work. */
+/** A ticket watched on behalf of active issues via the Implements chain (see src/jira-watch/routes.ts). */
 export interface RelatedIssue {
   issue: JiraIssue;
   /** Active issue keys whose agents should hear when this ticket changes. */
@@ -15,10 +15,11 @@ export interface LoopDeps {
   /** Fetch the assigned issues (active + recently changed) each poll. */
   search: () => Promise<JiraIssue[]>;
   /**
-   * Fetch tickets related to the active set — children and linked work — with
-   * the active keys that watch each. Related tickets are watched regardless of
-   * assignee, so a hierarchy can span credentials (and machines): the reviewer
-   * hears about its child's progress even when another daemon staffs the child.
+   * Fetch tickets related to the active set via the Implements chain (plus
+   * the Relates deprecation window — see src/jira-watch/routes.ts), with the
+   * active keys that watch each. Related tickets are watched regardless of
+   * assignee, so a hierarchy can span credentials (and machines): a boss
+   * hears about its implementer's progress even when another daemon staffs it.
    */
   related?: (active: readonly string[]) => Promise<RelatedIssue[]>;
   herd: Herd;
@@ -86,15 +87,15 @@ export function startLoop(deps: LoopDeps): Stop {
         sent.add(id);
         await deps.notify(issue, about);
       };
-      // Assigned issues: the issue's own agent, and its parent's — results flow upward.
-      const byKey = new Map(next.issues.map((i) => [i.key, i]));
+      // Assigned issues: notify the issue's own agent only. Parent is membership
+      // only (not an event to listen for) — a boss hears change only through
+      // the Implements chain below, via routes.ts.
       for (const key of changedKeys(prev.issues, next.issues)) {
         if (isOwnLabelBump(prev, next, key)) continue;
         await send(key, key);
-        const parent = byKey.get(key)?.parent ?? prev.issues.find((i) => i.key === key)?.parent;
-        if (parent) await send(parent, key);
       }
-      // Related work (children, linked tickets): notify every watcher of what changed.
+      // Related work (the Implements chain, plus the Relates deprecation window):
+      // notify every watcher of what changed.
       const watchersOf = (k: string) =>
         next.related.find((r) => r.issue.key === k)?.watchers ?? prev.related.find((r) => r.issue.key === k)?.watchers ?? [];
       for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)))
