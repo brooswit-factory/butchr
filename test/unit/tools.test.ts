@@ -92,6 +92,61 @@ describe("priority", () => {
   });
 });
 
+describe("onWrite hook (own-write ledger feed)", () => {
+  function rigWithOnWrite() {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async (p) => ({ key: `KAN-${p.summary.length}` }), setPriority: async () => ({ ok: true }),
+      createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
+    };
+    const writes: Array<[string[], string]> = [];
+    const tools = atlassianTools(ops, () => {}, (keys, writer) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    return { tools, writes, conn };
+  }
+
+  test("jira_add_comment/jira_transition/jira_set_priority fire onWrite with the single key", async () => {
+    const { tools, writes, conn } = rigWithOnWrite();
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "hi" }, conn);
+    await tools.jira_transition!.handler({ key: "KAN-2", status: "In Review" }, conn);
+    await tools.jira_set_priority!.handler({ key: "KAN-3", priority: "High" }, conn);
+    expect(writes).toEqual([[["KAN-1"], "KAN-7"], [["KAN-2"], "KAN-7"], [["KAN-3"], "KAN-7"]]);
+  });
+
+  test("jira_link_issues fires onWrite with BOTH ends", async () => {
+    const { tools, writes, conn } = rigWithOnWrite();
+    await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
+    expect(writes).toEqual([[["KAN-2", "KAN-9"], "KAN-7"]]);
+  });
+
+  test("jira_create_issue fires onWrite with the created key when the response carries one", async () => {
+    const { tools, writes, conn } = rigWithOnWrite();
+    await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "abc" }, conn);
+    expect(writes).toEqual([[["KAN-3"], "KAN-7"]]);
+  });
+
+  test("jira_get_issue/jira_search (read tools) never fire onWrite", async () => {
+    const { tools, writes, conn } = rigWithOnWrite();
+    await tools.jira_get_issue!.handler({ key: "KAN-1" }, conn);
+    await tools.jira_search!.handler({ jql: "x" }, conn);
+    expect(writes).toEqual([]);
+  });
+
+  test("a call with no x-issue header never fires onWrite (never record an unknown writer)", async () => {
+    const { tools, writes } = rigWithOnWrite();
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "hi" }, { headers: {} } as any);
+    expect(writes).toEqual([]);
+  });
+
+  test("onWrite is optional — omitting it changes nothing about the tool's own behavior", async () => {
+    const { tools, calls, conn } = rig();
+    const result = await tools.jira_add_comment!.handler({ key: "KAN-1", text: "hi" }, conn);
+    expect(result).toEqual({ ok: "addComment" });
+    expect(calls.map(([n]) => n)).toEqual(["addComment"]);
+  });
+});
+
 describe("comment identity tagging", () => {
   test("prepends the caller's issue tag; idempotent when already tagged", async () => {
     const { tools, calls, conn } = rig();               // conn carries x-issue KAN-7
