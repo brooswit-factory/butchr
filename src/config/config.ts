@@ -21,6 +21,13 @@ export interface Config {
    * BUTCHR_GITHUB_ORGS are set; otherwise pr:* discovery is skipped entirely.
    */
   github?: { token: string; orgs: string[] };
+  /**
+   * KAN-804/807: minutes an active ticket's agent must sit idle/done,
+   * continuously since first observed running, with zero comments from this
+   * account, before it's surfaced as `agent:stalled` — a swallowed kickoff
+   * "idle since spawn, never spoke" must never look like a finished agent.
+   */
+  stalledMinutes: number;
 }
 
 export interface ConfigEnv {
@@ -33,6 +40,7 @@ export interface ConfigEnv {
   BUTCHR_TERMINAL?: string | undefined;
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
+  BUTCHR_STALLED_MINUTES?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -51,9 +59,13 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
 
+  const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
+  if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
+
   return {
     atlassian: { site, email, token },
     port,
+    stalledMinutes,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -68,4 +80,5 @@ function required(v: string | undefined, name: string): string {
 /** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
-  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"}`;
+  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
+  `stalledMinutes=${c.stalledMinutes}`;

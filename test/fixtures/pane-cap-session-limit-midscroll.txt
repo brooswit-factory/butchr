@@ -1,0 +1,17 @@
+
+● Quoting the ticket for reference:
+
+  You've hit your session limit · resets 9:50pm
+
+That's the exact refusal text from the incident report — not what this pane is showing right now.
+
+● Bash(herdr pane read "$HERDR_PANE_ID" --source detection)
+  ⎿  Running…
+
+✽ Choreographing… (1m 12s · ↓ 2.1k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+───────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc

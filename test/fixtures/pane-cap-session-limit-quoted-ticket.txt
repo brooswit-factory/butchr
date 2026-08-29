@@ -1,0 +1,24 @@
+
+● Called butchr (ctrl+o to expand)
+
+  ⎿  === THE MEASURED DEFECT (operator, booswrit fleet, 2026-08-29T06:5xZ) ===
+     A freshly spawned agent's KICKOFF prompt landed while the Claude account
+     was at its session limit. The pane printed:
+
+     You've hit your session limit · resets 9:50pm
+
+     ...refused the prompt, and NOTHING ever re-sent it.
+     … +19 lines (ctrl+o to expand)
+
+● Let me look at HerdrHerd.spawn().
+
+● Read(src/agents/herd.ts)
+  ⎿  Read 128 lines
+
+✽ Choreographing… (2m 03s · ↓ 3.4k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+───────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc

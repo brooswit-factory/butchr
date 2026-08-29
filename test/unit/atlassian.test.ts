@@ -86,18 +86,18 @@ describe("AtlassianClient", () => {
     await expect(c.updateLabels("KAN-1", { add: ["agent:idle"] })).rejects.toThrow(/400/);
   });
 
-  test("comments() maps id/body/created off a faked fetch, flattening ADF bodies", async () => {
+  test("comments() maps id/body/created/authorEmail off a faked fetch, flattening ADF bodies", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
       "/issue/KAN-1/comment": {
         comments: [
-          { id: "10", created: "2026-08-28T00:00:00.000Z", body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Looks good" }] }] } },
+          { id: "10", created: "2026-08-28T00:00:00.000Z", author: { emailAddress: "agent@example.com" }, body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Looks good" }] }] } },
           { id: "9", created: "2026-08-27T00:00:00.000Z", body: { type: "doc", content: [] } },
         ],
       },
     }));
     expect(await c.comments("KAN-1")).toEqual([
-      { id: "10", body: "Looks good", created: "2026-08-28T00:00:00.000Z" },
-      { id: "9", body: "", created: "2026-08-27T00:00:00.000Z" },
+      { id: "10", body: "Looks good", created: "2026-08-28T00:00:00.000Z", authorEmail: "agent@example.com" },
+      { id: "9", body: "", created: "2026-08-27T00:00:00.000Z", authorEmail: null },
     ]);
   });
 });

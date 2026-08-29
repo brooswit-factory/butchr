@@ -16,6 +16,8 @@ import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { watchSessionLimits } from "../agents/session-limit-watch.js";
+import { createStalledCheck } from "../agents/stalled.js";
 
 let config;
 try {
@@ -54,7 +56,20 @@ console.error(`butchr daemon on http://localhost:${config.port}  (${describeConf
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
+const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
+const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
+
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined;
+// KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
+// for issues that already satisfy the cheap preconditions (see stalled.ts),
+// never on every poll.
+const stalled = createStalledCheck({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  comments: (issue) => atlassian.comments(issue),
+  accountEmail: config.atlassian.email,
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: atlassian,
   agentStatuses: async () => {
@@ -67,8 +82,27 @@ const syncLabels = createLabelSync({
     return m;
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
+  stalled,
   log: (line) => console.error(`  ${line}`),
 });
+
+// KAN-804/807: a session-limit refusal is not a dialog — the prompt-watcher
+// and escalator never see it (agent_status stays idle/done, not blocked).
+// Level-triggered: every poll, for every idle/done agent, check the pane for
+// the refusal and close it once past its printed reset time plus margin so
+// the reconciler respawns with a fresh kickoff. Nothing persisted; a restart
+// re-reads the same pane and reaches the same decision.
+watchSessionLimits({
+  list: async () => (await herdr.agent.list()).agents.map((a) => ({
+    pane_id: a.pane_id,
+    agent_status: a.agent_status ?? "",
+    issue: issueOfAgentName((a as { name?: string }).name),
+  })),
+  read: readPane,
+  close: (issue) => herd.stop(issue),
+  now: () => Date.now(),
+  log: (line) => console.error(`  ${line}`),
+}, 15_000);
 
 // One-time startup sweep: agent:* stranded by a ticket that went inactive
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
@@ -140,9 +174,6 @@ startLoop({
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
 });
-
-const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
-const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for

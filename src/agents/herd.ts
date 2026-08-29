@@ -1,5 +1,6 @@
 import type { HerdrClient } from "@brooswit/herdr-sdk";
 import { buildWorkspace, modelFor, type SpawnSpec } from "./workspace.js";
+import { detectSessionLimitRefusal } from "./session-limit.js";
 export type { SpawnSpec } from "./workspace.js";
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
@@ -24,6 +25,27 @@ const AGENT_PREFIX = "butchr-";
 const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
 const issueOf = (name: string | null | undefined) =>
   name && name.startsWith(AGENT_PREFIX) ? name.slice(AGENT_PREFIX.length).toUpperCase() : null;
+
+/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
+const KICKOFF_PROMPT = "follow your CLAUDE.md";
+
+/**
+ * How long nudge() waits after delivering a prompt before checking whether a
+ * turn actually started, vs. the prompt merely landing in an unsubmitted
+ * composer (KAN-691 sat 2.5h on exactly that). 8s is long enough for Claude
+ * Code to move off "idle" once it accepts input.
+ */
+const NUDGE_VERIFY_MS = 8_000;
+
+/**
+ * Sibling to NUDGE_VERIFY_MS: how long spawn() waits after `agent.start`
+ * before checking whether the kickoff actually started a turn (KAN-804/807 —
+ * the kickoff is fire-and-forget, unlike a nudge, so nothing else ever
+ * re-checks it). Slightly longer than the nudge wait: a cold process start
+ * (loading, startup dialogs) is slower than an already-running agent
+ * accepting a new prompt. ~8-15s is the intended range.
+ */
+const KICKOFF_VERIFY_MS = 12_000;
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
@@ -79,7 +101,7 @@ export class HerdrHerd implements Herd {
       // another entry — "entries must be tagged: follow your CLAUDE.md", claude
       // exits, and the daemon retry-loops leaking a workspace per poll
       // (measured live on KAN-681's first spawn).
-      args: ["follow your CLAUDE.md", "--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
+      args: [KICKOFF_PROMPT, "--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
     } catch (e) {
       // A failed start must not leak the workspace we just created: the next
@@ -87,6 +109,33 @@ export class HerdrHerd implements Herd {
       await this.herdr.pane.close(paneId).catch(() => {});
       throw e;
     }
+    await this.verifyKickoff(issue);
+  }
+
+  /**
+   * KAN-804/807: the kickoff is fire-and-forget — unlike nudge()'s prompt, or
+   * a blocked dialog, NOTHING else ever re-sends it if it's swallowed (e.g.
+   * landing at a Claude session-limit refusal). Give it KICKOFF_VERIFY_MS,
+   * then check whether a turn actually started; if not, recover the same way
+   * nudge() recovers a stranded composer — UNLESS the pane shows a
+   * session-limit refusal, which is not recoverable by re-sending (the
+   * refusal is a property of the CLI session, not of the composer) and is
+   * instead handled by the level-triggered poll in session-limit-watch.ts.
+   */
+  private async verifyKickoff(issue: string): Promise<void> {
+    await this.wait(KICKOFF_VERIFY_MS);
+    const status = await this.statusOf(issue);
+    if (status !== "idle" && status !== "done") return; // working/blocked: the kickoff landed
+    const pane = (await this.byIssue()).get(issue); // re-resolve: panes renumber
+    if (!pane) return;
+    const text = await this.readPane(pane);
+    if (detectSessionLimitRefusal(text, new Date())) return;
+    await this.nudge(issue, KICKOFF_PROMPT);
+  }
+
+  private async readPane(paneId: string): Promise<string> {
+    const r = await this.herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true } as Parameters<HerdrClient["pane"]["read"]>[0]);
+    return (r as { read: { text: string } }).read.text;
   }
 
   async stop(issue: string): Promise<void> {
@@ -115,7 +164,7 @@ export class HerdrHerd implements Herd {
     // strands in the composer unsubmitted (KAN-691 sat 2.5h on an approved PR).
     // Verify a turn starts; if the agent is still IDLE — never blocked, where
     // enter would select a dialog option — submit the stranded composer text.
-    await this.wait(8_000);
+    await this.wait(NUDGE_VERIFY_MS);
     if ((await this.statusOf(issue)) === "idle") {
       const pane = (await this.byIssue()).get(issue); // re-resolve: panes renumber
       if (pane) await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});

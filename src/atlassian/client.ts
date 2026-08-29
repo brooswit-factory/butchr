@@ -88,7 +88,7 @@ export class AtlassianClient {
   async comments(issueKey: string, maxResults = 20): Promise<JiraComment[]> {
     const q = new URLSearchParams({ orderBy: "-created", maxResults: String(maxResults) });
     const body = await this.get(`/rest/api/3/issue/${issueKey}/comment?${q}`);
-    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "" }));
+    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "", authorEmail: c.author?.emailAddress ?? null }));
   }
 }
 

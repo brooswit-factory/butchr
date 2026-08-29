@@ -46,4 +46,11 @@ describe("loadConfig", () => {
     expect(d).not.toContain("s3cr3t-gh-tok");
     expect(d).toContain("orgs=acme");
   });
+
+  test("stalledMinutes defaults to 10, honours BUTCHR_STALLED_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).stalledMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "20" }, noRead).stalledMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+  });
 });
