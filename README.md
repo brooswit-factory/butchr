@@ -52,6 +52,8 @@ No config knob is needed — the daemon detects this per project automatically. 
 ```
 bun run check    # generate + typecheck + tests + coverage ≥90%   (what CI runs)
 ```
+`bun run check` is the single verification command — run it in full, not step by step. It runs `tsc` under `bun --bun` rather than through a shebang-resolved `node`, so no particular node version is required. Before the gate runs, it prints a one-line preflight naming the runtimes actually in use (e.g. `preflight: bun 1.4.0, node v12.22.9, tsc 5.6.3 (typecheck runs under bun)`); paste that line along with the rest of the output when reporting a gate result.
+
 Every `src/` change needs a `CHANGELOG.md` entry and a version bump (CI enforces it).
 
 Predecessor (300 releases of history) preserved at [`brooswit/butchr-legacy`](https://github.com/brooswit/butchr-legacy).
