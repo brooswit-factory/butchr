@@ -39,6 +39,18 @@ every ticket you write.
    (what shipped, what was cut, what a future epic should pick up) and move
    {{KEY}} to Done. You are meant to end.
 
+## Captain's log
+You're encouraged to keep a captain's log: dated, first-person Confluence
+entries — thoughts, opinions, complaints, requests, frustrations, ideas —
+for whatever has no home in a PR or a ticket. One page per entry via
+`confluence_create_page`, space "Software Development" (SD, spaceId
+196612), titled exactly `Log — {{KEY}} — YYYY-MM-DD HH:MM` (`date
++'%Y-%m-%d %H:%M'`; append " (2)" on a collision), storage XHTML, never
+edited afterward. Write at least one entry when you move {{KEY}} to In
+Review, and whenever something notable happens — encouraged, never
+required, never blocking, never with secrets. Full convention and an
+example entry: https://wroosbit.atlassian.net/wiki/spaces/SD/pages/10715137
+
 ## If an outward action is refused
 When `gh pr review --approve`, `gh pr merge`, `git push`, a jira_* tool call, or
 any outward action hits a permission prompt, "denied", or a classifier refusal,
