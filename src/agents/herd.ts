@@ -1,11 +1,29 @@
 import type { HerdrClient } from "@brooswit/herdr-sdk";
-import { buildWorkspace, modelFor, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, type SpawnSpec } from "./workspace.js";
+import { spawnArgs, checkArgv } from "./argv.js";
+import { selectClaudeProcess, realProcessTable, type ProcessEntry } from "./proctable.js";
 export type { SpawnSpec } from "./workspace.js";
+
+/** A running agent found to be stale: its process argv lacks butchr's spawn flags. */
+export interface StaleAgent {
+  issue: string;
+  /** Why it's stale — a checkArgv() reason string, e.g. "argv lacks --permission-mode bypassPermissions". */
+  reason: string;
+  /** The offending process's real argv, for the log line and Jira notice. */
+  observedArgv: string[];
+}
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
 export interface Herd {
   /** Issues that currently have a butchr-managed agent running. */
   runningIssues(): Promise<string[]>;
+  /**
+   * Running agents whose claude process was found, but its argv lacks
+   * butchr's spawn flags — e.g. a pane herdr restored as a bare
+   * `claude --resume <id>` after a server restart. An agent whose process
+   * can't be found at all is NOT stale (unknown ≠ stale — see proctable.ts).
+   */
+  staleIssues(): Promise<StaleAgent[]>;
   /** Start an agent for an issue (idempotent — a no-op if one is already running). */
   spawn(spec: SpawnSpec): Promise<void>;
   /** Shut off the agent for an issue (idempotent). */
@@ -33,20 +51,38 @@ export class HerdrHerd implements Herd {
     private readonly mcpUrl: string,
     /** Injectable wait, for tests. */
     private readonly wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    /** Injectable process table reader, for tests — defaults to walking /proc. */
+    private readonly processSource: () => Promise<ProcessEntry[]> = realProcessTable,
   ) {}
 
-  private async byIssue(): Promise<Map<string, string>> {
+  private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
     const { agents } = await this.herdr.agent.list();
-    const map = new Map<string, string>();
+    const map = new Map<string, { pane: string; cwd: string | null }>();
     for (const a of agents) {
       const issue = issueOf((a as { name?: string }).name);
-      if (issue && a.pane_id) map.set(issue, a.pane_id);
+      if (issue && a.pane_id) map.set(issue, { pane: a.pane_id, cwd: (a as { cwd?: string | null }).cwd ?? null });
     }
     return map;
   }
 
   async runningIssues(): Promise<string[]> {
     return [...(await this.byIssue()).keys()];
+  }
+
+  async staleIssues(): Promise<StaleAgent[]> {
+    const table = await this.processSource();
+    const out: StaleAgent[] = [];
+    for (const [issue, { cwd }] of await this.byIssue()) {
+      if (!cwd) continue; // no cwd reported — can't locate its process — unknown, not stale
+      const proc = selectClaudeProcess(cwd, table);
+      if (!proc) continue; // no claude process found — unknown, not stale
+      // issuetype/summary/parent don't matter here: --model (the only thing
+      // issuetype affects) is deliberately excluded from the comparison.
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd);
+      const check = checkArgv(expected, proc.argv);
+      if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
+    }
+    return out;
   }
 
   async spawn(spec: SpawnSpec): Promise<void> {
@@ -68,18 +104,10 @@ export class HerdrHerd implements Herd {
       pane_id: paneId,
       name,
       kind: "claude",
-      // bypassPermissions: a spawned agent works unattended in its own workspace and
-      // must be able to run git/gh without a human to approve each command. Without
-      // it the permission classifier denies `git add/commit/push` and the agent
-      // completes its work but cannot deliver it (measured, KAN-679).
-      // The positional is Claude Code's initial prompt: queued at startup and
-      // submitted once the startup dialogs are answered, so the agent kicks
-      // itself off. It MUST come FIRST: --dangerously-load-development-channels
-      // (and --mcp-config) are variadic and swallow a trailing positional as
-      // another entry — "entries must be tagged: follow your CLAUDE.md", claude
-      // exits, and the daemon retry-loops leaking a workspace per poll
-      // (measured live on KAN-681's first spawn).
-      args: ["follow your CLAUDE.md", "--model", modelFor(spec.issuetype), "--permission-mode", "bypassPermissions", "--mcp-config", dir + "/mcp.json", "--dangerously-load-development-channels", "server:butchr"],
+      // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
+      // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
+      // single source the staleness check compares a restored pane against.
+      args: spawnArgs(spec, dir),
     } as Parameters<HerdrClient["agent"]["start"]>[0]);
     } catch (e) {
       // A failed start must not leak the workspace we just created: the next
@@ -90,12 +118,12 @@ export class HerdrHerd implements Herd {
   }
 
   async stop(issue: string): Promise<void> {
-    const pane = (await this.byIssue()).get(issue);
+    const pane = (await this.byIssue()).get(issue)?.pane;
     if (pane) await this.herdr.pane.close(pane);
   }
 
   async paneFor(issue: string): Promise<string | null> {
-    return (await this.byIssue()).get(issue) ?? null;
+    return (await this.byIssue()).get(issue)?.pane ?? null;
   }
 
   private async statusOf(issue: string): Promise<string | null> {
@@ -117,7 +145,7 @@ export class HerdrHerd implements Herd {
     // enter would select a dialog option — submit the stranded composer text.
     await this.wait(8_000);
     if ((await this.statusOf(issue)) === "idle") {
-      const pane = (await this.byIssue()).get(issue); // re-resolve: panes renumber
+      const pane = (await this.byIssue()).get(issue)?.pane; // re-resolve: panes renumber
       if (pane) await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
     }
     return true;
