@@ -3,7 +3,7 @@ import { HerdrClient } from "@brooswit/herdr-sdk";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
-import { HerdrHerd, issueOfAgentName } from "../agents/herd.js";
+import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
@@ -207,9 +207,16 @@ startLoop({
     // Channel push renders mid-turn; the prompt is what STARTS a turn on an
     // idle agent (measured: an idle epic never woke on the push alone).
     void notifyIssue(mcp, issue, msg);
-    const woke = await herd.nudge(issue, msg).catch(() => false);
+    const outcome = await herd.nudge(issue, msg).catch((): NudgeResult => ({ delivered: false }));
     const transitionTag = reason?.pr ? ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})` : "";
-    console.error(`  [notify] ${issue} ← ${about}${transitionTag}: channel pushed, prompt ${woke ? "delivered" : "refused/absent"}`);
+    // KAN-829: a prompt that landed on a session-limit refusal is NOT
+    // "delivered" in any sense an operator cares about — say so explicitly,
+    // with the reset time, so `grep '\[notify\]'` and `grep 'session limit'`
+    // both surface it instead of the incident's silent "prompt delivered".
+    const promptState = outcome.refusal
+      ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
+      : outcome.delivered ? "delivered" : "refused/absent";
+    console.error(`  [notify] ${issue} ← ${about}${transitionTag}: channel pushed, prompt ${promptState}`);
   },
   onRespawn: async (issue, reason, observedArgv) => {
     console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
