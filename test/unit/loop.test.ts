@@ -123,6 +123,59 @@ describe("startLoop related-work watch", () => {
   });
 });
 
+describe("startLoop related-work watch: same-daemon boss/implementer", () => {
+  const rel = (key: string, status: string, watchers: string[], updated = "t") =>
+    ({ issue: { key, status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels: [] }, watchers });
+  test("boss B and implementer I both active on this daemon: I changing notifies B about I, and I about itself exactly once", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    // B (a story) and I (its task) are both in the assigned/active set — the
+    // gap this closes: I used to be skipped out of `related` entirely
+    // because it was already in `keys`, so B never heard about it.
+    const assignedPolls = [
+      [iss("B", "In Progress"), iss("I", "In Progress")],
+      [iss("B", "In Progress"), iss("I", "In Review")],   // I changed
+    ];
+    const relatedPolls = [
+      [rel("I", "In Progress", ["B"])],
+      [rel("I", "In Review", ["B"])],       // I changed
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => assignedPolls[Math.min(n, 1)]!,
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("B<-I");                                  // boss notified about its implementer
+    expect(notified.filter((x) => x === "I<-I").length).toBe(1);         // I's own agent notified about itself exactly once (sent dedupe)
+  });
+
+  test("mirror: B changing does NOT notify I", async () => {
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("B", "In Progress"), iss("I", "In Progress")],
+      [iss("B", "In Review"), iss("I", "In Progress")],   // B changed
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, 1)]!,
+      related: async () => [rel("I", "In Progress", ["B"])],
+      herd,
+      notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    expect(notified).toContain("B<-B");        // B's own agent hears its own change
+    expect(notified).not.toContain("I<-B");    // I never hears about its boss through this link
+  });
+});
+
 describe("startLoop own-label-write nudge suppression", () => {
   test("the daemon's own label write bumping `updated` does not itself nudge; a real subsequent change still does", async () => {
     const herd = fakeHerd();
