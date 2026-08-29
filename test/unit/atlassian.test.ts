@@ -17,7 +17,7 @@ describe("AtlassianClient", () => {
       "/search/jql": { issues: [{ key: "KAN-1", fields: { summary: "s", status: { name: "In Progress" }, issuetype: { name: "Task" }, assignee: { displayName: "Ada" }, updated: "2026-08-24" } }] },
     }, seen));
     const issues = await c.search("assignee = currentUser()");
-    expect(issues).toEqual([{ key: "KAN-1", summary: "s", status: "In Progress", issuetype: "Task", assignee: "Ada", parent: null, updated: "2026-08-24" }]);
+    expect(issues).toEqual([{ key: "KAN-1", summary: "s", status: "In Progress", issuetype: "Task", assignee: "Ada", parent: null, updated: "2026-08-24", labels: [] }]);
     expect(seen[0]!.auth).toBe("Basic " + Buffer.from("a@b.c:tok").toString("base64"));
     expect(seen[0]!.url).toContain("jql=");
   });
@@ -41,6 +41,31 @@ describe("AtlassianClient", () => {
   test("a non-2xx response throws with the status", async () => {
     const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 401 }));
     await expect(c.search("x")).rejects.toThrow(/401/);
+  });
+
+  test("updateLabels sends add/remove ops in one PUT request, never a wholesale field set", async () => {
+    const seen: { url: string; method: string | undefined; body: string | undefined }[] = [];
+    const c = new AtlassianClient("https://x.atlassian.net", "a@b.c", "tok", async (url, init) => {
+      seen.push({ url, method: init?.method, body: init?.body as string | undefined });
+      return new Response("", { status: 204 });
+    });
+    await c.updateLabels("KAN-1", { add: ["agent:idle"], remove: ["agent:working"] });
+    expect(seen.length).toBe(1);
+    expect(seen[0]!.method).toBe("PUT");
+    expect(seen[0]!.url).toContain("/rest/api/3/issue/KAN-1?notifyUsers=false");
+    expect(JSON.parse(seen[0]!.body!)).toEqual({ update: { labels: [{ add: "agent:idle" }, { remove: "agent:working" }] } });
+  });
+
+  test("updateLabels is a no-op (no request) when there is nothing to add or remove", async () => {
+    let called = false;
+    const c = new AtlassianClient("https://x", "a", "t", async () => { called = true; return new Response("", { status: 204 }); });
+    await c.updateLabels("KAN-1", {});
+    expect(called).toBe(false);
+  });
+
+  test("updateLabels throws with the status on a non-2xx response", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 400 }));
+    await expect(c.updateLabels("KAN-1", { add: ["agent:idle"] })).rejects.toThrow(/400/);
   });
 
   test("comments() maps id/body/created off a faked fetch, flattening ADF bodies", async () => {
