@@ -164,6 +164,33 @@ describe("createLabelSync", () => {
     expect(jira.calls).toEqual([]);
   });
 
+  test("an Epic never triggers pr:* discovery (KAN-824): prState is never called for issuetype Epic", async () => {
+    const jira = fakeJira();
+    let called = false;
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "working"]]),
+      prState: async () => { called = true; throw new Error("must not be called for an Epic"); },
+    });
+    const issue = { ...iss("KAN-1", "In Progress", []), issuetype: "Epic" };
+    await sync([issue]);
+    expect(called).toBe(false);
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:working"], remove: [] }]); // no pr:* label added, no throw
+  });
+
+  test("onPollEnd fires once per syncLabels run when supplied (KAN-824 poll boundary for PrTracker.endPoll)", async () => {
+    const jira = fakeJira();
+    let pollEnds = 0;
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      onPollEnd: () => { pollEnds++; },
+    });
+    await sync([iss("KAN-1", "In Progress", [])]);
+    await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+    expect(pollEnds).toBe(2);
+  });
+
   test("pr:* disabled (no prState dep) never adds a pr:* label, agent:* unaffected", async () => {
     const jira = fakeJira();
     const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]) });

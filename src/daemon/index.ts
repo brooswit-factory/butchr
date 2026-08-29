@@ -96,7 +96,7 @@ if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE
 const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
-const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined;
+const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
 // KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
@@ -118,7 +118,7 @@ const syncLabels = createLabelSync({
     }
     return m;
   },
-  ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key) } : {}),
+  ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),

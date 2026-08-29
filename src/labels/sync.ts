@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { AGENT_PREFIX, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrState } from "./plan.js";
+import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrState } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 
 export interface LabelWriter {
@@ -23,6 +23,13 @@ export interface SyncDeps {
    */
   onWrite?: (keys: readonly string[]) => void;
   log?: (line: string) => void;
+  /**
+   * Called once at the end of every syncLabels run, after all issues (and
+   * the disappearance cleanup) are processed — the poll boundary PrTracker
+   * needs to log-and-reset its per-poll search count (KAN-824). Optional so
+   * existing tests/callers that don't supply it are unaffected.
+   */
+  onPollEnd?: () => void;
 }
 
 /** A representative raw agent_status that maps back to `label` via mapAgentStatus. */
@@ -141,7 +148,9 @@ export function createLabelSync(deps: SyncDeps) {
         stalled = label === "stalled";
         agentStatus = stalled ? "idle" : rawFor(label);
       }
-      const prState = deps.prState ? await deps.prState(issue.key) : null;
+      // KAN-824: epics never have a branch, so a search for one can only ever
+      // miss — skip the call entirely rather than let it burn a GitHub search.
+      const prState = deps.prState && canHavePr(issue.issuetype) ? await deps.prState(issue.key) : null;
       const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled });
       const ok = await write(written, issue.key, issue.labels, desired);
       if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
@@ -158,6 +167,7 @@ export function createLabelSync(deps: SyncDeps) {
     }
 
     if (written.size) deps.onWrite?.([...written]);
+    deps.onPollEnd?.();
     return written;
   };
 }
