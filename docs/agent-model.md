@@ -40,9 +40,10 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   main).
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
-- **Review** = the parent's agent reads the child's result against what the
-  child's ticket asked. Changes are requested as ticket comments — the watch
-  loop nudges the child's agent.
+- **Review** = the boss agent — reached via the Implements link, not the
+  parent field — reads the child's result against what the child's ticket
+  asked. Changes are requested as ticket comments — the watch loop nudges the
+  child's agent.
 
 ## Briefs and the kickoff cascade
 
@@ -86,4 +87,6 @@ Issue type decides only brief, model, and duties.
 2. **Workspace builder + briefs** — CLAUDE.md, the four briefs, interpolation,
    `workspace.create({cwd})`, the kickoff prompt.
 3. **Per-type models** — epic=fable, story=opus, task=sonnet via spawn args.
-4. **Parent notification** — extend the diff/notify loop with the parent field.
+4. **Implements-link routing** — extend the diff/notify loop to route a
+   ticket's events to whatever it implements (task→story→epic); the parent
+   field stays membership-only and triggers no notification.
