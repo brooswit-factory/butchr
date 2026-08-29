@@ -203,6 +203,22 @@ describe("nudge", () => {
     expect(outcome.refusal?.raw).toContain("You've hit your session limit"); // resetsAt resolution is session-limit.test.ts's concern
     expect(keys.length).toBe(0);
   });
+  // KAN-831 review (PR #82): before the refusal check existed, nudge() could
+  // no longer throw once agent.prompt succeeded (the only remaining call,
+  // sendKeys, was already .catch(() => {})). A transient pane.read failure
+  // here must not propagate: it would make daemon/index.ts's caller log
+  // "refused/absent" for a prompt that WAS delivered — inverting the honesty
+  // fix — and skip the stranded-composer enter, reopening KAN-691's 2.5h
+  // stall via an unrelated herdr hiccup.
+  test("a transient pane.read failure while checking for a refusal does not fail the nudge — falls through to submitting the stranded composer", async () => {
+    const prompts: any[] = []; const keys: any[] = [];
+    const client = base(prompts, { keys });
+    client.pane.read = async () => { throw new Error("herdr hiccup"); };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant);
+    const outcome = await herd.nudge("KAN-7", "x");
+    expect(outcome).toEqual({ delivered: true });
+    expect(keys[0]).toEqual({ pane_id: "w1:p1", keys: ["enter"] });
+  });
 });
 
 describe("staleIssues", () => {

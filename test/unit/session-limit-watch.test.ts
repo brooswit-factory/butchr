@@ -140,8 +140,12 @@ describe("watchSessionLimits", () => {
     nowMs = new Date(2026, 7, 28, 21, 50, 0).getTime() + POST_RESET_MARGIN_MS;
     await wait(30);
     stop();
-    expect(closed.length).toBeGreaterThanOrEqual(1);
-    expect(closed.every((i) => i === "KAN-1")).toBe(true);
+    // DoD #4 says "exactly one close" on purpose: >= 1 would also pass a
+    // watcher that closes the pane every poll forever. Once closed, the
+    // level-triggered `now` is already past today's printed reset, so the
+    // NEXT poll's fresh resolve rolls to TOMORROW's — which is why this
+    // stays at exactly one even though the fake clock is held fixed here.
+    expect(closed).toEqual(["KAN-1"]);
   });
 
   test("a failing list() poll survives to the next poll", async () => {
