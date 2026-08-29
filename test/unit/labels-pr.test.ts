@@ -21,6 +21,10 @@ const searchHit = (owner: string, repo: string, number: number) => () => ({
   items: [{ number, repository_url: `https://api.github.com/repos/${owner}/${repo}` }],
 });
 
+const searchHits = (owner: string, repo: string, numbers: number[]) => () => ({
+  items: numbers.map((number) => ({ number, repository_url: `https://api.github.com/repos/${owner}/${repo}` })),
+});
+
 const pull = (state: string, merged: boolean, headRef: string) => () => ({ state, merged, head: { ref: headRef } });
 
 describe("isApproved", () => {
@@ -115,6 +119,17 @@ describe("PrTracker", () => {
     expect(await tracker.stateFor("KAN-790")).toBeNull(); // search hit is the task's PR (head KAN-790-ownwrites), not an exact match
     exact = true;
     expect(await tracker.stateFor("KAN-790")).toBe("open"); // a later poll's exact-head PR is discoverable — nothing was poisoned
+  });
+
+  test("a prefix-colliding hit sorted FIRST in the same org's results doesn't shadow an exact-head hit sorted second (KAN-814 review, PR #77)", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /search\/issues/, respond: searchHits("acme", "widgets", [66, 70]) }, // collision (66, head KAN-790-ownwrites) sorts before the exact match (70, head KAN-790)
+      { match: /pulls\/66$/, respond: pull("open", false, "KAN-790-ownwrites") },
+      { match: /pulls\/70$/, respond: pull("open", false, "KAN-790") },
+      { match: /pulls\/70\/reviews/, respond: () => [] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-790")).toBe("open"); // resolves #70's state, not null
   });
 
   test("cold cache: open search finds nothing, merged search finds an exact-head hit -> 'merged' (restart durability)", async () => {

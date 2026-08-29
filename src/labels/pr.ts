@@ -57,16 +57,20 @@ async function fetchPull(deps: GithubDeps, ref: PrRef): Promise<PullPayload | nu
   return (await res.json()) as PullPayload;
 }
 
+/** How many of a search's top hits to check for an exact head-ref match, per org, before giving up on it — GitHub's best-match sort gives no ordering guarantee between a ticket's own PR and a prefix-colliding one (e.g. a task's `KAN-790-ownwrites` branch vs. the story's own `KAN-790`), so the first hit alone isn't enough, but an unranked org-wide result set could in principle be large and each candidate costs a pulls fetch. */
+const DISCOVER_CANDIDATES = 5;
+
 /**
  * Searches GitHub for a PR whose head branch is EXACTLY `key`, within
  * `status` ("open" or "merged"), across the configured orgs. GitHub's
  * `head:` search qualifier matches by PREFIX — the search result shape
- * doesn't even carry `head.ref` — so the top hit is confirmed against the
- * pull payload itself before it is trusted. A prefix-colliding hit (e.g.
- * `KAN-790-ownwrites` for key `KAN-790`) is rejected without caching
- * anything, so a later exact-match PR on the same key stays discoverable on
- * a subsequent poll. The validated pull is returned alongside the ref so the
- * caller can reuse it instead of re-fetching.
+ * doesn't even carry `head.ref` — so each of the top `DISCOVER_CANDIDATES`
+ * hits is confirmed against its own pull payload, in order, until one's head
+ * ref is an exact match. A prefix-colliding hit (e.g. `KAN-790-ownwrites` for
+ * key `KAN-790`) is skipped without caching anything, so a later exact-match
+ * PR on the same key stays discoverable on a subsequent poll even if this
+ * org never turns one up. The validated pull is returned alongside the ref
+ * so the caller can reuse it instead of re-fetching.
  */
 async function discover(deps: GithubDeps, key: string, status: "open" | "merged"): Promise<{ ref: PrRef; pull: PullPayload } | null> {
   for (const org of deps.orgs) {
@@ -74,14 +78,14 @@ async function discover(deps: GithubDeps, key: string, status: "open" | "merged"
     const res = await deps.fetchImpl(`https://api.github.com/search/issues?${q}`, { headers: ghHeaders(deps.token) });
     if (!res.ok) continue;
     const body = (await res.json()) as { items?: Array<{ number: number; repository_url: string }> };
-    const item = body.items?.[0];
-    if (!item) continue;
-    const m = /\/repos\/([^/]+)\/([^/]+)$/.exec(item.repository_url);
-    if (!m) continue;
-    const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
-    const pull = await fetchPull(deps, ref);
-    if (!pull || pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
-    return { ref, pull };
+    for (const item of body.items?.slice(0, DISCOVER_CANDIDATES) ?? []) {
+      const m = /\/repos\/([^/]+)\/([^/]+)$/.exec(item.repository_url);
+      if (!m) continue;
+      const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
+      const pull = await fetchPull(deps, ref);
+      if (!pull || pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
+      return { ref, pull };
+    }
   }
   return null;
 }
