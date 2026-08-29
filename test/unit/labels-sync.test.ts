@@ -167,6 +167,21 @@ describe("createLabelSync", () => {
     expect([...written]).toEqual(["KAN-1"]);
   });
 
+  test("onWrite fires once with the written keys; not at all when nothing was written", async () => {
+    const jira = fakeJira();
+    const onWriteCalls: string[][] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"], ["KAN-2", "idle"]]),
+      onWrite: (keys) => onWriteCalls.push([...keys]),
+    });
+    await sync([iss("KAN-1", "In Progress", []), iss("KAN-2", "In Progress", ["agent:idle"])]);
+    expect(onWriteCalls).toEqual([["KAN-1"]]);
+    onWriteCalls.length = 0;
+    await sync([iss("KAN-1", "In Progress", ["agent:idle"]), iss("KAN-2", "In Progress", ["agent:idle"])]); // no-op poll
+    expect(onWriteCalls).toEqual([]);
+  });
+
   test("done maps to agent:idle, not agent:working (herdr's done = sitting at its prompt)", async () => {
     const jira = fakeJira();
     const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "done"]]) });
