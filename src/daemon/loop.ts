@@ -321,6 +321,22 @@ export function startLoop(deps: LoopDeps): Stop {
       // "new" and wake the agent about it. Fail-open discipline is
       // unchanged either way: a rejected/unwired fetch leaves the cursor
       // untouched, never installing a baseline nothing this poll observed.
+      //
+      // Two residuals, carried forward rather than silently dropped (KAN-828
+      // documented the first; this ticket must not let the rewrite lose it):
+      //
+      // Known residual, stated rather than hidden: a ledger hit whose
+      // folded-in foreign event was a status change with NO comment is still
+      // suppressed — outside this discriminator's reach, on the DAEMON arm,
+      // unchanged since KAN-828.
+      //
+      // Second known residual (KAN-838): on the AGENT arm, a foreign comment
+      // landing in the SAME fetch window as the agent's own write is folded
+      // into the cursor advance below and is never delivered to the ticket's
+      // own agent that poll (it still reaches any WATCHER via
+      // crossDaemonSuppressed, which never consults this cursor for a pure
+      // comment diff) — the arm's job is only to keep the cursor honest for
+      // later polls, not to reconsider what it suppresses on its own poll.
       const ledgerHitCache = new Map<string, Promise<boolean>>();
       const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
         let p = ledgerHitCache.get(key);
