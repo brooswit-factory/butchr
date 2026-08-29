@@ -218,6 +218,31 @@ describe("startLoop own-label-write nudge suppression", () => {
     expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once (poll 1), nudged once (poll 2's real change)
   });
 
+  test("a notifying (non-quiet) label write still gets exactly one own-write `updated` bump swallowed", async () => {
+    // startLoop only sees the written-keys set syncLabels returns — it has no idea
+    // whether the write behind it was quiet (notifyUsers=false) or notifying (KAN-801):
+    // a notifying write bumps `updated` exactly the same way, so the swallow is unaffected.
+    const herd = fakeHerd();
+    const notified: string[] = [];
+    const polls: JiraIssue[][] = [
+      [iss("A", "In Progress")],
+      [{ ...iss("A", "In Progress"), updated: "t2" }], // our own notifying write bumped `updated`
+      [{ ...iss("A", "In Review"), updated: "t3" }],   // a real subsequent change
+    ];
+    const writes: Array<ReadonlySet<string>> = [new Set(["A"]), new Set(), new Set()];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      herd,
+      notify: (i) => { notified.push(i); },
+      syncLabels: async () => { const w = writes[Math.min(n, writes.length - 1)]!; n++; return w; },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    expect(notified.filter((x) => x === "A").length).toBe(1); // swallowed once, nudged once for the real change
+  });
+
   test("a poll whose only change is the daemon's own label write produces no nudge at all", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
