@@ -370,6 +370,61 @@ describe("PrTracker — KAN-824 search budget", () => {
     expect(searchAttempts).toBe(2);
   });
 
+  // KAN-824 review (PR #83): throttledUntil trusted X-RateLimit-Reset with no forward floor, so a
+  // past reset (clock skew, or a reset right at a window boundary) silently disabled the throttle
+  // entirely — the exact "silence in the journal is the defect" failure this ticket exists to fix,
+  // reintroduced one layer up. Fixed by clamping to the 60s fallback whenever resetMs <= now.
+  test("a 403 whose x-ratelimit-reset is in the PAST still suppresses the next poll's searches (a forward floor, not a bare fallback)", async () => {
+    let now = 10_000;
+    const pastResetEpochSec = 5; // resetMs = 5_000, already before `now` = 10_000
+    let searchAttempts = 0;
+    const statusFetch = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) {
+        searchAttempts++;
+        return new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(pastResetEpochSec) } });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now });
+
+    expect(await tracker.stateFor("KAN-1")).toBeNull(); // 403 with an already-past reset
+    expect(searchAttempts).toBe(1);
+
+    now = 10_001; // the very next poll — a bare `resetMs ?? fallback` would NOT be throttled here
+    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(searchAttempts).toBe(1); // still suppressed: no new search issued
+
+    now = 10_000 + 60_000 - 1; // just before the 60s fallback throttle elapses
+    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(searchAttempts).toBe(1);
+
+    now = 10_000 + 60_000; // fallback throttle elapsed: searches resume
+    await tracker.stateFor("KAN-1");
+    expect(searchAttempts).toBe(2);
+  });
+
+  // The nit that makes the above reachable in practice: Number("") is 0, and Number.isFinite(0) is
+  // true, so an empty x-ratelimit-reset header used to parse as the number zero rather than absent.
+  test("an empty x-ratelimit-reset header parses as absent, not zero — falls back to the 60s throttle instead of disabling it", async () => {
+    let now = 10_000;
+    let searchAttempts = 0;
+    const statusFetch = async (url: string): Promise<Response> => {
+      if (/search\/issues/.test(url)) {
+        searchAttempts++;
+        return new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "" } });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const tracker = new PrTracker({ fetchImpl: statusFetch, orgs: ["acme"], now: () => now });
+
+    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(searchAttempts).toBe(1);
+
+    now = 10_001; // an empty header must not act as resetMs=0, i.e. "already elapsed" — no new search
+    expect(await tracker.stateFor("KAN-1")).toBeNull();
+    expect(searchAttempts).toBe(1);
+  });
+
   test("a 403 followed by a different status (500) for the same key logs a second line", async () => {
     let now = 0;
     let attempts = 0;

@@ -119,7 +119,7 @@ const MERGED_SWEEP_EVERY_ROUNDS = 20;
 const THROTTLE_FALLBACK_MS = 60_000;
 
 function parseIntHeader(v: string | null): number | undefined {
-  if (v == null) return undefined;
+  if (v == null || v.trim() === "") return undefined; // Number("") is 0, not "absent" — guard it explicitly
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
 }
@@ -245,7 +245,11 @@ export class PrTracker {
 
   private handleNonOk(key: string, outcome: NonNullable<SearchOutcome["nonOk"]>, now: number): void {
     const resetMs = outcome.resetEpochSec != null ? outcome.resetEpochSec * 1000 : undefined;
-    this.throttledUntil = resetMs ?? now + THROTTLE_FALLBACK_MS;
+    // A forward floor, not a bare `?? fallback`: X-RateLimit-Reset is GitHub's absolute epoch
+    // second, `now()` is the local clock, and a reset at or before `now` (clock skew, a 0/empty
+    // header) must still degrade to the fixed fallback — trusting it unconditionally would set
+    // an already-expired throttle, i.e. no throttle at all, silently (KAN-824 review, PR #83).
+    this.throttledUntil = resetMs != null && resetMs > now ? resetMs : now + THROTTLE_FALLBACK_MS;
     if (this.loggedStatus.get(key) === outcome.status) return; // same key, same status: already logged
     this.loggedStatus.set(key, outcome.status);
     const remainingPart = outcome.remaining != null ? `remaining=${outcome.remaining}` : "remaining=absent";
