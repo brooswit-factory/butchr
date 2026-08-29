@@ -219,6 +219,65 @@ describe("createLabelSync", () => {
     expect(calls).toEqual([{ key: "KAN-1", add: ["agent:idle"], remove: [] }]);
   });
 
+  test("stalled: takes precedence over idle, goes through the SAME 2-poll stabilizer as any other agent:* value", async () => {
+    const jira = fakeJira();
+    let stalledNow = false;
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => stalledNow, forget: () => {} },
+    });
+    const issue = iss("KAN-1", "In Progress", []);
+    await sync([issue]); // establishes agent:idle (first observation, no flip to confirm)
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:idle"], remove: [] }]);
+
+    jira.calls.length = 0;
+    stalledNow = true;
+    const issue2 = iss("KAN-1", "In Progress", ["agent:idle"]);
+    await sync([issue2]); // 1st poll of "stalled" vs applied "idle": unconfirmed
+    expect(jira.calls).toEqual([]);
+    await sync([issue2]); // 2nd consecutive poll: confirmed
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:stalled"], remove: ["agent:idle"] }]);
+  });
+
+  test("stalled is never applied when the observed status isn't idle, even if the check reports true", async () => {
+    const jira = fakeJira();
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "working"]]),
+      stalled: { check: async () => true, forget: () => {} },
+    });
+    await sync([iss("KAN-1", "In Progress", [])]);
+    expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:working"], remove: [] }]);
+  });
+
+  test("the stalled log line fires immediately (unlike the label, not delayed by the stabilizer)", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => true, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:idle"])]); // label write still suppressed (1st poll)
+    expect(jira.calls).toEqual([]);
+    expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled"))).toBe(true);
+  });
+
+  test("leaving the active set forgets the stalled tracker's state for that ticket", async () => {
+    const jira = fakeJira();
+    const forgotten: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => false, forget: (k) => forgotten.push(k) },
+    });
+    await sync([iss("KAN-1", "In Progress", [])]);
+    await sync([]); // KAN-1 leaves the active set
+    expect(forgotten).toEqual(["KAN-1"]);
+  });
+
   test("a permanently failing write logs 'write failed' exactly once, not once per poll; a change in reason logs again", async () => {
     const jira: LabelWriter = {
       async updateLabels() { throw new Error("403 forbidden"); },
