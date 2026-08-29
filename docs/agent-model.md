@@ -89,7 +89,7 @@ Issue type decides only brief, model, and duties.
 1. **Daemon tools** — jira.js/confluence.js proxied through thatch.
 2. **Workspace builder + briefs** — CLAUDE.md, the four briefs, interpolation,
    `workspace.create({cwd})`, the kickoff prompt.
-3. **Per-type models** — epic=fable, story=opus, task=sonnet via spawn args.
+3. **Per-type models** — epic=opus, story=opus, task=sonnet via spawn args.
 4. **Implements-link routing** — extend the diff/notify loop to route a
    ticket's events to whatever it implements (task→story→epic); the parent
    field stays membership-only and triggers no notification.
