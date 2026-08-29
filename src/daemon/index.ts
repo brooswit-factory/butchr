@@ -119,11 +119,22 @@ const escalator = createEscalator({
   log: (line) => console.error(`  ${line}`),
 });
 
+// Resolves a pane's issue key the same way for onExposed and onUnparseable —
+// both need it, and neither can assume the caller already has it.
+async function issueForPane(paneId: string): Promise<string | null> {
+  const { agents } = await herdr.agent.list();
+  return issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
+}
+
 watchPrompts({
   onBlocked: (cb) => watchBlocked(
     async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
     5_000, cb,
     (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),
+    // Per-tick, synchronous: lets the escalator see the polls it was NOT
+    // called on (the pane wasn't blocked), which is what resets a flickering
+    // pane's debounce (KAN-756, item A).
+    (blockedPaneIds, pollSeq) => escalator.onPoll(pollSeq, blockedPaneIds),
   ),
   read: readPane,
   send: sendPane,
@@ -135,14 +146,26 @@ watchPrompts({
   // onExposed is typed void — this async body's promise goes unawaited by the
   // caller, so a rejection here (e.g. herdr.agent.list() failing) would
   // otherwise surface as an unhandled rejection instead of a [prompts] line.
-  onExposed: ({ paneId, prompt }) => {
+  onExposed: ({ paneId, prompt, pollSeq }) => {
     void (async () => {
       try {
-        const { agents } = await herdr.agent.list();
-        const issue = issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
-        await escalator.onBlocked(paneId, issue, prompt);
+        const issue = await issueForPane(paneId);
+        await escalator.onBlocked(paneId, issue, prompt, pollSeq);
       } catch (e) {
         console.error(`  [prompts] onExposed error: ${(e as Error)?.message ?? e}`);
+      }
+    })();
+  },
+  // A blocked pane whose text does not parse as a dialog (KAN-756, item C) —
+  // resets the debounce like any other gap and logs, deduplicated by the
+  // escalator, instead of being silently dropped.
+  onUnparseable: ({ paneId, text, pollSeq }) => {
+    void (async () => {
+      try {
+        const issue = await issueForPane(paneId);
+        escalator.onNoPrompt(paneId, issue, text, pollSeq);
+      } catch (e) {
+        console.error(`  [prompts] onUnparseable error: ${(e as Error)?.message ?? e}`);
       }
     })();
   },
