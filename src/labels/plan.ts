@@ -14,6 +14,17 @@ export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || 
 
 export type PrState = "open" | "approved" | "changes-requested" | "merged" | null;
 
+/**
+ * Whether a ticket of this Jira issue type could ever have a PR — used to
+ * skip GitHub search discovery entirely for types that structurally never
+ * do. Epics in this fleet never have a branch of their own (their stories do
+ * the work), so a search for one can only ever miss — pure waste against
+ * GitHub's 30/min search budget (KAN-824). Case-insensitive; an unrecognised
+ * or empty issuetype is treated as "yes" (conservative: keeps today's
+ * behaviour rather than risk skipping a type that does get PRs).
+ */
+export const canHavePr = (issuetype: string): boolean => issuetype.toLowerCase() !== "epic";
+
 export interface DesiredInput {
   /** The ticket's Jira status. */
   status: string;
