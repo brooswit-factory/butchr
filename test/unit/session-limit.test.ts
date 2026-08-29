@@ -52,6 +52,19 @@ describe("detectSessionLimitRefusal", () => {
     expect(detectSessionLimitRefusal(fixture("pane-cap-session-limit-quoted-ticket.txt"), new Date())).toBeNull();
   });
 
+  // PR #68 review: a real idle Claude Code pane still renders its composer
+  // (a bare `❯` box, the "⏵⏵ bypass permissions on …" status line) BELOW the
+  // refusal — requiring the refusal to be strictly the LAST content line
+  // (as an earlier version of this matcher did) would never match the exact
+  // pane this feature exists to recover. This must match.
+  test("matches a genuine refusal even with the real composer chrome rendered below it", () => {
+    const now = new Date(2026, 7, 28, 18, 59, 0);
+    const r = detectSessionLimitRefusal(fixture("pane-cap-session-limit-with-composer.txt"), now);
+    expect(r).not.toBeNull();
+    expect(r!.raw).toContain("You've hit your session limit");
+    expect(r!.resetsAt).toBe(new Date(2026, 7, 28, 21, 50, 0).getTime());
+  });
+
   test("does NOT match an ordinary healthy working-agent capture", () => {
     expect(detectSessionLimitRefusal(fixture("pane-cap-a.txt"), new Date())).toBeNull();
     expect(detectSessionLimitRefusal(fixture("pane-cap-b.txt"), new Date())).toBeNull();

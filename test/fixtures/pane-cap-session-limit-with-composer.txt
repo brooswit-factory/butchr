@@ -1,0 +1,10 @@
+
+● Bash(claude --model sonnet --permission-mode bypassPermissions --mcp-config mcp.json --dangerously-load-development-channels server:butchr "follow your CLAUDE.md")
+  ⎿  Running…
+
+You've hit your session limit · resets 9:50pm
+
+───────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc

@@ -56,7 +56,14 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
   const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys());
-  for (const issue of plan.spawn) await herd.spawn(desired.get(issue)!);
+  // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
+  // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
+  // burst of N new spawns (e.g. several stories activating in one poll)
+  // would stall this ENTIRE poll — label sync and every ticket's
+  // notifications included — for N times that wait. Each issue's spawn is
+  // independent (its own workspace directory, its own pane), so nothing
+  // requires them to run one after another.
+  await Promise.all(plan.spawn.map((issue) => herd.spawn(desired.get(issue)!)));
   for (const issue of plan.stop) await herd.stop(issue);
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
