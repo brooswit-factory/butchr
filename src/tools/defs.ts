@@ -46,10 +46,27 @@ const noTargetMsg = (issuetype: "Story" | "Task"): string =>
  * is the Story/Task assignee mapping `jira_create_issue` staffs by; injected
  * rather than read from config here so this module stays pure over its ops
  * and unit-testable without a config fixture.
+ *
+ * `onWrite`, when given, fires after each MUTATING tool resolves, with the
+ * key(s) it wrote and the caller's `x-issue` as writer — feeds the own-write
+ * ledger (src/jira-watch/own-writes.ts) so the notify loop can recognize its
+ * own echoes. Read tools call nothing; this stays free of Jira reads on
+ * purpose (only src/daemon/index.ts talks to Jira for that read-back).
+ * Omitted when the caller's `x-issue` is missing (an untagged/human call) —
+ * we never record a write under an unknown writer.
  */
-export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = console.error, roles: AssigneeRoles = {}): Record<string, ToolDef<any>> {
+export function atlassianTools(
+  ops: AtlassianOps,
+  log: (line: string) => void = console.error,
+  roles: AssigneeRoles = {},
+  onWrite?: (keys: readonly string[], writer: string) => void,
+): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
+  const noted = (c: { headers: Record<string, string> }, keys: readonly string[]) => {
+    const writer = c.headers["x-issue"];
+    if (writer) onWrite?.(keys, writer);
+  };
   return {
     jira_get_issue: {
       description: "Read a Jira issue (fields incl. description, status, parent, labels).",
@@ -68,7 +85,10 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         const { from, to, type } = a as { from: string; to: string; type?: string };
         const resolvedType = type ?? "Implements";
         audit(c, `link ${from} → ${to} (${resolvedType})`);
-        return ops.linkIssues(from, to, resolvedType).then((r) => orOk(r, { ok: true, from, to, type: resolvedType }));
+        return ops.linkIssues(from, to, resolvedType).then((r) => {
+          noted(c, [from, to]); // a link bumps `updated` on BOTH ends
+          return orOk(r, { ok: true, from, to, type: resolvedType });
+        });
       },
     },
     jira_add_comment: {
@@ -83,13 +103,13 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         const who = c.headers["x-issue"];
         const tag = who ? `[${who}] ` : "";
         const body = tag && !text.startsWith(`[${who}]`) ? tag + text : text;
-        return ops.addComment(key, body);
+        return ops.addComment(key, body).then((r) => { noted(c, [key]); return r; });
       },
     },
     jira_transition: {
       description: 'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
-      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status); },
+      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description:
@@ -150,6 +170,7 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
           ...(p.priority ? { priority: p.priority } : {}),
         })) as { key?: string } & Record<string, unknown>;
         const key = created.key;
+        if (key) noted(c, [key]); // the create itself: a new ticket's own `updated`
 
         if (p.issuetype === "Epic" || orphan) return created;
 
@@ -167,6 +188,7 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
         // here — only a REJECTION distinguishes a link failure on this path.
         try {
           await ops.linkIssues(key, target!, "Implements");
+          noted(c, [key, target!]); // the link bumps `updated` on BOTH ends
           return { ...created, key, implements: { ok: true, to: target } };
         } catch (e) {
           return { ...created, key, implements: { ok: false, to: target, error: (e as Error).message } };
@@ -179,7 +201,7 @@ export function atlassianTools(ops: AtlassianOps, log: (line: string) => void = 
       handler: (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
         audit(c, `priority ${key} → ${priority}`);
-        return ops.setPriority(key, priority).then((r) => orOk(r, { ok: true, key, priority }));
+        return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, priority }); });
       },
     },
     confluence_create_page: {

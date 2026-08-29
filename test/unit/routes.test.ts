@@ -53,6 +53,25 @@ describe("watchedKeys", () => {
     expect(watchedKeys([link("Cloners", "inward", "KAN-A")])).toEqual([]);
   });
 
+  test("Part B, pinned (KAN-790): a task that Implements a story is watched by the story, never routed to the epic; the story's own story-implements-epic link does not make it watch its epic; a Relates link routes nothing", () => {
+    // From the STORY's point of view: its task (the implementer) is otherEnd
+    // "outward" -> the story watches it. This is the delivery path KAN-790
+    // was filed over: a task's "merged, over to you" comment must reach its
+    // story, not vanish into the (unrelated) Jira-parent epic.
+    const storyLinks = [link("Implements", "outward", "KAN-TASK")];
+    expect(watchedKeys(storyLinks)).toEqual(["KAN-TASK"]);
+    // The SAME story also implements its epic — seen from the story's own
+    // links, the epic is otherEnd "inward" (the boss side), so the story
+    // does NOT watch its epic through that link (only the epic watches the
+    // story, symmetrically, via its own outward-Implements link).
+    const storyOwnBossLink = [link("Implements", "inward", "KAN-EPIC")];
+    expect(watchedKeys(storyOwnBossLink)).toEqual([]);
+    // A Relates link (the pre-routing-release-B bridge KAN-790 was filed
+    // against) routes nothing at all, in either direction.
+    expect(watchedKeys([link("Relates", "outward", "KAN-TASK")])).toEqual([]);
+    expect(watchedKeys([link("Relates", "inward", "KAN-TASK")])).toEqual([]);
+  });
+
   test("mixed links: only the routable ones are returned, in order", () => {
     const links = [
       link("Implements", "outward", "KAN-1"),
