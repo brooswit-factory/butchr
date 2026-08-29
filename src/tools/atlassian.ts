@@ -9,6 +9,8 @@ export interface AtlassianOps {
   createIssue(p: { projectKey: string; issuetype: string; summary: string; description?: string; parent?: string; labels?: string[]; assignee?: string; priority?: string }): Promise<unknown>;
   /** Set priority by name (e.g. "High"). */
   setPriority(key: string, priority: string): Promise<unknown>;
+  /** Assign to an accountId. Never writes any other field. */
+  assign(key: string, accountId: string): Promise<unknown>;
   /** `parentId` nests the page under it; omitted, Confluence lands it under the space's own default (the SD homepage today). */
   createPage(p: { spaceId: string; title: string; body: string; parentId?: string }): Promise<unknown>;
   getPage(id: string): Promise<unknown>;

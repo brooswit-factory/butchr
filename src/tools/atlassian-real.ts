@@ -61,6 +61,9 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // node_modules/jira.js/dist/cloud/parameters/editIssue.d.ts) — no wrapper
     // gotcha here, unlike addComment/createPage.
     setPriority: (key, priority) => jira.issues.editIssue({ issueIdOrKey: key, fields: { priority: { name: priority } } }),
+    // Same editIssue route as setPriority above — `fields` is a loose Record
+    // with no wrapper gotcha, and it writes only the one key we pass.
+    assign: (key, accountId) => jira.issues.editIssue({ issueIdOrKey: key, fields: { assignee: { accountId } } }),
     // CreatePage spreads CreatePageSchema at the TOP level: only `body` is
     // forwarded (zod, $strip — every other top-level key, including spaceId,
     // is silently dropped) — the flat shape sent an empty spaceId and

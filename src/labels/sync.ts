@@ -12,6 +12,13 @@ export interface SyncDeps {
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
   prState?: (key: string) => Promise<PrState>;
+  /**
+   * Called once per poll with the keys this poll wrote daemon-owned labels
+   * for (only when non-empty), so the caller can feed the own-write ledger
+   * (src/jira-watch/own-writes.ts) with writer "daemon" — generalizes the
+   * old isOwnLabelBump swallow into the same mechanism agent writes use.
+   */
+  onWrite?: (keys: readonly string[]) => void;
   log?: (line: string) => void;
 }
 
@@ -133,6 +140,7 @@ export function createLabelSync(deps: SyncDeps) {
       if (ok) lastLabels.delete(key);
     }
 
+    if (written.size) deps.onWrite?.([...written]);
     return written;
   };
 }
