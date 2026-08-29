@@ -14,7 +14,7 @@ function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: 
     async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
-    async nudge() { return true; },
+    async nudge() { return { delivered: true }; },
   };
 }
 const iss = (key: string, status: string, parent: string | null = null): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", parent, updated: "t", labels: [] });
@@ -63,7 +63,7 @@ describe("reconcileNow", () => {
       async spawn(sp) { await new Promise((r) => setTimeout(r, DELAY_MS)); running.add(sp.key); },
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
-      async nudge() { return true; },
+      async nudge() { return { delivered: true }; },
     };
     const start = Date.now();
     await reconcileNow(herd, new Map([["A", spec("A")], ["B", spec("B")], ["C", spec("C")]]));

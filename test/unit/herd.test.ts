@@ -155,34 +155,53 @@ describe("nudge", () => {
       prompt: async (p: any) => { if (opts.fail) throw new Error("pane is blocked"); prompts.push(p); },
     },
     workspace: { create: async () => ({ root_pane: "w1:p1" }) },
-    pane: { close: async () => {}, sendKeys: async (k: any) => { (opts.keys ?? []).push(k); } },
+    pane: {
+      close: async () => {},
+      sendKeys: async (k: any) => { (opts.keys ?? []).push(k); },
+      read: async () => ({ read: { text: "no refusal here" } }),
+    },
   });
   test("delivers a prompt; still idle after the wait → submits the stranded composer", async () => {
     const prompts: any[] = []; const keys: any[] = [];
     const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);
-    expect(await herd.nudge("KAN-7", "[butchr] hi")).toBe(true);
+    expect(await herd.nudge("KAN-7", "[butchr] hi")).toEqual({ delivered: true });
     expect(prompts[0]).toEqual({ target: "butchr-kan-7", text: "[butchr] hi" });
     expect(keys[0]).toEqual({ pane_id: "w1:p1", keys: ["enter"] });   // delivered ≠ turn started
   });
   test("agent went working → no enter is sent", async () => {
     const keys: any[] = [];
     const herd = new HerdrHerd(base([], { statusAfter: "working", keys }) as any, "http://x/mcp", instant);
-    expect(await herd.nudge("KAN-7", "x")).toBe(true);
+    expect(await herd.nudge("KAN-7", "x")).toEqual({ delivered: true });
     expect(keys.length).toBe(0);
   });
   test("agent blocked after prompt → never send enter (it would pick a dialog option)", async () => {
     const keys: any[] = [];
     const herd = new HerdrHerd(base([], { statusAfter: "blocked", keys }) as any, "http://x/mcp", instant);
-    expect(await herd.nudge("KAN-7", "x")).toBe(true);
+    expect(await herd.nudge("KAN-7", "x")).toEqual({ delivered: true });
     expect(keys.length).toBe(0);
   });
   test("false when no agent runs for the issue", async () => {
     const herd = new HerdrHerd(base([]) as any, "http://x/mcp", instant);
-    expect(await herd.nudge("KAN-999", "x")).toBe(false);
+    expect(await herd.nudge("KAN-999", "x")).toEqual({ delivered: false });
   });
   test("false when the pane refuses (blocked at prompt time)", async () => {
     const herd = new HerdrHerd(base([], { fail: true }) as any, "http://x/mcp", instant);
-    expect(await herd.nudge("KAN-7", "x")).toBe(false);
+    expect(await herd.nudge("KAN-7", "x")).toEqual({ delivered: false });
+  });
+  // KAN-829: the nudge landed (agent.prompt did not throw), the agent is
+  // still idle after the verify wait — but it is idle because the session
+  // refused the prompt, not because of a stranded composer. Enter must NOT
+  // be sent (nothing to submit), and the caller must be able to tell this
+  // apart from an ordinary "delivered".
+  test("prompt lands on a session-limit refusal → delivered but reports the refusal, never sends enter", async () => {
+    const prompts: any[] = []; const keys: any[] = [];
+    const client = base(prompts, { keys });
+    client.pane.read = async () => ({ read: { text: "You've hit your session limit · resets 9:50pm" } });
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant);
+    const outcome = await herd.nudge("KAN-7", "x");
+    expect(outcome.delivered).toBe(true);
+    expect(outcome.refusal?.raw).toContain("You've hit your session limit"); // resetsAt resolution is session-limit.test.ts's concern
+    expect(keys.length).toBe(0);
   });
 });
 
