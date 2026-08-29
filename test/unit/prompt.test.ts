@@ -144,6 +144,71 @@ describe("bypass-permissions acceptance dialog", () => {
   });
 });
 
+// KAN-756 PR #40 review, Finding 1 (comments 14956/14969/14983): item (B)
+// hardened the NUMBERED branch and left parseUnnumbered carrying exactly
+// the substring-anywhere footer trap it was warned about — `findIndex(l =>
+// /Enter to (confirm|select)/.test(l))` matches the phrase ANYWHERE in a
+// line, including mid-sentence prose, and un-numbered dialogs never got a
+// positional gate at all. Reviewer's real proof (reproduced against PR
+// head e6d1be4, fp bc4162ee): a working agent's own narration about the
+// footer rule — `❯ `-prefixed lines (Claude Code's own composer/user-
+// message prefix) and 2-space-indented short lines (ordinary tool output)
+// are the everyday shape; the only scarce ingredient is the footer phrase
+// in prose, and butchr itself puts it there (every escalation comment
+// quotes a real dialog's footer onto a ticket the agent then reads) — the
+// same self-sustaining loop as the numbered-branch finding, one code path
+// over. Fix: anchor FOOTER to line-start on BOTH branches (a real footer
+// IS the line, never a clause inside a sentence), and have parseUnnumbered
+// anchor to the LAST matching line rather than the first — a real dialog
+// is always the last thing rendered in scrollback, so prose mentioning the
+// phrase ABOVE a genuine dialog must not steal the anchor from it.
+describe("un-numbered branch: footer must be line-anchored, not merely present (KAN-756 PR #40 review)", () => {
+  test("THE TRAP (reviewer's real proof): narration ABOUT the footer, with no real dialog anywhere, must not parse", () => {
+    const trap = `❯ [butchr] KAN-756 was updated — re-read it, then act
+● Reviewing the reviewer's note about the footer rule.
+  the gate requires a footer
+  immediately after the options
+❯ so a stray cursor line counts
+  the real dialog says Enter to confirm · Esc to cancel`;
+    expect(parsePrompt(trap)).toBeNull();
+  });
+
+  test("a real un-numbered dialog still parses identically (regression: the captured trust dialog)", () => {
+    const trust = `──────────────────────────────
+ Accessing workspace:
+ /home/brooswit/butchr-workspaces/KAN-706
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review
+ what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel`;
+    const p = parsePrompt(trust)!;
+    expect(p).not.toBeNull();
+    expect(p.options).toEqual(["No, exit", "Yes, I trust this folder"]);
+    expect(p.current).toBe(1);
+  });
+
+  test("the footer phrase as a mid-line clause in prose, with a REAL dialog further down: the real dialog still parses (anchoring to the LAST match, not the first)", () => {
+    const text = `● Someone wrote: "the real dialog says Enter to confirm · Esc to cancel somewhere"
+ Choose deployment target:
+ ❯ Production
+   Staging
+ Enter to confirm · Esc to cancel`;
+    const p = parsePrompt(text)!;
+    expect(p).not.toBeNull();
+    expect(p.options).toEqual(["Production", "Staging"]);
+    expect(p.current).toBe(1);
+    expect(p.question).toContain("Choose deployment target:");
+  });
+
+  test("indented prose containing the footer phrase (not line-start once trimmed) never anchors, even alone", () => {
+    expect(parsePrompt("  some text mentions Enter to confirm in passing\n  another line")).toBeNull();
+  });
+});
+
 // KAN-756, item (B): parser hardening so transient pane prose never parses
 // as a dialog. FINDING (KAN-756 comment 14863/14867, real captures on the
 // affected host): the trigger is NOT any specific banner — it is ANY two

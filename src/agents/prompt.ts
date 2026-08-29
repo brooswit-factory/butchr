@@ -23,8 +23,17 @@ const QUESTION_TAIL = 6;
  * detected here") contains the phrase as ordinary prose, far from any real
  * menu. The position relative to the options — not the phrase's presence —
  * is the signal.
+ *
+ * Anchored to the START of the line (PR #40 review, comment 14956): a real
+ * footer IS the line, never a clause inside a sentence. Every footer line
+ * in every real fixture in this repo begins with this phrase once trimmed
+ * — an un-anchored match let a narration sentence merely CONTAINING the
+ * phrase satisfy the gate (the exact self-sustaining loop mechanism this
+ * whole ticket exists to close: an escalation comment quotes a real
+ * dialog's footer onto a ticket, the agent reads that ticket, and the
+ * phrase is now sitting in its own pane as prose).
  */
-const FOOTER = /Enter to (confirm|select)/;
+const FOOTER = /^\s*Enter to (confirm|select)/;
 
 /**
  * Parse herdr's `pane.read source:detection` text of a blocked Claude prompt.
@@ -98,9 +107,17 @@ function footerImmediatelyFollows(lines: string[], lastOptionLineIdx: number): b
  * of short option lines, one carrying `❯`, terminated by an
  * "Enter to confirm/select · Esc" footer. The footer is REQUIRED — it is the
  * gate that keeps arbitrary prose from parsing as a menu.
+ *
+ * Anchors to the LAST line-start match of FOOTER, not the first (PR #40
+ * review, comment 14983): a real dialog is always the LAST thing rendered
+ * in a pane's scrollback, so prose mentioning the footer phrase ABOVE a
+ * genuine dialog must never steal the anchor from the real one below it.
  */
 function parseUnnumbered(lines: string[]): Prompt | null {
-  const footerIdx = lines.findIndex((l) => /Enter to (confirm|select)/.test(l));
+  let footerIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (FOOTER.test(lines[i]!)) { footerIdx = i; break; }
+  }
   if (footerIdx < 1) return null;
   const options: string[] = [];
   let current = -1;
