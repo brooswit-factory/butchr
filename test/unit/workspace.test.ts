@@ -18,6 +18,14 @@ describe("briefFor / modelFor", () => {
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
   });
+  test("reviewer briefs carry the [review] verdict-line instruction", () => {
+    expect(briefFor("Epic")).toContain("[review] APPROVED");
+    expect(briefFor("Story")).toContain("[review] APPROVED");
+  });
+  test("author briefs carry the two-signal reviewDecision+headRefOid check", () => {
+    expect(briefFor("Story")).toContain("reviewDecision,headRefOid");
+    expect(briefFor("Task")).toContain("reviewDecision,headRefOid");
+  });
 });
 describe("interpolate", () => {
   test("fills key, summary, type, parent; parent-less says so", () => {
