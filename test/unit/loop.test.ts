@@ -1025,6 +1025,128 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
   });
 });
 
+describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (regression)", () => {
+  // Same fixtures as the KAN-828 suite above.
+  const withLabels = (labels: string[], updated: string): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const relK = (labels: string[], updated: string) => [{ issue: withLabels(labels, updated), watchers: ["W"] }];
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("(f) THE BUG: an agent's own comment (agent-writer arm, no label change) leaves the cursor stale, so the VERY NEXT daemon label flip with no new comment wrongly wakes K's own agent AND its watcher W", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    let commentCalls = 0;
+    let pollIndex = 0;
+    // What deps.comments(K) would genuinely return if queried during poll
+    // `pollIndex` — independent of how many times (0 or 1) our code under
+    // test actually calls it that poll, so this fixture is valid whether or
+    // not the fix is applied yet.
+    const commentsByPoll: Record<number, JiraComment[]> = {
+      1: [comment("c1")],               // idx1: K appears — baseline seed sees "c1"
+      2: [comment("c2"), comment("c1")], // idx2: the agent's OWN comment "c2" just landed
+      3: [comment("c2"), comment("c1")], // idx3: unchanged since idx2 — no genuinely new comment
+    };
+    const comments = async () => { commentCalls++; return commentsByPoll[pollIndex] ?? [comment("c1")]; };
+    const polls: JiraIssue[][] = [
+      [],                                        // idx0: silent baseline
+      [withLabels(["agent:working"], "t1")],     // idx1: K appears
+      [withLabels(["agent:working"], "t2")],     // idx2 (poll N): agent's own comment — NO label change
+      [withLabels(["agent:idle"], "t3")],        // idx3 (poll N+1): daemon flips the label, no new comment since idx2
+    ];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:working"], "t2"), relK(["agent:idle"], "t3")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n, polls.length - 1); return polls[pollIndex]!; },
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      // idx2 ("t2"): the AGENT-writer arm — writer is K itself, so only K's
+      // own site is suppressed by the ledger; a watcher (W) is NOT this
+      // writer, exactly as own-writes.ts would report it.
+      // idx3 ("t3"): a DAEMON_WRITER label flip — suppressed for every site
+      // pending the comment-cursor check.
+      suppress: (key, updated, watcher) => {
+        if (key !== "K") return false;
+        if (updated === "t2") return watcher === "K";
+        if (updated === "t3") return true;
+        return false;
+      },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    // idx1: appear, delivered to both (unconditional). idx2: K's own agent is
+    // suppressed (agent-writer arm); W is NOT suppressed by the ledger (it
+    // isn't the writer) and isDaemonLabelOnlyDiff is false (no label changed
+    // at all here), so W hears the agent's own comment too — that's the
+    // existing, correct "boss still hears it" behaviour, unrelated to this
+    // bug. idx3: a pure daemon label flip with NO genuinely new comment since
+    // idx2 — this MUST be zero further wakes for both K and W. Before the
+    // fix, the cursor is still stuck at idx1's "c1" (the agent-writer arm at
+    // idx2 never advanced it), so idx3 sees "c2" != "c1" and WRONGLY
+    // delivers to both — the exact self-notify-storm shape from the ticket.
+    expect(kEvents.length).toBe(1); // idx1 appear only — idx3 must NOT wake K about its own already-suppressed comment
+    expect(wEvents.length).toBe(2); // idx1 appear + idx2's genuine (unrelated) deliver — idx3 must NOT add a third
+  });
+
+  test("(g) WATCHER + FOREIGN COMMENT IN WINDOW: a foreign comment folded into the SAME read-back window as the agent's own write still reaches watcher W (via crossDaemon, cursor-independent); K's own agent stays suppressed either way (stated residual); the cursor still advances to the TRUE newest id, not just the agent's own", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string }> = [];
+    let pollIndex = 0;
+    const commentsByPoll: Record<number, JiraComment[]> = {
+      1: [comment("c1")],
+      // idx2: BOTH the agent's own comment "c2" AND a foreign comment "f1"
+      // landed in the same read-back window — "f1" is the true newest.
+      2: [comment("f1"), comment("c2"), comment("c1")],
+      // idx3: nothing new since idx2 (still "f1" newest) — a correct cursor
+      // must recognize this as "no new comment", not just compare against
+      // the agent's own "c2".
+      3: [comment("f1"), comment("c2"), comment("c1")],
+    };
+    const comments = async () => commentsByPoll[pollIndex] ?? [comment("c1")];
+    const polls: JiraIssue[][] = [
+      [],
+      [withLabels(["agent:working"], "t1")],
+      [withLabels(["agent:working"], "t2")],
+      [withLabels(["agent:idle"], "t3")],
+    ];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:working"], "t2"), relK(["agent:idle"], "t3")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n, polls.length - 1); return polls[pollIndex]!; },
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about) => { notified.push({ issue, about }); },
+      suppress: (key, updated, watcher) => {
+        if (key !== "K") return false;
+        if (updated === "t2") return watcher === "K";
+        if (updated === "t3") return true;
+        return false;
+      },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    // K's own agent: idx1 appear only. idx2's agent-writer arm ALWAYS
+    // suppresses (regardless of what landed in the window) — K never learns
+    // about the foreign comment "f1" either. Stated residual: this is the
+    // one case the agent-writer arm cannot recover — known and accepted, not
+    // this ticket's regression to fix (see the ledger-hit comment block).
+    expect(kEvents.length).toBe(1);
+    // W: idx1 appear + idx2 delivered via crossDaemonSuppressed (a pure
+    // comment diff is never daemon-label-only, so W hears it independent of
+    // any cursor state) + idx3 must NOT add a third, because the cursor
+    // correctly advanced to the TRUE newest ("f1"), not "c2".
+    expect(wEvents.length).toBe(2);
+  });
+});
+
 describe("startLoop respawn wiring", () => {
   test("deps.onRespawn is invoked through reconcileNow when a stale agent is found", async () => {
     const herd = fakeHerd(["A"], [{ issue: "A", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }]);
