@@ -9,9 +9,13 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
-## [0.9.1] - 2026-08-28
+## [0.9.2] - 2026-08-29
 ### Fixed
-- **`bun run check` no longer depends on the pane's `node`.** `typecheck` ran `tsc` through a package.json bare-script invocation, which resolves `node_modules/.bin/tsc`'s shebang against whatever `node` the pane's PATH happens to give — on panes where that resolves to node v12, tsc's own `??` syntax fails to parse (`SyntaxError: Unexpected token '?'`) even though the code being checked is fine. `typecheck` now runs `bun --bun x tsc -p tsconfig.json --noEmit`, which forces the bun runtime instead of honoring the shebang. `check` also now prints a one-line `scripts/preflight.ts` diagnostic (bun/node/tsc versions in use) before the gate runs, so a pasted gate result is self-describing; it degrades to `node: not found` rather than failing when `node` is absent, and never fails the gate on its own.
+- **`bun run check` no longer depends on the pane's `node`.** `typecheck` ran `tsc` through a package.json bare-script invocation, which resolves `node_modules/.bin/tsc`'s shebang against whatever `node` the pane's PATH happens to give — on panes where that resolves to node v12, tsc's own `??` syntax fails to parse (`SyntaxError: Unexpected token '?'`) even though the code being checked is fine. `typecheck` now runs `bun --bun x tsc -p tsconfig.json --noEmit`, which forces the bun runtime instead of honoring the shebang. `check` also now prints a one-line `scripts/preflight.ts` diagnostic (bun/node/tsc versions in use) before the gate runs, so a pasted gate result is self-describing; it degrades to `node: not found` rather than failing when `node` is absent, and never fails the gate on its own. The diagnostic is emitted only when the script is run directly (`import.meta.main`), so importing it — as the generated load test does — stays side-effect-free.
+
+## [0.9.1] - 2026-08-29
+### Fixed
+- **Label writes never silently 403 anymore.** `updateLabels` PUTs `notifyUsers=false` so board label sync doesn't spam watchers — but Jira Cloud 403s the WHOLE write for any account lacking Administer Jira/Projects on the ticket's project, and nothing said so. The daemon now preflights `ADMINISTER_PROJECTS`/`ADMINISTER` per project on first sight (cached for the run) and logs the verdict once, naming the account, project, and remedy. An account lacking the role now gets quiet label sync gracefully degraded to notifying writes (watchers get a Jira notification per label change, but labels always land) instead of every write failing. If a write still 403s at runtime, that project flips to notifying writes for the rest of the run and the write is retried so labels land — logged once, never a per-poll spin. README documents the Administrator-project-role requirement.
 
 ## [0.9.0] - 2026-08-28
 ### Added
