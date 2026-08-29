@@ -235,7 +235,7 @@ export function atlassianTools(
           label = truncAccountId(assignee);
         }
         audit(c, `assign ${key} → ${label}`);
-        return ops.assign(key, accountId).then((r) => orOk(r, { ok: true, key, assignee: accountId }));
+        return ops.assign(key, accountId).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, assignee: accountId }); });
       },
     },
     confluence_create_page: {

@@ -102,6 +102,7 @@ describe("onWrite hook (own-write ledger feed)", () => {
       getIssue: async () => ({}), search: async () => ({}), addComment: async () => ({ ok: true }),
       linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
       createIssue: async (p) => ({ key: `KAN-${p.summary.length}` }), setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
       createPage: async () => ({}), getPage: async () => ({}), listSpaces: async () => ({}),
     };
     const writes: Array<[string[], string]> = [];
@@ -110,12 +111,13 @@ describe("onWrite hook (own-write ledger feed)", () => {
     return { tools, writes, conn };
   }
 
-  test("jira_add_comment/jira_transition/jira_set_priority fire onWrite with the single key", async () => {
+  test("jira_add_comment/jira_transition/jira_set_priority/jira_assign fire onWrite with the single key", async () => {
     const { tools, writes, conn } = rigWithOnWrite();
     await tools.jira_add_comment!.handler({ key: "KAN-1", text: "hi" }, conn);
     await tools.jira_transition!.handler({ key: "KAN-2", status: "In Review" }, conn);
     await tools.jira_set_priority!.handler({ key: "KAN-3", priority: "High" }, conn);
-    expect(writes).toEqual([[["KAN-1"], "KAN-7"], [["KAN-2"], "KAN-7"], [["KAN-3"], "KAN-7"]]);
+    await tools.jira_assign!.handler({ key: "KAN-4", assignee: "acct-x" }, conn);
+    expect(writes).toEqual([[["KAN-1"], "KAN-7"], [["KAN-2"], "KAN-7"], [["KAN-3"], "KAN-7"], [["KAN-4"], "KAN-7"]]);
   });
 
   test("jira_link_issues fires onWrite with BOTH ends", async () => {
