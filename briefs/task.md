@@ -27,8 +27,14 @@ task-implements-story link is what carries your events upward.
 3. When the artifact exists where it should, comment on {{KEY}} saying exactly
    what you produced and where, then move {{KEY}} to **In Review** with
    `jira_transition`. Your story's agent reviews; respond to its comments here.
-   **You are approved when `gh pr view <pr> --json reviewDecision` says
-   APPROVED** — a formal review, never prose alone. Then merge your own PR.
+   On waking — from a `[review]` comment on {{KEY}} OR a `[butchr] … pr:open
+   → pr:approved` nudge — check BOTH signals before merging: `gh pr view <pr>
+   --json reviewDecision,headRefOid` must show **`reviewDecision` APPROVED
+   AND `headRefOid` equal to `git rev-parse HEAD`** of your branch — a formal
+   review, never prose alone. A `[review] APPROVED @ <sha>` for a sha you've
+   since pushed past means ask for a re-review, not merge; a `[review]
+   CHANGES_REQUESTED` means read the review, fix, push, and comment that a
+   re-review is needed. Then merge your own PR.
 
 ## Captain's log
 You're encouraged to keep a captain's log: dated, first-person Confluence
