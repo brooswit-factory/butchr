@@ -204,6 +204,40 @@ export function atlassianTools(
         return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, priority }); });
       },
     },
+    // ASSIGNEE RULE: a role name ("story"/"task", case-insensitive) resolves
+    // through `roles`; anything else is passed through as a raw accountId.
+    // These two cases are not cleanly separable by shape alone — any string
+    // that isn't a known role name could equally be an accountId — so rather
+    // than invent a fragile "looks like an accountId" regex, we only refuse
+    // the case that actually indicates caller error: a role name whose
+    // accountId is UNSET on this daemon. An accountId that's simply wrong
+    // fails at Jira, same as it always has.
+    jira_assign: {
+      description:
+        'Assign an EXISTING Jira issue — for a boss adopting or re-staffing a ticket someone else already filed; never call this on your own ticket (your assignee is your boss\'s call). `assignee` is either an Atlassian accountId or a role name ("story"/"task", case-insensitive) resolved through this daemon\'s role→accountId mapping; a role whose accountId is unset on this daemon REFUSES, naming the env var. Writes only the assignee field — nothing else about the issue changes.',
+      input: { key: z.string(), assignee: z.string() },
+      handler: async (a, c) => {
+        const { key, assignee } = a as { key: string; assignee: string };
+        const role = assignee.trim().toLowerCase();
+        let accountId: string;
+        let label: string;
+        if (role === "story" || role === "task") {
+          const resolved = role === "story" ? roles.story : roles.task;
+          if (!resolved) {
+            const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
+            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset)`);
+            throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
+          }
+          accountId = resolved;
+          label = role;
+        } else {
+          accountId = assignee;
+          label = truncAccountId(assignee);
+        }
+        audit(c, `assign ${key} → ${label}`);
+        return ops.assign(key, accountId).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, assignee: accountId }); });
+      },
+    },
     confluence_create_page: {
       description: "Create a Confluence page (storage/XHTML body) in a space.",
       input: { spaceId: z.string(), title: z.string(), body: z.string() },
