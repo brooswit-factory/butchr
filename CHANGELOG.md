@@ -9,6 +9,10 @@ CI refuses a merge that changes `src/` or `package.json` without a new entry her
 - **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
 - **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
 
+## [0.6.0] - 2026-08-28
+### Added
+- **Priority flows down the command chain.** `jira_create_issue` gains an optional `priority` (a Jira priority name, passed through verbatim — omitted, Jira's site default applies) so a boss sets a child's priority at filing, and a new `jira_set_priority` tool lets a boss re-prioritize its children as reality shifts. Priority is command metadata, not staffing: no daemon behavior reads it, only assignee + status do. `briefs/epic.md` and `briefs/story.md` now carry the duty to set and maintain their children's priority (and never their own); `briefs/task.md` notes a task's priority is set by its story.
+
 ## [0.5.17] - 2026-08-28
 ### Fixed
 - **The fullscreen-renderer offer is auto-answered "Not now".** It stranded stories at the composer, and after the v0.5.16 rate cap engaged, new dialogs on capped panes were log-only — so parents were never told (the cap's blind spot; two stories sat stranded). The offer is a non-work UI opt-in with an established fleet answer, so it now belongs to the auto-answerer and never reaches escalation at all.

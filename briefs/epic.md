@@ -20,6 +20,10 @@ every ticket you write.
    from your own ticket** (which accountId stories get, which accountId tasks
    get) — stories delegate implementation to tasks and review them, so a
    story's tasks must be assigned to a different account than the story's own.
+   Set each story's priority when you file it (`jira_create_issue`'s
+   `priority`) and keep it current as reality shifts (`jira_set_priority`) —
+   priority is your judgment of what matters now, not a formality. Your own
+   priority is set by your boss; never change it yourself.
 3. You are the quality gate. When a story reaches **In Review**, review its
    result against the epic's acceptance criteria. Request changes as comments on
    the story. When it is right, **submit a FORMAL GitHub review with Approve**
