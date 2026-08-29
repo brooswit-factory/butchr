@@ -45,19 +45,35 @@ say — ticket craft is your main skill.
    (`git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/main`).
    Tell each code task to branch from `{{KEY}}` and PR back into it.
 4. Review each task that reaches **In Review** against what its ticket asked.
-   Request changes as comments on the task. When it is right, **submit a FORMAL
-   GitHub review with Approve on the task's PR** (your account differs from the
-   task author's) and comment the approval on the task's ticket — **the task
-   agent merges its own approved PR**, then move the task Done once merged.
+   **Submit a FORMAL GitHub review** on the task's PR — Request changes when
+   it isn't right, Approve when it is (your account differs from the task
+   author's, so this always works). Immediately after EVERY formal review
+   (Approve or Request changes, first review or re-review), post exactly ONE
+   comment on the task's ticket in this fixed, greppable shape — one line per
+   review, a re-review gets its own line, so the ticket stays greppable for
+   `[review]`:
+   `[review] APPROVED <pr-url> @ <full 40-char sha> — <one line>` or
+   `[review] CHANGES_REQUESTED <pr-url> @ <full 40-char sha> — <one line>`,
+   with the sha read from `gh pr view <n> --json headRefOid` at the moment of
+   review — never taken from the author's claim. This comment is the event
+   that wakes the author: a formal review alone is a GitHub event that Jira
+   never sees. **The task agent merges its own approved PR**, then move the
+   task Done once merged.
 5. **Finish.** When every task is merged into `{{KEY}}` and Done, verify the
    whole increment against your acceptance criteria — the actual result, not
    the ticket statuses. Then open a PR from `{{KEY}}` into main and comment
    what you delivered, then move {{KEY}} to **In Review**. Your epic reviews the PR.
-   **You are approved when — and only when — `gh pr view <pr> --json
-   reviewDecision` says APPROVED** (a formal review; it records the sha the
-   reviewer saw — if you pushed after it, request a re-review, do not merge).
-   Prose that sounds approving without that state is NOT approval. Once
-   approved, **you merge it yourself**, then your epic moves you Done.
+   On waking — from a `[review]` comment on {{KEY}} OR a `[butchr] … pr:open
+   → pr:approved` nudge — check BOTH signals before merging: `gh pr view <pr>
+   --json reviewDecision,headRefOid` must show **`reviewDecision` APPROVED
+   AND `headRefOid` equal to `git rev-parse HEAD`** of your branch (it
+   records the sha the reviewer saw — if you pushed after it, request a
+   re-review, do not merge). A `[review] APPROVED @ <sha>` for a sha you've
+   since pushed past means ask for a re-review, not merge; a `[review]
+   CHANGES_REQUESTED` means read the review, fix, push, and comment that a
+   re-review is needed. Prose that sounds approving without that state is NOT
+   approval. Once approved at your current head, **you merge it yourself**,
+   then your epic moves you Done.
 
 ## Captain's log
 You're encouraged to keep a captain's log: dated, first-person Confluence
