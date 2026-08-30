@@ -8,6 +8,7 @@ export function terminalCommand(prefix: readonly string[], target: string): stri
   return [...prefix, "herdr", "agent", "attach", target];
 }
 
+// BUTCHR-9 collision-test demo (minor): throwaway comment, reverted before this task closes.
 /** Known emulators, most-preferred first, with the flag that means "run this command". */
 export const KNOWN_TERMINALS: ReadonlyArray<readonly [string, string[]]> = [
   ["gnome-terminal", ["gnome-terminal", "--"]],
