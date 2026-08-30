@@ -58,6 +58,18 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
     expect(failing({ newFragments: [frag("x.md", "### Fixed\n- x\n")] })[0]).toMatch(/no valid "bump: major\|minor\|patch"/);
   });
 
+  test("a fragment with a valid bump but no bullets under any known section fails", () => {
+    const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n")] });
+    expect(reasons.some((r) => /x\.md has no bullets under a known section/.test(r) && /BREAKING\/Added\/Changed\/Fixed\/Removed/.test(r))).toBe(true);
+  });
+  test("a fragment with a valid bump but a bullet under an UNRECOGNIZED section still fails (not a known section)", () => {
+    const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Notes\n- unrelated\n")] });
+    expect(reasons.some((r) => /x\.md has no bullets under a known section/.test(r))).toBe(true);
+  });
+  test("a fragment with a valid bump and at least one bullet passes the content check", () => {
+    expect(evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a fix\n")] }).ok).toBe(true);
+  });
+
   test("schema drift requires fragments to declare at least minor", () => {
     expect(failing({ schemaChanged: true })[0]).toMatch(/at least a MINOR bump/); // base fragment declares patch
     expect(evaluate({ ...base, schemaChanged: true, newFragments: [frag("x.md", "bump: minor\n### Added\n- a\n")] }).ok).toBe(true);

@@ -30,7 +30,7 @@ export function parseChangelog(md: string): Entry[] {
   return entries;
 }
 
-export const hasContent = (e: Entry) => Object.values(e.sections).some((b) => b && b.length > 0);
+export const hasContent = (e: { sections: Partial<Record<Section, string[]>> }) => Object.values(e.sections).some((b) => b && b.length > 0);
 
 /** Build a `## [x.y.z] - YYYY-MM-DD` block collating bullets from several sources (fragments), by section, in SECTIONS order. */
 export function collateEntry(version: string, date: string, sources: { sections: Partial<Record<Section, string[]>> }[]): string {

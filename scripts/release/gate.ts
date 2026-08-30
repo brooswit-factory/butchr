@@ -1,5 +1,5 @@
 import { compare, parse, type Bump } from "./semver.js";
-import { parseChangelog } from "./changelog.js";
+import { hasContent, parseChangelog, SECTIONS } from "./changelog.js";
 import { hasBreaking, highestBump, type Fragment } from "./fragments.js";
 
 export interface Facts {
@@ -67,11 +67,14 @@ export function evaluate(f: Facts): GateResult {
     ? `${f.newFragments.length} new changelog.d/ fragment(s): ${f.newFragments.map((x) => x.path).join(", ")}`
     : `gated files changed but no changelog.d/ fragment was added — create changelog.d/<TICKET>.md starting with "bump: major|minor|patch" on its own line, followed by "### Added"/"### Fixed"/etc. bullets (see changelog.d/README.md)`);
 
-  // 5. per-fragment: a valid declared level, and BREAKING <=> major.
+  // 5. per-fragment: a valid declared level, at least one bullet, and BREAKING <=> major.
   for (const frag of f.newFragments) {
     v(frag.bump !== null, frag.bump !== null
       ? `${frag.path} declares bump: ${frag.bump}`
       : `${frag.path} has no valid "bump: major|minor|patch" line`);
+    v(hasContent(frag), hasContent(frag)
+      ? `${frag.path} has at least one bullet`
+      : `${frag.path} has no bullets under a known section (${SECTIONS.join("/")}) — add at least one describing the change`);
     if (!frag.bump) continue;
     const breaking = hasBreaking(frag);
     if (breaking && frag.bump !== "major") v(false, `${frag.path} has a ### BREAKING section but declares "bump: ${frag.bump}" — BREAKING content requires "bump: major"`);

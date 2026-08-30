@@ -40,6 +40,37 @@ describe("computeRelease", () => {
   });
 
   test("a fragment with no valid declared bump fails loudly instead of silently skipping it", () => {
-    expect(() => computeRelease("0.1.0", [frag("x.md", "### Fixed\n- x\n")], null, "2026-08-30")).toThrow(/no fragment.*valid|none declares/i);
+    expect(() => computeRelease("0.1.0", [frag("x.md", "### Fixed\n- x\n")], null, "2026-08-30")).toThrow(/no valid "bump/);
+  });
+
+  test("the DANGEROUS case: one valid fragment alongside one with an unparseable bump line still throws — it must not silently drop the bad one while collating its bullets", () => {
+    // BUMP_RE is case-sensitive: "Major" (capitalized) never matches — this is exactly the shape
+    // a modified-not-added fragment could carry, since the PR gate only validates ADDED fragments.
+    const fragments = [
+      frag("changelog.d/A.md", "bump: patch\n### Fixed\n- a small fix\n"),
+      frag("changelog.d/B.md", "bump: Major\n### BREAKING\n- the daemon API is restructured\n"),
+    ];
+    expect(() => computeRelease("0.1.0", fragments, null, "2026-08-30")).toThrow(/B\.md/);
+  });
+
+  test("BREAKING content that disagrees with its declared bump throws at merge time too, not just at the gate", () => {
+    // A fragment could reach main with this mismatch via a PR that only MODIFIED an
+    // already-present fragment (never validated — the gate only checks ADDED fragments) or,
+    // since main has no branch protection, a direct push.
+    const breakingButMinor = [frag("x.md", "bump: minor\n### BREAKING\n- surprise breakage\n")];
+    expect(() => computeRelease("0.1.0", breakingButMinor, null, "2026-08-30")).toThrow(/BREAKING.*disagree|x\.md/);
+
+    const majorButNoBreaking = [frag("x.md", "bump: major\n### Added\n- just a feature\n")];
+    expect(() => computeRelease("0.1.0", majorButNoBreaking, null, "2026-08-30")).toThrow(/BREAKING.*disagree|x\.md/);
+  });
+
+  test("a valid, correctly-declared BREAKING fragment alongside other valid fragments still computes normally", () => {
+    const fragments = [
+      frag("changelog.d/A.md", "bump: patch\n### Fixed\n- a fix\n"),
+      frag("changelog.d/B.md", "bump: major\n### BREAKING\n- the real deal\n"),
+    ];
+    const r = computeRelease("0.1.0", fragments, null, "2026-08-30")!;
+    expect(r.version).toBe("1.0.0");
+    expect(r.changelogEntry).toContain("### BREAKING\n- the real deal");
   });
 });
