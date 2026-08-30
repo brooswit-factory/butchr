@@ -1,39 +1,87 @@
 import { describe, expect, test } from "bun:test";
 import { evaluate, type Facts } from "../../scripts/release/gate.js";
+import { parseFragment, type Fragment } from "../../scripts/release/fragments.js";
 
-const log = (v: string, body = "### Fixed\n- x") => `# Changelog\n## [${v}] - 2026-08-24\n${body}\n## [0.1.0] - 2026-08-23\n### Added\n- first\n`;
-const base: Facts = { version: "0.1.1", baseVersion: "0.1.0", registryLatest: "0.1.0", changedFiles: ["src/a.ts"], changelog: log("0.1.1"), baseChangelog: log("0.1.0").replace(/## \[0\.1\.1\][\s\S]*?(?=## \[0\.1\.0\])/, ""), schemaChanged: false, today: "2026-08-24" };
+const frag = (path: string, body: string): Fragment => parseFragment(path, body);
+const log = (versions: string[] = ["0.1.0"]) => "# Changelog\n" + versions.map((v) => `## [${v}] - 2026-08-24\n### Fixed\n- x\n`).join("");
+
+const base: Facts = {
+  version: "0.1.0",
+  baseVersion: "0.1.0",
+  changedFiles: ["src/a.ts"],
+  changelog: log(),
+  baseChangelog: log(),
+  schemaChanged: false,
+  newFragments: [frag("changelog.d/X.md", "bump: patch\n### Fixed\n- a bug\n")],
+  today: "2026-08-24",
+};
 const failing = (f: Partial<Facts>) => evaluate({ ...base, ...f }).verdicts.filter((v) => !v.ok).map((v) => v.reason);
 
-describe("release gate", () => {
-  test("happy path: patch with a new changelog entry passes", () => { const r = evaluate(base); expect(r.ok, JSON.stringify(r.verdicts)).toBe(true); expect(r.bump).toBe("patch"); });
-  test("docs-only PR is exempt and must NOT bump", () => {
-    expect(evaluate({ ...base, changedFiles: ["README.md"], version: "0.1.0" }).ok).toBe(true);
-    expect(failing({ changedFiles: ["README.md"] })[0]).toMatch(/bump only with a real change/);
+describe("release gate (version at merge, changelog.d fragments)", () => {
+  test("happy path: gated change, unchanged version, one fragment, no new heading — passes", () => {
+    const r = evaluate(base);
+    expect(r.ok, JSON.stringify(r.verdicts)).toBe(true);
+    expect(r.bump).toBe("patch");
   });
-  test("gated change with no bump fails", () => { expect(failing({ version: "0.1.0" })[0]).toMatch(/bump it/); });
-  test("not greater than registry fails", () => { expect(failing({ registryLatest: "0.1.1" })[0]).toMatch(/not greater than published/); });
-  test("skipping a step fails", () => { expect(failing({ version: "0.3.0", changelog: log("0.3.0") })[0]).toMatch(/single-step/); });
-  test("schema drift on a patch fails; on a minor passes", () => {
-    expect(failing({ schemaChanged: true })[0]).toMatch(/at least a MINOR/);
-    expect(evaluate({ ...base, schemaChanged: true, version: "0.2.0", changelog: log("0.2.0") }).ok).toBe(true);
+
+  test("docs-only PR is exempt and must NOT bump the version", () => {
+    expect(evaluate({ ...base, changedFiles: ["README.md"], newFragments: [] }).ok).toBe(true);
+    expect(failing({ changedFiles: ["README.md"], version: "0.2.0", newFragments: [] })[0]).toMatch(/version is assigned at MERGE time, not on a branch/);
   });
-  test("missing / stale / empty / future-dated changelog entries fail", () => {
-    expect(failing({ changelog: log("0.1.0") })[0]).toMatch(/no "## \[0\.1\.1\]/);
-    expect(failing({ baseChangelog: log("0.1.1") })[0]).toMatch(/already existed on main/);
-    expect(failing({ changelog: log("0.1.1", "### Fixed\n") })[0]).toMatch(/no bullets/);
-    expect(failing({ changelog: log("0.1.1").replace("2026-08-24\n### Fixed", "2027-01-01\n### Fixed") })[0]).toMatch(/in the future/);
+
+  test("gated change with no fragment fails, naming exactly what to add", () => {
+    const reasons = failing({ newFragments: [] });
+    expect(reasons.some((r) => /no changelog\.d\/ fragment was added/.test(r) && /changelog\.d\/<TICKET>\.md/.test(r) && /bump: major\|minor\|patch/.test(r))).toBe(true);
   });
-  test("major needs BREAKING; non-major must not have it", () => {
-    expect(failing({ baseVersion: "0.9.0", version: "1.0.0", changelog: log("1.0.0") })[0]).toMatch(/requires a non-empty ### BREAKING/);
-    expect(evaluate({ ...base, baseVersion: "0.9.0", version: "1.0.0", changelog: log("1.0.0", "### BREAKING\n- all new") }).ok).toBe(true);
-    expect(failing({ changelog: log("0.1.1", "### BREAKING\n- oops") })[0]).toMatch(/it is a MAJOR/);
+
+  test("a branch that bumps package.json's version fails, telling the author to remove it", () => {
+    const reasons = failing({ version: "0.1.1" });
+    expect(reasons.some((r) => /remove the bump/.test(r) && /assigned at MERGE time/.test(r))).toBe(true);
   });
+
+  test("a branch that adds a dated CHANGELOG heading fails", () => {
+    const reasons = failing({ changelog: log(["0.2.0", "0.1.0"]) });
+    expect(reasons.some((r) => /new "## \[0\.2\.0\] - 2026-08-24" heading/.test(r) && /release workflow writes/.test(r))).toBe(true);
+  });
+
+  test("BREAKING content without bump: major fails; bump: major without BREAKING content fails", () => {
+    expect(failing({ newFragments: [frag("x.md", "bump: minor\n### BREAKING\n- oops\n")] })[0]).toMatch(/requires "bump: major"/);
+    expect(failing({ newFragments: [frag("x.md", "bump: major\n### Added\n- new thing\n")] })[0]).toMatch(/no ### BREAKING section/);
+  });
+  test("BREAKING content WITH bump: major passes that check", () => {
+    const r = evaluate({ ...base, newFragments: [frag("x.md", "bump: major\n### BREAKING\n- all new\n")] });
+    expect(r.ok, JSON.stringify(r.verdicts)).toBe(true);
+    expect(r.bump).toBe("major");
+  });
+
+  test("a fragment with no valid bump line fails, in isolation from the BREAKING checks", () => {
+    expect(failing({ newFragments: [frag("x.md", "### Fixed\n- x\n")] })[0]).toMatch(/no valid "bump: major\|minor\|patch"/);
+  });
+
+  test("schema drift requires fragments to declare at least minor", () => {
+    expect(failing({ schemaChanged: true })[0]).toMatch(/at least a MINOR bump/); // base fragment declares patch
+    expect(evaluate({ ...base, schemaChanged: true, newFragments: [frag("x.md", "bump: minor\n### Added\n- a\n")] }).ok).toBe(true);
+    expect(evaluate({ ...base, schemaChanged: true, newFragments: [frag("x.md", "bump: major\n### BREAKING\n- a\n")] }).ok).toBe(true);
+  });
+  test("schema drift with multiple fragments: only the HIGHEST needs to clear minor", () => {
+    const r = evaluate({ ...base, schemaChanged: true, newFragments: [frag("a.md", "bump: patch\n### Fixed\n- x\n"), frag("b.md", "bump: minor\n### Added\n- y\n")] });
+    expect(r.ok, JSON.stringify(r.verdicts)).toBe(true);
+  });
+
+  test("multiple fragments in one PR are all individually validated", () => {
+    const reasons = failing({ newFragments: [frag("a.md", "bump: patch\n### Fixed\n- x\n"), frag("b.md", "bump: minor\n### BREAKING\n- y\n")] });
+    expect(reasons.some((r) => /b\.md.*requires "bump: major"/.test(r))).toBe(true);
+  });
+
   test("ungated pass hints when the branch is behind base's tip, and stays silent when it isn't", () => {
-    const behind = evaluate({ ...base, changedFiles: ["README.md"], version: "0.1.0", baseTipVersion: "0.2.0" });
+    const behind = evaluate({ ...base, changedFiles: ["README.md"], newFragments: [], baseTipVersion: "0.2.0" });
     expect(behind.ok).toBe(true);
     expect(behind.verdicts[0]!.reason).toBe("no gated files changed; no release required (branch is behind base 0.2.0 — merge main when convenient)");
-    const current = evaluate({ ...base, changedFiles: ["README.md"], version: "0.1.0", baseTipVersion: "0.1.0" });
+    const current = evaluate({ ...base, changedFiles: ["README.md"], newFragments: [], baseTipVersion: "0.1.0" });
     expect(current.verdicts[0]!.reason).toBe("no gated files changed; no release required");
+  });
+
+  test("no gated files changed still passes even with a fragment present (fragment isn't required, but isn't forbidden either)", () => {
+    expect(evaluate({ ...base, changedFiles: ["README.md"] }).ok).toBe(true);
   });
 });

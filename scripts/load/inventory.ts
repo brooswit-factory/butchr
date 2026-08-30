@@ -20,7 +20,7 @@ export const loadTestPathFor = (file: string) => `test/load/${file.replace(/\.ts
 
 /** Entry-point scripts run on import (they call process.exit / hit the network); they are load-tested as a subprocess with a guard env instead. */
 export const RUNS_ON_IMPORT = new Set([
-  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/publish-needed.ts",
+  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/collate.ts",
   "scripts/release/notes.ts", "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
   "src/daemon/index.ts",
 ]);

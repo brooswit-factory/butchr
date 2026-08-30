@@ -3,8 +3,11 @@ on:
   push:
     branches: [main]
 permissions:
-  contents: write   # tag + GitHub Release
+  contents: write   # version-bump commit + tag + GitHub Release
   id-token: write   # npm trusted publishing (OIDC) + provenance
+concurrency:
+  group: release-main
+  cancel-in-progress: false   # never cancel a merge's release — that would strand its fragment unreleased, silently
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -17,16 +20,39 @@ jobs:
         with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
       - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5
       - run: bun install --frozen-lockfile
-      - id: gate
-        run: bun run scripts/release/publish-needed.ts
-      - if: steps.gate.outputs.needed == 'true'
+      - name: sync onto the current origin/main
+        # cancel-in-progress:false serializes this workflow with itself — a second merge's run
+        # does not even START (checkout included) until this one finishes — but `checkout` pins
+        # github.sha, the exact commit that triggered THIS run, which can already be stale by the
+        # time the job actually executes (runner queueing, or another merge landing during it).
+        # Reset onto whatever origin/main actually is right now so the version we read and the
+        # fragments we collate are never a stale snapshot.
+        run: git fetch origin main && git reset --hard origin/main
+      - id: collate
+        name: collate changelog.d/ fragments into a version
+        run: bun run scripts/release/collate.ts
+      - if: steps.collate.outputs.needed == 'true'
         run: bun run check && bun run build
-      - if: steps.gate.outputs.needed == 'true'
+      - if: steps.collate.outputs.needed == 'true'
         name: publish to npm (OIDC, provenance)
         run: npm publish --provenance --access public
-      - if: steps.gate.outputs.needed == 'true'
+      - if: steps.collate.outputs.needed == 'true'
+        name: commit + push the version bump (published to npm above; recording it here can't double-publish if it needs a retry)
+        env: { V: "${{ steps.collate.outputs.version }}" }
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json CHANGELOG.md changelog.d
+          git commit -m "release: v$V"
+          for i in 1 2 3; do
+            git push origin HEAD:main && break
+            if [ "$i" = 3 ]; then echo "::error::could not push the v$V release commit to main after 3 attempts — v$V IS published to npm; reconcile package.json/CHANGELOG.md on main by hand" && exit 1; fi
+            git fetch origin main
+            git rebase origin/main   # fragment deletions + our two file edits vs. someone else's unrelated commit: no textual overlap expected — fail rather than force past a real conflict
+          done
+      - if: steps.collate.outputs.needed == 'true'
         name: tag + GitHub Release with the changelog entry
-        env: { GH_TOKEN: "${{ github.token }}", V: "${{ steps.gate.outputs.version }}" }
+        env: { GH_TOKEN: "${{ github.token }}", V: "${{ steps.collate.outputs.version }}" }
         run: |
           bun run scripts/release/notes.ts "$V"
           git tag "v$V" && git push origin "v$V"
