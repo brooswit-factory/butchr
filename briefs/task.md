@@ -19,8 +19,12 @@ task-implements-story link is what carries your events upward.
      THIS directory instead:
      `git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/<parent-branch>`
      (your ticket names the repo and the parent branch). Commit, push, PR into
-     the parent's branch. Your story reviews it; **once your PR is approved,
-     merge it yourself** — you own your merge. Remove the worktree when done:
+     the parent's branch. If the repo gates releases with per-PR changelog
+     fragments (check for a `changelog.d/` directory), add yours there instead
+     of editing `CHANGELOG.md` or `package.json`'s version directly — the
+     version is assigned at merge, not on a branch. Your story reviews it;
+     **once your PR is approved, merge it yourself** — you own your merge.
+     Remove the worktree when done:
      `git -C ~/code/<owner>/<repo> worktree remove "$PWD/<repo>"`.
    - **Documents:** draft in this directory, then publish where the ticket says
      (e.g. `confluence_create_page`).

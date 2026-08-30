@@ -21,3 +21,10 @@ export function bumpKind(from: Semver, to: Semver): Bump | null {
   if (to.major === from.major && to.minor === from.minor && to.patch === from.patch + 1) return "patch";
   return null;
 }
+
+/** The inverse of `bumpKind`: apply a single-step bump, one component +1, lower ones reset. */
+export function bumpVersion(from: Semver, kind: Bump): Semver {
+  if (kind === "major") return { major: from.major + 1, minor: 0, patch: 0 };
+  if (kind === "minor") return { major: from.major, minor: from.minor + 1, patch: 0 };
+  return { major: from.major, minor: from.minor, patch: from.patch + 1 };
+}
