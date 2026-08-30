@@ -288,10 +288,19 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     expect(failures[0]).toContain("disk full");
   });
 
-  test("(f) eviction once CAPTURE_MAX_FILES is reached, removing the oldest name first", async () => {
-    const existing = Array.from({ length: CAPTURE_MAX_FILES }, (_, i) => `KAN-0-unrecognised-2026010${String(i).padStart(2, "0")}T000000Z.txt`);
-    const { sink, files } = fakeSink(existing);
-    expect(files.size).toBe(CAPTURE_MAX_FILES);
+  test("(f) eviction removes the globally OLDEST capture by timestamp — not the lexicographically-first filename — and never touches a foreign file sharing the directory", async () => {
+    // Deliberately anti-correlated with alphabetical order (review on
+    // BUTCHR-12): AAAA-1's issue key sorts before ZZZZ-9's, but AAAA-1's
+    // captures are the NEWEST (Aug 2026) and ZZZZ-9's are the OLDEST (Jan
+    // 2026), spanning both trigger classes. A plain lexicographic sort of
+    // the whole filename would evict AAAA-1 entries first — the newest
+    // evidence — while seven-month-old ZZZZ-9 files survived; sorting by
+    // the parsed timestamp instead gets this right.
+    const aaaa = Array.from({ length: 25 }, (_, i) => `AAAA-1-unrecognised-20260801T${String(i).padStart(2, "0")}0000Z.txt`);
+    const zzzz = Array.from({ length: 25 }, (_, i) => `ZZZZ-9-no-reset-time-20260101T${String(i).padStart(2, "0")}0000Z.txt`);
+    const foreign = "operator-notes.txt"; // not a butchr capture filename: must never be touched, never counted toward the cap
+    const { sink, files } = fakeSink([...aaaa, ...zzzz, foreign]);
+    expect(files.size).toBe(51);
     const stop = watchSessionLimits({
       list: async () => [row("KAN-1", "idle")],
       read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
@@ -302,11 +311,10 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     }, 10);
     await wait(30);
     stop();
-    // The cap holds: the new file landed, and exactly one — the oldest,
-    // lexicographically smallest — was evicted to make room.
-    expect(files.size).toBe(CAPTURE_MAX_FILES);
-    expect(files.has(existing[0]!)).toBe(false);
-    expect(existing.slice(1).every((n) => files.has(n))).toBe(true);
+    expect(files.has(foreign)).toBe(true);
+    expect(aaaa.every((n) => files.has(n))).toBe(true); // newest: none evicted
+    expect(files.has(zzzz[0]!)).toBe(false); // globally oldest: evicted
+    expect(zzzz.slice(1).every((n) => files.has(n))).toBe(true);
     expect([...files.keys()].some((n) => n.startsWith("KAN-1-unrecognised-"))).toBe(true);
   });
 

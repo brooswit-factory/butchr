@@ -64,6 +64,32 @@ function compactUtc(ms: number): string {
 }
 
 /**
+ * Recognises exactly the filenames this module writes
+ * (`<ISSUE>-<trigger>-<compact-UTC-timestamp>.txt`) and captures the
+ * timestamp segment. Two things depend on this, both from review on
+ * BUTCHR-12: eviction must sort by the TIMESTAMP, not the whole filename —
+ * a plain lexicographic sort of the full name orders by issue key first, so
+ * across more than one issue it evicts the newest capture and keeps
+ * seven-month-old ones — and `BUTCHR_CAPTURE_DIR` is operator-settable, so
+ * `list()` can return files butchr never wrote (pointed at a shared
+ * directory); eviction must never delete a file it doesn't recognise as its
+ * own.
+ */
+const CAPTURE_NAME = /^[A-Z][A-Z0-9]*-\d+-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
+
+/** Our own capture files present in the sink, oldest (by timestamp) first; anything we didn't write is excluded. */
+async function ourCapturesOldestFirst(sink: CaptureSink): Promise<{ name: string; ts: string }[]> {
+  const all = await sink.list();
+  const ours: { name: string; ts: string }[] = [];
+  for (const name of all) {
+    const m = CAPTURE_NAME.exec(name);
+    if (m) ours.push({ name, ts: m[1]! });
+  }
+  ours.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  return ours;
+}
+
+/**
  * Per-(issue, trigger class, pane incarnation) dedupe so a pane that stays
  * refused for 90 minutes across hundreds of polls yields ONE file, not
  * hundreds. Deliberately a SEPARATE map from `seen` in watchSessionLimits:
@@ -115,12 +141,15 @@ async function maybeCapture(
     const name = `${row.issue}-${trigger}-${compactUtc(capturedAt.getTime())}.txt`;
 
     // Eviction lives here, in the watcher, not in the store, so it's
-    // exercised through the injected seam with no real fs.
-    let names = (await sink.list()).slice().sort();
-    while (names.length >= CAPTURE_MAX_FILES) {
-      const oldest = names[0]!;
-      await sink.remove(oldest);
-      names = names.slice(1);
+    // exercised through the injected seam with no real fs. Only OUR OWN
+    // capture files count against the cap and are eligible for eviction —
+    // a `BUTCHR_CAPTURE_DIR` pointed at a directory that already holds
+    // something must never have those files deleted out from under it.
+    let ours = await ourCapturesOldestFirst(sink);
+    while (ours.length >= CAPTURE_MAX_FILES) {
+      const oldest = ours[0]!;
+      await sink.remove(oldest.name);
+      ours = ours.slice(1);
     }
     const path = await sink.write(name, header + body);
     deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} ${trigger} — pane text captured to ${path}`);
