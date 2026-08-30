@@ -18,6 +18,7 @@ import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
+import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
@@ -140,6 +141,7 @@ watchSessionLimits({
   close: (issue) => herd.stop(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
+  captures: createCaptureStore(config.captureDir),
 }, 15_000);
 
 // One-time startup sweep: agent:* stranded by a ticket that went inactive
