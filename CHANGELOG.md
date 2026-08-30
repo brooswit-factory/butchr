@@ -2,12 +2,20 @@
 
 All notable changes to butchr. Format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries are `## [x.y.z] - YYYY-MM-DD` with subsections from: `BREAKING`, `Added`, `Changed`, `Fixed`, `Removed`.
-CI refuses a merge that changes `src/` or `package.json` without a new entry here.
+
+**The version is assigned at MERGE, not on a branch.** A PR that changes `src/`,
+`schema/`, or `package.json` adds a fragment at `changelog.d/<TICKET>.md`
+instead of editing this file directly — CI refuses a merge that changes those
+paths without one, and separately refuses a branch that bumps `package.json`
+or adds a dated heading here itself. The release workflow collates every
+fragment present on `main` at merge time, computes the version from their
+declared bump levels, and prepends the dated entry below. See
+`changelog.d/README.md` for the fragment format.
 
 ## Versioning
-- **MAJOR** — a restructuring/rewrite that breaks a lot, requiring reimplementation. Requires a `### BREAKING` section.
-- **MINOR** — a new feature, or a change to an existing feature that breaks just that feature.
-- **PATCH** — a fix or correction needing no consumer code changes, or very minor ones.
+- **MAJOR** — a restructuring/rewrite that breaks a lot, requiring reimplementation. Fragment declares `bump: major`, with a `### BREAKING` section.
+- **MINOR** — a new feature, or a change to an existing feature that breaks just that feature. Fragment declares `bump: minor`.
+- **PATCH** — a fix or correction needing no consumer code changes, or very minor ones. Fragment declares `bump: patch`.
 
 ## [0.15.5] - 2026-08-29
 ### Fixed
