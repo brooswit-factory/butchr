@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import { loadConfig, describeConfig } from "../../src/config/config.js";
+import { workspaceRoot } from "../../src/agents/workspace.js";
 
 const noRead = () => { throw new Error("should not read"); };
 const base = { ATLASSIAN_SITE: "https://x.atlassian.net/", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "tok" };
@@ -70,5 +72,14 @@ describe("loadConfig", () => {
     const none = describeConfig(loadConfig(base, noRead));
     expect(none).toContain("story:unset — Story creation will be refused");
     expect(none).toContain("task:unset — Task creation will be refused");
+  });
+
+  test("captureDir defaults to .captures under the workspace root; BUTCHR_CAPTURE_DIR overrides it", () => {
+    const c = loadConfig(base, noRead);
+    expect(c.captureDir).toBe(join(workspaceRoot(), ".captures"));
+    expect(loadConfig({ ...base, BUTCHR_CAPTURE_DIR: "/tmp/captures" }, noRead).captureDir).toBe("/tmp/captures");
+  });
+  test("describeConfig includes captureDir", () => {
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_CAPTURE_DIR: "/tmp/captures" }, noRead))).toContain("captureDir=/tmp/captures");
   });
 });
