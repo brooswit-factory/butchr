@@ -1,3 +1,6 @@
+import { join } from "node:path";
+import { workspaceRoot } from "../agents/workspace.js";
+
 /**
  * Butchr's configuration, parsed from the environment once at startup.
  *
@@ -35,6 +38,13 @@ export interface Config {
    * create time (see src/tools/defs.ts), not here.
    */
   assignees: { story?: string; task?: string };
+  /**
+   * BUTCHR-12: directory the session-limit watcher's evidence captures land
+   * in. Default `.captures` under the workspace root — dot-prefixed so it
+   * can never collide with a per-issue workspace directory (issue keys are
+   * `[A-Z]+-\d+`, never dot-prefixed).
+   */
+  captureDir: string;
 }
 
 export interface ConfigEnv {
@@ -50,6 +60,7 @@ export interface ConfigEnv {
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
+  BUTCHR_CAPTURE_DIR?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -74,6 +85,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
 
+  const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
+
   return {
     atlassian: { site, email, token },
     port,
@@ -85,6 +98,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
     },
+    captureDir,
   };
 }
 
@@ -105,4 +119,5 @@ export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} ` +
-  `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)}`;
+  `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
+  `captureDir=${c.captureDir}`;

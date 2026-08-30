@@ -2,6 +2,21 @@ import { detectSessionLimitRefusal } from "./session-limit.js";
 
 export interface AgentRow { pane_id: string; agent_status: string; issue: string | null }
 
+/**
+ * BUTCHR-12: a durable place to land the pane text when this module's own
+ * detection is inconclusive — the recogniser might be missing a live
+ * refusal, or it recognised one it can't schedule recovery for. Optional and
+ * injected (not real fs) so unit tests never touch a real filesystem; the
+ * fs-backed implementation lives in capture-store.ts.
+ */
+export interface CaptureSink {
+  /** Write a capture file; resolves to the full path written (for the journal line). */
+  write: (name: string, contents: string) => Promise<string>;
+  /** Existing capture file names in the directory (unordered). */
+  list: () => Promise<string[]>;
+  remove: (name: string) => Promise<void>;
+}
+
 export interface SessionLimitWatchDeps {
   /** Every currently running butchr agent, with its herdr status and resolved issue key (null for a foreign pane). */
   list: () => Promise<AgentRow[]>;
@@ -11,6 +26,8 @@ export interface SessionLimitWatchDeps {
   close: (issue: string) => Promise<void>;
   now: () => number;
   log: (line: string) => void;
+  /** Optional: when absent, the watcher behaves exactly as it did before BUTCHR-12 (no capture, ever). */
+  captures?: CaptureSink;
 }
 
 export type Stop = () => void;
@@ -26,6 +43,93 @@ export type Stop = () => void;
 export const POST_RESET_MARGIN_MS = 2 * 60_000;
 
 /**
+ * BUTCHR-12: the two — and only two — trigger classes worth durably
+ * capturing. Deliberately NOT a capture on the normal recognised-with-a-
+ * reset-time path: that path is working, so capturing it would be pure
+ * noise. `unrecognised` uses a cheap unanchored substring test (not the full
+ * anchored "You've ..." phrase `detectSessionLimitRefusal` matches) so both
+ * the straight and curly apostrophe trip it without touching the recogniser.
+ */
+type TriggerClass = "unrecognised" | "no-reset-time";
+const CHEAP_PHRASE = /hit your session limit/i;
+
+/** Global cap on capture files kept at once; exported so tests can assert eviction against it directly. */
+export const CAPTURE_MAX_FILES = 50;
+
+/** A real pane is ~2.5KB; this is only a backstop against something pathological. */
+const MAX_CAPTURE_BYTES = 256 * 1024;
+
+function compactUtc(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d\d\dZ$/, "Z");
+}
+
+/**
+ * Per-(issue, trigger class, pane incarnation) dedupe so a pane that stays
+ * refused for 90 minutes across hundreds of polls yields ONE file, not
+ * hundreds. Deliberately a SEPARATE map from `seen` in watchSessionLimits:
+ * `seen`'s delete-on-no-refusal semantics are load-bearing for the
+ * close-after-reset path and must not be overloaded with capture bookkeeping.
+ */
+function clearCaptured(captured: Map<string, true>, issue: string): void {
+  for (const key of captured.keys()) if (key.startsWith(`${issue}|`)) captured.delete(key);
+}
+
+/**
+ * Attempt one capture, honouring the per-pane dedupe and the global file
+ * cap. Fail-open by construction (decision 8, BUTCHR-12): the dedupe entry
+ * is set BEFORE the write is attempted, so a write failure is logged once
+ * and never retried on the next poll — a permanently unwritable directory
+ * produces one log line per pane, not one per poll. Never throws.
+ */
+async function maybeCapture(
+  deps: SessionLimitWatchDeps,
+  captured: Map<string, true>,
+  row: AgentRow,
+  trigger: TriggerClass,
+  triggerDetail: string,
+  text: string,
+): Promise<void> {
+  const sink = deps.captures;
+  if (!sink) return;
+  const key = `${row.issue}|${trigger}|${row.pane_id}`;
+  if (captured.has(key)) return;
+  captured.set(key, true);
+  try {
+    const capturedAt = new Date(deps.now());
+    let body = text;
+    let truncatedNote: string | null = null;
+    if (Buffer.byteLength(body, "utf8") > MAX_CAPTURE_BYTES) {
+      body = Buffer.from(body, "utf8").subarray(0, MAX_CAPTURE_BYTES).toString("utf8");
+      truncatedNote = `pane text exceeded ${MAX_CAPTURE_BYTES} bytes; kept the first ${MAX_CAPTURE_BYTES}`;
+    }
+    const header =
+      `# butchr session-limit capture\n` +
+      `# issue: ${row.issue}\n` +
+      `# pane: ${row.pane_id}\n` +
+      `# agent_status: ${row.agent_status}\n` +
+      `# captured-at: ${capturedAt.toISOString()}\n` +
+      `# trigger: ${trigger} (${triggerDetail})\n` +
+      (truncatedNote ? `# truncated: ${truncatedNote}\n` : "") +
+      `# --- pane text follows verbatim (ANSI already stripped) ---\n` +
+      `\n`;
+    const name = `${row.issue}-${trigger}-${compactUtc(capturedAt.getTime())}.txt`;
+
+    // Eviction lives here, in the watcher, not in the store, so it's
+    // exercised through the injected seam with no real fs.
+    let names = (await sink.list()).slice().sort();
+    while (names.length >= CAPTURE_MAX_FILES) {
+      const oldest = names[0]!;
+      await sink.remove(oldest);
+      names = names.slice(1);
+    }
+    const path = await sink.write(name, header + body);
+    deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} ${trigger} — pane text captured to ${path}`);
+  } catch (e) {
+    deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} ${trigger} capture failed: ${(e as Error)?.message ?? e}`);
+  }
+}
+
+/**
  * Level-triggered, not scheduled (KAN-804/807): every poll, for every agent
  * whose status is idle/done — the cheap gate, so a working or blocked agent's
  * pane is never read here — check for a session-limit refusal and, once past
@@ -37,6 +141,11 @@ export const POST_RESET_MARGIN_MS = 2 * 60_000;
  * distinct (issue, resetsAt) pair, not every poll (the escalator's
  * dedupe-by-distinct-fingerprint in escalation-loop.ts is the local
  * precedent).
+ *
+ * BUTCHR-12: additionally, when `deps.captures` is supplied, durably capture
+ * the full ANSI-stripped pane text on the two trigger classes documented
+ * above `maybeCapture` — evidence for the NEXT recogniser miss, since a pane
+ * holds no scrollback and the text is gone within hours.
  */
 export function watchSessionLimits(deps: SessionLimitWatchDeps, intervalMs: number): Stop {
   // issue -> the resetsAt FIRST resolved for this refusal, and whether it's
@@ -53,6 +162,7 @@ export function watchSessionLimits(deps: SessionLimitWatchDeps, intervalMs: numb
   // poller has closed the pane is the one case that re-derives a stale
   // "tomorrow" instead and waits a full day — rare, and self-correcting.
   const seen = new Map<string, { resetsAt: number; logged: boolean }>();
+  const captured = new Map<string, true>();
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -64,12 +174,19 @@ export function watchSessionLimits(deps: SessionLimitWatchDeps, intervalMs: numb
         if (row.agent_status !== "idle" && row.agent_status !== "done") continue;
         if (!row.issue) continue;
         const text = await deps.read(row.pane_id);
+        const phrasePresent = CHEAP_PHRASE.test(text);
+        if (!phrasePresent) clearCaptured(captured, row.issue);
         const refusal = detectSessionLimitRefusal(text, new Date(deps.now()));
-        if (!refusal) { seen.delete(row.issue); continue; }
+        if (!refusal) {
+          seen.delete(row.issue);
+          if (phrasePresent) await maybeCapture(deps, captured, row, "unrecognised", "phrase present, detectSessionLimitRefusal returned null", text);
+          continue;
+        }
         if (refusal.resetsAt === null) {
           // Conservative: never invent a reset time. An operator-visible line
           // beats silently never recovering — this pane needs a human.
           deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} refused ("${refusal.raw}") but no reset time could be parsed — cannot schedule recovery, needs an operator`);
+          await maybeCapture(deps, captured, row, "no-reset-time", `recognised ("${refusal.raw}"), no reset time parseable`, text);
           continue;
         }
         const entry = seen.get(row.issue) ?? { resetsAt: refusal.resetsAt, logged: false };

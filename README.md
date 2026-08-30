@@ -35,6 +35,8 @@ butchr                        # reads .env / the environment
 
 As of 0.10.0, also set `BUTCHR_ASSIGNEE_STORY` and `BUTCHR_ASSIGNEE_TASK` (Atlassian accountIds) in `.env` before deploying — `jira_create_issue` assigns a Story/Task by role from these, and REFUSES to create one of that type if its role is unset and the caller passed no explicit `assignee`. Epics are unaffected.
 
+Optionally set `BUTCHR_CAPTURE_DIR` to change where the session-limit watcher durably captures a pane's ANSI-stripped text when its own detection is inconclusive (the phrase is present but unrecognised, or recognised with no parseable reset time) — default `.captures` under the workspace root (`BUTCHR_WORKSPACES`, or `~/butchr-workspaces`). Bounded to at most one capture per issue/trigger/pane incarnation and 50 files total (oldest evicted first); an operator turns a capture into a test fixture by deleting its `# `-prefixed header block.
+
 From source (development):
 
 ```
