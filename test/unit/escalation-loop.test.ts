@@ -3,6 +3,25 @@ import { createEscalator, type CommentRow } from "../../src/agents/escalation-lo
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { fingerprint } from "../../src/agents/escalate.js";
+import { tellWorker } from "../../src/tools/relationship.js";
+import type { AtlassianOps } from "../../src/tools/atlassian.js";
+
+/**
+ * BUTCHR-45: the REAL tell_worker/tagComment construction (src/tools/
+ * relationship.ts) — a boss (`bossKey`) replying on one of its worker's
+ * tickets, exactly the intended downward channel for an ANSWER. Returns the
+ * body `addComment` actually received (a leading `[bossKey] ` tag), not a
+ * hand-typed `"[KEY] ANSWER ..."` literal standing in for the real path.
+ */
+async function taggedReply(bossKey: string, workerKey: string, text: string): Promise<string> {
+  let captured = "";
+  const ops = {
+    getIssue: async () => ({ fields: { issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: bossKey } }] } }),
+    addComment: async (_key: string, body: string) => { captured = body; },
+  } as unknown as AtlassianOps;
+  await tellWorker(ops, bossKey, workerKey, text);
+  return captured;
+}
 
 // The real prompt text from test/unit/prompt.test.ts, reused per the ticket's
 // instruction not to invent new dialog text for the delivery tests.
@@ -250,6 +269,76 @@ describe("createEscalator — directive delivery", () => {
     await h.poll("p1", "KAN-1", prompt);
     expect(h.sent).toEqual([]);
     expect(h.logs.some((l) => /REFUSED ANSWER 99/.test(l))).toBe(true);
+  });
+});
+
+describe("createEscalator — identity-tagged directives (BUTCHR-45)", () => {
+  // BUTCHR-44: an ANSWER sent as the entire comment body — the terse form the
+  // escalation comment itself asks for — is silently dropped once the
+  // identity tag every jira_add_comment/tell_worker reply carries lands in
+  // front of it (a single line reading "[KEY] ANSWER 2 abc12345" never
+  // STARTS with "ANSWER "). These reproduce the bug end-to-end through the
+  // real tagging construction (taggedReply -> tell_worker -> tagComment),
+  // proving delivery actually happens now, not just that parseDirective
+  // returns a value in isolation.
+  test("a terse ANSWER <n>, tagged via the real tell_worker construction, is delivered", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt); // debounce
+    await h.poll("p1", "KAN-1", prompt); // escalate
+    const fp = fingerprint(prompt);
+    const tagged = await taggedReply("BOSS-1", "KAN-1", `ANSWER 2 ${fp}`);
+    expect(tagged).toBe(`[BOSS-1] ANSWER 2 ${fp}`); // sanity: this IS the tagged, single-line, terse form
+    h.addHumanComment(tagged);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+  });
+
+  test("a tagged ANSWER TEXT is delivered too — selects the free-text option, sends the text, then Enter", async () => {
+    const h = harness();
+    h.setPaneText(FREE_TEXT_MENU);
+    const prompt = parsePrompt(FREE_TEXT_MENU)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    const fp = fingerprint(prompt);
+    h.addHumanComment(await taggedReply("BOSS-1", "KAN-1", `ANSWER TEXT run the migration first ${fp}`));
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.sent).toEqual([
+      { pane: "p1", text: keysToSelect(prompt.current, 2) },
+      { pane: "p1", text: "run the migration first" },
+      { pane: "p1", text: "\r" },
+    ]);
+  });
+
+  test("negative: a tagged ANSWER carrying a stale fingerprint is refused — nothing sent", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const dialogA = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", dialogA); // debounce
+    await h.poll("p1", "KAN-1", dialogA); // escalate A
+    const fpA = fingerprint(dialogA);
+    h.addHumanComment(await taggedReply("BOSS-1", "KAN-1", `ANSWER 2 ${fpA}`));
+    // The pane has moved on to a different dialog by the time this directive
+    // is actually processed, exactly like the untagged stale-fingerprint test
+    // above — the fp verification lives in handleDirective, downstream of
+    // (and unaffected by) the tag-stripping fix.
+    h.setPaneText(TRUST);
+    await h.poll("p1", "KAN-1", dialogA);
+    expect(h.sent).toEqual([]);
+    expect(h.logs.some((l) => /REFUSED directive on KAN-1: fingerprint/.test(l))).toBe(true);
+  });
+
+  test("negative: a tagged ANSWER quoted mid-sentence inside prose still does not fire", async () => {
+    const h = harness();
+    h.setPaneText(REAL);
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    const fp = fingerprint(prompt);
+    h.addHumanComment(await taggedReply("BOSS-1", "KAN-1", `quoting the dialog above: ANSWER 2 ${fp}`));
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.sent).toEqual([]);
   });
 });
 

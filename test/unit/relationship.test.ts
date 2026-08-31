@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, ASK_MARKER,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -20,13 +20,13 @@ function makeWorld() {
   let nextPageId = 900;
   const issues = new Map<
     string,
-    { issuetype: string; project: string; status: string; assignee?: string; priority?: string; labels: string[]; bossKey?: string; comments: string[]; remoteLink?: { title: string; url: string } }
+    { issuetype: string; project: string; status: string; assignee?: string; priority?: string; labels: string[]; bossKey?: string; comments: string[]; remoteLink?: { title: string; url: string }; description?: string }
   >();
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
   const projectProperties = new Map<string, unknown>();
 
-  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string }) {
-    issues.set(key, { issuetype: p.issuetype, project: p.project, status: p.status ?? "To Do", labels: p.labels ?? [], comments: [], ...(p.bossKey ? { bossKey: p.bossKey } : {}), ...(p.assignee ? { assignee: p.assignee } : {}) });
+  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: string }) {
+    issues.set(key, { issuetype: p.issuetype, project: p.project, status: p.status ?? "To Do", labels: p.labels ?? [], comments: [], ...(p.bossKey ? { bossKey: p.bossKey } : {}), ...(p.assignee ? { assignee: p.assignee } : {}), ...(p.description ? { description: p.description } : {}) });
   }
   function setProjectProperty(projectKey: string, value: unknown) {
     projectProperties.set(projectKey, value);
@@ -53,6 +53,7 @@ function makeWorld() {
           labels: i.labels,
           assignee: i.assignee ? { accountId: i.assignee } : null,
           issuelinks: i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : [],
+          description: i.description,
         },
       };
     },
@@ -75,6 +76,7 @@ function makeWorld() {
         issuetype: p.issuetype, project: p.projectKey, status: "To Do",
         labels: p.labels ? [...p.labels] : [], comments: [],
         ...(p.assignee ? { assignee: p.assignee } : {}), ...(p.priority ? { priority: p.priority } : {}),
+        ...(p.description ? { description: p.description } : {}),
       });
       return { key };
     },
@@ -589,6 +591,211 @@ describe("shelveWorker: ORDERING — label before transition", () => {
 // Worker -> boss
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// classifyDestination — the refusal shapes, pure
+// ---------------------------------------------------------------------------
+
+describe("classifyDestination", () => {
+  test("empty/whitespace-only refuses, teaching both accepted shapes and WHY", async () => {
+    for (const bad of ["", "   "]) {
+      expect(() => classifyDestination(bad)).toThrow(/EXISTING EPIC KEY.*brand-new epic.*half the job/s);
+    }
+  });
+
+  test("known placeholders refuse, normalized (case, whitespace, trailing punctuation)", () => {
+    for (const bad of ["n/a", "N/A", "N/A.", " tbd ", "Unknown", "none", "?", "-", "idk"]) {
+      expect(() => classifyDestination(bad)).toThrow(/placeholder/);
+    }
+  });
+
+  test("prose too thin to be a real reason refuses, but a genuinely terse real reason survives", () => {
+    expect(() => classifyDestination("misc")).toThrow(/too thin/);
+    expect(() => classifyDestination("later maybe")).not.toThrow(); // 10 non-space chars, and not a listed placeholder
+    expect(classifyDestination("no epic covers billing yet")).toEqual({ kind: "reason", text: "no epic covers billing yet" });
+  });
+
+  test("a Jira-key-shaped destination classifies as an epic candidate, UNVALIDATED (existence/type is the caller's job)", () => {
+    expect(classifyDestination("BUTCHR-25")).toEqual({ kind: "epic", key: "BUTCHR-25" });
+    expect(classifyDestination("  BUTCHR-25  ")).toEqual({ kind: "epic", key: "BUTCHR-25" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fileWhereItBelongs — the 2026-08-30 regression scenario: an agent files
+// work outside its own epic, and the result must have BOTH halves: the
+// destination stated on the ticket itself, AND a notice a person receives.
+// ---------------------------------------------------------------------------
+
+describe("fileWhereItBelongs: refusals", () => {
+  test("refuses without a valid destination (delegates to classifyDestination's teaching message)", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR" });
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "n/a" }))
+      .rejects.toThrow(/placeholder/);
+  });
+
+  test("refuses a Jira-key destination that does not exist", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR" });
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-999" }))
+      .rejects.toThrow(/"BUTCHR-999".*could not be read/s);
+  });
+
+  test("refuses a Jira-key destination that exists but is NOT an Epic, naming what it actually is", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR" });
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-2" }))
+      .rejects.toThrow(/"BUTCHR-2" exists but is a Story, not an Epic/);
+  });
+
+  test("refuses when the requested issuetype's role has no configured accountId", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR" });
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    await expect(fileWhereItBelongs(ops, {}, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" }))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_TASK/);
+  });
+});
+
+describe("fileWhereItBelongs: case A — destination is an existing epic key", () => {
+  test("THE REGRESSION SCENARIO, case A: the created ticket states its destination AND a notice reaches the named epic — both halves, on the real end state", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // the destination epic
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" }); // the filer, in-scope under its own epic
+
+    const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", {
+      summary: "found this while doing BUTCHR-7, not mine",
+      issuetype: "Task",
+      destination: "BUTCHR-1",
+    });
+
+    // HALF ONE: the destination is stated on the ticket's own description + a filterable label.
+    const created = issues.get(result.key)!;
+    expect(created.description).toMatch(/Epic BUTCHR-1/);
+    expect(created.description).toMatch(/Filed by: BUTCHR-7/);
+    expect(created.labels).toContain(ORPHAN_LABEL);
+    expect(created.labels).not.toContain(EXEMPT_LABEL); // never cargo-culted — parkedCandidates can't see this ticket anyway
+    expect(created.bossKey).toBeUndefined(); // TRUE ORPHAN — no Implements link, ever
+    expect(created.status).toBe("To Do"); // staffed by role, never transitioned
+    expect(created.assignee).toBe(ROLES.task);
+
+    // HALF TWO: a notice actually reaches a ticket a human watches — the named epic.
+    expect(result.noticeTarget).toBe("BUTCHR-1");
+    const notice = issues.get("BUTCHR-1")!.comments[0]!;
+    expect(notice).toContain(result.key);
+    expect(notice).toContain("BUTCHR-7"); // who filed it
+    expect(notice).toMatch(/not linked to you/i); // notice is NOT the home
+    expect(issues.get("BUTCHR-1")!.bossKey).toBeUndefined(); // the epic never became this ticket's boss either
+  });
+
+  test("the doc is ensured and bottoms out under the project root (no boss)", async () => {
+    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
+    expect(result.doc).toBeDefined();
+    expect(pages.get(result.doc.id)!.parentId).toBe(ROOT_DOC_ID);
+  });
+});
+
+describe("fileWhereItBelongs: case B — destination is a reason a NEW epic is needed", () => {
+  test("THE REGRESSION SCENARIO, case B: no epic to comment on, so the notice walks the CALLER's own Implements chain to the topmost ticket — and still creates NO link", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // topmost — the caller's grandboss
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" }); // caller's boss
+    addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-2" }); // the filer
+
+    const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", {
+      summary: "unrelated infra work",
+      issuetype: "Task",
+      destination: "no epic covers observability tooling yet",
+    });
+
+    // HALF ONE: destination stated on the ticket, even though it names no key.
+    const created = issues.get(result.key)!;
+    expect(created.description).toMatch(/a NEW epic/);
+    expect(created.description).toMatch(/observability tooling/);
+    expect(created.labels).toContain(ORPHAN_LABEL);
+    expect(created.bossKey).toBeUndefined(); // CRITICAL: case B creates NO link — not to BUTCHR-1, not to anything
+
+    // HALF TWO: the notice lands on the TOPMOST ticket in BUTCHR-7's OWN chain (BUTCHR-1), never on BUTCHR-7 itself or BUTCHR-2.
+    expect(result.noticeTarget).toBe("BUTCHR-1");
+    expect(issues.get("BUTCHR-2")!.comments).toEqual([]);
+    const notice = issues.get("BUTCHR-1")!.comments[0]!;
+    expect(notice).toContain(result.key);
+    expect(notice).toContain("BUTCHR-7");
+    expect(notice).toMatch(/observability tooling/);
+    expect(issues.get("BUTCHR-1")!.bossKey).toBeUndefined(); // still not linked to anything
+  });
+
+  test("when the caller itself has no boss (an Epic filing on its own behalf), the topmost ticket IS the caller", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no boss — topmost by construction
+    const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-1", { summary: "s", issuetype: "Task", destination: "needs a brand new epic entirely" });
+    expect(result.noticeTarget).toBe("BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.comments.length).toBe(1);
+  });
+});
+
+describe("fileWhereItBelongs: partial-failure honesty — the ticket, once created, is NEVER rolled back", () => {
+  test("notice failing: the ticket survives, fully documented, and the throw names the notice failure without claiming anything needs cleanup on the ticket itself", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const broken: AtlassianOps = { ...ops, addComment: async (key: string) => { if (key === "BUTCHR-1") throw new Error("comment refused"); return { ok: true }; } };
+    let thrown: Error | undefined;
+    let key: string | undefined;
+    const before = issues.size;
+    try {
+      await fileWhereItBelongs(broken, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown?.message).toMatch(/nothing there needs cleanup/);
+    expect(thrown?.message).toMatch(/notice comment on BUTCHR-1 failed/);
+    // exactly one new ticket was created and SURVIVES, destination + label intact.
+    const created = [...issues.entries()].filter(([k]) => !["BUTCHR-1", "BUTCHR-7"].includes(k));
+    expect(created.length).toBe(1);
+    key = created[0]![0];
+    expect(issues.get(key)!.labels).toContain(ORPHAN_LABEL);
+    expect(issues.size).toBe(before + 1);
+  });
+
+  test("doc failing: the ticket, destination and notice all survive; the throw names the doc failure and how it self-heals", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    // no project property registered -> ensureDoc's step 0 throws.
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    let thrown: Error | undefined;
+    try {
+      await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown?.message).toMatch(/Confluence doc failed to create/);
+    expect(thrown?.message).toMatch(/own first set_doc call/);
+    // the notice still fired despite the doc failure — independent steps.
+    expect(issues.get("BUTCHR-1")!.comments.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// jira_create_issue's `implements: "none"` orphan escape is NOT this module's
+// concern (it lives in defs.ts, tested in defs.test.ts) — but the parked
+// detector's reach IS relevant here: fileWhereItBelongs's ticket must never
+// carry EXEMPT_LABEL, on top of the direct assertion above.
+// ---------------------------------------------------------------------------
+
 describe("reportToBoss / askBoss / submitToBoss", () => {
   test("reportToBoss comments on the CALLER'S OWN ticket, tagged", async () => {
     const { ops, addIssue, issues } = makeWorld();
@@ -610,5 +817,31 @@ describe("reportToBoss / askBoss / submitToBoss", () => {
     addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
     await submitToBoss(ops, "BUTCHR-7");
     expect(issues.get("BUTCHR-7")!.status).toBe("In Review");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// finish_without_a_boss — the load-bearing test is the refusal: it is the
+// review hop this verb exists to protect for the one caller shape (bossless)
+// that has no boss to submit to and no boss who will ever call finish_worker.
+// ---------------------------------------------------------------------------
+
+describe("finishWithoutABoss", () => {
+  test("THE LOAD-BEARING TEST: refuses a caller that HAS a boss, naming the boss and teaching the way out", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/has a boss \(BUTCHR-1\)/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/submit_to_boss/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/finish_worker/);
+    // and, correctly, it was never transitioned by the refused call.
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do");
+  });
+
+  test("the happy path: a bossless caller actually reaches Done", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey at all
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
   });
 });
