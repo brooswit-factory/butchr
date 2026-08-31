@@ -115,9 +115,19 @@ export function escalationComment(issue: string, prompt: Prompt, fp: string, cap
     `fingerprint: ${fp}`,
     ...(capturePath ? ["", `Full pane text captured to ${capturePath} (local disk only — not posted here, may carry command output or secrets).`] : []),
     "",
-    `Reply on THIS ticket with a comment containing exactly \`ANSWER <n> ${fp}\` (or \`ANSWER TEXT <your text> ${fp}\`).`,
+    `Reply on THIS ticket with a comment whose body is \`ANSWER <n> ${fp}\` (or \`ANSWER TEXT <your text> ${fp}\`) — sent as the ENTIRE comment, nothing else on the line. A leading \`[KEY]\` identity tag (every jira_add_comment/tell_worker reply gets one) is fine and expected; it is stripped before matching.`,
   ].join("\n");
 }
+
+/**
+ * A tag-SHAPED prefix, matching how `jira_add_comment`/`tell_worker`
+ * (src/tools/defs.ts, src/tools/relationship.ts) prepend the caller's own
+ * `x-issue` — `[KEY] ` — ahead of whatever text it's given, UNLESS the text
+ * already starts with that exact tag. This parser has no way to know the
+ * caller's key, so it matches the SHAPE Jira issue keys take
+ * (`[A-Z]+-\d+`, per src/config/config.ts), not any specific one.
+ */
+const TAG_RE = /^\[[A-Z]+-\d+\]\s*/;
 
 /**
  * Parse the first `ANSWER ...` directive line out of a comment body. Returns
@@ -128,10 +138,37 @@ export function escalationComment(issue: string, prompt: Prompt, fp: string, cap
  * the START of the (trimmed) text, not merely that it appears somewhere: a
  * reviewer replying "quoting the dialog above: [butchr:blocked] ... ANSWER 2
  * abc12345" is a perfectly good answer and must not be silently dropped.
+ *
+ * BUTCHR-45: every reply posted through `jira_add_comment`/`tell_worker`
+ * carries a leading `[KEY] ` identity tag, so a terse `ANSWER 2 abc12345`
+ * sent as the entire message arrives as `[KEY] ANSWER 2 abc12345` — one
+ * line, tag then directive, which never STARTS with `ANSWER ` untouched.
+ * A leading prose line happened to dodge this (the tag lands on line 1, the
+ * lone `ANSWER …` line 2 is untouched) — the terse, system-recommended form
+ * was exactly the one silently dropped. Fixed by stripping a tag-SHAPED
+ * prefix (`TAG_RE`, above) before matching, never a hardcoded key.
+ *
+ * The MARKER guard above is deliberately checked ONLY against the RAW text,
+ * never the tag-stripped text — an earlier version of this fix checked both
+ * and was wrong to. The daemon never tags its own MARKER comments (they go
+ * out via `addComment` directly — see escalationComment above and
+ * escalation-loop.ts/parked.ts — never through `jira_add_comment`/
+ * `tell_worker`), so the raw check already catches every genuine self-echo,
+ * and a TAGGED body can only ever have been written by someone else, never
+ * the daemon. A boss that pastes the whole escalation (marker included)
+ * and answers underneath it produces exactly that shape once tagged —
+ * `[KEY] [butchr:blocked] ... ANSWER 2 abc12345` — and checking the
+ * stripped text against MARKER there would silently drop a real answer,
+ * the identical failure class BUTCHR-44 exists to eliminate (caught in
+ * review of this ticket before merge: measured, on the pre-fix code, that
+ * exact tagged body already parsed correctly — checking the stripped text
+ * would have been a regression, not a hardening).
  */
 export function parseDirective(commentText: string): Directive | null {
-  if (commentText.trimStart().startsWith(MARKER)) return null;
-  const line = commentText.split("\n").map((l) => l.trim()).find((l) => l.startsWith("ANSWER "));
+  const trimmed = commentText.trimStart();
+  if (trimmed.startsWith(MARKER)) return null;
+  const unwrapped = trimmed.replace(TAG_RE, "");
+  const line = unwrapped.split("\n").map((l) => l.trim()).find((l) => l.startsWith("ANSWER "));
   if (!line) return null;
   const rest = line.slice("ANSWER ".length).trim();
 
