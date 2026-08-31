@@ -245,12 +245,16 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
     } catch (e) {
       // RACE GUARD (defense in depth — see the function doc comment above):
       // a concurrent ensureDoc(key) may have created the page between our
-      // step-3 scan and this create. Confluence's title-uniqueness 400 is the
-      // server telling us that happened; re-scan once rather than treating
-      // it as fatal or, worse, retrying the create into a second 400 loop.
+      // step-3 scan and this create, and Confluence's title-uniqueness 400 is
+      // the server telling us that happened — so ANY 400 here re-scans once
+      // rather than failing outright or retrying the create into a loop. Most
+      // 400s reaching this branch genuinely are the title collision, but a
+      // malformed body or a bad parentId would also 400 and land here; the
+      // re-scan is harmless either way (it just won't find anything to
+      // adopt), so the message below doesn't assert which one happened.
       if (isApiError(e) && e.status === 400) {
         const adopted = await findLabelledChild(ops, parentId, label);
-        if (!adopted) throw new Error(`ensureDoc: create for ${key} hit a title collision (400) but a re-scan of parent ${parentId} still found no page labelled "${label}" — giving up rather than looping (${(e as Error).message})`);
+        if (!adopted) throw new Error(`ensureDoc: create for ${key} failed with 400 (possibly a title collision with a concurrent creator) and a re-scan of parent ${parentId} still found no page labelled "${label}" — giving up rather than looping (${(e as Error).message})`);
         pageId = adopted;
       } else {
         throw e;
@@ -277,6 +281,20 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
  * `title` is REQUIRED: an agent cannot write real content and leave the page
  * reading as unwritten. Once titled, `title` is optional and omitting it
  * keeps the current title.
+ *
+ * TITLE CHANGE -> RE-UPSERT THE LINK. `ensureDoc` already upserted the
+ * `butchr:doc` remote link once, but it did so with the title the page had
+ * AT THAT MOMENT — the provisional one, on first write. If `updatePage`
+ * changes the title and nothing else touches the link, the Jira ticket's
+ * human-visible web link is stuck reading "[unwritten] …" forever, even
+ * after the doc is genuinely written — exactly the stale-reads-as-
+ * authoritative failure rule (f) names, and on the half of the binding a
+ * human actually looks at (PR #112 review). The upsert is idempotent by
+ * globalId (see ensureDoc's step 5 comment), so re-calling it here can never
+ * create a second link — it only refreshes the one that already exists.
+ * Only do this when the title actually changed: a body-only write touches
+ * nothing the link displays, and an unconditional upsert would bump the
+ * ticket's `updated` on every doc write, waking a boss for a non-event.
  */
 export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<DocResult> {
   const doc = await ensureDoc(ops, key);
@@ -284,5 +302,9 @@ export async function setDoc(ops: AtlassianOps, key: string, body: string, title
     throw new Error(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
   }
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
-  return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
+  const finalTitle = title ?? doc.title;
+  if (title && title !== doc.title) {
+    await ops.upsertRemoteLink(key, DOC_LINK_GLOBAL_ID, "documented by", { title: finalTitle, url: doc.url });
+  }
+  return { id: doc.id, url: doc.url, title: finalTitle, body };
 }
