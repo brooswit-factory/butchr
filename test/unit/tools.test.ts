@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
-/** Defaults for the get_doc/set_doc ops (BUTCHR-33) shared by every rig() below; override per test as needed. */
-function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel">> = {}) {
+/** Defaults for the get_doc/set_doc ops (BUTCHR-33) and the label/delete ops (BUTCHR-35) shared by every rig() below; override per test as needed. */
+function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "deleteIssue">> = {}) {
   return {
     getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
     getRemoteLink: async () => null,
@@ -11,6 +11,8 @@ function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" |
     getChildPages: async () => ({ results: [] }),
     getPageLabels: async () => [],
     createPageWithLabel: async () => ({ id: "999", title: "t", url: "https://x/999" }),
+    addLabels: async () => ({ ok: true }),
+    deleteIssue: async () => ({ ok: true }),
     ...overrides,
   };
 }
@@ -31,15 +33,27 @@ function rig(roles: { story?: string; task?: string } = {}) {
 }
 
 describe("atlassianTools", () => {
-  test("exposes the full proxy surface", () => {
+  test("exposes the full proxy surface — alias-completeness: every pre-existing name still resolves, plus the ten relationship verbs (BUTCHR-35)", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
+      "adopt_worker", "ask_boss",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
+      "finish_worker",
       "get_doc",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
-      "set_doc",
+      "new_worker", "prioritize_worker", "report_to_boss",
+      "set_doc", "shelve_worker", "start_worker", "submit_to_boss",
+      "tell_worker",
     ]);
+  });
+
+  test("the five permanent verbs carry NO deprecation note; the eight aliased ones do", () => {
+    const { tools } = rig();
+    const permanent = ["jira_get_issue", "jira_search", "jira_add_comment", "confluence_list_spaces", "confluence_search_pages"];
+    const aliased = ["jira_link_issues", "jira_transition", "jira_create_issue", "jira_set_priority", "jira_assign", "confluence_create_page", "confluence_update_page", "confluence_get_page"];
+    for (const name of permanent) expect(tools[name]!.description).not.toMatch(/DEPRECATED/);
+    for (const name of aliased) expect(tools[name]!.description).toMatch(/DEPRECATED/);
   });
   test("each tool routes to its op and audits the caller's issue", async () => {
     const { tools, calls, audits, conn } = rig();
@@ -648,5 +662,153 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
     })();
     await tools.set_doc!.handler({ body: "<p>x</p>", title: "T" }, { headers: { "x-issue": "KAN-7" } } as any);
     expect(writes).toEqual([[["KAN-7"], "KAN-7"]]);
+  });
+});
+
+describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema shape, audit, onWrite", () => {
+  const TEN = ["new_worker", "start_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker", "report_to_boss", "ask_boss", "submit_to_boss"] as const;
+
+  /** Minimal args satisfying each verb's required schema, so every one below can be called uniformly for the no-x-issue sweep. */
+  const MIN_ARGS: Record<(typeof TEN)[number], Record<string, unknown>> = {
+    new_worker: { summary: "s", disposition: "start" },
+    start_worker: { key: "KAN-9" },
+    shelve_worker: { key: "KAN-9", reason: "r" },
+    adopt_worker: { key: "KAN-9", disposition: "start" },
+    finish_worker: { key: "KAN-9" },
+    prioritize_worker: { key: "KAN-9", priority: "High" },
+    tell_worker: { key: "KAN-9", text: "t" },
+    report_to_boss: { text: "t" },
+    ask_boss: { text: "t" },
+    submit_to_boss: {},
+  };
+
+  function rigNoOp() {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "To Do" }, issuelinks: [] } }),
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({}), transition: async () => ({}),
+      createIssue: async () => ({ key: "KAN-999" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    return atlassianTools(ops, () => {}, { story: "acct-story", task: "acct-task" });
+  }
+
+  test("every one of the ten refuses a connection with no x-issue, in the get_doc/set_doc shape", async () => {
+    const tools = rigNoOp();
+    for (const name of TEN) {
+      await expect(tools[name]!.handler(MIN_ARGS[name], { headers: {} } as any)).rejects.toThrow(/this connection has no x-issue/);
+    }
+  });
+
+  test("report_to_boss / ask_boss have ONLY `text` — no key parameter is expressible", () => {
+    const tools = rigNoOp();
+    expect(Object.keys(tools.report_to_boss!.input).sort()).toEqual(["text"]);
+    expect(Object.keys(tools.ask_boss!.input).sort()).toEqual(["text"]);
+  });
+
+  test("submit_to_boss takes NO arguments at all", () => {
+    const tools = rigNoOp();
+    expect(Object.keys(tools.submit_to_boss!.input)).toEqual([]);
+  });
+
+  test("new_worker's schema requires `disposition`; `reason` stays optional at the schema level (validated by relationship.ts instead)", () => {
+    const tools = rigNoOp();
+    expect(Object.keys(tools.new_worker!.input).sort()).toEqual(["description", "disposition", "priority", "reason", "summary"]);
+  });
+
+  test("start_worker / shelve_worker / finish_worker / prioritize_worker / tell_worker audit lines name the verb and the target key", async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    const rec = (name: string, result: unknown = { ok: name }) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ fields: { issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "To Do" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-7" } }] } }),
+      search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"), transition: rec("transition"),
+      createIssue: rec("createIssue"), setPriority: rec("setPriority"), assign: rec("assign"),
+      createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
+      ...fakeDocOps(),
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l));
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    await tools.start_worker!.handler({ key: "KAN-9" }, conn);
+    await tools.shelve_worker!.handler({ key: "KAN-9", reason: "later" }, conn);
+    await tools.finish_worker!.handler({ key: "KAN-9" }, conn);
+    await tools.prioritize_worker!.handler({ key: "KAN-9", priority: "High" }, conn);
+    await tools.tell_worker!.handler({ key: "KAN-9", text: "hi" }, conn);
+    expect(audits.some((a) => a.includes("start_worker KAN-9"))).toBe(true);
+    expect(audits.some((a) => a.includes("shelve_worker KAN-9"))).toBe(true);
+    expect(audits.some((a) => a.includes("finish_worker KAN-9"))).toBe(true);
+    expect(audits.some((a) => a.includes("prioritize_worker KAN-9 → High"))).toBe(true);
+    expect(audits.some((a) => a.includes("tell_worker KAN-9"))).toBe(true);
+    expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
+  });
+
+  test("report_to_boss / ask_boss / submit_to_boss fire onWrite for the CALLER's own key, never an argument", async () => {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ fields: { issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } }),
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({}), transition: async () => ({ ok: true }),
+      createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    const writes: Array<[string[], string]> = [];
+    const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    await tools.report_to_boss!.handler({ text: "a" }, conn);
+    await tools.ask_boss!.handler({ text: "b" }, conn);
+    await tools.submit_to_boss!.handler({}, conn);
+    expect(writes).toEqual([[["KAN-7"], "KAN-7"], [["KAN-7"], "KAN-7"], [["KAN-7"], "KAN-7"]]);
+  });
+
+  test("new_worker end-to-end through the tool layer: disposition/priority reach relationship.ts, and onWrite fires for both the new key and the caller", async () => {
+    let created: string | undefined;
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        if (key === "KAN-1") return { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } };
+        // ensureDoc reads the NEW ticket's own issuelinks to find its boss chain; give it one back to KAN-1.
+        return { fields: { issuetype: { name: "Story" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }] } };
+      },
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async (p) => { created = "KAN-42"; expect(p.priority).toBe("High"); return { key: created }; },
+      setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    const writes: Array<[string[], string]> = [];
+    const tools = atlassianTools(ops, () => {}, { story: "acct-story" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.new_worker!.handler({ summary: "s", priority: "High", disposition: "start" }, conn)) as { key: string };
+    expect(result.key).toBe("KAN-42");
+    expect(created).toBe("KAN-42");
+    expect(writes).toEqual([[["KAN-42", "KAN-1"], "KAN-1"]]);
+  });
+
+  test("adopt_worker end-to-end through the tool layer: disposition reaches relationship.ts, onWrite fires for both the adopted key and the caller", async () => {
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        if (key === "KAN-1") return { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } };
+        return { fields: { issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "To Do" }, issuelinks: [] } }; // orphan
+      },
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({ ok: true }),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    const writes: Array<[string[], string]> = [];
+    const tools = atlassianTools(ops, () => {}, { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.adopt_worker!.handler({ key: "KAN-9", disposition: "start" }, conn)) as { key: string; alreadyAdopted: boolean };
+    expect(result.key).toBe("KAN-9");
+    expect(result.alreadyAdopted).toBe(false);
+    expect(writes).toEqual([[["KAN-9", "KAN-1"], "KAN-1"]]);
+  });
+
+  test("new_worker's description does not claim atomicity, and states the ordering guarantee / convergent-doc / rollback shape (BUTCHR-35 review criterion: judge the description, not just the code)", () => {
+    const tools = rigNoOp();
+    const d = tools.new_worker!.description;
+    expect(d).not.toMatch(/\batomic\b/i);
+    expect(d).not.toMatch(/leaves nothing/i);
+    expect(d).toMatch(/GUARANTEES/);
+    expect(d).toMatch(/set_doc/);
+    expect(d).toMatch(/rolled back|ROLLED BACK|delete the ticket/i);
   });
 });

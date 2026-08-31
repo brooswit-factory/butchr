@@ -61,4 +61,31 @@ export interface AtlassianOps {
    * content API takes the space's key, not its numeric id.
    */
   createPageWithLabel(p: { spaceKey: string; parentId: string; title: string; body: string; label: string }): Promise<{ id: string; title: string; url: string }>;
+
+  /**
+   * Read-modify-write: unions `labels` into the issue's CURRENT label set and
+   * writes the result back. NEVER removes an existing label — there is no
+   * other way to set a label on an issue that already exists (labels can
+   * otherwise only be set at creation), and a naive replace would silently
+   * destroy whatever labels the ticket already carried (src/tools/relationship.ts,
+   * shelve_worker).
+   */
+  addLabels(key: string, labels: readonly string[]): Promise<unknown>;
+
+  /**
+   * Delete a Jira issue outright — `new_worker`'s compensating rollback for a
+   * ticket it just created a moment ago, when the Implements link or the
+   * disposition write that must immediately follow it fails (src/tools/
+   * relationship.ts). MEASURED against this daemon's own credential
+   * (BUTCHR-35, 2026-08-31): `GET .../mypermissions?projectKey=BUTCHR&
+   * permissions=DELETE_ISSUES` → 200, `{"havePermission":false}`; a live
+   * create-then-delete round trip on a throwaway Epic → `DELETE
+   * .../issue/BUTCHR-36` → 403, `{"errorMessages":["You do not have
+   * permission to delete issues in this project."]}`. Called anyway — the
+   * refusal is a PROJECT PERMISSION, not an API limitation, so granting
+   * `Delete Issues` on this daemon's Atlassian account upgrades
+   * `new_worker`'s rollback to fully working with NO CODE CHANGE. Every
+   * caller of this op must already handle it failing.
+   */
+  deleteIssue(key: string): Promise<unknown>;
 }
