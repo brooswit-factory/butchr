@@ -8,11 +8,15 @@
  * without pulling in the other's machinery.
  *
  * NOT wired into escalation-loop.ts yet: PR #108 (BUTCHR-5) was OPEN against
- * that exact file (and escalate.ts) when this was written, and refactoring
- * it here would conflict with an in-flight review. See BUTCHR-24's PR body
- * for the full reasoning. This module is written so that migration — moving
+ * that exact file (and escalate.ts) when BUTCHR-24 branched, so refactoring
+ * it there would have conflicted with an in-flight review — #108 HAS since
+ * merged (mid-BUTCHR-24), but that migration was deliberately NOT bundled
+ * into BUTCHR-24's PR (a behaviour-preserving refactor of a state machine
+ * that had just landed, folded into a PR that was also fixing an unrelated
+ * bug, would have made both harder to review). It is tracked as a follow-up
+ * under BUTCHR-13 instead. This module is written so that migration — moving
  * escalation-loop.ts's rate cap and dedupe onto these primitives — is a
- * behaviour-preserving swap once #108 lands, not a redesign.
+ * behaviour-preserving swap, not a redesign, whenever it happens.
  */
 
 export interface CommentRow {

@@ -83,9 +83,12 @@ export interface LoopDeps {
    * this poll's already-fetched (issues, related) snapshot. Called from
    * inside the observe function below, NEVER from `watch()`'s `onChange`
    * callback: `@brooswit/sundry`'s `watch()` only invokes `onChange` when
-   * the polled snapshot's hash differs from the previous one (confirmed by
-   * reading its `dist/watch/watcher.ts`: `observe()` returns early via
-   * `if (h !== prevHash)` before ever calling `onChange`), so a detector
+   * the polled snapshot's hash differs from the previous one — documented in
+   * the published package's `dist/watch/watcher.d.ts` ("call `onChange(next,
+   * prev)` whenever the hash of its return value changes") and confirmed
+   * against the compiled implementation in `dist/index.js`, whose internal
+   * `observe()` returns early via `if (h !== prevHash)` before ever calling
+   * `onChange` — so a detector
    * wired into `onChange` would silently stop firing on any poll whose
    * snapshot happens not to change — exactly the "the fix doesn't survive a
    * quiet poll" failure mode this ticket exists to remove. Optional;

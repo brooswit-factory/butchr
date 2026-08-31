@@ -94,27 +94,44 @@ interface Entry {
 }
 
 /**
- * Per-child in-memory floor + stage bookkeeping. `observe` starts (or
- * restarts, if the watching boss changed) the floor the first time a child
- * is seen as a candidate; `forgetMissing` drops tracking for anything that
- * stopped being a candidate, so a LATER re-park (the child leaves To Do and
- * comes back) starts a fresh floor rather than carrying a stale one.
+ * Tracking key for one (child, boss) PAIR — `parkedCandidates` emits one
+ * candidate per pair (a child can in principle be watched by more than one
+ * active boss), so tracking must be keyed on the pair too, not on the child
+ * alone: keying on the child alone means a child with two In Progress bosses
+ * has each poll's `observe(child, bossA)` immediately overwritten by
+ * `observe(child, bossB)` (and back again next poll), so the floor never
+ * matures and NOTHING is ever posted, at any stage, ever — a livelock, not a
+ * delay. Reachable in practice: `jira_link_issues` adds a link rather than
+ * moving one, and `briefs/story.md` tells an agent adopting an orphan ticket
+ * to re-link it, which can leave both the old and new Implements link in
+ * place.
+ */
+const pairKey = (childKey: string, boss: string): string => `${childKey}|${boss}`;
+
+/**
+ * Per-(child, boss)-pair in-memory floor + stage bookkeeping. `observe`
+ * starts the floor the first time a pair is seen as a candidate;
+ * `forgetMissing` drops tracking for any pair that stopped being a
+ * candidate, so a LATER re-park (the child leaves To Do and comes back, or
+ * comes back under a different boss) starts a fresh floor rather than
+ * carrying a stale one.
  */
 export class ParkedTracker {
   private readonly entries = new Map<string, Entry>();
   constructor(private readonly now: () => number) {}
 
-  /** Drop tracking for every key not in `stillCandidates` this poll. */
+  /** Drop tracking for every (child, boss) pair-key not in `stillCandidates` this poll. */
   forgetMissing(stillCandidates: ReadonlySet<string>): void {
     for (const key of [...this.entries.keys()]) if (!stillCandidates.has(key)) this.entries.delete(key);
   }
 
   /** This poll's observation for a currently-PARKED `childKey` watched by `boss`. */
   observe(childKey: string, boss: string): Entry {
-    const existing = this.entries.get(childKey);
-    if (existing && existing.boss === boss) return existing;
+    const key = pairKey(childKey, boss);
+    const existing = this.entries.get(key);
+    if (existing) return existing;
     const fresh: Entry = { boss, firstObservedAt: this.now() };
-    this.entries.set(childKey, fresh);
+    this.entries.set(key, fresh);
     return fresh;
   }
 }
@@ -193,7 +210,25 @@ export interface ParkedDetector {
  */
 export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
   const tracker = new ParkedTracker(deps.now);
+  // Keyed by the actual comment TARGET (never the origin boss) — the cap
+  // protects whichever ticket would actually receive the write. Stage 1/2
+  // always target the boss, so the cap is per-boss there as the ticket
+  // describes; stage 3 targets the grandboss (or the boss itself, in the
+  // terminal case), so a post that lands on the grandboss is counted
+  // against the grandboss's own budget, not silently exempted from it —
+  // otherwise several stories under one epic, each independently reaching
+  // stage 3, could exceed 3/hour on the epic without any single origin boss
+  // ever appearing to.
   const rateCap = new RateCap(MAX_PER_HOUR, HOUR_MS);
+  // One "rate cap reached" WARNING per target until it posts successfully
+  // again — mirrors escalation-loop.ts's `cappedPanes` set. Without this, a
+  // capped candidate never advances (postStage keeps returning null), so it
+  // re-enters the capped branch every 15s poll: a few hundred WARNING lines
+  // an hour with just four parked children under one boss. That matters
+  // more than usual here because the stage-3 terminal case leans on
+  // `journalctl | grep WARNING` being a channel an operator actually reads
+  // — flooding it undercuts the feature's own escape hatch.
+  const cappedLogged = new Set<string>();
   const minutesMs = deps.minutes * 60_000;
   const log = (line: string) => deps.log?.(line);
 
@@ -212,7 +247,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
    * exactly the same "delay, never fabricate" guarantee the floor itself
    * relies on.
    */
-  async function postStage(target: string, stageTag: "1" | "2" | "3", child: string, body: string, capKey: string): Promise<number | null> {
+  async function postStage(target: string, stageTag: "1" | "2" | "3", child: string, body: string): Promise<number | null> {
     const rows = await deps.comments(target).catch((e) => {
       log(`WARNING: [parked] comments fetch failed for ${target}: ${(e as Error)?.message ?? e}`);
       return null;
@@ -225,12 +260,16 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
       log(`[parked] adopted existing stage ${stageTag} escalation for ${child} on ${target} from comment ${existing.id} (daemon restart)`);
       return adoptedAt;
     }
-    if (!rateCap.allow(capKey, deps.now())) {
-      log(`WARNING: [parked] rate cap reached (${MAX_PER_HOUR}/hour) for ${capKey} — ${child} stage ${stageTag} logged only, not posted`);
+    if (!rateCap.allow(target, deps.now())) {
+      if (!cappedLogged.has(target)) {
+        cappedLogged.add(target);
+        log(`WARNING: [parked] rate cap reached (${MAX_PER_HOUR}/hour) for ${target} — ${child} stage ${stageTag} logged only, not posted (further cap hits for ${target} are logged only once until it frees up)`);
+      }
       return null;
     }
     await deps.addComment(target, body);
-    rateCap.record(capKey, deps.now());
+    rateCap.record(target, deps.now());
+    cappedLogged.delete(target);
     const postedAt = deps.now();
     log(`[parked] ${child} stage ${stageTag} posted on ${target}`);
     return postedAt;
@@ -239,7 +278,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
   async function check(issues: readonly JiraIssue[], related: readonly RelatedIssue[]): Promise<void> {
     try {
       const candidates = parkedCandidates(issues, related);
-      tracker.forgetMissing(new Set(candidates.map((c) => c.child.key)));
+      tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.child.key, c.boss))));
 
       for (const { child, boss } of candidates) {
         const e = tracker.observe(child.key, boss);
@@ -247,14 +286,14 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
 
         if (e.stage1At === undefined) {
           if (now - e.firstObservedAt < minutesMs) continue;
-          const at = await postStage(boss, "1", child.key, stage1Comment(child.key), boss);
+          const at = await postStage(boss, "1", child.key, stage1Comment(child.key));
           if (at !== null) e.stage1At = at;
           continue;
         }
 
         if (e.stage2At === undefined) {
           if (now - e.stage1At < minutesMs) continue;
-          const at = await postStage(boss, "2", child.key, stage2Comment(child.key), boss);
+          const at = await postStage(boss, "2", child.key, stage2Comment(child.key));
           if (at !== null) e.stage2At = at;
           continue;
         }
@@ -278,7 +317,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
           // OWN boss, from the boss's own links, is the "inward" end.
           const grandBoss = links.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
           if (grandBoss) {
-            const at = await postStage(grandBoss, "3", child.key, stage3EscalatedComment(child.key, boss), boss);
+            const at = await postStage(grandBoss, "3", child.key, stage3EscalatedComment(child.key, boss));
             if (at !== null) e.stage3At = at;
           } else {
             // Terminal case: the Implements chain in this fleet is
@@ -290,7 +329,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
             // and log a WARNING an operator's `journalctl | grep WARNING`
             // will actually surface.
             log(`WARNING: [parked] ${child.key} parked under ${boss}, which has no boss of its own to escalate to — re-posting on ${boss}`);
-            const at = await postStage(boss, "3", child.key, stage3TerminalComment(child.key), boss);
+            const at = await postStage(boss, "3", child.key, stage3TerminalComment(child.key));
             if (at !== null) e.stage3At = at;
           }
         }

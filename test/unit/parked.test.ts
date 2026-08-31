@@ -65,6 +65,13 @@ describe("parkedCandidates (pure predicate)", () => {
     const related = [rel(iss("CH", "To Do"), ["BOSS1", "BOSS2"])];
     expect(parkedCandidates(issues, related)).toEqual([{ child: related[0]!.issue, boss: "BOSS1" }]);
   });
+
+  test("a child watched by TWO In Progress bosses: both are candidates, as separate (child, boss) pairs", () => {
+    const issues = [iss("BOSS1", "In Progress"), iss("BOSS2", "In Progress")];
+    const related = [rel(iss("CH", "To Do"), ["BOSS1", "BOSS2"])];
+    const out = parkedCandidates(issues, related);
+    expect(out.map((c) => c.boss).sort()).toEqual(["BOSS1", "BOSS2"]);
+  });
 });
 
 /** A fake Jira comment store: addComment writes land here, newest-first, exactly like AtlassianClient.comments(). */
@@ -251,7 +258,44 @@ describe("createParkedDetector: escalation path (through addComment, per the tic
 
     now = 5 * MIN; await det.check(issues, related); // still within the hour window — still capped
     expect(jira.posted.length).toBe(3);
-    expect(logs.some((l) => l.startsWith("WARNING: [parked]") && l.includes("rate cap"))).toBe(true);
+    const rateCapLogs = logs.filter((l) => l.startsWith("WARNING: [parked]") && l.includes("rate cap"));
+    expect(rateCapLogs.length).toBeGreaterThan(0);
+    // Non-blocking review comment #1: the capped branch is re-entered on
+    // EVERY poll (CH2's stage 2 attempt at 2min, 3min, and 5min; CH1's
+    // stage 3 attempt at 3min and 5min — five capped attempts total, all
+    // targeting "BOSS") but must log only ONCE per target, not once per
+    // attempt — mirrors escalation-loop.ts's `cappedPanes` one-notice
+    // behaviour, so an operator's `journalctl | grep WARNING` isn't flooded.
+    expect(rateCapLogs.length).toBe(1);
+  });
+
+  test("REGRESSION (review finding): a child watched by TWO In Progress bosses escalates to BOTH, not neither — the tracker must key on (child, boss), not child alone", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    const det = createParkedDetector({ now: () => now, minutes: 10, addComment: jira.addComment, comments: jira.comments, links: jira.links });
+    const issues = [iss("BOSS1", "In Progress"), iss("BOSS2", "In Progress")];
+    const related = [rel(iss("CH", "To Do"), ["BOSS1", "BOSS2"])];
+
+    await det.check(issues, related); // both (CH,BOSS1) and (CH,BOSS2) floors start at 0
+    now = 5 * MIN; await det.check(issues, related); // still short of the threshold for either pair
+    expect(jira.posted).toEqual([]);
+
+    now = 10 * MIN; await det.check(issues, related); // both pairs cross the threshold on the SAME poll
+    expect(jira.posted.length).toBe(2);
+    const targets = jira.posted.map((p) => p.target).sort();
+    expect(targets).toEqual(["BOSS1", "BOSS2"]);
+    for (const p of jira.posted) {
+      expect(p.text.startsWith(MARKER)).toBe(true);
+      expect(p.text).toContain("fingerprint: CH");
+      expect(p.text).toContain("stage: 1");
+    }
+
+    // Keeps advancing independently per pair, not thrashing back to a fresh
+    // floor every poll (the livelock the bug produced: with the old
+    // child-only keying this never reaches a second post at all).
+    now = 20 * MIN; await det.check(issues, related); // stage 2 for both
+    expect(jira.posted.length).toBe(4);
+    expect(jira.posted.slice(2).map((p) => p.target).sort()).toEqual(["BOSS1", "BOSS2"]);
   });
 
   test("exclusion: under threshold never posts", async () => {
