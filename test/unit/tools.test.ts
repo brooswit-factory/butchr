@@ -2,6 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
+/** Defaults for the get_doc/set_doc ops (BUTCHR-33) shared by every rig() below; override per test as needed. */
+function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel">> = {}) {
+  return {
+    getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
+    getRemoteLink: async () => null,
+    upsertRemoteLink: async () => ({ id: 1 }),
+    getChildPages: async () => ({ results: [] }),
+    getPageLabels: async () => [],
+    createPageWithLabel: async () => ({ id: "999", title: "t", url: "https://x/999" }),
+    ...overrides,
+  };
+}
+
 function rig(roles: { story?: string; task?: string } = {}) {
   const calls: Array<[string, unknown[]]> = [];
   const rec = (name: string, result: unknown = { ok: name }) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
@@ -9,6 +22,7 @@ function rig(roles: { story?: string; task?: string } = {}) {
     getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
     transition: rec("transition"), createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
     assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages", { results: [] }), listSpaces: rec("listSpaces"),
+    ...fakeDocOps(),
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -21,8 +35,10 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
+      "get_doc",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
+      "set_doc",
     ]);
   });
   test("each tool routes to its op and audits the caller's issue", async () => {
@@ -71,6 +87,7 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
       linkIssues: async () => undefined, transition: async () => ({}), createIssue: async () => ({}),
       setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
@@ -106,6 +123,7 @@ describe("onWrite hook (own-write ledger feed)", () => {
       createIssue: async (p) => ({ key: `KAN-${p.summary.length}` }), setPriority: async () => ({ ok: true }),
       assign: async () => ({ ok: true }),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -184,6 +202,7 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
       linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
+      ...fakeDocOps(),
       ...opsOverrides,
     };
     const audits: string[] = [];
@@ -366,6 +385,7 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
       linkIssues: async () => ({}), transition: async () => ({}), createIssue: async () => ({ key: "KAN-1" }),
       setPriority: async () => undefined, assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
@@ -380,6 +400,7 @@ describe("confluence_update_page result normalization", () => {
       linkIssues: async () => ({}), transition: async () => ({}), createIssue: async () => ({}),
       setPriority: async () => ({}), assign: async () => ({}), createPage: async () => ({}), getPage: async () => ({}),
       updatePage: async () => undefined, searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.confluence_update_page!.handler({ id: "10715137", body: "<p>x</p>" }, { headers: {} } as any);
@@ -397,6 +418,7 @@ describe("confluence_search_pages", () => {
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"),
       searchPages: rec("searchPages", { results: [{ content: { id: "10715137" }, title: "The captain's log convention", url: "/spaces/SD/pages/10715137" }] }),
       listSpaces: rec("listSpaces", { results: [{ id: "196612", key: "SD" }] }),
+      ...fakeDocOps(),
       ...opsOverrides,
     };
     const tools = atlassianTools(ops, () => {});
@@ -463,6 +485,7 @@ describe("confluence_create_page parentId", () => {
       getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
       transition: rec("transition"), createIssue: rec("createIssue"), setPriority: rec("setPriority"),
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
+      ...fakeDocOps(),
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -486,6 +509,7 @@ describe("jira_assign (KAN-810)", () => {
       linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
+      ...fakeDocOps(),
       ...opsOverrides,
     };
     const audits: string[] = [];
@@ -540,5 +564,89 @@ describe("jira_assign (KAN-810)", () => {
     const { tools, audits, conn } = rig();
     await tools.jira_assign!.handler({ key: "KAN-1", assignee: "acct-x" }, conn);
     expect(audits.some((a) => a.includes("KAN-7") && a.includes("assign KAN-1 →"))).toBe(true);
+  });
+});
+
+describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
+  // docs.ts's own logic (recursive creation, pagination, the race retry) is
+  // covered exhaustively in test/unit/docs.test.ts — these tests only check
+  // that the tool layer resolves the right key from `x-issue` and never from
+  // an argument, and that set_doc's schema has no way to name another ticket.
+  function customRig(opsOverrides: Partial<AtlassianOps> = {}) {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ self: "https://fake.atlassian.net/rest/api/3/issue/1", fields: { summary: "s", issuelinks: [] } }),
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({}), transition: async () => ({}),
+      createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({ title: "t", body: { storage: { value: "b" } }, _links: {} }),
+      updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+      ...opsOverrides,
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools };
+  }
+
+  test("set_doc's input schema has no `key` field at all", () => {
+    const { tools } = customRig();
+    expect(Object.keys(tools.set_doc!.input).sort()).toEqual(["body", "title"]);
+  });
+
+  test("get_doc() with no args resolves to the caller's OWN key from x-issue, never an argument", async () => {
+    const seen: string[] = [];
+    const { tools } = customRig({ getRemoteLink: async (key) => { seen.push(key); return null; } });
+    await tools.get_doc!.handler({}, { headers: { "x-issue": "KAN-7" } } as any);
+    expect(seen).toEqual(["KAN-7"]);
+  });
+
+  test("get_doc(key) reads the GIVEN ticket's doc, not the caller's", async () => {
+    const seen: string[] = [];
+    const { tools } = customRig({ getRemoteLink: async (key) => { seen.push(key); return null; } });
+    await tools.get_doc!.handler({ key: "KAN-9" }, { headers: { "x-issue": "KAN-7" } } as any);
+    expect(seen).toEqual(["KAN-9"]);
+  });
+
+  test("get_doc never creates: a miss returns { found: false } without ever calling createPageWithLabel", async () => {
+    let createCalled = false;
+    const { tools } = customRig({ createPageWithLabel: async () => { createCalled = true; return { id: "1", title: "t", url: "https://x/1" }; } });
+    const result = await tools.get_doc!.handler({}, { headers: { "x-issue": "KAN-7" } } as any);
+    expect(result).toEqual({ found: false });
+    expect(createCalled).toBe(false);
+  });
+
+  test("get_doc refuses when the connection has no x-issue", async () => {
+    const { tools } = customRig();
+    await expect(tools.get_doc!.handler({}, { headers: {} } as any)).rejects.toThrow(/x-issue/);
+  });
+
+  test("set_doc always writes the CALLER's own doc from x-issue — no argument can target another ticket", async () => {
+    const seen: string[] = [];
+    const { tools } = customRig({ upsertRemoteLink: async (key: string) => { seen.push(key); return {}; } });
+    // Two upserts land here: ensureDoc's own (step 5, on lazy creation) plus
+    // set_doc's link-title refresh (the provisional title differs from "T") —
+    // both must still target only the caller's own key, never an argument.
+    await tools.set_doc!.handler({ body: "<p>x</p>", title: "T" }, { headers: { "x-issue": "KAN-7" } } as any);
+    expect(seen).toEqual(["KAN-7", "KAN-7"]);
+  });
+
+  test("set_doc refuses when the connection has no x-issue", async () => {
+    const { tools } = customRig();
+    await expect(tools.set_doc!.handler({ body: "x" }, { headers: {} } as any)).rejects.toThrow(/x-issue/);
+  });
+
+  test("set_doc fires onWrite for the caller's own key (the remote-link upsert bumps its `updated`)", async () => {
+    const writes: Array<[string[], string]> = [];
+    const { tools } = (() => {
+      const ops: AtlassianOps = {
+        getIssue: async () => ({ self: "https://fake.atlassian.net/rest/api/3/issue/1", fields: { summary: "s", issuelinks: [] } }),
+        search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({}), transition: async () => ({}),
+        createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
+        createPage: async () => ({}), getPage: async () => ({ title: "T", body: { storage: { value: "x" } }, _links: {} }),
+        updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+        ...fakeDocOps(),
+      };
+      return { tools: atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer])) };
+    })();
+    await tools.set_doc!.handler({ body: "<p>x</p>", title: "T" }, { headers: { "x-issue": "KAN-7" } } as any);
+    expect(writes).toEqual([[["KAN-7"], "KAN-7"]]);
   });
 });
