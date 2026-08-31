@@ -275,7 +275,7 @@ describe("summarize / formatTable", () => {
 });
 
 function fakeConfig(): Config {
-  return { atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" }, port: 7717, stalledMinutes: 10, pollStaleMs: 60_000, assignees: {}, captureDir: "/tmp/captures" };
+  return { atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" }, port: 7717, stalledMinutes: 10, idleDialogMinutes: 2, pollStaleMs: 60_000, assignees: {}, captureDir: "/tmp/captures" };
 }
 
 describe("fetchAllIssues", () => {

@@ -1,5 +1,6 @@
 import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
 import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
+import type { CaptureSink } from "./session-limit-watch.js";
 
 const FOLLOWUP_MS = 15 * 60_000;
 const DEBOUNCE_POLLS = 2;
@@ -19,6 +20,17 @@ export interface EscalatorDeps {
   comments: (issue: string) => Promise<CommentRow[]>;
   now: () => number;
   log: (line: string) => void;
+  /**
+   * BUTCHR-16: durable, LOCAL-DISK-ONLY landing spot for a blocked pane's
+   * full text at the moment it escalates — evidence for the NEXT unknown
+   * shape, since a pane holds no scrollback and the fixture for a dialog
+   * Claude Code stops showing is gone within hours (the effort-recommendation
+   * dialog this ticket exists to fix is the concrete case: nothing survived
+   * it but an operator's hand transcription). Optional and injected, like
+   * session-limit-watch's own CaptureSink: when absent, escalation behaves
+   * exactly as it did before this ticket (comment only, no capture).
+   */
+  captures?: CaptureSink;
 }
 
 interface PaneState {
@@ -70,6 +82,58 @@ function hashText(s: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Global cap on escalation capture files kept at once — same discipline as session-limit-watch's CAPTURE_MAX_FILES, kept separate because it recognizes a different filename shape and must never evict a session-limit capture (or vice versa). */
+const ESCALATION_CAPTURE_MAX_FILES = 50;
+
+/** `<ISSUE>-escalation-<compact-UTC-timestamp>.txt` — recognizes exactly the filenames this module writes, so eviction (and a shared BUTCHR_CAPTURE_DIR holding other files) never touches anything else's captures. */
+const ESCALATION_CAPTURE_NAME = /^[A-Z][A-Z0-9]*-\d+-escalation-(\d{8}T\d{6}Z)\.txt$/;
+
+function compactUtc(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d\d\dZ$/, "Z");
+}
+
+/**
+ * Durably capture the pane's full, UNREDACTED text to `deps.captures` at the
+ * moment a NEW escalation comment is about to post — never on an adopted or
+ * rate-capped one, since either means a comment (and, ordinarily, a capture)
+ * already exists for this fingerprint. Redaction is deliberately skipped
+ * here: this lands on local disk only (never Jira), exactly like
+ * session-limit-watch's own captures, and only the returned PATH — never the
+ * content — ever reaches `escalationComment`. Fails open: a capture failure
+ * is logged once and must never block the escalation comment itself from
+ * posting.
+ */
+async function captureEscalationText(deps: EscalatorDeps, paneId: string, issue: string): Promise<string | null> {
+  const sink = deps.captures;
+  if (!sink) return null;
+  try {
+    const text = await deps.read(paneId);
+    const capturedAt = deps.now();
+    const name = `${issue}-escalation-${compactUtc(capturedAt)}.txt`;
+    const header =
+      `# butchr escalation capture\n` +
+      `# issue: ${issue}\n` +
+      `# pane: ${paneId}\n` +
+      `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
+      `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
+      `\n`;
+    const all = await sink.list();
+    const ours = all
+      .map((n) => ({ n, m: ESCALATION_CAPTURE_NAME.exec(n) }))
+      .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
+      .map((x) => ({ name: x.n, ts: x.m[1]! }))
+      .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    while (ours.length >= ESCALATION_CAPTURE_MAX_FILES) {
+      const oldest = ours.shift()!;
+      await sink.remove(oldest.name);
+    }
+    return await sink.write(name, header + text);
+  } catch (e) {
+    deps.log(`escalation capture failed for ${issue} pane ${paneId}: ${(e as Error)?.message ?? e}`);
+    return null;
+  }
 }
 
 /**
@@ -174,9 +238,10 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     paneEscalations.set(paneId, recent);
     counted.add(fp);
     cappedPanes.delete(paneId);
-    await deps.addComment(issue, escalationComment(issue, prompt, fp));
+    const capturePath = await captureEscalationText(deps, paneId, issue);
+    await deps.addComment(issue, escalationComment(issue, prompt, fp, capturePath));
     s.escalatedAt = deps.now();
-    log(`escalated ${issue} fp=${fp} "${prompt.question.slice(0, 60)}"`);
+    log(`escalated ${issue} fp=${fp} "${prompt.question.slice(0, 60)}"${capturePath ? ` (captured to ${capturePath})` : ""}`);
   }
 
   async function handleDirective(paneId: string, issue: string, directive: Directive, s: PaneState): Promise<void> {

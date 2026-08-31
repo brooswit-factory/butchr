@@ -131,6 +131,56 @@ describe("un-numbered trust dialog (Claude Code 2.x)", () => {
   });
 });
 
+// BUTCHR-5/16: the effort-recommendation dialog that froze all five epic
+// agents for ~12 hours on 2026-08-30. See test/fixtures/
+// pane-cap-effort-recommendation.txt for what is real vs. reconstructed in
+// this fixture — the header there is stripped below, exactly like an
+// operator turns a capture-store file into a fixture (README.md).
+describe("settings-recommendation dialog: preserve the current setting BY CONTENT (BUTCHR-16)", () => {
+  const FIXTURE = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-effort-recommendation.txt"), "utf8");
+  const DELIM = "# --- reconstructed pane text follows ---\n";
+  const EFFORT_PANE = FIXTURE.slice(FIXTURE.indexOf(DELIM) + DELIM.length);
+
+  test("parses: question carries the recommendation, options in the transcribed order, option 1 highlighted", () => {
+    const p = parsePrompt(EFFORT_PANE)!;
+    expect(p).not.toBeNull();
+    expect(p.options).toEqual(["Switch Opus 5 to medium effort", "Keep high"]);
+    expect(p.current).toBe(1);
+  });
+
+  test("chooseStartupAnswer picks the option that PRESERVES the current setting ('Keep high'), by content", () => {
+    const p = parsePrompt(EFFORT_PANE)!;
+    expect(chooseStartupAnswer(p)).toBe(2);
+  });
+
+  test("REGRESSION: the SAME option is chosen when the vendor lists it FIRST instead — never by position", () => {
+    const reversed = { question: parsePrompt(EFFORT_PANE)!.question, options: ["Keep high", "Switch Opus 5 to medium effort"], current: 1 };
+    expect(chooseStartupAnswer(reversed)).toBe(1);
+  });
+
+  test("zero preserving options on a recommendation dialog escalates rather than guessing", () => {
+    const noPreserve = { question: "We recommend switching to the new renderer", options: ["Switch to the new renderer", "Exit"], current: 1 };
+    expect(chooseStartupAnswer(noPreserve)).toBeNull();
+  });
+
+  test("more than one plausible preserving option escalates rather than guessing", () => {
+    const ambiguous = { question: "We recommend Opus 5 at medium effort", options: ["Keep high", "Stay on the current setting"], current: 1 };
+    expect(chooseStartupAnswer(ambiguous)).toBeNull();
+  });
+
+  test("the 'recommended' wording on the UNRELATED resume-from-summary dialog is unaffected (ordering: the generic option-content rule wins first)", () => {
+    const REAL = `This session is 2d 12h old and 673.2k tokens.
+Resuming the full session will consume a substantial portion of your usage limits. We
+recommend resuming from a summary.
+❯ 1. Resume from summary (recommended)
+  2. Resume full session as-is
+  3. Don't ask me again
+Enter to confirm · Esc to cancel`;
+    const p = parsePrompt(REAL)!;
+    expect(chooseStartupAnswer(p)).toBe(1);
+  });
+});
+
 describe("bypass-permissions acceptance dialog", () => {
   test("accepts by content (option 2), never the leading exit", () => {
     const p = parsePrompt(` You are running in Bypass
