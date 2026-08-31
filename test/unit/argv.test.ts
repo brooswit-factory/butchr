@@ -60,6 +60,19 @@ describe("checkArgv", () => {
     expect(checkArgv(expected, observed)).toEqual({ ok: true });
   });
 
+  // The fleet as it exists on deploy day: every agent currently running was
+  // spawned before --effort existed, so its argv carries the flag not at all
+  // (not merely a different value). That must not read as stale either, or
+  // the first deploy of this feature respawns every running agent at once.
+  test("an agent spawned before --effort existed does not read as stale", () => {
+    const expected = spawnArgs(spec, "/w/KAN-783");
+    const withEffort = spawnArgs(spec, "/w/KAN-783");
+    const i = withEffort.indexOf("--effort");
+    const observed = [...withEffort.slice(0, i), ...withEffort.slice(i + 2)]; // the pre-feature argv
+    expect(observed).not.toContain("--effort");
+    expect(checkArgv(expected, observed)).toEqual({ ok: true });
+  });
+
   test("a wrong --mcp-config path -> stale", () => {
     const expected = spawnArgs(spec, "/w/KAN-783");
     const observed = spawnArgs(spec, "/w/SOMEWHERE-ELSE");
