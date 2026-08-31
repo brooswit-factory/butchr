@@ -203,5 +203,22 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       const base = created?._links?.base ?? `${cfg.site}/wiki`;
       return { id: created.id, title: created.title, url: `${base}${created?._links?.webui ?? ""}` };
     },
+
+    // Read-modify-write: `fields.labels` on editIssue takes the FULL desired
+    // array (same as createIssue's `labels`, confirmed by that existing
+    // usage above) — there is no additive "add a label" endpoint, so this
+    // reads the issue's current labels first and unions them in itself.
+    addLabels: async (key, labels) => {
+      const current: any = await jira.issues.getIssue({ issueIdOrKey: key, fields: ["labels"] });
+      const existing: string[] = current?.fields?.labels ?? [];
+      const merged = [...new Set([...existing, ...labels])];
+      return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: merged } });
+    },
+
+    // MEASURED live against the BUTCHR space (BUTCHR-35): DELETE with no
+    // `purge` param returns 204 and moves the page to the trash (status
+    // "trashed", parentId cleared) rather than purging it — see the
+    // AtlassianOps doc comment for what that does and doesn't guarantee.
+    deletePage: (id) => wiki.page.deletePage({ id }),
   };
 }

@@ -61,4 +61,26 @@ export interface AtlassianOps {
    * content API takes the space's key, not its numeric id.
    */
   createPageWithLabel(p: { spaceKey: string; parentId: string; title: string; body: string; label: string }): Promise<{ id: string; title: string; url: string }>;
+
+  /**
+   * Read-modify-write: unions `labels` into the issue's CURRENT label set and
+   * writes the result back. NEVER removes an existing label — there is no
+   * other way to set a label on an issue that already exists (labels can
+   * otherwise only be set at creation), and a naive replace would silently
+   * destroy whatever labels the ticket already carried (src/tools/relationship.ts,
+   * shelve_worker).
+   */
+  addLabels(key: string, labels: readonly string[]): Promise<unknown>;
+
+  /**
+   * Move a Confluence page to the trash (MEASURED live against the BUTCHR
+   * space, BUTCHR-35: a v2 DELETE with no `purge` param returns 204, and a
+   * follow-up GET on the same id still 200s with `status: "trashed"` and
+   * `parentId: null` — the page is gone from its parent's children, so
+   * ensureDoc's exhaustive child scan will never re-discover it, but it is
+   * NOT permanently purged). Used only to roll back a page THIS process just
+   * created a moment ago; see relationship.ts's rule-(d) comment for why that
+   * is not the doc convention's "nothing is archived" rule in disguise.
+   */
+  deletePage(id: string): Promise<unknown>;
 }

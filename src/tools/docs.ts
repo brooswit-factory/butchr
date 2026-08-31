@@ -50,7 +50,14 @@ function provisionalBody(key: string, ticketUrl: string): string {
   return `<p>This doc was created together with <a href="${ticketUrl}">${key}</a>. It has not been written yet and is not a record of anything.</p>`;
 }
 
-function findBossKey(issue: unknown): string | null {
+/**
+ * Exported (BUTCHR-35, approved by BUTCHR-27): the Implements link direction
+ * is the single most commonly inverted fact in this fleet — on the
+ * implementer, the boss is the INWARD side — and one shared reader means one
+ * place to be wrong and one place to fix, instead of five relationship verbs
+ * (src/tools/relationship.ts) each growing their own version of this read.
+ */
+export function findBossKey(issue: unknown): string | null {
   const links = (issue as { fields?: { issuelinks?: unknown[] } })?.fields?.issuelinks ?? [];
   for (const l of links as Array<{ type?: { name?: string }; inwardIssue?: { key?: string } }>) {
     // On the IMPLEMENTER (this ticket), its boss appears as `inwardIssue` — see
