@@ -47,6 +47,15 @@ export interface Config {
    */
   idleDialogMinutes: number;
   /**
+   * BUTCHR-18/BUTCHR-6: how long, in ms, `/health` tolerates the poll loop
+   * going without a successfully-completed cycle before reporting it stale —
+   * also doubles as the startup grace period (see src/daemon/health.ts).
+   * Default 60_000 (a 4x multiple of the loop's 15s `intervalMs`, src/daemon/
+   * index.ts): a small multiple, not 15s exactly, so one slow Jira call
+   * doesn't flap it red.
+   */
+  pollStaleMs: number;
+  /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
    * issuetype. Both are optional so a daemon that only ever reads Jira still
    * boots; the refusal for an unstaffable Story/Task happens per-call, at
@@ -74,6 +83,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
+  BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
@@ -100,6 +110,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
+  const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
+  if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
@@ -111,6 +123,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     idleDialogMinutes,
+    pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -138,6 +151,6 @@ const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} idleDialogMinutes=${c.idleDialogMinutes} ` +
+  `stalledMinutes=${c.stalledMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
   `captureDir=${c.captureDir}`;
