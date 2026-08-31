@@ -203,5 +203,24 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       const base = created?._links?.base ?? `${cfg.site}/wiki`;
       return { id: created.id, title: created.title, url: `${base}${created?._links?.webui ?? ""}` };
     },
+
+    // Read-modify-write: `fields.labels` on editIssue takes the FULL desired
+    // array (same as createIssue's `labels`, confirmed by that existing
+    // usage above) — there is no additive "add a label" endpoint, so this
+    // reads the issue's current labels first and unions them in itself.
+    addLabels: async (key, labels) => {
+      const current: any = await jira.issues.getIssue({ issueIdOrKey: key, fields: ["labels"] });
+      const existing: string[] = current?.fields?.labels ?? [];
+      const merged = [...new Set([...existing, ...labels])];
+      return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: merged } });
+    },
+
+    // MEASURED against this daemon's own credential (BUTCHR-35, 2026-08-31):
+    // GET /rest/api/3/mypermissions?projectKey=BUTCHR&permissions=DELETE_ISSUES
+    // returned {"DELETE_ISSUES":{...,"havePermission":false}}, and a live
+    // create-then-delete round trip on a throwaway Epic 403'd with "You do
+    // not have permission to delete issues in this project." — see the
+    // AtlassianOps doc comment for why this op is called anyway.
+    deleteIssue: (key) => jira.issues.deleteIssue({ issueIdOrKey: key }),
   };
 }
