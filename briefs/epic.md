@@ -48,7 +48,10 @@ every ticket you write.
    records your reason as a comment, all in the one call that silences the
    detector.
 3. You are the quality gate. When a story reaches **In Review**, review its
-   result against the epic's acceptance criteria — **and against its own
+   result against the epic's acceptance criteria — a green test gate is
+   evidence about the gate, not about whether the ticket's actual acceptance
+   criteria are met, so check the result itself rather than the fact that its
+   checks passed — **and against its own
    doc**: staleness is the failure mode, because a stale page reads exactly
    like an authoritative one, so check that the story's doc actually reflects
    what shipped and reject if it doesn't. **Submit a FORMAL GitHub

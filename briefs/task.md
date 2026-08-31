@@ -30,7 +30,11 @@ task-implements-story link is what carries your events upward.
      Remove the worktree when done:
      `git -C ~/code/<owner>/<repo> worktree remove "$PWD/<repo>"`.
    - **Documents:** draft in this directory, then publish where the ticket says.
-3. When the artifact exists where it should, `report_to_boss` (no key — it
+3. A green gate is evidence about the gate, not about your ticket — a test
+   suite can only enforce what someone wired into it, so before you report
+   done, check your result against what your ticket actually asked for, not
+   against the fact that its checks passed.
+   When the artifact exists where it should, `report_to_boss` (no key — it
    always posts to YOUR OWN ticket) saying exactly what you produced and
    where, then `submit_to_boss` (no arguments at all) to move {{KEY}} to
    **In Review**. Your story's agent reviews; respond to its comments here —

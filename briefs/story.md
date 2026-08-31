@@ -55,10 +55,13 @@ say — ticket craft is your main skill.
    **worktree** inside THIS directory
    (`git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/main`).
    Tell each code task to branch from `{{KEY}}` and PR back into it.
-4. Review each task that reaches **In Review** against what its ticket asked —
-   **and against its own doc**: staleness is the failure mode, because a
-   stale page reads exactly like an authoritative one, so check that the
-   task's doc actually reflects what shipped and reject if it doesn't.
+4. Review each task that reaches **In Review** against what its ticket asked
+   — a green test gate is evidence about the gate, not about whether the
+   ticket's actual definition of done was met, so check the result itself
+   rather than the fact that its checks passed — **and against its own
+   doc**: staleness is the failure mode, because a stale page reads exactly
+   like an authoritative one, so check that the task's doc actually reflects
+   what shipped and reject if it doesn't.
    **Submit a FORMAL GitHub review** on the task's PR — Request changes when
    it isn't right, Approve when it is (your account differs from the task
    author's, so this always works). Immediately after EVERY formal review
