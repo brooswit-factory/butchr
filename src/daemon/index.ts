@@ -3,6 +3,7 @@ import { HerdrClient } from "@brooswit/herdr-sdk";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
+import { createLoopHealth } from "./health.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchedKeys } from "../jira-watch/routes.js";
@@ -73,6 +74,15 @@ const recordOwnWrite = (keys: readonly string[], writer: string) => {
   })();
 };
 
+// Poll-loop liveness (BUTCHR-18/BUTCHR-6): a positive heartbeat, recorded by
+// startLoop's onPollSuccess below, independent of onError — see health.ts for
+// why onError alone can't be the liveness source.
+const loopHealth = createLoopHealth({
+  name: "pollLoop",
+  thresholdMs: config.pollStaleMs,
+  log: (line) => console.error(line),
+});
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -88,6 +98,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
+  health: () => loopHealth.status(),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -232,6 +243,7 @@ startLoop({
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
+  onPollSuccess: () => loopHealth.recordSuccess(),
 });
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
