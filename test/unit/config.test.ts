@@ -56,6 +56,16 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("pollStaleMs defaults to 60000, honours BUTCHR_POLL_STALE_MS, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).pollStaleMs).toBe(60_000);
+    expect(loadConfig({ ...base, BUTCHR_POLL_STALE_MS: "30000" }, noRead).pollStaleMs).toBe(30_000);
+    expect(() => loadConfig({ ...base, BUTCHR_POLL_STALE_MS: "0" }, noRead)).toThrow(/BUTCHR_POLL_STALE_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_POLL_STALE_MS: "nope" }, noRead)).toThrow(/BUTCHR_POLL_STALE_MS/);
+  });
+  test("describeConfig includes pollStaleMs", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("pollStaleMs=60000");
+  });
+
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
     const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
     expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });

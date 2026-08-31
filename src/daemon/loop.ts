@@ -69,6 +69,15 @@ export interface LoopDeps {
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
+  /**
+   * Called once a poll cycle (search + reconcile + related + label sync) has
+   * completed successfully — the positive heartbeat `/health` liveness is
+   * built on (see src/daemon/health.ts). Deliberately NOT the same signal as
+   * `onError`: `onError` only fires when the fetch stage rejects, which
+   * misses a loop that dies silently (BUTCHR-18/BUTCHR-6) — liveness must
+   * come from the absence of a success, not the presence of an error.
+   */
+  onPollSuccess?: () => void;
 }
 
 /** How many polls a just-respawned issue is shielded from a further respawn. */
@@ -205,6 +214,7 @@ export function startLoop(deps: LoopDeps): Stop {
       });
       const related = deps.related ? await deps.related([...desired.keys()]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
+      deps.onPollSuccess?.();
       return { issues, related };
     },
     async (next, prev) => {
