@@ -65,7 +65,11 @@ describe("briefFor / modelFor", () => {
   test("epic and story briefs teach the boss-side relationship verbs", () => {
     for (const t of ["Epic", "Story"]) {
       const brief = briefFor(t);
-      for (const verb of ["new_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker"]) {
+      // start_worker added by BUTCHR-42: it was absent from every brief, so
+      // reactivating a shelved worker or pulling one back from In Review had
+      // no documented route. Its presence in this per-tier loop is itself
+      // the guard that would have caught that gap.
+      for (const verb of ["new_worker", "start_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker"]) {
         expect(brief).toContain(verb);
       }
     }
@@ -76,6 +80,62 @@ describe("briefFor / modelFor", () => {
       for (const verb of ["report_to_boss", "ask_boss", "submit_to_boss"]) {
         expect(brief).toContain(verb);
       }
+    }
+  });
+  // BUTCHR-42: GAP 1 — start_worker is also the verb that reverses
+  // shelve_worker, so it belongs right where shelve_worker is taught, in
+  // both epic.md and story.md individually (a per-tier check, not just the
+  // aggregate verb-list guard above, since a brief could name the verb
+  // without covering both reactivation cases).
+  test("epic and story briefs teach start_worker covering both the shelved-reactivation and In-Review-back-to-work cases", () => {
+    for (const t of ["Epic", "Story"]) {
+      const brief = briefFor(t);
+      expect(brief).toContain("start_worker");
+      expect(brief).toContain("back from In Review");
+    }
+  });
+  // BUTCHR-42: GAP 3 — ask_boss was taught in story.md/task.md/default.md
+  // but missing from epic.md specifically, right where "too vague to
+  // decompose" already told an epic agent to comment and stop. An aggregate
+  // check across all briefs would have missed this (ask_boss was already
+  // present elsewhere); this guard is Epic-specific on purpose.
+  test("epic brief names ask_boss for a too-vague-to-decompose epic description", () => {
+    const brief = briefFor("Epic");
+    expect(brief).toContain("ask_boss");
+    expect(brief).toContain("too vague to decompose");
+  });
+  // BUTCHR-42: GAP 2 — jira_get_issue, jira_search, jira_add_comment,
+  // confluence_search_pages and confluence_list_spaces are retained
+  // PERMANENTLY (never deprecated, on no removal clock) but that was never
+  // stated anywhere. Each guard below is per-tier and only covers the
+  // briefs where the ticket confirmed the name is actually used, so a
+  // future rewrite can't satisfy it by adding the word "permanent" to one
+  // brief while leaving the other silent.
+  test("every brief marks jira_get_issue as a permanent lookup", () => {
+    for (const t of ["Epic", "Story", "Task", "Bug"]) {
+      expect(briefFor(t)).toContain("permanent lookup");
+    }
+  });
+  test("epic, story, and task briefs mark jira_search as permanent alongside jira_get_issue", () => {
+    for (const t of ["Epic", "Story", "Task"]) {
+      const brief = briefFor(t);
+      expect(brief).toContain("jira_search");
+      expect(brief.toUpperCase()).toContain("PERMANENTLY");
+    }
+  });
+  test("epic and story briefs teach jira_add_comment as the permanent sideways peer channel", () => {
+    for (const t of ["Epic", "Story"]) {
+      const brief = briefFor(t);
+      expect(brief).toContain("jira_add_comment");
+      expect(brief.toLowerCase()).toContain("sideways");
+      expect(brief.toUpperCase()).toContain("PERMANENT");
+    }
+  });
+  test("epic and story briefs teach confluence_search_pages/confluence_list_spaces as permanent discovery tools", () => {
+    for (const t of ["Epic", "Story"]) {
+      const brief = briefFor(t);
+      expect(brief).toContain("confluence_search_pages");
+      expect(brief).toContain("confluence_list_spaces");
     }
   });
   test("every brief points at the ASSIST space", () => {
