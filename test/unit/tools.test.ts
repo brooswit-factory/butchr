@@ -33,12 +33,12 @@ function rig(roles: { story?: string; task?: string } = {}) {
 }
 
 describe("atlassianTools", () => {
-  test("exposes the full proxy surface — alias-completeness: every pre-existing name still resolves, plus the ten relationship verbs (BUTCHR-35)", () => {
+  test("exposes the full proxy surface — alias-completeness: every pre-existing name still resolves, plus the ten relationship verbs (BUTCHR-35) and file_where_it_belongs (BUTCHR-37)", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
-      "finish_worker",
+      "file_where_it_belongs", "finish_worker",
       "get_doc",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
@@ -810,5 +810,71 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(d).toMatch(/GUARANTEES/);
     expect(d).toMatch(/set_doc/);
     expect(d).toMatch(/rolled back|ROLLED BACK|delete the ticket/i);
+  });
+});
+
+describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, audit, onWrite", () => {
+  function rigOrphan(roles: { story?: string; task?: string } = { story: "acct-story", task: "acct-task" }) {
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) =>
+        key === "KAN-1"
+          ? { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } }
+          : { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } },
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    return { ops, tools: atlassianTools(ops, () => {}, roles) };
+  }
+
+  test("refuses a connection with no x-issue, in the get_doc/set_doc shape", async () => {
+    const { tools } = rigOrphan();
+    await expect(tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "KAN-1" }, { headers: {} } as any))
+      .rejects.toThrow(/this connection has no x-issue/);
+  });
+
+  test("schema: summary/issuetype/destination required, description/priority optional, and NO disposition parameter at all", () => {
+    const { tools } = rigOrphan();
+    expect(Object.keys(tools.file_where_it_belongs!.input).sort()).toEqual(["description", "destination", "issuetype", "priority", "summary"]);
+  });
+
+  test("end-to-end through the tool layer: destination reaches relationship.ts, onWrite fires for the new key and the notice target, audit line names the verb and issuetype", async () => {
+    const writes: Array<[string[], string]> = [];
+    const audits: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } }),
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    const tools = atlassianTools(ops, (l) => audits.push(l), { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "KAN-1" }, conn)) as { key: string; noticeTarget: string };
+    expect(result.key).toBe("KAN-42");
+    expect(result.noticeTarget).toBe("KAN-1");
+    expect(writes).toEqual([[["KAN-42", "KAN-1"], "KAN-1"]]);
+    expect(audits.some((a) => a.includes('file_where_it_belongs issuetype=Task destination="KAN-1"'))).toBe(true);
+  });
+
+  test("the description names both destination shapes, the no-disposition rationale, and NEVER claims to be the only orphan route (jira_create_issue's implements:\"none\" still works)", () => {
+    const { tools } = rigOrphan();
+    const d = tools.file_where_it_belongs!.description;
+    expect(d).toMatch(/EXISTING EPIC KEY/);
+    expect(d).toMatch(/brand-new epic/);
+    expect(d).toMatch(/NO DISPOSITION/);
+    expect(d).toMatch(/CASE B CREATES NO LINK/);
+    expect(d).toMatch(/file_for_another_boss/); // the design-history sentence, per BUTCHR-29's own instruction
+  });
+
+  test("jira_create_issue's description no longer claims to be the ONLY orphan route, but implements:\"none\" behavior is untouched", async () => {
+    const { tools, ops } = rigOrphan();
+    expect(tools.jira_create_issue!.description).toMatch(/file_where_it_belongs/);
+    expect(tools.jira_create_issue!.description).not.toMatch(/ONLY way to file/);
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "none", assignee: "acct-x" }, conn)) as { key?: string };
+    expect(result.key).toBe("KAN-42");
+    void ops;
   });
 });
