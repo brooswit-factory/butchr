@@ -12,3 +12,8 @@ defect worth reporting.
 {{GROUND_TRUTH}}
 
 The same block is also in `ENVIRONMENT.md` in this directory, unchanged.
+
+The assistant documents how this factory works, how to verify anything in it,
+and how it fails, in the ASSIST Confluence space:
+https://wroosbit.atlassian.net/wiki/spaces/ASSIST — worth a visit before you
+assume something is broken rather than expected.
