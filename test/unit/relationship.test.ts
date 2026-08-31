@@ -51,6 +51,7 @@ function makeWorld() {
           project: { key: i.project },
           status: { name: i.status },
           labels: i.labels,
+          assignee: i.assignee ? { accountId: i.assignee } : null,
           issuelinks: i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : [],
         },
       };
@@ -129,10 +130,6 @@ function makeWorld() {
     addLabels: async (key: string, labels: readonly string[]) => {
       const i = requireIssue(key);
       i.labels = [...new Set([...i.labels, ...labels])];
-      return { ok: true };
-    },
-    deletePage: async (id: string) => {
-      if (!pages.delete(id)) throw new Error(`fake world: no such page ${id}`);
       return { ok: true };
     },
     deleteIssue: async (key: string) => {
@@ -477,16 +474,47 @@ describe("adoptWorker", () => {
     await expect(adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" })).rejects.toThrow(/cannot be adopted/);
   });
 
-  test("IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing and is not an error", async () => {
+  test("IDEMPOTENT: a ticket already linked, assigned by role, AND already in the state its disposition names changes nothing and is not an error", async () => {
     const { ops, addIssue, issues, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
-    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "already-correct", status: "In Progress" });
-    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "should be ignored" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress" });
+    let assignCalls = 0, linkCalls = 0, transitionCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
     expect(result.alreadyAdopted).toBe(true);
+    expect(assignCalls).toBe(0);
+    expect(linkCalls).toBe(0);
+    expect(transitionCalls).toBe(0);
     const w = issues.get("BUTCHR-9")!;
-    expect(w.assignee).toBe("already-correct"); // NOT overwritten with roles.task
-    expect(w.status).toBe("In Progress"); // NOT transitioned to To Do by the ignored "shelve"
+    expect(w.assignee).toBe(ROLES.task);
+    expect(w.status).toBe("In Progress");
+  });
+
+  test("THE RECOVERY-PATH BUG: a ticket that is already linked and assigned but NOT YET DECLARED (new_worker's own worst-case partial state on a deployment where deleteIssue is refused) is NOT reported as already adopted — the disposition is genuinely applied, not silently skipped", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Linked AND assigned already (as new_worker's steps 1-2 would leave it),
+    // but still To Do with NO exemption label — undeclared, exactly what the
+    // parked-ticket detector escalates on.
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "To Do" });
+    let assignCalls = 0, linkCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false); // NOT a no-op
+    expect(assignCalls).toBe(0); // already correct — not redundantly re-written
+    expect(linkCalls).toBe(0); // already correct — not redundantly re-written
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // the disposition WAS actually applied
   });
 
   test("shelve disposition on a fresh adoption sets the label additively and posts the reason", async () => {
@@ -499,6 +527,39 @@ describe("adoptWorker", () => {
     expect(w.status).toBe("To Do");
     expect(w.labels).toContain("team:infra");
     expect(w.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("shelve disposition on an already-Story-in-To-Do doesn't attempt a self-transition (label + comment only)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do" });
+    let transitionCalls = 0;
+    const spied: AtlassianOps = { ...ops, transition: async (...a) => { transitionCalls++; return ops.transition(...a); } };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "later" });
+    expect(transitionCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("ORDERING: a fresh-adoption shelve labels BEFORE transitioning — if addLabels fails, the ticket is NOT left To Do without the label", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
+    const broken: AtlassianOps = { ...ops, addLabels: async () => { throw new Error("label write refused"); } };
+    await expect(adoptWorker(broken, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "later" })).rejects.toThrow(/label write refused/);
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // NOT transitioned to To Do — never parked-looking
+  });
+});
+
+describe("shelveWorker: ORDERING — label before transition", () => {
+  test("if addLabels fails, the ticket is NOT left To Do without the exemption label (the parked-looking state)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    const broken: AtlassianOps = { ...ops, addLabels: async () => { throw new Error("label write refused"); } };
+    await expect(shelveWorker(broken, "BUTCHR-1", "BUTCHR-2", "later")).rejects.toThrow(/label write refused/);
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress"); // never transitioned — the addLabels call comes first
   });
 });
 

@@ -215,12 +215,6 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: merged } });
     },
 
-    // MEASURED live against the BUTCHR space (BUTCHR-35): DELETE with no
-    // `purge` param returns 204 and moves the page to the trash (status
-    // "trashed", parentId cleared) rather than purging it — see the
-    // AtlassianOps doc comment for what that does and doesn't guarantee.
-    deletePage: (id) => wiki.page.deletePage({ id }),
-
     // MEASURED against this daemon's own credential (BUTCHR-35, 2026-08-31):
     // GET /rest/api/3/mypermissions?projectKey=BUTCHR&permissions=DELETE_ISSUES
     // returned {"DELETE_ISSUES":{...,"havePermission":false}}, and a live

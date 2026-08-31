@@ -31,6 +31,15 @@ function issuetypeOf(issue: unknown): string | undefined {
 function projectKeyOf(issue: unknown): string | undefined {
   return (issue as { fields?: { project?: { key?: string } } })?.fields?.project?.key;
 }
+function statusOf(issue: unknown): string | undefined {
+  return (issue as { fields?: { status?: { name?: string } } })?.fields?.status?.name;
+}
+function assigneeAccountIdOf(issue: unknown): string | undefined {
+  return (issue as { fields?: { assignee?: { accountId?: string } | null } })?.fields?.assignee?.accountId;
+}
+function labelsOf(issue: unknown): string[] {
+  return (issue as { fields?: { labels?: string[] } })?.fields?.labels ?? [];
+}
 
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
 const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
@@ -236,8 +245,15 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
 export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerKey: string, reason: string): Promise<void> {
   if (!reason.trim()) throw new Error("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   await assertOwnWorker(ops, "shelve_worker", callerKey, workerKey);
-  await ops.transition(workerKey, "To Do");
+  // LABEL BEFORE TRANSITION, on purpose (order the writes by how bad it is to
+  // stop there, the same principle newWorker uses): if the label write fails
+  // after the transition, the ticket is left To Do, assigned, under a live
+  // boss, with NO exemption label — a textbook parked child, indistinguishable
+  // from one nobody ever declared. Labelling first means a partial failure
+  // instead leaves the ticket In Progress carrying an inert label — harmless,
+  // since the parked-ticket detector only ever looks at To Do tickets.
   await ops.addLabels(workerKey, [EXEMPT_LABEL]);
+  await ops.transition(workerKey, "To Do");
   await ops.addComment(workerKey, tagComment(callerKey, reason));
 }
 
@@ -251,12 +267,30 @@ export interface AdoptWorkerResult {
 /**
  * Takes ownership of an existing ticket: infers the assignee from the
  * ADOPTED ticket's own type, links it (Implements, outward) to `callerKey`,
- * and ensures its doc. IDEMPOTENT — if `workerKey` is already correctly
- * adopted by `callerKey` (assignee/link already correct), the assign/link
- * steps and the disposition are skipped entirely and this changes nothing;
+ * and ensures its doc. IDEMPOTENT on the FULL adopted state — link, assignee
+ * AND disposition — not on the link alone: `alreadyAdopted` is true only
+ * when the ticket is already linked to `callerKey`, already assigned by
+ * role, and already sitting in the state its disposition names (In Progress
+ * for "start"; To Do WITH the exemption label for "shelve" — matching the
+ * glossary's own definition of SHELVED). Only then are the assign/link/
+ * disposition writes skipped entirely.
+ *
+ * THIS MATTERS BEYOND ORDINARY IDEMPOTENCE: it is the documented recovery
+ * path from `newWorker`'s own worst-case partial state. On a deployment
+ * where `deleteIssue` is refused (measured, BUTCHR-35), a step-2/3 failure
+ * in `newWorker` can leave a ticket that is linked and assigned but NOT yet
+ * declared (no disposition applied) — an undeclared worker under a live
+ * boss, exactly what the parked-ticket detector exists to catch. The
+ * documented repair is calling `adopt_worker` again with a disposition. If
+ * "already adopted" were decided from the link alone, that repair call
+ * would see the link, call itself done, and silently skip the disposition
+ * — leaving the worker undeclared FOREVER while reporting success. Deciding
+ * from the full state closes that: a linked-but-undeclared ticket is NOT
+ * "already adopted", so the disposition is applied for real.
+ *
  * `ensureDoc` still runs unconditionally as a no-op-when-already-present
- * safety net, in case a prior partial adoption left the ticket linked but
- * undocumented. Refuses a ticket already linked to a DIFFERENT boss.
+ * safety net, regardless of `alreadyAdopted`. Refuses a ticket already
+ * linked to a DIFFERENT boss.
  */
 export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
@@ -269,26 +303,34 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     throw new Error(`adopt_worker: ${workerKey} is already linked to a different boss (${existingBoss}) — stealing another boss's worker must be an explicit act, not a side effect of a mistyped key; use jira_link_issues only if this is deliberate`);
   }
 
-  const alreadyAdopted = existingBoss === callerKey;
+  const issuetype = issuetypeOf(issue) as "Story" | "Task" | undefined;
+  if (issuetype !== "Story" && issuetype !== "Task") {
+    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
+  }
+  const role = issuetype === "Story" ? roles.story : roles.task;
+  if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
+
+  const linkedCorrectly = existingBoss === callerKey;
+  const assignedCorrectly = assigneeAccountIdOf(issue) === role;
+  const currentStatus = statusOf(issue);
+  const dispositionAlreadyApplied =
+    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labelsOf(issue).includes(EXEMPT_LABEL);
+  const alreadyAdopted = linkedCorrectly && assignedCorrectly && dispositionAlreadyApplied;
+
   if (!alreadyAdopted) {
-    const issuetype = issuetypeOf(issue) as "Story" | "Task" | undefined;
-    if (issuetype !== "Story" && issuetype !== "Task") {
-      throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
-    }
-    const role = issuetype === "Story" ? roles.story : roles.task;
-    if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
-    await ops.assign(workerKey, role);
-    await ops.linkIssues(workerKey, callerKey, "Implements");
+    if (!assignedCorrectly) await ops.assign(workerKey, role);
+    if (!linkedCorrectly) await ops.linkIssues(workerKey, callerKey, "Implements");
   }
 
   const doc = await ensureDoc(ops, workerKey);
 
-  if (!alreadyAdopted) {
+  if (!alreadyAdopted && !dispositionAlreadyApplied) {
     if (disposition.kind === "start") {
       await ops.transition(workerKey, "In Progress");
     } else {
-      await ops.transition(workerKey, "To Do");
+      // Label before transition — see shelveWorker's comment for why.
       await ops.addLabels(workerKey, [EXEMPT_LABEL]);
+      if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
       await ops.addComment(workerKey, tagComment(callerKey, disposition.reason));
     }
   }

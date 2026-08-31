@@ -73,29 +73,6 @@ export interface AtlassianOps {
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 
   /**
-   * Move a Confluence page to the trash. MEASURED live against the BUTCHR
-   * space (BUTCHR-35, 2026-08-31): a v2 DELETE with no `purge` param returns
-   * 204, and a follow-up GET on the same id still 200s with `status:
-   * "trashed"` and `parentId: null` — the page is gone from its parent's
-   * children (so ensureDoc's exhaustive child scan will never re-discover
-   * it), while a human with trash access can still restore it. THIS IS A
-   * BETTER FIT FOR RULE (d) ("nothing is archived") THAN A PURGE, NOT A
-   * WORSE ONE: a rollback that trashes removes a half-made page from normal
-   * discovery without irreversibly destroying it, which is the least-drastic
-   * tool that still does the job.
-   *
-   * NOT currently called by `new_worker`'s own rollback: BUTCHR-33's
-   * `ensureDoc` is convergent under retry, which lets doc creation go LAST
-   * in `new_worker`'s write order — a doc-step failure there is completed by
-   * that ticket's own first `set_doc` call rather than something to undo
-   * (nothing retries automatically; see relationship.ts's `newWorker` doc
-   * comment). Kept as a real, measured op — directed explicitly on
-   * BUTCHR-35 — for whichever future write needs to remove a page it just
-   * created.
-   */
-  deletePage(id: string): Promise<unknown>;
-
-  /**
    * Delete a Jira issue outright — `new_worker`'s compensating rollback for a
    * ticket it just created a moment ago, when the Implements link or the
    * disposition write that must immediately follow it fails (src/tools/
