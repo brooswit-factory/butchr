@@ -621,8 +621,11 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
   test("set_doc always writes the CALLER's own doc from x-issue — no argument can target another ticket", async () => {
     const seen: string[] = [];
     const { tools } = customRig({ upsertRemoteLink: async (key: string) => { seen.push(key); return {}; } });
+    // Two upserts land here: ensureDoc's own (step 5, on lazy creation) plus
+    // set_doc's link-title refresh (the provisional title differs from "T") —
+    // both must still target only the caller's own key, never an argument.
     await tools.set_doc!.handler({ body: "<p>x</p>", title: "T" }, { headers: { "x-issue": "KAN-7" } } as any);
-    expect(seen).toEqual(["KAN-7"]);
+    expect(seen).toEqual(["KAN-7", "KAN-7"]);
   });
 
   test("set_doc refuses when the connection has no x-issue", async () => {
