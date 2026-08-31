@@ -64,6 +64,9 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     },
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
+    addLabels: async () => ({ ok: true }),
+    deletePage: async () => ({ ok: true }),
+    deleteIssue: async () => ({ ok: true }),
 
     getProjectProperty: async (projectKey: string) => {
       const v = projectProperties.get(projectKey);

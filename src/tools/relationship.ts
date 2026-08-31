@@ -28,9 +28,6 @@ function noRoleMsg(verb: string, issuetype: "Story" | "Task"): string {
 function issuetypeOf(issue: unknown): string | undefined {
   return (issue as { fields?: { issuetype?: { name?: string } } })?.fields?.issuetype?.name;
 }
-function statusOf(issue: unknown): string | undefined {
-  return (issue as { fields?: { status?: { name?: string } } })?.fields?.status?.name;
-}
 function projectKeyOf(issue: unknown): string | undefined {
   return (issue as { fields?: { project?: { key?: string } } })?.fields?.project?.key;
 }
@@ -129,11 +126,10 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   const callerType = issuetypeOf(callerIssue);
   const childType = callerType ? CHILD_TYPE[callerType] : undefined;
   if (!childType) {
-    throw new Error(
-      callerType === "Task"
-        ? `new_worker: ${callerKey} is a Task — a Task is the bottom of this hierarchy and has no worker beneath it; new_worker can only be called by an Epic or a Story`
-        : `new_worker: ${callerKey}'s issue type ("${callerType ?? "unknown"}") has no defined child type — new_worker can only be called by an Epic or a Story`,
-    );
+    const msg = callerType === "Task"
+      ? `new_worker: ${callerKey} is a Task — a Task is the bottom of this hierarchy and has no worker beneath it; new_worker can only be called by an Epic or a Story`
+      : `new_worker: ${callerKey}'s issue type ("${callerType ?? "unknown"}") has no defined child type — new_worker can only be called by an Epic or a Story`;
+    throw new Error(msg);
   }
   const role = childType === "Story" ? roles.story : roles.task;
   if (!role) throw new Error(noRoleMsg("new_worker", childType));

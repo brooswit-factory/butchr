@@ -30,6 +30,13 @@ function orOk<T>(r: unknown, fallback: T): T {
 /** AccountIds are not secrets; truncate them only for readability, never redact. */
 const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
 
+/** Every one of BUTCHR-35's ten relationship verbs refuses a connection with no `x-issue`, in the same shape get_doc/set_doc already use — refusing beats resolving to an unknown caller. */
+function requireCaller(c: { headers: Record<string, string> }, verb: string): string {
+  const who = c.headers["x-issue"];
+  if (!who) throw new Error(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
+  return who;
+}
+
 const noAssigneeMsg = (issuetype: "Story" | "Task"): string => {
   const envVar = issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
   return `jira_create_issue: no assignee for a ${issuetype} — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit assignee`;
@@ -241,11 +248,11 @@ export function atlassianTools(
       },
     },
     jira_set_priority: {
-      description: "Set a Jira issue's priority by name. For a boss re-prioritizing its children as reality shifts — YOUR OWN priority is set by your boss, so never call this on your own ticket.",
+      description: "DEPRECATED — use prioritize_worker, which also refuses your own key (your priority is your boss's judgment, never your own) rather than leaving that as an unenforced instruction. Set a Jira issue's priority by name. For a boss re-prioritizing its children as reality shifts — YOUR OWN priority is set by your boss, so never call this on your own ticket.",
       input: { key: z.string(), priority: z.string() },
       handler: (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
-        audit(c, `priority ${key} → ${priority}`);
+        audit(c, `priority ${key} → ${priority} [deprecated alias; use prioritize_worker]`);
         return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, priority }); });
       },
     },
@@ -259,6 +266,7 @@ export function atlassianTools(
     // fails at Jira, same as it always has.
     jira_assign: {
       description:
+        'DEPRECATED for staffing a boss\'s own worker — use adopt_worker, which also makes the Implements link and ensures a doc in the same call, and refuses a ticket already adopted by a different boss. Still useful for a raw reassignment that isn\'t an adoption. ' +
         'Assign an EXISTING Jira issue — for a boss adopting or re-staffing a ticket someone else already filed; never call this on your own ticket (your assignee is your boss\'s call). `assignee` is either an Atlassian accountId or a role name ("story"/"task", case-insensitive) resolved through this daemon\'s role→accountId mapping; a role whose accountId is unset on this daemon REFUSES, naming the env var. Writes only the assignee field — nothing else about the issue changes.',
       input: { key: z.string(), assignee: z.string() },
       handler: async (a, c) => {
@@ -270,7 +278,7 @@ export function atlassianTools(
           const resolved = role === "story" ? roles.story : roles.task;
           if (!resolved) {
             const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset)`);
+            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker]`);
             throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
           }
           accountId = resolved;
@@ -279,27 +287,29 @@ export function atlassianTools(
           accountId = assignee;
           label = truncAccountId(assignee);
         }
-        audit(c, `assign ${key} → ${label}`);
+        audit(c, `assign ${key} → ${label} [deprecated alias; use adopt_worker]`);
         return ops.assign(key, accountId).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, assignee: accountId }); });
       },
     },
     confluence_create_page: {
       description:
+        "DEPRECATED for a ticket's own doc — use set_doc, which finds/creates and nests the caller's own doc under its boss's automatically; there is no key parameter, so it can never target another ticket's doc. Still the general-purpose way to create a page that ISN'T a ticket's doc. " +
         "Create a Confluence page (storage/XHTML body) in a space. Pass raw XHTML tags in `body`, NOT entity-escaped text — write <h2>Heading</h2>, never &lt;h2&gt;Heading&lt;/h2&gt;; escaped text renders on the page as literal escaped tags, not as formatting. Optional `parentId` nests the new page under that page id; omitted, Confluence files it under the space's own default parent (unchanged from today).",
       input: { spaceId: z.string(), title: z.string(), body: z.string(), parentId: z.string().optional() },
       handler: (a, c) => {
         const p = a as { spaceId: string; title: string; body: string; parentId?: string };
-        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""}`);
+        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
         return ops.createPage(p);
       },
     },
     confluence_update_page: {
       description:
+        "DEPRECATED for a ticket's own doc — use set_doc, a full-body replace of the CALLER's own doc with no key parameter at all. Still the general-purpose way to update a standing page (like a convention/reference page) that ISN'T a ticket's doc. " +
         "Full-body replace of an existing Confluence page (storage/XHTML). Pass raw XHTML tags in `body`, NOT entity-escaped text — write <h2>Heading</h2>, never &lt;h2&gt;Heading&lt;/h2&gt;. Optimistic locking (Confluence's version number) is handled INTERNALLY — never pass or compute a version yourself. Omit `title` to keep the page's current title. Convention entries stay one-page-per-entry, never edited — this tool is for maintaining a standing page (like a convention/reference page), not for rewriting log entries.",
       input: { id: z.string(), body: z.string(), title: z.string().optional() },
       handler: (a, c) => {
         const p = a as { id: string; body: string; title?: string };
-        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""}`);
+        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
         return ops.updatePage(p).then((r) => orOk(r, { ok: true, id: p.id }));
       },
     },
@@ -344,9 +354,10 @@ export function atlassianTools(
     },
     confluence_get_page: {
       description:
+        "DEPRECATED for a ticket's own doc — use get_doc, which resolves the page id for you (the caller's own by default, or another ticket's by key) instead of making you discover and hand-carry a page id. Still the general-purpose way to read a page that ISN'T reached through a ticket. " +
         "Read a Confluence page by id (storage body). The result adds `bodyRequested: true` and `bodyLength` (the storage body's character count) to the usual fields — `bodyLength: 0` means the page genuinely has an empty body, distinguishable from a body the API never returned at all.",
       input: { id: z.string() },
-      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id}`); return ops.getPage(id); },
+      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id} [deprecated alias; use get_doc for a ticket's own doc]`); return ops.getPage(id); },
     },
     confluence_list_spaces: {
       description: "List Confluence spaces (to find a spaceId).",
@@ -378,6 +389,166 @@ export function atlassianTools(
         const result = await setDoc(ops, who, body, title);
         noted(c, [who]); // the remote-link upsert bumps the ticket's own `updated`
         return result;
+      },
+    },
+
+    // -------------------------------------------------------------------
+    // BUTCHR-35: the ten relationship-shaped verbs. Every one below refuses
+    // a connection with no `x-issue`, in the same shape get_doc/set_doc use
+    // — refusing beats resolving to an unknown caller. `src/tools/
+    // relationship.ts` holds the actual logic (ownership checks, inference,
+    // the new_worker write order); these are thin wiring, same split as
+    // get_doc/set_doc over docs.ts.
+    // -------------------------------------------------------------------
+    new_worker: {
+      description:
+        "Create a worker one tier below the CALLER: an Epic's new_worker makes a Story, a Story's makes a Task — a Task has no worker beneath it and this REFUSES for a Task caller, explaining in words that it has reached the bottom of the hierarchy. " +
+        "YOU SUPPLY: `summary`, `description` (the full context a fresh agent needs to meet the definition of done), `priority` (optional — omitting it takes the site default), and a REQUIRED `disposition`: `\"start\"`, or `\"shelve\"` with a non-empty `reason` (the activation condition, in words — a `shelve` with no reason is REFUSED, and so is a missing disposition entirely; there is no default and no third option, because a worker this tool creates is always RUNNING or SHELVED, never undeclared). " +
+        "INFERRED, WITH NO ARGUMENT FOR ANY OF IT: the child's issue type (from your own type, per the rule above), the assignee (from this daemon's role map — REFUSED if that role's accountId is unset, naming the missing env var), the project (from your own), the link direction (Implements, outward from the new child to you, never the reverse), and the new doc's parent page (your own doc). " +
+        "WHAT A RETURNED KEY GUARANTEES, AND WHAT IT DOESN'T — READ THIS BEFORE TREATING A SUCCESS OR A FAILURE AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A RETURNED KEY ALWAYS MEANS a ticket that has a boss (the link succeeded) and a declared disposition (RUNNING or SHELVED, never undeclared) — that part is guaranteed, not best-effort. The doc is usually included too, but if ONLY the doc step failed, the key is still returned with a `doc` you should treat as unset; the doc is then completed by that ticket's own first `set_doc` call, whenever the agent working it makes one — nothing here retries or fixes it automatically, so a ticket that never gets a `set_doc` call simply has no doc until something calls for that key (strictly better than a duplicate or an orphan, but not invisible). " +
+        "ON FAILURE AFTER THE TICKET IS CREATED (the link or the disposition write): this attempts to delete the ticket it just created and rethrows either way — \"rolled back, nothing survives\" if the delete succeeded, or a NAMED PARTIAL STATE (the surviving ticket key) if it didn't. This is NOT unconditional atomicity: as of BUTCHR-35 this daemon's own credential does not hold Jira's `DELETE_ISSUES` permission on this project (measured — a permission read and a live round trip both confirm it), so the delete is currently expected to fail when attempted; it is attempted anyway because the refusal is a permission, not an API limit, and this exact code becomes fully self-cleaning the day that permission is granted, on whichever deployment holds it. Never assume a failure left nothing behind — read the error, which always names what survived. " +
+        "Replaces jira_create_issue plus the confluence_create_page call and the doc-linking step a careful agent did by hand. Does NOT cover filing a deliberate orphan (`implements: \"none\"`) — that stays on jira_create_issue, which remains the only route for out-of-scope work your brief tells you to file outside your epic.",
+      input: {
+        summary: z.string(),
+        description: z.string().optional(),
+        priority: z.string().optional(),
+        disposition: z.enum(["start", "shelve"]),
+        reason: z.string().optional(),
+      },
+      handler: async (a, c) => {
+        const p = a as { summary: string; description?: string; priority?: string; disposition: "start" | "shelve"; reason?: string };
+        const who = requireCaller(c, "new_worker");
+        const disposition: Disposition = p.disposition === "shelve" ? { kind: "shelve", reason: p.reason ?? "" } : { kind: "start" };
+        audit(c, `new_worker disposition=${p.disposition}${p.priority ? ` priority=${p.priority}` : ""}`);
+        const result = await newWorker(ops, roles, who, {
+          summary: p.summary,
+          ...(p.description ? { description: p.description } : {}),
+          ...(p.priority ? { priority: p.priority } : {}),
+          disposition,
+        });
+        noted(c, [result.key, who]); // the new ticket's own `updated`, plus the Implements link bumping the caller's
+        return result;
+      },
+    },
+    start_worker: {
+      description:
+        "Move ONE OF THE CALLER'S OWN workers to In Progress — the call that actually staffs an agent for it (an assigned-but-To-Do ticket is not staffed, and a boss waiting on events from it waits forever). Also reactivates a shelved worker, and sends an In Review worker back to work. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot). Replaces jira_transition(key, \"In Progress\") for this case.",
+      input: { key: z.string() },
+      handler: async (a, c) => {
+        const { key } = a as { key: string };
+        const who = requireCaller(c, "start_worker");
+        audit(c, `start_worker ${key}`);
+        const r = await startWorker(ops, who, key);
+        noted(c, [key]);
+        return orOk(r, { ok: true, key, status: "In Progress" });
+      },
+    },
+    shelve_worker: {
+      description:
+        "Deliberately put ONE OF THE CALLER'S OWN workers down, with the intention recorded: moves it to To Do, ADDS the shelved-exemption label (additively — never drops labels the ticket already carries; the exact label is read out of the parked-ticket detector's own code, so it always matches what that detector checks for), and posts `reason` as a comment — ALL IN ONE CALL, because a two-step declaration recreates the exact multi-step failure this epic exists to kill. Refuses a `key` that is not one of the caller's own workers, and refuses an empty `reason` — a reader six weeks from now must be able to tell a shelved ticket from a forgotten one without asking an agent that no longer exists. If you already know at filing time that a new or adopted ticket should be shelved, prefer new_worker/adopt_worker's own `disposition: \"shelve\"` — the label lands in the very call that creates the ticket, so there's no second call to forget. Has no predecessor: shelving was previously only an intention in an agent's head.",
+      input: { key: z.string(), reason: z.string() },
+      handler: async (a, c) => {
+        const { key, reason } = a as { key: string; reason: string };
+        const who = requireCaller(c, "shelve_worker");
+        audit(c, `shelve_worker ${key}`);
+        await shelveWorker(ops, who, key, reason);
+        noted(c, [key]);
+        return { ok: true, key, status: "To Do" };
+      },
+    },
+    adopt_worker: {
+      description:
+        "Take ownership of an EXISTING ticket — an orphan, or one filed by an agent that has since ended: infers the assignee from the ADOPTED ticket's own issue type (Story or Task; anything else is refused), makes the Implements link (adopted ticket → caller), and ensures its doc, nested under the caller's own. Also takes the SAME required `disposition` as new_worker (`\"start\"`, or `\"shelve\"` with a non-empty `reason`) — an adopted ticket left in To Do with nobody's decision recorded is the same undeclared state as an unstarted new_worker child, by a different door. IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing (the assign/link/disposition writes are skipped) and is NOT an error — only the doc is still ensured, as a no-op-when-already-present safety net. REFUSES a ticket already linked to a DIFFERENT boss — stealing another boss's worker must be an explicit act (jira_link_issues), never a side effect of a mistyped key. Replaces jira_assign plus a hand-written jira_link_issues call, plus the doc creation nobody remembered.",
+      input: {
+        key: z.string(),
+        disposition: z.enum(["start", "shelve"]),
+        reason: z.string().optional(),
+      },
+      handler: async (a, c) => {
+        const p = a as { key: string; disposition: "start" | "shelve"; reason?: string };
+        const who = requireCaller(c, "adopt_worker");
+        const disposition: Disposition = p.disposition === "shelve" ? { kind: "shelve", reason: p.reason ?? "" } : { kind: "start" };
+        audit(c, `adopt_worker ${p.key} disposition=${p.disposition}`);
+        const result = await adoptWorker(ops, roles, who, p.key, disposition);
+        noted(c, [p.key, who]);
+        return result;
+      },
+    },
+    finish_worker: {
+      description:
+        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Refuses a `key` that is not one of the caller's own workers. A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry. Replaces jira_transition(key, \"Done\") for this case.",
+      input: { key: z.string() },
+      handler: async (a, c) => {
+        const { key } = a as { key: string };
+        const who = requireCaller(c, "finish_worker");
+        audit(c, `finish_worker ${key}`);
+        const r = await finishWorker(ops, who, key);
+        noted(c, [key]);
+        return orOk(r, { ok: true, key, status: "Done" });
+      },
+    },
+    prioritize_worker: {
+      description:
+        "Revise ONE OF THE CALLER'S OWN workers' priority — a boss's judgment of what matters NOW, not only at filing. Refuses a `key` that is not one of the caller's own workers, AND — distinctively — refuses the CALLER'S OWN key: your priority is your boss's judgment, never your own, and this makes that a refusal instead of an unenforced sentence in a brief. Replaces jira_set_priority for this case.",
+      input: { key: z.string(), priority: z.string() },
+      handler: async (a, c) => {
+        const { key, priority } = a as { key: string; priority: string };
+        const who = requireCaller(c, "prioritize_worker");
+        audit(c, `prioritize_worker ${key} → ${priority}`);
+        const r = await prioritizeWorker(ops, who, key, priority);
+        noted(c, [key]);
+        return orOk(r, { ok: true, key, priority });
+      },
+    },
+    tell_worker: {
+      description:
+        `The ONLY way to speak DOWN to a worker: comments on ONE OF THE CALLER'S OWN workers' ticket. Refuses a \`key\` that is not one of the caller's own workers, verified via the Implements link — the failure this exists to prevent is a boss commenting on a stranger's ticket because one character of a key was wrong. THE HIGHEST-CONSEQUENCE MESSAGES IN THIS FLEET TRAVEL HERE: the \`[review] APPROVED <pr-url> @ <sha>\` / \`[review] CHANGES_REQUESTED\` lines that wake a PR author, and the \`ANSWER <n> <fingerprint>\` reply that unfreezes a worker blocked on a dialog — an agent that doesn't know this reaches for jira_add_comment instead, and its worker never wakes up. Replaces jira_add_comment(key, text) for the downward case ONLY — jira_add_comment remains the deliberate SIDEWAYS channel for two bosses coordinating (which this refuses, by design) and stays permanent for that.`,
+      input: { key: z.string(), text: z.string() },
+      handler: async (a, c) => {
+        const { key, text } = a as { key: string; text: string };
+        const who = requireCaller(c, "tell_worker");
+        audit(c, `tell_worker ${key}`);
+        const r = await tellWorker(ops, who, key, text);
+        noted(c, [key]);
+        return r;
+      },
+    },
+    report_to_boss: {
+      description:
+        'Comment on the CALLER\'S OWN ticket — the routing a boss actually listens to. THERE IS NO KEY PARAMETER, AND THERE MUST NEVER BE ONE: a boss listens to its workers\' tickets, so a comment written onto the BOSS\'s own ticket routes one tier too high — the empty arg list settles that question faster than any name could ("report_to_boss" sounds like it writes to the boss\'s ticket; it must not). Refuses nothing else — a verb with no key has no key to get wrong. Replaces jira_add_comment(my_own_key, text).',
+      input: { text: z.string() },
+      handler: async (a, c) => {
+        const { text } = a as { text: string };
+        const who = requireCaller(c, "report_to_boss");
+        audit(c, `report_to_boss`);
+        const r = await reportToBoss(ops, who, text);
+        noted(c, [who]);
+        return r;
+      },
+    },
+    ask_boss: {
+      description:
+        `Same channel as report_to_boss — a comment on the CALLER'S OWN ticket, no key parameter — but marked with the literal \`${ASK_MARKER}\` right after the identity tag, so a boss can find its workers' UNANSWERED questions without reading every comment they wrote. ASKING DOES NOT CHANGE THE ASKER'S STATUS — an agent that asks and can still make progress should carry on; one that genuinely cannot proceed is a different situation (the daemon's own blocked-dialog escalation handles that). Use report_to_boss for information; use this only when there's a real outstanding answer you're waiting on.`,
+      input: { text: z.string() },
+      handler: async (a, c) => {
+        const { text } = a as { text: string };
+        const who = requireCaller(c, "ask_boss");
+        audit(c, `ask_boss`);
+        const r = await askBoss(ops, who, text);
+        noted(c, [who]);
+        return r;
+      },
+    },
+    submit_to_boss: {
+      description:
+        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS AT ALL: this is the one transition an agent is always entitled to make about itself. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review").',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireCaller(c, "submit_to_boss");
+        audit(c, `submit_to_boss`);
+        const r = await submitToBoss(ops, who);
+        noted(c, [who]);
+        return orOk(r, { ok: true, key: who, status: "In Review" });
       },
     },
   };
