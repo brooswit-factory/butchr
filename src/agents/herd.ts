@@ -136,8 +136,9 @@ export class HerdrHerd implements Herd {
       // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
       const proc = info?.foreground_processes?.find((p) => isClaude(p));
       if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
-      // issuetype/summary/parent don't matter here: --model (the only thing
-      // issuetype affects) is deliberately excluded from the comparison.
+      // issuetype/summary/parent don't matter here: --model and --effort
+      // (the only things issuetype affects) are both deliberately excluded
+      // from the comparison.
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
