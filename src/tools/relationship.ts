@@ -64,30 +64,60 @@ export interface NewWorkerResult {
 }
 
 /**
- * Creates a worker one tier below `callerKey`: infers the child's issue
- * type from the caller's own type, the assignee from `roles`, the project
- * from the caller's, and the doc's parent from the caller's own doc. Writes,
- * in order: (1) create the ticket — WITH the shelve exemption label already
- * on it if disposition is "shelve", so that write never has to happen
- * separately; (2) link the new ticket to `callerKey` (Implements, outward);
- * (3) ensure its doc, nested under the caller's; (4) apply the disposition
- * (transition to In Progress, or — for shelve — the reason comment; the
- * label already landed in step 1).
+ * Creates a worker one tier below `callerKey`: infers the child's issue type
+ * from the caller's own type, the assignee from `roles`, the project from
+ * the caller's, and the doc's parent from the caller's own doc.
  *
- * ATOMICITY, HONESTLY: rule (a) ("creates the ticket, the doc, links both
- * directions, or it fails and leaves nothing") is NOT reachable here. It was
- * directed as a compensating rollback keyed on an issue-delete op, and
- * BUTCHR-35 measured that THIS DAEMON'S CREDENTIAL CANNOT DELETE A JIRA
- * ISSUE (`DELETE_ISSUES` is refused with a 403 on this project — see the
- * comment trail on that ticket). So a failure at step 2, 3 or 4 leaves the
- * ticket from step 1 in place, permanently — there is no way to undo it from
- * here. What this DOES guarantee: every failure names the surviving ticket
- * key so it's never a silent orphan, and — when the doc from step 3 exists
- * (i.e. only a LATER step failed) — it is rolled back via `ops.deletePage`
- * (Confluence page deletes DO work on this credential; MEASURED, BUTCHR-35),
- * since a half-made page with nobody able to find it is worse than one that
- * was never created. This is reported as a finding on BUTCHR-35/BUTCHR-25;
- * do not read this comment as the settled design.
+ * WRITE ORDER, AND WHY IT IS NOT THE ORDER THE VERBS ARE LISTED IN: the
+ * ticket create is irreversible and first — everything else needs its key.
+ * Everything AFTER it is ordered so each successive stopping point is LESS
+ * HARMFUL than the last, not by convenience:
+ *   1. Create the ticket — labels (the shelve exemption label included when
+ *      the disposition is "shelve"), assignee and priority all in this one
+ *      call. Irreversible.
+ *   2. Implements link to `callerKey`. A ticket with no boss is the worst
+ *      survivable state, so this closes immediately.
+ *   3. The disposition — transition to In Progress for "start"; for
+ *      "shelve" the label is already on from step 1, so this is just the
+ *      reason comment. AFTER THIS STEP the ticket is a fully declared
+ *      worker: it has a boss and it is RUNNING or SHELVED, never undeclared
+ *      — which is the invariant this whole epic exists to hold.
+ *   4. The doc — page, label, remote link. Deliberately LAST: a failure
+ *      here is harmless, NOT because anything "heals" it — nothing retries,
+ *      there is no sweeper — but because `ensureDoc` (BUTCHR-33) is
+ *      CONVERGENT: it can never produce a duplicate, so the ticket's own
+ *      first `set_doc` call (whenever the agent working it makes one) safely
+ *      completes the binding. If that call never happens, the ticket simply
+ *      has no doc until something calls for that key — worse than nothing,
+ *      but strictly better than an orphan or a duplicate page, and
+ *      recoverable by anyone at any time. No rollback is attempted for step
+ *      4; there is nothing to roll back FROM, because nothing downstream
+ *      depends on it.
+ *
+ * ROLLBACK covers only steps 2 and 3, via `ops.deleteIssue` — the
+ * genuinely damaging window, where the ticket exists but is not yet a
+ * declared worker. MEASURED (BUTCHR-35): this daemon's credential does NOT
+ * currently hold Jira's `DELETE_ISSUES` permission on this project (a
+ * `mypermissions` read reports `havePermission: false`, and a live
+ * create-then-delete round trip 403s). The delete is attempted anyway,
+ * because the refusal is a PROJECT PERMISSION, not an API limitation:
+ * granting `Delete Issues` to this daemon's Atlassian account upgrades this
+ * path to fully working with no code change. Every caller must already
+ * handle it failing, and on failure this reports a NAMED PARTIAL STATE (the
+ * surviving ticket key) rather than pretending the write undid itself.
+ *
+ * WHAT A RETURNED KEY MEANS, HONESTLY: rule (a) as originally stated —
+ * "creates the ticket, the doc, links both directions, or it fails and
+ * leaves nothing" — is not what this delivers, and this description does
+ * not claim it. What IS guaranteed: a returned key is always a ticket that
+ * has a boss (step 2) and a declared disposition (step 3) — never an
+ * undeclared worker. Its doc either exists already, or is completed by the
+ * agent's OWN first `set_doc` call for that key — the ordering guarantees no
+ * other partial state is reachable, not that anything repairs it
+ * automatically. A thrown error after step 1 means: either
+ * the ticket was rolled back (deleted) and nothing survives, or the
+ * rollback itself failed and the error names exactly which ticket key
+ * needs manual cleanup.
  */
 export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;
@@ -110,7 +140,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   const projectKey = projectKeyOf(callerIssue);
   if (!projectKey) throw new Error(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
-  // (1) create — the shelve label, if any, lands HERE, not as a follow-up write.
+  // (1) create — irreversible; the shelve label, if any, lands HERE.
   const created = (await ops.createIssue({
     projectKey,
     issuetype: childType,
@@ -121,60 +151,65 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to link or create a doc against nothing");
+  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to link or transition against nothing");
 
-  const survives = (extra: string) =>
-    `new_worker: ticket ${key} was created and survives (this daemon's credential cannot delete Jira issues — see BUTCHR-35). ${extra}`;
+  // Rollback for steps 2/3 only (see the function comment for why step 4
+  // never rolls back). Attempts the delete unconditionally — see
+  // AtlassianOps.deleteIssue's doc comment for why a currently-refused
+  // permission is not a reason to skip the attempt.
+  const rollback = async (why: string): Promise<never> => {
+    let deleted = false;
+    let deleteError: string | undefined;
+    try {
+      await ops.deleteIssue(key);
+      deleted = true;
+    } catch (e) {
+      deleteError = (e as Error).message;
+    }
+    throw new Error(
+      deleted
+        ? `new_worker: ${why} — ticket ${key} has been rolled back (deleted); nothing survives.`
+        : `new_worker: ${why} — ticket ${key} COULD NOT be rolled back (${deleteError}); this daemon's credential may lack DELETE_ISSUES on this project (measured absent as of BUTCHR-35 — granting it upgrades this path to true atomicity with no code change). Ticket ${key} SURVIVES and needs manual cleanup.`,
+    );
+  };
 
   // (2) link — outward from the new child to the caller, never the reverse.
   try {
     await ops.linkIssues(key, callerKey, "Implements");
   } catch (e) {
-    throw new Error(survives(`The Implements link to ${callerKey} failed (${(e as Error).message}) — link it by hand or with jira_link_issues(from: "${key}", to: "${callerKey}").`));
+    return rollback(`the Implements link to ${callerKey} failed (${(e as Error).message})`);
   }
 
-  // (3) ensure the doc, nested under the caller's own.
-  let doc: DocResult;
-  try {
-    doc = await ensureDoc(ops, key);
-  } catch (e) {
-    throw new Error(survives(`It is linked to ${callerKey}, but its doc failed to create/bind (${(e as Error).message}) — check ${key} by hand; a Confluence page under ${callerKey}'s doc may or may not exist.`));
-  }
-
-  // (d) Deleting a page created two seconds ago as the rollback of a failed
-  // creation is not archiving a record, it is refusing to leave a half-made
-  // one — the ticket that page documented already exists at this point (step
-  // 1 succeeded), so this is NOT the doc convention's rule (d) ("nothing is
-  // archived") in disguise; that rule protects real history, and a page
-  // whose creation failed a moment later never became real history. Without
-  // this rollback and this comment both, a half-made page silently
-  // accumulates on every disposition failure below, AND the next reader who
-  // finds a rollback delete without this reasoning is liable to "fix" it by
-  // removing the rollback, bringing the orphan-page class straight back.
-  const rollbackDoc = async (extra: string): Promise<never> => {
-    try {
-      await ops.deletePage(doc.id);
-      throw new Error(survives(`Its Confluence page (${doc.id}) has been rolled back (deleted). ${extra}`));
-    } catch (e) {
-      if ((e as Error).message.startsWith("new_worker:")) throw e;
-      throw new Error(survives(`Its Confluence page (${doc.id}) COULD NOT be rolled back either (${(e as Error).message}) — both the ticket and the page survive. ${extra}`));
-    }
-  };
-
-  // (4) disposition — start transitions; shelve's label already landed in
-  // step 1, so only the reason comment remains.
+  // (3) disposition — after this, the ticket is a fully declared worker.
   if (disposition.kind === "start") {
     try {
       await ops.transition(key, "In Progress");
     } catch (e) {
-      return rollbackDoc(`The disposition transition to In Progress failed (${(e as Error).message}).`);
+      return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
     }
   } else {
     try {
       await ops.addComment(key, tagComment(callerKey, disposition.reason));
     } catch (e) {
-      return rollbackDoc(`The shelve reason comment failed to post (${(e as Error).message}); the exemption label is already on the ticket from creation.`);
+      return rollback(`the shelve reason comment failed to post (${(e as Error).message}); the exemption label was already applied at creation`);
     }
+  }
+
+  // (4) doc — last, on purpose. `ensureDoc` is convergent (BUTCHR-33), so a
+  // failure here is reported but NOT rolled back: the ticket is already a
+  // fully declared worker (steps 2/3 succeeded), and nothing downstream
+  // depends on the doc existing yet. Convergent means "the next call for
+  // this key cannot make a duplicate", NOT "something retries automatically"
+  // — nothing here does. The doc is completed by that ticket's own first
+  // `set_doc` call, whenever the agent working it makes one.
+  let doc: DocResult;
+  try {
+    doc = await ensureDoc(ops, key);
+  } catch (e) {
+    throw new Error(
+      `new_worker: ticket ${key} was created, linked to ${callerKey}, and its disposition (${disposition.kind}) applied — it is a fully declared worker; no rollback was attempted or is needed. ` +
+        `Only its Confluence doc failed to create (${(e as Error).message}); it will be completed by ${key}'s own first set_doc call, whenever that agent makes one (ensureDoc is convergent — it will never create a duplicate — but nothing here retries automatically).`,
+    );
   }
 
   return { key, implements: callerKey, doc, disposition: disposition.kind };

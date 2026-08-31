@@ -2,6 +2,11 @@ import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc } from "./docs.js";
+import {
+  newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
+  reportToBoss, askBoss, submitToBoss, ASK_MARKER,
+  type Disposition,
+} from "./relationship.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). */
 export interface AssigneeRoles {
@@ -44,17 +49,48 @@ const noTargetMsg = (issuetype: "Story" | "Task"): string =>
  * The daemon's MCP tools: a thin proxy over the de-facto Atlassian SDKs,
  * executed daemon-side with the shared credential. No scoping — any agent may
  * call any tool; `log` records which connection (x-issue) did what. `roles`
- * is the Story/Task assignee mapping `jira_create_issue` staffs by; injected
- * rather than read from config here so this module stays pure over its ops
- * and unit-testable without a config fixture.
+ * is the Story/Task assignee mapping `jira_create_issue` (and now
+ * `new_worker`/`adopt_worker`) staffs by; injected rather than read from
+ * config here so this module stays pure over its ops and unit-testable
+ * without a config fixture.
+ *
+ * READS: this layer is NO LONGER free of Jira reads — that was true only
+ * until BUTCHR-33 added `get_doc`/`set_doc` (which read a ticket to find or
+ * create its doc), and BUTCHR-35's ten relationship verbs (below) break it
+ * far more: inferring a caller's issue type, verifying "is this one of my
+ * own workers" via the Implements link, and idempotency checks are ALL Jira
+ * reads, on the calling path, by design. The constraint was dropped on
+ * purpose: the whole point of this vocabulary is that an agent no longer
+ * supplies the issue type, the assignee or the link direction — the tool has
+ * to read enough to infer and verify them itself, or those decisions go back
+ * to being the agent's problem, which is the thing this story exists to
+ * remove. `src/daemon/index.ts`'s own read-back loop is unaffected; this
+ * note is about the tool layer specifically.
  *
  * `onWrite`, when given, fires after each MUTATING tool resolves, with the
  * key(s) it wrote and the caller's `x-issue` as writer — feeds the own-write
  * ledger (src/jira-watch/own-writes.ts) so the notify loop can recognize its
- * own echoes. Read tools call nothing; this stays free of Jira reads on
- * purpose (only src/daemon/index.ts talks to Jira for that read-back).
- * Omitted when the caller's `x-issue` is missing (an untagged/human call) —
- * we never record a write under an unknown writer.
+ * own echoes. Omitted when the caller's `x-issue` is missing (an
+ * untagged/human call) — we never record a write under an unknown writer.
+ *
+ * ALIAS POLICY (BUTCHR-35): the ten relationship verbs below — new_worker,
+ * start_worker, shelve_worker, adopt_worker, finish_worker,
+ * prioritize_worker, tell_worker, report_to_boss, ask_boss, submit_to_boss —
+ * replace the generic verbs an agent used to reach for by hand. Every
+ * PRE-EXISTING name keeps working, unchanged, because a tool surface reaches
+ * only newly spawned agents — one mid-task when this deploys keeps the tool
+ * list it started with, and removing a name out from under it takes its
+ * hands off mid-sentence. `jira_get_issue`, `jira_search`, `jira_add_comment`
+ * (the deliberate SIDEWAYS channel — two bosses coordinating have no
+ * relationship verb, since the hierarchy only models up and down), and
+ * `confluence_list_spaces`/`confluence_search_pages` (space-wide discovery,
+ * not an act inside a relationship) are RETAINED PERMANENTLY: no deprecation
+ * note, not on any removal clock. Every other pre-existing name is now an
+ * ALIAS — same behavior, a deprecation note in its description naming the
+ * verb that replaces it, and its audit line names that verb too, so removal
+ * is an evidence-based decision (zero alias calls across a full fleet
+ * lifetime after a respawn — see the glossary page) rather than a guess.
+ * Nothing is removed in this release.
  */
 export function atlassianTools(
   ops: AtlassianOps,
@@ -80,12 +116,12 @@ export function atlassianTools(
       handler: (a, c) => { const { jql, maxResults } = a as { jql: string; maxResults: number }; audit(c, `search ${jql.slice(0, 60)}`); return ops.search(jql, maxResults ?? 25); },
     },
     jira_link_issues: {
-      description: "Link two issues. The IMPLEMENTER is `from` — the outward side: task implements story ⇒ from=task, to=story; story implements epic ⇒ from=story, to=epic. This link is what routes a ticket's events (In Review, comments) to its boss — nothing else is listened to (the Jira parent field is membership only). Defaults to type \"Implements\"; pass an explicit `type` for other link kinds (Blocks, Relates, …).",
+      description: "DEPRECATED for the boss/worker Implements case — use new_worker (new ticket) or adopt_worker (existing ticket), which make this link for you and infer the direction. Still the only way to make a NON-Implements link (Blocks, Relates, …) or to fix up an Implements link by hand. Link two issues. The IMPLEMENTER is `from` — the outward side: task implements story ⇒ from=task, to=story; story implements epic ⇒ from=story, to=epic. This link is what routes a ticket's events (In Review, comments) to its boss — nothing else is listened to (the Jira parent field is membership only). Defaults to type \"Implements\"; pass an explicit `type` for other link kinds (Blocks, Relates, …).",
       input: { from: z.string(), to: z.string(), type: z.string().default("Implements") },
       handler: (a, c) => {
         const { from, to, type } = a as { from: string; to: string; type?: string };
         const resolvedType = type ?? "Implements";
-        audit(c, `link ${from} → ${to} (${resolvedType})`);
+        audit(c, `link ${from} → ${to} (${resolvedType}) [deprecated alias; use new_worker/adopt_worker for an Implements link]`);
         return ops.linkIssues(from, to, resolvedType).then((r) => {
           noted(c, [from, to]); // a link bumps `updated` on BOTH ends
           return orOk(r, { ok: true, from, to, type: resolvedType });
@@ -108,12 +144,15 @@ export function atlassianTools(
       },
     },
     jira_transition: {
-      description: 'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
+      description:
+        'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), or submit_to_boss (→ In Review on your OWN ticket, no args). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
+        'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
-      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status}`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
+      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description:
+        "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. This tool remains the ONLY way to file a DELIBERATE ORPHAN (`implements: \"none\"`, for explicit out-of-scope/triage work your brief tells you to file outside your epic) — new_worker always links to its caller and has no orphan route; do not use new_worker in place of this when you actually need an orphan. " +
         "Create a Jira issue. ASSIGNMENT: a Story or a Task is assigned BY ROLE from its issuetype (configured on this daemon) — pass an explicit `assignee` (an Atlassian accountId) to override, which always wins; an Epic is unchanged (caller-supplied assignee, or none — Epics are the human's). If the role's accountId isn't configured on this daemon and you passed no `assignee`, the call is REFUSED. HOME: a Story or a Task also requires a home — pass `implements` (the issue key it reports to: a Story implements an Epic, a Task implements a Story) or `parent` (nests it in Jira for membership; a Story can parent to an Epic, but a Task CANNOT parent to a Story in this project — use `implements` for Tasks). Omitting both refuses the call; an Epic needs neither. OPT-OUT: pass `implements: \"none\"` (case-insensitive) to file a deliberate orphan — the ticket is still created and still staffed by role, but no link is made; use this ONLY for the explicit out-of-scope/triage tickets your brief tells you to file outside your epic — silence (omitting both `implements` and `parent`) is never the opt-out. LINKING: after creating the issue, the tool itself creates the Implements link (from = the new issue, to = the resolved target) — the result carries both the new `key` and the link outcome as `implements: { ok, to, error? }`; a link failure never hides the key, so retry the LINK, not the create, on failure. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
       input: {
         projectKey: z.string(), issuetype: z.enum(["Epic", "Story", "Task"]), summary: z.string(),
@@ -134,7 +173,7 @@ export function atlassianTools(
           assignee = p.issuetype === "Story" ? roles.story : roles.task;
           if (!assignee) {
             const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset)`);
+            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker]`);
             throw new Error(noAssigneeMsg(p.issuetype));
           }
         }
@@ -151,15 +190,20 @@ export function atlassianTools(
           } else if (p.parent) {
             target = p.parent;
           } else {
-            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target`);
+            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker]`);
             throw new Error(noTargetMsg(p.issuetype));
           }
         }
 
         // (4) Audit line: type/parent, resolved target ("orphan by request" for the opt-out), resolved assignee.
+        // An Epic, and a deliberate orphan, have no successor at all (new_worker
+        // never creates an Epic — Epics are the human's — and has no orphan
+        // route by design); the deprecation note says so only for the linked
+        // Story/Task case, where new_worker genuinely does replace this.
         let line = `create ${p.issuetype} under ${p.parent ?? "(none)"}`;
         if (p.issuetype !== "Epic") line += orphan ? " orphan by request" : ` implements ${target}`;
         if (assignee) line += ` → ${truncAccountId(assignee)}`;
+        line += p.issuetype !== "Epic" && !orphan ? " [deprecated alias; use new_worker]" : " [deprecated alias; no successor for this case]";
         audit(c, line);
 
         const created = (await ops.createIssue({

@@ -220,5 +220,13 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // "trashed", parentId cleared) rather than purging it — see the
     // AtlassianOps doc comment for what that does and doesn't guarantee.
     deletePage: (id) => wiki.page.deletePage({ id }),
+
+    // MEASURED against this daemon's own credential (BUTCHR-35, 2026-08-31):
+    // GET /rest/api/3/mypermissions?projectKey=BUTCHR&permissions=DELETE_ISSUES
+    // returned {"DELETE_ISSUES":{...,"havePermission":false}}, and a live
+    // create-then-delete round trip on a throwaway Epic 403'd with "You do
+    // not have permission to delete issues in this project." — see the
+    // AtlassianOps doc comment for why this op is called anyway.
+    deleteIssue: (key) => jira.issues.deleteIssue({ issueIdOrKey: key }),
   };
 }

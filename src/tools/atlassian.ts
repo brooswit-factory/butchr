@@ -73,14 +73,41 @@ export interface AtlassianOps {
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 
   /**
-   * Move a Confluence page to the trash (MEASURED live against the BUTCHR
-   * space, BUTCHR-35: a v2 DELETE with no `purge` param returns 204, and a
-   * follow-up GET on the same id still 200s with `status: "trashed"` and
-   * `parentId: null` — the page is gone from its parent's children, so
-   * ensureDoc's exhaustive child scan will never re-discover it, but it is
-   * NOT permanently purged). Used only to roll back a page THIS process just
-   * created a moment ago; see relationship.ts's rule-(d) comment for why that
-   * is not the doc convention's "nothing is archived" rule in disguise.
+   * Move a Confluence page to the trash. MEASURED live against the BUTCHR
+   * space (BUTCHR-35, 2026-08-31): a v2 DELETE with no `purge` param returns
+   * 204, and a follow-up GET on the same id still 200s with `status:
+   * "trashed"` and `parentId: null` — the page is gone from its parent's
+   * children (so ensureDoc's exhaustive child scan will never re-discover
+   * it), while a human with trash access can still restore it. THIS IS A
+   * BETTER FIT FOR RULE (d) ("nothing is archived") THAN A PURGE, NOT A
+   * WORSE ONE: a rollback that trashes removes a half-made page from normal
+   * discovery without irreversibly destroying it, which is the least-drastic
+   * tool that still does the job.
+   *
+   * NOT currently called by `new_worker`'s own rollback: BUTCHR-33's
+   * `ensureDoc` is convergent under retry, which lets doc creation go LAST
+   * in `new_worker`'s write order and makes a doc-step failure self-healing
+   * rather than something to undo (see relationship.ts's `newWorker` doc
+   * comment). Kept as a real, measured op — directed explicitly on
+   * BUTCHR-35 — for whichever future write needs to remove a page it just
+   * created.
    */
   deletePage(id: string): Promise<unknown>;
+
+  /**
+   * Delete a Jira issue outright — `new_worker`'s compensating rollback for a
+   * ticket it just created a moment ago, when the Implements link or the
+   * disposition write that must immediately follow it fails (src/tools/
+   * relationship.ts). MEASURED against this daemon's own credential
+   * (BUTCHR-35, 2026-08-31): `GET .../mypermissions?projectKey=BUTCHR&
+   * permissions=DELETE_ISSUES` → 200, `{"havePermission":false}`; a live
+   * create-then-delete round trip on a throwaway Epic → `DELETE
+   * .../issue/BUTCHR-36` → 403, `{"errorMessages":["You do not have
+   * permission to delete issues in this project."]}`. Called anyway — the
+   * refusal is a PROJECT PERMISSION, not an API limitation, so granting
+   * `Delete Issues` on this daemon's Atlassian account upgrades
+   * `new_worker`'s rollback to fully working with NO CODE CHANGE. Every
+   * caller of this op must already handle it failing.
+   */
+  deleteIssue(key: string): Promise<unknown>;
 }
