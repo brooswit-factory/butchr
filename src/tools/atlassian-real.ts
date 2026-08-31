@@ -1,5 +1,6 @@
-import { createCloudClient } from "jira.js";
+import { createCloudClient, isNotFoundError } from "jira.js";
 import { createV2Client, createV1Client } from "confluence.js";
+import { createClient as createConfluenceClient } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
 
 /** One paragraph of plain text as ADF (what Jira v3 wants for descriptions/comments). */
@@ -23,6 +24,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
   // The v1 (legacy "content") API's /wiki/rest/api/search still serves CQL and is not
   // deprecated, so a second client, same host/auth, is the documented way to reach it.
   const wiki1: any = createV1Client({ host: cfg.site, auth });
+  // confluence.js's v1 client wraps only a handful of legacy endpoints
+  // (content/{archive,publish,search}) — it has NO wrapped method at all for
+  // `POST /wiki/rest/api/content` (confirmed against
+  // node_modules/confluence.js/dist/v1/createV1Client.d.ts: `.content` only
+  // exposes archivePages/publishLegacyDraft/publishSharedDraft/searchContentByCQL).
+  // That endpoint is the only one that can set `metadata.labels` atomically at
+  // create time (the v2 create has no label support at all), so
+  // createPageWithLabel below drives it with the bare low-level client
+  // (`confluence.js/core`'s `createClient`, the same one createV1Client uses
+  // internally) rather than through a wrapped call that doesn't exist.
+  const wikiRaw = createConfluenceClient({ host: cfg.site, auth });
   return {
     getIssue: (key) => jira.issues.getIssue({ issueIdOrKey: key }),
     search: (jql, maxResults) =>
@@ -126,5 +138,70 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // body-forwarding gotcha here, unlike the page-write endpoints above.
     searchPages: (cql, limit) => wiki1.search.searchByCQL({ cql, limit }),
     listSpaces: () => wiki.space?.getSpaces?.({ limit: 50 }) ?? wiki.spaces?.getSpaces?.({ limit: 50 }),
+
+    getProjectProperty: (projectKey, propertyKey) =>
+      jira.projectProperties.getProjectProperty({ projectIdOrKey: projectKey, propertyKey }).then((r: any) => r?.value),
+
+    // getRemoteIssueLinks with a `globalId` 404s (jira.js throws NotFoundError)
+    // when no such link exists, rather than resolving an empty result (MEASURED
+    // live against BUTCHR-33) — every caller wants one "not found" shape, so
+    // that 404 is the only thing this op ever converts into `null`; any other
+    // rejection still propagates.
+    getRemoteLink: (key, globalId) =>
+      jira.issueRemoteLinks.getRemoteIssueLinks({ issueIdOrKey: key, globalId }).catch((e: unknown) => {
+        if (isNotFoundError(e)) return null;
+        throw e;
+      }),
+    // MEASURED live: POSTing the same globalId twice returns the SAME link id
+    // both times, with the second call's `object` winning — this idempotence
+    // is what makes ensureDoc's step 5 safe to retry (src/tools/docs.ts).
+    upsertRemoteLink: (key, globalId, relationship, object) =>
+      jira.issueRemoteLinks.createOrUpdateRemoteIssueLink({ issueIdOrKey: key, globalId, relationship, object }),
+
+    // GetChildPages (v2) is a DIRECT, cursor-paginated read — never CQL (see
+    // docs.ts for why CQL is wrong here). `_links.next`, when present, is a
+    // relative URL carrying an opaque `cursor` query param; a `new URL` needs
+    // a base to parse a relative one, so an arbitrary absolute base is used
+    // purely as a parsing scratchpad and discarded — MEASURED live: a
+    // `limit: 1` call against a parent with 2+ children came back with
+    // `_links.next` set, and following its `cursor` reached the rest.
+    getChildPages: async (parentId, cursor) => {
+      const r: any = await wiki.children.getChildPages({ id: parentId, limit: 50, ...(cursor ? { cursor } : {}) });
+      const nextUrl: string | undefined = r?._links?.next;
+      const nextCursor = nextUrl ? new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor") : null;
+      return { results: (r?.results ?? []).map((c: any) => ({ id: c.id, title: c.title })), ...(nextCursor ? { nextCursor } : {}) };
+    },
+    getPageLabels: (pageId) =>
+      wiki.label.getPageLabels({ id: pageId }).then((r: any) => (r?.results ?? []).map((l: any) => l.name).filter(Boolean)),
+
+    // MEASURED live against the BUTCHR space: a v1 create with `space: { key }`
+    // (NOT spaceId — v1 wants the space's KEY) plus `ancestors: [{ id: parentId }]`
+    // plus `metadata: { labels: [{ prefix: "global", name }] }` produced a page
+    // whose label was present on an IMMEDIATE direct read (no async-index lag,
+    // unlike CQL). Response shape is the legacy v1 "content" shape (`_links.base`
+    // + `_links.webui` for the URL, string `id`, `title`) — NOT the v2 shape
+    // `createPage`/`getPage` above return; that's the whole reason this is a
+    // separate op rather than a `labels?` branch inside `createPage` — a caller
+    // of the existing op must never see a shape change.
+    // MEASURED live: creating a second page with the SAME title in the SAME
+    // space 400s ("A page with this title already exists") and creates
+    // nothing — ensureDoc's race guard (docs.ts) relies on this being a real,
+    // atomic, server-enforced rejection, not a client-side check.
+    createPageWithLabel: async (p) => {
+      const created: any = await wikiRaw.sendRequest({
+        url: "/wiki/rest/api/content",
+        method: "POST",
+        body: {
+          type: "page",
+          title: p.title,
+          space: { key: p.spaceKey },
+          ancestors: [{ id: p.parentId }],
+          body: { storage: { value: p.body, representation: "storage" } },
+          metadata: { labels: [{ prefix: "global", name: p.label }] },
+        },
+      });
+      const base = created?._links?.base ?? `${cfg.site}/wiki`;
+      return { id: created.id, title: created.title, url: `${base}${created?._links?.webui ?? ""}` };
+    },
   };
 }
