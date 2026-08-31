@@ -10,6 +10,17 @@ const iss = (key: string, status: string, opts: Partial<JiraIssue> = {}): JiraIs
 
 const rel = (child: JiraIssue, watchers: string[]): RelatedIssue => ({ issue: child, watchers });
 
+// Pins the LITERAL VALUE, not just its shape — every other test imports and
+// uses EXEMPT_LABEL symbolically, so none of them would notice if the
+// constant's string changed. That value is a cross-epic contract: BUTCHR-25's
+// proposed shelve_worker will write this exact string from code this repo
+// does not control, and a near-miss (e.g. "butchr:shelve") would be silent —
+// a shelved ticket carrying the wrong label is byte-indistinguishable from a
+// genuinely parked one, so this detector would escalate it anyway.
+test("EXEMPT_LABEL is exactly \"butchr:shelved\" (cross-epic contract with BUTCHR-25's shelve_worker)", () => {
+  expect(EXEMPT_LABEL).toBe("butchr:shelved");
+});
+
 describe("parkedCandidates (pure predicate)", () => {
   test("all five conditions hold: a candidate", () => {
     const issues = [iss("BOSS", "In Progress")];
