@@ -291,6 +291,18 @@ export interface AdoptWorkerResult {
  * `ensureDoc` still runs unconditionally as a no-op-when-already-present
  * safety net, regardless of `alreadyAdopted`. Refuses a ticket already
  * linked to a DIFFERENT boss.
+ *
+ * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
+ * "shelve" disposition, the reason is posted whenever this call does ANY
+ * real adoption work at all (`!alreadyAdopted`) — even if the ticket
+ * already happens to be To Do with the exemption label already on it (set
+ * by a human, or by a boss that has since died). The label is STATE; the
+ * reason is a DECLARATION this caller is making on its own authority as
+ * part of taking ownership, and skipping it whenever the label happened to
+ * already be present would adopt an orphan straight into "shelved, with no
+ * activation condition on record" — the one state the glossary says must
+ * never exist. Only a genuinely idempotent re-adoption (`alreadyAdopted`)
+ * skips the comment.
  */
 export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
@@ -324,13 +336,29 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
 
   const doc = await ensureDoc(ops, workerKey);
 
-  if (!alreadyAdopted && !dispositionAlreadyApplied) {
+  // NOTE: the reason comment for "shelve" is posted whenever this call is
+  // doing ANY real adoption work (!alreadyAdopted) — NOT gated on
+  // `dispositionAlreadyApplied` the way the transition/label are. Those two
+  // are STATE (already To Do + labelled — cheap to check, safe to skip
+  // re-writing); the reason is a DECLARATION this caller is making right
+  // now, on ITS OWN authority, as part of taking ownership. A ticket can
+  // already carry the label (set by a human, or by a boss that has since
+  // died) while this boss has never written down why IT is shelving it — if
+  // the comment were skipped whenever the label happens to already be
+  // there, exactly that ticket (adopting an orphan that already carries the
+  // exemption label) would end up SHELVED with no activation condition on
+  // record at all, which is the one state the glossary says must never
+  // exist. Only `alreadyAdopted` (a true no-op re-adoption by the same
+  // caller) may skip it.
+  if (!alreadyAdopted) {
     if (disposition.kind === "start") {
-      await ops.transition(workerKey, "In Progress");
+      if (!dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
     } else {
-      // Label before transition — see shelveWorker's comment for why.
-      await ops.addLabels(workerKey, [EXEMPT_LABEL]);
-      if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
+      if (!dispositionAlreadyApplied) {
+        // Label before transition — see shelveWorker's comment for why.
+        await ops.addLabels(workerKey, [EXEMPT_LABEL]);
+        if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
+      }
       await ops.addComment(workerKey, tagComment(callerKey, disposition.reason));
     }
   }

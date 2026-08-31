@@ -550,6 +550,28 @@ describe("adoptWorker", () => {
     await expect(adoptWorker(broken, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "later" })).rejects.toThrow(/label write refused/);
     expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // NOT transitioned to To Do — never parked-looking
   });
+
+  test("THE DISCARDED-REASON BUG: adopting an orphan that ALREADY carries the exemption label (set by a human, or a boss that has since died) still posts the caller's reason — a shelved worker must never end up with no activation condition on record", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Exact repro from review: To Do, already labelled, but unlinked and unassigned.
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [EXEMPT_LABEL] });
+    let transitionCalls = 0, labelCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+      addLabels: async (...a) => { labelCalls++; return ops.addLabels(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "MY-FRESH-REASON" });
+    expect(result.alreadyAdopted).toBe(false); // real adoption work happened (link + assign)
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.bossKey).toBe("BUTCHR-1");
+    expect(w.assignee).toBe(ROLES.story);
+    expect(w.comments.some((c) => c.includes("MY-FRESH-REASON"))).toBe(true); // THE bug: this must never be empty
+    expect(transitionCalls).toBe(0); // state already correct — no redundant write
+    expect(labelCalls).toBe(0); // state already correct — no redundant write
+  });
 });
 
 describe("shelveWorker: ORDERING — label before transition", () => {
