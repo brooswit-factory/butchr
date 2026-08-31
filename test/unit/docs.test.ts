@@ -348,6 +348,39 @@ describe("docs.ts: set_doc — full replace, provisional-title refusal", () => {
   });
 });
 
+describe("docs.ts: the provisional body's ASSIST pointer", () => {
+  // BUTCHR-25 (operator, late addition): the assistant documents this estate in a
+  // Confluence space nothing routed an agent to. The provisional body is the ONLY
+  // text the tool itself authors and the one thing a newly-born agent is certain
+  // to read, so it carries the pointer. These tests exist so the pointer cannot be
+  // dropped silently by someone tidying the body text — the reason it is here is
+  // not visible from the string itself.
+  test("a freshly created doc points at the ASSIST space and its entry points", async () => {
+    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-70", "a newborn agent reads this once");
+    const doc = await ensureDoc(ops, "BUTCHR-70");
+    const body = pages.get(doc.id)!.body;
+    expect(body).toContain("/wiki/spaces/ASSIST/overview");
+    expect(body).toContain("/wiki/spaces/ASSIST/pages/12714016"); // the factory, end to end
+    expect(body).toContain("/wiki/spaces/ASSIST/pages/12386388"); // working agreements with agents
+    // still carries the ticket affordance it always did
+    expect(body).toContain("BUTCHR-70");
+  });
+
+  test("the pointer is transient by design — the first set_doc replaces it", async () => {
+    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-71", "pointer is scaffolding, not content");
+    const doc = await ensureDoc(ops, "BUTCHR-71");
+    expect(pages.get(doc.id)!.body).toContain("ASSIST");
+    await setDoc(ops, "BUTCHR-71", "<p>what actually happened</p>", "A real outcome title");
+    // Replaced wholesale, pointer included. That is correct: by now the agent has
+    // read it, and the doc's job has changed from orienting its author to recording.
+    expect(pages.get(doc.id)!.body).toBe("<p>what actually happened</p>");
+  });
+});
+
 describe("docs.ts: labelForKey / JIRA_KEY_RE", () => {
   test("round-trips a valid key losslessly (lowercased)", () => {
     expect(labelForKey("BUTCHR-27")).toBe("butchr-ticket-butchr-27");
