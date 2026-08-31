@@ -3,7 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, buildWorkspace } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace } from "../../src/agents/workspace.js";
 
 describe("briefFor / modelFor", () => {
   test("each type gets its brief; unknown gets default", () => {
@@ -17,6 +17,15 @@ describe("briefFor / modelFor", () => {
     expect(modelFor("Story")).toBe("opus");
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
+  });
+  test("effort: epic/story/task all high, unknown type also defaults to high without throwing", () => {
+    expect(effortFor("Epic")).toBe("high");
+    expect(effortFor("Story")).toBe("high");
+    expect(effortFor("Task")).toBe("high");
+    expect(() => effortFor("Whatever")).not.toThrow();
+    expect(effortFor("Whatever")).toBe("high");
+    expect(effortFor("EPIC")).toBe("high");
+    expect(effortFor("Story")).toBe("high");
   });
   test("reviewer briefs carry the [review] verdict-line instruction", () => {
     expect(briefFor("Epic")).toContain("[review] APPROVED");
