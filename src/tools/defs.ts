@@ -4,7 +4,7 @@ import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc } from "./docs.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, ASK_MARKER,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER,
   type Disposition,
 } from "./relationship.js";
 
@@ -152,14 +152,14 @@ export function atlassianTools(
     },
     jira_transition: {
       description:
-        'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), or submit_to_boss (→ In Review on your OWN ticket, no args). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
+        'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), submit_to_boss (→ In Review on your OWN ticket, no args), or finish_without_a_boss (→ Done on your OWN ticket, no args, ONLY when you have no boss). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
         'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
       handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description:
-        "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. This tool remains the ONLY way to file a DELIBERATE ORPHAN (`implements: \"none\"`, for explicit out-of-scope/triage work your brief tells you to file outside your epic) — new_worker always links to its caller and has no orphan route; do not use new_worker in place of this when you actually need an orphan. " +
+        "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. For a DELIBERATE ORPHAN (`implements: \"none\"`, explicit out-of-scope/triage work your brief tells you to file outside your epic), prefer file_where_it_belongs instead — it demands and records WHERE the work belongs and pushes a notice a person actually receives; `implements: \"none\"` here still works, unchanged, but leaves the destination undocumented and nobody notified unless you do that by hand. new_worker always links to its caller and has no orphan route either way. " +
         "Create a Jira issue. ASSIGNMENT: a Story or a Task is assigned BY ROLE from its issuetype (configured on this daemon) — pass an explicit `assignee` (an Atlassian accountId) to override, which always wins; an Epic is unchanged (caller-supplied assignee, or none — Epics are the human's). If the role's accountId isn't configured on this daemon and you passed no `assignee`, the call is REFUSED. HOME: a Story or a Task also requires a home — pass `implements` (the issue key it reports to: a Story implements an Epic, a Task implements a Story) or `parent` (nests it in Jira for membership; a Story can parent to an Epic, but a Task CANNOT parent to a Story in this project — use `implements` for Tasks). Omitting both refuses the call; an Epic needs neither. OPT-OUT: pass `implements: \"none\"` (case-insensitive) to file a deliberate orphan — the ticket is still created and still staffed by role, but no link is made; use this ONLY for the explicit out-of-scope/triage tickets your brief tells you to file outside your epic — silence (omitting both `implements` and `parent`) is never the opt-out. LINKING: after creating the issue, the tool itself creates the Implements link (from = the new issue, to = the resolved target) — the result carries both the new `key` and the link outcome as `implements: { ok, to, error? }`; a link failure never hides the key, so retry the LINK, not the create, on failure. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
       input: {
         projectKey: z.string(), issuetype: z.enum(["Epic", "Story", "Task"]), summary: z.string(),
@@ -549,6 +549,52 @@ export function atlassianTools(
         const r = await submitToBoss(ops, who);
         noted(c, [who]);
         return orOk(r, { ok: true, key: who, status: "In Review" });
+      },
+    },
+    finish_without_a_boss: {
+      description:
+        "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
+        "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
+        "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
+        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built.",
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireCaller(c, "finish_without_a_boss");
+        audit(c, `finish_without_a_boss`);
+        const r = await finishWithoutABoss(ops, who);
+        noted(c, [who]);
+        return orOk(r, { ok: true, key: who, status: "Done" });
+      },
+    },
+    file_where_it_belongs: {
+      description:
+        "The successor to jira_create_issue's `implements: \"none\"` deliberate-orphan escape (still an unchanged alias this release). Files a ticket that is explicitly NOT the caller's — genuine out-of-scope work your brief tells you to file outside your own epic. NO Implements link is ever made, to the destination or to anything else: this stays a true orphan. " +
+        "YOU SUPPLY: `summary`, `description` (optional), `issuetype` (`\"Story\"` or `\"Task\"`), `priority` (optional — omitting it takes the site default), and a REQUIRED `destination`. " +
+        "`destination` IS EITHER: an EXISTING EPIC KEY this work belongs under (e.g. \"BUTCHR-25\"), OR a short prose REASON it needs a brand-new epic (e.g. \"no epic covers observability tooling yet\") — both are legitimate, neither is a fallback for the other. REFUSED: an empty or whitespace-only destination; a placeholder (\"n/a\", \"tbd\", \"unknown\", \"none\", \"?\", \"-\", \"idk\", and the like); a Jira-key-shaped destination that doesn't exist, or that exists but isn't an Epic (naming what it actually is); and prose too thin to be a real reason. This is the point of the tool, not an obstacle to route around: filing work outside your scope is only half the job, saying where it should live is the other half. " +
+        "TAKES NO DISPOSITION, unlike new_worker/adopt_worker — argued, not omitted: a disposition answers \"what happens to MY worker\", and nobody can answer that for a ticket that is by definition not yours. It is filed To Do, staffed by role exactly as jira_create_issue staffs it today, and stays there — never staffed by this daemon — until some future boss calls adopt_worker on it. Never carries the shelved-exemption label: the parked-ticket detector only ever walks tickets reachable by an Implements link, and this ticket has none, so that label would mean nothing here. " +
+        "WHAT IT WRITES: the created ticket's OWN description gets a destination header block baked in at creation (never only in a comment) plus the `butchr:orphan` label (a one-line JQL away from \"show me every undirected ticket\"); then a best-effort NOTICE comment — on the named epic (case A), or, when the destination is a \"needs a new epic\" reason, on the TOPMOST ticket in the CALLER's own Implements chain (case B, since there's no epic yet to comment on and this daemon has no configured human/root key). CASE B CREATES NO LINK: the notice says where the filer thinks the work belongs, it does not make it so — quietly re-parenting an orphan onto whatever it lands near would be exactly the suppression this verb exists to prevent. " +
+        "ORDER AND WHAT A THROW MEANS: create (destination + label already baked in) happens first and is irreversible; the notice and the doc (ensureDoc, same as new_worker) are best-effort afterward. A THROW after creation means the ticket itself is fine and needs no cleanup — the error names exactly which of the notice/doc failed and how to complete it by hand (jira_add_comment for the notice; the ticket's own first set_doc call for the doc). " +
+        "Was named `file_for_another_boss` during design; renamed before shipping because that name asserts there IS another boss, which is false in the \"needs a new epic\" case.",
+      input: {
+        summary: z.string(),
+        description: z.string().optional(),
+        issuetype: z.enum(["Story", "Task"]),
+        priority: z.string().optional(),
+        destination: z.string(),
+      },
+      handler: async (a, c) => {
+        const p = a as { summary: string; description?: string; issuetype: "Story" | "Task"; priority?: string; destination: string };
+        const who = requireCaller(c, "file_where_it_belongs");
+        audit(c, `file_where_it_belongs issuetype=${p.issuetype} destination="${p.destination.slice(0, 60)}"`);
+        const result = await fileWhereItBelongs(ops, roles, who, {
+          summary: p.summary,
+          ...(p.description ? { description: p.description } : {}),
+          issuetype: p.issuetype,
+          ...(p.priority ? { priority: p.priority } : {}),
+          destination: p.destination,
+        });
+        noted(c, [result.key, result.noticeTarget]); // the new ticket's own `updated`, plus the notice bumping its target's
+        return result;
       },
     },
   };

@@ -33,12 +33,12 @@ function rig(roles: { story?: string; task?: string } = {}) {
 }
 
 describe("atlassianTools", () => {
-  test("exposes the full proxy surface — alias-completeness: every pre-existing name still resolves, plus the ten relationship verbs (BUTCHR-35)", () => {
+  test("exposes the full proxy surface — alias-completeness: every pre-existing name still resolves, plus the ten relationship verbs (BUTCHR-35) and file_where_it_belongs (BUTCHR-37)", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
-      "finish_worker",
+      "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
       "get_doc",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
@@ -90,6 +90,23 @@ describe("atlassianTools", () => {
     const { tools, calls, conn } = rig();
     await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9", type: "Blocks" }, conn);
     expect(calls[0]![1]).toEqual(["KAN-2", "KAN-9", "Blocks"]);
+  });
+});
+
+describe("jira_transition: pinning test — still works exactly as it does today (BUTCHR-39)", () => {
+  test("moves ANY key to ANY status, with no ownership check and no refusal finish_without_a_boss now adds for the bossless-Done case", async () => {
+    const { tools, calls, audits, conn } = rig();
+    // A key that is neither the caller's own nor one of its workers — jira_transition
+    // has never checked ownership, and finish_without_a_boss's arrival must not change that.
+    await tools.jira_transition!.handler({ key: "SOMEONE-ELSE-1", status: "Done" }, conn);
+    expect(calls).toEqual([["transition", ["SOMEONE-ELSE-1", "Done"]]]);
+    expect(audits[0]).toContain("transition SOMEONE-ELSE-1 → Done");
+    expect(audits[0]).toContain("[deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]");
+  });
+
+  test("still names finish_without_a_boss in its deprecation note, alongside the other successors", () => {
+    const { tools } = rig();
+    expect(tools.jira_transition!.description).toMatch(/finish_without_a_boss/);
   });
 });
 
@@ -810,5 +827,125 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(d).toMatch(/GUARANTEES/);
     expect(d).toMatch(/set_doc/);
     expect(d).toMatch(/rolled back|ROLLED BACK|delete the ticket/i);
+  });
+});
+
+describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, audit, onWrite", () => {
+  function rigOrphan(roles: { story?: string; task?: string } = { story: "acct-story", task: "acct-task" }) {
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) =>
+        key === "KAN-1"
+          ? { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } }
+          : { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } },
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    return { ops, tools: atlassianTools(ops, () => {}, roles) };
+  }
+
+  test("refuses a connection with no x-issue, in the get_doc/set_doc shape", async () => {
+    const { tools } = rigOrphan();
+    await expect(tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "KAN-1" }, { headers: {} } as any))
+      .rejects.toThrow(/this connection has no x-issue/);
+  });
+
+  test("schema: summary/issuetype/destination required, description/priority optional, and NO disposition parameter at all", () => {
+    const { tools } = rigOrphan();
+    expect(Object.keys(tools.file_where_it_belongs!.input).sort()).toEqual(["description", "destination", "issuetype", "priority", "summary"]);
+  });
+
+  test("end-to-end through the tool layer: destination reaches relationship.ts, onWrite fires for the new key and the notice target, audit line names the verb and issuetype", async () => {
+    const writes: Array<[string[], string]> = [];
+    const audits: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [] } }),
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    const tools = atlassianTools(ops, (l) => audits.push(l), { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "KAN-1" }, conn)) as { key: string; noticeTarget: string };
+    expect(result.key).toBe("KAN-42");
+    expect(result.noticeTarget).toBe("KAN-1");
+    expect(writes).toEqual([[["KAN-42", "KAN-1"], "KAN-1"]]);
+    expect(audits.some((a) => a.includes('file_where_it_belongs issuetype=Task destination="KAN-1"'))).toBe(true);
+  });
+
+  test("the description names both destination shapes, the no-disposition rationale, and NEVER claims to be the only orphan route (jira_create_issue's implements:\"none\" still works)", () => {
+    const { tools } = rigOrphan();
+    const d = tools.file_where_it_belongs!.description;
+    expect(d).toMatch(/EXISTING EPIC KEY/);
+    expect(d).toMatch(/brand-new epic/);
+    expect(d).toMatch(/NO DISPOSITION/);
+    expect(d).toMatch(/CASE B CREATES NO LINK/);
+    expect(d).toMatch(/file_for_another_boss/); // the design-history sentence, per BUTCHR-29's own instruction
+  });
+
+  test("jira_create_issue's description no longer claims to be the ONLY orphan route, but implements:\"none\" behavior is untouched", async () => {
+    const { tools, ops } = rigOrphan();
+    expect(tools.jira_create_issue!.description).toMatch(/file_where_it_belongs/);
+    expect(tools.jira_create_issue!.description).not.toMatch(/ONLY way to file/);
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "none", assignee: "acct-x" }, conn)) as { key?: string };
+    expect(result.key).toBe("KAN-42");
+    void ops;
+  });
+});
+
+describe("finish_without_a_boss (BUTCHR-39): wiring — x-issue, schema shape, audit, refusal, onWrite", () => {
+  function rigWithBoss(bossKey: string | undefined) {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({
+        fields: {
+          issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" },
+          issuelinks: bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: bossKey } }] : [],
+        },
+      }),
+      // transition resolves undefined, matching Jira's real empty-201-body case (KAN-764) —
+      // exercises orOk's fallback rather than masking it behind a truthy fake result.
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({}), transition: async () => undefined,
+      createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    return ops;
+  }
+
+  test("takes NO arguments at all, same shape as submit_to_boss", () => {
+    const tools = atlassianTools(rigWithBoss(undefined), () => {});
+    expect(Object.keys(tools.finish_without_a_boss!.input)).toEqual([]);
+  });
+
+  test("refuses a connection with no x-issue, in the get_doc/set_doc shape", async () => {
+    const tools = atlassianTools(rigWithBoss(undefined), () => {});
+    await expect(tools.finish_without_a_boss!.handler({}, { headers: {} } as any)).rejects.toThrow(/this connection has no x-issue/);
+  });
+
+  test("THE LOAD-BEARING TEST: refuses a caller that HAS a boss, with a message that teaches, and never transitions it", async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    const ops = rigWithBoss("KAN-1");
+    const spied: AtlassianOps = { ...ops, transition: async (...a) => { calls.push(["transition", a]); return ops.transition(...a); } };
+    const tools = atlassianTools(spied, () => {});
+    const conn = { headers: { "x-issue": "KAN-9" } } as any;
+    await expect(tools.finish_without_a_boss!.handler({}, conn)).rejects.toThrow(/has a boss \(KAN-1\)/);
+    await expect(tools.finish_without_a_boss!.handler({}, conn)).rejects.toThrow(/submit_to_boss/);
+    await expect(tools.finish_without_a_boss!.handler({}, conn)).rejects.toThrow(/finish_worker/);
+    expect(calls.length).toBe(0); // never even attempted the transition
+  });
+
+  test("the happy path: a bossless caller reaches Done, audits, and fires onWrite for its OWN key", async () => {
+    const ops = rigWithBoss(undefined);
+    const audits: string[] = [];
+    const writes: Array<[string[], string]> = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = await tools.finish_without_a_boss!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-1", status: "Done" });
+    expect(audits.some((a) => a.includes("finish_without_a_boss") && a.includes("KAN-1"))).toBe(true);
+    expect(writes).toEqual([[["KAN-1"], "KAN-1"]]);
   });
 });
