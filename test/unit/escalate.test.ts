@@ -1,9 +1,47 @@
 import { describe, expect, test } from "bun:test";
-import { fingerprint, escalationComment, parseDirective, freeTextOption, redact } from "../../src/agents/escalate.js";
+import { fingerprint, escalationComment, parseDirective, freeTextOption, redact, MARKER } from "../../src/agents/escalate.js";
 import { parsePrompt } from "../../src/agents/prompt.js";
 import type { Prompt } from "../../src/agents/prompt.js";
+import { tellWorker } from "../../src/tools/relationship.js";
+import { atlassianTools } from "../../src/tools/defs.js";
+import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import type { Connection } from "@brooswit/thatch";
 
 const prompt = (question: string, options: string[], current = 1): Prompt => ({ question, options, current });
+
+/**
+ * A minimal `AtlassianOps` fake that only implements what `tellWorker`
+ * actually calls (`getIssue` to verify the boss/worker link, `addComment` to
+ * post) — cast past the rest of the (much larger) interface, which
+ * `tellWorker` never touches. Returns the body `addComment` was actually
+ * called with, i.e. the REAL production tagging construction
+ * (tellWorker -> tagComment in src/tools/relationship.ts), not a hand-typed
+ * literal standing in for it.
+ */
+async function tellWorkerTagged(bossKey: string, workerKey: string, text: string): Promise<string> {
+  let captured = "";
+  const ops = {
+    getIssue: async () => ({ fields: { issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: bossKey } }] } }),
+    addComment: async (_key: string, body: string) => { captured = body; },
+  } as unknown as AtlassianOps;
+  await tellWorker(ops, bossKey, workerKey, text);
+  return captured;
+}
+
+/**
+ * Same idea for `jira_add_comment`'s handler (src/tools/defs.ts) — the OTHER
+ * production tagging path the ticket requires coverage of. Invokes the real
+ * handler wired by `atlassianTools`, with a caller connection carrying
+ * `x-issue`, and returns the body `addComment` actually received.
+ */
+async function jiraAddCommentTagged(callerIssue: string, key: string, text: string): Promise<string> {
+  let captured = "";
+  const ops = { addComment: async (_key: string, body: string) => { captured = body; } } as unknown as AtlassianOps;
+  const tools = atlassianTools(ops, () => {});
+  const connection = { headers: { "x-issue": callerIssue } } as unknown as Connection;
+  await tools.jira_add_comment!.handler({ key, text }, connection);
+  return captured;
+}
 
 describe("fingerprint", () => {
   test("is a stable 8-hex-char digest of question + options", () => {
@@ -118,6 +156,54 @@ describe("parseDirective", () => {
   });
   test("finds the first ANSWER line among other prose", () => {
     expect(parseDirective("I looked at this.\nANSWER 3 deadbeef\nThanks.")).toEqual({ kind: "option", n: 3, fp: "deadbeef" });
+  });
+});
+
+describe("parseDirective — identity tag prepended (BUTCHR-45)", () => {
+  test("a terse ANSWER sent as the ENTIRE comment body, tagged via the real tell_worker/tagComment construction, parses", async () => {
+    // This is the exact defect: the system-recommended terse form, run through
+    // the REAL production tagging path (not a hand-typed `[KEY] ANSWER ...`
+    // literal) — tell_worker is the intended downward channel for replies.
+    const tagged = await tellWorkerTagged("BOSS-1", "WORKER-1", "ANSWER 2 abc12345");
+    expect(tagged).toBe("[BOSS-1] ANSWER 2 abc12345");
+    expect(parseDirective(tagged)).toEqual({ kind: "option", n: 2, fp: "abc12345" });
+  });
+
+  test("the same terse ANSWER, tagged via the real jira_add_comment construction, also parses", async () => {
+    const tagged = await jiraAddCommentTagged("BOSS-1", "WORKER-1", "ANSWER 2 abc12345");
+    expect(tagged).toBe("[BOSS-1] ANSWER 2 abc12345");
+    expect(parseDirective(tagged)).toEqual({ kind: "option", n: 2, fp: "abc12345" });
+  });
+
+  test("a tagged ANSWER TEXT also parses, via tell_worker", async () => {
+    const tagged = await tellWorkerTagged("BOSS-1", "WORKER-1", "ANSWER TEXT do it differently abc12345");
+    expect(parseDirective(tagged)).toEqual({ kind: "text", text: "do it differently", fp: "abc12345" });
+  });
+
+  test("a tagged ANSWER with no fingerprint also parses, via jira_add_comment", async () => {
+    const tagged = await jiraAddCommentTagged("BOSS-1", "WORKER-1", "ANSWER 2");
+    expect(parseDirective(tagged)).toEqual({ kind: "option", n: 2, fp: null });
+  });
+
+  test("negative: a tagged ANSWER quoted mid-sentence inside prose still does not fire", async () => {
+    const tagged = await tellWorkerTagged("BOSS-1", "WORKER-1", "quoting the dialog above: ANSWER 2 abc12345");
+    expect(parseDirective(tagged)).toBeNull();
+  });
+
+  test("negative: a tagged comment that is itself a [butchr:blocked] escalation is still ignored, guarding both raw and tag-stripped text", async () => {
+    // Today the daemon never posts MARKER comments through a tagging path (it
+    // calls addComment directly — see escalate.ts's doc comment on this), so
+    // this is a defence-in-depth case, not a live one: it proves the guard
+    // still holds if that ever changed.
+    const tagged = await tellWorkerTagged("BOSS-1", "WORKER-1", `${MARKER} WORKER-1 is waiting on a decision:\n\nQ\n\n1. a\n\nfingerprint: abc12345\n\nANSWER 2 abc12345`);
+    expect(tagged.startsWith(`[BOSS-1] ${MARKER}`)).toBe(true);
+    expect(parseDirective(tagged)).toBeNull();
+  });
+
+  test("negative: a leading bracket that is NOT issue-key-shaped is left untouched, so it does not rescue the line", () => {
+    // "[not a tag]" doesn't match TAG_RE ([A-Z]+-\d+) — contrast with the real
+    // tag-shaped case above (e.g. "[BOSS-1] ") which IS stripped.
+    expect(parseDirective("[not a tag] ANSWER 2 abc12345")).toBeNull();
   });
 });
 
