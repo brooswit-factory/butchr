@@ -18,6 +18,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
   const projectProperties = new Map<string, unknown>();
   let nextId = 100;
+  let upsertRemoteLinkCalls = 0;
 
   function addIssue(key: string, summary: string, bossKey?: string) {
     issues.set(key, { summary, ...(bossKey ? { bossKey } : {}) });
@@ -74,6 +75,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       return issue?.remoteLink ? { object: { ...issue.remoteLink } } : null;
     },
     upsertRemoteLink: async (key: string, _globalId: string, _relationship: string, object: { title: string; url: string }) => {
+      upsertRemoteLinkCalls++;
       const issue = issues.get(key);
       if (!issue) throw new Error(`fake world: no such issue ${key}`);
       issue.remoteLink = { ...object };
@@ -99,7 +101,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     },
   };
 
-  return { ops, issues, pages, projectProperties, addIssue, setProjectProperty };
+  return { ops, issues, pages, projectProperties, addIssue, setProjectProperty, upsertCalls: () => upsertRemoteLinkCalls };
 }
 
 const ROOT_DOC_ID = "1";
@@ -315,6 +317,34 @@ describe("docs.ts: set_doc — full replace, provisional-title refusal", () => {
     await setDoc(ops, "BUTCHR-64", "<p>x</p>", "T");
     expect(pages.size).toBe(1);
     expect(issues.get("BUTCHR-64")!.remoteLink).toBeTruthy();
+  });
+
+  // PR #112 review: retitling via set_doc must refresh the remote link's own
+  // title too, not just the page's — the link is what a human actually sees
+  // on the Jira ticket, and it was upserted once already (by ensureDoc, on
+  // first write) carrying whatever title the page had at THAT moment.
+  test("retitling via set_doc refreshes the remote link's title, not just the page's", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-65", "link must not go stale");
+    // Lazily create the doc first (ensureDoc's own step-5 upsert carries
+    // whatever title the page has AT THAT MOMENT — the provisional one).
+    await ensureDoc(ops, "BUTCHR-65");
+    expect(issues.get("BUTCHR-65")!.remoteLink!.title).toBe("[unwritten] BUTCHR-65 — link must not go stale");
+    // Retitling write: the link must now read the REAL title, not the stale provisional one.
+    const result = await setDoc(ops, "BUTCHR-65", "<p>real content</p>", "A real outcome-shaped title");
+    expect(result.title).toBe("A real outcome-shaped title");
+    expect(issues.get("BUTCHR-65")!.remoteLink!.title).toBe("A real outcome-shaped title");
+  });
+
+  test("a body-only write (title omitted) does NOT re-upsert the link — no title changed, nothing to refresh", async () => {
+    const { ops, addIssue, upsertCalls, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-66", "no spurious link writes");
+    await setDoc(ops, "BUTCHR-66", "<p>v1</p>", "Outcome title"); // ensureDoc's upsert (1) + this retitle's refresh (2)
+    const callsAfterFirstWrite = upsertCalls();
+    await setDoc(ops, "BUTCHR-66", "<p>v2</p>"); // body-only — title unchanged
+    expect(upsertCalls()).toBe(callsAfterFirstWrite); // no additional upsert
   });
 });
 
