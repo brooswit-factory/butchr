@@ -190,14 +190,22 @@ describe("parseDirective — identity tag prepended (BUTCHR-45)", () => {
     expect(parseDirective(tagged)).toBeNull();
   });
 
-  test("negative: a tagged comment that is itself a [butchr:blocked] escalation is still ignored, guarding both raw and tag-stripped text", async () => {
-    // Today the daemon never posts MARKER comments through a tagging path (it
-    // calls addComment directly — see escalate.ts's doc comment on this), so
-    // this is a defence-in-depth case, not a live one: it proves the guard
-    // still holds if that ever changed.
+  test("a boss that pastes the full escalation (marker included) and answers underneath is NOT dropped, once tagged", async () => {
+    // Review correction (PR #123): a comment starting RAW with MARKER is the
+    // daemon's own self-echo and must be dropped (see the untagged case in
+    // the "parseDirective" describe block above) — but a TAGGED body can only
+    // ever have been written by someone else, since the daemon never tags its
+    // own MARKER comments. Checking the tag-STRIPPED text against MARKER too
+    // (an earlier version of this fix did) would silently drop exactly this
+    // shape — a boss quoting the whole escalation, marker included, then
+    // answering below it — which is the same silent-drop failure class
+    // BUTCHR-44 exists to eliminate. This body already parsed correctly
+    // before this PR's tag-stripping existed at all (the ANSWER line itself
+    // was always untouched by the tag, which only ever lands on line 1); the
+    // fix must not regress that.
     const tagged = await tellWorkerTagged("BOSS-1", "WORKER-1", `${MARKER} WORKER-1 is waiting on a decision:\n\nQ\n\n1. a\n\nfingerprint: abc12345\n\nANSWER 2 abc12345`);
     expect(tagged.startsWith(`[BOSS-1] ${MARKER}`)).toBe(true);
-    expect(parseDirective(tagged)).toBeNull();
+    expect(parseDirective(tagged)).toEqual({ kind: "option", n: 2, fp: "abc12345" });
   });
 
   test("negative: a leading bracket that is NOT issue-key-shaped is left untouched, so it does not rescue the line", () => {

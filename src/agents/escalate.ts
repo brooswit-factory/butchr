@@ -146,20 +146,28 @@ const TAG_RE = /^\[[A-Z]+-\d+\]\s*/;
  * A leading prose line happened to dodge this (the tag lands on line 1, the
  * lone `ANSWER …` line 2 is untouched) — the terse, system-recommended form
  * was exactly the one silently dropped. Fixed by stripping a tag-SHAPED
- * prefix (`TAG_RE`, above) before matching, never a hardcoded key. The
- * MARKER guard below is checked against BOTH the raw and the tag-stripped
- * text: today the daemon only ever posts MARKER comments untagged (see
- * escalationComment above and escalation-loop.ts/parked.ts, which call
- * `addComment` directly, bypassing the tagging tools entirely), so the
- * stripped check is currently a no-op — but checking only the raw text
- * would leave a silent hole open the moment anything ever posts a MARKER
- * comment through a tagging path.
+ * prefix (`TAG_RE`, above) before matching, never a hardcoded key.
+ *
+ * The MARKER guard above is deliberately checked ONLY against the RAW text,
+ * never the tag-stripped text — an earlier version of this fix checked both
+ * and was wrong to. The daemon never tags its own MARKER comments (they go
+ * out via `addComment` directly — see escalationComment above and
+ * escalation-loop.ts/parked.ts — never through `jira_add_comment`/
+ * `tell_worker`), so the raw check already catches every genuine self-echo,
+ * and a TAGGED body can only ever have been written by someone else, never
+ * the daemon. A boss that pastes the whole escalation (marker included)
+ * and answers underneath it produces exactly that shape once tagged —
+ * `[KEY] [butchr:blocked] ... ANSWER 2 abc12345` — and checking the
+ * stripped text against MARKER there would silently drop a real answer,
+ * the identical failure class BUTCHR-44 exists to eliminate (caught in
+ * review of this ticket before merge: measured, on the pre-fix code, that
+ * exact tagged body already parsed correctly — checking the stripped text
+ * would have been a regression, not a hardening).
  */
 export function parseDirective(commentText: string): Directive | null {
   const trimmed = commentText.trimStart();
   if (trimmed.startsWith(MARKER)) return null;
   const unwrapped = trimmed.replace(TAG_RE, "");
-  if (unwrapped.startsWith(MARKER)) return null;
   const line = unwrapped.split("\n").map((l) => l.trim()).find((l) => l.startsWith("ANSWER "));
   if (!line) return null;
   const rest = line.slice("ANSWER ".length).trim();
