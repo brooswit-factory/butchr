@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -817,5 +817,31 @@ describe("reportToBoss / askBoss / submitToBoss", () => {
     addIssue("BUTCHR-7", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
     await submitToBoss(ops, "BUTCHR-7");
     expect(issues.get("BUTCHR-7")!.status).toBe("In Review");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// finish_without_a_boss — the load-bearing test is the refusal: it is the
+// review hop this verb exists to protect for the one caller shape (bossless)
+// that has no boss to submit to and no boss who will ever call finish_worker.
+// ---------------------------------------------------------------------------
+
+describe("finishWithoutABoss", () => {
+  test("THE LOAD-BEARING TEST: refuses a caller that HAS a boss, naming the boss and teaching the way out", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/has a boss \(BUTCHR-1\)/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/submit_to_boss/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/finish_worker/);
+    // and, correctly, it was never transitioned by the refused call.
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do");
+  });
+
+  test("the happy path: a bossless caller actually reaches Done", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey at all
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
   });
 });

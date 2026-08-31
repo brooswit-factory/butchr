@@ -412,6 +412,66 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
 }
 
 // ---------------------------------------------------------------------------
+// Self-close: finish_without_a_boss
+// ---------------------------------------------------------------------------
+
+/**
+ * The caller's OWN ticket -> Done, but ONLY when the caller HAS NO BOSS.
+ * Every other route to Done goes through a review hop: `submit_to_boss`
+ * only ever targets In Review, and `finish_worker` only fires from a boss
+ * closing one of its OWN workers. Neither reaches a ticket with no boss at
+ * all (today, in practice, an Epic) — that ticket has nobody to submit to
+ * and nobody who will ever call `finish_worker` on it. This verb is the
+ * dedicated route for exactly that one case, and no other.
+ *
+ * NO ARGUMENTS: like `submit_to_boss`, the only ticket this can ever act on
+ * is the caller's own (`x-issue`), so there is nothing to get wrong.
+ *
+ * THE REFUSAL IS THE FEATURE, NOT A GUARD. A worker never finishes itself —
+ * that is the entire point of the boss/worker asymmetry (`finish_worker`'s
+ * own doc comment), and this verb exists to hold that line for the one
+ * caller shape that could otherwise slip past it: a ticket with a boss has
+ * no business reaching for a "no boss" verb, so refusing it here converts
+ * "a worker never finishes itself" from a sentence in a brief into a call
+ * that fails, the same move `prioritize_worker` makes refusing the caller's
+ * own key. Every Done in this system, apart from this one deliberate
+ * exception, requires a SECOND IDENTITY to have looked at the work before
+ * it closes; a caller with a boss already has that second identity waiting
+ * (`submit_to_boss`, then its boss's `finish_worker`), so it is refused here
+ * and pointed at the path that actually gets its work reviewed.
+ *
+ * DESIGNED TO BECOME OBSOLETE, NOT ABANDONED. This system's design decisions
+ * record a planned tier ABOVE epics (a "project" level) that does not exist
+ * yet. If it did, an epic would have a boss like everything else, would call
+ * `submit_to_boss` and let that boss call `finish_worker` on it, and this
+ * verb would simply have no caller left — a ticket with a boss can never use
+ * it, so the day every top-level ticket has one, this narrows to nothing ON
+ * ITS OWN, with no removal needed. A future reader who finds this verb with
+ * zero callers should read that as the tier having arrived, not as dead code
+ * nobody cleaned up.
+ *
+ * OPEN QUESTION THIS DOES NOT SETTLE, AND IS NOT THIS VERB'S TO SETTLE:
+ * whether a top-level ticket SHOULD be able to close itself at all, with no
+ * second identity ever looking, is a real question — every other Done here
+ * requires a review hop, and a bossless ticket's self-close has none. This
+ * verb only formalizes what `jira_transition` already lets happen today; it
+ * takes no position on whether that's the right end state, and that
+ * question belongs to whoever decides if and when the project tier above
+ * epics gets built — a human call, not an agent's to make by building or
+ * not building this.
+ */
+export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
+  const issue = await ops.getIssue(callerKey);
+  const boss = findBossKey(issue);
+  if (boss) {
+    throw new Error(
+      `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
+    );
+  }
+  return ops.transition(callerKey, "Done");
+}
+
+// ---------------------------------------------------------------------------
 // The deliberate-orphan escape: file_where_it_belongs
 // ---------------------------------------------------------------------------
 
@@ -591,6 +651,36 @@ export interface FileWhereItBelongsResult {
  * and the doc failed (either, or both) and what a caller can do about each:
  * re-post the notice by hand with jira_add_comment, or wait for the ticket's
  * own first set_doc call.
+ *
+ * A KNOWN NARROWING IN CASE B, RECORDED RATHER THAN FIXED (found in review of
+ * BUTCHR-37, after that branch had already merged — a defect in the original
+ * spec, not in that implementation): case B's guarantee is "a person sees
+ * it" only when the CALLER's own Implements chain is intact and bottoms out
+ * at an Epic, which is human-watched. `topmostBoss` walks that chain and
+ * returns whatever key has no boss above it — if the CALLER ITSELF is a
+ * bossless Story (an orphan filing an orphan), that key is the caller's own,
+ * and the notice lands on an agent-owned ticket nobody human is watching.
+ * The guarantee silently degrades from "a person sees it" to "an agent sees
+ * it". This is rare — it needs an orphan to be doing the filing — and it is
+ * inherent to how the walk is specified (find the topmost ticket in MY OWN
+ * chain), not a bug in the walk itself. NOT fixed here: no fallback, no
+ * config key, no human/root-key lookup added for it — matching this file's
+ * own standard elsewhere (see `newWorker`'s three throws and its measured
+ * `DELETE_ISSUES` refusal) of stating a known limitation rather than
+ * silently accepting it or quietly patching around it.
+ *
+ * CASE B'S MISSING LINK IS DELIBERATE, AND IT WILL NOT FEEL DELIBERATE TO
+ * WHOEVER READS IT NEXT — that is exactly why this is spelled out rather than
+ * left to the "creates NO link" line above to carry alone. A notice arrives
+ * on someone's ticket announcing unowned work; the natural, helpful,
+ * courteous reflex on reading it is to link the orphan so it has a home. THAT
+ * REFLEX IS THE FAILURE this verb exists to prevent — the same
+ * suppression-by-quiet-adoption named above, just arriving as a well-meaning
+ * "fix" instead of a bug. Nothing about the missing link is an oversight: do
+ * not add it, ever, from inside this function. The fact that adding it feels
+ * like a kindness is precisely the reason the warning has to be this
+ * explicit — a reader who understands WHY they want to change this is far
+ * less likely to than one who is only told not to.
  */
 export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, callerKey: string, input: FileWhereItBelongsInput): Promise<FileWhereItBelongsResult> {
   const destination = classifyDestination(input.destination);
