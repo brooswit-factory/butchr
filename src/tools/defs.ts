@@ -4,7 +4,7 @@ import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc } from "./docs.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, fileWhereItBelongs, ASK_MARKER,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER,
   type Disposition,
 } from "./relationship.js";
 
@@ -152,7 +152,7 @@ export function atlassianTools(
     },
     jira_transition: {
       description:
-        'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), or submit_to_boss (→ In Review on your OWN ticket, no args). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
+        'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), submit_to_boss (→ In Review on your OWN ticket, no args), or finish_without_a_boss (→ Done on your OWN ticket, no args, ONLY when you have no boss). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
         'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
       handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
@@ -549,6 +549,21 @@ export function atlassianTools(
         const r = await submitToBoss(ops, who);
         noted(c, [who]);
         return orOk(r, { ok: true, key: who, status: "In Review" });
+      },
+    },
+    finish_without_a_boss: {
+      description:
+        "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
+        "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
+        "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
+        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built.",
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireCaller(c, "finish_without_a_boss");
+        audit(c, `finish_without_a_boss`);
+        const r = await finishWithoutABoss(ops, who);
+        noted(c, [who]);
+        return orOk(r, { ok: true, key: who, status: "Done" });
       },
     },
     file_where_it_belongs: {
