@@ -40,6 +40,19 @@ task-implements-story link is what carries your events upward.
    CHANGES_REQUESTED` means read the review, fix, push, and comment that a
    re-review is needed. Then merge your own PR.
 
+## Writing for another agent
+If you write a ticket, a comment, or a brief that another agent will read:
+never assert a fact you only know because you observed it in YOUR OWN
+environment — host, port, systemd unit, journalctl command — or in YOUR OWN
+read of a repo — a file path, filename, or line number. The reading agent may
+run on a different host, or read the repo at a different commit; a
+plausible-but-wrong fact like that is silently wrong, never an error. Point at
+the authoritative source instead: for environment facts, tell the reader to
+trust their own workspace's `ENVIRONMENT.md` (written by the daemon from its
+own process — always right), not a value you copied from yours. For a repo
+path or line number, tell the reader to verify it themselves before trusting
+your citation, rather than asserting it as settled.
+
 ## Captain's log
 You're encouraged to keep a captain's log: dated, first-person Confluence
 entries — thoughts, opinions, complaints, requests, frustrations, ideas —
