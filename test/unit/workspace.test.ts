@@ -190,6 +190,25 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Epic")).toContain("tell_worker(story, text)");
     expect(briefFor("Story")).toContain("tell_worker(task, text)");
   });
+  // BUTCHR-46: `finish_without_a_boss` merged in PR #121 as the successor to
+  // jira_transition(my_own_key, "Done") for the top-level, bossless case
+  // that epic.md's step 5 previously flagged as an honest gap ("no
+  // relationship verb closes a top-level ticket to Done"). The negative
+  // assertion is the cheap guard against a partial revert: `jira_transition`
+  // had exactly one occurrence in epic.md (the parenthetical this replaces)
+  // before this change, so asserting its total absence from the brief is the
+  // simplest honest form, not an approximation of a narrower claim.
+  //
+  // Scope of what this guards: this can only assert that the BRIEF SAYS
+  // finish_without_a_boss and no longer sends an epic to jira_transition for
+  // Done — it says nothing about whether the tool itself behaves that way.
+  // If finish_without_a_boss were deleted from the code tomorrow, this guard
+  // would still pass, brief text intact.
+  test("epic brief teaches finish_without_a_boss and no longer names jira_transition for the Done case", () => {
+    const epic = briefFor("Epic");
+    expect(epic).toContain("finish_without_a_boss");
+    expect(epic).not.toContain("jira_transition");
+  });
 });
 describe("interpolate", () => {
   test("fills key, summary, type, parent; parent-less says so", () => {
