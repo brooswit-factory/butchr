@@ -1,6 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
+import { getDoc, setDoc } from "./docs.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). */
 export interface AssigneeRoles {
@@ -307,6 +308,33 @@ export function atlassianTools(
       description: "List Confluence spaces (to find a spaceId).",
       input: {},
       handler: (_a, c) => { audit(c, "list spaces"); return ops.listSpaces(); },
+    },
+    get_doc: {
+      description:
+        'Read a ticket\'s doc — the CALLER\'s own by default, or another ticket\'s when `key` is given (e.g. a boss reading a worker\'s doc at review time). Reads are unrestricted by ownership: reading any ticket\'s doc for context is fine. WRITES NOTHING, EVER, for self or for another ticket — a ticket with no doc yet resolves to `{ found: false }`, never an error and never a lazily-created page; use set_doc to create/write your own doc. On a hit, returns `{ found: true, id, url, title, body }`.',
+      input: { key: z.string().optional() },
+      handler: async (a, c) => {
+        const { key } = a as { key?: string };
+        const who = c.headers["x-issue"];
+        if (!who) throw new Error("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        const target = key ?? who;
+        audit(c, `get_doc ${target}${key ? "" : " (self)"}`);
+        return getDoc(ops, target);
+      },
+    },
+    set_doc: {
+      description:
+        'FULL-BODY REPLACE of the CALLER\'S OWN doc. READ THIS FIRST: this is REPLACE, not APPEND — an agent that treats `set_doc` as "append" destroys its own page on the very first call. Call get_doc() first, edit the body you got back, then write the whole thing. There is NO KEY PARAMETER AT ALL: this can only ever write the caller\'s own doc, identified by `x-issue` — overwriting another ticket\'s doc is not expressible by getting an argument wrong. Ensures the doc exists first (creating it lazily, nested under the boss\'s doc, or the project root doc when there is no boss) then writes. `title` is optional ONCE the doc has a real title (omitting it keeps the current one) — but while the current title still carries the "[unwritten]" provisional marker, `title` is REQUIRED: you cannot write real content and leave the page looking unwritten.',
+      input: { body: z.string(), title: z.string().optional() },
+      handler: async (a, c) => {
+        const { body, title } = a as { body: string; title?: string };
+        const who = c.headers["x-issue"];
+        if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
+        const result = await setDoc(ops, who, body, title);
+        noted(c, [who]); // the remote-link upsert bumps the ticket's own `updated`
+        return result;
+      },
     },
   };
 }
