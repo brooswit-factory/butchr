@@ -31,6 +31,12 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Epic")).toContain("[review] APPROVED");
     expect(briefFor("Story")).toContain("[review] APPROVED");
   });
+  test("epic and story briefs carry the staffing-activation instruction", () => {
+    expect(briefFor("Epic")).toContain("In Progress");
+    expect(briefFor("Epic")).toContain("never staffed");
+    expect(briefFor("Story")).toContain("In Progress");
+    expect(briefFor("Story")).toContain("never staffed");
+  });
   test("author briefs carry the two-signal reviewDecision+headRefOid check", () => {
     expect(briefFor("Story")).toContain("reviewDecision,headRefOid");
     expect(briefFor("Task")).toContain("reviewDecision,headRefOid");
