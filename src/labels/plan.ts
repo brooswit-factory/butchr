@@ -10,6 +10,17 @@ export const PR_PREFIX = "pr:";
 
 export const isAgentLabel = (label: string): boolean => label.startsWith(AGENT_PREFIX);
 export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX);
+
+/**
+ * BUTCHR-24: `butchr:parked-ok` (src/agents/parked.ts's `EXEMPT_LABEL`) is
+ * NOT a daemon-owned label, deliberately — it is READ-ONLY for the daemon. A
+ * human adds it to a ticket to declare a parked child deliberate; the daemon
+ * only ever reads it (to skip escalating that child) and must never add or
+ * remove it itself. Do NOT fold it into `isDaemonLabel` below: doing so would
+ * make `sweepStaleAgentLabels` (src/labels/sweep.ts) treat it as daemon-owned
+ * and silently strip a human's deliberate exemption the moment the ticket
+ * left the active statuses. Pinned by a test in test/unit/labels-plan.test.ts.
+ */
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
 
 export type PrState = "open" | "approved" | "changes-requested" | "merged" | null;

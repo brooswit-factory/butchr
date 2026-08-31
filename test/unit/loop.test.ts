@@ -1191,3 +1191,52 @@ describe("startLoop respawn wiring", () => {
     for (const line of logged) expect(line).toContain("respawned again within 5 polls — suppressing further respawns");
   });
 });
+
+describe("startLoop checkParked wiring (BUTCHR-24)", () => {
+  // @brooswit/sundry's watch() only calls its onChange callback when the
+  // polled snapshot's hash differs from the previous one — a detector wired
+  // into onChange would silently stop firing on any poll whose snapshot
+  // doesn't change. checkParked must be invoked from the observe function
+  // instead, so it runs on EVERY poll, changed or not — this is the trap the
+  // ticket calls out, and it needs its own test, independent of anything the
+  // parked predicate itself does.
+  test("checkParked runs on every poll, including a poll whose (issues, related) snapshot is identical to the previous one", async () => {
+    const herd = fakeHerd();
+    const calls: Array<{ issues: JiraIssue[]; related: unknown[] }> = [];
+    // The SAME issue/related snapshot every poll — watch()'s hash never
+    // changes, so onChange would never fire if checkParked were wired there.
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      related: async () => [],
+      herd,
+      notify: () => {},
+      checkParked: async (issues, related) => { calls.push({ issues: [...issues], related: [...related] }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 55));
+    stop();
+    // At a 10ms interval over ~55ms we expect several polls; the point is
+    // strictly more than one despite the snapshot never changing.
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls[0]!.issues[0]!.key).toBe("A");
+  });
+
+  test("a checkParked rejection is caught: does not stop the loop, and does not appear as a notify or onError event", async () => {
+    const herd = fakeHerd();
+    let calls = 0;
+    const errors: unknown[] = [];
+    const stop = startLoop({
+      search: async () => [iss("A", "In Progress")],
+      related: async () => [],
+      herd,
+      notify: () => {},
+      checkParked: async () => { calls++; throw new Error("boom"); },
+      onError: (e) => errors.push(e),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 35));
+    stop();
+    expect(calls).toBeGreaterThan(1); // kept polling despite the rejection
+    expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkParked's internal errors
+  });
+});

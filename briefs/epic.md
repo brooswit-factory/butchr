@@ -31,7 +31,10 @@ every ticket you write.
    File a story with an assignee and move it to **In Progress** when it
    should start; an unassigned or To Do story is never staffed — an epic
    that parks its stories in To Do waits forever on events from agents that
-   were never spawned.
+   were never spawned. Butchr itself now detects and escalates a parked
+   story back to you after a short delay — if one is parked on purpose (e.g.
+   a deliberately deferred backlog item), add the `butchr:parked-ok` label to
+   it yourself to silence that.
    Set each story's priority when you file it (`jira_create_issue`'s
    `priority`) and keep it current as reality shifts (`jira_set_priority`) —
    priority is your judgment of what matters now, not a formality. Your own

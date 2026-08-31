@@ -78,6 +78,24 @@ export interface LoopDeps {
    * come from the absence of a success, not the presence of an error.
    */
   onPollSuccess?: () => void;
+  /**
+   * BUTCHR-24: run the parked-ticket detector (src/agents/parked.ts) over
+   * this poll's already-fetched (issues, related) snapshot. Called from
+   * inside the observe function below, NEVER from `watch()`'s `onChange`
+   * callback: `@brooswit/sundry`'s `watch()` only invokes `onChange` when
+   * the polled snapshot's hash differs from the previous one (confirmed by
+   * reading its `dist/watch/watcher.ts`: `observe()` returns early via
+   * `if (h !== prevHash)` before ever calling `onChange`), so a detector
+   * wired into `onChange` would silently stop firing on any poll whose
+   * snapshot happens not to change — exactly the "the fix doesn't survive a
+   * quiet poll" failure mode this ticket exists to remove. Optional;
+   * omitted, parked-ticket detection simply never runs. The detector itself
+   * never throws (see parked.ts), but this call is awaited inside the same
+   * try-implicit observe function as `syncLabels` above, so a change to that
+   * guarantee can never silently take the success heartbeat below down with
+   * it.
+   */
+  checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
 }
 
 /** How many polls a just-respawned issue is shielded from a further respawn. */
@@ -214,6 +232,18 @@ export function startLoop(deps: LoopDeps): Stop {
       });
       const related = deps.related ? await deps.related([...desired.keys()]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
+      // A detector failure must never take down the poll — caught HERE too
+      // (belt and suspenders on top of parked.ts's own internal try/catch):
+      // a rejection reaching this point would otherwise fail the whole `fn`
+      // this poll, skipping `onPollSuccess` below and reporting the poll
+      // loop unhealthy over what is, at worst, one failed Jira comment call.
+      if (deps.checkParked) {
+        try {
+          await deps.checkParked(issues, related);
+        } catch (e) {
+          deps.log?.(`WARNING: [parked] checkParked threw: ${(e as Error)?.message ?? e}`);
+        }
+      }
       deps.onPollSuccess?.();
       return { issues, related };
     },

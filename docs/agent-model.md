@@ -60,6 +60,18 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   starts the herdr workspace with that `cwd` — Claude Code auto-reads
   `CLAUDE.md` there. Kickoff prompt: **"follow your CLAUDE.md"**.
 
+## Parked-ticket detection (BUTCHR-24)
+
+A staffed child (has an assignee) left in To Do under a live (In Progress)
+boss is never legitimate — nobody spawns an agent for a To Do ticket, so the
+boss waits forever on events from an agent that does not exist. The daemon
+detects this itself (`src/agents/parked.ts`) after `BUTCHR_PARKED_MINUTES`
+(default 10) and escalates to the boss's ticket, then follows up once, then
+escalates up the Implements chain if the boss still hasn't acted — arriving
+at a human-owned ticket by construction, since epics are the human's
+(above). A deliberately-parked backlog item can be exempted with the
+`butchr:parked-ok` label, which the daemon only ever reads.
+
 ## Tools: the daemon MCP is a thin proxy
 
 thatch tools proxy the de-facto SDKs — `jira.js` and `confluence.js` —
