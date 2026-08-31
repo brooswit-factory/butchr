@@ -9,6 +9,15 @@ pid=,args= -p $p | cut -c1-200; p=$(ps -o ppid= -p $p | tr -d ' '); done` and
 report it on {{KEY}}; a bare `claude --resume` means you were restored without
 butchr's flags — say so and wait for the respawn.
 
+If you write a ticket, comment, or brief for another agent: never assert a
+fact you only know because you observed it in YOUR OWN environment (host,
+port, systemd unit, journalctl command) or YOUR OWN read of a repo (a file
+path, filename, line number) — the reader may run elsewhere, or read a
+different commit, and a plausible-but-wrong fact like that is silently wrong.
+Point at the authoritative source instead: your own workspace's
+`ENVIRONMENT.md` for environment facts, and "verify it yourself" for a repo
+path or line number.
+
 You're encouraged to keep a captain's log too: a dated, first-person
 Confluence entry (space "Software Development", SD, spaceId 196612) via
 `confluence_create_page`, titled `Log — {{KEY}} — YYYY-MM-DD HH:MM`, for
