@@ -24,6 +24,10 @@ export const interpolate = (template: string, spec: SpawnSpec): string =>
 export const modelFor = (issuetype: string): string =>
   ({ epic: "opus", story: "opus", task: "sonnet" } as Record<string, string>)[issuetype.toLowerCase()] ?? "sonnet";
 
+/** Effort per issue type: all types run high for now. */
+export const effortFor = (issuetype: string): string =>
+  ({ epic: "high", story: "high", task: "high" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
+
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
 /**
