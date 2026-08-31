@@ -4,7 +4,7 @@ import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc } from "./docs.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, ASK_MARKER,
+  reportToBoss, askBoss, submitToBoss, fileWhereItBelongs, ASK_MARKER,
   type Disposition,
 } from "./relationship.js";
 
@@ -159,7 +159,7 @@ export function atlassianTools(
     },
     jira_create_issue: {
       description:
-        "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. This tool remains the ONLY way to file a DELIBERATE ORPHAN (`implements: \"none\"`, for explicit out-of-scope/triage work your brief tells you to file outside your epic) — new_worker always links to its caller and has no orphan route; do not use new_worker in place of this when you actually need an orphan. " +
+        "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. For a DELIBERATE ORPHAN (`implements: \"none\"`, explicit out-of-scope/triage work your brief tells you to file outside your epic), prefer file_where_it_belongs instead — it demands and records WHERE the work belongs and pushes a notice a person actually receives; `implements: \"none\"` here still works, unchanged, but leaves the destination undocumented and nobody notified unless you do that by hand. new_worker always links to its caller and has no orphan route either way. " +
         "Create a Jira issue. ASSIGNMENT: a Story or a Task is assigned BY ROLE from its issuetype (configured on this daemon) — pass an explicit `assignee` (an Atlassian accountId) to override, which always wins; an Epic is unchanged (caller-supplied assignee, or none — Epics are the human's). If the role's accountId isn't configured on this daemon and you passed no `assignee`, the call is REFUSED. HOME: a Story or a Task also requires a home — pass `implements` (the issue key it reports to: a Story implements an Epic, a Task implements a Story) or `parent` (nests it in Jira for membership; a Story can parent to an Epic, but a Task CANNOT parent to a Story in this project — use `implements` for Tasks). Omitting both refuses the call; an Epic needs neither. OPT-OUT: pass `implements: \"none\"` (case-insensitive) to file a deliberate orphan — the ticket is still created and still staffed by role, but no link is made; use this ONLY for the explicit out-of-scope/triage tickets your brief tells you to file outside your epic — silence (omitting both `implements` and `parent`) is never the opt-out. LINKING: after creating the issue, the tool itself creates the Implements link (from = the new issue, to = the resolved target) — the result carries both the new `key` and the link outcome as `implements: { ok, to, error? }`; a link failure never hides the key, so retry the LINK, not the create, on failure. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
       input: {
         projectKey: z.string(), issuetype: z.enum(["Epic", "Story", "Task"]), summary: z.string(),
@@ -549,6 +549,37 @@ export function atlassianTools(
         const r = await submitToBoss(ops, who);
         noted(c, [who]);
         return orOk(r, { ok: true, key: who, status: "In Review" });
+      },
+    },
+    file_where_it_belongs: {
+      description:
+        "The successor to jira_create_issue's `implements: \"none\"` deliberate-orphan escape (still an unchanged alias this release). Files a ticket that is explicitly NOT the caller's — genuine out-of-scope work your brief tells you to file outside your own epic. NO Implements link is ever made, to the destination or to anything else: this stays a true orphan. " +
+        "YOU SUPPLY: `summary`, `description` (optional), `issuetype` (`\"Story\"` or `\"Task\"`), `priority` (optional — omitting it takes the site default), and a REQUIRED `destination`. " +
+        "`destination` IS EITHER: an EXISTING EPIC KEY this work belongs under (e.g. \"BUTCHR-25\"), OR a short prose REASON it needs a brand-new epic (e.g. \"no epic covers observability tooling yet\") — both are legitimate, neither is a fallback for the other. REFUSED: an empty or whitespace-only destination; a placeholder (\"n/a\", \"tbd\", \"unknown\", \"none\", \"?\", \"-\", \"idk\", and the like); a Jira-key-shaped destination that doesn't exist, or that exists but isn't an Epic (naming what it actually is); and prose too thin to be a real reason. This is the point of the tool, not an obstacle to route around: filing work outside your scope is only half the job, saying where it should live is the other half. " +
+        "TAKES NO DISPOSITION, unlike new_worker/adopt_worker — argued, not omitted: a disposition answers \"what happens to MY worker\", and nobody can answer that for a ticket that is by definition not yours. It is filed To Do, staffed by role exactly as jira_create_issue staffs it today, and stays there — never staffed by this daemon — until some future boss calls adopt_worker on it. Never carries the shelved-exemption label: the parked-ticket detector only ever walks tickets reachable by an Implements link, and this ticket has none, so that label would mean nothing here. " +
+        "WHAT IT WRITES: the created ticket's OWN description gets a destination header block baked in at creation (never only in a comment) plus the `butchr:orphan` label (a one-line JQL away from \"show me every undirected ticket\"); then a best-effort NOTICE comment — on the named epic (case A), or, when the destination is a \"needs a new epic\" reason, on the TOPMOST ticket in the CALLER's own Implements chain (case B, since there's no epic yet to comment on and this daemon has no configured human/root key). CASE B CREATES NO LINK: the notice says where the filer thinks the work belongs, it does not make it so — quietly re-parenting an orphan onto whatever it lands near would be exactly the suppression this verb exists to prevent. " +
+        "ORDER AND WHAT A THROW MEANS: create (destination + label already baked in) happens first and is irreversible; the notice and the doc (ensureDoc, same as new_worker) are best-effort afterward. A THROW after creation means the ticket itself is fine and needs no cleanup — the error names exactly which of the notice/doc failed and how to complete it by hand (jira_add_comment for the notice; the ticket's own first set_doc call for the doc). " +
+        "Was named `file_for_another_boss` during design; renamed before shipping because that name asserts there IS another boss, which is false in the \"needs a new epic\" case.",
+      input: {
+        summary: z.string(),
+        description: z.string().optional(),
+        issuetype: z.enum(["Story", "Task"]),
+        priority: z.string().optional(),
+        destination: z.string(),
+      },
+      handler: async (a, c) => {
+        const p = a as { summary: string; description?: string; issuetype: "Story" | "Task"; priority?: string; destination: string };
+        const who = requireCaller(c, "file_where_it_belongs");
+        audit(c, `file_where_it_belongs issuetype=${p.issuetype} destination="${p.destination.slice(0, 60)}"`);
+        const result = await fileWhereItBelongs(ops, roles, who, {
+          summary: p.summary,
+          ...(p.description ? { description: p.description } : {}),
+          issuetype: p.issuetype,
+          ...(p.priority ? { priority: p.priority } : {}),
+          destination: p.destination,
+        });
+        noted(c, [result.key, result.noticeTarget]); // the new ticket's own `updated`, plus the notice bumping its target's
+        return result;
       },
     },
   };
