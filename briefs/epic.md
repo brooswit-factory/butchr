@@ -28,6 +28,10 @@ every ticket you write.
    existing orphan story instead of filing a new one? Re-link it and staff it
    with `jira_assign` (by role, e.g. `assignee: "story"`) rather than
    duplicating the work.
+   File a story with an assignee and move it to **In Progress** when it
+   should start; an unassigned or To Do story is never staffed — an epic
+   that parks its stories in To Do waits forever on events from agents that
+   were never spawned.
    Set each story's priority when you file it (`jira_create_issue`'s
    `priority`) and keep it current as reality shifts (`jira_set_priority`) —
    priority is your judgment of what matters now, not a formality. Your own
