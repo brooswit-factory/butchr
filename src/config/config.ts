@@ -32,6 +32,21 @@ export interface Config {
    */
   stalledMinutes: number;
   /**
+   * BUTCHR-5/16: minutes a pane's herdr status must read idle/done,
+   * CONTINUOUSLY, before its text is even read to check for an end-of-pane
+   * dialog herdr's own classification missed (the second, herdr-independent
+   * blocked-detector — see src/agents/idle-dialog.ts). Default 2: short
+   * enough that a real freeze is caught fast, long enough that a normal
+   * end-of-turn idle blip (which resolves within seconds, long before the
+   * next 5s poll even lands) never trips it. The asymmetry that sets this
+   * bound: escalating a dialog we could have answered costs one Jira
+   * notification; failing to escalate one we cannot answer costs hours times
+   * the number of agents sitting on it (measured: ~12 hours × 5 agents on
+   * 2026-08-30, the incident this ticket exists to close) — so this stays
+   * deliberately short rather than "safely" long.
+   */
+  idleDialogMinutes: number;
+  /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
    * issuetype. Both are optional so a daemon that only ever reads Jira still
    * boots; the refusal for an unstaffable Story/Task happens per-call, at
@@ -58,6 +73,7 @@ export interface ConfigEnv {
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
@@ -82,6 +98,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
+  const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
+  if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
+
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
 
@@ -91,6 +110,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     atlassian: { site, email, token },
     port,
     stalledMinutes,
+    idleDialogMinutes,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -118,6 +138,6 @@ const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} ` +
+  `stalledMinutes=${c.stalledMinutes} idleDialogMinutes=${c.idleDialogMinutes} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
   `captureDir=${c.captureDir}`;

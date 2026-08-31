@@ -10,6 +10,7 @@ import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
+import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
@@ -245,6 +246,13 @@ const escalator = createEscalator({
   comments: (issue) => atlassian.comments(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
+  // BUTCHR-16: durably capture the full pane text at the moment a dialog
+  // escalates, so the NEXT unknown shape can be fixtured from the escalation
+  // itself instead of vanishing within hours like the effort-recommendation
+  // dialog that opened this ticket. Shares config.captureDir with the
+  // session-limit watcher's own captures (capture-store.ts); each recognizes
+  // only its own filename shape, so neither ever evicts the other's files.
+  captures: createCaptureStore(config.captureDir),
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
@@ -256,7 +264,18 @@ async function issueForPane(paneId: string): Promise<string | null> {
 
 watchPrompts({
   onBlocked: (cb) => watchBlocked(
-    async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
+    // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
+    // whose text parses as an end-of-pane dialog is folded in HERE, as an
+    // agent_status override, so it flows through blockedNow's existing
+    // filter exactly like a herdr-native "blocked" pane — blockedNow itself
+    // (src/agents/blocked.ts) stays pure and untouched. Pane text is only
+    // ever read for a pane that already cleared the cheap idle-duration
+    // precondition (see idle-dialog.ts) — this poll otherwise costs the same
+    // one herdr.agent.list() call it always did.
+    withIdleDialogDetection(
+      async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
+      { now: () => Date.now(), minutes: config.idleDialogMinutes, read: readPane, log: (line) => console.error(`  [idle-dialog] ${line}`) },
+    ),
     5_000, cb,
     (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),
     // Per-tick, synchronous: lets the escalator see the polls it was NOT

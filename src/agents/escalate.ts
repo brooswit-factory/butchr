@@ -90,8 +90,18 @@ export function fingerprint(prompt: Prompt): string {
  * question is capped at `QUESTION_CAP` chars: `parsePrompt` bounds how much
  * pane text can reach `question`, but a bound is not a scrub, and a dialog
  * question longer than the cap is not a question.
+ *
+ * `capturePath`, when given, is a LOCAL DISK path only — the full pane text
+ * itself is never redacted for and never posted to Jira (BUTCHR-16): the
+ * fixture for a dialog Claude Code stops showing is otherwise gone within
+ * hours, so the caller durably captures the raw pane text to
+ * `config.captureDir` (see capture-store.ts) and this only references
+ * WHERE, so the next unknown shape can be fixtured from the escalation
+ * itself without ever putting raw scrollback in a project-readable comment.
+ * A path is not secret-shaped (see `looksLikePath` above) so it needs no
+ * redaction of its own.
  */
-export function escalationComment(issue: string, prompt: Prompt, fp: string): string {
+export function escalationComment(issue: string, prompt: Prompt, fp: string, capturePath: string | null = null): string {
   let question = redact(prompt.question);
   if (question.length > QUESTION_CAP) question = question.slice(0, QUESTION_CAP) + " …[truncated]";
   const options = prompt.options.map((o, i) => `${i + 1}. ${redact(o)}`).join("\n");
@@ -103,6 +113,7 @@ export function escalationComment(issue: string, prompt: Prompt, fp: string): st
     options,
     "",
     `fingerprint: ${fp}`,
+    ...(capturePath ? ["", `Full pane text captured to ${capturePath} (local disk only — not posted here, may carry command output or secrets).`] : []),
     "",
     `Reply on THIS ticket with a comment containing exactly \`ANSWER <n> ${fp}\` (or \`ANSWER TEXT <your text> ${fp}\`).`,
   ].join("\n");
