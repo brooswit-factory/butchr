@@ -32,6 +32,13 @@ export interface Config {
    */
   stalledMinutes: number;
   /**
+   * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
+   * a live (In Progress) boss before the parked-ticket detector's stage 1
+   * escalation comment fires (see src/agents/parked.ts) — also the interval
+   * between each subsequent stage. Default 10.
+   */
+  parkedMinutes: number;
+  /**
    * BUTCHR-18/BUTCHR-6: how long, in ms, `/health` tolerates the poll loop
    * going without a successfully-completed cycle before reporting it stale —
    * also doubles as the startup grace period (see src/daemon/health.ts).
@@ -67,6 +74,7 @@ export interface ConfigEnv {
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
@@ -92,6 +100,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
+  const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
+  if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
+
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
 
@@ -104,6 +115,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     atlassian: { site, email, token },
     port,
     stalledMinutes,
+    parkedMinutes,
     pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
@@ -132,6 +144,6 @@ const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
   `captureDir=${c.captureDir}`;

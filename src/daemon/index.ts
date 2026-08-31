@@ -23,6 +23,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
+import { createParkedDetector } from "../agents/parked.js";
 
 let config;
 try {
@@ -117,6 +118,17 @@ const stalled = createStalledCheck({
   minutes: config.stalledMinutes,
   comments: (issue) => atlassian.comments(issue),
   accountEmail: config.atlassian.email,
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
+// see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
+// every other daemon-side comment write; no second Atlassian writer.
+const parkedDetector = createParkedDetector({
+  now: () => Date.now(),
+  minutes: config.parkedMinutes,
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  links: (issue) => atlassian.links(issue),
   log: (line) => console.error(`  ${line}`),
 });
 const syncLabels = createLabelSync({
@@ -238,6 +250,7 @@ startLoop({
       console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
   },
   syncLabels,
+  checkParked: parkedDetector.check,
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
