@@ -103,18 +103,22 @@ export interface NewWorkerResult {
  * handle it failing, and on failure this reports a NAMED PARTIAL STATE (the
  * surviving ticket key) rather than pretending the write undid itself.
  *
- * WHAT A RETURNED KEY MEANS, HONESTLY: rule (a) as originally stated —
- * "creates the ticket, the doc, links both directions, or it fails and
- * leaves nothing" — is not what this delivers, and this description does
- * not claim it. What IS guaranteed: a returned key is always a ticket that
- * has a boss (step 2) and a declared disposition (step 3) — never an
- * undeclared worker. Its doc either exists already, or is completed by the
- * agent's OWN first `set_doc` call for that key — the ordering guarantees no
- * other partial state is reachable, not that anything repairs it
- * automatically. A thrown error after step 1 means: either
- * the ticket was rolled back (deleted) and nothing survives, or the
- * rollback itself failed and the error names exactly which ticket key
- * needs manual cleanup.
+ * WHAT A NORMAL RETURN MEANS, AND WHAT A THROW MEANS, HONESTLY: rule (a) as
+ * originally stated — "creates the ticket, the doc, links both directions,
+ * or it fails and leaves nothing" — is not what this delivers, and this
+ * comment does not claim it. A NORMAL RETURN always means a ticket that has
+ * a boss (step 2), a declared disposition (step 3) — never undeclared — AND
+ * a doc (step 4 also succeeded). A THROW after step 1 means exactly one of
+ * three things, distinguishable from the error text: (1) the link or
+ * disposition write failed and the rollback delete SUCCEEDED — nothing
+ * survives; (2) that same failure happened and the rollback delete ALSO
+ * FAILED — the error names exactly which ticket key needs manual cleanup;
+ * or (3) the link and disposition both succeeded and ONLY the doc step
+ * failed — the ticket, its boss link and its disposition all survive
+ * (correctly, undamaged, never rolled back), and its doc is completed by
+ * that ticket's own first `set_doc` call, whenever the agent working it
+ * makes one. Case (3) is the one easiest to misread as case (2): both throw,
+ * but only (2) means something needs to be cleaned up — read the message.
  */
 export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;

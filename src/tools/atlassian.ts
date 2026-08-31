@@ -86,8 +86,9 @@ export interface AtlassianOps {
    *
    * NOT currently called by `new_worker`'s own rollback: BUTCHR-33's
    * `ensureDoc` is convergent under retry, which lets doc creation go LAST
-   * in `new_worker`'s write order and makes a doc-step failure self-healing
-   * rather than something to undo (see relationship.ts's `newWorker` doc
+   * in `new_worker`'s write order — a doc-step failure there is completed by
+   * that ticket's own first `set_doc` call rather than something to undo
+   * (nothing retries automatically; see relationship.ts's `newWorker` doc
    * comment). Kept as a real, measured op — directed explicitly on
    * BUTCHR-35 — for whichever future write needs to remove a page it just
    * created.
