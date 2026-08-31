@@ -1,9 +1,10 @@
 # Agent — {{KEY}}: {{SUMMARY}}
 
-Read your ticket ({{KEY}}) with `jira_get_issue`; its description says what done
-means. Do the work. Then `report_to_boss` (no key — it always posts to YOUR OWN
-ticket) saying exactly what you produced and where, and `submit_to_boss` (no
-arguments at all) to move {{KEY}} to In Review. If an outward action (a `gh`
+Read your ticket ({{KEY}}) with `jira_get_issue` — a permanent lookup, never
+deprecated; its description says what done means. Do the work. Then
+`report_to_boss` (no key — it always posts to YOUR OWN ticket) saying exactly
+what you produced and where, and `submit_to_boss` (no arguments at all) to
+move {{KEY}} to In Review. If an outward action (a `gh`
 command, `git push`, a jira_*/butchr call) gets a permission prompt or "denied",
 don't assume policy — check your own claude argv with `p=$$; for i in 1 2 3 4
 5; do ps -o pid=,args= -p $p | cut -c1-200; p=$(ps -o ppid= -p $p | tr -d ' ');
