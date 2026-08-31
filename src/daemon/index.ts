@@ -11,6 +11,7 @@ import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
+import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
@@ -270,6 +271,13 @@ const escalator = createEscalator({
   comments: (issue) => atlassian.comments(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
+  // BUTCHR-16: durably capture the full pane text at the moment a dialog
+  // escalates, so the NEXT unknown shape can be fixtured from the escalation
+  // itself instead of vanishing within hours like the effort-recommendation
+  // dialog that opened this ticket. Shares config.captureDir with the
+  // session-limit watcher's own captures (capture-store.ts); each recognizes
+  // only its own filename shape, so neither ever evicts the other's files.
+  captures: createCaptureStore(config.captureDir),
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
@@ -279,9 +287,30 @@ async function issueForPane(paneId: string): Promise<string | null> {
   return issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
 }
 
+// BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
+// whose text parses as a dialog, and whose trailing region isn't a recognized
+// STALE scrollback quote, is folded into `.list()`'s rows as a "blocked"
+// agent_status override, so it flows through blockedNow's existing filter
+// exactly like a herdr-native "blocked" pane — blockedNow itself
+// (src/agents/blocked.ts) stays pure and untouched. Pane text is only ever
+// read for a pane that already cleared the cheap idle-duration precondition
+// (see idle-dialog.ts) — this poll otherwise costs the same one
+// herdr.agent.list() call it always did. `.isUnknownTrailing` is consulted
+// below in onPrompt: a pane whose trailing region we could not classify as
+// either genuinely live or a recognized stale quote must never be
+// auto-answered on that unverifiable evidence, only escalated.
+const idleDialogDetector = withIdleDialogDetection(
+  async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
+  // idle-dialog.ts already prefixes its own log lines with [idle-dialog]
+  // (the house convention — see stalled.ts/session-limit-watch.ts's own
+  // wiring below); this callback stays bare or lines come out
+  // double-tagged.
+  { now: () => Date.now(), minutes: config.idleDialogMinutes, read: readPane, log: (line) => console.error(`  ${line}`) },
+);
+
 watchPrompts({
   onBlocked: (cb) => watchBlocked(
-    async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
+    idleDialogDetector.list,
     5_000, cb,
     (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),
     // Per-tick, synchronous: lets the escalator see the polls it was NOT
@@ -291,7 +320,19 @@ watchPrompts({
   ),
   read: readPane,
   send: sendPane,
+  // KNOWN TOCTOU (PR #104 review, non-blocking, deliberate): `isUnknownTrailing`
+  // reflects `idleDialogDetector.list`'s classification from the START of
+  // this same tick; watchPrompts has just re-read the pane fresh and decides
+  // via `parsePrompt` alone. The gap is milliseconds within one tick, and the
+  // pane would have to transition from a genuinely-unverifiable trailing
+  // shape to a clean one in that window — not worth a second, cache-fresh
+  // classification. The strong check gates ONLY whether an idle-detected
+  // pane may be auto-answered at all, never the send itself.
   onPrompt: ({ paneId, prompt }) => {
+    if (idleDialogDetector.isUnknownTrailing(paneId)) {
+      console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → left for a human (idle-detected dialog with an unverifiable trailing shape — never auto-answered)`);
+      return undefined;
+    }
     const choice = chooseStartupAnswer(prompt);
     console.error(`  [prompts] ${paneId} "${prompt.question.slice(0, 60)}" → ${choice != null ? `answer ${choice} ("${prompt.options[choice - 1]?.slice(0, 40)}")` : "left for a human"}`);
     return choice ?? undefined;

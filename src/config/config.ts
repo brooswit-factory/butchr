@@ -39,6 +39,21 @@ export interface Config {
    */
   parkedMinutes: number;
   /**
+   * BUTCHR-5/16: minutes a pane's herdr status must read idle/done,
+   * CONTINUOUSLY, before its text is even read to check for an end-of-pane
+   * dialog herdr's own classification missed (the second, herdr-independent
+   * blocked-detector — see src/agents/idle-dialog.ts). Default 2: short
+   * enough that a real freeze is caught fast, long enough that a normal
+   * end-of-turn idle blip (which resolves within seconds, long before the
+   * next 5s poll even lands) never trips it. The asymmetry that sets this
+   * bound: escalating a dialog we could have answered costs one Jira
+   * notification; failing to escalate one we cannot answer costs hours times
+   * the number of agents sitting on it (measured: ~12 hours × 5 agents on
+   * 2026-08-30, the incident this ticket exists to close) — so this stays
+   * deliberately short rather than "safely" long.
+   */
+  idleDialogMinutes: number;
+  /**
    * BUTCHR-18/BUTCHR-6: how long, in ms, `/health` tolerates the poll loop
    * going without a successfully-completed cycle before reporting it stale —
    * also doubles as the startup grace period (see src/daemon/health.ts).
@@ -75,6 +90,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
+  BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
@@ -103,6 +119,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
+  const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
+  if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
 
@@ -116,6 +134,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     parkedMinutes,
+    idleDialogMinutes,
     pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
@@ -144,6 +163,6 @@ const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
   `captureDir=${c.captureDir}`;

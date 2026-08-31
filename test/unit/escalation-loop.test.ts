@@ -32,7 +32,20 @@ const FREE_TEXT_MENU = `Proceed with the deploy?
   3. No, exit
 Enter to confirm · Esc to cancel`;
 
-function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
+/** In-memory CaptureSink fake — no real fs, mirrors capture-store.ts's contract. */
+function fakeCaptureSink() {
+  const files = new Map<string, string>();
+  return {
+    files,
+    sink: {
+      write: async (name: string, contents: string) => { files.set(name, contents); return `/fake-captures/${name}`; },
+      list: async () => [...files.keys()],
+      remove: async (name: string) => { files.delete(name); },
+    },
+  };
+}
+
+function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"] } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -60,6 +73,7 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number } = {}) {
     },
     now: () => clock,
     log: (line) => logs.push(line),
+    ...(opts.captures ? { captures: opts.captures } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -853,5 +867,109 @@ describe("createEscalator — unparseable blocked panes (KAN-756, item C)", () =
     h.noPrompt("p1", "KAN-1", "never blocked before");
     expect(h.logs.some((l) => /debounce reset/.test(l))).toBe(false);
     expect(h.logs.some((l) => /blocked with no parseable dialog/.test(l))).toBe(true);
+  });
+});
+
+// BUTCHR-16: the escalation carries the pane text via a durable local capture
+// (never raw text in the Jira comment itself), so the NEXT unknown shape can
+// be fixtured from the escalation — the fixture for the effort-recommendation
+// dialog that opened this ticket is otherwise gone for good.
+describe("createEscalator — escalation captures the full pane text (BUTCHR-16)", () => {
+  test("with no captures dep configured, behaves exactly as before: no capture, no path in the comment", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1);
+    expect(h.posted[0]!.text).not.toContain("captured to");
+  });
+
+  test("on a fresh escalation, the FULL raw pane text (not just question/options) is written to the capture store, unredacted, and only the PATH reaches the Jira comment", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const SECRET_PANE = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n" + REAL;
+    h.setPaneText(SECRET_PANE);
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt); // debounce
+    await h.poll("p1", "KAN-1", prompt); // escalates
+    expect(h.posted.length).toBe(1);
+
+    expect(cap.files.size).toBe(1);
+    const [name, contents] = [...cap.files.entries()][0]!;
+    expect(name).toMatch(/^KAN-1-escalation-\d{8}T\d{6}Z\.txt$/);
+    expect(contents).toContain(SECRET_PANE); // full pane text, UNREDACTED, on local disk
+    expect(contents).toContain("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI"); // the raw secret, deliberately (local-disk-only)
+
+    const path = `/fake-captures/${name}`;
+    expect(h.posted[0]!.text).toContain(path);
+    expect(h.posted[0]!.text).not.toContain(SECRET_PANE); // the Jira comment never gets the raw text
+    expect(h.posted[0]!.text).not.toContain("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI"); // nor the secret
+  });
+
+  test("an ADOPTED escalation (daemon restart) does not capture again", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    const fp = fingerprint(prompt);
+    h.addHumanComment(`[butchr:blocked] KAN-1 is waiting on a decision:\n\nQ\n\n1. a\n\nfingerprint: ${fp}\n\nReply...`);
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(0); // adopted, not posted
+    expect(cap.files.size).toBe(0); // and nothing captured for an adoption
+  });
+
+  test("a RATE-CAPPED escalation does not capture", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    h.setClock(1_000_000);
+    const TRUST = `You are running in Bypass\n Permissions mode.\n ❯ No, exit\n   Yes, I accept\n Enter to confirm · Esc to cancel`;
+    const FREE_TEXT_MENU = `Proceed with the deploy?\n❯ 1. Yes, proceed\n  2. No, and tell Claude what to do differently\n  3. No, exit\nEnter to confirm · Esc to cancel`;
+    const BYPASS = `Overwrite?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`;
+    async function earn(text: string) {
+      h.setPaneText(text);
+      const d = parsePrompt(text)!;
+      await h.poll("p1", "KAN-1", d);
+      await h.poll("p1", "KAN-1", d);
+    }
+    await earn(REAL);
+    await earn(TRUST);
+    await earn(FREE_TEXT_MENU);
+    const before = cap.files.size;
+    await earn(BYPASS); // 4th distinct dialog: rate-capped, not escalated
+    expect(h.posted.filter((c) => c.text.includes("rate cap reached")).length).toBe(1);
+    expect(cap.files.size).toBe(before); // no new capture for the capped notice
+  });
+
+  test("evicts the oldest capture, by timestamp, once at the file cap", async () => {
+    const cap = fakeCaptureSink();
+    // Pre-populate 50 (the cap) recognizable escalation captures, oldest first by name/timestamp.
+    for (let i = 0; i < 50; i++) {
+      const ts = `202601${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`KAN-1-escalation-${ts}.txt`, "old capture");
+    }
+    const oldestName = "KAN-1-escalation-20260101T000000Z.txt";
+    expect(cap.files.has(oldestName)).toBe(true);
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates — pushes past the cap
+    expect(h.posted.length).toBe(1);
+    expect(cap.files.has(oldestName)).toBe(false); // evicted
+    expect(cap.files.size).toBe(50); // 49 kept + 1 new
+  });
+
+  test("a capture failure is logged and never blocks the escalation comment from posting", async () => {
+    const failingSink = {
+      write: async (): Promise<string> => { throw new Error("disk full"); },
+      list: async () => [] as string[],
+      remove: async () => {},
+    };
+    const h = harness({ captures: failingSink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1); // still escalates
+    expect(h.posted[0]!.text).not.toContain("captured to");
+    expect(h.logs.some((l) => /escalation capture failed/.test(l))).toBe(true);
   });
 });

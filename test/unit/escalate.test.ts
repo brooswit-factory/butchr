@@ -43,6 +43,18 @@ describe("escalationComment", () => {
   });
 });
 
+describe("escalationComment — capture path reference (BUTCHR-16)", () => {
+  test("with no capturePath, the comment is unchanged from before this ticket", () => {
+    const c = escalationComment("KAN-1", prompt("Deploy to prod?", ["Yes", "No"]), "a1b2c3d4");
+    expect(c).not.toContain("captured to");
+  });
+  test("with a capturePath, the comment references WHERE the full pane text landed, never the text itself", () => {
+    const c = escalationComment("KAN-1", prompt("Deploy to prod?", ["Yes", "No"]), "a1b2c3d4", "/var/butchr/.captures/KAN-1-escalation-20260830T120000Z.txt");
+    expect(c).toContain("/var/butchr/.captures/KAN-1-escalation-20260830T120000Z.txt");
+    expect(c).toContain("local disk only");
+  });
+});
+
 describe("redact", () => {
   test("KEY=VALUE / KEY: VALUE, keying on KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/AUTH/BEARER/API_KEY", () => {
     expect(redact("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")).toBe("AWS_SECRET_ACCESS_KEY=[redacted]");
