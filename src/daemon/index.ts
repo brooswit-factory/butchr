@@ -274,7 +274,11 @@ watchPrompts({
     // one herdr.agent.list() call it always did.
     withIdleDialogDetection(
       async () => (await herdr.agent.list()).agents.map((a) => ({ pane_id: a.pane_id, agent_status: a.agent_status })),
-      { now: () => Date.now(), minutes: config.idleDialogMinutes, read: readPane, log: (line) => console.error(`  [idle-dialog] ${line}`) },
+      // idle-dialog.ts already prefixes its own log lines with [idle-dialog]
+      // (the house convention — see stalled.ts/session-limit-watch.ts's own
+      // wiring below); this callback stays bare or lines come out
+      // double-tagged.
+      { now: () => Date.now(), minutes: config.idleDialogMinutes, read: readPane, log: (line) => console.error(`  ${line}`) },
     ),
     5_000, cb,
     (e) => console.error(`  [prompts] status poll failed: ${(e as Error)?.message ?? e}`),

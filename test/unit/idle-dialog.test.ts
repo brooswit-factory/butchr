@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { IdleDialogTracker, withIdleDialogDetection } from "../../src/agents/idle-dialog.js";
+import { IdleDialogTracker, withIdleDialogDetection, endsInLiveChrome, parsesAsLiveDialog } from "../../src/agents/idle-dialog.js";
 import { blockedNow } from "../../src/agents/blocked.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
@@ -54,6 +54,56 @@ describe("IdleDialogTracker", () => {
     expect(t.observe("p1", "idle")).toBe(true);
     t.forget("p1");
     expect(t.observe("p1", "idle")).toBe(false);
+  });
+
+  test("trackedPaneIds() reports exactly the panes with a live floor, for pruning ones that dropped out of a poll", () => {
+    const t = new IdleDialogTracker(() => 0, 2);
+    t.observe("p1", "idle");
+    t.observe("p2", "idle");
+    t.observe("p3", "working"); // never tracked — not idle/done
+    expect(new Set(t.trackedPaneIds())).toEqual(new Set(["p1", "p2"]));
+    t.forget("p1");
+    expect(t.trackedPaneIds()).toEqual(["p2"]);
+  });
+});
+
+// PR #104 review (blocking): parsePrompt's existing gates verify the dialog
+// BLOCK itself but say nothing about what follows it — safe for herdr's own
+// `blocked` classification (the dialog IS the live composer state by
+// construction) but NOT safe once an IDLE pane reaches the same parser. Real
+// pane-cap-*.txt captures in this repo (dialog or not) all end in the same
+// persistent terminal chrome; endsInLiveChrome is tested against those exact
+// tails, not an invented one.
+describe("endsInLiveChrome / parsesAsLiveDialog (PR #104 review)", () => {
+  const REAL_CHROME_TAIL_A = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-a.txt"), "utf8").split("\n").slice(-6).join("\n");
+  const REAL_CHROME_TAIL_B = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-b.txt"), "utf8").split("\n").slice(-6).join("\n");
+
+  test("a footer with nothing after it (every synthetic dialog fixture used throughout this suite) is live", () => {
+    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel")).toBe(true);
+  });
+
+  test("a footer followed by the REAL terminal chrome (verbatim tail of pane-cap-a.txt / pane-cap-b.txt) is live", () => {
+    expect(endsInLiveChrome(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_A}`)).toBe(true);
+    expect(endsInLiveChrome(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_B}`)).toBe(true);
+  });
+
+  test("THE REGRESSION (PR #104 review, reproduced against 82c4a2b): a footer followed by agent PROSE, even with real chrome further below, is NOT live", () => {
+    const pane = `● Bash(cat test/fixtures/pane-cap-effort-recommendation.txt)\n  ⎿  "We recommend Opus 5 at medium effort"\n     ❯ 1. Switch Opus 5 to medium effort\n       2. Keep high\n     Enter to confirm · Esc to cancel\n\n● That's the reconstructed fixture for the effort-recommendation dialog from BUTCHR-16 — nothing to act on here.\n\n${REAL_CHROME_TAIL_A}`;
+    expect(pane.includes("Enter to confirm")).toBe(true); // sanity: the footer really is present, intact
+    expect(endsInLiveChrome(pane)).toBe(false);
+    expect(parsesAsLiveDialog(pane)).toBe(false);
+  });
+
+  test("a footer followed by a tool-result continuation line (⎿) is NOT live", () => {
+    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n  ⎿  some tool output line")).toBe(false);
+  });
+
+  test("no footer at all is not this check's concern (parsePrompt already rejects it) — returns false, not true", () => {
+    expect(endsInLiveChrome("just some prose, no dialog here")).toBe(false);
+  });
+
+  test("blank lines between the footer and real chrome are tolerated", () => {
+    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n\n─────\n❯\n─────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc")).toBe(true);
   });
 });
 
@@ -298,6 +348,38 @@ describe("idle-dialog detection routed through the existing escalation pipeline 
     expect(h.reads.length).toBeGreaterThan(0); // it DID get read (past the cheap gate)...
     expect(h.posted).toEqual([]); // ...but never parsed as a real end-of-pane dialog
     expect(h.sent).toEqual([]);
+  });
+
+  // PR #104 review (blocking): DoD 6's original QUOTED_MID_SCROLLBACK had no
+  // footer at all, so it was rejected trivially — it never exercised the
+  // gate DoD 6 exists for. THIS is the case that matters: footer AND cursor
+  // both intact (so parsePrompt alone accepts it), agent prose continuing
+  // after it, and genuine live composer chrome (the real pane-cap-a.txt
+  // tail) further below still. Reproduced sending a real keystroke against
+  // 82c4a2b before the endsInLiveChrome fix; must now neither post nor send.
+  test("DoD 6 (hardened): a menu with an INTACT footer and cursor, quoted mid-scrollback with agent prose after it and real composer chrome below THAT, neither escalates nor sends a keystroke", async () => {
+    const REAL_CHROME_TAIL = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-a.txt"), "utf8").split("\n").slice(-6).join("\n");
+    const pane = [
+      "● Bash(cat test/fixtures/pane-cap-effort-recommendation.txt)",
+      '  ⎿  "We recommend Opus 5 at medium effort"',
+      "     ❯ 1. Switch Opus 5 to medium effort",
+      "       2. Keep high",
+      "     Enter to confirm · Esc to cancel",
+      "",
+      "● That's the reconstructed fixture for the effort-recommendation dialog from BUTCHR-16 — nothing to act on here.",
+      "",
+      REAL_CHROME_TAIL,
+    ].join("\n");
+
+    const h = integrationHarness(2);
+    h.setStatus("p1", "idle");
+    h.setPaneText("p1", pane);
+    h.setIssue("p1", "KAN-1");
+    await h.tick(); // establishes the floor at t=0
+    h.advanceMinutes(2);
+    for (let i = 0; i < 5; i++) await h.tick();
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]); // the assertion that would have caught this: no keystroke into a working composer
   });
 
   test("a RECOGNISED dialog reaching this path is auto-answered, never escalated", async () => {
