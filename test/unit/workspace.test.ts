@@ -83,6 +83,10 @@ describe("briefFor / modelFor", () => {
       expect(briefFor(t)).toContain("wiki/spaces/ASSIST");
     }
   });
+  test("the blocked-dialog ANSWER reply names tell_worker, not a bare comment", () => {
+    expect(briefFor("Epic")).toContain("tell_worker(story, text)");
+    expect(briefFor("Story")).toContain("tell_worker(task, text)");
+  });
 });
 describe("interpolate", () => {
   test("fills key, summary, type, parent; parent-less says so", () => {

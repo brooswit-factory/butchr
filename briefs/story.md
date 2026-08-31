@@ -175,10 +175,20 @@ Butchr will notify you here when your tasks change. Stay in this session.
 ## When a child is blocked on a dialog
 If butchr posts a `[butchr:blocked]` comment on a task's ticket, that task
 agent is FROZEN on the quoted prompt and cannot proceed until someone answers.
-Decide and reply ON THE TASK'S TICKET with a comment containing exactly
-`ANSWER <n> <fingerprint>` (or `ANSWER TEXT <your text> <fingerprint>`),
-copying the fingerprint from the escalation comment — the daemon re-checks it
-against the live dialog and refuses a stale answer. Choose as the reviewer:
-prefer the option that respects the protocol you set for that task. If no
-option is safe, DO NOT answer — state why on YOUR OWN ticket, so it escalates
-to whoever watches you. The human is the fallback, not the first responder.
+Decide and reply with `tell_worker(task, text)` — it is the only way to speak
+down to a worker, and this is exactly the highest-consequence case it exists
+for. `text` must contain a line reading exactly `ANSWER <n> <fingerprint>`
+(or `ANSWER TEXT <your text> <fingerprint>`), copying the fingerprint from
+the escalation comment — the daemon re-checks it against the live dialog and
+refuses a stale answer.
+**Put the ANSWER line on its own line — never send it as your whole
+message.** `tell_worker` prepends your identity tag to the FIRST line of
+whatever you send, so a bare `ANSWER 1 <fingerprint>` with nothing else
+becomes `[{{KEY}}] ANSWER 1 <fingerprint>` — one line that no longer starts
+with `ANSWER `, which the daemon's parser does not recognize as an answer at
+all. Nothing errors: the comment posts, and the task stays frozen. Lead with
+even one word of prose so the ANSWER line lands on its own.
+Choose as the reviewer: prefer the option that respects the protocol you set
+for that task. If no option is safe, DO NOT answer — `report_to_boss` (no
+key — it always posts to YOUR OWN ticket) stating why, so it escalates to
+whoever watches you. The human is the fallback, not the first responder.
