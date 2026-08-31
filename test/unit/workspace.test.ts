@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { briefFor, interpolate, modelFor, effortFor, buildWorkspace } from "../../src/agents/workspace.js";
 
 describe("briefFor / modelFor", () => {
@@ -62,6 +62,23 @@ describe("buildWorkspace", () => {
       const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
       expect(mcp.mcpServers.butchr.headers["x-issue"]).toBe("KAN-9");
       expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
+    } finally { delete process.env.BUTCHR_WORKSPACES; }
+  });
+
+  test("writes ENVIRONMENT.md, and CLAUDE.md is interpolated with the same ground truth", () => {
+    const root = mkdtempSync(join(tmpdir(), "bw-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-10", issuetype: "Task", summary: "ship it", parent: "KAN-1" }, "http://localhost:7719/mcp");
+      expect(existsSync(join(dir, "ENVIRONMENT.md"))).toBe(true);
+      const environment = readFileSync(join(dir, "ENVIRONMENT.md"), "utf8");
+      expect(environment).toContain(hostname());
+      expect(environment).toContain("journalctl");
+      expect(environment).toContain("7719");
+      const claudeMd = readFileSync(join(dir, "CLAUDE.md"), "utf8");
+      expect(claudeMd).toContain(hostname());
+      expect(claudeMd).toContain("journalctl");
+      expect(claudeMd).not.toContain("{{GROUND_TRUTH}}");
     } finally { delete process.env.BUTCHR_WORKSPACES; }
   });
 });

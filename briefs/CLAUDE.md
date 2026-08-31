@@ -8,3 +8,7 @@ If your very first line of output is `server:butchr · no MCP server configured
 with that name`, ignore it: it's a startup-order artefact printed on every
 fresh pane, and the butchr tools are available seconds later — it is not a
 defect worth reporting.
+
+{{GROUND_TRUTH}}
+
+The same block is also in `ENVIRONMENT.md` in this directory, unchanged.
