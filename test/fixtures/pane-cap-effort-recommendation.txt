@@ -1,0 +1,36 @@
+# EFFORT-RECOMMENDATION DIALOG — RECONSTRUCTED FIXTURE (BUTCHR-5/BUTCHR-16)
+#
+# PROVENANCE: the live capture for this dialog is GONE. herdr classified all
+# five frozen panes as idle/done for the ~12 hours they sat on this dialog
+# (BUTCHR-5's root cause — our only blocked-detector never saw it, so nothing
+# ever read the pane while it was showing), and by the time the story agent
+# tried to recover it (~14 hours later) `herdr pane read` returned unrelated,
+# shallow scrollback with no trace of it and the butchr journal had no copy
+# either. The ONLY surviving record is the operator's own hand transcription,
+# quoted verbatim in the BUTCHR-16 ticket description:
+#
+#   "We recommend Opus 5 at medium effort"
+#   1. Switch Opus 5 to medium effort
+#   2. Keep high
+#
+# WHAT IS REAL: the question wording and the two option strings above,
+# exactly as transcribed by the operator.
+#
+# WHAT IS GUESSED (labelled here, not silent): the ❯ cursor position (placed
+# on option 1, "Switch ... to medium effort" — matching the recommended
+# choice being highlighted first, the same convention the real "Resume from
+# summary (recommended)" dialog uses, see test/unit/prompt.test.ts); the
+# footer line ("Enter to confirm · Esc to cancel", copied from every other
+# real Claude Code selection dialog captured in this repo); and the absence
+# of any other trailing chrome — nobody knows what, if anything, this
+# specific dialog renders around the question and options, so none is
+# invented here.
+#
+# If this dialog appears again, CAPTURE IT FRESH (`herdr pane read <pane>
+# --source detection --format text`, saved byte-exact) and replace this file
+# — do not keep trusting this reconstruction longer than necessary.
+# --- reconstructed pane text follows ---
+"We recommend Opus 5 at medium effort"
+❯ 1. Switch Opus 5 to medium effort
+  2. Keep high
+Enter to confirm · Esc to cancel

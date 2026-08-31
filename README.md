@@ -37,6 +37,8 @@ As of 0.10.0, also set `BUTCHR_ASSIGNEE_STORY` and `BUTCHR_ASSIGNEE_TASK` (Atlas
 
 Optionally set `BUTCHR_CAPTURE_DIR` to change where the session-limit watcher durably captures a pane's ANSI-stripped text when its own detection is inconclusive (the phrase is present but unrecognised, or recognised with no parseable reset time) — default `.captures` under the workspace root (`BUTCHR_WORKSPACES`, or `~/butchr-workspaces`). Bounded to at most one capture per issue/trigger/pane incarnation and 50 files total (oldest evicted first); an operator turns a capture into a test fixture by deleting its `# `-prefixed header block.
 
+herdr's own `blocked` classification is not the only blocked-detector: a pane herdr reports idle/done continuously for `BUTCHR_IDLE_DIALOG_MINUTES` (default 2) whose text parses as a dialog at the END of the pane is treated as blocked too — read, auto-answered if the shape is known, escalated to the pane's own ticket otherwise (an unrecognised idle-blocked dialog escalating, rather than freezing the agent silently, is the whole point — see `src/agents/idle-dialog.ts`). Every escalation additionally captures the full pane text to the same `BUTCHR_CAPTURE_DIR`, under an `<ISSUE>-escalation-<timestamp>.txt` name, and the Jira comment references that path (never the raw text) so the next unrecognised dialog can be fixtured from the escalation itself.
+
 From source (development):
 
 ```
