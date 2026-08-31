@@ -180,6 +180,31 @@ export function chooseStartupAnswer(prompt: Prompt): number | null {
     for (let i = 0; i < prompt.options.length; i++)
       if (/continue|ok|yes/i.test(prompt.options[i]!) && !/exit|no/i.test(prompt.options[i]!)) return i + 1;
   }
+  // BUTCHR-5/16: a settings-RECOMMENDATION dialog ("We recommend Opus 5 at
+  // medium effort" / "Switch ... to medium effort" vs "Keep high") froze all
+  // five epic agents for ~12 hours because our only blocked-detector — herdr's
+  // own classification — never saw it (idle-dialog.ts closes that gap). Once
+  // seen, the automatic answer is whichever option PRESERVES the CURRENT
+  // configuration, by CONTENT, never by position: the vendor is free to list
+  // the preserving option first or second, or to reorder it in the next
+  // release, and this must still pick the same one. Deliberately placed
+  // AFTER the generic ANSWER scan above: "recommended" also appears as
+  // ordinary option text on the (already-handled) resume-from-summary
+  // dialog, and that dialog's own option-content match must win first.
+  //
+  // Same "exactly one hit or null" discipline as freeTextOption
+  // (src/agents/escalate.ts) — a bare word gate is not enough on its own to
+  // guess which of several options preserves state, so this only ever acts
+  // when scanning every option turns up EXACTLY one preserving candidate.
+  // Guessing wrong here would silently change the fleet's configuration,
+  // which is worse than leaving the dialog for a human — so zero matches or
+  // more than one both return null and let it escalate.
+  if (/\brecommend/i.test(prompt.question)) {
+    const PRESERVE = /\bkeep\b|\bno change\b|\bdon'?t change\b|\bdo not change\b|\bstay\b|\bleave.*as[- ]is\b/i;
+    const hits: number[] = [];
+    prompt.options.forEach((o, i) => { if (PRESERVE.test(o)) hits.push(i + 1); });
+    return hits.length === 1 ? hits[0]! : null;
+  }
   return null;
 }
 
