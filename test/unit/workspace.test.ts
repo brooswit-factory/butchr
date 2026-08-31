@@ -80,9 +80,30 @@ describe("briefFor / modelFor", () => {
     expect(story).toContain("no third option");
     expect(story).toContain("never left undeclared");
   });
-  test("author briefs carry the two-signal reviewDecision+headRefOid check", () => {
-    expect(briefFor("Story")).toContain("reviewDecision,headRefOid");
-    expect(briefFor("Task")).toContain("reviewDecision,headRefOid");
+  // BUTCHR-46: the old `reviewDecision,headRefOid` two-signal check could
+  // not detect a stale approval — `headRefOid` is the PR's CURRENT head, not
+  // the reviewed head, so it keeps matching a local HEAD after every push
+  // while `reviewDecision` stays APPROVED (this repo doesn't dismiss stale
+  // reviews). Both required signals survived exactly the event they existed
+  // to catch, proven live against PR #120's own review history. The guard is
+  // now pinned to `reviews[].commit.oid`, the field that actually records
+  // what the reviewer saw, plus a negative assertion that the old command
+  // string is gone — the same cheap defense against a partial revert as the
+  // other negative guards here.
+  //
+  // Scope of what this guards: this can only assert that the BRIEF SAYS to
+  // use the last-decisive-review check — it says nothing about whether `gh`
+  // actually returns those fields as described. If the command were wrong
+  // and never caught anything, this guard would still pass, brief text
+  // intact.
+  test("author briefs carry the last-decisive-review merge check, not the stale reviewDecision+headRefOid one", () => {
+    for (const t of ["Story", "Task"]) {
+      const brief = briefFor(t);
+      expect(brief).toContain("reviews[].commit.oid");
+      expect(brief).toContain('select(.state=="APPROVED" or .state=="CHANGES_REQUESTED")');
+      expect(brief).toContain("last");
+      expect(brief).not.toContain("reviewDecision,headRefOid");
+    }
   });
   // BUTCHR-38: the relationship-verb rewrite. Guards below protect the
   // load-bearing new instructions so the next rewrite can't silently drop
@@ -189,6 +210,25 @@ describe("briefFor / modelFor", () => {
   test("the blocked-dialog ANSWER reply names tell_worker, not a bare comment", () => {
     expect(briefFor("Epic")).toContain("tell_worker(story, text)");
     expect(briefFor("Story")).toContain("tell_worker(task, text)");
+  });
+  // BUTCHR-46: `finish_without_a_boss` merged in PR #121 as the successor to
+  // jira_transition(my_own_key, "Done") for the top-level, bossless case
+  // that epic.md's step 5 previously flagged as an honest gap ("no
+  // relationship verb closes a top-level ticket to Done"). The negative
+  // assertion is the cheap guard against a partial revert: `jira_transition`
+  // had exactly one occurrence in epic.md (the parenthetical this replaces)
+  // before this change, so asserting its total absence from the brief is the
+  // simplest honest form, not an approximation of a narrower claim.
+  //
+  // Scope of what this guards: this can only assert that the BRIEF SAYS
+  // finish_without_a_boss and no longer sends an epic to jira_transition for
+  // Done — it says nothing about whether the tool itself behaves that way.
+  // If finish_without_a_boss were deleted from the code tomorrow, this guard
+  // would still pass, brief text intact.
+  test("epic brief teaches finish_without_a_boss and no longer names jira_transition for the Done case", () => {
+    const epic = briefFor("Epic");
+    expect(epic).toContain("finish_without_a_boss");
+    expect(epic).not.toContain("jira_transition");
   });
 });
 describe("interpolate", () => {

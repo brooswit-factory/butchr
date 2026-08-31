@@ -43,17 +43,27 @@ task-implements-story link is what carries your events upward.
    highest-consequence messages in this fleet (a `[review]` verdict, an
    `ANSWER` that unfreezes you) travel that way.
    On waking — from a `tell_worker` `[review]` message on {{KEY}} OR a
-   `[butchr] … pr:open → pr:approved` nudge — check BOTH signals before
-   merging: `gh pr view <pr> --json reviewDecision,headRefOid` must show
-   **`reviewDecision` APPROVED AND `headRefOid` equal to `git rev-parse
-   HEAD`** of your branch. Say what would make this check fail before you run
-   it: an approval is recorded against a specific sha, and your branch can
-   move between when it was reviewed and when you go to merge — so a
-   `reviewDecision` of APPROVED alone proves nothing about your CURRENT head.
-   A `[review] APPROVED @ <sha>` for a sha you've since pushed past means ask
-   for a re-review, not merge; a `[review] CHANGES_REQUESTED` means read the
-   review, fix, push, and comment that a re-review is needed. Then merge your
-   own PR.
+   `[butchr] … pr:open → pr:approved` nudge — do NOT merge on
+   `reviewDecision` plus `headRefOid`: `headRefOid` is the PR's CURRENT
+   head, not the head that was reviewed, so it keeps matching your local
+   HEAD after every push while `reviewDecision` stays APPROVED — both
+   signals survive exactly the stale-approval case they exist to catch.
+   Verify the LAST decisive review instead:
+   `gh pr view <pr> --json headRefOid,reviews -q '(.headRefOid) as $h
+   | [.reviews[] | select(.state=="APPROVED" or .state=="CHANGES_REQUESTED")] | last
+   | if . == null then "REFUSE: no decisive review"
+     elif .state != "APPROVED" then "REFUSE: last review is \(.state) @ \(.commit.oid[0:8])"
+     elif .commit.oid != $h then "REFUSE: approval is STALE — approved @ \(.commit.oid[0:8]) but head is \($h[0:8])"
+     else "MERGE OK: approved @ \(.commit.oid[0:8]) == head" end'`
+   — the LAST decisive review, never just any APPROVED one: a naive
+   `select(.state=="APPROVED")` still matches a stale approval sitting
+   earlier in the list, and `reviews[].commit.oid` is the field that
+   actually records the sha the reviewer saw — `headRefOid` never did. A
+   `REFUSE: STALE` result, or a `[review] APPROVED @ <sha>` for a sha you've
+   since pushed past, means ask for a re-review, not merge; a
+   `REFUSE: … CHANGES_REQUESTED` result, or a `[review] CHANGES_REQUESTED`,
+   means read the review, fix, push, and comment that a re-review is needed.
+   Then merge your own PR.
 
 ## Filing work that isn't yours
 Something surfaces mid-task that's real but doesn't serve {{KEY}} — a bug in

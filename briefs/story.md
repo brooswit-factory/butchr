@@ -90,20 +90,30 @@ say — ticket craft is your main skill.
    `submit_to_boss` (no arguments at all) to move {{KEY}} to **In Review**.
    Your epic reviews the PR.
    On waking — from a `tell_worker` `[review]` message on {{KEY}} OR a
-   `[butchr] … pr:open → pr:approved` nudge — check BOTH signals before
-   merging: `gh pr view <pr> --json reviewDecision,headRefOid` must show
-   **`reviewDecision` APPROVED AND `headRefOid` equal to `git rev-parse
-   HEAD`** of your branch. Say what would make this check fail before you run
-   it: an approval is recorded against a specific sha, and your branch can
-   move between when it was reviewed and when you go to merge — so a
-   `reviewDecision` of APPROVED alone proves nothing about your CURRENT head;
-   it records the sha the reviewer saw, and if you pushed after it, request a
-   re-review instead of merging. A `[review] APPROVED @ <sha>` for a sha
-   you've since pushed past means ask for a re-review, not merge; a `[review]
-   CHANGES_REQUESTED` means read the review, fix, push, and comment that a
-   re-review is needed. Prose that sounds approving without that state is NOT
-   approval. Once approved at your current head, **you merge it yourself**,
-   then your epic calls `finish_worker` and you're Done.
+   `[butchr] … pr:open → pr:approved` nudge — do NOT merge on
+   `reviewDecision` plus `headRefOid`: `headRefOid` is the PR's CURRENT
+   head, not the head that was reviewed, so it keeps matching your local
+   HEAD after every push while `reviewDecision` stays APPROVED — both
+   signals survive exactly the stale-approval case they exist to catch.
+   Verify the LAST decisive review instead:
+   `gh pr view <pr> --json headRefOid,reviews -q '(.headRefOid) as $h
+   | [.reviews[] | select(.state=="APPROVED" or .state=="CHANGES_REQUESTED")] | last
+   | if . == null then "REFUSE: no decisive review"
+     elif .state != "APPROVED" then "REFUSE: last review is \(.state) @ \(.commit.oid[0:8])"
+     elif .commit.oid != $h then "REFUSE: approval is STALE — approved @ \(.commit.oid[0:8]) but head is \($h[0:8])"
+     else "MERGE OK: approved @ \(.commit.oid[0:8]) == head" end'`
+   — the LAST decisive review, never just any APPROVED one: a naive
+   `select(.state=="APPROVED")` still matches a stale approval sitting
+   earlier in the list, and `reviews[].commit.oid` is the field that
+   actually records the sha the reviewer saw — `headRefOid` never did. Say
+   what would make this check fail before you run it: a `REFUSE: STALE`
+   result, or a `[review] APPROVED @ <sha>` for a sha you've since pushed
+   past, means ask for a re-review, not merge; a `REFUSE: … CHANGES_REQUESTED`
+   result, or a `[review] CHANGES_REQUESTED`, means read the review, fix,
+   push, and comment that a re-review is needed. Prose that sounds approving
+   without a matching `MERGE OK` is NOT approval. Once you get `MERGE OK`,
+   **you merge it yourself**, then your epic calls `finish_worker` and
+   you're Done.
 
 ## Filing work that isn't yours
 Something surfaces mid-story that's real but doesn't serve {{KEY}} — a

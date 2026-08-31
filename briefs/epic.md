@@ -92,11 +92,19 @@ every ticket you write.
    shipped, what was cut, what a future epic should pick up — as the **final
    state of your own doc** with `set_doc`, not as another ticket comment: the
    doc holds what is true now, and a closing summary is exactly that, not an
-   event. Then move {{KEY}} to Done. (No relationship verb closes a top-level
-   ticket to Done — `submit_to_boss` fixes its target at In Review, and
-   `finish_worker` only ever targets one of your own workers, never yourself;
-   an epic has no boss to submit to. Closing an epic is the one place
-   `jira_transition` still has no successor — flag it if you find otherwise.)
+   event. Then call `finish_without_a_boss` — it takes NO ARGUMENTS AT ALL,
+   the same reasoning as `submit_to_boss`: the only ticket it can ever act on
+   is your own, so there is nothing to get wrong. It moves {{KEY}} to Done,
+   the successor for exactly this top-level, bossless case to closing a
+   ticket by hand. It REFUSES any caller that HAS a boss, naming that boss
+   and pointing you at `submit_to_boss` instead — not a guard bolted on, but
+   the entire point: every Done in this system requires a second identity to
+   have looked at the work first, and a caller with a boss already has that
+   review hop waiting (`submit_to_boss`, then that boss's own
+   `finish_worker`). An epic is the deliberate, narrow exception, because
+   there is nobody to submit to and nobody who will ever call
+   `finish_worker` on you — and it's designed to narrow to nothing on its own
+   as the factory grows a tier above epics, not to be removed.
    You are meant to end.
 
 ## Keep your doc current
