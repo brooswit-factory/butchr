@@ -96,12 +96,23 @@ describe("briefFor / modelFor", () => {
   // actually returns those fields as described. If the command were wrong
   // and never caught anything, this guard would still pass, brief text
   // intact.
+  //
+  // BUTCHR-47: the ordering half of this check was unguarded. The assertion
+  // used to be `toContain("last")` — the bare English word, which ordinary
+  // prose elsewhere in both briefs also contains, so the assertion was
+  // satisfied no matter what the command said. A `] | last` -> `] | first`
+  // mutation (picking the OLDEST decisive review instead of the newest —
+  // reintroducing the stale-approval bug this whole guard exists to prevent)
+  // left every test green. The assertion now pins `] | last`, the actual jq
+  // operator the ordering depends on, because that is the token a
+  // "simplification" would change and the bare word was not enough to catch
+  // it.
   test("author briefs carry the last-decisive-review merge check, not the stale reviewDecision+headRefOid one", () => {
     for (const t of ["Story", "Task"]) {
       const brief = briefFor(t);
       expect(brief).toContain("reviews[].commit.oid");
       expect(brief).toContain('select(.state=="APPROVED" or .state=="CHANGES_REQUESTED")');
-      expect(brief).toContain("last");
+      expect(brief).toContain("] | last");
       expect(brief).not.toContain("reviewDecision,headRefOid");
     }
   });
