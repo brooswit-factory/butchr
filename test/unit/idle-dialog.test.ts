@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { IdleDialogTracker, withIdleDialogDetection, endsInLiveChrome, parsesAsLiveDialog } from "../../src/agents/idle-dialog.js";
+import { IdleDialogTracker, withIdleDialogDetection, classifyTrailing } from "../../src/agents/idle-dialog.js";
 import { blockedNow } from "../../src/agents/blocked.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
@@ -67,47 +67,73 @@ describe("IdleDialogTracker", () => {
   });
 });
 
-// PR #104 review (blocking): parsePrompt's existing gates verify the dialog
-// BLOCK itself but say nothing about what follows it — safe for herdr's own
-// `blocked` classification (the dialog IS the live composer state by
-// construction) but NOT safe once an IDLE pane reaches the same parser. Real
-// pane-cap-*.txt captures in this repo (dialog or not) all end in the same
-// persistent terminal chrome; endsInLiveChrome is tested against those exact
-// tails, not an invented one.
-describe("endsInLiveChrome / parsesAsLiveDialog (PR #104 review)", () => {
+// PR #104 review, ROUND 1 (blocking): parsePrompt's existing gates verify the
+// dialog BLOCK itself but say nothing about what follows it — safe for
+// herdr's own `blocked` classification (the dialog IS the live composer
+// state by construction) but NOT safe once an IDLE pane reaches the same
+// parser.
+//
+// PR #104 review, ROUND 2 (blocking): a binary "is this live" check fails
+// toward SILENCE — any trailing shape this repo has no fixture for (a boxed
+// dialog's closing border, a split footer, an unfamiliar status line, a
+// scroll hint) was being dropped outright, which is DoD 1's failure mode for
+// a REAL dialog. classifyTrailing replaces the binary with three outcomes;
+// see its own doc comment for the full reasoning.
+describe("classifyTrailing (PR #104 review, both rounds)", () => {
   const REAL_CHROME_TAIL_A = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-a.txt"), "utf8").split("\n").slice(-6).join("\n");
   const REAL_CHROME_TAIL_B = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-b.txt"), "utf8").split("\n").slice(-6).join("\n");
 
-  test("a footer with nothing after it (every synthetic dialog fixture used throughout this suite) is live", () => {
-    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel")).toBe(true);
+  test("LIVE: a footer with nothing after it (every synthetic dialog fixture used throughout this suite)", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel")).toBe("live");
   });
 
-  test("a footer followed by the REAL terminal chrome (verbatim tail of pane-cap-a.txt / pane-cap-b.txt) is live", () => {
-    expect(endsInLiveChrome(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_A}`)).toBe(true);
-    expect(endsInLiveChrome(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_B}`)).toBe(true);
+  test("LIVE: a footer followed by the REAL working-pane chrome (verbatim tail of pane-cap-a.txt / pane-cap-b.txt) — blank lines tolerated", () => {
+    expect(classifyTrailing(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_A}`)).toBe("live");
+    expect(classifyTrailing(`Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n${REAL_CHROME_TAIL_B}`)).toBe("live");
   });
 
-  test("THE REGRESSION (PR #104 review, reproduced against 82c4a2b): a footer followed by agent PROSE, even with real chrome further below, is NOT live", () => {
+  test("STALE (ROUND 1's demonstrated repro, reproduced against 82c4a2b): a footer followed by agent PROSE (a Claude Code turn bullet), even with real chrome further below", () => {
     const pane = `● Bash(cat test/fixtures/pane-cap-effort-recommendation.txt)\n  ⎿  "We recommend Opus 5 at medium effort"\n     ❯ 1. Switch Opus 5 to medium effort\n       2. Keep high\n     Enter to confirm · Esc to cancel\n\n● That's the reconstructed fixture for the effort-recommendation dialog from BUTCHR-16 — nothing to act on here.\n\n${REAL_CHROME_TAIL_A}`;
     expect(pane.includes("Enter to confirm")).toBe(true); // sanity: the footer really is present, intact
-    expect(endsInLiveChrome(pane)).toBe(false);
-    expect(parsesAsLiveDialog(pane)).toBe(false);
+    expect(classifyTrailing(pane)).toBe("stale");
   });
 
-  test("a footer followed by a tool-result continuation line (⎿) is NOT live", () => {
-    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n  ⎿  some tool output line")).toBe(false);
+  test("STALE: a footer followed by a tool-result continuation line (⎿)", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n  ⎿  some tool output line")).toBe("stale");
   });
 
-  test("no footer at all is not this check's concern (parsePrompt already rejects it) — returns false, not true", () => {
-    expect(endsInLiveChrome("just some prose, no dialog here")).toBe(false);
+  // ROUND 2's four concrete shapes: none was invented to be difficult — the
+  // first is the exact unknown named in the ticket itself ("nobody knows
+  // what trailing chrome renders around this dialog or how the options are
+  // boxed"). All four must be UNKNOWN, never silently dropped.
+  test("UNKNOWN: a live dialog rendered inside a box (closing border is not a pure rule)", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n╰──────────────────────────────╯")).toBe("unknown");
   });
 
-  test("blank lines between the footer and real chrome are tolerated", () => {
-    expect(endsInLiveChrome("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n\n\n─────\n❯\n─────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc")).toBe(true);
+  test("UNKNOWN: the footer's two halves split across separate lines", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm\nEsc to cancel")).toBe("unknown");
+  });
+
+  test("UNKNOWN: a pane not in bypass mode (a different status-line hint)", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n  ? for shortcuts")).toBe("unknown");
+  });
+
+  test("UNKNOWN: a scroll hint after the footer", () => {
+    expect(classifyTrailing("Pick one:\n❯ 1. a\n  2. b\nEnter to confirm · Esc to cancel\n(2 more options below)")).toBe("unknown");
+  });
+
+  test("no footer at all is defensive-only — every real caller already required parsePrompt to succeed first, which requires one", () => {
+    expect(classifyTrailing("just some prose, no dialog here")).toBe("unknown");
   });
 });
 
 const END_OF_PANE_MENU = "Choose your favorite color:\n❯ 1. Red\n  2. Blue\nEnter to confirm · Esc to cancel";
+// classifyTrailing only inspects content AFTER the footer — the stale marker
+// belongs there, not before it (a marker only before the footer, e.g. quoting
+// the dialog inside a tool block with nothing said afterward, classifies
+// LIVE: the documented residual from PR #104's first review round).
+const STALE_QUOTE_PANE = `${END_OF_PANE_MENU}\n● narrating after the quoted dialog — this pane is working normally`;
+const UNKNOWN_TRAILING_PANE = `${END_OF_PANE_MENU}\n(2 more options below)`;
 
 describe("withIdleDialogDetection", () => {
   test("COST GATE: never reads pane text for a row that hasn't cleared the idle-duration bound yet", async () => {
@@ -117,34 +143,61 @@ describe("withIdleDialogDetection", () => {
       async () => [row("p1", "idle")],
       { now: () => now, minutes: 2, read: async (p) => { reads.push(p); return END_OF_PANE_MENU; } },
     );
-    await wrapped(); // first observation
+    await wrapped.list(); // first observation
     now = 60_000;
-    await wrapped(); // 1 minute: still not a candidate
+    await wrapped.list(); // 1 minute: still not a candidate
     expect(reads).toEqual([]);
   });
 
-  test("reads pane text once the bound clears, and overrides agent_status to 'blocked' when it parses as an end-of-pane menu", async () => {
+  test("reads pane text once the bound clears, and overrides agent_status to 'blocked' when it classifies LIVE", async () => {
     let now = 0;
     const wrapped = withIdleDialogDetection(
       async () => [row("p1", "idle")],
       { now: () => now, minutes: 2, read: async () => END_OF_PANE_MENU },
     );
-    await wrapped();
+    await wrapped.list();
     now = 2 * 60_000;
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     expect(rows).toEqual([{ pane_id: "p1", agent_status: "blocked" }]);
     expect(blockedNow(rows)).toEqual(["p1"]); // flows through blockedNow's existing, unmodified filter
+    expect(wrapped.isUnknownTrailing("p1")).toBe(false);
   });
 
-  test("leaves agent_status untouched when the pane text does not parse as a menu, even past the bound", async () => {
+  test("also overrides to 'blocked' when the trailing region classifies UNKNOWN — but flags isUnknownTrailing so the caller never auto-answers it", async () => {
+    let now = 0;
+    const wrapped = withIdleDialogDetection(
+      async () => [row("p1", "idle")],
+      { now: () => now, minutes: 2, read: async () => UNKNOWN_TRAILING_PANE },
+    );
+    await wrapped.list();
+    now = 2 * 60_000;
+    const rows = await wrapped.list();
+    expect(rows).toEqual([{ pane_id: "p1", agent_status: "blocked" }]);
+    expect(wrapped.isUnknownTrailing("p1")).toBe(true);
+  });
+
+  test("does NOT override to 'blocked' when the trailing region classifies STALE — dropped entirely, like any other non-dialog text", async () => {
+    let now = 0;
+    const wrapped = withIdleDialogDetection(
+      async () => [row("p1", "idle")],
+      { now: () => now, minutes: 2, read: async () => STALE_QUOTE_PANE },
+    );
+    await wrapped.list();
+    now = 2 * 60_000;
+    const rows = await wrapped.list();
+    expect(rows).toEqual([{ pane_id: "p1", agent_status: "idle" }]);
+    expect(wrapped.isUnknownTrailing("p1")).toBe(false);
+  });
+
+  test("leaves agent_status untouched when the pane text does not parse as a menu at all, even past the bound", async () => {
     let now = 0;
     const wrapped = withIdleDialogDetection(
       async () => [row("p1", "idle")],
       { now: () => now, minutes: 2, read: async () => "just idle, nothing on screen" },
     );
-    await wrapped();
+    await wrapped.list();
     now = 2 * 60_000;
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     expect(rows).toEqual([{ pane_id: "p1", agent_status: "idle" }]);
     expect(blockedNow(rows)).toEqual([]);
   });
@@ -156,20 +209,21 @@ describe("withIdleDialogDetection", () => {
       async () => [row("p1", "working")],
       { now: () => now, minutes: 2, read: async (p) => { reads.push(p); return END_OF_PANE_MENU; } },
     );
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     expect(rows).toEqual([{ pane_id: "p1", agent_status: "working" }]);
     expect(reads).toEqual([]);
   });
 
-  test("a pane herdr already calls 'blocked' passes through unchanged, with no extra read (it isn't idle/done)", async () => {
+  test("a pane herdr already calls 'blocked' passes through unchanged, with no extra read, and is never flagged isUnknownTrailing", async () => {
     const reads: string[] = [];
     const wrapped = withIdleDialogDetection(
       async () => [row("p1", "blocked")],
-      { now: () => 0, minutes: 2, read: async (p) => { reads.push(p); return END_OF_PANE_MENU; } },
+      { now: () => 0, minutes: 2, read: async (p) => { reads.push(p); return UNKNOWN_TRAILING_PANE; } },
     );
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     expect(rows).toEqual([{ pane_id: "p1", agent_status: "blocked" }]);
     expect(reads).toEqual([]);
+    expect(wrapped.isUnknownTrailing("p1")).toBe(false); // herdr's own classification keeps the full benefit of the doubt
   });
 
   test("a pane read failure is logged and the row is left exactly as herdr reported it", async () => {
@@ -179,11 +233,44 @@ describe("withIdleDialogDetection", () => {
       async () => [row("p1", "idle")],
       { now: () => now, minutes: 2, read: async () => { throw new Error("herdr unreachable"); }, log: (l) => logs.push(l) },
     );
-    await wrapped();
+    await wrapped.list();
     now = 2 * 60_000;
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     expect(rows).toEqual([{ pane_id: "p1", agent_status: "idle" }]);
     expect(logs.some((l) => l.includes("p1") && l.includes("herdr unreachable"))).toBe(true);
+  });
+
+  test("isUnknownTrailing resets once the pane leaves idle/done", async () => {
+    let now = 0;
+    const status = { p1: "idle" };
+    const text = { p1: UNKNOWN_TRAILING_PANE };
+    const wrapped = withIdleDialogDetection(
+      async () => [row("p1", status.p1)],
+      { now: () => now, minutes: 2, read: async () => text.p1 },
+    );
+    await wrapped.list();
+    now = 2 * 60_000;
+    await wrapped.list();
+    expect(wrapped.isUnknownTrailing("p1")).toBe(true);
+    status.p1 = "working";
+    await wrapped.list();
+    expect(wrapped.isUnknownTrailing("p1")).toBe(false);
+  });
+
+  test("isUnknownTrailing resets once the pane drops out of the polled rows entirely", async () => {
+    let now = 0;
+    let rowsNow: Array<{ pane_id: string; agent_status: string }> = [row("p1", "idle")];
+    const wrapped = withIdleDialogDetection(
+      async () => rowsNow,
+      { now: () => now, minutes: 2, read: async () => UNKNOWN_TRAILING_PANE },
+    );
+    await wrapped.list();
+    now = 2 * 60_000;
+    await wrapped.list();
+    expect(wrapped.isUnknownTrailing("p1")).toBe(true);
+    rowsNow = []; // pane gone from the herd
+    await wrapped.list();
+    expect(wrapped.isUnknownTrailing("p1")).toBe(false);
   });
 
   test("independent per-pane tracking: one pane's status change never affects another's floor", async () => {
@@ -193,13 +280,13 @@ describe("withIdleDialogDetection", () => {
       async () => [...statusFor.entries()].map(([id, s]) => row(id, s)),
       { now: () => now, minutes: 2, read: async () => END_OF_PANE_MENU },
     );
-    await wrapped(); // t=0: both first-observed
+    await wrapped.list(); // t=0: both first-observed
     now = 90_000;
     statusFor.set("p2", "working"); // p2 goes to work in between; p1 stays idle
-    await wrapped(); // t=1.5min: p1 not yet a candidate; p2's floor resets
+    await wrapped.list(); // t=1.5min: p1 not yet a candidate; p2's floor resets
     now = 2 * 60_000 + 90_000;
     statusFor.set("p2", "idle"); // p2 back to idle, but from a FRESH floor
-    const rows = await wrapped();
+    const rows = await wrapped.list();
     const byId = Object.fromEntries(rows.map((r) => [r.pane_id, r.agent_status]));
     expect(byId.p1).toBe("blocked"); // p1's own floor, uninterrupted, has cleared 2 minutes
     expect(byId.p2).toBe("idle"); // p2's floor restarted when it went to "working"
@@ -212,6 +299,8 @@ describe("withIdleDialogDetection", () => {
 // createEscalator used for herdr-native "blocked" panes. No real timers: each
 // `tick()` call below is one simulated watchBlocked poll, with `nowMs`
 // advanced by the test to simulate elapsed idle time without waiting for it.
+// `onPrompt` mirrors daemon/index.ts's real wiring exactly, including the
+// `isUnknownTrailing` consult added in PR #104's second review round.
 function integrationHarness(minutes: number) {
   let nowMs = 0;
   const statusFor = new Map<string, string>();
@@ -238,7 +327,7 @@ function integrationHarness(minutes: number) {
     log: () => {},
   });
 
-  const wrappedList = withIdleDialogDetection(
+  const idleDialogDetector = withIdleDialogDetection(
     async () => [...statusFor.entries()].map(([pane_id, agent_status]) => row(pane_id, agent_status)),
     { now: () => nowMs, minutes, read: readPane },
   );
@@ -249,7 +338,10 @@ function integrationHarness(minutes: number) {
     onBlocked: (cb) => { fireBlocked = cb; return () => {}; },
     read: readPane,
     send: async (pane, text) => { sent.push({ pane, text }); },
-    onPrompt: ({ prompt }) => chooseStartupAnswer(prompt) ?? undefined,
+    onPrompt: ({ paneId, prompt }) => {
+      if (idleDialogDetector.isUnknownTrailing(paneId)) return undefined;
+      return chooseStartupAnswer(prompt) ?? undefined;
+    },
     onExposed: ({ paneId, prompt, pollSeq }) => {
       pending.push(escalator.onBlocked(paneId, issueFor.get(paneId) ?? null, prompt, pollSeq));
     },
@@ -265,7 +357,7 @@ function integrationHarness(minutes: number) {
     setIssue: (pane: string, issue: string | null) => { issueFor.set(pane, issue); },
     tick: async () => {
       seq++;
-      const rows = await wrappedList();
+      const rows = await idleDialogDetector.list();
       const ids = blockedNow(rows);
       escalator.onPoll(seq, ids);
       for (const paneId of ids) fireBlocked!(paneId, seq);
@@ -350,13 +442,14 @@ describe("idle-dialog detection routed through the existing escalation pipeline 
     expect(h.sent).toEqual([]);
   });
 
-  // PR #104 review (blocking): DoD 6's original QUOTED_MID_SCROLLBACK had no
-  // footer at all, so it was rejected trivially — it never exercised the
-  // gate DoD 6 exists for. THIS is the case that matters: footer AND cursor
-  // both intact (so parsePrompt alone accepts it), agent prose continuing
-  // after it, and genuine live composer chrome (the real pane-cap-a.txt
-  // tail) further below still. Reproduced sending a real keystroke against
-  // 82c4a2b before the endsInLiveChrome fix; must now neither post nor send.
+  // PR #104 review, ROUND 1 (blocking): DoD 6's original QUOTED_MID_SCROLLBACK
+  // had no footer at all, so it was rejected trivially — it never exercised
+  // the gate DoD 6 exists for. THIS is the case that matters: footer AND
+  // cursor both intact (so parsePrompt alone accepts it), agent prose
+  // continuing after it, and genuine live composer chrome (the real
+  // pane-cap-a.txt tail) further below still. Reproduced sending a real
+  // keystroke against 82c4a2b before the classifyTrailing fix; must now
+  // classify STALE and neither post nor send.
   test("DoD 6 (hardened): a menu with an INTACT footer and cursor, quoted mid-scrollback with agent prose after it and real composer chrome below THAT, neither escalates nor sends a keystroke", async () => {
     const REAL_CHROME_TAIL = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-a.txt"), "utf8").split("\n").slice(-6).join("\n");
     const pane = [
@@ -380,6 +473,38 @@ describe("idle-dialog detection routed through the existing escalation pipeline 
     for (let i = 0; i < 5; i++) await h.tick();
     expect(h.posted).toEqual([]);
     expect(h.sent).toEqual([]); // the assertion that would have caught this: no keystroke into a working composer
+  });
+
+  // PR #104 review, ROUND 2 (blocking): the opposite failure direction — an
+  // UNKNOWN trailing shape (not stale, not recognized-live) must still
+  // ESCALATE, never sit silent, and must never be auto-answered even when
+  // chooseStartupAnswer would otherwise recognize the dialog's content.
+  describe("ROUND 2: an UNKNOWN trailing region escalates but is NEVER auto-answered", () => {
+    // Use a dialog chooseStartupAnswer WOULD recognize (trust-folder) as the
+    // base for each case, so a failure to suppress auto-answer would be
+    // visible as a `sent` entry, not just a missing escalation.
+    const BASE = "Quick safety check: is this a project you trust?\n ❯ No, exit\n   Yes, I trust this folder\n";
+    const CASES: Record<string, string> = {
+      "boxed dialog closing border": `${BASE} Enter to confirm · Esc to cancel\n╰──────────────────────────────╯`,
+      "the footer's two halves split across separate lines": `${BASE} Enter to confirm\n Esc to cancel`,
+      "a pane not in bypass mode (a different status-line hint)": `${BASE} Enter to confirm · Esc to cancel\n  ? for shortcuts`,
+      "a scroll hint after the footer": `${BASE} Enter to confirm · Esc to cancel\n(2 more options below)`,
+    };
+
+    for (const [name, pane] of Object.entries(CASES)) {
+      test(`escalates rather than being silently dropped: ${name}`, async () => {
+        const h = integrationHarness(2);
+        h.setStatus("p1", "idle");
+        h.setPaneText("p1", pane);
+        h.setIssue("p1", "KAN-1");
+        await h.tick();
+        h.advanceMinutes(2);
+        for (let i = 0; i < 5; i++) await h.tick();
+        expect(h.posted.length).toBe(1); // escalated — the criterion that survives the next unknown shape
+        expect(h.sent).toEqual([]); // and NEVER auto-answered on unverifiable trailing evidence
+      });
+    }
+
   });
 
   test("a RECOGNISED dialog reaching this path is auto-answered, never escalated", async () => {
