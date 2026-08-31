@@ -32,6 +32,13 @@ export interface Config {
    */
   stalledMinutes: number;
   /**
+   * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
+   * a live (In Progress) boss before the parked-ticket detector's stage 1
+   * escalation comment fires (see src/agents/parked.ts) — also the interval
+   * between each subsequent stage. Default 10.
+   */
+  parkedMinutes: number;
+  /**
    * BUTCHR-5/16: minutes a pane's herdr status must read idle/done,
    * CONTINUOUSLY, before its text is even read to check for an end-of-pane
    * dialog herdr's own classification missed (the second, herdr-independent
@@ -82,6 +89,7 @@ export interface ConfigEnv {
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
@@ -108,6 +116,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
+  const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
+  if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
+
   const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
@@ -122,6 +133,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     atlassian: { site, email, token },
     port,
     stalledMinutes,
+    parkedMinutes,
     idleDialogMinutes,
     pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
@@ -151,6 +163,6 @@ const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
   `captureDir=${c.captureDir}`;
