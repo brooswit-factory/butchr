@@ -12,14 +12,16 @@ export const isAgentLabel = (label: string): boolean => label.startsWith(AGENT_P
 export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX);
 
 /**
- * BUTCHR-24: `butchr:parked-ok` (src/agents/parked.ts's `EXEMPT_LABEL`) is
- * NOT a daemon-owned label, deliberately — it is READ-ONLY for the daemon. A
- * human adds it to a ticket to declare a parked child deliberate; the daemon
- * only ever reads it (to skip escalating that child) and must never add or
- * remove it itself. Do NOT fold it into `isDaemonLabel` below: doing so would
- * make `sweepStaleAgentLabels` (src/labels/sweep.ts) treat it as daemon-owned
- * and silently strip a human's deliberate exemption the moment the ticket
- * left the active statuses. Pinned by a test in test/unit/labels-plan.test.ts.
+ * BUTCHR-24: `butchr:shelved` (src/agents/parked.ts's `EXEMPT_LABEL`) is NOT
+ * a daemon-owned label, deliberately — it is READ-ONLY for the daemon. ANY
+ * actor may SET it on a ticket to declare a parked child deliberately
+ * shelved — a human today, and possibly an automated shelving tool in
+ * future (BUTCHR-25) — but the daemon only ever READS it (to skip escalating
+ * that child) and must never add or remove it itself. Do NOT fold it into
+ * `isDaemonLabel` below: doing so would make `sweepStaleAgentLabels`
+ * (src/labels/sweep.ts) treat it as daemon-owned and silently strip a
+ * deliberate exemption the moment the ticket left the active statuses.
+ * Pinned by a test in test/unit/labels-plan.test.ts.
  */
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
 

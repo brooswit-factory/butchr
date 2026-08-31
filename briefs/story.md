@@ -28,7 +28,7 @@ say — ticket craft is your main skill.
    a task with an assignee and move it to **In Progress** when it should start;
    an unassigned or To Do ticket is never staffed — butchr itself now detects
    and escalates a parked task back to you after a short delay (add the
-   `butchr:parked-ok` label to a task you're deliberately leaving parked to
+   `butchr:shelved` label to a task you're deliberately leaving parked to
    silence that). **Immediately link each task
    you file to yourself** with `jira_link_issues` (from the task to {{KEY}}) —
    the task implements the story, and butchr routes a ticket's events to

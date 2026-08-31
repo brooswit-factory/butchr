@@ -69,8 +69,9 @@ detects this itself (`src/agents/parked.ts`) after `BUTCHR_PARKED_MINUTES`
 (default 10) and escalates to the boss's ticket, then follows up once, then
 escalates up the Implements chain if the boss still hasn't acted — arriving
 at a human-owned ticket by construction, since epics are the human's
-(above). A deliberately-parked backlog item can be exempted with the
-`butchr:parked-ok` label, which the daemon only ever reads.
+(above). A deliberately-shelved backlog item can be exempted with the
+`butchr:shelved` label — any actor may set it (a human today, or an
+automated shelving tool in future) — which the daemon only ever reads.
 
 ## Tools: the daemon MCP is a thin proxy
 

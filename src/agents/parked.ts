@@ -26,12 +26,17 @@ export const MARKER = "[butchr:parked]";
 
 /**
  * A ticket carrying this label is never reported parked, at any stage — the
- * exemption for a deliberately-parked backlog item under a live boss (the
- * one real false positive; KAN-839 is the live example). Read-only for the
- * daemon: see the guarding comment next to `isDaemonLabel` in
- * src/labels/plan.ts, and the pinned test in test/unit/labels-plan.test.ts.
+ * exemption for a deliberately-shelved backlog item under a live boss (the
+ * one real false positive; KAN-839 is the live example). Named for the STATE
+ * ("a boss put this down on purpose"), not the detector — it reads correctly
+ * to a reader who doesn't know this detector exists, and is the vocabulary
+ * BUTCHR-25's proposed `shelve_worker` is standardising on, so if that ships
+ * it can set this same label with no rename. Any actor may SET it — a human
+ * today, a shelving tool in future — but it is read-only for the daemon: see
+ * the guarding comment next to `isDaemonLabel` in src/labels/plan.ts, and the
+ * pinned test in test/unit/labels-plan.test.ts.
  */
-export const EXEMPT_LABEL = "butchr:parked-ok";
+export const EXEMPT_LABEL = "butchr:shelved";
 
 /** Mirrors escalation-loop.ts's per-pane budget: at most this many escalation comments per boss ticket per hour. */
 const MAX_PER_HOUR = 3;
@@ -136,48 +141,60 @@ export class ParkedTracker {
   }
 }
 
-function stage1Comment(child: string): string {
+/**
+ * The escalation comments below are deliberately OBSERVATIONAL, not
+ * accusatory: the daemon can see state (assigned, linked, To Do, for how
+ * long) but not intent, and a ticket a boss shelved on purpose is
+ * byte-identical in Jira to one a boss simply forgot. Report what was
+ * measured — including the actual elapsed time — and let the reader draw
+ * the conclusion, rather than asserting a mistake was made. This matters
+ * more than usual for a detector explicitly built to survive an agent that
+ * doesn't read carefully: its output has to hold up even when the reader
+ * disagrees with it.
+ */
+
+function stage1Comment(child: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${child} is assigned but sitting in To Do — no agent is running for it.`,
+    `${MARKER} ${child} has been assigned and linked to this ticket, in To Do, for ${elapsedMinutes} minutes; no agent is running for a To Do ticket.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this parking is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
     "",
     `fingerprint: ${child}`,
     "stage: 1",
   ].join("\n");
 }
 
-function stage2Comment(child: string): string {
+function stage2Comment(child: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${child} is STILL sitting in To Do, unactivated — this is a follow-up.`,
+    `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked. This is a follow-up.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this parking is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
     "",
     `fingerprint: ${child}`,
     "stage: 2",
   ].join("\n");
 }
 
-function stage3EscalatedComment(child: string, boss: string): string {
+function stage3EscalatedComment(child: string, boss: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${child} is still parked in To Do, assigned but unactivated, under ${boss} — which has not acted on two prior notices there.`,
+    `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked, under ${boss} — which has not acted on two prior notices there.`,
     "",
     `Prompt ${boss} to transition ${child} to In Progress (or close it).`,
-    `If this parking is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
     "",
     `fingerprint: ${child}`,
     "stage: 3",
   ].join("\n");
 }
 
-function stage3TerminalComment(child: string): string {
+function stage3TerminalComment(child: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${child} is still parked in To Do after three notices, and this ticket has no boss of its own to escalate to further.`,
+    `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked, and this ticket has no boss of its own to escalate to further.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this parking is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
     "",
     `fingerprint: ${child}`,
     "stage: 3",
@@ -283,17 +300,22 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
       for (const { child, boss } of candidates) {
         const e = tracker.observe(child.key, boss);
         const now = deps.now();
+        // Total elapsed time since first observed parked — reported in
+        // every stage's comment (see the OBSERVATIONAL note above), not just
+        // the time since the previous stage, since "how long has this
+        // actually been sitting" is the number a reader needs.
+        const elapsedMinutes = Math.round((now - e.firstObservedAt) / 60_000);
 
         if (e.stage1At === undefined) {
           if (now - e.firstObservedAt < minutesMs) continue;
-          const at = await postStage(boss, "1", child.key, stage1Comment(child.key));
+          const at = await postStage(boss, "1", child.key, stage1Comment(child.key, elapsedMinutes));
           if (at !== null) e.stage1At = at;
           continue;
         }
 
         if (e.stage2At === undefined) {
           if (now - e.stage1At < minutesMs) continue;
-          const at = await postStage(boss, "2", child.key, stage2Comment(child.key));
+          const at = await postStage(boss, "2", child.key, stage2Comment(child.key, elapsedMinutes));
           if (at !== null) e.stage2At = at;
           continue;
         }
@@ -317,7 +339,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
           // OWN boss, from the boss's own links, is the "inward" end.
           const grandBoss = links.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
           if (grandBoss) {
-            const at = await postStage(grandBoss, "3", child.key, stage3EscalatedComment(child.key, boss));
+            const at = await postStage(grandBoss, "3", child.key, stage3EscalatedComment(child.key, boss, elapsedMinutes));
             if (at !== null) e.stage3At = at;
           } else {
             // Terminal case: the Implements chain in this fleet is
@@ -329,7 +351,7 @@ export function createParkedDetector(deps: ParkedDetectorDeps): ParkedDetector {
             // and log a WARNING an operator's `journalctl | grep WARNING`
             // will actually surface.
             log(`WARNING: [parked] ${child.key} parked under ${boss}, which has no boss of its own to escalate to — re-posting on ${boss}`);
-            const at = await postStage(boss, "3", child.key, stage3TerminalComment(child.key));
+            const at = await postStage(boss, "3", child.key, stage3TerminalComment(child.key, elapsedMinutes));
             if (at !== null) e.stage3At = at;
           }
         }

@@ -24,11 +24,12 @@ describe("isDaemonLabel", () => {
     expect(isDaemonLabel("urgent")).toBe(false);
   });
 
-  // BUTCHR-24: butchr:parked-ok is a human-set exemption the daemon only ever
-  // reads — pinned so nobody later folds it into isDaemonLabel and has
-  // sweepStaleAgentLabels (src/labels/sweep.ts) silently strip it.
-  test("butchr:parked-ok is NOT daemon-owned — read-only exemption label", () => {
-    expect(isDaemonLabel("butchr:parked-ok")).toBe(false);
+  // BUTCHR-24: butchr:shelved is a settable-by-any-actor exemption the
+  // daemon only ever reads — pinned so nobody later folds it into
+  // isDaemonLabel and has sweepStaleAgentLabels (src/labels/sweep.ts)
+  // silently strip it.
+  test("butchr:shelved is NOT daemon-owned — read-only exemption label", () => {
+    expect(isDaemonLabel("butchr:shelved")).toBe(false);
   });
 });
 

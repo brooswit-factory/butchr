@@ -54,7 +54,7 @@ describe("parkedCandidates (pure predicate)", () => {
     expect(parkedCandidates([], related)).toEqual([]);
   });
 
-  test("excluded: child carries butchr:parked-ok", () => {
+  test("excluded: child carries butchr:shelved", () => {
     const issues = [iss("BOSS", "In Progress")];
     const related = [rel(iss("CH", "To Do", { labels: [EXEMPT_LABEL] }), ["BOSS"])];
     expect(parkedCandidates(issues, related)).toEqual([]);
@@ -129,6 +129,10 @@ describe("createParkedDetector: escalation path (through addComment, per the tic
     expect(jira.posted[0]!.text).toContain("fingerprint: CH");
     expect(jira.posted[0]!.text).toContain("stage: 1");
     expect(jira.posted[0]!.text).toContain(EXEMPT_LABEL); // the exemption is documented in the comment itself
+    // Observational, not accusatory (review addendum item 6): reports the
+    // measured elapsed time rather than asserting the boss made a mistake.
+    expect(jira.posted[0]!.text).toContain("10 minutes");
+    expect(jira.posted[0]!.text.toLowerCase()).not.toContain("mistake");
   });
 
   test("it does NOT escalate again on the next poll (dedupe): re-running check() at the same or later time posts nothing further for stage 1", async () => {
@@ -191,6 +195,7 @@ describe("createParkedDetector: escalation path (through addComment, per the tic
     expect(jira.posted.length).toBe(2);
     expect(jira.posted[1]!.target).toBe("BOSS");
     expect(jira.posted[1]!.text).toContain("stage: 2");
+    expect(jira.posted[1]!.text).toContain("20 minutes"); // elapsed since firstObservedAt (0), not just since stage 1
 
     now = 21 * MIN; await det.check(issues, related); // holds still — stage 2 fires only once
     now = 25 * MIN; await det.check(issues, related);
@@ -319,7 +324,7 @@ describe("createParkedDetector: escalation path (through addComment, per the tic
     expect(jira.posted).toEqual([]);
   });
 
-  test("exclusion: butchr:parked-ok never posts, even well past the threshold", async () => {
+  test("exclusion: butchr:shelved never posts, even well past the threshold", async () => {
     let now = 100 * MIN;
     const jira = fakeJira();
     const det = createParkedDetector({ now: () => now, minutes: 10, addComment: jira.addComment, comments: jira.comments, links: jira.links });
