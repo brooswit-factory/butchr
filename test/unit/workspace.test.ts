@@ -31,11 +31,54 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Epic")).toContain("[review] APPROVED");
     expect(briefFor("Story")).toContain("[review] APPROVED");
   });
+  // This guard was written to pin an INSTRUCTION: an epic/story must
+  // transition its child to In Progress, because an assigned-but-To-Do
+  // child is never staffed. BUTCHR-13's review of PR #120 (BUTCHR-43) found
+  // that in epic.md "never staffed" now sits inside a HISTORICAL sentence
+  // explaining a hole new_worker's required disposition already closed, not
+  // an activation instruction — the substring still matches, but what makes
+  // it match moved out from under the guard. That's variant #7 of this
+  // epic's guard-failure family (a check whose SUBJECT moved while the
+  // assertion kept matching) — distinct from too-narrow, too-wide,
+  // wrong-moment, adjacent-field, delta-not-requirement and write-not-effect,
+  // the other six this epic has produced. Kept below, not deleted: in
+  // story.md this text is still an operative warning, not history, and the
+  // guard is weaker, not worthless. The guard that actually pins the
+  // structural property that replaced the instruction is the one right
+  // after it.
   test("epic and story briefs carry the staffing-activation instruction", () => {
     expect(briefFor("Epic")).toContain("In Progress");
     expect(briefFor("Epic")).toContain("never staffed");
     expect(briefFor("Story")).toContain("In Progress");
     expect(briefFor("Story")).toContain("never staffed");
+  });
+  // BUTCHR-43: the property that actually replaced the instruction above is
+  // structural, not procedural — new_worker takes a REQUIRED disposition
+  // ("start" or "shelve"+reason) with no default and no third option, so a
+  // filed worker can't be left undeclared. Per-tier on purpose (Epic files
+  // Stories, Story files Tasks — each teaches new_worker at its own call
+  // site, so a rewrite that drops the requirement from only one brief must
+  // fail exactly that tier's expect, not get covered by the other's).
+  //
+  // Scope of what this guards: this can only assert that the BRIEF SAYS the
+  // disposition is required with no default — it says nothing about whether
+  // relationship.ts actually enforces that. If the requirement were removed
+  // from the code tomorrow, this guard would still pass, brief text intact.
+  // The behaviour itself is guarded separately, code-side, by
+  // test/unit/relationship.test.ts and test/unit/tools.test.ts, which assert
+  // the refusals directly (a missing disposition, a reasonless shelve) —
+  // verify those still exist rather than trusting this comment. Two guards,
+  // two different properties (prose vs. behaviour); this one only covers the
+  // first, and the pairing is what covers both.
+  test("epic and story briefs teach new_worker's disposition as required, with no default and no third option", () => {
+    const epic = briefFor("Epic");
+    expect(epic).toContain("required disposition");
+    expect(epic).toContain("no third option and no default");
+
+    const story = briefFor("Story");
+    expect(story).toContain("required disposition");
+    expect(story).toContain("no third option");
+    expect(story).toContain("never left undeclared");
   });
   test("author briefs carry the two-signal reviewDecision+headRefOid check", () => {
     expect(briefFor("Story")).toContain("reviewDecision,headRefOid");
