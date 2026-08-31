@@ -1,0 +1,9 @@
+bump: minor
+
+### Added
+- **`/health` now reports real poll-loop liveness instead of a hardcoded `{ ok: true }` (BUTCHR-18/BUTCHR-6).** The endpoint previously could never go false — both laptop daemons logged nothing for ~15 hours (most likely the host suspending overnight, not a crash) and `/health` stayed green throughout. `/health` now returns `{ ok, components: [{ name, ok, state, lastSuccessAt, staleForMs }] }`, where `state` is `"starting"` (no successful poll yet, within the grace period), `"ok"` (a poll completed within the threshold), or `"stale"` (it hasn't). Liveness comes from a POSITIVE heartbeat — `startLoop`'s new `onPollSuccess` fires once a full cycle (search + reconcile + related + label sync) completes — never from the `onError` seam, which does not fire on a silent death (a synchronous throw inside `observe()` in `@brooswit/sundry`'s `watch()`, or an unawaited async `onChange` rejection). `/health` returns HTTP 503 when `ok` is false so a `curl -f` or any uptime checker goes red too, and recovers to 200 on the very next successful poll — no latching.
+- New `BUTCHR_POLL_STALE_MS` env knob (default 60000 — a 4x multiple of the loop's 15s poll interval, chosen so one slow Jira call can't flap it red), added to `Config`/`ConfigEnv`, documented in `.env.example`, and printed in the daemon's startup line via `describeConfig`.
+- The daemon logs the transition, not every tick: a `  [health] pollLoop STALE — no successful poll in Ns (threshold Ms)` line when it crosses into stale, and a `  [health] pollLoop recovered — last success <ISO>` line when it recovers — see `src/daemon/health.ts`.
+
+### Fixed
+- A daemon whose poll loop throws during construction and never completes a single cycle now reports unhealthy from startup (the `"starting"` grace period, not a silent `ok: true`) rather than reading healthy forever.
