@@ -1,4 +1,4 @@
-import { modelFor, type SpawnSpec } from "./workspace.js";
+import { effortFor, modelFor, type SpawnSpec } from "./workspace.js";
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
@@ -16,6 +16,7 @@ export function spawnArgs(spec: SpawnSpec, dir: string): string[] {
   return [
     KICKOFF_PROMPT,
     "--model", modelFor(spec.issuetype),
+    "--effort", effortFor(spec.issuetype),
     "--permission-mode", "bypassPermissions",
     "--mcp-config", dir + "/mcp.json",
     "--dangerously-load-development-channels", "server:butchr",
@@ -25,9 +26,9 @@ export function spawnArgs(spec: SpawnSpec, dir: string): string[] {
 export type ArgvCheck = { ok: true } | { ok: false; reason: string };
 
 /**
- * Flags that must survive a herdr restore verbatim. `--model` and the
- * kickoff positional are startup-only and deliberately excluded: a
- * `modelFor()` change on deploy must not churn the whole fleet.
+ * Flags that must survive a herdr restore verbatim. `--model`, `--effort`,
+ * and the kickoff positional are startup-only and deliberately excluded: a
+ * `modelFor()`/`effortFor()` change on deploy must not churn the whole fleet.
  */
 const REQUIRED_FLAGS = ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels"] as const;
 
