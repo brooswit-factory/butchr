@@ -1,5 +1,5 @@
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, ensureDoc, type DocResult } from "./docs.js";
+import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. */
@@ -409,4 +409,343 @@ export async function askBoss(ops: AtlassianOps, callerKey: string, text: string
 /** The caller's OWN ticket -> In Review. No arguments at all — the one transition an agent is always entitled to make about itself. */
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   return ops.transition(callerKey, "In Review");
+}
+
+// ---------------------------------------------------------------------------
+// Self-close: finish_without_a_boss
+// ---------------------------------------------------------------------------
+
+/**
+ * The caller's OWN ticket -> Done, but ONLY when the caller HAS NO BOSS.
+ * Every other route to Done goes through a review hop: `submit_to_boss`
+ * only ever targets In Review, and `finish_worker` only fires from a boss
+ * closing one of its OWN workers. Neither reaches a ticket with no boss at
+ * all (today, in practice, an Epic) — that ticket has nobody to submit to
+ * and nobody who will ever call `finish_worker` on it. This verb is the
+ * dedicated route for exactly that one case, and no other.
+ *
+ * NO ARGUMENTS: like `submit_to_boss`, the only ticket this can ever act on
+ * is the caller's own (`x-issue`), so there is nothing to get wrong.
+ *
+ * THE REFUSAL IS THE FEATURE, NOT A GUARD. A worker never finishes itself —
+ * that is the entire point of the boss/worker asymmetry (`finish_worker`'s
+ * own doc comment), and this verb exists to hold that line for the one
+ * caller shape that could otherwise slip past it: a ticket with a boss has
+ * no business reaching for a "no boss" verb, so refusing it here converts
+ * "a worker never finishes itself" from a sentence in a brief into a call
+ * that fails, the same move `prioritize_worker` makes refusing the caller's
+ * own key. Every Done in this system, apart from this one deliberate
+ * exception, requires a SECOND IDENTITY to have looked at the work before
+ * it closes; a caller with a boss already has that second identity waiting
+ * (`submit_to_boss`, then its boss's `finish_worker`), so it is refused here
+ * and pointed at the path that actually gets its work reviewed.
+ *
+ * DESIGNED TO BECOME OBSOLETE, NOT ABANDONED. This system's design decisions
+ * record a planned tier ABOVE epics (a "project" level) that does not exist
+ * yet. If it did, an epic would have a boss like everything else, would call
+ * `submit_to_boss` and let that boss call `finish_worker` on it, and this
+ * verb would simply have no caller left — a ticket with a boss can never use
+ * it, so the day every top-level ticket has one, this narrows to nothing ON
+ * ITS OWN, with no removal needed. A future reader who finds this verb with
+ * zero callers should read that as the tier having arrived, not as dead code
+ * nobody cleaned up.
+ *
+ * OPEN QUESTION THIS DOES NOT SETTLE, AND IS NOT THIS VERB'S TO SETTLE:
+ * whether a top-level ticket SHOULD be able to close itself at all, with no
+ * second identity ever looking, is a real question — every other Done here
+ * requires a review hop, and a bossless ticket's self-close has none. This
+ * verb only formalizes what `jira_transition` already lets happen today; it
+ * takes no position on whether that's the right end state, and that
+ * question belongs to whoever decides if and when the project tier above
+ * epics gets built — a human call, not an agent's to make by building or
+ * not building this.
+ */
+export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
+  const issue = await ops.getIssue(callerKey);
+  const boss = findBossKey(issue);
+  if (boss) {
+    throw new Error(
+      `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
+    );
+  }
+  return ops.transition(callerKey, "Done");
+}
+
+// ---------------------------------------------------------------------------
+// The deliberate-orphan escape: file_where_it_belongs
+// ---------------------------------------------------------------------------
+
+/** `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL filter. Never combined with `EXEMPT_LABEL`: see fileWhereItBelongs's doc comment for why an orphan can never trip the parked-ticket detector. */
+export const ORPHAN_LABEL = "butchr:orphan";
+
+/** A destination is either a named existing Epic, or prose explaining why a new one is needed. Neither is a fallback for the other. */
+export type OrphanDestination = { kind: "epic"; key: string } | { kind: "reason"; text: string };
+
+/**
+ * Known placeholders an agent reaches for when it hasn't actually thought
+ * about where work belongs. Normalized (trimmed, lowercased, trailing
+ * `.`/`!` stripped) before comparison, so "N/A.", "Unknown", " tbd " all
+ * still hit.
+ */
+const PLACEHOLDER_DESTINATIONS = new Set([
+  "n/a", "na", "tbd", "unknown", "none", "?", "??", "-", "--", "idk", "dunno", "todo", "later", "null", "undefined", "n/a for now",
+]);
+
+/**
+ * A prose reason shorter than this (non-whitespace characters) is refused as
+ * too thin to be a real reason. Tuned deliberately low: every placeholder in
+ * PLACEHOLDER_DESTINATIONS is already caught by that set, so this only needs
+ * to catch the un-listed near-placeholders ("misc", "later maybe") without
+ * punishing a genuinely terse real reason like "no epic covers billing yet"
+ * (which clears it easily). A false refusal here is worse than letting a
+ * marginal one through — it's what teaches an agent the verb is an obstacle.
+ */
+const MIN_REASON_CHARS = 8;
+
+function normalizeDestinationText(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[.!]+$/, "");
+}
+
+/**
+ * Every refusal from this verb ends on the same teaching tail: what a good
+ * destination looks like, both accepted shapes, and WHY it's asked at all.
+ * `reason` is the specific complaint, stated plainly and without scolding.
+ */
+function destinationRefusal(reason: string): Error {
+  return new Error(
+    `file_where_it_belongs: ${reason} A destination is either an EXISTING EPIC KEY this work belongs under (e.g. "BUTCHR-25"), or a short REASON it needs a brand-new epic (e.g. "no epic covers observability tooling yet") — both are legitimate, neither is a fallback for the other. ` +
+      "This is required, not bureaucracy: filing a ticket outside your own scope is only half the job — saying where it should live is the other half. An orphan with no stated destination is exactly the silent failure this verb exists to prevent.",
+  );
+}
+
+/**
+ * Classifies (and refuses) `raw` — pure, no Jira reads. A Jira-key-shaped
+ * destination is returned as `{ kind: "epic" }` UNVALIDATED: whether it
+ * actually exists and is actually an Epic is a read, done by the caller
+ * (fileWhereItBelongs), not here.
+ */
+export function classifyDestination(raw: string): OrphanDestination {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw destinationRefusal("no destination was given (empty, or only whitespace).");
+  }
+  if (JIRA_KEY_RE.test(trimmed)) {
+    return { kind: "epic", key: trimmed };
+  }
+  const normalized = normalizeDestinationText(trimmed);
+  if (PLACEHOLDER_DESTINATIONS.has(normalized)) {
+    throw destinationRefusal(`"${trimmed}" is a placeholder, not a destination.`);
+  }
+  if (trimmed.replace(/\s+/g, "").length < MIN_REASON_CHARS) {
+    throw destinationRefusal(`"${trimmed}" is too thin to be a real reason a new epic is needed.`);
+  }
+  return { kind: "reason", text: trimmed };
+}
+
+/** The header block baked into the created ticket's OWN description — see fileWhereItBelongs's doc comment for why this, not a comment, is where the destination is recorded. */
+function orphanHeader(destination: OrphanDestination, filerKey: string): string {
+  const where = destination.kind === "epic" ? `Epic ${destination.key}` : `a NEW epic (none exists yet) — reason given: "${destination.text}"`;
+  return [
+    "[ORPHAN] This ticket has no boss. It was filed here on purpose, outside its filer's own scope.",
+    `Filed by: ${filerKey}`,
+    `Destination: ${where}`,
+    "It is not linked to anything yet — a boss makes it theirs by calling adopt_worker. Until then, nobody owns it.",
+  ].join("\n");
+}
+
+/** The pushed notice's body — worded so a human reading it cold (case A on the epic, case B on the topmost ticket) knows what was filed, by whom, where it's meant to go, and that it isn't anyone's yet. */
+function orphanNotice(filerKey: string, key: string, summary: string, destination: OrphanDestination, noticeTarget: string): string {
+  const belongs =
+    destination.kind === "epic"
+      ? `${filerKey} thinks it belongs under this epic (${destination.key}) — it is NOT linked to you; filing this notice does not make it yours. Adopt it with adopt_worker if you want it.`
+      : `${filerKey} says it needs a NEW epic — reason given: "${destination.text}". There is no epic yet to comment on, so this is posted here, on the topmost ticket in ${filerKey}'s own Implements chain (${noticeTarget}), for a human to see and decide.`;
+  return [`Filed ${key} ("${summary}"), outside ${filerKey}'s own scope.`, belongs, `${key} has no boss and is linked to nothing — nobody owns it until someone adopts it.`].join("\n");
+}
+
+/** Depth cap for walking a caller's OWN Implements chain in case B — same reasoning as ensureDoc's MAX_BOSS_DEPTH: a real boss chain is a handful of hops, and only a genuine Implements cycle would recurse forever without one. */
+const MAX_ORPHAN_CHAIN_DEPTH = 20;
+
+/** Walks UP `startKey`'s own Implements chain (never the new orphan's — it has none) to the topmost ticket, reusing `startIssue` (already fetched by the caller) to avoid re-reading `startKey` itself. */
+async function topmostBoss(ops: AtlassianOps, startKey: string, startIssue: unknown): Promise<string> {
+  let key = startKey;
+  let issue = startIssue;
+  for (let i = 0; i < MAX_ORPHAN_CHAIN_DEPTH; i++) {
+    const boss = findBossKey(issue);
+    if (!boss) return key;
+    key = boss;
+    issue = await ops.getIssue(key);
+  }
+  throw new Error(`file_where_it_belongs: ${startKey}'s own Implements chain is more than ${MAX_ORPHAN_CHAIN_DEPTH} hops deep — refusing rather than risking a cycle looping forever`);
+}
+
+export interface FileWhereItBelongsInput {
+  summary: string;
+  description?: string;
+  issuetype: "Story" | "Task";
+  priority?: string;
+  destination: string;
+}
+export interface FileWhereItBelongsResult {
+  key: string;
+  destination: OrphanDestination;
+  noticeTarget: string;
+  doc: DocResult;
+}
+
+/**
+ * The successor to `jira_create_issue`'s `implements: "none"` deliberate-
+ * orphan escape (still an unchanged alias this release — see defs.ts). Files
+ * a ticket that is explicitly NOT the caller's: no Implements link is ever
+ * made, to the destination or to anything else. Was named
+ * `file_for_another_boss` during design; renamed before shipping because
+ * that name asserts there IS another boss, which is false in the "needs a
+ * new epic" case — see the glossary entry for the full reasoning.
+ *
+ * NO DISPOSITION PARAMETER, unlike new_worker/adopt_worker — argued, not
+ * omitted: a disposition answers "what happens to MY worker", and nobody can
+ * answer that for a ticket that is by definition not the caller's. It is
+ * filed To Do, staffed by role exactly as jira_create_issue staffs it today,
+ * and stays there until some future boss calls adopt_worker on it.
+ *
+ * NEVER LABELLED `EXEMPT_LABEL` (butchr:shelved): `parkedCandidates`
+ * (src/agents/parked.ts) only ever walks tickets reachable by an Implements
+ * link off the active set, and this ticket has none — the parked detector
+ * structurally cannot see it, so that label here would be cargo-culted state
+ * meaning nothing. Labelled `ORPHAN_LABEL` instead, which is what actually
+ * makes it discoverable (a saved JQL filter).
+ *
+ * WRITE ORDER, AND WHY: unlike new_worker, there is no "worst survivable
+ * state" to protect against here, because this ticket never gets a boss link
+ * at all — the one thing that makes a half-finished new_worker call
+ * dangerous (a linked-but-undeclared child a live boss waits on forever)
+ * cannot happen to an orphan by construction. So the ordering question here
+ * is narrower: which is worse, a real ticket whose destination is on it but
+ * whose human notice never fired, or a notice that points at a ticket that
+ * doesn't exist? The second is actively misleading — a dangling reference a
+ * human can't even open — while the first is merely quiet: the ticket is
+ * still fully self-documenting (destination in its own description,
+ * ORPHAN_LABEL for the saved-filter route) and findable with zero
+ * cooperation from anything downstream. So:
+ *   1. CREATE — summary, issuetype, assignee (by role), priority, and a
+ *      description with the destination header ALREADY BAKED IN, plus
+ *      ORPHAN_LABEL — all in the one call. Irreversible, and there is no
+ *      window, ever, where this ticket exists without its destination
+ *      recorded on it: both land in the same write.
+ *   2. NOTICE — best-effort comment: case A on the named epic, case B on the
+ *      topmost ticket in the CALLER's own Implements chain (walked fresh,
+ *      never the orphan's own — it has none). Creates NO link either way;
+ *      case B in particular must never re-parent the ticket onto whatever it
+ *      lands on, or this verb becomes the exact suppression-by-quiet-
+ *      adoption it exists to prevent.
+ *   3. DOC — ensureDoc, last, same reasoning as new_worker: convergent
+ *      (BUTCHR-33), so a failure here is reported but not rolled back, and
+ *      is completed by this ticket's own first set_doc call whenever its
+ *      eventual owner makes one. `ensureDoc` already bottoms a bossless
+ *      ticket out under the project root doc, so this needs no new logic —
+ *      the orphan surfaces in the doc tree at the top level, next to the
+ *      epics.
+ *
+ * WHAT A THROW AFTER STEP 1 MEANS, HONESTLY: the ticket, its destination and
+ * ORPHAN_LABEL all survive untouched — there is nothing to roll back, and
+ * nothing here ever attempts to. The error names exactly which of the notice
+ * and the doc failed (either, or both) and what a caller can do about each:
+ * re-post the notice by hand with jira_add_comment, or wait for the ticket's
+ * own first set_doc call.
+ *
+ * A KNOWN NARROWING IN CASE B, RECORDED RATHER THAN FIXED (found in review of
+ * BUTCHR-37, after that branch had already merged — a defect in the original
+ * spec, not in that implementation): case B's guarantee is "a person sees
+ * it" only when the CALLER's own Implements chain is intact and bottoms out
+ * at an Epic, which is human-watched. `topmostBoss` walks that chain and
+ * returns whatever key has no boss above it — if the CALLER ITSELF is a
+ * bossless Story (an orphan filing an orphan), that key is the caller's own,
+ * and the notice lands on an agent-owned ticket nobody human is watching.
+ * The guarantee silently degrades from "a person sees it" to "an agent sees
+ * it". This is rare — it needs an orphan to be doing the filing — and it is
+ * inherent to how the walk is specified (find the topmost ticket in MY OWN
+ * chain), not a bug in the walk itself. NOT fixed here: no fallback, no
+ * config key, no human/root-key lookup added for it — matching this file's
+ * own standard elsewhere (see `newWorker`'s three throws and its measured
+ * `DELETE_ISSUES` refusal) of stating a known limitation rather than
+ * silently accepting it or quietly patching around it.
+ *
+ * CASE B'S MISSING LINK IS DELIBERATE, AND IT WILL NOT FEEL DELIBERATE TO
+ * WHOEVER READS IT NEXT — that is exactly why this is spelled out rather than
+ * left to the "creates NO link" line above to carry alone. A notice arrives
+ * on someone's ticket announcing unowned work; the natural, helpful,
+ * courteous reflex on reading it is to link the orphan so it has a home. THAT
+ * REFLEX IS THE FAILURE this verb exists to prevent — the same
+ * suppression-by-quiet-adoption named above, just arriving as a well-meaning
+ * "fix" instead of a bug. Nothing about the missing link is an oversight: do
+ * not add it, ever, from inside this function. The fact that adding it feels
+ * like a kindness is precisely the reason the warning has to be this
+ * explicit — a reader who understands WHY they want to change this is far
+ * less likely to than one who is only told not to.
+ */
+export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, callerKey: string, input: FileWhereItBelongsInput): Promise<FileWhereItBelongsResult> {
+  const destination = classifyDestination(input.destination);
+
+  if (destination.kind === "epic") {
+    let epicIssue: unknown;
+    try {
+      epicIssue = await ops.getIssue(destination.key);
+    } catch (e) {
+      throw destinationRefusal(`"${destination.key}" looks like a Jira key but could not be read (${(e as Error).message}) — a typo'd destination that silently "succeeds" produces an orphan whose stated home does not exist.`);
+    }
+    const epicType = issuetypeOf(epicIssue);
+    if (epicType !== "Epic") {
+      throw destinationRefusal(`"${destination.key}" exists but is a ${epicType ?? "unknown type"}, not an Epic.`);
+    }
+  }
+
+  const role = input.issuetype === "Story" ? roles.story : roles.task;
+  if (!role) throw new Error(noRoleMsg("file_where_it_belongs", input.issuetype));
+
+  const callerIssue = await ops.getIssue(callerKey);
+  const projectKey = projectKeyOf(callerIssue);
+  if (!projectKey) throw new Error(`file_where_it_belongs: could not read ${callerKey}'s own project key — refusing rather than guessing`);
+
+  const header = orphanHeader(destination, callerKey);
+  const description = input.description ? `${header}\n\n---\n\n${input.description}` : header;
+
+  // (1) create — irreversible; destination + ORPHAN_LABEL land in this same call.
+  const created = (await ops.createIssue({
+    projectKey,
+    issuetype: input.issuetype,
+    summary: input.summary,
+    description,
+    assignee: role,
+    ...(input.priority ? { priority: input.priority } : {}),
+    labels: [ORPHAN_LABEL],
+  })) as { key?: string };
+  const key = created.key;
+  if (!key) throw new Error("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
+
+  // (2) notice — best-effort, never a link.
+  const noticeTarget = destination.kind === "epic" ? destination.key : await topmostBoss(ops, callerKey, callerIssue);
+  const noticeText = tagComment(callerKey, orphanNotice(callerKey, key, input.summary, destination, noticeTarget));
+  let noticeError: string | undefined;
+  try {
+    await ops.addComment(noticeTarget, noticeText);
+  } catch (e) {
+    noticeError = (e as Error).message;
+  }
+
+  // (3) doc — last, on purpose (see the function comment).
+  let doc: DocResult | undefined;
+  let docError: string | undefined;
+  try {
+    doc = await ensureDoc(ops, key);
+  } catch (e) {
+    docError = (e as Error).message;
+  }
+
+  if (noticeError || docError) {
+    const parts: string[] = [`file_where_it_belongs: ticket ${key} was created with its destination recorded and ${ORPHAN_LABEL} applied — nothing there needs cleanup.`];
+    if (noticeError) parts.push(`The notice comment on ${noticeTarget} failed (${noticeError}); post it by hand with jira_add_comment(${noticeTarget}, ...) if it still matters.`);
+    if (docError) parts.push(`Its Confluence doc failed to create (${docError}); it will be completed by ${key}'s own first set_doc call, whenever the agent working it makes one.`);
+    throw new Error(parts.join(" "));
+  }
+
+  return { key, destination, noticeTarget, doc: doc! };
 }
