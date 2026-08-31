@@ -41,6 +41,48 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Story")).toContain("reviewDecision,headRefOid");
     expect(briefFor("Task")).toContain("reviewDecision,headRefOid");
   });
+  // BUTCHR-38: the relationship-verb rewrite. Guards below protect the
+  // load-bearing new instructions so the next rewrite can't silently drop
+  // them, the same way the guards above protect the ones before them.
+  test("every brief teaches set_doc's replace-not-append semantic", () => {
+    for (const t of ["Epic", "Story", "Task", "Bug"]) {
+      expect(briefFor(t)).toContain("FULL-BODY REPLACE");
+      expect(briefFor(t)).toContain("not an append");
+    }
+  });
+  test("reviewing tiers' checklists reject on doc staleness", () => {
+    expect(briefFor("Epic")).toContain("doc actually reflects");
+    expect(briefFor("Story")).toContain("doc actually reflects");
+  });
+  test("the captain's-log convention is fully gone — no title format, no convention link, in any brief", () => {
+    for (const t of ["Epic", "Story", "Task", "Bug"]) {
+      const brief = briefFor(t);
+      expect(brief).not.toContain("Log — ");
+      expect(brief.toLowerCase()).not.toContain("captain's log");
+      expect(brief).not.toContain("10715137");
+    }
+  });
+  test("epic and story briefs teach the boss-side relationship verbs", () => {
+    for (const t of ["Epic", "Story"]) {
+      const brief = briefFor(t);
+      for (const verb of ["new_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker"]) {
+        expect(brief).toContain(verb);
+      }
+    }
+  });
+  test("story and task briefs teach the worker-side relationship verbs", () => {
+    for (const t of ["Story", "Task"]) {
+      const brief = briefFor(t);
+      for (const verb of ["report_to_boss", "ask_boss", "submit_to_boss"]) {
+        expect(brief).toContain(verb);
+      }
+    }
+  });
+  test("every brief points at the ASSIST space", () => {
+    for (const t of ["Epic", "Story", "Task", "Bug"]) {
+      expect(briefFor(t)).toContain("wiki/spaces/ASSIST");
+    }
+  });
 });
 describe("interpolate", () => {
   test("fills key, summary, type, parent; parent-less says so", () => {
