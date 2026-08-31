@@ -45,9 +45,39 @@ function provisionalTitle(key: string, summary: string): string {
  * this line, or this whole paragraph, must break nothing; that asymmetry is
  * the entire difference between this design and the prose convention the
  * design page records rejecting for the project-to-space link.
+ *
+ * IT ALSO CARRIES THE ONLY POINTER TO ASSIST, AND THAT IS DELIBERATE. The
+ * assistant documents the estate in a Confluence space (ASSIST) that nothing
+ * routed an agent to, and the operator's reason for adding this is the same
+ * one this whole epic rests on: knowledge that exists but is never read is
+ * not knowledge, and a library nobody is sent to is a diary. This paragraph
+ * is the ONLY text the tool itself ever authors, and it is read exactly once,
+ * by an agent that has just been born and knows nothing — which makes it the
+ * one place a pointer is certain to land.
+ *
+ * Link the SPACE plus a couple of durable entry points, never a list of
+ * pages: an enumeration here goes stale silently and this file is the last
+ * place anyone would look to fix it. The space's own index is the list. The
+ * two pages linked below were each read before being cited (the cold-start
+ * page, the obvious-looking choice, is written for the ASSISTANT operating
+ * the fleet, not for a worker agent on a ticket — pointing a newborn worker
+ * at it would have been plausible and wrong).
+ *
+ * This text is TRANSIENT BY DESIGN: the first `set_doc` replaces the whole
+ * body, pointer included. That is correct and not a leak to engineer around —
+ * by then the agent has read it, and the doc's job has changed from
+ * orienting its author to recording what happened.
  */
-function provisionalBody(key: string, ticketUrl: string): string {
-  return `<p>This doc was created together with <a href="${ticketUrl}">${key}</a>. It has not been written yet and is not a record of anything.</p>`;
+function provisionalBody(key: string, ticketUrl: string, site: string): string {
+  const assist = `${site}/wiki/spaces/ASSIST`;
+  return (
+    `<p>This doc was created together with <a href="${ticketUrl}">${key}</a>. It has not been written yet and is not a record of anything.</p>` +
+    `<p><strong>New here?</strong> The assistant documents this estate — how work is created, routed and reviewed, how the fleet is run, and where it has failed before — in ` +
+    `<a href="${assist}/overview">the ASSIST space</a>. Two places to start: ` +
+    `<a href="${assist}/pages/12714016">The factory, end to end: how a ticket becomes shipped code</a>, and ` +
+    `<a href="${assist}/pages/12386388">Working agreements between the assistant and the agents</a>. ` +
+    `Every page there carries the date it was last verified, and the space's own rule is that when a page disagrees with a measurement you just took, the measurement wins.</p>`
+  );
 }
 
 function findBossKey(issue: unknown): string | null {
@@ -233,7 +263,7 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
   if (!pageId) {
     // (4) create, with the label, in the same call.
     try {
-      const created = await ops.createPageWithLabel({ spaceKey, parentId, title, body: provisionalBody(key, ticketUrl), label });
+      const created = await ops.createPageWithLabel({ spaceKey, parentId, title, body: provisionalBody(key, ticketUrl, ticketSite ?? ""), label });
       pageId = created.id;
     } catch (e) {
       // RACE GUARD (defense in depth — see the function doc comment above):
