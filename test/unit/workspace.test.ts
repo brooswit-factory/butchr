@@ -86,10 +86,11 @@ describe("briefFor / modelFor", () => {
   // while `reviewDecision` stays APPROVED (this repo doesn't dismiss stale
   // reviews). Both required signals survived exactly the event they existed
   // to catch, proven live against PR #120's own review history. The guard is
-  // now pinned to `reviews[].commit.oid`, the field that actually records
-  // what the reviewer saw, plus a negative assertion that the old command
-  // string is gone — the same cheap defense against a partial revert as the
-  // other negative guards here.
+  // now pinned to `reviews[].commit.oid`, the field this check anchors on
+  // instead of `headRefOid` (NOT immutable itself — see BUTCHR-74, which
+  // caveats this in every merge-instructing channel), plus a negative
+  // assertion that the old command string is gone — the same cheap defense
+  // against a partial revert as the other negative guards here.
   //
   // Scope of what this guards: this can only assert that the BRIEF SAYS to
   // use the last-decisive-review check — it says nothing about whether `gh`

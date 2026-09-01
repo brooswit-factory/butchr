@@ -141,6 +141,32 @@ const LAST_DECISIVE_REVIEW = /last\s+decisive\s+review/i;
 const MERGE_INSTRUCTING_BRIEFS = ["brief:Story:brief.md", "brief:Task:brief.md"];
 const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 
+// BUTCHR-74: `reviews[].commit.oid` is not the immutable fallback the text
+// used to claim it was — GitHub re-points it to the merge commit whenever
+// the branch takes a base-merge (confirmed live on PR #135: the review body
+// quotes the approved sha, but both GraphQL and REST report the merge
+// commit instead), so the check cannot detect a head move caused by a
+// base-merge. Every merge-instructing channel must say so and must not
+// describe the check as sufficient.
+//
+// Anchored on the single token "base-merge", not a full sentence, on
+// purpose: a phrase-length match reddens on ordinary rewording (the exact
+// words a maintainer improving this prose would naturally change) and
+// invites weakening the assertion out of spite, the same failure mode the
+// explicit-list design above already avoids for the positive channel list.
+// "base-merge" is the one term that names the actual hazard, doesn't occur
+// anywhere in these channels for any other reason (checked at the time this
+// was written), and can't be reworded away without also losing the fact
+// being asserted — so it survives a rewrite but not a deletion.
+//
+// FORWARDING ADDRESS: this caveat is true only because the check has this
+// hole. BUTCHR-52 is filing the remedy for the base-merge hole itself. If
+// BUTCHR-52 (or any later ticket) closes that hole, this caveat becomes
+// FALSE, this assertion SHOULD go red, and that red is correct — it is
+// telling you the pinned text must be updated or removed, not that the test
+// is broken. Do not delete this assertion to get green; fix the text.
+const BASE_MERGE_CAVEAT = /base-merge/i;
+
 describe("merge-check instruction channels (BUTCHR-56)", () => {
   test("non-vacuity: every channel group actually resolves to content, and it's the content we expect", () => {
     const briefs = briefChannels();
@@ -177,7 +203,7 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
   // mutation: stripping `reviews[].commit.oid` from the rendered nudge (not
   // its source comment) turns this assertion red — see the PR description's
   // "direction 2" mutation.
-  test("every channel explicitly named as merge-instructing names reviews[].commit.oid and the last-decisive ordering", () => {
+  test("every channel explicitly named as merge-instructing names reviews[].commit.oid, the last-decisive ordering, and the base-merge caveat (BUTCHR-74)", () => {
     const briefs = briefChannels().filter((c) => MERGE_INSTRUCTING_BRIEFS.includes(c.label));
     expect(briefs.length).toBe(MERGE_INSTRUCTING_BRIEFS.length); // the explicit list actually matched something
 
@@ -189,6 +215,9 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
     for (const c of [...briefs, ...docs, ...nudges]) {
       expect(c.text, `${c.label} should name reviews[].commit.oid`).toContain("reviews[].commit.oid");
       expect(c.text, `${c.label} should name the last-decisive ordering`).toMatch(LAST_DECISIVE_REVIEW);
+      // See BASE_MERGE_CAVEAT above for the forwarding address to BUTCHR-52:
+      // this assertion is EXPECTED to go red once that hole is closed.
+      expect(c.text, `${c.label} should carry the base-merge caveat (BUTCHR-74)`).toMatch(BASE_MERGE_CAVEAT);
     }
   });
 });

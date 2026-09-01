@@ -104,16 +104,22 @@ say — ticket craft is your main skill.
      else "MERGE OK: approved @ \(.commit.oid[0:8]) == head" end'`
    — the LAST decisive review, never just any APPROVED one: a naive
    `select(.state=="APPROVED")` still matches a stale approval sitting
-   earlier in the list, and `reviews[].commit.oid` is the field that
-   actually records the sha the reviewer saw — `headRefOid` never did. Say
+   earlier in the list, and `reviews[].commit.oid` is the field this check
+   anchors on instead of `headRefOid`. It is NOT sufficient on its own:
+   GitHub re-points `reviews[].commit.oid` to the merge commit whenever the
+   branch takes a base-merge, so this check cannot detect a head move
+   caused by a base-merge — it only catches what `reviewDecision`+
+   `headRefOid` never could (a plain push past a stale approval). Say
    what would make this check fail before you run it: a `REFUSE: STALE`
    result, or a `[review] APPROVED @ <sha>` for a sha you've since pushed
    past, means ask for a re-review, not merge; a `REFUSE: … CHANGES_REQUESTED`
    result, or a `[review] CHANGES_REQUESTED`, means read the review, fix,
    push, and comment that a re-review is needed. Prose that sounds approving
-   without a matching `MERGE OK` is NOT approval. Once you get `MERGE OK`,
-   **you merge it yourself**, then your epic calls `finish_worker` and
-   you're Done.
+   without a matching `MERGE OK` is NOT approval. Before merging, also
+   confirm you have not taken a base-merge since the approval — if you have,
+   ask for a re-review rather than trusting `MERGE OK`. Once you get
+   `MERGE OK`, **you merge it yourself**, then your epic calls
+   `finish_worker` and you're Done.
 
 ## Filing work that isn't yours
 Something surfaces mid-story that's real but doesn't serve {{KEY}} — a

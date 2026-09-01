@@ -42,7 +42,12 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   that actually wakes them), and the author verifies the last decisive
   review's own `reviews[].commit.oid` against the current head before
   merging (an approval is recorded against a sha, and the branch may have
-  moved since).
+  moved since). That check is NOT sufficient on its own: GitHub re-points
+  `reviews[].commit.oid` to the merge commit whenever the branch takes a
+  base-merge, so it cannot detect a head move caused by a base-merge —
+  strictly better than the `reviewDecision`+`headRefOid` pair it replaced
+  (which failed on every push), but not proof the base hasn't moved under
+  the reviewed diff.
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the boss agent — reached via the Implements link, not the
