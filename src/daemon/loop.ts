@@ -99,6 +99,23 @@ export interface LoopDeps {
    * it.
    */
   checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
+  /**
+   * BUTCHR-57: called once per poll when the NOTIFY stage (the `onChange`
+   * callback below — changed-key diffing, suppression checks, `deps.notify`
+   * sends) concludes without throwing, including the zero-nudges case where
+   * nothing needed sending. This is the positive heartbeat the notify
+   * component of `/health` is built on — see src/daemon/health.ts and the
+   * `hash` override below for why it fires every poll rather than only when
+   * `@brooswit/sundry`'s `watch()` would naturally invoke `onChange`.
+   * Deliberately NOT derived from `onError`: `watch()` never awaits
+   * `onChange`'s returned promise (confirmed against
+   * `node_modules/@brooswit/sundry/dist/index.js`'s `observe()`, which calls
+   * `onChange(next, prev)` synchronously and never touches the promise it
+   * returns), so a rejecting notify stage would otherwise be an unhandled
+   * rejection invisible to both `onError` and any heartbeat built on it.
+   * Optional; omitted, the notify component simply never records success.
+   */
+  onNotifySuccess?: () => void;
 }
 
 /** How many polls a just-respawned issue is shielded from a further respawn. */
@@ -220,9 +237,234 @@ export function startLoop(deps: LoopDeps): Stop {
   // it survives across polls without leaking between independent startLoop
   // calls (e.g. separate tests).
   const respawnGuard = new RespawnGuard();
+  // BUTCHR-57: a monotonic counter used as `watch()`'s `hash` option below,
+  // forcing `onChange` (the notify stage) to run on EVERY poll rather than
+  // only when the fetched Snapshot's content-hash differs from last time.
+  // Without this, a quiet fleet (nothing changed in Jira for hours) would
+  // never invoke `onChange` at all — the same "silently stops firing on a
+  // quiet poll" trap `checkParked` above is deliberately kept OUT of
+  // `onChange` to avoid, except here the notify stage's own job (diffing
+  // `prev`/`next` and sending nudges) genuinely belongs in `onChange`, so the
+  // fix is to make `onChange` unconditional instead of moving its work out.
+  // `prev`/`next` stay correct either way: `watch()`'s own baseline tracking
+  // (`prevValue`) is untouched by this — only the change-detection hash is
+  // forced to always differ, so `observe()`'s `h !== prevHash` branch is
+  // always taken (confirmed against `@brooswit/sundry`'s compiled
+  // `observe()`) and it still passes the REAL previous/current snapshots.
+  let notifyTick = 0;
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedIssue[], key: string) => list.find((r) => r.issue.key === key)?.issue;
+
+  /** The notify stage: diff `prev` -> `next`, apply suppression, send nudges. See the `onChange` wrapper above for why this can never let its promise reject. */
+  const notifyOnChange = async (next: Snapshot, prev: Snapshot): Promise<void> => {
+    const sent = new Set<string>();
+    const send = async (issue: string, about: string, reason?: NotifyReason) => {
+      const id = `${issue}|${about}`;
+      if (sent.has(id)) return;
+      sent.add(id);
+      await deps.notify(issue, about, reason);
+    };
+
+    // ONE deps.comments(key) call per key, per poll — shared by baseline
+    // seeding below, the DAEMON_WRITER ledger-hit comment-cursor check, and
+    // the cross-daemon label-only echo check (KAN-828 item 4). Fails OPEN:
+    // a rejected call (a transient network error — this is a live Jira
+    // call), or `deps.comments` simply not being wired up, is never treated
+    // as "no new comment" and never advances the cursor, so a failed poll
+    // can never install a wrong baseline.
+    const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null } | { ok: false }>>();
+    const fetchComments = (key: string): Promise<{ ok: true; newest: string | null } | { ok: false }> => {
+      let p = commentsCache.get(key);
+      if (!p) {
+        p = (async () => {
+          if (!deps.comments) return { ok: false as const };
+          try {
+            const comments = await deps.comments(key);
+            return { ok: true as const, newest: comments[0]?.id ?? null };
+          } catch {
+            return { ok: false as const };
+          }
+        })();
+        commentsCache.set(key, p);
+      }
+      return p;
+    };
+
+    // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
+    // no recorded comment-cursor entry yet gets one seeded now, from its
+    // CURRENT newest comment id, so its first-ever ledger hit already has a
+    // baseline to compare against — without this, the "unknown baseline"
+    // fail-safe would turn every key's first daemon-label ledger hit into
+    // a one-time echo nudge, noise this ticket must not add. Fail-open: a
+    // rejected/unavailable call leaves the key unseeded, retried on a
+    // later poll, never installing a baseline it did not observe. A key
+    // that appears mid-run (a newly staffed ticket) is seeded right here,
+    // on the poll it first appears — safe, because `suppressed()` already
+    // delivers unconditionally on appear/disappear (no `before`), and a
+    // ledger hit requires both `before` and `after`, so by the time a key
+    // can ever hit the ledger it was necessarily present — and thus
+    // seeded — on the previous poll. A ledger hit therefore always has a
+    // baseline.
+    const seenKeys = new Set<string>([...next.issues.map((i) => i.key), ...next.related.map((r) => r.issue.key)]);
+    await Promise.all(
+      [...seenKeys].map(async (key) => {
+        if (commentCursor.has(key)) return;
+        const result = await fetchComments(key);
+        if (result.ok) commentCursor.set(key, result.newest);
+      }),
+    );
+
+    // Memoized per key, per poll: the label-only branch makes at most one
+    // comments() call per key, however many watchers consult it. Fails
+    // OPEN: a rejected comments() call (a transient network error — this is
+    // a live Jira call) must never suppress and must never write the
+    // comment cursor, or a failed poll would install a wrong baseline and
+    // could cause a LATER poll to wrongly suppress a real change.
+    const crossDaemonCache = new Map<string, Promise<boolean>>();
+    const crossDaemonSuppressed = (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined): Promise<boolean> => {
+      let p = crossDaemonCache.get(key);
+      if (!p) {
+        p = (async () => {
+          if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
+          const result = await fetchComments(key);
+          if (!result.ok) return false; // cannot look -> do not suppress; cursor left untouched
+          const hadBaseline = commentCursor.has(key);
+          const baseline = commentCursor.get(key) ?? null;
+          commentCursor.set(key, result.newest);
+          if (!hadBaseline) return false; // unknown baseline: never suppress
+          return result.newest === baseline;
+        })();
+        crossDaemonCache.set(key, p);
+      }
+      return p;
+    };
+
+    // DAEMON_WRITER ledger-hit comment-cursor check (KAN-828). The own-write
+    // ledger's exact-`updated`-match discriminator (own-writes.ts, not
+    // modified here) treats a foreign write folded into our read-back the
+    // same as a pure self-write, which swallows a reviewer/boss/human
+    // comment landing in that round-trip (KAN-793/799/804). That guarantee
+    // is corrected HERE, not in own-writes.ts (out of scope): a
+    // DAEMON_WRITER hit is no longer the final verdict — it means "our
+    // write bumped `updated` — was anything else folded in?", answered by
+    // whether the ticket's newest comment id moved since the recorded
+    // baseline.
+    //
+    // `daemonLabelsChanged` decides WHICH arm to run, not what the cursor
+    // means (KAN-838 — a prior version of this comment claimed a moved
+    // newest-comment-id on the DAEMON arm meant something foreign was
+    // folded in, treating that as proof the cursor could only be checked,
+    // never advanced, on the AGENT arm; that reasoning was false). The
+    // cursor's real invariant is "the newest comment id this daemon has
+    // OBSERVED for this key", not "the newest it has DELIVERED" — every
+    // path that learns the newest id must advance it, including a
+    // suppression. The AGENT arm (an agent's own write, typically its own
+    // comment, changing no daemon label) still always suppresses — that
+    // part of KAN-828's reasoning holds — but it must ALSO resolve and
+    // record the newest comment id before returning, via the same
+    // per-poll `fetchComments` memo the DAEMON arm uses, so a stale
+    // baseline never survives past the write that actually moved it.
+    // Skipping that step is exactly what caused the regression this
+    // ticket fixes: the NEXT daemon label write (agent:working<->idle,
+    // every turn) would see the agent's own already-suppressed comment as
+    // "new" and wake the agent about it. Fail-open discipline is
+    // unchanged either way: a rejected/unwired fetch leaves the cursor
+    // untouched, never installing a baseline nothing this poll observed.
+    //
+    // Two residuals, carried forward rather than silently dropped (KAN-828
+    // documented the first; this ticket must not let the rewrite lose it):
+    //
+    // Known residual, stated rather than hidden: a ledger hit whose
+    // folded-in foreign event was a status change with NO comment is still
+    // suppressed — outside this discriminator's reach, on the DAEMON arm,
+    // unchanged since KAN-828.
+    //
+    // Second known residual (KAN-838): on the AGENT arm, a foreign comment
+    // landing in the SAME fetch window as the agent's own write is folded
+    // into the cursor advance below and is never delivered to the ticket's
+    // own agent that poll (it still reaches any WATCHER via
+    // crossDaemonSuppressed, which never consults this cursor for a pure
+    // comment diff) — the arm's job is only to keep the cursor honest for
+    // later polls, not to reconsider what it suppresses on its own poll.
+    const ledgerHitCache = new Map<string, Promise<boolean>>();
+    const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
+      let p = ledgerHitCache.get(key);
+      if (!p) {
+        p = (async () => {
+          if (!daemonLabelsChanged(before, after)) {
+            // Agent-writer arm / pure comment path: always suppressed, but
+            // the cursor must still learn the newest id it just observed
+            // (KAN-838) — see the block comment above.
+            const result = await fetchComments(key);
+            if (result.ok) commentCursor.set(key, result.newest);
+            return true;
+          }
+          const result = await fetchComments(key);
+          if (!result.ok) return false; // fail open: deliver, cursor untouched
+          const baseline = commentCursor.get(key) ?? null;
+          if (result.newest === baseline) return true; // no new comment -> suppress
+          commentCursor.set(key, result.newest);
+          return false; // newest comment moved -> deliver
+        })();
+        ledgerHitCache.set(key, p);
+      }
+      return p;
+    };
+
+    // Both suppression checks require an ACTUAL before/after pair — a key
+    // appearing or disappearing is still a real change (the old
+    // isOwnLabelBump made this explicit; crossDaemonSuppressed already
+    // requires both above). Consulting the ledger with a stale previous
+    // `updated` for a now-gone key would check a value nothing this poll
+    // actually observed, so appear/disappear always delivers, unchecked.
+    const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
+      if (!before || !after) return false;
+      if (deps.suppress?.(key, after.updated, watcher)) return ledgerHitSuppressed(key, before, after);
+      return crossDaemonSuppressed(key, before, after);
+    };
+
+    // Assigned issues: notify the issue's own agent only. Parent is membership
+    // only (not an event to listen for) — a boss hears change only through
+    // the Implements chain below, via routes.ts.
+    for (const key of changedKeys(prev.issues, next.issues)) {
+      const before = issueOf(prev.issues, key);
+      const after = issueOf(next.issues, key);
+      // A pr:* transition on the ticket's OWN agent is delivered BEFORE
+      // either suppression is consulted (KAN-691/KAN-819/KAN-823): neither
+      // the own-write ledger (writer "daemon" — a label sync write) nor
+      // isDaemonLabelOnlyDiff may swallow it, because it's the one label
+      // flip an approved/changes-requested author is actually waiting on.
+      // This deliberately SKIPS crossDaemonSuppressed too, so the per-key
+      // comment cursor does not advance this poll for this key when no
+      // watcher also touches it. That is safe: the cursor is used only as
+      // an EQUALITY check against a monotonically-growing newest-comment
+      // id (see crossDaemonSuppressed below), so leaving it one poll stale
+      // only ever biases a LATER comparison toward "not suppressed"
+      // (delivered) — it can never manufacture a match that wrongly
+      // suppresses a genuine later change. This mirrors the existing
+      // tolerance in `suppressed()` itself: an own-write-ledger hit already
+      // short-circuits before crossDaemonSuppressed ever runs.
+      const transition = before && after ? prTransition(before, after) : null;
+      if (transition) {
+        await send(key, key, { pr: transition });
+        continue;
+      }
+      if (await suppressed(key, before, after, key)) continue;
+      await send(key, key);
+    }
+    // Related work (the Implements chain): notify every watcher of what changed.
+    const watchersOf = (k: string) =>
+      next.related.find((r) => r.issue.key === k)?.watchers ?? prev.related.find((r) => r.issue.key === k)?.watchers ?? [];
+    for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue))) {
+      const before = relatedIssueOf(prev.related, key);
+      const after = relatedIssueOf(next.related, key);
+      for (const w of watchersOf(key)) {
+        if (await suppressed(key, before, after, w)) continue;
+        await send(w, key);
+      }
+    }
+  };
 
   return watch<Snapshot>(
     async () => {
@@ -251,214 +493,30 @@ export function startLoop(deps: LoopDeps): Stop {
       return { issues, related };
     },
     async (next, prev) => {
-      const sent = new Set<string>();
-      const send = async (issue: string, about: string, reason?: NotifyReason) => {
-        const id = `${issue}|${about}`;
-        if (sent.has(id)) return;
-        sent.add(id);
-        await deps.notify(issue, about, reason);
-      };
-
-      // ONE deps.comments(key) call per key, per poll — shared by baseline
-      // seeding below, the DAEMON_WRITER ledger-hit comment-cursor check, and
-      // the cross-daemon label-only echo check (KAN-828 item 4). Fails OPEN:
-      // a rejected call (a transient network error — this is a live Jira
-      // call), or `deps.comments` simply not being wired up, is never treated
-      // as "no new comment" and never advances the cursor, so a failed poll
-      // can never install a wrong baseline.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null } | { ok: false }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null } | { ok: false }> => {
-        let p = commentsCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!deps.comments) return { ok: false as const };
-            try {
-              const comments = await deps.comments(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null };
-            } catch {
-              return { ok: false as const };
-            }
-          })();
-          commentsCache.set(key, p);
-        }
-        return p;
-      };
-
-      // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
-      // no recorded comment-cursor entry yet gets one seeded now, from its
-      // CURRENT newest comment id, so its first-ever ledger hit already has a
-      // baseline to compare against — without this, the "unknown baseline"
-      // fail-safe would turn every key's first daemon-label ledger hit into
-      // a one-time echo nudge, noise this ticket must not add. Fail-open: a
-      // rejected/unavailable call leaves the key unseeded, retried on a
-      // later poll, never installing a baseline it did not observe. A key
-      // that appears mid-run (a newly staffed ticket) is seeded right here,
-      // on the poll it first appears — safe, because `suppressed()` already
-      // delivers unconditionally on appear/disappear (no `before`), and a
-      // ledger hit requires both `before` and `after`, so by the time a key
-      // can ever hit the ledger it was necessarily present — and thus
-      // seeded — on the previous poll. A ledger hit therefore always has a
-      // baseline.
-      const seenKeys = new Set<string>([...next.issues.map((i) => i.key), ...next.related.map((r) => r.issue.key)]);
-      await Promise.all(
-        [...seenKeys].map(async (key) => {
-          if (commentCursor.has(key)) return;
-          const result = await fetchComments(key);
-          if (result.ok) commentCursor.set(key, result.newest);
-        }),
-      );
-
-      // Memoized per key, per poll: the label-only branch makes at most one
-      // comments() call per key, however many watchers consult it. Fails
-      // OPEN: a rejected comments() call (a transient network error — this is
-      // a live Jira call) must never suppress and must never write the
-      // comment cursor, or a failed poll would install a wrong baseline and
-      // could cause a LATER poll to wrongly suppress a real change.
-      const crossDaemonCache = new Map<string, Promise<boolean>>();
-      const crossDaemonSuppressed = (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined): Promise<boolean> => {
-        let p = crossDaemonCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
-            const result = await fetchComments(key);
-            if (!result.ok) return false; // cannot look -> do not suppress; cursor left untouched
-            const hadBaseline = commentCursor.has(key);
-            const baseline = commentCursor.get(key) ?? null;
-            commentCursor.set(key, result.newest);
-            if (!hadBaseline) return false; // unknown baseline: never suppress
-            return result.newest === baseline;
-          })();
-          crossDaemonCache.set(key, p);
-        }
-        return p;
-      };
-
-      // DAEMON_WRITER ledger-hit comment-cursor check (KAN-828). The own-write
-      // ledger's exact-`updated`-match discriminator (own-writes.ts, not
-      // modified here) treats a foreign write folded into our read-back the
-      // same as a pure self-write, which swallows a reviewer/boss/human
-      // comment landing in that round-trip (KAN-793/799/804). That guarantee
-      // is corrected HERE, not in own-writes.ts (out of scope): a
-      // DAEMON_WRITER hit is no longer the final verdict — it means "our
-      // write bumped `updated` — was anything else folded in?", answered by
-      // whether the ticket's newest comment id moved since the recorded
-      // baseline.
-      //
-      // `daemonLabelsChanged` decides WHICH arm to run, not what the cursor
-      // means (KAN-838 — a prior version of this comment claimed a moved
-      // newest-comment-id on the DAEMON arm meant something foreign was
-      // folded in, treating that as proof the cursor could only be checked,
-      // never advanced, on the AGENT arm; that reasoning was false). The
-      // cursor's real invariant is "the newest comment id this daemon has
-      // OBSERVED for this key", not "the newest it has DELIVERED" — every
-      // path that learns the newest id must advance it, including a
-      // suppression. The AGENT arm (an agent's own write, typically its own
-      // comment, changing no daemon label) still always suppresses — that
-      // part of KAN-828's reasoning holds — but it must ALSO resolve and
-      // record the newest comment id before returning, via the same
-      // per-poll `fetchComments` memo the DAEMON arm uses, so a stale
-      // baseline never survives past the write that actually moved it.
-      // Skipping that step is exactly what caused the regression this
-      // ticket fixes: the NEXT daemon label write (agent:working<->idle,
-      // every turn) would see the agent's own already-suppressed comment as
-      // "new" and wake the agent about it. Fail-open discipline is
-      // unchanged either way: a rejected/unwired fetch leaves the cursor
-      // untouched, never installing a baseline nothing this poll observed.
-      //
-      // Two residuals, carried forward rather than silently dropped (KAN-828
-      // documented the first; this ticket must not let the rewrite lose it):
-      //
-      // Known residual, stated rather than hidden: a ledger hit whose
-      // folded-in foreign event was a status change with NO comment is still
-      // suppressed — outside this discriminator's reach, on the DAEMON arm,
-      // unchanged since KAN-828.
-      //
-      // Second known residual (KAN-838): on the AGENT arm, a foreign comment
-      // landing in the SAME fetch window as the agent's own write is folded
-      // into the cursor advance below and is never delivered to the ticket's
-      // own agent that poll (it still reaches any WATCHER via
-      // crossDaemonSuppressed, which never consults this cursor for a pure
-      // comment diff) — the arm's job is only to keep the cursor honest for
-      // later polls, not to reconsider what it suppresses on its own poll.
-      const ledgerHitCache = new Map<string, Promise<boolean>>();
-      const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
-        let p = ledgerHitCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!daemonLabelsChanged(before, after)) {
-              // Agent-writer arm / pure comment path: always suppressed, but
-              // the cursor must still learn the newest id it just observed
-              // (KAN-838) — see the block comment above.
-              const result = await fetchComments(key);
-              if (result.ok) commentCursor.set(key, result.newest);
-              return true;
-            }
-            const result = await fetchComments(key);
-            if (!result.ok) return false; // fail open: deliver, cursor untouched
-            const baseline = commentCursor.get(key) ?? null;
-            if (result.newest === baseline) return true; // no new comment -> suppress
-            commentCursor.set(key, result.newest);
-            return false; // newest comment moved -> deliver
-          })();
-          ledgerHitCache.set(key, p);
-        }
-        return p;
-      };
-
-      // Both suppression checks require an ACTUAL before/after pair — a key
-      // appearing or disappearing is still a real change (the old
-      // isOwnLabelBump made this explicit; crossDaemonSuppressed already
-      // requires both above). Consulting the ledger with a stale previous
-      // `updated` for a now-gone key would check a value nothing this poll
-      // actually observed, so appear/disappear always delivers, unchecked.
-      const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
-        if (!before || !after) return false;
-        if (deps.suppress?.(key, after.updated, watcher)) return ledgerHitSuppressed(key, before, after);
-        return crossDaemonSuppressed(key, before, after);
-      };
-
-      // Assigned issues: notify the issue's own agent only. Parent is membership
-      // only (not an event to listen for) — a boss hears change only through
-      // the Implements chain below, via routes.ts.
-      for (const key of changedKeys(prev.issues, next.issues)) {
-        const before = issueOf(prev.issues, key);
-        const after = issueOf(next.issues, key);
-        // A pr:* transition on the ticket's OWN agent is delivered BEFORE
-        // either suppression is consulted (KAN-691/KAN-819/KAN-823): neither
-        // the own-write ledger (writer "daemon" — a label sync write) nor
-        // isDaemonLabelOnlyDiff may swallow it, because it's the one label
-        // flip an approved/changes-requested author is actually waiting on.
-        // This deliberately SKIPS crossDaemonSuppressed too, so the per-key
-        // comment cursor does not advance this poll for this key when no
-        // watcher also touches it. That is safe: the cursor is used only as
-        // an EQUALITY check against a monotonically-growing newest-comment
-        // id (see crossDaemonSuppressed below), so leaving it one poll stale
-        // only ever biases a LATER comparison toward "not suppressed"
-        // (delivered) — it can never manufacture a match that wrongly
-        // suppresses a genuine later change. This mirrors the existing
-        // tolerance in `suppressed()` itself: an own-write-ledger hit already
-        // short-circuits before crossDaemonSuppressed ever runs.
-        const transition = before && after ? prTransition(before, after) : null;
-        if (transition) {
-          await send(key, key, { pr: transition });
-          continue;
-        }
-        if (await suppressed(key, before, after, key)) continue;
-        await send(key, key);
-      }
-      // Related work (the Implements chain): notify every watcher of what changed.
-      const watchersOf = (k: string) =>
-        next.related.find((r) => r.issue.key === k)?.watchers ?? prev.related.find((r) => r.issue.key === k)?.watchers ?? [];
-      for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue))) {
-        const before = relatedIssueOf(prev.related, key);
-        const after = relatedIssueOf(next.related, key);
-        for (const w of watchersOf(key)) {
-          if (await suppressed(key, before, after, w)) continue;
-          await send(w, key);
-        }
+      // BUTCHR-57: the whole notify stage is wrapped so its returned promise
+      // can never reject — `watch()` does not await `onChange` (mechanic A
+      // above), so a rejection here would otherwise be a silent unhandled
+      // promise rejection, invisible to both `deps.onError` (that seam only
+      // ever sees a rejection from the FETCH stage, the first `watch()`
+      // argument) and to `/health`. A failure is instead logged loudly on
+      // the house `deps.log`/`console.error` seam, in the neighbouring
+      // `WARNING: [tag] ... threw: ...` style, and `onNotifySuccess` is
+      // simply not called — leaving the notify health component to go stale
+      // rather than reporting a false success. Per mechanic C, a failed pass
+      // here has already lost this poll's diff forever (`watch()` advances
+      // its baseline before calling `onChange`), so there is nothing left to
+      // retry — the goal here is only to make that failure loud, not silent.
+      try {
+        await notifyOnChange(next, prev);
+        deps.onNotifySuccess?.();
+      } catch (e) {
+        deps.log?.(`  WARNING: [notify] stage threw: ${(e as Error)?.message ?? e}`);
       }
     },
     deps.intervalMs,
-    deps.onError ? { onError: deps.onError } : {},
+    {
+      ...(deps.onError ? { onError: deps.onError } : {}),
+      hash: () => String(notifyTick++),
+    },
   );
 }
