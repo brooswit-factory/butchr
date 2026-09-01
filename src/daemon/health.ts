@@ -51,6 +51,22 @@ export interface LoopHealth {
   stop(): void;
 }
 
+/**
+ * Combine several independently-tracked `LoopHealth` components into one
+ * `/health` response (BUTCHR-57): `ok` is the AND of every component, and
+ * `components` is their concatenation, in the order given. Deliberately
+ * additive rather than a change to `createLoopHealth`/`status()` themselves —
+ * a single `createLoopHealth` instance keeps its existing one-component
+ * contract untouched (BUTCHR-18/BUTCHR-6's callers, and any test built on
+ * that shape, are unaffected); a caller with more than one liveness signal to
+ * report (the poll loop, the notify stage) calls each instance's `status()`
+ * and combines the results here instead.
+ */
+export const combineHealth = (components: readonly LoopHealth[]): HealthStatus => {
+  const statuses = components.map((c) => c.status());
+  return { ok: statuses.every((s) => s.ok), components: statuses.flatMap((s) => s.components) };
+};
+
 const fmtSecs = (ms: number): string => `${Math.round(ms / 1000)}s`;
 
 /**
