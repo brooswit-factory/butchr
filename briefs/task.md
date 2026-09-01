@@ -57,13 +57,28 @@ task-implements-story link is what carries your events upward.
      else "MERGE OK: approved @ \(.commit.oid[0:8]) == head" end'`
    — the LAST decisive review, never just any APPROVED one: a naive
    `select(.state=="APPROVED")` still matches a stale approval sitting
-   earlier in the list, and `reviews[].commit.oid` is the field that
-   actually records the sha the reviewer saw — `headRefOid` never did. A
+   earlier in the list, and `reviews[].commit.oid` is the field this check
+   anchors on instead of `headRefOid`. It is NOT sufficient on its own:
+   GitHub can silently rewrite `reviews[].commit.oid` to a later commit
+   after a base-merge — confirmed on two PRs, including one with three
+   reviews where an OLDER review still held its original recorded sha while
+   a LATER review's recorded commit had already moved, matching the current
+   head each time it was re-read. Only a review's own written-at-submission
+   BODY text stays fixed; any structured field, `reviews[].commit.oid`
+   included, can move — and this check reads the LAST decisive review,
+   which is exactly the one most likely to have been rewritten. It still
+   only catches what `reviewDecision`+`headRefOid` never could (a plain
+   push past a stale approval). If the base may have moved since approval,
+   ask for a re-review at the new head, or point at the append-only
+   `[review] APPROVED ... @ <sha>` line already on the ticket — GitHub
+   cannot rewrite that one. A
    `REFUSE: STALE` result, or a `[review] APPROVED @ <sha>` for a sha you've
    since pushed past, means ask for a re-review, not merge; a
    `REFUSE: … CHANGES_REQUESTED` result, or a `[review] CHANGES_REQUESTED`,
    means read the review, fix, push, and comment that a re-review is needed.
-   Then merge your own PR.
+   Before merging, also confirm you have not taken a base-merge since the
+   approval — if you have, ask for a re-review rather than trusting
+   `MERGE OK`. Then merge your own PR.
 
 ## Filing work that isn't yours
 Something surfaces mid-task that's real but doesn't serve {{KEY}} — a bug in

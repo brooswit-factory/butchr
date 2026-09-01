@@ -141,6 +141,45 @@ const LAST_DECISIVE_REVIEW = /last\s+decisive\s+review/i;
 const MERGE_INSTRUCTING_BRIEFS = ["brief:Story:brief.md", "brief:Task:brief.md"];
 const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 
+// BUTCHR-74: `reviews[].commit.oid` is not the immutable fallback the text
+// used to claim it was — confirmed on two PRs (#135, #136) that GitHub can
+// silently rewrite it to a later commit after a base-merge, and on #136
+// (three reviews) an OLDER review kept its original recorded sha while a
+// LATER review's recorded commit had already moved. Only a review's own
+// written-at-submission body text stays fixed; any structured field can
+// move, and this check reads the LAST decisive review — exactly the one
+// most likely to have been rewritten. Every merge-instructing channel must
+// say so (without asserting a rewrite mechanism beyond what's observed)
+// and must not describe the check as sufficient.
+//
+// Requires TWO independent short markers to both be present, anywhere in
+// the channel, rather than one token or one long sentence:
+//   - "base-merge" — names the hazard.
+//   - "not sufficient" — denies sufficiency; this is the actual point of
+//     the caveat, not just its topic.
+// One token alone is not discriminating: a single "base-merge" anchor was
+// tried first and passed review with a real hole — briefs/story.md and
+// briefs/task.md each also carry an OPERATIONAL sentence this same ticket
+// added ("confirm you have not taken a base-merge since the approval"),
+// which still contains the word "base-merge" after the caveat sentence
+// itself is deleted, so a bare-token assertion stayed green with the
+// caveat gone. "not sufficient" appears ONLY inside the caveat sentence in
+// every covered channel (verified when this was written), so requiring it
+// too closes that hole: deleting the caveat removes "not sufficient" from
+// the channel even though "base-merge" survives via the operational
+// sentence. Two short, independently-reworded-resistant markers, not one
+// long brittle phrase — a maintainer rewording either sentence while
+// keeping its meaning (and thus keeping both markers) leaves this green;
+// only an actual deletion of the sufficiency claim turns it red.
+//
+// FORWARDING ADDRESS: this caveat is true only because the check has this
+// hole. BUTCHR-73 is filing the remedy for the base-merge hole itself. If
+// BUTCHR-73 (or any later ticket) closes that hole, this caveat becomes
+// FALSE, this assertion SHOULD go red, and that red is correct — it is
+// telling you the pinned text must be updated or removed, not that the test
+// is broken. Do not delete this assertion to get green; fix the text.
+const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
+
 describe("merge-check instruction channels (BUTCHR-56)", () => {
   test("non-vacuity: every channel group actually resolves to content, and it's the content we expect", () => {
     const briefs = briefChannels();
@@ -177,7 +216,7 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
   // mutation: stripping `reviews[].commit.oid` from the rendered nudge (not
   // its source comment) turns this assertion red — see the PR description's
   // "direction 2" mutation.
-  test("every channel explicitly named as merge-instructing names reviews[].commit.oid and the last-decisive ordering", () => {
+  test("every channel explicitly named as merge-instructing names reviews[].commit.oid, the last-decisive ordering, and the base-merge caveat (BUTCHR-74)", () => {
     const briefs = briefChannels().filter((c) => MERGE_INSTRUCTING_BRIEFS.includes(c.label));
     expect(briefs.length).toBe(MERGE_INSTRUCTING_BRIEFS.length); // the explicit list actually matched something
 
@@ -189,6 +228,9 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
     for (const c of [...briefs, ...docs, ...nudges]) {
       expect(c.text, `${c.label} should name reviews[].commit.oid`).toContain("reviews[].commit.oid");
       expect(c.text, `${c.label} should name the last-decisive ordering`).toMatch(LAST_DECISIVE_REVIEW);
+      // See BASE_MERGE_CAVEAT above for the forwarding address to BUTCHR-73:
+      // this assertion is EXPECTED to go red once that hole is closed.
+      expect(c.text, `${c.label} should carry the base-merge caveat (BUTCHR-74)`).toMatch(BASE_MERGE_CAVEAT);
     }
   });
 });
