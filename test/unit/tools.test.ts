@@ -26,6 +26,8 @@ function rig(roles: { story?: string; task?: string } = {}) {
     transition: rec("transition"), createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
     assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages", { results: [] }), listSpaces: rec("listSpaces"),
     ...fakeDocOps(),
+  commentOnPage: async () => ({ ok: true }),
+  getPageComments: async () => ({ results: [] }),
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -120,6 +122,8 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
       setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
@@ -156,6 +160,8 @@ describe("onWrite hook (own-write ledger feed)", () => {
       assign: async () => ({ ok: true }),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -236,6 +242,8 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...fakeDocOps(),
       ...opsOverrides,
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -418,6 +426,8 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
       setPriority: async () => undefined, assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
@@ -433,6 +443,8 @@ describe("confluence_update_page result normalization", () => {
       setPriority: async () => ({}), assign: async () => ({}), createPage: async () => ({}), getPage: async () => ({}),
       updatePage: async () => undefined, searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.confluence_update_page!.handler({ id: "10715137", body: "<p>x</p>" }, { headers: {} } as any);
@@ -452,6 +464,8 @@ describe("confluence_search_pages", () => {
       listSpaces: rec("listSpaces", { results: [{ id: "196612", key: "SD" }] }),
       ...fakeDocOps(),
       ...opsOverrides,
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -518,6 +532,8 @@ describe("confluence_create_page parentId", () => {
       transition: rec("transition"), createIssue: rec("createIssue"), setPriority: rec("setPriority"),
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -543,6 +559,8 @@ describe("jira_assign (KAN-810)", () => {
       assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...fakeDocOps(),
       ...opsOverrides,
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -613,6 +631,8 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
       updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
       ...opsOverrides,
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, () => {});
     return { tools };
@@ -675,6 +695,8 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
         createPage: async () => ({}), getPage: async () => ({ title: "T", body: { storage: { value: "x" } }, _links: {} }),
         updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
         ...fakeDocOps(),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
       };
       return { tools: atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer])) };
     })();
@@ -707,6 +729,8 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       createIssue: async () => ({ key: "KAN-999" }), setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     return atlassianTools(ops, () => {}, { story: "acct-story", task: "acct-task" });
   }
@@ -743,6 +767,8 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       createIssue: rec("createIssue"), setPriority: rec("setPriority"), assign: rec("assign"),
       createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l));
@@ -767,6 +793,8 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -790,6 +818,8 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { story: "acct-story" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -810,6 +840,8 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({ ok: true }),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -842,6 +874,8 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
       createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     return { ops, tools: atlassianTools(ops, () => {}, roles) };
   }
@@ -866,6 +900,8 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
       createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     const tools = atlassianTools(ops, (l) => audits.push(l), { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
     const conn = { headers: { "x-issue": "KAN-1" } } as any;
@@ -912,6 +948,8 @@ describe("finish_without_a_boss (BUTCHR-39): wiring — x-issue, schema shape, a
       createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
       createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
       ...fakeDocOps(),
+    commentOnPage: async () => ({ ok: true }),
+    getPageComments: async () => ({ results: [] }),
     };
     return ops;
   }
@@ -948,5 +986,119 @@ describe("finish_without_a_boss (BUTCHR-39): wiring — x-issue, schema shape, a
     expect(result).toEqual({ ok: true, key: "KAN-1", status: "Done" });
     expect(audits.some((a) => a.includes("finish_without_a_boss") && a.includes("KAN-1"))).toBe(true);
     expect(writes).toEqual([[["KAN-1"], "KAN-1"]]);
+  });
+});
+
+describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) across the tool-registration layer", () => {
+  /**
+   * A project-shaped world: "BUTCHR" is the project key, "BUTCHR-9" an Epic
+   * that is its member (no Implements link — see src/tools/relationship.ts).
+   * `pages` seeds the project's root doc at id "1", matching `fakeDocOps`'s
+   * default `rootDoc.id`.
+   */
+  function projectRig(rolesOverride: { story?: string; task?: string; epic?: string } = { story: "acct-story", task: "acct-task", epic: "acct-epic" }) {
+    const epicIssue = { status: "To Do", labels: [] as string[], assignee: undefined as string | undefined };
+    const pageComments: Array<{ pageId: string; body: string }> = [];
+    const jiraComments: Array<{ key: string; text: string }> = [];
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        if (key === "BUTCHR-9") {
+          return { fields: { issuetype: { name: "Epic" }, project: { key: "BUTCHR" }, status: { name: epicIssue.status }, labels: epicIssue.labels, assignee: epicIssue.assignee ? { accountId: epicIssue.assignee } : null, issuelinks: [] } };
+        }
+        return { fields: { issuetype: { name: "Story" }, project: { key: "BUTCHR" }, status: { name: "To Do" }, labels: [], issuelinks: [] } };
+      },
+      search: async () => ({}),
+      addComment: async (key: string, text: string) => { jiraComments.push({ key, text }); return { ok: true }; },
+      linkIssues: async () => ({ ok: true }),
+      transition: async (_key: string, status: string) => { epicIssue.status = status; return { ok: true }; },
+      createIssue: async (p: { assignee?: string; labels?: string[] }) => { epicIssue.assignee = p.assignee; if (p.labels) epicIssue.labels = [...p.labels]; return { key: "BUTCHR-9" }; },
+      setPriority: async () => ({ ok: true }),
+      assign: async (_key: string, accountId: string) => { epicIssue.assignee = accountId; return { ok: true }; },
+      createPage: async () => ({}),
+      getPage: async (id: string) => ({ title: "BUTCHR — product brief", body: { storage: { value: "<p>hi</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({}),
+      ...fakeDocOps({ getProjectProperty: async () => ({ space: { key: "BUTCHR" }, rootDoc: { id: "1" } }) }),
+      commentOnPage: async (pageId: string, body: string) => { pageComments.push({ pageId, body }); return { ok: true }; },
+      getPageComments: async () => ({ results: [] }),
+    };
+    const tools = atlassianTools(ops, () => {}, rolesOverride as any);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    return { tools, conn, epicIssue, pageComments, jiraComments };
+  }
+
+  test("get_doc() resolves to the PROJECT's root doc, not an ensureDoc-created page", async () => {
+    const { tools, conn } = projectRig();
+    const result = await tools.get_doc!.handler({}, conn);
+    expect(result).toEqual({ found: true, id: "1", url: expect.any(String), title: "BUTCHR — product brief", body: "<p>hi</p>" });
+  });
+
+  test("set_doc() replaces the PROJECT's root doc, title optional", async () => {
+    const { tools, conn } = projectRig();
+    const result = await tools.set_doc!.handler({ body: "<p>new</p>" }, conn);
+    expect((result as any).id).toBe("1");
+    expect((result as any).body).toBe("<p>new</p>");
+  });
+
+  test("new_worker creates an EPIC, member of BUTCHR, no implements field, staffed by roles.epic", async () => {
+    const { tools, conn, epicIssue } = projectRig();
+    const result = (await tools.new_worker!.handler({ summary: "s", disposition: "start" }, conn)) as any;
+    expect(result.key).toBe("BUTCHR-9");
+    expect(result.member).toBe("BUTCHR");
+    expect(result.implements).toBeUndefined();
+    expect(epicIssue.assignee).toBe("acct-epic");
+    expect(epicIssue.status).toBe("In Progress");
+  });
+
+  test("new_worker refuses when roles.epic is unset, naming BUTCHR_ASSIGNEE_EPIC — never falls back to roles.story/roles.task", async () => {
+    const { tools, conn } = projectRig({ story: "acct-story", task: "acct-task" }); // epic omitted
+    await expect(tools.new_worker!.handler({ summary: "s", disposition: "start" }, conn)).rejects.toThrow(/BUTCHR_ASSIGNEE_EPIC/);
+  });
+
+  test("finish_worker / tell_worker succeed on the epic that is a member of BUTCHR", async () => {
+    const { tools, conn, epicIssue, jiraComments } = projectRig();
+    epicIssue.status = "In Progress";
+    await tools.finish_worker!.handler({ key: "BUTCHR-9" }, conn);
+    expect(epicIssue.status).toBe("Done");
+    await tools.tell_worker!.handler({ key: "BUTCHR-9", text: "[review] APPROVED https://x/1 @ deadbeef" }, conn);
+    expect(jiraComments.some((c) => c.key === "BUTCHR-9" && c.text.includes("[review] APPROVED"))).toBe(true);
+  });
+
+  test("report_to_boss / ask_boss are ALLOWED for a project caller — post on the root doc, never refused (BUTCHR-71 spec correction)", async () => {
+    const { tools, conn, pageComments } = projectRig();
+    await tools.report_to_boss!.handler({ text: "status update" }, conn);
+    await tools.ask_boss!.handler({ text: "which way?" }, conn);
+    expect(pageComments.length).toBe(2);
+    expect(pageComments[0]!.pageId).toBe("1");
+    expect(pageComments[0]!.body).toContain("[BUTCHR] status update");
+    expect(pageComments[1]!.body).toContain("[ask]");
+  });
+
+  test("submit_to_boss REFUSES a project caller, naming why", async () => {
+    const { tools, conn } = projectRig();
+    await expect(tools.submit_to_boss!.handler({}, conn)).rejects.toThrow(/refusing a project caller/);
+  });
+
+  test("finish_without_a_boss REFUSES a project caller at the gate — WITHOUT ever calling relationship.ts's finishWithoutABoss (its own ops.getIssue(\"BUTCHR\") is never even attempted)", async () => {
+    let getIssueCalls = 0;
+    const ops: AtlassianOps = {
+      getIssue: async () => { getIssueCalls++; return { fields: {} }; },
+      search: async () => ({}), addComment: async () => ({}), linkIssues: async () => ({}), transition: async () => ({}),
+      createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
+    };
+    const tools = atlassianTools(ops, () => {});
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.finish_without_a_boss!.handler({}, conn)).rejects.toThrow(/refusing a project caller/);
+    expect(getIssueCalls).toBe(0); // the gate fired before relationship.ts's own finishWithoutABoss ever ran
+  });
+
+  test("file_where_it_belongs REFUSES a project caller, naming why (no coherent case-B bottom)", async () => {
+    const { tools, conn } = projectRig();
+    await expect(tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "BUTCHR-9" }, conn)).rejects.toThrow(/refusing a project caller/);
   });
 });
