@@ -123,6 +123,21 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
  * placed outside src/, schema/, package.json or briefs/ — in a .ts file or
  * any other — fails this test instead of silently reopening the hole this
  * ticket closed.
+ *
+ * TRADE MADE DELIBERATELY (BUTCHR-72): walking every file, not just code
+ * files, means ASSET_IMPORT — unanchored, and matched against raw file text
+ * — can also match an illustrative example inside a prose/doc file (e.g. a
+ * .md file's code fence showing the import syntax), not just a real import.
+ * Confirmed: an example whose relative path resolves to somewhere already
+ * under src/ stays green (harmless — src/ is gated regardless); one whose
+ * relative path resolves outside src/ to an ungated location fails this
+ * test even though nothing real imports anything. That is the accepted
+ * failure direction — failing loud on a correct file, never silently
+ * missing a real asset import — because there is no filter that is right
+ * forever, and a false negative here is the defect this ticket exists to
+ * close. If this test ever goes red on a file that isn't a real import,
+ * either gate the illustrative path or move the example so its relative
+ * path stays inside src/.
  */
 describe("every build-time asset import reachable from src/ is a gated path (BUTCHR-55)", () => {
   const ASSET_IMPORT = /from\s+["']([^"']+)["']\s+with\s*\{[^}]*type:[^}]*\}/g;
