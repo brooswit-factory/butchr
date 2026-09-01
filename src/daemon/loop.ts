@@ -79,17 +79,27 @@ export interface LoopDeps {
   /**
    * BUTCHR-24: run the parked-ticket detector (src/agents/parked.ts) over
    * this poll's already-fetched (issues, related) snapshot. Called from
-   * inside the observe function below, NEVER from `watch()`'s `onChange`
-   * callback: `@brooswit/sundry`'s `watch()` only invokes `onChange` when
-   * the polled snapshot's hash differs from the previous one — documented in
-   * the published package's `dist/watch/watcher.d.ts` ("call `onChange(next,
-   * prev)` whenever the hash of its return value changes") and confirmed
-   * against the compiled implementation in `dist/index.js`, whose internal
-   * `observe()` returns early via `if (h !== prevHash)` before ever calling
-   * `onChange` — so a detector
-   * wired into `onChange` would silently stop firing on any poll whose
-   * snapshot happens not to change — exactly the "the fix doesn't survive a
-   * quiet poll" failure mode this ticket exists to remove. Optional;
+   * inside the observe function below, NOT from `watch()`'s `onChange`
+   * callback, because this is fetch-stage work operating on the snapshot
+   * `observe()` just produced — it belongs alongside `syncLabels` above, not
+   * downstream in the diff/notify stage.
+   *
+   * BUTCHR-57 UPDATE: the reason this placement used to be load-bearing no
+   * longer applies IN THIS LOOP. `@brooswit/sundry`'s `watch()` by DEFAULT
+   * only invokes `onChange` when the polled snapshot's hash differs from the
+   * previous one — documented in the published package's
+   * `dist/watch/watcher.d.ts` ("call `onChange(next, prev)` whenever the
+   * hash of its return value changes") and confirmed against the compiled
+   * implementation in `dist/index.js`, whose internal `observe()` returns
+   * early via `if (h !== prevHash)` before ever calling `onChange`. THIS loop
+   * no longer relies on that default: the `hash` option passed to `watch()`
+   * below (see `notifyTick`) forces `observe()`'s `h !== prevHash` branch to
+   * always be taken, so `onChange` now runs on every poll tick regardless of
+   * whether anything changed. A detector wired into `onChange` here would no
+   * longer silently stop firing on a quiet poll. That does not make
+   * `checkParked` a candidate to move, though: it still belongs in the fetch
+   * stage on its own merits (it consumes the same freshly-fetched snapshot
+   * as `syncLabels`, before any diffing happens), so it stays here. Optional;
    * omitted, parked-ticket detection simply never runs. The detector itself
    * never throws (see parked.ts), but this call is awaited inside the same
    * try-implicit observe function as `syncLabels` above, so a change to that
@@ -97,6 +107,23 @@ export interface LoopDeps {
    * it.
    */
   checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
+  /**
+   * BUTCHR-57: called once per poll when the NOTIFY stage (the `onChange`
+   * callback below — changed-key diffing, suppression checks, `deps.notify`
+   * sends) concludes without throwing, including the zero-nudges case where
+   * nothing needed sending. This is the positive heartbeat the notify
+   * component of `/health` is built on — see src/daemon/health.ts and the
+   * `hash` override below for why it fires every poll rather than only when
+   * `@brooswit/sundry`'s `watch()` would naturally invoke `onChange`.
+   * Deliberately NOT derived from `onError`: `watch()` never awaits
+   * `onChange`'s returned promise (confirmed against
+   * `node_modules/@brooswit/sundry/dist/index.js`'s `observe()`, which calls
+   * `onChange(next, prev)` synchronously and never touches the promise it
+   * returns), so a rejecting notify stage would otherwise be an unhandled
+   * rejection invisible to both `onError` and any heartbeat built on it.
+   * Optional; omitted, the notify component simply never records success.
+   */
+  onNotifySuccess?: () => void;
 }
 
 /** How many polls a just-respawned issue is shielded from a further respawn. */
@@ -221,6 +248,15 @@ export interface GenericLoopDeps<T> {
   intervalMs: number;
   onError?: (error: unknown) => void;
   onPollSuccess?: () => void;
+  /**
+   * BUTCHR-57: called once per poll when the NOTIFY stage concludes without
+   * throwing, including the zero-nudges case — the positive heartbeat the
+   * notify component of `/health` is built on (see `onNotifySuccess` on
+   * `LoopDeps` above for the full reasoning; `startLoop` threads that field
+   * straight through to this one). Optional; omitted, the notify component
+   * simply never records success.
+   */
+  onNotifySuccess?: () => void;
 }
 
 /**
@@ -251,6 +287,25 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   // survives across polls without leaking between independent
   // runResourceLoop calls (e.g. separate tests).
   const respawnGuard = new RespawnGuard();
+  // BUTCHR-57: a monotonic counter used as `watch()`'s `hash` option below,
+  // forcing `onChange` (the notify stage) to run on EVERY poll rather than
+  // only when the fetched Snapshot's content-hash differs from last time.
+  // Without this, a quiet fleet (nothing changed in Jira for hours) would
+  // never invoke `onChange` at all, and the notify component of `/health`
+  // (see `onNotifySuccess` on `LoopDeps`) would have no way to distinguish
+  // "healthy and idle" from "stuck" — this is why `checkParked`'s own doc
+  // comment above now flags that `onChange` is no longer change-gated in
+  // THIS loop. `checkParked` itself is unaffected and stays in the fetch
+  // stage regardless (see that comment) — the notify stage's own job
+  // (diffing `prev`/`next` and sending nudges) is what genuinely belongs in
+  // `onChange`, so the fix here is to make `onChange` unconditional rather
+  // than move work out of it. `prev`/`next` stay correct either way:
+  // `watch()`'s own baseline tracking (`prevValue`) is untouched by this —
+  // only the change-detection hash is forced to always differ, so
+  // `observe()`'s `h !== prevHash` branch is always taken (confirmed against
+  // `@brooswit/sundry`'s compiled `observe()`) and it still passes the REAL
+  // previous/current snapshots.
+  let notifyTick = 0;
 
   return watch<Snapshot<T>>(
     async () => {
@@ -279,40 +334,61 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       return { issues, related };
     },
     async (next, prev) => {
-      const sent = new Set<string>();
-      const send = async (issue: string, about: string, reason?: NotifyReason) => {
-        const id = `${issue}|${about}`;
-        if (sent.has(id)) return;
-        sent.add(id);
-        await deps.notify(issue, about, reason);
-      };
+      // BUTCHR-57: the whole notify stage is wrapped so its returned promise
+      // can never reject — `watch()` does not await `onChange` (mechanic A
+      // above), so a rejection here would otherwise be a silent unhandled
+      // promise rejection, invisible to both `deps.onError` (that seam only
+      // ever sees a rejection from the FETCH stage, the first `watch()`
+      // argument) and to `/health`. A failure is instead logged loudly on
+      // the house `deps.log`/`console.error` seam, in the neighbouring
+      // `WARNING: [tag] ... threw: ...` style, and `onNotifySuccess` is
+      // simply not called — leaving the notify health component to go stale
+      // rather than reporting a false success. Per mechanic C, a failed pass
+      // here has already lost this poll's diff forever (`watch()` advances
+      // its baseline before calling `onChange`), so there is nothing left to
+      // retry — the goal here is only to make that failure loud, not silent.
+      try {
+        const sent = new Set<string>();
+        const send = async (issue: string, about: string, reason?: NotifyReason) => {
+          const id = `${issue}|${about}`;
+          if (sent.has(id)) return;
+          sent.add(id);
+          await deps.notify(issue, about, reason);
+        };
 
-      const evPoll = await resourceType.eventRules.poll(
-        { primary: prev.issues, related: prev.related },
-        { primary: next.issues, related: next.related },
-      );
+        const evPoll = await resourceType.eventRules.poll(
+          { primary: prev.issues, related: prev.related },
+          { primary: next.issues, related: next.related },
+        );
 
-      // Primary (assigned) resources: notify the resource's own agent only.
-      // Parent/membership is not an event to listen for — a boss hears
-      // change only through the related (Implements) chain below.
-      for (const key of evPoll.changedPrimary) {
-        const verdict = await evPoll.decide(key, key, "primary");
-        if (verdict.deliver) await send(key, key, verdict.reason);
-      }
-      // Related work: notify every watcher of what changed.
-      const watchersOf = (k: string) =>
-        next.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
-        ?? prev.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
-        ?? [];
-      for (const key of evPoll.changedRelated) {
-        for (const w of watchersOf(key)) {
-          const verdict = await evPoll.decide(key, w, "related");
-          if (verdict.deliver) await send(w, key, verdict.reason);
+        // Primary (assigned) resources: notify the resource's own agent only.
+        // Parent/membership is not an event to listen for — a boss hears
+        // change only through the related (Implements) chain below.
+        for (const key of evPoll.changedPrimary) {
+          const verdict = await evPoll.decide(key, key, "primary");
+          if (verdict.deliver) await send(key, key, verdict.reason);
         }
+        // Related work: notify every watcher of what changed.
+        const watchersOf = (k: string) =>
+          next.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? prev.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? [];
+        for (const key of evPoll.changedRelated) {
+          for (const w of watchersOf(key)) {
+            const verdict = await evPoll.decide(key, w, "related");
+            if (verdict.deliver) await send(w, key, verdict.reason);
+          }
+        }
+        deps.onNotifySuccess?.();
+      } catch (e) {
+        deps.log?.(`  WARNING: [notify] stage threw: ${(e as Error)?.message ?? e}`);
       }
     },
     deps.intervalMs,
-    deps.onError ? { onError: deps.onError } : {},
+    {
+      ...(deps.onError ? { onError: deps.onError } : {}),
+      hash: () => String(notifyTick++),
+    },
   );
 }
 
@@ -353,5 +429,6 @@ export function startLoop(deps: LoopDeps): Stop {
     intervalMs: deps.intervalMs,
     ...(deps.onError ? { onError: deps.onError } : {}),
     ...(deps.onPollSuccess ? { onPollSuccess: deps.onPollSuccess } : {}),
+    ...(deps.onNotifySuccess ? { onNotifySuccess: deps.onNotifySuccess } : {}),
   });
 }
