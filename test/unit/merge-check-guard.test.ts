@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { briefFor } from "../../src/agents/workspace.js";
+import { tmpdir } from "node:os";
+import { buildWorkspace } from "../../src/agents/workspace.js";
 import { prReviewStateNudge } from "../../src/agents/pr-nudge.js";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -22,14 +23,16 @@ const DOCS_DIR = join(ROOT, "docs");
  * exactly the event they exist to catch.
  *
  * Each channel below is read from what is actually DELIVERED to an agent,
- * not from a copy that resembles it: `briefFor()` is the function that
- * renders a real brief into a workspace; `atlassianTools()` is the real
- * tool registry an agent's tool list is built from; docs/*.md are read as
- * files, the way a reader reads them; and the daemon nudge is reached
- * through `prReviewStateNudge`, a function `src/daemon/index.ts` itself
- * calls to build the message it pushes — not a regex over the daemon's
- * source text, which would only prove a template resembling what ships,
- * not what ships.
+ * not from a copy that resembles it: BRIEFS are read from the files
+ * `buildWorkspace()` actually writes to a real workspace directory (CLAUDE.md
+ * AND brief.md — not just the brief.md template, since CLAUDE.md is the
+ * first instruction file an agent reads and is a real, separate delivered
+ * channel); tool descriptions come from the real `atlassianTools()`
+ * registry an agent's tool list is built from; docs/*.md are read as files,
+ * the way a reader reads them; and the daemon nudge is reached through
+ * `prReviewStateNudge`, a function `src/daemon/index.ts` itself calls to
+ * build the message it pushes — not a regex over the daemon's source text,
+ * which would only prove a template resembling what ships, not what ships.
  *
  * WHAT THIS FILE CANNOT PROVE: it asserts what the TEXT SAYS. It says
  * nothing about whether `gh pr view` actually returns a `reviews[].commit.oid`
@@ -37,25 +40,44 @@ const DOCS_DIR = join(ROOT, "docs");
  * correct — that's a runtime property, not a text-content one, and this is
  * a unit test over strings.
  *
- * COVERAGE, STATED (see the PR description for the authoritative version):
- * covered — briefs (epic/story/task/default), tool descriptions, docs/*.md,
- * the daemon's PR-state-change nudge. NOT covered, deliberately: CHANGELOG.md
- * and changelog.d/*.md (they're the historical record of this defect being
- * fixed, not instruction — a guard that reddens on its own changelog gets
- * deleted); this guard file and test/unit/workspace.test.ts (they name the
- * forbidden pair in negative assertions/comments, not as instruction);
- * src/labels/pr.ts's code comment (documents the GitHub REST API's own
- * `reviewDecision` semantics, not an agent instruction); and the Confluence
- * glossary named upstream as a fifth channel, which lives outside this repo
- * and which no unit test here can see.
+ * COVERAGE: covered channels are the four functions below (briefChannels,
+ * toolDescriptionChannels, docChannels, nudgeChannels). Everything NOT
+ * covered is enumerated in EXCLUSIONS, with a reason, so the list is
+ * auditable by someone who wasn't here rather than living only as prose.
  */
+const EXCLUSIONS: ReadonlyArray<{ path: string; reason: string }> = [
+  { path: "CHANGELOG.md", reason: "the historical record of this defect being fixed, not an instruction to an agent" },
+  { path: "changelog.d/*.md", reason: "same as CHANGELOG.md — per-PR fragments are history, not instruction" },
+  { path: "test/unit/merge-check-guard.test.ts (this file)", reason: "names the forbidden pair in its own assertions/comments/mutation notes, not as instruction" },
+  { path: "test/unit/workspace.test.ts", reason: "names the forbidden pair in a negative brief assertion/comment, not as instruction" },
+  { path: "src/labels/pr.ts", reason: "code comment documents the GitHub REST API's own reviewDecision semantics, not an agent instruction" },
+  { path: "Confluence glossary (ASSIST space)", reason: "named upstream as a fifth instruction channel; lives outside this repo, invisible to a unit test" },
+];
 
 interface Channel { label: string; text: string }
 
-// BRIEFS — every issue type briefFor() actually serves, including the
-// default fallback (an unrecognized type, e.g. "Bug", still gets a brief).
+// BRIEFS — the actual files `buildWorkspace()` writes into a real agent
+// workspace (CLAUDE.md + the interpolated brief.md), for every issue type
+// briefFor() serves plus the default fallback ("Bug"). Reading the files
+// buildWorkspace() writes, rather than the brief.md template alone, is what
+// makes this channel catch CLAUDE.md too — the first instruction file an
+// agent reads, and a real, separate delivered artifact from brief.md.
 function briefChannels(): Channel[] {
-  return ["Epic", "Story", "Task", "Bug"].map((t) => ({ label: `brief:${t}`, text: briefFor(t) }));
+  const root = mkdtempSync(join(tmpdir(), "merge-check-guard-"));
+  const prevEnv = process.env.BUTCHR_WORKSPACES;
+  process.env.BUTCHR_WORKSPACES = root;
+  try {
+    return ["Epic", "Story", "Task", "Bug"].flatMap((t) => {
+      const dir = buildWorkspace({ key: `MCG-${t}`, issuetype: t, summary: "verify merge-check coverage", parent: null }, "http://localhost:7717/mcp");
+      return [
+        { label: `brief:${t}:CLAUDE.md`, text: readFileSync(join(dir, "CLAUDE.md"), "utf8") },
+        { label: `brief:${t}:brief.md`, text: readFileSync(join(dir, "brief.md"), "utf8") },
+      ];
+    });
+  } finally {
+    if (prevEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+    else process.env.BUTCHR_WORKSPACES = prevEnv;
+  }
 }
 
 // TOOL DESCRIPTIONS — the text an agent literally reads in its tool list,
@@ -97,7 +119,10 @@ function allChannels(): Channel[] {
 // whole string: the two field names legitimately appear far apart in
 // correct prose (e.g. briefs explaining why `headRefOid` alone doesn't
 // work), and a document-wide "both names appear somewhere" test would
-// misfire on exactly the correct explanation of the bug.
+// misfire on exactly the correct explanation of the bug. This sweeps EVERY
+// covered channel (briefs, tools, ALL of docs/*.md, the nudge) — broad is
+// right for a negative assertion: a new doc must never reintroduce the pair
+// either, even one that has nothing to do with merging.
 const FORBIDDEN_PAIR = /reviewDecision\s*,\s*headRefOid|headRefOid\s*,\s*reviewDecision/;
 
 // Hand-wrapped markdown prose in this repo hard-wraps at ~80 columns, which
@@ -105,6 +130,16 @@ const FORBIDDEN_PAIR = /reviewDecision\s*,\s*headRefOid|headRefOid\s*,\s*reviewD
 // (including newline-) tolerant on purpose, so a wrap doesn't produce a
 // false negative for a phrase that IS there.
 const LAST_DECISIVE_REVIEW = /last\s+decisive\s+review/i;
+
+// Channels required to carry the merge check, named EXPLICITLY rather than
+// inferred by scanning content for a word like "merge" (an inferred rule
+// would just rebuild the bare-vs-namespaced trap in a new shape). This is
+// the positive half of the guard, so it must be narrower than the negative
+// sweep above: a channel with nothing to do with merging (an ordinary
+// unrelated doc, say) must never be required to teach this check, or the
+// guard reddens on correct, unrelated work and gets weakened out of spite.
+const MERGE_INSTRUCTING_BRIEFS = ["brief:Story:brief.md", "brief:Task:brief.md"];
+const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 
 describe("merge-check instruction channels (BUTCHR-56)", () => {
   test("non-vacuity: every channel group actually resolves to content, and it's the content we expect", () => {
@@ -118,10 +153,16 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
     expect(docs.length).toBeGreaterThan(0);
     expect(nudges.length).toBeGreaterThan(0);
 
-    expect(briefs.some((c) => c.text.includes("one unit of work"))).toBe(true);
+    expect(briefs.some((c) => c.label.endsWith(":brief.md") && c.text.includes("one unit of work"))).toBe(true);
+    expect(briefs.some((c) => c.label.endsWith(":CLAUDE.md") && c.text.includes("Your entire assignment is in"))).toBe(true);
     expect(tools.some((c) => c.text.includes("Read a Jira issue"))).toBe(true);
     expect(docs.some((c) => c.text.includes("The agent model"))).toBe(true);
     expect(nudges.every((c) => c.text.includes("your PR's review state changed"))).toBe(true);
+
+    // The exclusion list itself is non-vacuous, and actually excludes
+    // something the covered channels above would otherwise sweep in.
+    expect(EXCLUSIONS.length).toBeGreaterThan(0);
+    expect(EXCLUSIONS.some((e) => e.path === "CHANGELOG.md")).toBe(true);
   });
 
   test("the forbidden reviewDecision+headRefOid pair appears in no covered channel", () => {
@@ -130,16 +171,19 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
   });
 
   // A pure negative guard permits deleting the instruction entirely, so
-  // every channel that DOES instruct an agent on merging must also name the
+  // every channel EXPLICITLY named as merge-instructing must also name the
   // field that actually matters (`reviews[].commit.oid`) and the
-  // last-decisive-review ordering — not just avoid the old pair. This is
-  // explicit about WHICH channels instruct on merging (built from the same
-  // channel-producing functions above, not inferred by scanning content for
-  // a word like "merge" — that would just rebuild the bare-vs-namespaced
-  // trap in a new shape).
-  test("every channel that instructs on merging names reviews[].commit.oid and the last-decisive ordering", () => {
-    const briefs = briefChannels().filter((c) => c.label === "brief:Story" || c.label === "brief:Task");
-    const docs = docChannels();
+  // last-decisive-review ordering — not just avoid the old pair. Verified by
+  // mutation: stripping `reviews[].commit.oid` from the rendered nudge (not
+  // its source comment) turns this assertion red — see the PR description's
+  // "direction 2" mutation.
+  test("every channel explicitly named as merge-instructing names reviews[].commit.oid and the last-decisive ordering", () => {
+    const briefs = briefChannels().filter((c) => MERGE_INSTRUCTING_BRIEFS.includes(c.label));
+    expect(briefs.length).toBe(MERGE_INSTRUCTING_BRIEFS.length); // the explicit list actually matched something
+
+    const docs = docChannels().filter((c) => MERGE_INSTRUCTING_DOCS.includes(c.label.replace(/^docs\//, "")));
+    expect(docs.length).toBe(MERGE_INSTRUCTING_DOCS.length);
+
     const nudges = nudgeChannels();
 
     for (const c of [...briefs, ...docs, ...nudges]) {
