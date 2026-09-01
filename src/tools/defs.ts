@@ -2,6 +2,7 @@ import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc, getProjectDoc, setProjectDoc } from "./docs.js";
+import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER,
@@ -159,7 +160,11 @@ export function atlassianTools(
       handler: (a, c) => {
         const { from, to, type } = a as { from: string; to: string; type?: string };
         const resolvedType = type ?? "Implements";
-        audit(c, `link ${from} → ${to} (${resolvedType}) [deprecated alias; use new_worker/adopt_worker for an Implements link]`);
+        const cls = classifyLinkIssues(resolvedType);
+        const note = cls === "sanctioned"
+          ? "non-Implements link type; still the only route for it"
+          : "Implements-type call; either drift toward new_worker/adopt_worker or a deliberate boss-reassignment override — not distinguishable from arguments alone";
+        audit(c, `link ${from} → ${to} (${resolvedType}) — ${note} ${aliasTag("jira_link_issues", cls)}`);
         return ops.linkIssues(from, to, resolvedType).then((r) => {
           noted(c, [from, to]); // a link bumps `updated` on BOTH ends
           return orOk(r, { ok: true, from, to, type: resolvedType });
@@ -186,7 +191,7 @@ export function atlassianTools(
         'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), submit_to_boss (→ In Review on your OWN ticket, no args), or finish_without_a_boss (→ Done on your OWN ticket, no args, ONLY when you have no boss). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
         'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
-      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
+      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss] ${aliasTag("jira_transition", "drift")}`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description:
@@ -203,6 +208,12 @@ export function atlassianTools(
           parent?: string; labels?: string[]; assignee?: string; priority?: string; implements?: string;
         };
 
+        // Decided up front, from `issuetype`/`implements` alone, so every audit line below
+        // (including the two REFUSED ones, before `orphan`/`target` are even resolved) agrees —
+        // see classifyCreateIssue's own doc comment (src/tools/alias-audit.ts) for the rule.
+        const cls = classifyCreateIssue(p.issuetype, p.implements);
+        const clsTag = aliasTag("jira_create_issue", cls);
+
         // (1) Assign by role, regardless of parent — an explicit `assignee` always wins.
         // A refusal is still something a connection did, so it gets its own audit line
         // before the throw — otherwise the operator watching the daemon log sees nothing.
@@ -211,7 +222,7 @@ export function atlassianTools(
           assignee = p.issuetype === "Story" ? roles.story : roles.task;
           if (!assignee) {
             const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker]`);
+            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker] ${clsTag}`);
             throw new Error(noAssigneeMsg(p.issuetype));
           }
         }
@@ -228,7 +239,7 @@ export function atlassianTools(
           } else if (p.parent) {
             target = p.parent;
           } else {
-            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker]`);
+            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker] ${clsTag}`);
             throw new Error(noTargetMsg(p.issuetype));
           }
         }
@@ -236,12 +247,14 @@ export function atlassianTools(
         // (4) Audit line: type/parent, resolved target ("orphan by request" for the opt-out), resolved assignee.
         // An Epic, and a deliberate orphan, have no successor at all (new_worker
         // never creates an Epic — Epics are the human's — and has no orphan
-        // route by design); the deprecation note says so only for the linked
-        // Story/Task case, where new_worker genuinely does replace this.
+        // route by design) — SANCTIONED, not drift, even though the human-facing
+        // text still says "no successor" for readability. Only the linked
+        // Story/Task case, where new_worker genuinely does replace this, is DRIFT.
         let line = `create ${p.issuetype} under ${p.parent ?? "(none)"}`;
         if (p.issuetype !== "Epic") line += orphan ? " orphan by request" : ` implements ${target}`;
         if (assignee) line += ` → ${truncAccountId(assignee)}`;
         line += p.issuetype !== "Epic" && !orphan ? " [deprecated alias; use new_worker]" : " [deprecated alias; no successor for this case]";
+        line += ` ${clsTag}`;
         audit(c, line);
 
         const created = (await ops.createIssue({
@@ -283,7 +296,7 @@ export function atlassianTools(
       input: { key: z.string(), priority: z.string() },
       handler: (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
-        audit(c, `priority ${key} → ${priority} [deprecated alias; use prioritize_worker]`);
+        audit(c, `priority ${key} → ${priority} [deprecated alias; use prioritize_worker] ${aliasTag("jira_set_priority", "drift")}`);
         return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, priority }); });
       },
     },
@@ -309,7 +322,7 @@ export function atlassianTools(
           const resolved = role === "story" ? roles.story : roles.task;
           if (!resolved) {
             const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker]`);
+            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker] ${aliasTag("jira_assign", "ambiguous")}`);
             throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
           }
           accountId = resolved;
@@ -318,7 +331,7 @@ export function atlassianTools(
           accountId = assignee;
           label = truncAccountId(assignee);
         }
-        audit(c, `assign ${key} → ${label} [deprecated alias; use adopt_worker]`);
+        audit(c, `assign ${key} → ${label} [deprecated alias; use adopt_worker — unless this is a raw reassignment that isn't an adoption, which stays sanctioned] ${aliasTag("jira_assign", "ambiguous")}`);
         return ops.assign(key, accountId).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, assignee: accountId }); });
       },
     },
@@ -329,7 +342,7 @@ export function atlassianTools(
       input: { spaceId: z.string(), title: z.string(), body: z.string(), parentId: z.string().optional() },
       handler: (a, c) => {
         const p = a as { spaceId: string; title: string; body: string; parentId?: string };
-        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
+        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""} [deprecated alias; use set_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_create_page", "ambiguous")}`);
         return ops.createPage(p);
       },
     },
@@ -340,7 +353,7 @@ export function atlassianTools(
       input: { id: z.string(), body: z.string(), title: z.string().optional() },
       handler: (a, c) => {
         const p = a as { id: string; body: string; title?: string };
-        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
+        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""} [deprecated alias; use set_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_update_page", "ambiguous")}`);
         return ops.updatePage(p).then((r) => orOk(r, { ok: true, id: p.id }));
       },
     },
@@ -388,7 +401,7 @@ export function atlassianTools(
         "DEPRECATED for a ticket's own doc — use get_doc, which resolves the page id for you (the caller's own by default, or another ticket's by key) instead of making you discover and hand-carry a page id. Still the general-purpose way to read a page that ISN'T reached through a ticket. " +
         "Read a Confluence page by id (storage body). The result adds `bodyRequested: true` and `bodyLength` (the storage body's character count) to the usual fields — `bodyLength: 0` means the page genuinely has an empty body, distinguishable from a body the API never returned at all.",
       input: { id: z.string() },
-      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id} [deprecated alias; use get_doc for a ticket's own doc]`); return ops.getPage(id); },
+      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id} [deprecated alias; use get_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_get_page", "ambiguous")}`); return ops.getPage(id); },
     },
     confluence_list_spaces: {
       description: "List Confluence spaces (to find a spaceId).",
