@@ -24,7 +24,7 @@ export interface Facts {
 export interface Verdict { ok: boolean; reason: string }
 export interface GateResult { required: boolean; bump: Bump | null; verdicts: Verdict[]; ok: boolean }
 
-const GATED = [/^src\//, /^schema\//, /^package\.json$/];
+const GATED = [/^src\//, /^schema\//, /^package\.json$/, /^briefs\//];
 export const requiresRelease = (files: string[]) => files.some((f) => GATED.some((r) => r.test(f)));
 
 /** Every changelog entry version in `changelog` that isn't already in `base` — i.e. a heading this branch added. */
