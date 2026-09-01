@@ -126,16 +126,22 @@ describe("a second, deliberately non-issue-shaped resource type — runResourceL
   test("byte-identical polls still notify when the type's OWN verdict says changed — a loop that diffed T itself could never see this", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
-    // Poll 1 -> poll 2: W1 is BYTE-IDENTICAL. A second, ticking widget is
-    // included only so the overall snapshot hash changes and the underlying
-    // watch() library actually re-runs onChange — it says nothing about W1.
+    // Poll 1 -> poll 2: W1 is BYTE-IDENTICAL. A second, ticking widget rides
+    // along too, but says nothing about W1 either — since BUTCHR-57's `hash`
+    // override on `runResourceLoop`'s own `watch()` call forces `onChange` to
+    // run on EVERY poll tick regardless of whether the fetched snapshot's
+    // content actually differs, TICK is no longer load-bearing for onChange
+    // to re-run; it stays only as a second, deliberately-ignored resource,
+    // reinforcing that the type's OWN verdict — not the loop's own diffing —
+    // is what decides "changed".
     const polls: Widget[][] = [
       [{ id: "W1", payload: "same" }, { id: "TICK", payload: "0" }],
       [{ id: "W1", payload: "same" }, { id: "TICK", payload: "1" }],
     ];
-    // Exactly one onChange transition happens for this two-snapshot sequence
-    // (the first fetch is the baseline; the second is the only diff the
-    // underlying watch() ever sees before the polls repeat) — one entry.
+    // `changedPerPoll` has one entry, clamped by `Math.min(pollCall, ...)` in
+    // `widgetResourceType` above, so every onChange call — however many the
+    // hash override drives across this test's ~60ms window — answers with
+    // the same verdict: W1 changed, TICK didn't.
     const resourceType = widgetResourceType(polls, [["W1"]]);
     const stop = runResourceLoop(resourceType, {
       herd,
