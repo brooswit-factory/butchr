@@ -134,6 +134,12 @@ function makeWorld() {
       i.labels = [...new Set([...i.labels, ...labels])];
       return { ok: true };
     },
+    removeLabels: async (key: string, labels: readonly string[]) => {
+      const i = requireIssue(key);
+      const toRemove = new Set(labels);
+      i.labels = i.labels.filter((l) => !toRemove.has(l));
+      return { ok: true };
+    },
     deleteIssue: async (key: string) => {
       if (!issues.delete(key)) throw new Error(`fake world: no such issue ${key}`);
       return { ok: true };
@@ -371,6 +377,125 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
     expect(issues.get("BUTCHR-2")!.status).toBe("Done");
   });
 
+});
+
+describe("start_worker / finish_worker / adopt_worker: BUTCHR-58 — butchr:shelved means CURRENTLY shelved, so reactivating withdraws it", () => {
+  test("start_worker on a worker carrying butchr:shelved removes it BEFORE transitioning (the ordering IS the design decision)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do", labels: [EXEMPT_LABEL, "team:infra"] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await startWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(calls).toEqual(["removeLabels", "transition"]); // order pinned, not just presence
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+    expect(w.labels).toContain("team:infra"); // only the exemption is removed, nothing else
+  });
+
+  test("start_worker on a worker WITHOUT the label makes no removeLabels call at all — zero extra cost for the common case", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await startWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+  });
+
+  test("finish_worker on a worker carrying butchr:shelved removes it BEFORE transitioning to Done — same ordering as start_worker", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: [EXEMPT_LABEL] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await finishWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(calls).toEqual(["removeLabels", "transition"]);
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("Done");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+
+  test("finish_worker on a worker WITHOUT the label makes no removeLabels call at all", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await finishWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+  });
+
+  test("adopt_worker with disposition \"start\" on a ticket carrying the label clears it (fresh adoption)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [EXEMPT_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+
+  test("adopt_worker with disposition \"start\" clears a stale label even on an otherwise fully idempotent re-adoption (already linked, assigned, In Progress)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Already fully adopted by every OTHER measure — this is the residue case:
+    // alreadyAdopted would be true by the old definition, and a naive
+    // "skip everything when alreadyAdopted" implementation reproduces the bug.
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.story, status: "In Progress", labels: [EXEMPT_LABEL] });
+    let assignCalls = 0, linkCalls = 0, transitionCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(assignCalls).toBe(0); // already correct — no redundant write
+    expect(linkCalls).toBe(0); // already correct — no redundant write
+    expect(transitionCalls).toBe(0); // already In Progress — no redundant write
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(EXEMPT_LABEL); // but the stale label is still cleared
+  });
+
+  test("adopt_worker with disposition \"shelve\" still SETS the label — existing behaviour does not regress", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("To Do");
+    expect(w.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("THE ROUND TRIP IS THE BUG: shelve_worker then start_worker leaves the ticket's label set with no trace of the exemption", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(issues.get("BUTCHR-2")!.labels).toContain(EXEMPT_LABEL);
+    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+});
+
+describe("start_worker / finish_worker / prioritize_worker / tell_worker: ownership refusal (continued)", () => {
   test("prioritize_worker refuses a stranger's key AND the caller's OWN key, distinctly", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });

@@ -53,7 +53,9 @@ every ticket you write.
    Progress, whether you're reactivating one you shelved once its condition
    is met, or pulling one back from In Review because it isn't actually
    done — a shelved child being started later by its epic is the normal
-   life of a deliberately shelved story, not an edge case.
+   life of a deliberately shelved story, not an edge case. Reactivating also
+   withdraws the `butchr:shelved` exemption `shelve_worker` set, so the
+   detector starts watching the story again.
 3. You are the quality gate. When a story reaches **In Review**, review its
    result against the epic's acceptance criteria — a green test gate is
    evidence about the gate, not about whether the ticket's actual acceptance

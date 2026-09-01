@@ -29,12 +29,23 @@ export const MARKER = "[butchr:parked]";
  * exemption for a deliberately-shelved backlog item under a live boss (the
  * one real false positive; KAN-839 is the live example). Named for the STATE
  * ("a boss put this down on purpose"), not the detector — it reads correctly
- * to a reader who doesn't know this detector exists, and is the vocabulary
- * BUTCHR-25's proposed `shelve_worker` is standardising on, so if that ships
- * it can set this same label with no rename. Any actor may SET it — a human
- * today, a shelving tool in future — but it is read-only for the daemon: see
+ * to a reader who doesn't know this detector exists. It means CURRENTLY
+ * shelved: a decision in force right now, set when the decision is made and
+ * CLEARED when the decision is reversed — a state, not a history (BUTCHR-50).
+ *
+ * Any actor may SET it — a human by hand, or `shelve_worker`
+ * (src/tools/relationship.ts), which is the vocabulary this detector's label
+ * standardises on. It is READ-ONLY FOR THE DAEMON: the poll loop and
+ * `sweepStaleAgentLabels` (src/labels/sweep.ts) never add or remove it — see
  * the guarding comment next to `isDaemonLabel` in src/labels/plan.ts, and the
- * pinned test in test/unit/labels-plan.test.ts.
+ * pinned test in test/unit/labels-plan.test.ts. It is NOT read-only for
+ * everyone: `start_worker`/`finish_worker`/`adopt_worker(..., "start")`
+ * (src/tools/relationship.ts) clear it as part of reversing the decision it
+ * records — the verb that withdraws a declaration is the one that made it
+ * meaningful, and it is a daemon TOOL, not the daemon's own poll/sweep
+ * machinery, that owns that lifecycle. A label set BY HAND is never cleared
+ * for anybody; whoever sets one that way owns clearing it when the ticket is
+ * reactivated.
  */
 export const EXEMPT_LABEL = "butchr:shelved";
 
@@ -158,7 +169,7 @@ function stage1Comment(child: string, elapsedMinutes: number): string {
     `${MARKER} ${child} has been assigned and linked to this ticket, in To Do, for ${elapsedMinutes} minutes; no agent is running for a To Do ticket.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, shelve ${child} with \`shelve_worker\` and this will stop — it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but only \`shelve_worker\` withdraws it for you.`,
     "",
     `fingerprint: ${child}`,
     "stage: 1",
@@ -170,7 +181,7 @@ function stage2Comment(child: string, elapsedMinutes: number): string {
     `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked. This is a follow-up.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, shelve ${child} with \`shelve_worker\` and this will stop — it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but only \`shelve_worker\` withdraws it for you.`,
     "",
     `fingerprint: ${child}`,
     "stage: 2",
@@ -182,7 +193,7 @@ function stage3EscalatedComment(child: string, boss: string, elapsedMinutes: num
     `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked, under ${boss} — which has not acted on two prior notices there.`,
     "",
     `Prompt ${boss} to transition ${child} to In Progress (or close it).`,
-    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, shelve ${child} with \`shelve_worker\` and this will stop — it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but only \`shelve_worker\` withdraws it for you.`,
     "",
     `fingerprint: ${child}`,
     "stage: 3",
@@ -194,7 +205,7 @@ function stage3TerminalComment(child: string, elapsedMinutes: number): string {
     `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked, and this ticket has no boss of its own to escalate to further.`,
     "",
     `Transition ${child} to In Progress (or close it) to activate it.`,
-    `If this is deliberate, add the \`${EXEMPT_LABEL}\` label to ${child} and this will stop.`,
+    `If this is deliberate, shelve ${child} with \`shelve_worker\` and this will stop — it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but only \`shelve_worker\` withdraws it for you.`,
     "",
     `fingerprint: ${child}`,
     "stage: 3",
