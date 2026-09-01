@@ -81,17 +81,27 @@ export interface LoopDeps {
   /**
    * BUTCHR-24: run the parked-ticket detector (src/agents/parked.ts) over
    * this poll's already-fetched (issues, related) snapshot. Called from
-   * inside the observe function below, NEVER from `watch()`'s `onChange`
-   * callback: `@brooswit/sundry`'s `watch()` only invokes `onChange` when
-   * the polled snapshot's hash differs from the previous one — documented in
-   * the published package's `dist/watch/watcher.d.ts` ("call `onChange(next,
-   * prev)` whenever the hash of its return value changes") and confirmed
-   * against the compiled implementation in `dist/index.js`, whose internal
-   * `observe()` returns early via `if (h !== prevHash)` before ever calling
-   * `onChange` — so a detector
-   * wired into `onChange` would silently stop firing on any poll whose
-   * snapshot happens not to change — exactly the "the fix doesn't survive a
-   * quiet poll" failure mode this ticket exists to remove. Optional;
+   * inside the observe function below, NOT from `watch()`'s `onChange`
+   * callback, because this is fetch-stage work operating on the snapshot
+   * `observe()` just produced — it belongs alongside `syncLabels` above, not
+   * downstream in the diff/notify stage.
+   *
+   * BUTCHR-57 UPDATE: the reason this placement used to be load-bearing no
+   * longer applies IN THIS LOOP. `@brooswit/sundry`'s `watch()` by DEFAULT
+   * only invokes `onChange` when the polled snapshot's hash differs from the
+   * previous one — documented in the published package's
+   * `dist/watch/watcher.d.ts` ("call `onChange(next, prev)` whenever the
+   * hash of its return value changes") and confirmed against the compiled
+   * implementation in `dist/index.js`, whose internal `observe()` returns
+   * early via `if (h !== prevHash)` before ever calling `onChange`. THIS loop
+   * no longer relies on that default: the `hash` option passed to `watch()`
+   * below (see `notifyTick`) forces `observe()`'s `h !== prevHash` branch to
+   * always be taken, so `onChange` now runs on every poll tick regardless of
+   * whether anything changed. A detector wired into `onChange` here would no
+   * longer silently stop firing on a quiet poll. That does not make
+   * `checkParked` a candidate to move, though: it still belongs in the fetch
+   * stage on its own merits (it consumes the same freshly-fetched snapshot
+   * as `syncLabels`, before any diffing happens), so it stays here. Optional;
    * omitted, parked-ticket detection simply never runs. The detector itself
    * never throws (see parked.ts), but this call is awaited inside the same
    * try-implicit observe function as `syncLabels` above, so a change to that
@@ -241,16 +251,20 @@ export function startLoop(deps: LoopDeps): Stop {
   // forcing `onChange` (the notify stage) to run on EVERY poll rather than
   // only when the fetched Snapshot's content-hash differs from last time.
   // Without this, a quiet fleet (nothing changed in Jira for hours) would
-  // never invoke `onChange` at all — the same "silently stops firing on a
-  // quiet poll" trap `checkParked` above is deliberately kept OUT of
-  // `onChange` to avoid, except here the notify stage's own job (diffing
-  // `prev`/`next` and sending nudges) genuinely belongs in `onChange`, so the
-  // fix is to make `onChange` unconditional instead of moving its work out.
-  // `prev`/`next` stay correct either way: `watch()`'s own baseline tracking
-  // (`prevValue`) is untouched by this — only the change-detection hash is
-  // forced to always differ, so `observe()`'s `h !== prevHash` branch is
-  // always taken (confirmed against `@brooswit/sundry`'s compiled
-  // `observe()`) and it still passes the REAL previous/current snapshots.
+  // never invoke `onChange` at all, and the notify component of `/health`
+  // (see `onNotifySuccess` on `LoopDeps`) would have no way to distinguish
+  // "healthy and idle" from "stuck" — this is why `checkParked`'s own doc
+  // comment above now flags that `onChange` is no longer change-gated in
+  // THIS loop. `checkParked` itself is unaffected and stays in the fetch
+  // stage regardless (see that comment) — the notify stage's own job
+  // (diffing `prev`/`next` and sending nudges) is what genuinely belongs in
+  // `onChange`, so the fix here is to make `onChange` unconditional rather
+  // than move work out of it. `prev`/`next` stay correct either way:
+  // `watch()`'s own baseline tracking (`prevValue`) is untouched by this —
+  // only the change-detection hash is forced to always differ, so
+  // `observe()`'s `h !== prevHash` branch is always taken (confirmed against
+  // `@brooswit/sundry`'s compiled `observe()`) and it still passes the REAL
+  // previous/current snapshots.
   let notifyTick = 0;
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
