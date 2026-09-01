@@ -13,9 +13,14 @@
  *      route: it prints a `uid:` and `cgroup:` field for EVERY listening
  *      socket, including ones owned by a different Unix user that an
  *      unprivileged `ss -ltnp` shows with no process at all). Never assumes
- *      a socket is a butchr daemon from its port — every candidate is
- *      confirmed with a live GET to its own `http://localhost:<port>/health`,
- *      checked against the daemon's actual response shape (src/web/view.ts).
+ *      a socket is a butchr daemon from its port — every listener gets a
+ *      live GET to its own `http://localhost:<port>/health`, checked
+ *      against the daemon's actual response shape (src/web/view.ts).
+ *      Confirmed-daemon-shaped listeners are then split by unit name
+ *      (`partitionCandidates`): a `butchr.service` unit is aggregated; any
+ *      other unit (a different daemon sharing this org's `/health`
+ *      convention — a live `herdr.service` was observed doing exactly this)
+ *      is printed as an explicitly SKIPPED CANDIDATE rather than vanishing.
  *   2. `src/agents/ground-truth.ts`'s own `parseCgroup` — already pure,
  *      already fixture-tested — turns each confirmed daemon's cgroup path
  *      into a systemd unit + the journalctl invocation for it. Reused
@@ -100,20 +105,35 @@ export interface JournalInvocation {
  * it would silently read OUR OWN matching unit (if we happen to run one
  * too) and mislabel that as the foreign identity's log — a wrong-daemon
  * failure sharper than the "-- No entries --" one, because it comes back
- * non-empty. So a foreign uid ALWAYS drops `--user` and queries the
- * system-level view instead (filtered by `_UID=` so multiple uids running
- * a same-named unit don't conflate) — the one vantage that could ever see
- * a foreign user's persisted journal, and the one that needs
- * `adm`/`systemd-journal` to actually do so.
+ * non-empty. So a foreign uid ALWAYS drops `--user`.
+ *
+ * The match FIELD for the foreign, system-level query depends on
+ * `systemd.kind`, and getting this wrong is silent in exactly the way the
+ * rest of this file guards against: `-u <unit>` matches `_SYSTEMD_UNIT`,
+ * but a USER unit's journal entries carry `_SYSTEMD_UNIT=user@<uid>.service`
+ * and the unit name itself only in `_SYSTEMD_USER_UNIT=<unit>` — so `-u
+ * <unit>` matches NOTHING for a user unit, with or without permission.
+ * Verified live, unprivileged, against a journal this reader can definitely
+ * read: `journalctl -u butchr.service _UID=<own uid>` returns "-- No
+ * entries --" while `journalctl _SYSTEMD_USER_UNIT=butchr.service
+ * _UID=<own uid>` returns real lines. A system unit's entries DO carry
+ * `_SYSTEMD_UNIT=<unit>`, so `-u <unit>` is correct there. `_UID=` is
+ * always added (so multiple uids running a same-named unit don't conflate)
+ * — the one vantage that could ever see a foreign user's persisted
+ * journal, and the one that needs `adm`/`systemd-journal` to actually do so.
  */
 export function journalInvocationFor(systemd: SystemdInfo, targetUid: number, readerUid: number): JournalInvocation {
   if (systemd.kind === "none") return { command: "", note: "not running under a systemd unit — no journal to read" };
   if (targetUid === readerUid) {
     return { command: systemd.journalctl, note: "own identity — using this unit's own recommended invocation" };
   }
+  const unitMatch = systemd.kind === "user" ? `_SYSTEMD_USER_UNIT=${systemd.unit}` : `-u ${systemd.unit}`;
   return {
-    command: `journalctl -u ${systemd.unit} _UID=${targetUid}`,
-    note: "foreign identity — `--user` cannot cross users, so this queries the system-level view (needs adm/systemd-journal to see anything for a uid that isn't ours)",
+    command: `journalctl ${unitMatch} _UID=${targetUid}`,
+    note:
+      systemd.kind === "user"
+        ? "foreign identity, user unit — `--user`/`-u` cannot cross users or match a user unit's own field, so this matches `_SYSTEMD_USER_UNIT` at the system level (needs adm/systemd-journal to see anything for a uid that isn't ours)"
+        : "foreign identity, system unit — `--user` cannot cross users, so this queries the system-level view (needs adm/systemd-journal to see anything for a uid that isn't ours)",
   };
 }
 
@@ -273,23 +293,50 @@ export function formatReport(identities: IdentityReport[], result: VerdictResult
 // ---------------------------------------------------------------------------
 
 /**
- * Cheap pre-filter, before any network probe: is this listener's cgroup
- * even a `butchr.service` unit at all? ENVIRONMENT.md is explicit that
- * every butchr daemon in this fleet — any host, any uid — runs as a unit
- * literally named `butchr.service`; that is a fact about how the fleet is
- * deployed, not a hardcoded port or a guessed default (`src/config/
- * config.ts`'s port default is exactly the guess this script must not
- * make). Narrowing on the unit name first both skips the unrelated local
- * services a host always has (ssh, cups, tailscale, …) and avoids
- * mistaking a same-shaped `/health` response on a DIFFERENT daemon in this
- * org's stack (e.g. herdr, observed live on this host sharing the same
- * `{ok, components}` convention) for a butchr identity. `/health` below
- * still does the real confirmation — this only decides who's worth asking.
+ * Is this listener's cgroup a `butchr.service` unit at all? ENVIRONMENT.md
+ * is explicit that every butchr daemon in this fleet — any host, any uid —
+ * runs as a unit literally named `butchr.service`; that is a fact about how
+ * the fleet is deployed, not a hardcoded port or a guessed default
+ * (`src/config/config.ts`'s port default is exactly the guess this script
+ * must not make). This exists because a `/health` shape check ALONE
+ * over-matches: a live `herdr.service` on this host answers the same
+ * `{ok, components}` convention. But the unit-name check is never used to
+ * SKIP a network probe (see `partitionCandidates` below) — only to decide,
+ * after a listener is already confirmed daemon-shaped, whether it's ours to
+ * aggregate or a same-shaped different daemon worth naming instead of
+ * silently dropping.
  */
 export function looksLikeButchrUnit(cgroup: string | null): boolean {
   if (!cgroup) return false;
   const info = parseCgroup(cgroup);
   return info.kind !== "none" && info.unit === "butchr.service";
+}
+
+/**
+ * Split every `/health`-confirmed daemon-shaped listener into ours
+ * (`butchr`) and everyone else's (`skipped`). PURE — the network probe
+ * already happened; this only classifies the listeners it returned true
+ * for. Never drop a confirmed-live, daemon-shaped responder silently: a
+ * host running a butchr daemon under some other unit name would otherwise
+ * vanish from the report with the verdict still claiming "every identity
+ * was read" — the discovery-side version of the exact silent-miss failure
+ * this ticket exists to kill on the readability side. `skipped` is
+ * reported (see `main`) but does not by itself change the verdict — an
+ * unrelated daemon-shaped service sharing this org's `/health` convention
+ * is not evidence about alias calls one way or the other.
+ */
+export function partitionCandidates(healthConfirmed: SsListener[]): { butchr: SsListener[]; skipped: SsListener[] } {
+  const butchr: SsListener[] = [];
+  const skipped: SsListener[] = [];
+  for (const l of healthConfirmed) (looksLikeButchrUnit(l.cgroup) ? butchr : skipped).push(l);
+  return { butchr, skipped };
+}
+
+/** Render a skipped candidate's unit for the human-readable report — never asserts a name the cgroup didn't actually carry. */
+export function describeSkippedUnit(cgroup: string | null): string {
+  if (!cgroup) return "(no cgroup reported)";
+  const info = parseCgroup(cgroup);
+  return info.kind === "none" ? "(not a systemd unit)" : info.unit;
 }
 
 async function isButchrHealth(port: number): Promise<boolean> {
@@ -327,12 +374,18 @@ async function main(): Promise<void> {
   const ssOutput = execFileSync("ss", ["-ltne"], { encoding: "utf8" });
   const listeners = parseSsListeners(ssOutput);
 
-  // Never confirmed by port — only by the unit-name pre-filter above, then a
-  // live /health round trip against exactly that pre-filtered set.
-  const candidates = listeners.filter((l) => looksLikeButchrUnit(l.cgroup));
-  const confirmed: SsListener[] = [];
-  for (const l of candidates) {
-    if (await isButchrHealth(l.port)) confirmed.push(l);
+  // Never confirmed by port — every listener gets a live /health round trip;
+  // the unit-name check only sorts the confirmed-daemon-shaped ones afterward
+  // (see partitionCandidates) so a same-shaped non-butchr daemon is named
+  // instead of silently vanishing.
+  const healthConfirmed: SsListener[] = [];
+  for (const l of listeners) {
+    if (await isButchrHealth(l.port)) healthConfirmed.push(l);
+  }
+  const { butchr: confirmed, skipped } = partitionCandidates(healthConfirmed);
+
+  for (const s of skipped) {
+    console.log(`SKIPPED CANDIDATE: port ${s.port} uid=${s.uid ?? "unknown"} unit=${describeSkippedUnit(s.cgroup)} — /health responded daemon-shaped but the unit isn't butchr.service; not aggregated`);
   }
 
   // A daemon can listen on more than one socket; group by (uid, cgroup) so it's
@@ -366,7 +419,11 @@ async function main(): Promise<void> {
     const systemd = parseCgroup(identity.cgroup);
     const unit = systemd.kind === "none" ? "(none)" : systemd.unit;
     const invocation = journalInvocationFor(systemd, identity.uid, readerUid);
-    const liveNow = await Promise.race(identity.ports.map(isButchrHealth));
+    // Promise.all, never Promise.race: race resolves on the first SETTLED
+    // promise, so a fast `false` from one socket could beat a slower `true`
+    // from another and understate liveness — `some` is exact regardless of
+    // which port answers first.
+    const liveNow = (await Promise.all(identity.ports.map(isButchrHealth))).some(Boolean);
 
     if (!invocation.command) {
       reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome: { readable: false, reason: invocation.note } }));

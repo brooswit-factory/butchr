@@ -3,11 +3,14 @@ import {
   buildIdentityReport,
   computeVerdict,
   decideReadability,
+  describeSkippedUnit,
   formatReport,
   journalInvocationFor,
   looksLikeButchrUnit,
   parseSsListeners,
+  partitionCandidates,
   type IdentityReport,
+  type SsListener,
 } from "../../scripts/audit-alias-calls.js";
 
 // A REAL `ss -ltne` transcript, captured live on the host this ticket was
@@ -70,6 +73,37 @@ describe("looksLikeButchrUnit", () => {
   });
 });
 
+describe("partitionCandidates — a same-shaped non-butchr daemon is named, never silently dropped", () => {
+  const butchrListener: SsListener = { port: 7717, uid: 1001, cgroup: "/user.slice/user-1001.slice/user@1001.service/app.slice/butchr.service" };
+  const herdrListener: SsListener = { port: 7719, uid: 1002, cgroup: "/user.slice/user-1002.slice/user@1002.service/app.slice/herdr.service" };
+
+  test("a butchr.service listener goes in `butchr`", () => {
+    expect(partitionCandidates([butchrListener])).toEqual({ butchr: [butchrListener], skipped: [] });
+  });
+
+  // REQUIRED (review finding #2): a health-confirmed, daemon-shaped listener whose
+  // unit is NOT butchr.service must still surface — as `skipped`, not vanish. If this
+  // ever returns `{ butchr: [], skipped: [] }` for a herdr listener, the failure it
+  // catches is real: an operator sees "0 identities" instead of "1 skipped".
+  test("a health-confirmed listener under a different unit goes in `skipped`, not dropped", () => {
+    expect(partitionCandidates([herdrListener])).toEqual({ butchr: [], skipped: [herdrListener] });
+  });
+
+  test("a mix is partitioned correctly", () => {
+    expect(partitionCandidates([butchrListener, herdrListener])).toEqual({ butchr: [butchrListener], skipped: [herdrListener] });
+  });
+});
+
+describe("describeSkippedUnit", () => {
+  test("names the real unit from the cgroup", () => {
+    expect(describeSkippedUnit("/user.slice/user-1002.slice/user@1002.service/app.slice/herdr.service")).toBe("herdr.service");
+  });
+  test("is honest when there's no cgroup or no systemd unit at all — never guesses a name", () => {
+    expect(describeSkippedUnit(null)).toBe("(no cgroup reported)");
+    expect(describeSkippedUnit("0::/")).toBe("(not a systemd unit)");
+  });
+});
+
 describe("journalInvocationFor", () => {
   const userUnit = { kind: "user" as const, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" };
   const systemUnit = { kind: "system" as const, unit: "butchr.service", journalctl: "journalctl -u butchr.service" };
@@ -78,14 +112,28 @@ describe("journalInvocationFor", () => {
     expect(journalInvocationFor(userUnit, 1001, 1001).command).toBe("journalctl --user -u butchr.service");
   });
 
-  test("foreign identity: NEVER uses --user (it would silently read the reader's own session) — drops to the system-level view, scoped by _UID", () => {
+  // REQUIRED (blocking review finding): `-u <unit>` matches `_SYSTEMD_UNIT`, but a
+  // USER unit's own entries carry `_SYSTEMD_UNIT=user@<uid>.service` and the unit
+  // name only in `_SYSTEMD_USER_UNIT=<unit>` — so `-u <unit>` matches NOTHING for a
+  // user unit, with or without privilege. Verified live: `journalctl -u
+  // butchr.service _UID=<own uid>` returned "-- No entries --" against a journal
+  // that `journalctl _SYSTEMD_USER_UNIT=butchr.service _UID=<own uid>` reads fine,
+  // unprivileged. So this asserts the FIELD the command scopes by, not the exact
+  // string this implementation happens to produce — a test asserting the old
+  // (wrong) string would have passed while the invocation matched nothing.
+  test("foreign identity, USER unit: NEVER --user (would silently read the reader's own session), and matches _SYSTEMD_USER_UNIT — NOT -u/_SYSTEMD_UNIT, which cannot match a user unit's entries at all", () => {
     const inv = journalInvocationFor(userUnit, 1002, 1001);
-    expect(inv.command).toBe("journalctl -u butchr.service _UID=1002");
     expect(inv.command).not.toContain("--user");
+    expect(inv.command).toContain("_SYSTEMD_USER_UNIT=butchr.service");
+    expect(inv.command).not.toMatch(/(^|\s)-u\s/);
+    expect(inv.command).toContain("_UID=1002");
   });
 
-  test("a system unit for a foreign uid still queries system-level, scoped by _UID", () => {
-    expect(journalInvocationFor(systemUnit, 1002, 1001).command).toBe("journalctl -u butchr.service _UID=1002");
+  test("foreign identity, SYSTEM unit: matches -u/_SYSTEMD_UNIT (correct for a system unit), not _SYSTEMD_USER_UNIT", () => {
+    const inv = journalInvocationFor(systemUnit, 1002, 1001);
+    expect(inv.command).toMatch(/(^|\s)-u\s+butchr\.service(\s|$)/);
+    expect(inv.command).not.toContain("_SYSTEMD_USER_UNIT");
+    expect(inv.command).toContain("_UID=1002");
   });
 
   test("not under systemd at all: no command to run, said honestly", () => {
