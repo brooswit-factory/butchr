@@ -25,6 +25,7 @@ import { createStalledCheck } from "../agents/stalled.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
+import { prReviewStateNudge } from "../agents/pr-nudge.js";
 
 let config;
 try {
@@ -226,7 +227,7 @@ startLoop({
   herd,
   notify: async (issue, about, reason) => {
     const msg = reason?.pr
-      ? `[butchr] ${issue}: your PR's review state changed pr:${reason.pr.from ?? "none"} → pr:${reason.pr.to}. Verify with gh pr view <n> --json reviewDecision,headRefOid and act: approved → merge your own PR; changes-requested → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.`
+      ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
       : about === issue
         ? `[butchr] Ticket ${issue} was updated — re-read it.`
         : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
