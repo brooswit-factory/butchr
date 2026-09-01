@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { evaluate, type Facts } from "../../scripts/release/gate.js";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { evaluate, requiresRelease, type Facts } from "../../scripts/release/gate.js";
 import { parseFragment, type Fragment } from "../../scripts/release/fragments.js";
+
+const ROOT = join(import.meta.dir, "..", "..");
 
 const frag = (path: string, body: string): Fragment => parseFragment(path, body);
 const log = (versions: string[] = ["0.1.0"]) => "# Changelog\n" + versions.map((v) => `## [${v}] - 2026-08-24\n### Fixed\n- x\n`).join("");
@@ -95,5 +99,57 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
 
   test("no gated files changed still passes even with a fragment present (fragment isn't required, but isn't forbidden either)", () => {
     expect(evaluate({ ...base, changedFiles: ["README.md"] }).ok).toBe(true);
+  });
+
+  test("a briefs-only change with no fragment fails, naming exactly what to add (BUTCHR-55)", () => {
+    const reasons = failing({ changedFiles: ["briefs/task.md"], newFragments: [] });
+    expect(reasons.some((r) => /no changelog\.d\/ fragment was added/.test(r) && /changelog\.d\/<TICKET>\.md/.test(r) && /bump: major\|minor\|patch/.test(r))).toBe(true);
+  });
+
+  test("a briefs-only change with a fragment passes, same as any other gated change (BUTCHR-55)", () => {
+    expect(evaluate({ ...base, changedFiles: ["briefs/task.md"] }).ok).toBe(true);
+  });
+});
+
+/**
+ * Generalises the BUTCHR-55 fix: rather than re-asserting the five briefs by
+ * name, this walks every .ts file under src/ for a build-time asset import
+ * (an `import ... from "<path>" with { type: ... }` attribute — the same
+ * shape `grep -rn 'with *{ *type:' src/` finds) and asserts `requiresRelease`
+ * covers whatever path it resolves to. A future embedded asset placed
+ * outside src/, schema/, package.json or briefs/ fails this test instead of
+ * silently reopening the hole this ticket closed.
+ */
+describe("every build-time asset import reachable from src/ is a gated path (BUTCHR-55)", () => {
+  const ASSET_IMPORT = /from\s+["']([^"']+)["']\s+with\s*\{[^}]*type:[^}]*\}/g;
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) { out.push(...walk(p)); continue; }
+      if (name.endsWith(".ts")) out.push(p);
+    }
+    return out;
+  }
+
+  function embeddedAssetPaths(): string[] {
+    const found: string[] = [];
+    for (const file of walk(join(ROOT, "src"))) {
+      const text = readFileSync(file, "utf8");
+      for (const m of text.matchAll(ASSET_IMPORT)) {
+        found.push(relative(ROOT, join(dirname(file), m[1]!)));
+      }
+    }
+    return found;
+  }
+
+  test("the finder actually finds something — a vacuous scan would pass the coverage test for the wrong reason", () => {
+    expect(embeddedAssetPaths().length).toBeGreaterThan(0);
+  });
+
+  test("every build-time embedded asset import is covered by requiresRelease", () => {
+    const uncovered = embeddedAssetPaths().filter((p) => !requiresRelease([p]));
+    expect(uncovered, `these build-time embedded assets are NOT on the gated path list, so a change to them ships silently: ${uncovered.join(", ")}`).toEqual([]);
   });
 });

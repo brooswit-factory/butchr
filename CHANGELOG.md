@@ -4,7 +4,7 @@ All notable changes to butchr. Format is [Keep a Changelog](https://keepachangel
 entries are `## [x.y.z] - YYYY-MM-DD` with subsections from: `BREAKING`, `Added`, `Changed`, `Fixed`, `Removed`.
 
 **The version is assigned at MERGE, not on a branch.** A PR that changes `src/`,
-`schema/`, or `package.json` adds a fragment at `changelog.d/<TICKET>.md`
+`schema/`, `package.json`, or `briefs/` adds a fragment at `changelog.d/<TICKET>.md`
 instead of editing this file directly — CI refuses a merge that changes those
 paths without one, and separately refuses a branch that bumps `package.json`
 or adds a dated heading here itself. The release workflow collates every
