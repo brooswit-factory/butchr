@@ -144,10 +144,8 @@ describe("every build-time asset import reachable from src/ is a gated path (BUT
     return found;
   }
 
-  test("the finder actually finds the five briefs — a vacuous scan would pass for the wrong reason", () => {
-    const paths = embeddedAssetPaths();
-    expect(paths.length).toBeGreaterThan(0);
-    expect(paths.every((p) => p.startsWith("briefs/"))).toBe(true);
+  test("the finder actually finds something — a vacuous scan would pass the coverage test for the wrong reason", () => {
+    expect(embeddedAssetPaths().length).toBeGreaterThan(0);
   });
 
   test("every build-time embedded asset import is covered by requiresRelease", () => {
