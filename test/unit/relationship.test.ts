@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER,
+  newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -20,13 +20,26 @@ function makeWorld() {
   let nextPageId = 900;
   const issues = new Map<
     string,
-    { issuetype: string; project: string; status: string; assignee?: string; priority?: string; labels: string[]; bossKey?: string; comments: string[]; remoteLink?: { title: string; url: string }; description?: string }
+    {
+      issuetype: string; project: string; status: string; assignee?: string; priority?: string; labels: string[]; bossKey?: string; comments: string[];
+      remoteLink?: { title: string; url: string };
+      // `description` is `unknown`, not `string`: real Jira hands back ADF (an
+      // object), and correctWorker's tests need a fake world that can hold
+      // that shape too, not just the plain text createIssue/fileWhereItBelongs
+      // already exercise here.
+      description?: unknown;
+      summary?: string;
+    }
   >();
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
   const projectProperties = new Map<string, unknown>();
 
-  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: string }) {
-    issues.set(key, { issuetype: p.issuetype, project: p.project, status: p.status ?? "To Do", labels: p.labels ?? [], comments: [], ...(p.bossKey ? { bossKey: p.bossKey } : {}), ...(p.assignee ? { assignee: p.assignee } : {}), ...(p.description ? { description: p.description } : {}) });
+  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: unknown; summary?: string }) {
+    issues.set(key, {
+      issuetype: p.issuetype, project: p.project, status: p.status ?? "To Do", labels: p.labels ?? [], comments: [],
+      ...(p.bossKey ? { bossKey: p.bossKey } : {}), ...(p.assignee ? { assignee: p.assignee } : {}),
+      ...(p.description !== undefined ? { description: p.description } : {}), ...(p.summary ? { summary: p.summary } : {}),
+    });
   }
   function setProjectProperty(projectKey: string, value: unknown) {
     projectProperties.set(projectKey, value);
@@ -46,7 +59,7 @@ function makeWorld() {
       return {
         self: `https://fake.atlassian.net/rest/api/3/issue/${key}`,
         fields: {
-          summary: `${key} summary`,
+          summary: i.summary ?? `${key} summary`,
           issuetype: { name: i.issuetype },
           project: { key: i.project },
           status: { name: i.status },
@@ -86,6 +99,12 @@ function makeWorld() {
     },
     assign: async (key: string, accountId: string) => {
       requireIssue(key).assignee = accountId;
+      return { ok: true };
+    },
+    correctText: async (key: string, p: { description?: string; summary?: string }) => {
+      const i = requireIssue(key);
+      if (p.description !== undefined) i.description = p.description;
+      if (p.summary !== undefined) i.summary = p.summary;
       return { ok: true };
     },
     createPage: async () => ({}),
@@ -389,6 +408,117 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
     await tellWorker(ops, "BUTCHR-1", "BUTCHR-2", "scope note");
     expect(issues.get("BUTCHR-2")!.comments).toEqual(["[BUTCHR-1] scope note"]);
     expect(issues.get("BUTCHR-1")!.comments).toEqual([]); // the CALLER's own ticket gets nothing
+  });
+});
+
+// ---------------------------------------------------------------------------
+// correct_worker (BUTCHR-60)
+// ---------------------------------------------------------------------------
+
+describe("correctWorker", () => {
+  test("refuses the CALLER'S OWN key, BEFORE any Jira read (matches prioritizeWorker's own shape)", async () => {
+    const { ops } = makeWorld();
+    let getIssueCalls = 0;
+    const throwingOps: AtlassianOps = { ...ops, getIssue: async (key: string) => { getIssueCalls++; throw new Error(`should not be read: ${key}`); } };
+    await expect(correctWorker(throwingOps, "BUTCHR-1", "BUTCHR-1", { description: "new", why: "reason" })).rejects.toThrow(/refusing to correct BUTCHR-1's own/);
+    expect(getIssueCalls).toBe(0); // the refusal cost no Jira round trip
+  });
+
+  test("refuses a stranger's key (not one of the caller's own workers)", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "SOMEONE-ELSE" });
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-9", { description: "new", why: "reason" })).rejects.toThrow(/not one of BUTCHR-1's own workers/);
+  });
+
+  test("refuses when neither `description` nor `summary` is given", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { why: "reason" })).rejects.toThrow(/neither/);
+  });
+
+  test("refuses an empty/whitespace-only `why`", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "   " })).rejects.toThrow(/why.*(required|non-empty)/i);
+  });
+
+  test("happy path: archives the CURRENT description as a `[correction]`-marked comment BEFORE overwriting it, superseded text present", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", {
+      issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1",
+      description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "old description text" }] }] },
+    });
+    const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new description text", why: "was stale" });
+    expect(issues.get("BUTCHR-2")!.description).toBe("new description text"); // the edit landed
+    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(1);
+    const comment = issues.get("BUTCHR-2")!.comments[0]!;
+    // reads the exported constant, not a hardcoded literal — a marker drift would fail THIS assertion, not silently pass it.
+    expect(comment.startsWith(`[BUTCHR-1] ${CORRECTION_MARKER}`)).toBe(true);
+    expect(comment).toContain("old description text"); // adfToText flattened the pre-existing ADF description correctly
+    expect(comment).toContain("was stale"); // `why` landed in the archive
+    expect(comment).toMatch(/PREVIOUS VERSION/);
+    expect(result.key).toBe("BUTCHR-2");
+    expect(result.correctedDescription).toBe(true);
+    expect(result.correctedSummary).toBe(false);
+  });
+
+  test("ORDER PROOF: when the archive comment fails, the edit op is NEVER called and the worker is unchanged", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    let correctTextCalled = false;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      addComment: async () => { throw new Error("comment API down"); },
+      correctText: async (key, p) => { correctTextCalled = true; return ops.correctText(key, p); },
+    };
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/archive comment failed/);
+    expect(correctTextCalled).toBe(false); // the guarantee, not a comment about it
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // UNCHANGED
+  });
+
+  test("edit failing AFTER a successful archive: one harmless extra comment, description UNCHANGED, error says safe to retry", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const failingOps: AtlassianOps = { ...ops, correctText: async () => { throw new Error("edit API down"); } };
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/UNCHANGED/);
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/retry/i);
+    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(2); // the archive lands each time (safe to retry)
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // the edit never took
+  });
+
+  test("a description-only call writes ONLY description — summary is untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old", summary: "kept summary" });
+    await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" });
+    expect(issues.get("BUTCHR-2")!.description).toBe("new");
+    expect(issues.get("BUTCHR-2")!.summary).toBe("kept summary");
+  });
+
+  test("a summary-only call writes ONLY summary — description is untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "kept description", summary: "old summary" });
+    await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+    expect(issues.get("BUTCHR-2")!.summary).toBe("new summary");
+    expect(issues.get("BUTCHR-2")!.description).toBe("kept description");
+  });
+
+  test("result.message names the summary-snapshot limitation ONLY when a summary was actually corrected", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old", summary: "old summary" });
+    const descOnly = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" });
+    expect(descOnly.message).not.toMatch(/SNAPSHOTTED/);
+    const summaryToo = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "newer summary", why: "reason 2" });
+    expect(summaryToo.message).toMatch(/SNAPSHOTTED/);
+    expect(summaryToo.message).toMatch(/tell_worker/);
   });
 });
 

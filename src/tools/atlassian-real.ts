@@ -10,6 +10,20 @@ export const adf = (text: string) => ({
 });
 
 /**
+ * `adf("")` produces a `text` node whose `text` is `""` — the ADF spec does
+ * not allow an empty text node, and this daemon has NOT measured what Jira
+ * does when handed one (found in review, BUTCHR-60). Clearing a description
+ * is a real, needed call (BUTCHR-51's shape: a structurally malformed
+ * description its filer could not repair), so `correctText` below cannot
+ * just pass an empty string through `adf()` unexamined. This emits the
+ * unambiguously valid empty form instead — a paragraph with NO `content` —
+ * used ONLY for the empty-string case; `adf()` itself, and its behavior for
+ * every non-empty string, is untouched, because `addComment`/`createIssue`
+ * share it and must not see this change.
+ */
+const adfForCorrection = (text: string) => (text === "" ? { type: "doc", version: 1, content: [{ type: "paragraph" }] } : adf(text));
+
+/**
  * The real Atlassian operations, over the de-facto SDKs (jira.js 6, confluence.js 3).
  * NOTE the 6.x config shape is `auth: { type: "basic", email, apiToken }` — the
  * older `authentication: { basic: … }` shape is silently ignored (no header sent,
@@ -76,6 +90,27 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Same editIssue route as setPriority above — `fields` is a loose Record
     // with no wrapper gotcha, and it writes only the one key we pass.
     assign: (key, accountId) => jira.issues.editIssue({ issueIdOrKey: key, fields: { assignee: { accountId } } }),
+    // Same editIssue route again, no wrapper gotcha — but the two fields it
+    // can touch do NOT share a wire shape: `description` is ADF, same as
+    // createIssue's, so it goes through `adfForCorrection` (the same `adf()`
+    // helper for non-empty text; a valid empty-paragraph ADF doc for "",
+    // see `adfForCorrection`'s own comment for why `adf("")` isn't safe to
+    // use unexamined here). `summary` is a plain string and must NOT be
+    // wrapped, or Jira 400s. Only the field(s) actually supplied are
+    // included in `fields`. DECIDED (review, BUTCHR-60): `summary: ""` is
+    // passed through UNCHANGED rather than refused here — Jira itself
+    // requires a non-empty summary and will reject it with its own clear
+    // error; this layer does not duplicate a rule Jira already enforces,
+    // the same reasoning `deleteIssue`'s own doc comment already applies to
+    // a Jira-side permission rather than a client-side guess at one.
+    correctText: (key, p) =>
+      jira.issues.editIssue({
+        issueIdOrKey: key,
+        fields: {
+          ...(p.description !== undefined ? { description: adfForCorrection(p.description) } : {}),
+          ...(p.summary !== undefined ? { summary: p.summary } : {}),
+        },
+      }),
     // CreatePage spreads CreatePageSchema at the TOP level: only `body` is
     // forwarded (zod, $strip — every other top-level key, including spaceId,
     // is silently dropped) — the flat shape sent an empty spaceId and

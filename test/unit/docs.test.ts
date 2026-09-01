@@ -49,6 +49,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     createIssue: async () => ({}),
     setPriority: async () => ({}),
     assign: async () => ({}),
+    correctText: async () => ({}),
     createPage: async () => ({}),
     getPage: async (id: string) => {
       const p = pages.get(id);

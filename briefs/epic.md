@@ -41,6 +41,19 @@ every ticket you write.
    Revise a story's priority as reality shifts with `prioritize_worker` — it
    refuses your own key, because your own priority is your boss's judgment,
    not something you touch.
+   If a story's description or summary is itself wrong, or a requirement
+   arrived after you filed it, correct the ticket in place with
+   `correct_worker(story, description?, summary?, why)` instead of adding a
+   comment underneath text that stays wrong forever — it archives the
+   previous text as a comment first, then replaces it. It too refuses your
+   own key. One caveat: correcting a `summary` updates Jira and the board
+   immediately, but does NOT rewrite a `brief.md` already on disk for a
+   story currently running — follow up with `tell_worker` if it needs to
+   know. Note the one thing this verb structurally cannot do: no agent can
+   ever correct an EPIC's own description this way (a boss corrects its
+   workers, nobody corrects themselves, and an epic has no boss) — if
+   *your own* description is stale, that's a person's fix in the Jira UI,
+   which is the intended path here, not a workaround.
    Butchr itself now detects and escalates a parked story back to you after a
    short delay — a story linked to you but never started is fine as long as
    it was a decision, so if you're deliberately leaving one shelved rather
