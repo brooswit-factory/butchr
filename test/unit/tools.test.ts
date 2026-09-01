@@ -3,7 +3,7 @@ import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33) and the label/delete ops (BUTCHR-35) shared by every rig() below; override per test as needed. */
-function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "deleteIssue">> = {}) {
+function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue">> = {}) {
   return {
     getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
     getRemoteLink: async () => null,
@@ -12,6 +12,7 @@ function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" |
     getPageLabels: async () => [],
     createPageWithLabel: async () => ({ id: "999", title: "t", url: "https://x/999" }),
     addLabels: async () => ({ ok: true }),
+    removeLabels: async () => ({ ok: true }),
     deleteIssue: async () => ({ ok: true }),
     ...overrides,
   };
