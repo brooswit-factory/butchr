@@ -42,12 +42,20 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   that actually wakes them), and the author verifies the last decisive
   review's own `reviews[].commit.oid` against the current head before
   merging (an approval is recorded against a sha, and the branch may have
-  moved since). That check is NOT sufficient on its own: GitHub re-points
-  `reviews[].commit.oid` to the merge commit whenever the branch takes a
-  base-merge, so it cannot detect a head move caused by a base-merge —
-  strictly better than the `reviewDecision`+`headRefOid` pair it replaced
-  (which failed on every push), but not proof the base hasn't moved under
-  the reviewed diff.
+  moved since). That check is NOT sufficient on its own: GitHub can
+  silently rewrite `reviews[].commit.oid` to a later commit after a
+  base-merge — confirmed on two PRs, including one with three reviews where
+  an OLDER review still held its original recorded sha while a LATER
+  review's recorded commit had already moved, matching the current head
+  each time it was re-read. Only a review's own written-at-submission BODY
+  text stays fixed; any structured field, `reviews[].commit.oid` included,
+  can move — and this check reads the LAST decisive review, which is
+  exactly the one most likely to have been rewritten. Strictly better than
+  the `reviewDecision`+`headRefOid` pair it replaced (which failed on every
+  push), but not proof the base hasn't moved under the reviewed diff. If
+  the base may have moved since approval, a re-review at the new head, or
+  the append-only `[review] APPROVED ... @ <sha>` ticket comment GitHub
+  cannot rewrite, are the moves that already exist.
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the boss agent — reached via the Implements link, not the

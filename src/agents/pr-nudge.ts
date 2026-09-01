@@ -14,15 +14,19 @@
  * ordering, without pasting the full multi-line jq — the agent's own brief
  * has that.
  *
- * BUTCHR-74: `reviews[].commit.oid` is NOT immutable either. GitHub
- * re-points it when the branch takes a merge from its base (a base-merge),
- * confirmed live on PR #135: the review body quotes the approved sha, but
- * both GraphQL and REST report the merge commit instead. So this check
- * cannot detect a head move caused by a base-merge — it is strictly better
- * than the `reviewDecision`+`headRefOid` pair it replaced (which failed on
- * every push), but it is not sufficient, and neither this nudge nor the
- * doc comment above may claim otherwise.
+ * BUTCHR-74: `reviews[].commit.oid` is NOT immutable either. Confirmed on
+ * two PRs (#135, #136) that GitHub can silently rewrite it to a later
+ * commit after a base-merge — on #136 (three reviews) an OLDER review kept
+ * its original recorded sha while a LATER review's recorded commit had
+ * already moved, matching the current head each time it was re-read. Only
+ * a review's own written-at-submission BODY text stays fixed; any
+ * structured field can move, and this check reads the LAST decisive
+ * review — exactly the one most likely to have been rewritten. Do not
+ * assert a specific rewrite mechanism beyond what's observed. It is
+ * strictly better than the `reviewDecision`+`headRefOid` pair it replaced
+ * (which failed on every push), but it is not sufficient, and neither this
+ * nudge nor the doc comment above may claim otherwise.
  */
 export function prReviewStateNudge(issue: string, from: string | null, to: string): string {
-  return `[butchr] ${issue}: your PR's review state changed pr:${from ?? "none"} → pr:${to}. Before merging, verify the last decisive review's own reviews[].commit.oid against your current head — an approval is recorded against a sha, and the branch may have moved since. That check does not detect a head move caused by a base-merge (GitHub re-points reviews[].commit.oid too); your brief has the exact command and the full caveat. Act: approved → merge your own PR; changes-requested → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.`;
+  return `[butchr] ${issue}: your PR's review state changed pr:${from ?? "none"} → pr:${to}. Before merging, verify the last decisive review's own reviews[].commit.oid against your current head — an approval is recorded against a sha, and the branch may have moved since. That check is not sufficient on its own: reviews[].commit.oid, unlike the review's own body text, can be silently rewritten after a base-merge, and this check reads the LAST review — the one most likely to have moved. If in doubt, ask for a re-review or point at the ticket's own [review] comment (GitHub can't rewrite that); your brief has the full caveat. Act: approved → merge your own PR; changes-requested → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.`;
 }

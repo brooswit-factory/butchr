@@ -142,30 +142,43 @@ const MERGE_INSTRUCTING_BRIEFS = ["brief:Story:brief.md", "brief:Task:brief.md"]
 const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 
 // BUTCHR-74: `reviews[].commit.oid` is not the immutable fallback the text
-// used to claim it was — GitHub re-points it to the merge commit whenever
-// the branch takes a base-merge (confirmed live on PR #135: the review body
-// quotes the approved sha, but both GraphQL and REST report the merge
-// commit instead), so the check cannot detect a head move caused by a
-// base-merge. Every merge-instructing channel must say so and must not
-// describe the check as sufficient.
+// used to claim it was — confirmed on two PRs (#135, #136) that GitHub can
+// silently rewrite it to a later commit after a base-merge, and on #136
+// (three reviews) an OLDER review kept its original recorded sha while a
+// LATER review's recorded commit had already moved. Only a review's own
+// written-at-submission body text stays fixed; any structured field can
+// move, and this check reads the LAST decisive review — exactly the one
+// most likely to have been rewritten. Every merge-instructing channel must
+// say so (without asserting a rewrite mechanism beyond what's observed)
+// and must not describe the check as sufficient.
 //
-// Anchored on the single token "base-merge", not a full sentence, on
-// purpose: a phrase-length match reddens on ordinary rewording (the exact
-// words a maintainer improving this prose would naturally change) and
-// invites weakening the assertion out of spite, the same failure mode the
-// explicit-list design above already avoids for the positive channel list.
-// "base-merge" is the one term that names the actual hazard, doesn't occur
-// anywhere in these channels for any other reason (checked at the time this
-// was written), and can't be reworded away without also losing the fact
-// being asserted — so it survives a rewrite but not a deletion.
+// Requires TWO independent short markers to both be present, anywhere in
+// the channel, rather than one token or one long sentence:
+//   - "base-merge" — names the hazard.
+//   - "not sufficient" — denies sufficiency; this is the actual point of
+//     the caveat, not just its topic.
+// One token alone is not discriminating: a single "base-merge" anchor was
+// tried first and passed review with a real hole — briefs/story.md and
+// briefs/task.md each also carry an OPERATIONAL sentence this same ticket
+// added ("confirm you have not taken a base-merge since the approval"),
+// which still contains the word "base-merge" after the caveat sentence
+// itself is deleted, so a bare-token assertion stayed green with the
+// caveat gone. "not sufficient" appears ONLY inside the caveat sentence in
+// every covered channel (verified when this was written), so requiring it
+// too closes that hole: deleting the caveat removes "not sufficient" from
+// the channel even though "base-merge" survives via the operational
+// sentence. Two short, independently-reworded-resistant markers, not one
+// long brittle phrase — a maintainer rewording either sentence while
+// keeping its meaning (and thus keeping both markers) leaves this green;
+// only an actual deletion of the sufficiency claim turns it red.
 //
 // FORWARDING ADDRESS: this caveat is true only because the check has this
-// hole. BUTCHR-52 is filing the remedy for the base-merge hole itself. If
-// BUTCHR-52 (or any later ticket) closes that hole, this caveat becomes
+// hole. BUTCHR-73 is filing the remedy for the base-merge hole itself. If
+// BUTCHR-73 (or any later ticket) closes that hole, this caveat becomes
 // FALSE, this assertion SHOULD go red, and that red is correct — it is
 // telling you the pinned text must be updated or removed, not that the test
 // is broken. Do not delete this assertion to get green; fix the text.
-const BASE_MERGE_CAVEAT = /base-merge/i;
+const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 
 describe("merge-check instruction channels (BUTCHR-56)", () => {
   test("non-vacuity: every channel group actually resolves to content, and it's the content we expect", () => {
@@ -215,7 +228,7 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
     for (const c of [...briefs, ...docs, ...nudges]) {
       expect(c.text, `${c.label} should name reviews[].commit.oid`).toContain("reviews[].commit.oid");
       expect(c.text, `${c.label} should name the last-decisive ordering`).toMatch(LAST_DECISIVE_REVIEW);
-      // See BASE_MERGE_CAVEAT above for the forwarding address to BUTCHR-52:
+      // See BASE_MERGE_CAVEAT above for the forwarding address to BUTCHR-73:
       // this assertion is EXPECTED to go red once that hole is closed.
       expect(c.text, `${c.label} should carry the base-merge caveat (BUTCHR-74)`).toMatch(BASE_MERGE_CAVEAT);
     }

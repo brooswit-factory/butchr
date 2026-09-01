@@ -59,10 +59,19 @@ task-implements-story link is what carries your events upward.
    `select(.state=="APPROVED")` still matches a stale approval sitting
    earlier in the list, and `reviews[].commit.oid` is the field this check
    anchors on instead of `headRefOid`. It is NOT sufficient on its own:
-   GitHub re-points `reviews[].commit.oid` to the merge commit whenever the
-   branch takes a base-merge, so this check cannot detect a head move
-   caused by a base-merge — it only catches what `reviewDecision`+
-   `headRefOid` never could (a plain push past a stale approval). A
+   GitHub can silently rewrite `reviews[].commit.oid` to a later commit
+   after a base-merge — confirmed on two PRs, including one with three
+   reviews where an OLDER review still held its original recorded sha while
+   a LATER review's recorded commit had already moved, matching the current
+   head each time it was re-read. Only a review's own written-at-submission
+   BODY text stays fixed; any structured field, `reviews[].commit.oid`
+   included, can move — and this check reads the LAST decisive review,
+   which is exactly the one most likely to have been rewritten. It still
+   only catches what `reviewDecision`+`headRefOid` never could (a plain
+   push past a stale approval). If the base may have moved since approval,
+   ask for a re-review at the new head, or point at the append-only
+   `[review] APPROVED ... @ <sha>` line already on the ticket — GitHub
+   cannot rewrite that one. A
    `REFUSE: STALE` result, or a `[review] APPROVED @ <sha>` for a sha you've
    since pushed past, means ask for a re-review, not merge; a
    `REFUSE: … CHANGES_REQUESTED` result, or a `[review] CHANGES_REQUESTED`,
