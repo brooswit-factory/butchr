@@ -193,7 +193,7 @@ function stage3EscalatedComment(child: string, boss: string, elapsedMinutes: num
     `${MARKER} ${child} is still in To Do, unactivated, ${elapsedMinutes} minutes after being observed parked, under ${boss} — which has not acted on two prior notices there.`,
     "",
     `Prompt ${boss} to transition ${child} to In Progress (or close it).`,
-    `If this is deliberate, shelve ${child} with \`shelve_worker\` and this will stop — it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but only \`shelve_worker\` withdraws it for you.`,
+    `If this is deliberate, ${boss} should shelve ${child} with \`shelve_worker\` — only ${child}'s own boss can, and it clears itself on reactivation. A hand-added \`${EXEMPT_LABEL}\` label also stops it, but nothing withdraws that one for you.`,
     "",
     `fingerprint: ${child}`,
     "stage: 3",
