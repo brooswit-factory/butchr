@@ -39,8 +39,10 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   — at both levels (story approves task PRs; epic approves the story's PR to
   main). Every formal review — Approve or Request changes — also gets one
   `[review] <verdict> <pr> @ <sha>` comment on the author's ticket (the event
-  that actually wakes them), and the author checks both `reviewDecision` and
-  `headRefOid` before merging.
+  that actually wakes them), and the author verifies the last decisive
+  review's own `reviews[].commit.oid` against the current head before
+  merging (an approval is recorded against a sha, and the branch may have
+  moved since).
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the boss agent — reached via the Implements link, not the
