@@ -76,6 +76,19 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Same editIssue route as setPriority above — `fields` is a loose Record
     // with no wrapper gotcha, and it writes only the one key we pass.
     assign: (key, accountId) => jira.issues.editIssue({ issueIdOrKey: key, fields: { assignee: { accountId } } }),
+    // Same editIssue route again, no wrapper gotcha — but the two fields it
+    // can touch do NOT share a wire shape: `description` is ADF, same as
+    // createIssue's, so it goes through the same `adf()` helper; `summary`
+    // is a plain string and must NOT be wrapped, or Jira 400s. Only the
+    // field(s) actually supplied are included in `fields`.
+    correctText: (key, p) =>
+      jira.issues.editIssue({
+        issueIdOrKey: key,
+        fields: {
+          ...(p.description !== undefined ? { description: adf(p.description) } : {}),
+          ...(p.summary !== undefined ? { summary: p.summary } : {}),
+        },
+      }),
     // CreatePage spreads CreatePageSchema at the TOP level: only `body` is
     // forwarded (zod, $strip — every other top-level key, including spaceId,
     // is silently dropped) — the flat shape sent an empty spaceId and

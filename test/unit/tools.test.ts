@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
-/** Defaults for the get_doc/set_doc ops (BUTCHR-33) and the label/delete ops (BUTCHR-35) shared by every rig() below; override per test as needed. */
-function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "deleteIssue">> = {}) {
+/** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
+function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "deleteIssue" | "correctText">> = {}) {
   return {
     getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
     getRemoteLink: async () => null,
@@ -13,6 +13,7 @@ function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" |
     createPageWithLabel: async () => ({ id: "999", title: "t", url: "https://x/999" }),
     addLabels: async () => ({ ok: true }),
     deleteIssue: async () => ({ ok: true }),
+    correctText: async () => ({ ok: true }),
     ...overrides,
   };
 }
@@ -24,7 +25,7 @@ function rig(roles: { story?: string; task?: string } = {}) {
     getIssue: rec("getIssue"), search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"),
     transition: rec("transition"), createIssue: rec("createIssue", { key: "KAN-999" }), setPriority: rec("setPriority"),
     assign: rec("assign"), createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage"), searchPages: rec("searchPages", { results: [] }), listSpaces: rec("listSpaces"),
-    ...fakeDocOps(),
+    ...fakeDocOps({ correctText: rec("correctText") }),
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -38,6 +39,7 @@ describe("atlassianTools", () => {
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
+      "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
       "get_doc",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
@@ -893,6 +895,81 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
     const result = (await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "none", assignee: "acct-x" }, conn)) as { key?: string };
     expect(result.key).toBe("KAN-42");
     void ops;
+  });
+});
+
+describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, onWrite", () => {
+  function rigWorker(roles: { story?: string; task?: string } = { story: "acct-story", task: "acct-task" }) {
+    const ops: AtlassianOps = {
+      getIssue: async () => ({
+        fields: {
+          issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "In Progress" },
+          issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }],
+          description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "old description" }] }] },
+          summary: "old summary",
+        },
+      }),
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+    };
+    return { ops, tools: atlassianTools(ops, () => {}, roles) };
+  }
+
+  test("refuses a connection with no x-issue, in the get_doc/set_doc shape", async () => {
+    const { tools } = rigWorker();
+    await expect(tools.correct_worker!.handler({ key: "KAN-9", description: "new", why: "was wrong" }, { headers: {} } as any)).rejects.toThrow(/this connection has no x-issue/);
+  });
+
+  test("schema: key/why required, description/summary optional", () => {
+    const { tools } = rigWorker();
+    expect(Object.keys(tools.correct_worker!.input).sort()).toEqual(["description", "key", "summary", "why"]);
+  });
+
+  test("end-to-end through the tool layer: the archive comment is posted BEFORE correctText, onWrite fires for the WORKER key only (caller as writer — never the caller's own key), audit line names the verb and which fields were touched", async () => {
+    const writes: Array<[string[], string]> = [];
+    const audits: string[] = [];
+    const calls: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({
+        fields: {
+          issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "In Progress" },
+          issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }],
+          description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "old description" }] }] },
+          summary: "old summary",
+        },
+      }),
+      search: async () => ({}),
+      addComment: async () => { calls.push("addComment"); return { ok: true }; },
+      linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps({ correctText: async () => { calls.push("correctText"); return { ok: true }; } }),
+    };
+    const tools = atlassianTools(ops, (l) => audits.push(l), {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.correct_worker!.handler({ key: "KAN-9", description: "new description", why: "was stale" }, conn)) as {
+      key: string; correctedDescription: boolean; correctedSummary: boolean; message: string;
+    };
+    expect(calls).toEqual(["addComment", "correctText"]); // archive BEFORE edit — the ordering the whole verb is built to guarantee
+    expect(result.key).toBe("KAN-9");
+    expect(result.correctedDescription).toBe(true);
+    expect(result.correctedSummary).toBe(false);
+    expect(writes).toEqual([[["KAN-9"], "KAN-1"]]); // the worker key only, caller as writer
+    expect(audits.some((a) => a.includes('correct_worker KAN-9 description=true summary=false why="was stale"'))).toBe(true);
+  });
+
+  test("the description states both review-mandated limitations up front (the bossless-epic wording, WITH its named recourse, and the summary-snapshot caveat), the self-refusal rationale, the archive marker, and both legitimate use cases (correction AND a late-arriving requirement)", () => {
+    const { tools } = rigWorker();
+    const d = tools.correct_worker!.description;
+    expect(d).toMatch(/no AGENT can ever correct an epic's description/);
+    expect(d).toMatch(/person can still edit it directly in the Jira UI/); // the named recourse — half 1 without half 2 is the failure mode this ticket exists to fix
+    expect(d).toMatch(/SNAPSHOTTED/);
+    expect(d).toMatch(/launder a failure into a success/);
+    expect(d).toMatch(/\[correction\]/);
+    expect(d).toMatch(/LATE-ARRIVING REQUIREMENT/); // the additive use case — `why` is not only "what was wrong"
+    expect(d).not.toMatch(/one line saying what was wrong/);
   });
 });
 
