@@ -73,6 +73,19 @@ export interface AtlassianOps {
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 
   /**
+   * Read-modify-write: the inverse of `addLabels` — removes `labels` from the
+   * issue's CURRENT label set and writes the remainder back (there is no
+   * subtractive endpoint; `editIssue`'s `fields.labels` always takes the
+   * FULL desired array, same as `addLabels`). Removing a label the issue
+   * does not carry is a no-op, not an error. A caller that already knows the
+   * label isn't present (from a fetch it already made for another reason)
+   * should skip calling this entirely rather than pay for a no-op write —
+   * see `startWorker`/`finishWorker` in src/tools/relationship.ts, which do
+   * exactly that with `assertOwnWorker`'s own fetch.
+   */
+  removeLabels(key: string, labels: readonly string[]): Promise<unknown>;
+
+  /**
    * Delete a Jira issue outright — `new_worker`'s compensating rollback for a
    * ticket it just created a moment ago, when the Implements link or the
    * disposition write that must immediately follow it fails (src/tools/

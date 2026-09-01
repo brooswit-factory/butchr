@@ -44,12 +44,20 @@ function labelsOf(issue: unknown): string[] {
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
 const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
 
-async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<void> {
+/**
+ * Returns the fetched issue (not just void) so callers that need it for a
+ * follow-up decision — `startWorker`/`finishWorker` checking for a stale
+ * `EXEMPT_LABEL` — reuse this fetch instead of paying for a second one. A
+ * worker that was never shelved must cost exactly what it cost before this
+ * check existed.
+ */
+async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(workerKey);
   const boss = findBossKey(issue);
   if (boss !== callerKey) {
     throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
+  return issue;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,15 +232,50 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   return { key, implements: callerKey, doc, disposition: disposition.kind };
 }
 
-/** Worker -> In Progress. Refuses a key that is not one of the caller's own workers. The call that actually staffs an agent; also reactivates a shelved worker and sends an In Review worker back to work. */
+/**
+ * Worker -> In Progress. Refuses a key that is not one of the caller's own
+ * workers. The call that actually staffs an agent; also reactivates a
+ * shelved worker and sends an In Review worker back to work.
+ *
+ * CLEARS `EXEMPT_LABEL` (`butchr:shelved`) FIRST, ONLY IF PRESENT, THEN
+ * TRANSITIONS — this is the fix for BUTCHR-50: the label means CURRENTLY
+ * shelved, a state, not a history, so the verb that reverses a shelve is the
+ * verb that withdraws the declaration. Ordering (not just presence) is the
+ * design decision, by the same "order writes by how bad it is to stop
+ * halfway" principle shelveWorker's own comment and newWorker's step
+ * ordering already use: transitioning first and then failing the label
+ * removal would leave an In Progress ticket silently carrying a stale
+ * exemption — exactly the blind spot this fix exists to close. Clearing
+ * first and then failing the transition instead leaves a To Do, assigned,
+ * UNEXEMPT child under a live boss, which the parked detector reports
+ * loudly. Never leave a partial state where the detector is silently wrong;
+ * prefer the one where it is loudly right. Skipped entirely (zero extra
+ * Jira calls) when the label isn't present, reusing assertOwnWorker's fetch.
+ */
 export async function startWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+  const issue = await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
   return ops.transition(workerKey, "In Progress");
 }
 
-/** Worker -> Done. Refuses a key that is not one of the caller's own workers. A worker never finishes itself — see submit_to_boss; the review hop is the point. */
+/**
+ * Worker -> Done. Refuses a key that is not one of the caller's own workers.
+ * A worker never finishes itself — see submit_to_boss; the review hop is the
+ * point.
+ *
+ * CLEARS `EXEMPT_LABEL` FIRST, ONLY IF PRESENT, THEN TRANSITIONS — same
+ * ordering and reasoning as `startWorker` above. Done is not shelved: a
+ * finished ticket that still carries the exemption is the exact residue this
+ * ticket exists to stop producing (BUTCHR-28/-29/-30/-31, all Done and all
+ * still carrying it before this fix).
+ */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
   return ops.transition(workerKey, "Done");
 }
 
@@ -292,6 +335,11 @@ export interface AdoptWorkerResult {
  * safety net, regardless of `alreadyAdopted`. Refuses a ticket already
  * linked to a DIFFERENT boss.
  *
+ * A `disposition: "start"` ALSO CLEARS `EXEMPT_LABEL` (`butchr:shelved`)
+ * whenever the adopted ticket carries it, whether or not this call is
+ * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
+ * below for why that check is not gated on `alreadyAdopted`.
+ *
  * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
  * "shelve" disposition, the reason is posted whenever this call does ANY
  * real adoption work at all (`!alreadyAdopted`) — even if the ticket
@@ -322,11 +370,12 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const role = issuetype === "Story" ? roles.story : roles.task;
   if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
 
+  const labels = labelsOf(issue);
   const linkedCorrectly = existingBoss === callerKey;
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
   const currentStatus = statusOf(issue);
   const dispositionAlreadyApplied =
-    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labelsOf(issue).includes(EXEMPT_LABEL);
+    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labels.includes(EXEMPT_LABEL);
   const alreadyAdopted = linkedCorrectly && assignedCorrectly && dispositionAlreadyApplied;
 
   if (!alreadyAdopted) {
@@ -335,6 +384,21 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   }
 
   const doc = await ensureDoc(ops, workerKey);
+
+  // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
+  // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
+  // this path already reads the issue and computes labelsOf(issue), so this
+  // costs no extra Jira call). Adopting a ticket that already carries the
+  // label straight into (or already sitting in) In Progress reproduces the
+  // identical bug startWorker fixes, through a second door — even a fully
+  // idempotent re-adoption (already linked, assigned, and In Progress) must
+  // not leave a live ticket silently carrying a stale exemption, which is
+  // exactly the residue this fix exists to stop producing. Cleared BEFORE any
+  // transition below — same ordering reasoning as startWorker's own comment:
+  // never leave a partial state where the detector is silently wrong.
+  if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
 
   // NOTE: the reason comment for "shelve" is posted whenever this call is
   // doing ANY real adoption work (!alreadyAdopted) — NOT gated on
