@@ -12,16 +12,24 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Task")).toContain("one unit of work");
     expect(briefFor("Bug")).toContain("Read your ticket");
   });
-  test("models: epic=opus story=opus task=sonnet, default sonnet", () => {
+  test("BUTCHR-71: a project resource is selected the SAME WAY an issue's issuetype is — 'project' resolves to briefs/project.md, case-insensitively", () => {
+    expect(briefFor("project")).toContain("You own a **product**, not a ticket");
+    expect(briefFor("Project")).toBe(briefFor("project")); // same case-insensitivity every other entry gets
+  });
+  test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
+    // BUTCHR-71: a project resource gets the SAME tier an epic gets, not the
+    // task-level default — it makes epic-level product judgment.
+    expect(modelFor("project")).toBe("opus");
   });
-  test("effort: epic/story/task all high, unknown type also defaults to high without throwing", () => {
+  test("effort: epic/story/task/project all high, unknown type also defaults to high without throwing", () => {
     expect(effortFor("Epic")).toBe("high");
     expect(effortFor("Story")).toBe("high");
     expect(effortFor("Task")).toBe("high");
+    expect(effortFor("project")).toBe("high");
     expect(() => effortFor("Whatever")).not.toThrow();
     expect(effortFor("Whatever")).toBe("high");
     expect(effortFor("EPIC")).toBe("high");
