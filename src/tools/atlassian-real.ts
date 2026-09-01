@@ -215,6 +215,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: merged } });
     },
 
+    // The inverse of addLabels above, same read-modify-write reasoning: no
+    // subtractive endpoint, so read current labels, filter, write back.
+    // Filtering out a label that isn't present is a no-op.
+    removeLabels: async (key, labels) => {
+      const current: any = await jira.issues.getIssue({ issueIdOrKey: key, fields: ["labels"] });
+      const existing: string[] = current?.fields?.labels ?? [];
+      const toRemove = new Set(labels);
+      const remaining = existing.filter((l) => !toRemove.has(l));
+      return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: remaining } });
+    },
+
     // MEASURED against this daemon's own credential (BUTCHR-35, 2026-08-31):
     // GET /rest/api/3/mypermissions?projectKey=BUTCHR&permissions=DELETE_ISSUES
     // returned {"DELETE_ISSUES":{...,"havePermission":false}}, and a live
