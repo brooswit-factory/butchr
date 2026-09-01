@@ -513,10 +513,16 @@ export function atlassianTools(
       handler: async (a, c) => {
         const p = a as { key: string; description?: string; summary?: string; why: string };
         const who = requireCaller(c, "correct_worker");
-        audit(c, `correct_worker ${p.key} description=${!!p.description} summary=${!!p.summary} why="${p.why.slice(0, 60)}"`);
+        // `!== undefined`, NOT truthy — a supplied `description: ""` (e.g. clearing a
+        // malformed description, the BUTCHR-51 shape) is a real, intentional call and
+        // must reach correctWorker as "description was given", not get silently
+        // dropped and misreported as "neither field was given" (found in review,
+        // BUTCHR-60: a truthy check here was the one layer in this diff that didn't
+        // match the `!== undefined` discipline correctWorker/correctText already use).
+        audit(c, `correct_worker ${p.key} description=${p.description !== undefined} summary=${p.summary !== undefined} why="${p.why.slice(0, 60)}"`);
         const result = await correctWorker(ops, who, p.key, {
-          ...(p.description ? { description: p.description } : {}),
-          ...(p.summary ? { summary: p.summary } : {}),
+          ...(p.description !== undefined ? { description: p.description } : {}),
+          ...(p.summary !== undefined ? { summary: p.summary } : {}),
           why: p.why,
         });
         noted(c, [p.key]); // the correction's own write — recorded against the CALLER as writer, never the worker, so the "your ticket changed" nudge is suppressed for the corrector and still delivered to the worker

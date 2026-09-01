@@ -960,6 +960,35 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
     expect(audits.some((a) => a.includes('correct_worker KAN-9 description=true summary=false why="was stale"'))).toBe(true);
   });
 
+  test("a supplied `description: \"\"` (clearing it — the BUTCHR-51 shape) reaches correctText and is NOT silently dropped as \"neither field given\" (regression: BUTCHR-60 review found this handler used truthy checks where every other layer in the diff uses `!== undefined`)", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({
+        fields: {
+          issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "In Progress" },
+          issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }],
+          description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "malformed junk" }] }] },
+          summary: "old summary",
+        },
+      }),
+      search: async () => ({}), addComment: async () => ({ ok: true }), linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }), setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps({ correctText: async (key, p) => { calls.push([key, p]); return { ok: true }; } }),
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), {});
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.correct_worker!.handler(
+      { key: "KAN-9", description: "", why: "description was structurally malformed junk; clearing it" },
+      conn,
+    )) as { correctedDescription: boolean; correctedSummary: boolean };
+    expect(calls).toEqual([["KAN-9", { description: "" }]]); // correctText WAS called, with the empty string, not skipped
+    expect(result.correctedDescription).toBe(true);
+    expect(result.correctedSummary).toBe(false);
+    expect(audits.some((a) => a.includes("correct_worker KAN-9 description=true summary=false"))).toBe(true);
+  });
+
   test("the description states both review-mandated limitations up front (the bossless-epic wording, WITH its named recourse, and the summary-snapshot caveat), the self-refusal rationale, the archive marker, and both legitimate use cases (correction AND a late-arriving requirement)", () => {
     const { tools } = rigWorker();
     const d = tools.correct_worker!.description;
