@@ -113,12 +113,16 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
 
 /**
  * Generalises the BUTCHR-55 fix: rather than re-asserting the five briefs by
- * name, this walks every .ts file under src/ for a build-time asset import
- * (an `import ... from "<path>" with { type: ... }` attribute — the same
- * shape `grep -rn 'with *{ *type:' src/` finds) and asserts `requiresRelease`
- * covers whatever path it resolves to. A future embedded asset placed
- * outside src/, schema/, package.json or briefs/ fails this test instead of
- * silently reopening the hole this ticket closed.
+ * name, this walks EVERY file under src/, regardless of extension, for a
+ * build-time asset import (an `import ... from "<path>" with { type: ... }`
+ * attribute — the same shape `grep -rn 'with *{ *type:' src/` finds) and
+ * asserts `requiresRelease` covers whatever path it resolves to. The
+ * ASSET_IMPORT regex is what decides whether a file contributes a path, not
+ * its extension — a non-code file simply contributes nothing, so there is no
+ * extension allowlist to go stale (BUTCHR-72). A future embedded asset
+ * placed outside src/, schema/, package.json or briefs/ — in a .ts file or
+ * any other — fails this test instead of silently reopening the hole this
+ * ticket closed.
  */
 describe("every build-time asset import reachable from src/ is a gated path (BUTCHR-55)", () => {
   const ASSET_IMPORT = /from\s+["']([^"']+)["']\s+with\s*\{[^}]*type:[^}]*\}/g;
@@ -128,7 +132,7 @@ describe("every build-time asset import reachable from src/ is a gated path (BUT
     for (const name of readdirSync(dir)) {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) { out.push(...walk(p)); continue; }
-      if (name.endsWith(".ts")) out.push(p);
+      out.push(p);
     }
     return out;
   }
