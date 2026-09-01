@@ -93,13 +93,19 @@ describe("parkedCandidates (pure predicate)", () => {
   // startWorker (not a hand-rolled label toggle) through that exact
   // lifecycle and asserts the predicate now sees the re-parked child.
   test("a child that went shelved -> started -> parked again IS a candidate (shelve_worker/start_worker's real round trip, not a stub)", async () => {
+    // Issue-shaped keys ("BOSS-1"/"CHILD-1"), not the bare "BOSS"/"CHILD"
+    // this test used before BUTCHR-71: a bare all-caps word with no
+    // "-<digits>" suffix is now indistinguishable from a Jira PROJECT id
+    // (src/resources/id.ts's isProjectId), which would misroute this
+    // through assertOwnWorker's project-caller branch instead of the
+    // issue-caller one this test means to exercise.
     const issue = { status: "To Do", labels: [] as string[] };
     const ops = {
       getIssue: async () => ({
         fields: {
           status: { name: issue.status },
           labels: issue.labels,
-          issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "BOSS" } }],
+          issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "BOSS-1" } }],
         },
       }),
       transition: async (_key: string, status: string) => {
@@ -119,11 +125,11 @@ describe("parkedCandidates (pure predicate)", () => {
     } as unknown as AtlassianOps;
 
     // 1. Deliberately shelved: To Do + EXEMPT_LABEL.
-    await shelveWorker(ops, "BOSS", "CHILD", "waiting on a dependency");
+    await shelveWorker(ops, "BOSS-1", "CHILD-1", "waiting on a dependency");
     expect(issue.labels).toContain(EXEMPT_LABEL);
 
     // 2. Reactivated — this is the fix under test: the label must not survive it.
-    await startWorker(ops, "BOSS", "CHILD");
+    await startWorker(ops, "BOSS-1", "CHILD-1");
     expect(issue.status).toBe("In Progress");
     expect(issue.labels).not.toContain(EXEMPT_LABEL);
 
@@ -134,9 +140,9 @@ describe("parkedCandidates (pure predicate)", () => {
 
     // 4. Before this fix, EXEMPT_LABEL from step 1 would still be present
     //    here and this candidate would be silently, permanently invisible.
-    const bossIssues = [iss("BOSS", "In Progress")];
-    const related = [rel(iss("CHILD", issue.status, { labels: issue.labels }), ["BOSS"])];
-    expect(parkedCandidates(bossIssues, related)).toEqual([{ child: related[0]!.issue, boss: "BOSS" }]);
+    const bossIssues = [iss("BOSS-1", "In Progress")];
+    const related = [rel(iss("CHILD-1", issue.status, { labels: issue.labels }), ["BOSS-1"])];
+    expect(parkedCandidates(bossIssues, related)).toEqual([{ child: related[0]!.issue, boss: "BOSS-1" }]);
   });
 });
 
