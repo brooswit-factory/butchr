@@ -32,18 +32,20 @@ import * as ts from "typescript";
  * the exact failure this whole rule exists to catch):
  *   - A label built by concatenation or interpolation whose PARTS are
  *     literals but whose WHOLE is not (e.g. `AGENT_PREFIX + label`,
- *     `` `${PR_PREFIX}${state}` ``). AC-9(a), measured against this repo's
- *     `src/` at the time of writing: `agent:stalled` is never a string
- *     literal anywhere in it, and there is not a single `pr:*` string literal
- *     in `src` either — the whole family is a direct concat. This scanner run
- *     today therefore finds ZERO of the nine daemon-owned label values and
- *     only the two verb-owned `butchr:*` constants (two of eleven), even
- *     though every one of those nine has a `LABEL_REGISTRY` entry. That
- *     coverage comes ENTIRELY from ./registry.ts's TYPE-level door
- *     (`AgentLabelKey`/`PrLabelKey`, derived from `AgentLabel`/`PrState`
- *     themselves) — never from this scanner. Do not read a clean run of this
- *     scanner as evidence the agent:/pr: families are covered; it is silent
- *     about them by construction, not because they're fine.
+ *     `` `${PR_PREFIX}${state}` ``) — this is where `agent:*` and `pr:*` are
+ *     actually EMITTED (`./sync.ts`'s AGENT_PREFIX-plus-suffix and
+ *     PR_PREFIX-plus-prState concatenations), and neither is a literal this
+ *     scanner can parse. AC-9(a): a scan of this repo's `src/` today DOES
+ *     find all nine daemon-owned label values as literal text — every one of
+ *     them, as a string key of `LABEL_REGISTRY` in ./registry.ts. That is NOT
+ *     this scanner confirming the emission sites above; it is the registry
+ *     agreeing with itself, one file finding its own declarations. The real
+ *     coverage for these nine comes ENTIRELY from ./registry.ts's TYPE-level
+ *     door (`AgentLabelKey`/`PrLabelKey`, derived from `AgentLabel`/`PrState`
+ *     themselves) — never from this scanner, clean run or not. Do not read a
+ *     clean run of this scanner as evidence the agent:/pr: families are
+ *     covered; it sees them, but only circularly, in the file that declares
+ *     them, never at the sites that actually emit them.
  *   - `test/` and `scripts/`. Only `src/` is scanned. Labels are runtime
  *     state written by `src/`'s own code; `test/` fixtures use label
  *     literals freely by design (see e.g. test/unit/relationship.test.ts),
