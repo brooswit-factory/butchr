@@ -83,6 +83,20 @@ export interface Config {
    * `[A-Z]+-\d+`, never dot-prefixed).
    */
   captureDir: string;
+  /**
+   * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
+   * project key must appear here to ever be staffed (see
+   * `src/resources/project.ts`'s `ProjectResourceDeps.allowlist`, the one
+   * place this is actually enforced). Default EMPTY, deliberately: this
+   * ticket's whole hazard is that the shipped discovery+activation code
+   * verdicts every led-and-eligible project `"active"` on its very first
+   * poll (no project on this site has ever been checked in on), so an
+   * unset `BUTCHR_PROJECT_ALLOWLIST` must staff zero projects on deploy —
+   * enabling one is a deliberate env-var edit plus a restart, never a
+   * silent side effect of this commit landing. Comma-separated project
+   * keys, same shape as `BUTCHR_GITHUB_ORGS` above.
+   */
+  projectAllowlist: string[];
 }
 
 export interface ConfigEnv {
@@ -103,6 +117,7 @@ export interface ConfigEnv {
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
+  BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -138,6 +153,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
 
+  const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
+
   return {
     atlassian: { site, email, token },
     port,
@@ -154,6 +171,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
       ...(assigneeEpic ? { epic: assigneeEpic } : {}),
     },
     captureDir,
+    projectAllowlist,
   };
 }
 
@@ -175,4 +193,5 @@ export const describeConfig = (c: Config): string =>
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
-  `captureDir=${c.captureDir}`;
+  `captureDir=${c.captureDir} ` +
+  `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"}`;

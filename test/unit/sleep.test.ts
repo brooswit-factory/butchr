@@ -109,6 +109,10 @@ describe("rest is rest (BUTCHR-66/83 acceptance criterion 2, evidence-1)", () =>
     let respawns = 0;
     const stop = runResourceLoop(resourceType, {
       herd,
+      // BUTCHR-91/BUTCHR-68: this fixture isn't exercising the new
+      // per-type herd scoping, so own everything — preserves this test's
+      // exact pre-existing behavior.
+      ownsId: () => true,
       notify: () => {},
       intervalMs: 10,
       onPollSuccess: () => { pollSuccesses++; },
@@ -160,7 +164,7 @@ describe("a woken agent derives its reason from the resource alone (BUTCHR-66/83
       spawnConfig: { specFor: (r) => ({ key: r.id, issuetype: "sleeper", summary: r.id, parent: null }) },
     };
     const herd = fakeHerd();
-    const stop = runResourceLoop(resourceType, { herd, notify: () => {}, intervalMs: 10 });
+    const stop = runResourceLoop(resourceType, { herd, ownsId: () => true, notify: () => {}, intervalMs: 10 });
     await new Promise((r) => setTimeout(r, 50));
     stop();
     expect(herd.spawned).toContain("S1"); // it did wake and spawn
@@ -190,7 +194,7 @@ describe("the lost-wake proof (BUTCHR-66/83 criterion 4, evidence-4)", () => {
     // only be advanced by the agent that never got to run) — exactly the
     // "unfinished business is still visible" property the ticket names.
     const resourceType = sleeperResourceType([[{ id: "S1", awake: true }]]);
-    const stop = runResourceLoop(resourceType, { herd, notify: () => {}, intervalMs: 10 });
+    const stop = runResourceLoop(resourceType, { herd, ownsId: () => true, notify: () => {}, intervalMs: 10 });
     await new Promise((r) => setTimeout(r, 45));
     stop();
     expect(new Set(spawnAttempts)).toEqual(new Set(["S1"])); // never a different/wrong id

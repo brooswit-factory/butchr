@@ -267,9 +267,74 @@ interface Snapshot<T> {
   related: RelatedResource<T>[];
 }
 
+/**
+ * BUTCHR-91/BUTCHR-68: the mutual-eviction hazard, closed by construction.
+ * `HerdrHerd` (src/agents/herd.ts) maps EVERY `butchr-*` agent into one flat
+ * namespace, with no resource-type scoping at all — `herd.runningIssues()`
+ * for the issue tier and for a second resource type sharing the same `Herd`
+ * returns the IDENTICAL list. `reconcileNow`'s `stop = running - desired -
+ * atRest` (`src/reconcile/plan.ts`) then reads a running agent of the OTHER
+ * type as "running but not desired" and stops it — proven live, in both
+ * directions, before this fix existed (see BUTCHR-91's ticket history).
+ *
+ * FIX: wrap the herd handed to `reconcileNow` so `runningIssues()`/
+ * `staleIssues()` are scoped to ids `ownsId` recognizes as belonging to
+ * THIS loop's own resource type, before `planReconcile` ever sees them — a
+ * foreign agent is simply invisible to this loop's reconcile step, so it
+ * can never appear in `stop` or `respawn`. Deliberately NOT applied to
+ * `spawn`/`stop`/`nudge`/`paneFor` themselves: those are always called with
+ * a SPECIFIC id this loop's own discovery/desired set already produced,
+ * never an enumeration over the shared namespace, so they were never the
+ * vector for this hazard.
+ */
+export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
+  // BUTCHR-91 review fix: NOT `{ ...herd, runningIssues: ..., staleIssues: ... }`.
+  // In production `herd` is a `HerdrHerd` CLASS INSTANCE — its methods
+  // (spawn/stop/nudge/paneFor) live on the prototype, which object spread
+  // does not copy (spread copies only the instance's own enumerable
+  // properties, e.g. `herdr`/`mcpUrl`/`wait` — measured: `{...new
+  // HerdrHerd(...)}.spawn` is `undefined`). Every `Herd` in this codebase's
+  // tests is a plain object literal, where methods ARE own enumerable
+  // properties, so the spread "works" there and ONLY there — the test
+  // suite and the type checker (which models the declared `Herd` interface,
+  // not runtime enumerability) both certified a path that throws
+  // `herd.spawn is not a function` on the first real poll that needs to
+  // spawn or stop anything, for BOTH loops, swallowed by `onError` into a
+  // `loop error:` line — the daemon looks healthy while silently staffing
+  // nothing. Explicit delegation avoids this entirely, and is strictly
+  // safer besides: an object literal typed `Herd` fails to COMPILE if
+  // `Herd` ever gains a member, where the spread would have silently kept
+  // dropping it.
+  return {
+    runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
+    staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
+    spawn: (spec) => herd.spawn(spec),
+    stop: (issue) => herd.stop(issue),
+    paneFor: (issue) => herd.paneFor(issue),
+    nudge: (issue, text) => herd.nudge(issue, text),
+  };
+}
+
 /** What `runResourceLoop` needs beyond the resource type itself — every field here is already fully generic (no `T`-shaped logic anywhere). */
 export interface GenericLoopDeps<T> {
   herd: Herd;
+  /**
+   * BUTCHR-91/BUTCHR-68: which opaque ids (as `herd.runningIssues()`/
+   * `staleIssues()` report them) belong to THIS resource type, among a herd
+   * namespace shared by every resource type running against the same
+   * `Herd` instance — see `scopedHerd` above for the hazard this closes.
+   * REQUIRED, deliberately not defaulted to "everything": a resource type
+   * that forgets to scope itself is exactly the failure this ticket exists
+   * to prevent, so the type system forces every caller — this one included
+   * — to make the decision explicitly rather than inherit a permissive
+   * default. A THIRD resource type must supply a predicate provably
+   * disjoint from every other type's (see `src/resources/id.ts`'s
+   * `isIssueKey`/`isProjectId` — mutually exclusive by construction, via
+   * disjoint regexes, not a runtime `&&` patched on afterward) — reusing an
+   * existing predicate, or an equally-disjoint id shape of its own, not
+   * "whatever's left over".
+   */
+  ownsId: (id: string) => boolean;
   notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
@@ -350,7 +415,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       // would not have that guarantee — this is the concrete cost of ever
       // relaxing that constraint.
       const atRest = atRestFrom(issues, resourceType);
-      await reconcileNow(deps.herd, desired, {
+      await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
@@ -461,6 +526,20 @@ export function startLoop(deps: LoopDeps): Stop {
   };
   return runResourceLoop(resourceType, {
     herd: deps.herd,
+    // BUTCHR-91/BUTCHR-68: `startLoop` is never the production dual-loop
+    // wiring (src/daemon/index.ts calls `runResourceLoop` directly, with
+    // its own real `isIssueKey`/`isProjectId` scoping — see that file) — it
+    // is kept solely as a single-resource-type adapter for existing
+    // callers/tests (this function's own doc comment). The mutual-eviction
+    // hazard `ownsId` exists to close cannot arise here: nothing else ever
+    // shares `deps.herd` with a `startLoop`-driven loop. Own everything,
+    // matching every pre-`ownsId` caller's behavior exactly — MEASURED:
+    // this codebase's existing test suite (loop.test.ts and others) widely
+    // uses bare, non-Jira-shaped ids ("A", "B", ...) that `isIssueKey`
+    // itself would reject, so hardcoding the real predicate here would
+    // silently break `stop`/`respawn` for every one of those fixtures
+    // rather than the mutual-eviction bug it exists to fix.
+    ownsId: () => true,
     notify: deps.notify,
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
