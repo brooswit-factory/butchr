@@ -336,6 +336,15 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
  * never includes `labels`) — so it is paid with one extra `getIssue` PER
  * NON-DONE WORKER, and only then: exactly the path where this is already
  * about to refuse, never the healthy common case.
+ *
+ * RE-CHECKS DONE against that same fresh fetch (review nit, BUTCHR-193):
+ * the per-worker `getIssue` this function pays for the label read is also
+ * a fresher, authoritative status than the stub's — free to use once paid
+ * for. Without this, a worker whose stub status is stale or absent (a
+ * status change landing between the boss's fetch and this one, or a stub
+ * Jira genuinely never hydrates) would be reported open on stale data even
+ * though the fresh read already shows Done — a false refusal, the same
+ * inversion failure the anti-inversion tests guard against elsewhere.
  */
 async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef[]> {
   const nonDone = findWorkers(issue).filter((w) => w.status !== "Done");
@@ -343,8 +352,9 @@ async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef
   const open: WorkerRef[] = [];
   for (const w of nonDone) {
     const full = await ops.getIssue(w.key);
-    if (!labelsOf(full).includes(EXEMPT_LABEL)) {
-      open.push({ key: w.key, status: statusOf(full) ?? w.status });
+    const status = statusOf(full) ?? w.status;
+    if (status !== "Done" && !labelsOf(full).includes(EXEMPT_LABEL)) {
+      open.push({ key: w.key, status });
     }
   }
   return open;
@@ -1805,8 +1815,9 @@ export async function askBoss(ops: AtlassianOps, callerKey: string, text: string
 }
 
 /**
- * The caller's OWN ticket -> In Review. No arguments at all — the one
- * transition an agent is always entitled to make about itself.
+ * The caller's OWN ticket -> In Review. No arguments at all — the only
+ * ticket it can ever act on is the caller's own, so there is nothing to get
+ * wrong — but NOT unconditional (see below).
  *
  * BUTCHR-193: REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS OWN —
  * the one added `getIssue` this verb pays that it didn't before (see

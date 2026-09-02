@@ -2020,6 +2020,21 @@ describe("BUTCHR-193: submit_to_boss refuses a caller with open workers of its o
     await expect(submitToBoss(spied, "BUTCHR-1")).rejects.toThrow(/BUTCHR-3/);
     expect(getIssueCalls).toBe(2); // one for the caller itself, one label-read for BUTCHR-3 (the only non-Done worker) — none for BUTCHR-2
   });
+
+  test("REVIEW NIT FIX: a worker that reaches Done BETWEEN the boss's own fetch and the per-worker fetch is NOT falsely reported open — the fresh read wins over the stale stub", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" }); // stub will read "In Progress"
+    const spied: AtlassianOps = {
+      ...ops,
+      getIssue: async (key: string) => {
+        if (key === "BUTCHR-2") issues.get("BUTCHR-2")!.status = "Done"; // races to Done before the per-worker fetch resolves
+        return ops.getIssue(key);
+      },
+    };
+    await submitToBoss(spied, "BUTCHR-1"); // must NOT throw — the fresh fetch shows Done even though the stub was stale
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
 });
 
 describe("BUTCHR-193: finish_without_a_boss refuses a caller with open workers of its own — ADDITIVE to, and does not disturb, the existing has-a-boss refusal (BUTCHR-92 orthogonality)", () => {
