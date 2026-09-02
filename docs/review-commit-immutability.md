@@ -20,7 +20,7 @@ Raw snapshots taken during this measurement are committed under
   auto-merge with no content of its own — but this two-condition rule
   itself has a documented counter-example (PR #151), so it is not
   asserted as the mechanism. What IS established as a property, holding
-  across all nine cases measured including #151: the recorded commit
+  across every case measured in this document, including #151: the recorded commit
   equals the current head only when the branch's own contribution is
   unchanged since the review. The mechanism producing that property is
   UNDETERMINED — six candidates were proposed and killed; see "Mechanism"
@@ -572,9 +572,11 @@ which field is read (see "Same-record, cross-field contradiction" under
 Arm A above).
 
 The `[review] APPROVED/CHANGES_REQUESTED <pr-url> @ <sha>` Jira line:
-checked against the live API at submission time for every one of the six
-reviews received in this measurement. Agreed in five of six on first
-transcription; the sixth (#188's original APPROVE request) was
+checked against the live API at submission time for every one of the
+five reviews received in this measurement (`5087810116` on #188,
+`5087810416` on #189, and `5087810684`/`5088049611`/`5088066213` on
+#190 — #194 received no review at all). Agreed in four of five on first
+transcription; the fifth (#188's original APPROVE request) was
 hand-transcribed with a dropped character (`5431134c...`, 39 chars,
 non-existent) and caught by BUTCHR-114 before reviewing — see the
 "Incidental finding" under Arm A. Every subsequent request in this
@@ -658,9 +660,9 @@ held-constant account, BUTCHR-114):**
   value, not something recomputed fresh on every read.
 
 **INFERRED, as the simplest statement consistent with every case
-measured (nine total: #172's three reviews, #176, #177's three
+measured in this document: #172's three reviews, #176, #177's three
 successive moves, Arm A's two phases, Arm B, Test 1, Test 2a, Test 2b,
-Arm C's three records, and #151):**
+Arm C's three records, and #151:**
 
 > The review's recorded commit equals the current head only when the
 > branch's own contribution is unchanged since the review. Any commit
@@ -693,7 +695,7 @@ misrepresent how many wrong turns it took to get here:
 
 **No proposed mechanism survives. The mechanism is UNDETERMINED.** The
 property statement in the Q1 answer above is the strongest claim
-supported by all nine measured cases without asserting a mechanism that
+supported by every case measured in this document without asserting a mechanism that
 the next case might kill. #151's own sequence (`6774436f` reviewed →
 clean merge `ecc5fba9`, no advance → plain commit `62bc7db2` → PR merged)
 leaves one specific candidate explanation open and explicitly
@@ -729,8 +731,8 @@ available than what this document already rules out.
 **Two artefacts DO hold the reviewed sha immutably, confirmed directly:**
 
 1. **The review's own BODY TEXT.** Confirmed unchanged across every T0/T1
-   pair in this measurement (six reviews, multiple re-reads each), most
-   sharply on Arm A's review 5087810116, whose body still reads
+   pair in this measurement (five reviews received, multiple re-reads
+   each), most sharply on Arm A's review 5087810116, whose body still reads
    `REVIEWED-SHA: 54311340c...` while its `commit_id` field has advanced
    to `aeba3bb8...` — a same-record, cross-field contradiction, not an
    inference. A remedy that has the reviewer plant a machine-readable sha
@@ -769,8 +771,8 @@ this" as "nothing unreviewed is in the merged result."
 Labelled explicitly as gaps, not folded into the answers above:
 
 - **The actual mechanism.** Six candidates dead; the property survives
-  all nine cases but does not explain *why*. Named test above (reproduce
-  #151's timing).
+  every case measured but does not explain *why*. Named test above
+  (reproduce #151's timing).
 - **Replication of the chain-intact-evil-merge result (Test 2b).**
   Currently n=1. A second scratch PR (#194) was opened for exactly this
   and deliberately not used, given this task's priority order. The
