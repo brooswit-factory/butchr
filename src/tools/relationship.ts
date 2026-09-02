@@ -671,6 +671,15 @@ export interface AdoptWorkerResult {
  * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
  * below for why that check is not gated on `alreadyAdopted`.
  *
+ * SEPARATELY, THIS CALL ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`)
+ * whenever the adopted ticket carries it — for BOTH dispositions, unlike
+ * `EXEMPT_LABEL` above, and likewise not gated on `alreadyAdopted`
+ * (BUTCHR-108/BUTCHR-137). `ORPHAN_LABEL` means UNDIRECTED, not shelved, and
+ * a ticket adopted with `"shelve"` is exactly as directed as one adopted
+ * with `"start"` — it has a boss, a link, and a recorded decision either
+ * way. See the comment at that removeLabels call below for the full
+ * argument.
+ *
  * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
  * "shelve" disposition, the reason is posted whenever this call does ANY
  * real adoption work at all (`!alreadyAdopted`) — even if the ticket
@@ -758,6 +767,25 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
 
   const doc = await ensureDoc(ops, workerKey);
 
+  // CLEARS ORPHAN_LABEL WHENEVER IT'S PRESENT — REGARDLESS OF DISPOSITION,
+  // AND NOT GATED ON `alreadyAdopted` EITHER (BUTCHR-108/BUTCHR-137). The
+  // gating on EXEMPT_LABEL just below is specific to what THAT label means
+  // (CURRENTLY shelved, a state only "start" reverses); ORPHAN_LABEL means
+  // something different — UNDIRECTED — and a ticket adopted with "shelve" is
+  // exactly as directed as one adopted with "start": either way it now has a
+  // boss, a link, and a recorded decision, so this clear runs for BOTH. Reuses
+  // `labels` from the fetch above — no extra Jira call. Not gated on
+  // `alreadyAdopted`, by the same BUTCHR-50 argument EXEMPT_LABEL's own clear
+  // makes below: an otherwise fully idempotent re-adoption must still clear a
+  // stale orphan label, or a live, directed ticket keeps silently polluting
+  // the undirected-ticket query forever — exactly the residue this fix
+  // exists to stop producing. Cleared BEFORE any transition below — same
+  // "never leave a partial state where the detector is silently wrong"
+  // ordering EXEMPT_LABEL's own clear and startWorker's comment already use.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
+
   // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
   // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
   // this path already reads the issue and computes labelsOf(issue), so this
@@ -820,6 +848,17 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
  * boss (there is no equivalent "explicit move" verb for project
  * membership here — moving an issue between Jira projects is out of scope
  * for this tool surface, not silently omitted).
+ *
+ * ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`) WHENEVER PRESENT, SAME AS THE
+ * ISSUE-CALLER PATH ABOVE — argued explicitly here rather than left implicit
+ * (BUTCHR-108/BUTCHR-137): `fileWhereItBelongs` can only ever create a Story
+ * or a Task (its `issuetype` input is typed that way), so an orphan Epic can
+ * never arrive here through this codebase's own write path today. Clearing
+ * it here anyway is a symmetry / defence-in-depth call, not a reachable-bug
+ * fix — the label could still land on an Epic by hand, or from a future
+ * caller this tool surface doesn't control. It costs nothing to add: this
+ * path already fetches and computes `labels` for its own idempotence check,
+ * so the clear reuses that fetch exactly like the issue-caller path's does.
  */
 async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   const issue = await ops.getIssue(workerKey);
@@ -869,6 +908,16 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     : undefined;
 
   const doc = await ensureDoc(ops, workerKey);
+
+  // Same BUTCHR-108/BUTCHR-137 fix as the issue-caller path: clear a stale
+  // ORPHAN_LABEL whenever it's present, for BOTH dispositions and not gated
+  // on `alreadyAdopted` — see this function's own doc comment above for why
+  // this path clears it too (symmetry / defence-in-depth, argued there), and
+  // adoptWorker's ORPHAN_LABEL comment for the full disposition-gating
+  // reasoning. Reuses `labels` from the fetch above — no extra Jira call.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
 
   // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
   // on a "start" disposition whenever it's present, not gated on
@@ -925,6 +974,69 @@ export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, wor
  * STATED HERE VERBATIM because briefs need to quote it, same as ASK_MARKER.
  */
 export const CORRECTION_MARKER = "[correction]";
+
+/**
+ * Marks a follow-up comment `correctWorker` posts when the replace (the
+ * write AFTER the archive) fails for a reason the size pre-check below did
+ * not catch — a transient network fault, a permissions change, anything
+ * else Jira can reject with. Placed right after the identity tag, same
+ * idiom as `CORRECTION_MARKER`/`ASK_MARKER`. AN EXPORTED CONSTANT, NEVER
+ * RETYPED — including in tests, which read this symbol — for the same
+ * reason `CORRECTION_MARKER`'s own comment gives: a marker duplicated as a
+ * literal eventually drifts into two different literals, and a grep that
+ * silently misses half the corpus answers wrong instead of not at all.
+ * This is BUTCHR-136's fix for the gap BUTCHR-128 measured: the thrown
+ * error already tells the CALLER a rejected write happened, but nothing
+ * durable told a later reader of the ticket itself — this comment is that
+ * durable record, posted immediately after the `[correction]` archive it
+ * is annotating, best-effort (see `correctWorker`'s catch block: its own
+ * failure must never mask the original edit error).
+ */
+export const CORRECTION_REJECTED_MARKER = "[correction-rejected]";
+
+/**
+ * Body for the `CORRECTION_REJECTED_MARKER` follow-up comment — mirrors
+ * `correctionArchiveBody`'s shape so the two read as one family. Points at
+ * "the archive comment immediately above" rather than an ID: comments are
+ * posted in order and this one is always the very next one, so a reader
+ * never needs anything but position to connect the two.
+ */
+function correctionRejectedAnnotationBody(workerKey: string, editError: string): string {
+  return [
+    `the ${CORRECTION_MARKER} archive comment immediately above records a write that was REJECTED.`,
+    `The edit meant to replace it failed (${editError}) after the archive was posted, so the archived text above did NOT get superseded — ${workerKey}'s description/summary are UNCHANGED. Treat the archived text above as still current, not history. Safe to retry.`,
+  ].join("\n\n");
+}
+
+/**
+ * Documented, non-configurable Jira Cloud limits, established rather than
+ * guessed (BUTCHR-136, corrected on review): Jira Cloud enforces a fixed
+ * 32767-character limit on rich-text fields, `description` included — this
+ * is NOT the `jira.text.field.character.limit` advanced setting (that
+ * setting is a Server/Data Center mechanism, configurable there, and does
+ * not exist as a readable or writable Cloud setting at all; asserting
+ * "fixed... and not configurable" under that name would be true on Server/DC
+ * for the wrong reason and wrong on Cloud, where the setting is simply
+ * absent). The 32767 figure itself is corroborated, not sourced, by
+ * Atlassian's support KB for `CommentBodyCharacterLimitExceededException`
+ * (a Cloud Migration Assistant comment-body limit) quoting the same string
+ * verbatim: "The entered text is too long. It exceeds the allowed limit of
+ * 32,767 characters." — that KB is about a different field in a different
+ * tool, cited here only because it independently lands on the same number
+ * as the `CONTENT_LIMIT_EXCEEDED` error this verb actually catches.
+ * `summary` is a separate system field with its own fixed 255-character
+ * Cloud limit ("Summary can't exceed 255 characters") — the two fields are
+ * NOT the same limit, which is why this is two constants, not one reused
+ * twice.
+ *
+ * Sanity-checked against this corpus's own falsifier before shipping:
+ * BUTCHR-125 holds a description Jira ACCEPTED at 30,091 characters
+ * (BUTCHR-100's measurement, cited on BUTCHR-128/BUTCHR-130) — any
+ * description limit at or below 30,091 would be wrong on its face, and
+ * 32767 clears that bar.
+ */
+export const JIRA_DESCRIPTION_CHAR_LIMIT = 32767;
+export const JIRA_SUMMARY_CHAR_LIMIT = 255;
 
 /**
  * The archive comment body `correctWorker` posts BEFORE overwriting — see
@@ -1004,8 +1116,26 @@ export interface CorrectWorkerResult {
  *   3. `why` empty or whitespace-only — same discipline `shelveWorker`
  *      already applies to its own `reason`: an intention nobody wrote down
  *      is indistinguishable six weeks later from a mistake.
- *   4. `assertOwnWorker` — the existing ownership helper, reused unchanged;
+ *   4. oversized `description`/`summary` — BUTCHR-136: refused against the
+ *      REAL, documented Jira Cloud limits (`JIRA_DESCRIPTION_CHAR_LIMIT`,
+ *      `JIRA_SUMMARY_CHAR_LIMIT`) BEFORE the archive comment is posted, so
+ *      an oversized correction leaves the worker byte-for-byte untouched
+ *      instead of an archive comment with no replacement to match it. This
+ *      is a cheap, no-Jira-read check like 1-3 above, so it belongs here,
+ *      not after the ownership read.
+ *   5. `assertOwnWorker` — the existing ownership helper, reused unchanged;
  *      this is the only place ownership is checked, on purpose.
+ *
+ * WHEN THE REPLACE FAILS FOR ANY OTHER REASON — a pre-check on size cannot
+ * cover a transient network fault, a permissions change, or any other
+ * ground Jira might reject on. In that case the archive already stands, so
+ * the catch below posts a best-effort `CORRECTION_REJECTED_MARKER`
+ * follow-up comment marking that archive as recording a write that was
+ * REJECTED, then re-throws the ORIGINAL error unchanged. "Best-effort"
+ * means exactly that: the follow-up post is wrapped in its own try/catch
+ * that swallows its own failure — a reader who never sees the annotation
+ * still gets the original, already-correct error, never a secondary one
+ * about the annotation itself failing.
  *
  * ARCHIVE BEFORE OVERWRITE — THE ORDERING IS THE DESIGN, not decoration:
  * this reads the worker's CURRENT description/summary, posts them as a
@@ -1065,6 +1195,16 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
   if (!input.why.trim()) {
     throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
+  if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
+  if (input.summary !== undefined && input.summary.length > JIRA_SUMMARY_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new summary is ${input.summary.length} characters, over Jira's ${JIRA_SUMMARY_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
   await assertOwnWorker(ops, "correct_worker", callerKey, workerKey);
 
   const issue = await ops.getIssue(workerKey);
@@ -1088,8 +1228,18 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
     });
   } catch (e) {
+    const editError = (e as Error).message;
+    try {
+      await ops.addComment(workerKey, tagComment(callerKey, `${CORRECTION_REJECTED_MARKER} ${correctionRejectedAnnotationBody(workerKey, editError)}`));
+    } catch {
+      // Best-effort, by design: the annotation is a nice-to-have durable
+      // record, not a substitute for the ORIGINAL error thrown below. A
+      // reader who never sees this comment still gets the correct,
+      // already-established error text — never a secondary error about the
+      // annotation itself failing to post.
+    }
     throw new Error(
-      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${(e as Error).message}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
+      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${editError}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
     );
   }
 
@@ -1212,7 +1362,20 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
 // The deliberate-orphan escape: file_where_it_belongs
 // ---------------------------------------------------------------------------
 
-/** `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL filter. Never combined with `EXEMPT_LABEL`: see fileWhereItBelongs's doc comment for why an orphan can never trip the parked-ticket detector. */
+/**
+ * `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL
+ * filter. Applied exactly once, at creation, by `fileWhereItBelongs`.
+ * WITHDRAWN by `adoptWorker` / `adoptProjectWorker` (BUTCHR-108/BUTCHR-137)
+ * the moment the ticket gains a boss — for either disposition, not gated on
+ * idempotence — see the comment at those `removeLabels` calls for the full
+ * reasoning.
+ *
+ * Never combined with `EXEMPT_LABEL` (`butchr:shelved`) IN THE SAME CALL:
+ * `fileWhereItBelongs` never applies `EXEMPT_LABEL` at creation (see its own
+ * doc comment for why an orphan can't trip the parked-ticket detector), and
+ * `adoptWorker`'s `"shelve"` path withdraws `ORPHAN_LABEL` in the same call
+ * it adds `EXEMPT_LABEL` — so a live ticket never ends up carrying both.
+ */
 export const ORPHAN_LABEL = "butchr:orphan";
 
 /** A destination is either a named existing Epic, or prose explaining why a new one is needed. Neither is a fallback for the other. */
@@ -1349,7 +1512,10 @@ export interface FileWhereItBelongsResult {
  * link off the active set, and this ticket has none — the parked detector
  * structurally cannot see it, so that label here would be cargo-culted state
  * meaning nothing. Labelled `ORPHAN_LABEL` instead, which is what actually
- * makes it discoverable (a saved JQL filter).
+ * makes it discoverable (a saved JQL filter) — withdrawn by `adoptWorker` /
+ * `adoptProjectWorker` the moment this ticket gains a boss and stops being
+ * undirected (BUTCHR-108/BUTCHR-137); see the comment at those
+ * `removeLabels` calls.
  *
  * WRITE ORDER, AND WHY: unlike new_worker, there is no "worst survivable
  * state" to protect against here, because this ticket never gets a boss link
