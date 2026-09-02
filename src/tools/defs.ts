@@ -9,7 +9,7 @@ import {
   type Disposition,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
-import { advanceProjectWatermark, newestCommentId } from "../resources/project.js";
+import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -720,6 +720,22 @@ export function atlassianTools(
         const comments = await ops.getPageComments(doc.id);
         audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
         return comments;
+      },
+    },
+    list_peers: {
+      description:
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue talks only to its boss and its workers, never sideways to a project. TAKES NO ARGUMENTS: like check_in/get_doc_comments, the only estate a project can enumerate is the one it lives in, so which project\'s peers you get is never expressible as an argument mistake. Returns `{ results: [{ key, name }] }` — the OTHER ELIGIBLE projects (live, led by this credential, and carrying a readable `butchr` entity property naming a root doc — the SAME rule `resolveEligibleProjects` in src/resources/project.ts uses for staffing, not a second one), excluding the caller itself. Uses ELIGIBILITY, NOT the staffing allowlist (a ROLLOUT GATE, not an eligibility rule): a project can appear here even though it is not currently staffed, because eligibility and staffing are different questions — a future tell_peer to such a peer would post to a root page no running agent currently reads, which is the intended behavior for this increment, not a bug. Does NOT return a root-doc page id or url: resolve that fresh at send time instead of caching a value that can go stale between this listing and a later send.',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireProjectCaller(
+          c,
+          "list_peers",
+          "peers are a relationship between projects — an issue talks to its boss and its workers, never sideways to a project",
+        );
+        const { eligible } = await resolveEligibleProjects(ops);
+        const results = eligible.filter((p) => p.key !== who).map((p) => ({ key: p.key, name: p.name }));
+        audit(c, `list_peers (${results.length} peer${results.length === 1 ? "" : "s"})`);
+        return { results };
       },
     },
     submit_to_boss: {
