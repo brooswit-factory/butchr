@@ -39,23 +39,33 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   — at both levels (story approves task PRs; epic approves the story's PR to
   main). Every formal review — Approve or Request changes — also gets one
   `[review] <verdict> <pr> @ <sha>` comment on the author's ticket (the event
-  that actually wakes them), and the author verifies the last decisive
-  review's own `reviews[].commit.oid` against the current head before
-  merging (an approval is recorded against a sha, and the branch may have
-  moved since). That check is NOT sufficient on its own: GitHub can
-  silently rewrite `reviews[].commit.oid` to a later commit after a
-  base-merge — confirmed on two PRs, including one with three reviews where
-  an OLDER review still held its original recorded sha while a LATER
-  review's recorded commit had already moved, matching the current head
-  each time it was re-read. Only a review's own written-at-submission BODY
-  text stays fixed; any structured field, `reviews[].commit.oid` included,
-  can move — and this check reads the LAST decisive review, which is
-  exactly the one most likely to have been rewritten. Strictly better than
-  the `reviewDecision`+`headRefOid` pair it replaced (which failed on every
-  push), but not proof the base hasn't moved under the reviewed diff. If
-  the base may have moved since approval, a re-review at the new head, or
-  the append-only `[review] APPROVED ... @ <sha>` ticket comment GitHub
-  cannot rewrite, are the moves that already exist.
+  that actually wakes them, pasted verbatim from `gh pr view --json
+  headRefOid`, never retyped by hand — a hand-transcribed sha has already
+  gone out wrong, 39 characters naming no real commit, caught only by luck),
+  and the author verifies the last decisive review's own
+  `reviews[].commit.oid` against the current head before merging (an
+  approval is recorded against a sha, and the branch may have moved since).
+  A mismatch means the branch's own contribution changed since that review —
+  a real signal, not a false alarm on an ordinary older review. A match
+  means it did not, which is a narrower claim than "nothing unreviewed
+  landed": a clean base-merge advances `reviews[].commit.oid` to match the
+  new head precisely because it adds nothing of the branch's own beyond what
+  was already reviewed, but it does import `main`'s own content, which this
+  PR's reviewer never personally read (usually fine — `main`'s content is
+  reviewed on its own PRs). That check is NOT sufficient on its own for a
+  second reason too: the field's move is ASYNCHRONOUS, observed on the order
+  of 30–56s after a base-merge (`docs/review-commit-immutability.md`) — an
+  OBSERVED window, not a guaranteed bound — so a read taken immediately
+  after a push cannot be trusted as final; wait it out or use the `[review]`
+  comment instead. Strictly better than the `reviewDecision`+`headRefOid`
+  pair it replaced (which failed on every push), but untested against a
+  squash-merge, a rebase, a force-push, a merge's second parent, or a
+  genuine multi-way conflict resolution — any of those could behave
+  differently from what was measured. If the base may have moved since
+  approval, a re-review at the new head, or the append-only `[review]
+  APPROVED ... @ <sha>` ticket comment GitHub cannot rewrite (though it can
+  be mistyped at submission — trust it only when machine-pasted and
+  40-hex-checked), are the moves that already exist.
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the boss agent — reached via the Implements link, not the
