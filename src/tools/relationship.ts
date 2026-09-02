@@ -27,6 +27,71 @@ function tagComment(who: string, text: string): string {
 /** Marks an `ask_boss` comment as a QUESTION AWAITING AN ANSWER — distinguishes it from a plain `report_to_boss`, and lets a boss find unanswered questions without reading every comment its workers wrote. Placed right after the identity tag. STATED HERE VERBATIM because BUTCHR-30's briefs need to quote it. */
 export const ASK_MARKER = "[ask]";
 
+/**
+ * The swallowed-argument shape (BUTCHR-177/BUTCHR-180): a caller's tool call
+ * malforms one argument's closing tag, and the harness's own argument parser
+ * folds everything after it — including the FOLLOWING argument's own opening
+ * tag — into the still-open value. Measured twice in this corpus, both on
+ * `file_where_it_belongs`'s `destination` (BUTCHR-127 via BUTCHR-102,
+ * BUTCHR-164 via BUTCHR-156): a ticket's own description, in the wrong
+ * field, whole and readable but sitting behind a visible seam nobody's code
+ * caught. Both specimens contain the SAME two substrings in the SAME order:
+ * a closing tag naming the argument that was cut short, immediately
+ * followed by this harness's own `<parameter name="...">` wrapper opening
+ * the next one.
+ *
+ * This catches the SHAPE, not a length bound — see `MIN_REASON_CHARS`'s own
+ * comment for the opposite bound already living beside this one. A long,
+ * honest reason is legitimate and must not be refused for being long, only
+ * for CONTAINING what a swallowed argument boundary looks like. Two
+ * capturing groups, never both set: group 1 is the name inside a premature
+ * `</name>` closing tag; group 2 is the name inside a `<parameter name="...">`
+ * opening tag. Exported so this guard's own tests read one symbol rather
+ * than a re-typed regex that could silently drift from what this actually
+ * checks.
+ */
+export const SWALLOWED_ARGUMENT_RE = /<\/([A-Za-z_][\w:-]*)\s*>|<parameter\s+name=["']([^"']+)["']/;
+
+/**
+ * Refuses a SHORT-PROSE argument — one an agent composes as a title, a
+ * reason, or a brief explanation, as opposed to a `description` or a doc
+ * `body`, which may legitimately contain any text at all, this shape
+ * included, and must never be guarded this way (getting that backwards
+ * would make the tools unable to describe their own defects — including the
+ * tickets that found this one). Called EARLY in every relationship verb
+ * that accepts one, before that verb's first side effect — the point is to
+ * fail the call before anything is written or posted, not to clean up
+ * after.
+ *
+ * Matches `destinationRefusal`'s own house style deliberately (see that
+ * function, just below in this file for `file_where_it_belongs`'s own
+ * `destination`): the specific complaint, plainly and without scolding,
+ * then a teaching tail. The tail never reproduces the matched text as one
+ * contiguous run of `<`, `/` and `>` — only the bare argument NAME the tag
+ * appeared to reference — for the same reason this whole ticket exists: a
+ * caller that copied a refusal message straight into its next call would
+ * otherwise be handed the exact literal that trips this guard.
+ *
+ * FALSE-POSITIVE COST, STATED OUT LOUD: a legitimate value that happens to
+ * contain real tag-shaped text (quoting markup, or describing this very
+ * defect) will be refused. That is why this refusal explains what to do
+ * instead — break the literal up in words — rather than only "try again",
+ * which would just reintroduce the problem one layer up.
+ */
+export function guardShortProse(verb: string, argName: string, raw: string): void {
+  const m = SWALLOWED_ARGUMENT_RE.exec(raw);
+  if (!m) return;
+  const name = m[1] ?? m[2];
+  const what =
+    m[1] !== undefined
+      ? `what looks like a premature closing tag naming \`${name}\``
+      : `what looks like the wrapper that opens the NEXT tool-call argument (naming \`${name}\`)`;
+  throw new Error(
+    `${verb}: \`${argName}\` contains ${what}, partway through its own text — the exact seam a malformed tool call leaves when the harness's argument parser folds a LATER argument into this one instead of starting it separately (measured twice in this corpus: BUTCHR-127, BUTCHR-164). ` +
+      `Length alone is not the problem — a long, honest \`${argName}\` is fine on its own. Rewrite the call so \`${argName}\` holds only its own value, and check that every other argument you meant to send is still its own separate argument rather than text trapped inside this one. If you genuinely need literal tag syntax inside \`${argName}\`, describe it in words instead of the raw characters — the same discipline this defect's own tickets use when they have to talk about it. This call was refused before anything was written or posted.`,
+  );
+}
+
 /** The role env var that governs a given issuetype's staffing (src/config/config.ts's `Config.assignees`). Shared by `noRoleMsg` below and BUTCHR-110's collision messages so the two never drift apart on naming. */
 function envVarFor(issuetype: "Story" | "Task" | "Epic"): string {
   return issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : issuetype === "Task" ? "BUTCHR_ASSIGNEE_TASK" : "BUTCHR_ASSIGNEE_EPIC";
@@ -364,6 +429,8 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
     throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
+  guardShortProse("new_worker", "summary", input.summary);
+  if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
 
   const callerIssue = await ops.getIssue(callerKey);
   const callerType = issuetypeOf(callerIssue);
@@ -492,6 +559,8 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
     throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
+  guardShortProse("new_worker", "summary", input.summary);
+  if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
   const role = roles.epic;
   if (!role) throw new Error(noRoleMsg("new_worker", "Epic"));
 
@@ -617,6 +686,7 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
  */
 export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerKey: string, reason: string): Promise<void> {
   if (!reason.trim()) throw new Error("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+  guardShortProse("shelve_worker", "reason", reason);
   await assertOwnWorker(ops, "shelve_worker", callerKey, workerKey);
   // LABEL BEFORE TRANSITION, on purpose (order the writes by how bad it is to
   // stop there, the same principle newWorker uses): if the label write fails
@@ -703,6 +773,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
     throw new Error("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
+  if (disposition.kind === "shelve") guardShortProse("adopt_worker", "reason", disposition.reason);
   if (isProjectId(callerKey)) return adoptProjectWorker(ops, roles, callerKey, workerKey, disposition);
 
   const issue = await ops.getIssue(workerKey);
@@ -1536,6 +1607,8 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
   if (!input.why.trim()) {
     throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
+  guardShortProse("correct_worker", "why", input.why);
+  if (input.summary !== undefined) guardShortProse("correct_worker", "summary", input.summary);
   if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
     throw new Error(
       `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
@@ -1811,6 +1884,7 @@ export function classifyDestination(raw: string): OrphanDestination {
   if (!trimmed) {
     throw destinationRefusal("no destination was given (empty, or only whitespace).");
   }
+  guardShortProse("file_where_it_belongs", "destination", trimmed);
   if (JIRA_KEY_RE.test(trimmed)) {
     return { kind: "epic", key: trimmed };
   }
@@ -2255,6 +2329,7 @@ export interface FileWhereItBelongsResult {
  */
 export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, callerKey: string, input: FileWhereItBelongsInput): Promise<FileWhereItBelongsResult> {
   const destination = classifyDestination(input.destination);
+  guardShortProse("file_where_it_belongs", "summary", input.summary);
 
   if (destination.kind === "epic") {
     let epicIssue: unknown;
