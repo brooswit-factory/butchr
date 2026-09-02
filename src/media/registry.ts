@@ -154,25 +154,53 @@
  * this file only has to be honest about it.
  *
  * `deployedTruth` — WHAT EVERY DETECTOR BELOW PROVES ABOUT THE RUNNING
- * FLEET: for every entry today, the honest value is NOTHING. A source-level
- * check (a registry entry, a scanner, this file) can only ever speak to
- * MERGED-CODE TRUTH — the property holds at the commit the check ran
- * against. It can never speak to DEPLOYED-FLEET TRUTH — whether the daemon
- * that is actually running right now is executing that commit. Measured
- * live for this ticket, in this agent's own workspace, not inherited from
- * any other ticket's number: this workspace's `ENVIRONMENT.md` names this
- * daemon's pid; `/proc/<pid>/cwd` resolves to a SEPARATE working copy of
- * this same repository from the one this ticket's worktree lives in, and
- * that working copy's `HEAD` predates the merge that first introduced
- * `src/headers/` and `src/workspace/` at all — so today, for EVERY entry
- * below, not one of `agent:*`/`pr:*`/`butchr:shelved`/`butchr:orphan`'s
- * label registry, the header registry, or the workspace registry is
- * running in the fleet this daemon serves, regardless of what `main` (or
- * this PR) contains. `git merge-base --is-ancestor` against that daemon
- * tree's own commit is the check; RE-RUN IT IN YOUR OWN ENVIRONMENT before
- * trusting this paragraph — a daemon can restart, redeploy, or simply be a
- * different pid by the time you read this, and this file is exactly the
- * kind of record `self-declaring` warns is never a machine check.
+ * FLEET, STATED AS A TIMELESS CLAIM, NEVER AS A DATED MEASUREMENT BAKED IN
+ * AS A PRESENT-TENSE FACT (BUTCHR-172 review round 2 — the trap below is
+ * not hypothetical, it is what happened to this file's own first draft;
+ * read "THE WORKED EXAMPLE" below before writing a replacement measurement
+ * here): a source-level check (a registry entry, a scanner, this file) can
+ * only ever speak to MERGED-CODE TRUTH — the property holds at the commit
+ * the check ran against. It can never speak to DEPLOYED-FLEET TRUTH —
+ * whether the daemon that is actually running right now is executing that
+ * commit. This general claim is timeless and does not need re-measuring.
+ *
+ * HOW TO RE-MEASURE deployed-fleet truth for any entry below, CONTENT
+ * FIRST, ANCESTRY AS CORROBORATION ONLY (a squash merge makes ancestry
+ * answer NO for a PR that landed perfectly, manufacturing a deployment gap
+ * that does not exist — never let it override a content check):
+ *   1. Read the daemon pid from YOUR OWN workspace's `ENVIRONMENT.md` —
+ *      never from this ticket, never from a comment.
+ *   2. VERIFY THAT PID IS ALIVE BEFORE TRUSTING ANYTHING DERIVED FROM IT.
+ *      Not a formality — see "THE WORKED EXAMPLE" below.
+ *   3. Resolve the tree from `/proc/<pid>/cwd` — the daemon runs its
+ *      WORKING TREE, not its git HEAD.
+ *   4. Settle it by CONTENT: `grep` the working files for the actual thing
+ *      you care about (e.g. `MEDIA_REGISTRY`, or `src/media/` existing at
+ *      all) and PRINT THE MATCHING LINE — a bare `grep -q` reports your
+ *      conclusion, not your evidence.
+ *   5. `git merge-base --is-ancestor` against that tree's own commit is
+ *      corroboration only, the weaker instrument; never decisive on its own.
+ *
+ * THE WORKED EXAMPLE, KEPT DELIBERATELY AS DATED, SUPERSEDED HISTORY RATHER
+ * THAN SILENTLY PATCHED AWAY — this epic's own defect, caught happening TO
+ * this exact file: an earlier version of this paragraph stated, in the
+ * present tense, that the agent's own daemon tree (measured 2026-09-02,
+ * early morning PT, via the method above) predated the merge introducing
+ * `src/headers/`/`src/workspace/`, so neither was running yet. That
+ * sentence was accurate when written and FALSE roughly two hours later,
+ * under review, when this daemon (and the reviewer's) redeployed: the same
+ * pid died, a new one came up, and its fresh working tree had both
+ * `src/headers/registry.ts` and `src/workspace/registry.ts` on disk —
+ * `src/media/` still did not. Nobody's code caught the staleness; a human
+ * reviewer re-measuring by hand did. This is FAILURE MODE #3 — a source
+ * cannot see whether it is deployed — demonstrated live, inside the very
+ * file whose subject is failure mode #3, in under two hours. That is the
+ * value of recording it rather than quietly overwriting it: a dated,
+ * explicitly-superseded observation costs nothing and cannot mislead a
+ * later reader the way a present-tense one already did once. Do not update
+ * this paragraph with a fresher present-tense claim — re-measure with the
+ * method above instead, and if you keep a new dated observation, mark it
+ * dated and expect it to be superseded too.
  *
  * NO RUNTIME BEHAVIOUR LIVES HERE, same discipline as the three files this
  * one indexes — this file is never imported by any write path in this
@@ -227,7 +255,7 @@ export type MediaRegistryEntry = DetectorField & {
 };
 
 const DEPLOYED_TRUTH_NOTHING =
-  "Nothing. This medium's detector(s) can only ever speak to merged-code truth — the property held at the commit the check last ran against — never to deployed-fleet truth, whether the daemon actually running right now is executing that commit. Measured live for this ticket (see this file's header): this agent's own daemon (pid read from its own workspace's ENVIRONMENT.md, verified alive) has its working tree at a commit that predates the merge introducing src/headers/ and src/workspace/ at all, so today this is true of every entry in this registry, not a hedge. Re-measure in your own environment before trusting this sentence for a different point in time.";
+  "Nothing — timelessly, not as of any particular measurement. This medium's detector(s) run once, against one commit, as a static source check; they never execute inside the deployed daemon process and are never re-run against it, so by construction they cannot prove anything about which commit that process is currently running. Whether this medium's own write-path code (its registry.ts, its scanner) happens to be present in today's deployed tree is a SEPARATE, genuinely dated fact — see this file's header for the method to check it yourself (content first, ancestry as corroboration only) and for the worked example of exactly why a specific answer to that question does not belong baked in here as a present-tense claim.";
 
 /**
  * THE REGISTRY. Every medium this codebase declares a cached-assertion
@@ -283,7 +311,7 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
       {
         grade: "self-declaring",
         mechanism:
-          "GROUND_TRUTH — the exact worked example this file's header names for this grade: ENVIRONMENT.md's freshness paragraph (a 'measured at:' timestamp, src/agents/ground-truth.ts) and every brief's framing that a stale copy is wrong and the reader's own live workspace file is right. BUTCHR-169 declared this explicitly as a courtesy for a careful reader, never a machine check — preserved exactly, not upgraded, here.",
+          "GROUND_TRUTH — the exact worked example this file's header names for this grade: ENVIRONMENT.md's freshness paragraph (a 'measured at:' timestamp, src/agents/ground-truth.ts) and every brief's framing that a stale copy is wrong and the reader's own live workspace file is right. BUTCHR-169 declared this explicitly as a courtesy for a careful reader, never a machine check — preserved exactly, not upgraded, here. LIVE, NOT HYPOTHETICAL (BUTCHR-172 review round 2): mid-review, this exact trap fired in two independent agents' own workspaces at once — the pid each one's ENVIRONMENT.md named as authoritative had died, each daemon having redeployed under a new pid. The file that says 'THEY ARE WRONG and this is right' was, at that moment, wrong about the one fact everything else in it derives from. Neither agent's tooling caught it; both caught it only by checking before trusting. This is why the grade is weakest, not merely why it is named weakest.",
       },
       {
         grade: "same-call",
