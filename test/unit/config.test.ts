@@ -101,6 +101,85 @@ describe("loadConfig", () => {
     expect(unset).toContain("epic:unset — Epic creation will be refused");
   });
 
+  // BUTCHR-110/S2: role-map collision reporting at boot. Pairwise across the
+  // SET roles only; unset stays a DIFFERENT condition (never conflated —
+  // see the "unset" tests above, unaffected by any of this); and a HONESTY
+  // CLAUSE is always present, collision or none, because a clean report is
+  // the one case most likely to be misread as "every hop checked".
+  describe("describeConfig: role-map collisions (BUTCHR-110/S2)", () => {
+    test("story/task collision: names both env vars, both tiers, the hop, GitHub, and the shared accountId", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:same-account", BUTCHR_ASSIGNEE_TASK: "712020:same-account" }, noRead));
+      expect(d).toContain("BUTCHR_ASSIGNEE_STORY");
+      expect(d).toContain("BUTCHR_ASSIGNEE_TASK");
+      expect(d).toContain("story");
+      expect(d).toContain("task");
+      expect(d).toContain("SAME accountId");
+      expect(d).toContain("712020:same…");
+      expect(d).toContain("the story that owns a task");
+      expect(d).toContain("GitHub refuses");
+    });
+
+    test("epic/task collision — the exact incident this ticket exists to surface — is caught the same way, uniformly", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_TASK: "712020:collide", BUTCHR_ASSIGNEE_EPIC: "712020:collide" }, noRead));
+      expect(d).toContain("BUTCHR_ASSIGNEE_TASK");
+      expect(d).toContain("BUTCHR_ASSIGNEE_EPIC");
+      expect(d).toContain("the epic that owns a task");
+    });
+
+    test("all three roles set to the SAME account reports every pair, not just one", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:x", BUTCHR_ASSIGNEE_TASK: "712020:x", BUTCHR_ASSIGNEE_EPIC: "712020:x" }, noRead));
+      expect(d).toContain("the epic that owns a story");
+      expect(d).toContain("the epic that owns a task");
+      expect(d).toContain("the story that owns a task");
+    });
+
+    test("no collision when all set roles genuinely differ", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:aaa", BUTCHR_ASSIGNEE_TASK: "712020:bbb", BUTCHR_ASSIGNEE_EPIC: "712020:ccc" }, noRead));
+      expect(d).not.toContain("SAME accountId");
+      expect(d).toContain("none among this daemon's currently-SET roles");
+    });
+
+    test("an UNSET role is never reported as a collision, and the existing unset wording is unchanged — unset and collided are different conditions", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:aaa" }, noRead)); // task/epic unset
+      expect(d).not.toContain("SAME accountId");
+      expect(d).toContain("task:unset — Task creation will be refused");
+      expect(d).toContain("epic:unset — Epic creation will be refused");
+    });
+
+    // THE HONESTY CLAUSE (measured by BUTCHR-100, 2026-09-02): a local
+    // pairwise comparison cannot see a tier staffed by a DIFFERENT daemon —
+    // on that measured daemon, story/task differed locally while a live
+    // Epic staffed elsewhere carried the SAME accountId as the local task
+    // role, and a naive check reported a clean boot. The clause must
+    // therefore appear REGARDLESS of whether a collision was found —
+    // it qualifies the CLEAN report, which is the dangerous one.
+    test("the honesty clause is present on a CLEAN report (no collision found) — this is the graded case", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:aaa", BUTCHR_ASSIGNEE_TASK: "712020:bbb" }, noRead));
+      expect(d).not.toContain("SAME accountId");
+      expect(d).toContain("LOCALLY CONFIGURED");
+      expect(d).toContain("DIFFERENT daemon");
+      expect(d).toContain("NOT evidence");
+    });
+
+    test("the honesty clause is present on a COLLIDING report too — not only alongside a clean one", () => {
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:same", BUTCHR_ASSIGNEE_TASK: "712020:same" }, noRead));
+      expect(d).toContain("SAME accountId");
+      expect(d).toContain("LOCALLY CONFIGURED");
+      expect(d).toContain("project↔epic hop");
+    });
+
+    test("the honesty clause names the project↔epic gap, and points at S1 (new_worker/adopt_worker) as the check that actually catches it", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("project↔epic hop");
+      expect(d).toContain("new_worker/adopt_worker");
+    });
+
+    test("the whole collision report is scoped to THIS daemon, not the fleet", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("roleCollisions(this daemon only)=");
+    });
+  });
+
   test("captureDir defaults to .captures under the workspace root; BUTCHR_CAPTURE_DIR overrides it", () => {
     const c = loadConfig(base, noRead);
     expect(c.captureDir).toBe(join(workspaceRoot(), ".captures"));
