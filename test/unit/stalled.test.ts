@@ -100,7 +100,7 @@ describe("createStalledCheck", () => {
     expect(await check.check("KAN-1", "idle")).toBe(false);
   });
 
-  test("a failing comments fetch is logged and does not throw", async () => {
+  test("a failing comments fetch resolves null (could not verify) — a THIRD outcome, never a confident stalled=true", async () => {
     let now = 0;
     const logs: string[] = [];
     const check = createStalledCheck({
@@ -112,7 +112,7 @@ describe("createStalledCheck", () => {
     });
     await check.check("KAN-1", "idle"); // establishes the floor at now=0
     now = 10 * 60_000;
-    expect(await check.check("KAN-1", "idle")).toBe(true); // treated as no comments found
-    expect(logs.some((l) => l.includes("KAN-1") && l.includes("timeout"))).toBe(true);
+    expect(await check.check("KAN-1", "idle")).toBe(null); // could not verify — NOT treated as "no comments found"
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("timeout"))).toBe(true);
   });
 });

@@ -267,6 +267,11 @@ describe("buildWorkspace", () => {
       expect(dir).toBe(join(root, "KAN-9"));
       expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toContain("brief.md");
       const brief = readFileSync(join(dir, "brief.md"), "utf8");
+      // BUTCHR-169: `parent` is now a TRUSTWORTHY value by the time it
+      // reaches here — ISSUE_SPAWN_CONFIG.specFor (src/resources/issue.ts)
+      // derives it from the ticket's Implements link, never Jira's native
+      // `parent` field. buildWorkspace itself just renders whatever
+      // SpawnSpec it's given, which is what this fixture pins.
       expect(brief).toContain("KAN-9"); expect(brief).toContain("ship it"); expect(brief).toContain("KAN-1");
       const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
       expect(mcp.mcpServers.butchr.headers["x-issue"]).toBe("KAN-9");

@@ -1,11 +1,27 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
   CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
+  ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER, guardShortProse, SWALLOWED_ARGUMENT_RE,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
+
+// A SYNTHETIC swallowed-argument shape for tests that don't need a real
+// historical specimen (BUTCHR-164/BUTCHR-127 below cover those). Built from
+// separate characters at call time rather than written as one literal, same
+// discipline as the fixture file: nothing in this source tree should ever
+// contain the corrupted tag shape as one contiguous run — see
+// swallowed-argument-specimens.ts's own doc comment for why.
+const LT = "<", SLASH = "/", GT = ">";
+function fakeSwallowedArg(argName: string, nextArgName: string): string {
+  return `a perfectly good ${argName} value, until here${LT}${SLASH}${argName}${GT}\n${LT}parameter name="${nextArgName}"${GT}text that was meant to be a separate ${nextArgName} argument`;
+}
 
 const ROLES = { story: "acct-story", task: "acct-task", epic: "acct-epic" };
 
@@ -611,6 +627,186 @@ describe("adopt_worker: BUTCHR-108/BUTCHR-137 — butchr:orphan means UNDIRECTED
   });
 });
 
+describe("adopt_worker: BUTCHR-151/BUTCHR-157 — retiring a stale [ORPHAN] description header in the same call as the label withdrawal", () => {
+  // Mirrors adf() in src/atlassian/client.ts EXACTLY (one paragraph, one text
+  // node) — what a REAL fileWhereItBelongs-created ticket's description
+  // looks like on the wire, not a test shortcut. correctWorker's own "happy
+  // path" test uses the same shape for the same reason.
+  const adfDoc = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+  const HEADER = [ORPHAN_HEADER_OPEN_LINE, "Filed by: BUTCHR-5", 'Destination: Epic BUTCHR-1', ORPHAN_HEADER_CLOSE_LINE].join("\n");
+
+  test("disposition \"start\": header retired, archived under HEADER_WITHDRAWN_MARKER BEFORE the rewrite, body preserved byte for byte, result names the outcome", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL], description: adfDoc(`${HEADER}\n\n---\n\nDo the actual task body here.`) });
+
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      addComment: async (...a) => { calls.push("addComment"); return ops.addComment(...a); },
+      correctText: async (...a) => { calls.push("correctText"); return ops.correctText(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+
+    // ORDER: label clear, then archive-before-overwrite, then the eventual transition.
+    expect(calls).toEqual(["removeLabels", "addComment", "correctText", "transition"]);
+
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.comments).toHaveLength(1);
+    expect(w.comments[0]!.startsWith(`[BUTCHR-1] ${HEADER_WITHDRAWN_MARKER}`)).toBe(true);
+    expect(w.comments[0]).toContain(HEADER); // the retired header's exact text is preserved in the archive
+    const newDescription = w.description as string;
+    expect(newDescription.startsWith("[ORPHAN]")).toBe(false); // no longer the stale header
+    expect(newDescription.startsWith("[ADOPTED]")).toBe(true); // a truthful successor, not a blank
+    expect(newDescription).toContain("BUTCHR-1"); // names the adopter
+    expect(newDescription).toContain("BUTCHR-5"); // names the original filer, parsed back out of the retired header
+    expect(newDescription).toContain("Do the actual task body here."); // preserved, byte for byte
+    // REVIEW FIX (BUTCHR-157): the successor must assert only a HISTORICAL,
+    // time-invariant fact, never present-tense current state — the first
+    // draft's "This ticket HAS a boss" / "(disposition: X)" wording was
+    // reachably false (a later re-parent, or a "shelve"→"start" transition
+    // start_worker never touches the description for) and was itself an
+    // undeclared, scanner-invisible header. Pin both absences so neither can
+    // silently come back.
+    expect(newDescription).not.toContain("has a boss");
+    expect(newDescription).not.toContain("disposition:");
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+  });
+
+  test("disposition \"shelve\": header retired in the SAME call that adds butchr:shelved and posts the shelve reason", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready yet" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).toContain(EXEMPT_LABEL);
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    // Two comments: the header archive, then the shelve reason — the header
+    // block was the ENTIRE description (no body given at filing), so the
+    // rewritten description is just the successor line, no trailing separator.
+    expect(w.comments).toHaveLength(2);
+    expect(w.comments[0]).toContain(HEADER_WITHDRAWN_MARKER);
+    expect(w.comments[1]).toContain("not ready yet");
+    const newDescription = w.description as string;
+    expect(newDescription).toContain("[ADOPTED]");
+    expect(newDescription.endsWith("not repeated here.")).toBe(true); // no "---" body separator when there was no body
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+  });
+
+  test("a ticket with no header at all: silent no-op — neither result field is set, no extra Jira call", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", description: adfDoc("just an ordinary task description") });
+    let correctTextCalls = 0;
+    const spied: AtlassianOps = { ...ops, correctText: async (...a) => { correctTextCalls++; return ops.correctText(...a); } };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+    expect(correctTextCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc("just an ordinary task description")); // byte for byte untouched
+  });
+
+  test("a ticket with NO description at all: silent no-op, never throws", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // adoption itself still completed normally
+  });
+
+  test("HAND-EDITED (open line present, close line missing): refuses to guess, description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const hacked = `${ORPHAN_HEADER_OPEN_LINE}\nsomeone deleted the rest of this block and wrote their own note instead.`;
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(hacked) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/hand-edited/);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(hacked)); // untouched
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // never blocked
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL); // the label withdrawal is unaffected by the header failure
+  });
+
+  test("APPEARS TWICE: refuses to guess which occurrence is real, description UNCHANGED", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const duplicated = `${HEADER}\n\n---\n\n${HEADER}`;
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", description: adfDoc(duplicated) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/more than once/);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(duplicated));
+  });
+
+  test("archive comment fails: refuses to rewrite without first preserving the retired text — description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    let correctTextCalls = 0;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { if (text.includes(HEADER_WITHDRAWN_MARKER)) throw new Error("comment API down"); return ops.addComment(key, text); },
+      correctText: async (...a) => { correctTextCalls++; return ops.correctText(...a); },
+    };
+    const result = await adoptWorker(failingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/archive comment failed/);
+    expect(correctTextCalls).toBe(0); // never attempted the rewrite without a successful archive first
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(HEADER));
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // the adoption itself is never blocked by this
+  });
+
+  test("the rewrite itself fails AFTER a successful archive: one harmless extra comment, description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    const failingOps: AtlassianOps = { ...ops, correctText: async () => { throw new Error("edit API down"); } };
+    const result = await adoptWorker(failingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/rewrite failed/);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.comments).toHaveLength(1); // the archive landed
+    expect(w.comments[0]).toContain(HEADER_WITHDRAWN_MARKER);
+    expect(w.description).toEqual(adfDoc(HEADER)); // the edit never took
+    expect(w.status).toBe("In Progress"); // adoption proceeded regardless
+  });
+
+  test("re-adoption (alreadyAdopted no-op path) still retires a header that somehow survived a prior adoption — NOT gated on alreadyAdopted, mirroring ORPHAN_LABEL's own rule", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress", description: adfDoc(HEADER) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+    expect(issues.get("BUTCHR-9")!.description as string).toContain("[ADOPTED]");
+  });
+
+  test("PROJECT caller adopting an Epic: same header retirement, defence-in-depth path", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect((w.description as string)).toContain("[ADOPTED]");
+    expect((w.description as string)).toContain("BUTCHR"); // names the project as the new boss
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+  });
+});
+
 describe("start_worker / finish_worker / prioritize_worker / tell_worker: ownership refusal (continued)", () => {
   test("prioritize_worker refuses a stranger's key AND the caller's OWN key, distinctly", async () => {
     const { ops, addIssue, issues } = makeWorld();
@@ -638,6 +834,30 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
 // ---------------------------------------------------------------------------
 
 describe("correctWorker", () => {
+  // BUTCHR-169: correctWorker now touches the filesystem (best-effort
+  // brief.md rewrite on a summary correction, via rewriteWorkspaceBriefSummary
+  // -> workspaceRoot(), src/agents/workspace.ts). workspaceRoot() defaults to
+  // `~/butchr-workspaces` when BUTCHR_WORKSPACES is unset — a REAL,
+  // populated directory on any host that has actually run this fleet (this
+  // very worktree's own butchr-workspaces/BUTCHR-1 is a real file on disk).
+  // Every test below uses fake keys like "BUTCHR-2" that happen not to
+  // collide today, but that is an accident of which keys were picked, not a
+  // guarantee — sandboxing BUTCHR_WORKSPACES to a throwaway temp dir for
+  // this entire describe block is what actually makes it safe, the same
+  // discipline test/unit/workspace.test.ts already applies to buildWorkspace
+  // itself.
+  let workspacesRoot: string;
+  const priorEnv = process.env.BUTCHR_WORKSPACES;
+  beforeEach(() => {
+    workspacesRoot = mkdtempSync(join(tmpdir(), "correct-worker-test-"));
+    process.env.BUTCHR_WORKSPACES = workspacesRoot;
+  });
+  afterEach(() => {
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+    else process.env.BUTCHR_WORKSPACES = priorEnv;
+  });
+
   test("refuses the CALLER'S OWN key, BEFORE any Jira read (matches prioritizeWorker's own shape)", async () => {
     const { ops } = makeWorld();
     let getIssueCalls = 0;
@@ -767,6 +987,70 @@ describe("correctWorker", () => {
     const summaryToo = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "newer summary", why: "reason 2" });
     expect(summaryToo.message).toMatch(/SNAPSHOTTED/);
     expect(summaryToo.message).toMatch(/tell_worker/);
+  });
+
+  // BUTCHR-169: WORKSPACE_REGISTRY.SUMMARY's declared withdrawal mechanism.
+  describe("summary correction's best-effort brief.md rewrite (BUTCHR-169)", () => {
+    test("no on-disk workspace for the worker: reported as 'no-workspace-on-disk', not an error, no message SNAPSHOTTED-limitation text lost", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+      expect(result.summaryWorkspaceRewrite).toBe("no-workspace-on-disk");
+      expect(result.message).toContain("No on-disk workspace exists for BUTCHR-2");
+    });
+
+    test("an existing workspace's brief.md is regenerated with the new summary, using the SAME briefFor/interpolate machinery buildWorkspace uses", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      const dir = join(workspacesRoot, "BUTCHR-2");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "brief.md"), "# Task agent — BUTCHR-2: old summary\n\nstale content from a previous build\n");
+      writeFileSync(join(dir, "CLAUDE.md"), "unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+
+      expect(result.summaryWorkspaceRewrite).toBe("rewritten");
+      expect(result.message).toContain("brief.md on BUTCHR-2's on-disk workspace was regenerated");
+      const rewritten = readFileSync(join(dir, "brief.md"), "utf8");
+      expect(rewritten).toContain("new summary");
+      expect(rewritten).not.toContain("old summary");
+      expect(rewritten).toContain("BUTCHR-2");
+      // it re-derived the boss from the SAME issue fetch (bossKey: "BUTCHR-1"), not a stale/guessed value
+      expect(rewritten).toContain("BUTCHR-1");
+      // CLAUDE.md is untouched — it carries no {{SUMMARY}} placeholder (see WORKSPACE_REGISTRY.SUMMARY)
+      expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toBe("unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+    });
+
+    test("a rewrite failure is reported, never thrown — the Jira correction (which already landed) is NOT lost", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      // A DIRECTORY at the exact path brief.md would be written to — writeFileSync throws EISDIR, deterministic across platforms.
+      mkdirSync(join(workspacesRoot, "BUTCHR-2", "brief.md"), { recursive: true });
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+
+      expect(result.correctedSummary).toBe(true); // the Jira edit itself still succeeded
+      expect(result.summaryWorkspaceRewrite).toBe("failed");
+      expect(result.message).toContain("brief.md rewrite FAILED");
+      expect(result.message).toContain("already landed and is UNAFFECTED");
+    });
+
+    test("a description-only correction never touches the filesystem at all — summaryWorkspaceRewrite is absent, not a padded value", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+      const dir = join(workspacesRoot, "BUTCHR-2");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "brief.md"), "untouched\n");
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" });
+
+      expect(result.summaryWorkspaceRewrite).toBeUndefined();
+      expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe("untouched\n");
+    });
   });
 
   test("refuses an oversized `description` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {
@@ -1361,6 +1645,234 @@ describe("fileWhereItBelongs: partial-failure honesty — the ticket, once creat
     expect(thrown?.message).toMatch(/own first set_doc call/);
     // the notice still fired despite the doc failure — independent steps.
     expect(issues.get("BUTCHR-1")!.comments.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-177/BUTCHR-180: the swallowed-argument guard. A malformed tool call
+// can fold a LATER argument's text into an earlier SHORT-PROSE one (measured
+// twice: BUTCHR-127 via BUTCHR-102, BUTCHR-164 via BUTCHR-156, both on
+// file_where_it_belongs's `destination`) — this returned a normal result and
+// silently mangled the created ticket. guardShortProse (relationship.ts,
+// beside classifyDestination/destinationRefusal — the existing `destination`
+// validator this shares a file with) catches the SHAPE, not a length bound:
+// see MIN_REASON_CHARS's own comment for the opposite bound already living
+// here, which a pure length cap would collide with (BUTCHR-164's own
+// genuine reason is well over a thousand characters and must NOT be refused
+// for being long).
+// ---------------------------------------------------------------------------
+
+describe("guardShortProse: the shared swallowed-argument guard", () => {
+  test("ordinary short prose is unaffected — no false positive on normal text", () => {
+    expect(() => guardShortProse("some_verb", "reason", "waiting on a dependency")).not.toThrow();
+  });
+
+  test("a long, HONEST value is unaffected — length alone is never the trigger", () => {
+    const long = "a genuinely long, carefully argued reason. ".repeat(60); // ~2000 chars, no tag-shaped substring
+    expect(long.length).toBeGreaterThan(1500);
+    expect(() => guardShortProse("some_verb", "reason", long)).not.toThrow();
+  });
+
+  test("refuses a premature closing tag, naming the verb and argument, without reproducing the tag as one literal run", () => {
+    const bad = fakeSwallowedArg("reason", "description");
+    let thrown: Error | undefined;
+    try {
+      guardShortProse("shelve_worker", "reason", bad);
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).toMatch(/shelve_worker:/);
+    expect(thrown!.message).toContain("`reason`");
+    expect(thrown!.message).toMatch(/premature closing tag naming `reason`/);
+    // the refusal never reproduces "<" immediately followed by "/" and the
+    // name and ">" as one contiguous run — see guardShortProse's own doc
+    // comment for why (a caller pasting the refusal back in must not
+    // reproduce the very defect it is refusing).
+    expect(thrown!.message).not.toContain(`${LT}${SLASH}reason${GT}`);
+  });
+
+  test("refuses this harness's own `<parameter name=\"...\">` opening-wrapper shape too, not only a closing tag", () => {
+    // isolate JUST the opening-wrapper half of the shape (no closing tag
+    // present at all), to prove both regex branches are load-bearing.
+    const bad = `a fine value so far${LT}parameter name="description"${GT}rest of what should have been separate`;
+    expect(() => guardShortProse("new_worker", "summary", bad)).toThrow(/opens the NEXT tool-call argument \(naming `description`\)/);
+  });
+
+  test("THE FALSIFIER: BUTCHR-164's real captured mangled `destination` text is refused by this guard", () => {
+    // Stated before checking, per the ticket: if this does NOT throw, the
+    // defect is unfixed. It throws — see the fixture's own header comment
+    // for provenance (BUTCHR-175's archive comment on BUTCHR-164).
+    expect(SWALLOWED_ARGUMENT_RE.test(BUTCHR_164_MANGLED_DESTINATION)).toBe(true);
+    expect(() => guardShortProse("file_where_it_belongs", "destination", BUTCHR_164_MANGLED_DESTINATION)).toThrow();
+  });
+
+  test("THE FALSIFIER: BUTCHR-127's real captured mangled `destination` text is refused by this guard", () => {
+    expect(SWALLOWED_ARGUMENT_RE.test(BUTCHR_127_MANGLED_DESTINATION)).toBe(true);
+    expect(() => guardShortProse("file_where_it_belongs", "destination", BUTCHR_127_MANGLED_DESTINATION)).toThrow();
+  });
+});
+
+describe("classifyDestination / fileWhereItBelongs: the swallowed-argument guard on `destination`", () => {
+  test("classifyDestination refuses BUTCHR-164's real mangled destination text, teaching what a good destination looks like", () => {
+    expect(() => classifyDestination(BUTCHR_164_MANGLED_DESTINATION)).toThrow(/premature closing tag naming `destination`/);
+  });
+
+  test("classifyDestination refuses BUTCHR-127's real mangled destination text", () => {
+    expect(() => classifyDestination(BUTCHR_127_MANGLED_DESTINATION)).toThrow(/premature closing tag naming `destination`/);
+  });
+
+  test("fileWhereItBelongs: THE REGRESSION SCENARIO ITSELF — a swallowed destination is refused BEFORE the ticket is created, no comment posted anywhere, nothing half-written", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR" });
+    const before = issues.size;
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: BUTCHR_164_MANGLED_DESTINATION }))
+      .rejects.toThrow(/premature closing tag naming `destination`/);
+    expect(issues.size).toBe(before); // NO ticket was created
+    expect(issues.get("BUTCHR-7")!.comments).toEqual([]); // NO notice, NO comment, anywhere
+  });
+
+  test("a Jira-key-shaped destination is unaffected — the guard never fires on the ordinary case", () => {
+    expect(classifyDestination("BUTCHR-25")).toEqual({ kind: "epic", key: "BUTCHR-25" });
+  });
+
+  test("a genuinely long, honest reason (BUTCHR-164's real text MINUS the seam and everything after it) is NOT refused — the guard does not resurrect the length bound it replaces", () => {
+    const seamIndex = BUTCHR_164_MANGLED_DESTINATION.search(/<\//);
+    const genuinePart = BUTCHR_164_MANGLED_DESTINATION.slice(0, seamIndex);
+    expect(genuinePart.length).toBeGreaterThan(1000); // well over MIN_REASON_CHARS, on purpose
+    expect(() => classifyDestination(genuinePart)).not.toThrow();
+  });
+});
+
+describe("fileWhereItBelongs: the swallowed-argument guard on `summary`", () => {
+  test("refuses a swallowed `summary`, before the destination-epic read or the create call", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: bad, issuetype: "Task", destination: "BUTCHR-1" }))
+      .rejects.toThrow(/file_where_it_belongs: `summary` contains/);
+    expect(issues.size).toBe(before); // NO ticket created
+    expect(issues.get("BUTCHR-1")!.comments).toEqual([]); // NO notice posted on the named epic either
+  });
+});
+
+describe("correctWorker: the swallowed-argument guard on `why` and `summary`", () => {
+  test("refuses a swallowed `why`, before the archive comment is posted or the description is touched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const bad = fakeSwallowedArg("why", "description");
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: bad }))
+      .rejects.toThrow(/correct_worker: `why` contains/);
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // UNCHANGED
+    expect(issues.get("BUTCHR-2")!.comments).toEqual([]); // no archive comment posted
+  });
+
+  test("refuses a swallowed `summary`, same guarantee", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: bad, why: "reason" }))
+      .rejects.toThrow(/correct_worker: `summary` contains/);
+    expect(issues.get("BUTCHR-2")!.summary).toBe("old summary"); // UNCHANGED
+    expect(issues.get("BUTCHR-2")!.comments).toEqual([]);
+  });
+
+  test("`description` itself is NEVER guarded this way — a full-length replacement may legitimately contain this shape (e.g. quoting this very defect)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const describesTheDefect = `discussing the shape: ${LT}${SLASH}destination${GT} followed by ${LT}parameter name="description"${GT}`;
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: describesTheDefect, why: "documenting the defect" }))
+      .resolves.toBeDefined();
+    expect(issues.get("BUTCHR-2")!.description).toBe(describesTheDefect);
+  });
+});
+
+describe("shelveWorker: the swallowed-argument guard on `reason`", () => {
+  test("refuses a swallowed `reason`, before ownership is even checked or any label/transition/comment is written", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", bad)).rejects.toThrow(/shelve_worker: `reason` contains/);
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.labels).toEqual([]);
+    expect(w.status).toBe("To Do"); // untouched (was already the default, but never transitioned)
+    expect(w.comments).toEqual([]);
+  });
+});
+
+describe("newWorker / newProjectWorker: the swallowed-argument guard on `summary` and the shelve `reason`", () => {
+  test("issue caller: refuses a swallowed `summary`, before the caller's own issue is even read", async () => {
+    const { ops, issues } = makeWorld();
+    let getIssueCalls = 0;
+    const throwingOps: AtlassianOps = { ...ops, getIssue: async (key: string) => { getIssueCalls++; throw new Error(`should not be read: ${key}`); } };
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(newWorker(throwingOps, ROLES, "BUTCHR-1", { summary: bad, disposition: { kind: "start" } }))
+      .rejects.toThrow(/new_worker: `summary` contains/);
+    expect(getIssueCalls).toBe(0); // refused before any Jira read
+    expect(issues.size).toBe(before);
+  });
+
+  test("issue caller: refuses a swallowed shelve `reason`, before create", async () => {
+    const { ops, issues, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const before = issues.size;
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "shelve", reason: bad } }))
+      .rejects.toThrow(/new_worker: `reason` contains/);
+    expect(issues.size).toBe(before); // no child created
+  });
+
+  test("PROJECT caller: refuses a swallowed `summary` too — newProjectWorker has its own copy of this check, not inherited from newWorker's routing", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR", { summary: bad, disposition: { kind: "start" } }))
+      .rejects.toThrow(/new_worker: `summary` contains/);
+    expect(issues.size).toBe(before);
+  });
+
+  test("PROJECT caller: refuses a swallowed shelve `reason` too", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const before = issues.size;
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "shelve", reason: bad } }))
+      .rejects.toThrow(/new_worker: `reason` contains/);
+    expect(issues.size).toBe(before);
+  });
+});
+
+describe("adoptWorker: the swallowed-argument guard on the shelve `reason`", () => {
+  test("issue caller: refuses a swallowed shelve `reason`, before the adopted ticket is even read", async () => {
+    const { ops, issues, addIssue } = makeWorld();
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    let getIssueCalls = 0;
+    const throwingOps: AtlassianOps = { ...ops, getIssue: async (key: string) => { getIssueCalls++; throw new Error(`should not be read: ${key}`); } };
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(adoptWorker(throwingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: bad }))
+      .rejects.toThrow(/adopt_worker: `reason` contains/);
+    expect(getIssueCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.bossKey).toBeUndefined(); // never adopted
+  });
+
+  test("PROJECT caller: the SAME check (before isProjectId routing) also covers adoptProjectWorker — no duplicated check needed there", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "shelve", reason: bad }))
+      .rejects.toThrow(/adopt_worker: `reason` contains/);
+    expect(issues.get("BUTCHR-9")!.assignee).toBeUndefined(); // never assigned — refused before any write
   });
 });
 

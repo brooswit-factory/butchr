@@ -332,6 +332,48 @@ describe("createLabelSync", () => {
     expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled"))).toBe(true);
   });
 
+  test("a stalled check that could not verify (null) never writes agent:stalled onto a ticket that wasn't already labelled stalled, even across two consecutive polls", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => null, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+    await sync([issue]);
+    await sync([issue]); // two consecutive polls — would be enough to confirm a real candidate
+    expect(jira.calls).toEqual([]); // never wrote agent:stalled
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("could not verify"))).toBe(true);
+  });
+
+  test("REGRESSION: a stalled check that could not verify (null) never STRIPS an already-applied agent:stalled label, even across two consecutive polls", async () => {
+    // Naively falling a `null` result through to the OBSERVED status ("idle" —
+    // `check` only fetches comments once the idle/done streak already
+    // qualifies) makes the candidate "idle" regardless of what's actually
+    // applied. For a ticket that already carries agent:stalled from earlier
+    // successful polls, that "idle" candidate goes through the SAME 2-poll
+    // stabilizer any real transition uses and gets CONFIRMED on the second
+    // consecutive null poll — silently erasing a true stalled signal on
+    // exactly the sustained-degradation case this ticket cares about. The
+    // fix must leave the applied label untouched instead of falling through
+    // to `observed`.
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => null, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    const issue = iss("KAN-1", "In Progress", ["agent:stalled"]);
+    await sync([issue]);
+    await sync([issue]); // two consecutive null polls — would be enough to confirm a flip to idle
+    expect(jira.calls).toEqual([]); // agent:stalled was never removed
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("could not verify"))).toBe(true);
+  });
+
   test("leaving the active set forgets the stalled tracker's state for that ticket", async () => {
     const jira = fakeJira();
     const forgotten: string[] = [];
@@ -375,5 +417,98 @@ describe("createLabelSync", () => {
     failing.on = false;
     await sync([]); // still gone; cleanup retried, now succeeds
     expect(calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:idle"] }]);
+  });
+
+  // BUTCHR-179: syncLabels is the worked example (promoted to the STANDARD
+  // a coverage consumer must match) of correctly distinguishing all three
+  // stalled.check() outcomes. These tests are the CONSUMER half of that
+  // ticket: they prove `deps.coverage` is fed the right verb for each of
+  // the three states, not a naive `x === true`/`!x` collapse that would
+  // silently merge "not found" and "could not check" (or "found" and "not
+  // found") into the same bucket one line below the fix that removed the
+  // original collapse.
+  describe("coverage recording (BUTCHR-179)", () => {
+    function fakeCoverage() {
+      const calls: Array<{ op: "checked" | "declined"; name: string }> = [];
+      return { calls, recordChecked: (name: string) => calls.push({ op: "checked", name }), recordDeclined: (name: string) => calls.push({ op: "declined", name }) };
+    }
+
+    test("check() resolves true (found): recordChecked fires, recordDeclined never does", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(coverage.calls).toEqual([{ op: "checked", name: "stalled" }]);
+    });
+
+    test("check() resolves false (checked, not found): recordChecked fires — this is NOT a decline", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "working"]]),
+        stalled: { check: async () => false, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(coverage.calls).toEqual([{ op: "checked", name: "stalled" }]);
+    });
+
+    test("check() resolves null (could not check): recordDeclined fires — the naive-collapse trap this criterion exists to catch", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => null, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(coverage.calls).toEqual([{ op: "declined", name: "stalled" }]);
+    });
+
+    test("all three states across consecutive polls produce three DISTINCT verbs, in order — nothing collapses", async () => {
+      const coverage = fakeCoverage();
+      const results: Array<boolean | null> = [true, false, null];
+      let i = 0;
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => results[i++]!, forget: () => {} },
+        coverage,
+      });
+      const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+      await sync([issue]);
+      await sync([issue]);
+      await sync([issue]);
+      expect(coverage.calls).toEqual([
+        { op: "checked", name: "stalled" },
+        { op: "checked", name: "stalled" },
+        { op: "declined", name: "stalled" },
+      ]);
+    });
+
+    test("no stalled checker configured (feature disabled): coverage is never touched — an absent detector must not claim coverage", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        coverage,
+        // no `stalled` dep at all
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(coverage.calls).toEqual([]);
+    });
+
+    test("omitting coverage entirely (existing callers/fixtures) does not throw — fully backward compatible", async () => {
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => null, forget: () => {} },
+      });
+      await expect(sync([iss("KAN-1", "In Progress", ["agent:idle"])])).resolves.toBeInstanceOf(Set);
+    });
   });
 });
