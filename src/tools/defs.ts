@@ -71,18 +71,23 @@ function refuseProjectCaller(c: { headers: Record<string, string> }, verb: strin
 }
 
 /**
- * The inverse gate, for `check_in` (BUTCHR-67/BUTCHR-81): a verb that ONLY
- * makes sense for a project caller, because it is answering "has this
- * resource acted on what it has seen" — a question `ISSUE_ACTIVATION` never
- * asks (an issue never sleeps; `verdictFor` returns only `active`/`inactive`
- * for it, never `asleep` — see src/resources/types.ts). Refusing an issue
- * caller here, in words, is cheaper than that caller discovering the verb
- * silently does nothing for it.
+ * The inverse gate, first built for `check_in` (BUTCHR-67/BUTCHR-81): a verb
+ * that ONLY makes sense for a project caller. `why` is verb-specific — passed
+ * in rather than hardcoded — because "an issue never sleeps, so it has no
+ * watermark to advance" (check_in's reason) would be actively misleading on
+ * a verb like `get_doc_comments` (BUTCHR-109), whose refusal instead points
+ * an issue caller at the read it already has (`jira_get_issue`'s embedded
+ * comments). Refusing here, in words, is cheaper than that caller
+ * discovering the verb silently does nothing for it.
  */
-function requireProjectCaller(c: { headers: Record<string, string> }, verb: string): string {
+function requireProjectCaller(
+  c: { headers: Record<string, string> },
+  verb: string,
+  why: string = "this verb only exists for a PROJECT (an issue never sleeps, so it has no watermark to advance)",
+): string {
   const who = requireCaller(c, verb);
   if (!isProjectId(who)) {
-    throw new Error(`${verb}: refusing an issue caller — this verb only exists for a PROJECT (an issue never sleeps, so it has no watermark to advance)`);
+    throw new Error(`${verb}: refusing an issue caller — ${why}`);
   }
   return who;
 }
@@ -677,6 +682,22 @@ export function atlassianTools(
           epics,
         });
         return { ok: true, key: who, version: version ?? null, comment, epics };
+      },
+    },
+    get_doc_comments: {
+      description:
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns — sort by `id` numerically yourself, the way `newestCommentId` does, if you need newest-first). `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireProjectCaller(
+          c,
+          "get_doc_comments",
+          "your own root doc's footer comments have no per-issue equivalent to read here — an ISSUE caller's canonical read, jira_get_issue, already returns its own ticket's comments embedded in the response",
+        );
+        const doc = await projectRootDoc(ops, who);
+        const comments = await ops.getPageComments(doc.id);
+        audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
+        return comments;
       },
     },
     submit_to_boss: {
