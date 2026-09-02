@@ -489,7 +489,7 @@ implement it.**
 | project → epic | cross-account (`e160cf60` ≠ `619ec5ec`) | **Cross-account by design.** Deployed as one half of the 2-colour alternation over the chain path. Acceptable as-is: no recommendation in this document changes it. Would become unacceptable if a future `adopt_worker`/`new_worker` change ever let a project-tier call land an Epic on the project's own credential — nothing today does. |
 | epic → story | cross-account (`619ec5ec` ≠ `e160cf60`) | **Cross-account by design.** Same alternation. Acceptable as-is, unaffected by either recommended direction. |
 | story → task | cross-account (`e160cf60` ≠ `619ec5ec`), live-confirmed at the GitHub layer for both `CHANGES_REQUESTED` and, as of this session's re-check, `APPROVED` (PR #172) | **Cross-account by design, and the strongest-evidenced row in this table.** Acceptable as-is. |
-| epic → task (the `adopt_worker` shortcut) | **same-account** (`619ec5ec` = `619ec5ec`), real, live, **twice**: `BUTCHR-62`/`BUTCHR-96`/PR #170, and `BUTCHR-115`/`BUTCHR-105`/PR #178 | **Not acceptable as a permanent status quo.** As of `BUTCHR-103`/`BUTCHR-110` (PR #177, merged), the collision is no longer silent — it is recorded loudly (result field, audit line, ticket comment) at the moment of staffing — but it is still **unresolved**: the review hop still cannot produce a real GitHub approval. The record-of-review procedure for this hop while it stays unresolved is §6. A recommended fix is named in §2/§4 (Direction B, or A as an interim); it is acceptable to leave unresolved only until one of those is executed, and becomes unacceptable the moment a real Epic-tier review is blocked on it again without an operator having acted. |
+| epic → task (the `adopt_worker` shortcut) | **same-account** (`619ec5ec` = `619ec5ec`), real, live, **twice**: `BUTCHR-62`/`BUTCHR-96`/PR #170, and `BUTCHR-115`/`BUTCHR-105`/PR #178 | **Not acceptable as a permanent status quo.** `BUTCHR-103`/`BUTCHR-110` (PR #177) **merged** code that records this collision loudly (result field, audit log, ticket comment) at staffing time instead of failing silently — but merged is not running: MEASURED this session (see §6) that check is **not yet producing anything on either daemon in this fleet**, both still on pre-#177 checkouts. So today, concretely, neither the old silent gap nor the new staffing-time record is what a reader actually gets — what exists today for this hop is exactly markers 2 and 3 in §6 (the ticket `[review]` line and the honest-refusal PR comment), demonstrated on both live occurrences. The review hop still cannot produce a real GitHub approval regardless. The record-of-review procedure for this hop while it stays unresolved is §6. A recommended fix is named in §2/§4 (Direction B, or A as an interim); it is acceptable to leave unresolved only until one of those is executed, and becomes unacceptable the moment a real Epic-tier review is blocked on it again without an operator having acted. |
 | story → story, task → task (peer adoption) | same-account by construction under the current type-keyed rule; not observed on a real ticket, reachable today with no code change | **Not acceptable as a permanent status quo, and the sharper of the two gaps**: unlike epic→task, **no account addition (Direction A) can ever close this row**, at any account count — the type-keyed rule guarantees it. It is acceptable to leave it exactly as long as it is *named*, as it now is here, and unacceptable the moment a real Story-adopts-Story or Task-adopts-Task ticket surfaces this in production without Direction B (or an equivalent caller-aware rule) already having been decided on. Record-of-review procedure while unresolved: §6, same as epic→task. |
 
 **Every row above that is not "cross-account by design" is a collapsed
@@ -501,61 +501,110 @@ this table, not an afterthought.**
 
 ## 6. What a collapsed hop leaves behind, so a later reader can tell
 
-There is no branch protection on `main`. A PR on a collapsed hop reports
-`MERGEABLE` and merges with `reviewDecision: ""` — **identical, after the
-fact, to a PR nobody thought to review.** "Known, documented, and
-deliberately accepted" is not satisfied if the acceptance leaves no trace a
-later reader can find. This section names the materials that already exist
-for this; **nothing here is built by this ticket.**
+**What is verified, not merely repository-settings-shaped:** nothing on
+`main` requires an approving review before merge — confirmed by content, not
+by absence of a setting: PR #178 merged with `reviewDecision: ""`, and PR
+#170 before it did the same. That is the actual gap §6 exists to cover, and
+it holds regardless of what other protections the repo has.
+
+**A narrower, unverified claim is deliberately NOT made here, on review
+(BUTCHR-104, 2026-09-02).** An earlier draft of this section asserted "there
+is no branch protection on `main`" outright. Checked this session:
+`gh api repos/brooswit-factory/butchr/rules/branches/main` → `[]` (rules
+out *rulesets* only) and `gh api repos/brooswit-factory/butchr/branches/main/protection`
+→ `404`. **That 404 is ambiguous by GitHub's own documented behaviour** — it
+is returned both when no classic protection exists and when the caller
+lacks admin on the repo — so it is not evidence of absence, and this ticket
+cannot resolve it from its own vantage. `BUTCHR-100` reports that a
+different rule *does* exist (head must be up to date with base — the reason
+PR #176 needed a re-review after its own base-merge), and that what is
+*not* required is an approving review, consistent with what #178/#170
+actually did. Recorded as CITED, not measured, and named rather than
+asserted around: a future reader with admin access can settle it outright.
+
+A PR on a collapsed hop therefore reports `MERGEABLE` and merges with
+`reviewDecision: ""` — **identical, after the fact, to a PR nobody thought
+to review.** "Known, documented, and deliberately accepted" is not satisfied
+if the acceptance leaves no trace a later reader can find. This section
+names the materials that already exist for this; **nothing here is built by
+this ticket.**
 
 For **every hop this document records as collapsed or deliberately
 accepted** — today, epic→task, and structurally, same-issuetype peer
-adoption — the record of review is, and should be documented as, exactly
-these three artefacts, all of which already exist and none of which this
-ticket adds code for:
+adoption — the record of review should be documented as three artefacts.
+**Two of them exist right now; the third exists in code but is not
+currently producing anything, and that gap is itself a finding, not a
+detail:**
 
-1. **BUTCHR-103/BUTCHR-110's shipped staffing-time check (PR #177, merged)**
-   writes a durable comment on the worker's own ticket, and an `IDENTITY
-   COLLISION:` audit line on the daemon's log, at the moment a collision is
-   staffed — automatically, before any review is attempted. That comment is
-   the first marker: it exists whether or not anyone later tries to review
-   the PR, so its presence on a ticket is itself evidence the collision was
-   caught at staffing time, not missed.
+1. **NOT YET PRODUCING ANYTHING, as of 2026-09-02 — re-tensed on review.**
+   `BUTCHR-103`/`BUTCHR-110`'s staffing-time check (`describeCollisions`,
+   `src/config/config.ts`/`src/tools/relationship.ts`) **merged** into
+   `main` via PR #177, at `3a199f253e20ae7d48ae5429647a82bf1a8e01be`. **It is
+   not running on either daemon in this fleet.** MEASURED first-hand, this
+   session, on the daemon I own (`wroosbit`, port `7717`): live pid resolved
+   from `ss -ltnp` cross-checked against `systemctl --user show -p MainPID`
+   (agreeing, `695036`) — not from `ENVIRONMENT.md`, whose recorded pid goes
+   stale across restarts; `readlink /proc/695036/cwd` → a checkout at
+   `/home/wroosbit/code/brooswit/butchr`, HEAD `36db3e4`, **12 commits
+   behind `origin/main`** (`git rev-list --count HEAD..origin/main` = 12,
+   fetched fresh this session); `grep -rl describeCollisions src/` in that
+   checkout → **no match**; `docs/identity-model.md` → **absent from that
+   tree entirely.** `BUTCHR-104` independently measured its own daemon
+   (`booswrit`, port `7718`) at a *different* checkout path, **5 commits
+   behind**, same two symbols absent. **Both daemons started before #177
+   merged; neither is running it — and "how far behind" is per-daemon (5 vs.
+   12) and does not generalise to a fleet-wide number**, the same shape as
+   `docs/identity-model.md`'s own H1 finding that role maps are per-daemon,
+   not global. **This is not something this ticket deploys or restarts to
+   fix — that is an operational action under the same rule as the role
+   variables, already escalated to the operator by `BUTCHR-100`.** To check
+   whether this has changed: resolve the *live* pid for your own daemon
+   (never from a cached `ENVIRONMENT.md`), read `/proc/<live pid>/cwd`, and
+   `grep -rl describeCollisions` in *that* checkout's `src/` — a match means
+   this marker has caught up; no match means it has not, regardless of what
+   `origin/main` looks like.
 2. **The `[review] APPROVED/CHANGES_REQUESTED <pr-url> @ <sha>` line on the
    worker's own ticket** (this fleet's existing convention, per BUTCHR-73)
    is append-only and cannot follow a branch the way `reviews[].commit.oid`
    can (see the Merge Protocol caveat this document inherits). It holds the
    verdict and the exact sha **even where GitHub itself holds no formal
-   approval at all** — exactly the case a collapsed hop produces. This is
-   the second marker, and the one a later reader should treat as
+   approval at all** — exactly the case a collapsed hop produces. **This
+   marker exists today**, and is the one a later reader should treat as
    authoritative when `reviewDecision` is empty: an empty `reviewDecision`
    plus a present `[review] APPROVED ... @ <sha>` ticket line means
    "reviewed, verdict recorded, GitHub could not hold the badge because of
    the collision" — a documented consequence. An empty `reviewDecision`
    with **no** such line means "not reviewed" — a real gap.
-3. **The honest-refusal procedure**, demonstrated twice, live, on real
-   PRs — `BUTCHR-62` on PR #170 and, today, `BUTCHR-115` on PR #178 (see §1):
-   on a `gh pr review --approve` refusal, post the substantive verdict as a
-   PR comment at the exact head sha, post the same as a `[review]` ticket
-   line, and tell the worker in writing not to wait for a green badge that
-   cannot arrive. This is the procedure to prescribe for every future
-   collapsed hop, not a one-off workaround — **count it as "refused and
-   routed around honestly," not as "quietly approved from the wrong
-   account."** The workaround this document already rejects (§2) is
+3. **The honest-refusal procedure — also exists today**, demonstrated
+   twice, live, on real PRs — `BUTCHR-62` on PR #170 and, today, `BUTCHR-115`
+   on PR #178 (see §1): on a `gh pr review --approve` refusal, post the
+   substantive verdict as a PR comment at the exact head sha, post the same
+   as a `[review]` ticket line, and tell the worker in writing not to wait
+   for a green badge that cannot arrive. This is the procedure to prescribe
+   for every future collapsed hop, not a one-off workaround — **count it as
+   "refused and routed around honestly," not as "quietly approved from the
+   wrong account."** The workaround this document already rejects (§2) is
    approving from the *other* account's credentials; recording the verdict
    as a ticket/PR comment when GitHub refuses the badge is the accepted
    alternative, not the rejected one — the two are easy to conflate and are
    opposite recommendations.
 
+**So, stated plainly rather than left implicit: markers 2 and 3 are the
+records that exist right now for a collapsed hop. Marker 1 joins them only
+once the deploy the operator already has notice of catches up — until then,
+a reader relying on this section for what evidence to expect should expect
+exactly two artefacts, not three.**
+
 **What this does not do, named rather than built:** none of the above makes
 a collapsed hop's `reviewDecision` non-empty, and none of it stops a
-collapsed-hop PR from being technically `MERGEABLE`/`CLEAN` on a repo with
-no branch protection. If a further change is warranted — branch protection
-on `main` requiring a passing review-adjacent check, or some other way to
-make an unreviewed-looking merge visible as reviewed-but-collapsed — **that
-is a candidate for BUTCHR-100 to route, not a decision or a change this
-ticket makes.** Branch protection is a repository-settings change, out of
-reach the same way a `BUTCHR_ASSIGNEE_*` value is.
+collapsed-hop PR from being technically `MERGEABLE` on a repo whose review
+requirement, as verified above, does not gate on an approval. If a further
+change is warranted — a review-gating protection rule on `main`, or some
+other way to make an unreviewed-looking merge visible as
+reviewed-but-collapsed — **that is a candidate for BUTCHR-100 to route, not
+a decision or a change this ticket makes.** Branch/rule settings are a
+repository-settings change, out of reach the same way a `BUTCHR_ASSIGNEE_*`
+value is.
 
 **Why this is permanent, not transitional:** whichever direction is applied
 from §2/§4, at least one hop remains not-cross-account —
