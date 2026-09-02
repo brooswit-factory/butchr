@@ -42,9 +42,9 @@ describe("MEDIA_REGISTRY contents (verified against the code each medium actuall
     expect(grades).toEqual(["same-call", "time-invariant"]);
   });
 
-  test("workspace: mixes time-invariant (KEY/TYPE) and self-declaring (GROUND_TRUTH) — and its blindSpots names PARENT as a live, ungraded gap, not silently folded into either grade", () => {
+  test("workspace: mixes time-invariant (KEY/TYPE), self-declaring (GROUND_TRUTH), and same-call (SUMMARY) — and its blindSpots names PARENT as a live, ungraded gap, not silently folded into any of the three", () => {
     const grades = MEDIA_REGISTRY.workspace.withdrawal.map((w) => w.grade).sort();
-    expect(grades).toEqual(["self-declaring", "time-invariant"]);
+    expect(grades).toEqual(["same-call", "self-declaring", "time-invariant"]);
     expect(MEDIA_REGISTRY.workspace.blindSpots).toContain("PARENT");
   });
 
