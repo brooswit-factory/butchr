@@ -27,6 +27,7 @@ import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
+import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 
 let config;
 try {
@@ -214,16 +215,22 @@ const issueResourceType = createIssueResourceType({
 runResourceLoop(issueResourceType, {
   herd,
   notify: async (issue, about, reason) => {
-    const msg = reason?.pr
-      ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
-      : about === issue
-        ? `[butchr] Ticket ${issue} was updated — re-read it.`
-        : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
+    // BUTCHR-87: `reason?.pr` keeps its own dedicated rendering
+    // (prReviewStateNudge, src/agents/pr-nudge.ts — guarded by
+    // test/unit/merge-check-guard.test.ts, deliberately untouched here);
+    // every other member of NotifyReason, plus the no-reason fallback,
+    // renders through changeNudge (src/agents/change-nudge.ts) instead of
+    // the old bare "was updated" text this ticket replaces.
+    const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, about, reason);
     // Channel push renders mid-turn; the prompt is what STARTS a turn on an
     // idle agent (measured: an idle epic never woke on the push alone).
     void notifyIssue(mcp, issue, msg);
     const outcome = await herd.nudge(issue, msg).catch((): NudgeResult => ({ delivered: false }));
-    const transitionTag = reason?.pr ? ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})` : "";
+    // BUTCHR-87: was `reason?.pr ? " (pr:from→to)" : ""` — every notify line
+    // now carries a reason tag, never a silent "" for the 89% that used to
+    // fall through the pr-only branch (see BUTCHR-34's own journal counts,
+    // the measurement this line's [notify] output makes reproducible).
+    const reasonTag = notifyReasonTag(reason);
     // KAN-829: a prompt that landed on a session-limit refusal is NOT
     // "delivered" in any sense an operator cares about — say so explicitly,
     // with the reset time, so `grep '\[notify\]'` and `grep 'session limit'`
@@ -231,7 +238,7 @@ runResourceLoop(issueResourceType, {
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${issue} ← ${about}${transitionTag}: channel pushed, prompt ${promptState}`);
+    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: channel pushed, prompt ${promptState}`);
   },
   onRespawn: async (issue, reason, observedArgv) => {
     console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);

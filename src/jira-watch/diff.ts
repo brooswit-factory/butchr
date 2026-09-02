@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { isDaemonLabel, isPrLabel, PR_PREFIX } from "../labels/plan.js";
+import { AGENT_PREFIX, isDaemonLabel, isPrLabel, PR_PREFIX } from "../labels/plan.js";
 
 /** Keys of issues currently in an active status. */
 export const activeKeys = (issues: readonly JiraIssue[]): string[] =>
@@ -69,6 +69,52 @@ export function daemonLabelsChanged(before: JiraIssue, after: JiraIssue): boolea
 function prLabelValue(issue: JiraIssue): string | null {
   const values = issue.labels.filter(isPrLabel).sort();
   return values.length ? values[0]!.slice(PR_PREFIX.length) : null;
+}
+
+/**
+ * The ticket's single agent:* label value (the suffix after "agent:"), or
+ * null when it carries none. Same sorted-first tie-break as `prLabelValue`
+ * for the same reason: `desiredLabels` (src/labels/plan.ts) emits at most
+ * one, but this does not trust that invariant blindly.
+ */
+function agentLabelValue(issue: JiraIssue): string | null {
+  const values = issue.labels.filter((l) => l.startsWith(AGENT_PREFIX)).sort();
+  return values.length ? values[0]!.slice(AGENT_PREFIX.length) : null;
+}
+
+/** Which daemon-owned namespace changed in a `daemonLabelTransition`, and its from/to values (either side may be null: no label in that namespace on that side). */
+export interface DaemonLabelTransition {
+  prefix: "agent" | "pr";
+  from: string | null;
+  to: string | null;
+}
+
+/**
+ * BUTCHR-87: names WHICH daemon-owned label value (agent:* or pr:*) changed
+ * between before -> after, and its from/to — for NAMING a notify reason, a
+ * different job from `isDaemonLabelOnlyDiff`/`daemonLabelsChanged` (which
+ * only ever answer "did a daemon label change", for suppression). Relies on
+ * the same single-value-per-namespace invariant `prTransition` already
+ * relies on (`desiredLabels` emits at most one agent:* and one pr:* label);
+ * unlike `prTransition`, a pr:* value moving to null (a pure removal) DOES
+ * count here — this function is naming what changed, not deciding whether
+ * an author's outstanding review just resolved.
+ *
+ * Deterministic precedence when BOTH namespaces changed in the same diff:
+ * pr:* wins, agent:* is not reported. Rationale: pr:* is materially rarer
+ * and, per the self-path pr:* exemption in createIssueEventRules, already
+ * the class this codebase treats as most worth an agent's attention — this
+ * mirrors that same judgement for the general (non-self, or self-but-not-a-
+ * transition) case rather than inventing a second, competing ranking.
+ * Returns null when NEITHER namespace's value actually differs (including
+ * "no daemon label of either kind on either side").
+ */
+export function daemonLabelTransition(before: JiraIssue, after: JiraIssue): DaemonLabelTransition | null {
+  const prBefore = prLabelValue(before), prAfter = prLabelValue(after);
+  if (prBefore !== prAfter) return { prefix: "pr", from: prBefore, to: prAfter };
+  const agentBefore = agentLabelValue(before), agentAfter = agentLabelValue(after);
+  if (agentBefore !== agentAfter) return { prefix: "agent", from: agentBefore, to: agentAfter };
+  return null;
 }
 
 /**

@@ -823,12 +823,205 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     // transition) and poll3 (the stale-cursor catch-up) are unchanged.
     expect(kEvents.length).toBe(2); // poll2 (the transition, exempted), poll3 (delivered despite the stale cursor)
     expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
-    expect(kEvents[1]!.reason).toBeUndefined();
+    // BUTCHR-87: poll3 is delivered BECAUSE the newest comment id moved past
+    // the stale baseline (crossDaemonSuppressed's becauseComment branch) —
+    // that is now named as its own reason, honestly, rather than left bare.
+    expect(kEvents[1]!.reason).toEqual({ comment: true });
     // Exactly 2 comments() calls: poll1 (baseline seeding) and poll3
     // (crossDaemonSuppressed) — poll2's transition never consults the cursor
     // at all, so it genuinely never advances during it; the swap to "6" is
     // discovered only at poll3.
     expect(commentCalls).toBe(2);
+  });
+});
+
+describe("startLoop: every notify reason class is named, driven through the real decide()/notify path (BUTCHR-87)", () => {
+  const mk = (fields: Partial<JiraIssue> & { updated: string }): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, labels: [], ...fields });
+
+  test("status transition is named with both from and to", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ status: "In Progress", updated: "t1" })], [mk({ status: "In Review", updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ status: { from: "In Progress", to: "In Review" } });
+  });
+
+  test("a daemon agent:* label transition is named — the single most common wake in the fleet, unnamed before this ticket", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ labels: ["agent:working"], updated: "t1" })], [mk({ labels: ["agent:idle"], updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      suppress: () => false, // not this daemon's own write -> the general classifier, not the ledger-hit arm
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ label: { prefix: "agent", from: "working", to: "idle" } });
+  });
+
+  test("a summary edit is named", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ summary: "old", updated: "t1" })], [mk({ summary: "new", updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ summary: true });
+  });
+
+  test("appeared and disappeared are both named", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[], [mk({ updated: "t1" })], []];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ disappeared: true });
+  });
+
+  test("a pr:* label transition on a RELATED (watcher) path is named as a label transition, NOT the self-only pr reason — a boss must never be told 'your PR' about its implementer's PR", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relPolls = [
+      [{ issue: mk({ labels: ["pr:open"], updated: "t1" }), watchers: ["W"] }],
+      [{ issue: mk({ labels: ["pr:approved"], updated: "t2" }), watchers: ["W"] }],
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relPolls[Math.min(n++, relPolls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    expect(wEvents.length).toBe(1);
+    expect(wEvents[0]!.reason).toEqual({ label: { prefix: "pr", from: "open", to: "approved" } });
+  });
+
+  test("a pure `updated` bump with every other field identical, and no comments dep wired up, carries NO reason — the honest fallback, not a guess", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ updated: "t1" })], [mk({ updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      // No `suppress` and no `comments` deps at all: nothing in this poll
+      // could ever learn about a comment, so this must fall all the way
+      // through to the honest "no reason" fallback, never a guess.
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toBeUndefined();
+  });
+
+  describe("precedence: more than one class true of the same diff (documented order — status > daemon label > summary > comment)", () => {
+    test("status change AND a daemon label change in the same diff -> status wins", async () => {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; reason: unknown }> = [];
+      const polls: JiraIssue[][] = [
+        [mk({ status: "In Progress", labels: ["agent:working"], updated: "t1" })],
+        [mk({ status: "In Review", labels: ["agent:idle"], updated: "t2" })],
+      ];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => polls[Math.min(n++, polls.length - 1)]!,
+        herd,
+        notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+        suppress: () => false,
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      const kEvents = notified.filter((e) => e.issue === "K");
+      expect(kEvents.length).toBe(1);
+      expect(kEvents[0]!.reason).toEqual({ status: { from: "In Progress", to: "In Review" } });
+    });
+
+    test("a daemon label change AND a summary edit in the same diff -> the label transition wins", async () => {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; reason: unknown }> = [];
+      const polls: JiraIssue[][] = [
+        [mk({ summary: "old", labels: ["agent:working"], updated: "t1" })],
+        [mk({ summary: "new", labels: ["agent:idle"], updated: "t2" })],
+      ];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => polls[Math.min(n++, polls.length - 1)]!,
+        herd,
+        notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+        suppress: () => false,
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      const kEvents = notified.filter((e) => e.issue === "K");
+      expect(kEvents.length).toBe(1);
+      expect(kEvents[0]!.reason).toEqual({ label: { prefix: "agent", from: "working", to: "idle" } });
+    });
+
+    test("a pr:* transition on the SELF path always wins over everything, unchanged behaviour — status/summary/agent-label all changing in the same poll still yields the pr reason", async () => {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; reason: unknown }> = [];
+      const polls: JiraIssue[][] = [
+        [mk({ status: "In Progress", summary: "old", labels: ["agent:working", "pr:open"], updated: "t1" })],
+        [mk({ status: "In Review", summary: "new", labels: ["agent:idle", "pr:approved"], updated: "t2" })],
+      ];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => polls[Math.min(n++, polls.length - 1)]!,
+        herd,
+        notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+        suppress: () => false,
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      const kEvents = notified.filter((e) => e.issue === "K");
+      expect(kEvents.length).toBe(1);
+      expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
+    });
   });
 });
 
@@ -1008,13 +1201,17 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
     await new Promise((r) => setTimeout(r, 60));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
-    // idx1 contributes K's appear (always delivered, no reason); idx2 is the
-    // event under test — exactly ONE nudge, not two, despite the poll
+    // idx1 contributes K's appear (always delivered, named {appeared:true}
+    // — BUTCHR-87); idx2 is the event under test — exactly ONE nudge, not
+    // two, despite the poll
     // carrying both a pr:* transition AND a ledger hit that (were the
     // transition exemption absent) the comment-cursor check would ALSO have
     // independently evaluated.
     expect(kEvents.length).toBe(2);
-    expect(kEvents[0]!.reason).toBeUndefined();
+    // BUTCHR-87: idx1's appear is now named too — appear/disappear was
+    // always delivered unconditionally (see decide()'s comment), and is
+    // one of the classes the poll can establish outright with no I/O.
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
     expect(kEvents[1]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
     // The transition branch sends and `continue`s BEFORE suppressed() (and
     // so the comment-cursor check) is ever consulted for K's own site — only
