@@ -1,9 +1,12 @@
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel } from "./speak.js";
+import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
@@ -1354,6 +1357,51 @@ export interface CorrectWorkerResult {
   correctedSummary: boolean;
   /** States, in words, what this correction reaches and (when a summary was corrected) what it does NOT — see the function comment's "TWO FIELDS, TWO DIFFERENT REACHES" section. */
   message: string;
+  /**
+   * BUTCHR-169: `WORKSPACE_REGISTRY.SUMMARY`'s declared withdrawal path
+   * (src/workspace/registry.ts), reported as a STRUCTURED field so a caller
+   * can check it without parsing `message` prose — only meaningful when
+   * `correctedSummary` is true; absent otherwise (never a padded
+   * "not-applicable" string on a call that never touched a summary).
+   * "no-workspace-on-disk" is the common case (no agent has ever been
+   * spawned for `workerKey`, or its workspace was already cleaned up) and is
+   * NOT an error. "failed" means the Jira correction above already
+   * succeeded and is unaffected — see `message` for the actual error text.
+   * NONE of these values mean a RUNNING agent's already-loaded context was
+   * updated — that gap cannot be closed by a file rewrite; `message` says so
+   * explicitly and points at `tell_worker`.
+   */
+  summaryWorkspaceRewrite?: "no-workspace-on-disk" | "rewritten" | "failed";
+}
+
+/**
+ * BUTCHR-169: `WORKSPACE_REGISTRY.SUMMARY`'s declared withdrawal mechanism
+ * (src/workspace/registry.ts) — best-effort regenerates `brief.md` for any
+ * workspace already built for `spec.key`, from the SAME `briefFor`/
+ * `interpolate` machinery `buildWorkspace` itself uses (src/agents/
+ * workspace.ts), so the file on disk matches exactly what a fresh spawn
+ * would have written with the corrected summary. Deliberately does NOT
+ * touch `CLAUDE.md` — it carries no `{{SUMMARY}}` placeholder (see
+ * `WORKSPACE_REGISTRY.SUMMARY`'s own `appliedBy`), and rewriting it would
+ * silently reintroduce the exact false claim this ticket fixed elsewhere.
+ * NEVER THROWS: a workspace that was never built (or already cleaned up)
+ * for `spec.key` is the common, expected case, not an error — reported as
+ * "no-workspace-on-disk". A write failure (permission, disk) is caught and
+ * reported as "failed" with its message, NEVER re-thrown — by the time this
+ * runs, `correctWorker`'s Jira edit has already succeeded and must not be
+ * lost over a filesystem problem (DoD 6 / `retireOrphanHeader`'s precedent).
+ * Does NOT reach a RUNNING agent's already-loaded context — no file rewrite
+ * can — `correctWorker`'s own returned `message` names that gap explicitly.
+ */
+function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace-on-disk" | "rewritten" | "failed"; error?: string } {
+  const briefPath = join(workspaceRoot(), spec.key, "brief.md");
+  if (!existsSync(briefPath)) return { outcome: "no-workspace-on-disk" };
+  try {
+    writeFileSync(briefPath, interpolate(briefFor(spec.issuetype), spec));
+    return { outcome: "rewritten" };
+  } catch (e) {
+    return { outcome: "failed", error: (e as Error).message };
+  }
 }
 
 /**
@@ -1441,13 +1489,22 @@ export interface CorrectWorkerResult {
  * A DESCRIPTION is read LIVE — every read goes through `jira_get_issue`, so
  * correcting it reaches every future reader, including an agent that spawns
  * later, with no further action by anyone. A SUMMARY is SNAPSHOTTED — the
- * workspace builder interpolates it into `brief.md`/`CLAUDE.md` at
- * workspace-build time, so correcting it updates Jira, the board and every
- * future read, but does NOT rewrite the `brief.md` already on disk for an
- * agent that is currently running. Rewriting live workspaces is
- * deliberately OUT OF SCOPE. `result.message` names this limitation ONLY
- * when a summary was actually corrected, and points at `tell_worker` as the
- * follow-up if a running agent needs to know.
+ * workspace builder interpolates it into `brief.md` ONLY at workspace-build
+ * time (verified: `briefs/CLAUDE.md` carries no `{{SUMMARY}}` placeholder at
+ * all — an earlier version of this exact comment and this exact success
+ * message both claimed "brief.md/CLAUDE.md", which was simply false for the
+ * CLAUDE.md half; fixed by BUTCHR-169, which found itself repeating that
+ * same false claim to a caller mid-investigation of the bug it names). So
+ * correcting a summary updates Jira, the board and every future read, AND
+ * (BUTCHR-169: see `rewriteWorkspaceBriefSummary` below,
+ * `WORKSPACE_REGISTRY.SUMMARY` in src/workspace/registry.ts) best-effort
+ * REGENERATES `brief.md` for any workspace already on disk for the worker —
+ * but this can NEVER reach a RUNNING agent's already-loaded context, because
+ * no file rewrite can edit a process's memory; that gap is not "out of
+ * scope", it is structurally unclosable by this mechanism. `result.message`
+ * names both halves — what the rewrite achieved (or why it didn't apply/
+ * failed) and the running-agent gap it cannot close — and points at
+ * `tell_worker` as the only channel that can close the second half.
  *
  * WHO MAY CORRECT AN EPIC'S DESCRIPTION, STATED AS WHAT `assertOwnWorker`
  * ACTUALLY CHECKS, NOT AS WHICH TIERS HAPPEN TO EXIST TODAY: a PROJECT
@@ -1522,8 +1579,26 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
 
   const correctedDescription = input.description !== undefined;
   const correctedSummary = input.summary !== undefined;
+
+  // BUTCHR-169: SUMMARY's declared withdrawal path — best-effort, never
+  // throws (see rewriteWorkspaceBriefSummary's own doc comment). issuetype
+  // and the boss key come from THIS SAME `issue` fetch above, not a second
+  // call — findBossKey mirrors bossKeyFrom's (src/resources/issue.ts)
+  // Implements-link convention on the RAW shape ops.getIssue returns.
+  const summaryRewrite = correctedSummary
+    ? rewriteWorkspaceBriefSummary({ key: workerKey, issuetype: issuetypeOf(issue) ?? "", summary: input.summary!, parent: findBossKey(issue) })
+    : undefined;
+  const summaryRewriteNote =
+    summaryRewrite === undefined
+      ? ""
+      : summaryRewrite.outcome === "rewritten"
+        ? ` brief.md on ${workerKey}'s on-disk workspace was regenerated with the new summary — see WORKSPACE_REGISTRY.SUMMARY (src/workspace/registry.ts).`
+        : summaryRewrite.outcome === "no-workspace-on-disk"
+          ? ` No on-disk workspace exists for ${workerKey} (never spawned, or already cleaned up) — nothing to rewrite.`
+          : ` brief.md rewrite FAILED (${summaryRewrite.error}) — Jira's correction above already landed and is UNAFFECTED; the on-disk brief.md is now stale. Safe to retry (this call is idempotent for the rewrite step) or fix brief.md by hand.`;
+
   const message = correctedSummary
-    ? `correct_worker: ${workerKey}'s ${correctedDescription ? "description and summary" : "summary"} corrected; the superseded text was archived first (${CORRECTION_MARKER}). NOTE: a summary is SNAPSHOTTED into a workspace's brief.md/CLAUDE.md at build time — this correction updates Jira, the board and every future read, but does NOT rewrite the workspace already on disk for an agent currently running on ${workerKey}. If a running agent needs to know, follow up with tell_worker.`
+    ? `correct_worker: ${workerKey}'s ${correctedDescription ? "description and summary" : "summary"} corrected; the superseded text was archived first (${CORRECTION_MARKER}).${summaryRewriteNote} NOTE: a summary is SNAPSHOTTED into a workspace's brief.md ONLY (never CLAUDE.md) — this correction updates Jira, the board, every future read, AND (see above) any workspace already on disk, but does NOT reach a RUNNING agent's already-loaded context, because no file rewrite can. If a running agent needs to know, follow up with tell_worker.`
     : `correct_worker: ${workerKey}'s description corrected; the superseded text was archived first (${CORRECTION_MARKER}). A description is read live (jira_get_issue), so this reaches every future reader immediately, including any agent that spawns later.`;
 
   // Requirement 4: warn on THIS successful correction when the description
@@ -1536,7 +1611,13 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
       ? ` WARNING: ${workerKey}'s description is now ${input.description!.length} characters, within ${NEAR_BOUNDARY_MARGIN} of Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit — the NEXT correction on ${workerKey} will still succeed, but its archive will likely be split across multiple ${CORRECTION_MARKER} comments and be harder to read as one piece.`
       : "";
 
-  return { key: workerKey, correctedDescription, correctedSummary, message: message + nearBoundaryWarning };
+  return {
+    key: workerKey,
+    correctedDescription,
+    correctedSummary,
+    message: message + nearBoundaryWarning,
+    ...(summaryRewrite !== undefined ? { summaryWorkspaceRewrite: summaryRewrite.outcome } : {}),
+  };
 }
 
 /**

@@ -13,6 +13,26 @@ import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 export interface SpawnSpec { key: string; issuetype: string; summary: string; parent: string | null }
 
 /**
+ * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
+ * into a workspace file — the type-level door `src/workspace/registry.ts`
+ * mirrors (see that file's header for the rule this joins, and why the
+ * registry lives there, not here). This array is the hand-written source of
+ * truth (a closed union has to start somewhere written down), and what
+ * keeps it from silently drifting from what `interpolate()` actually
+ * substitutes is the OTHER direction of the tie: `interpolate()`'s own
+ * substitution table (`values`, below) is typed `Record<WorkspacePlaceholder,
+ * string>`, so adding a `.replaceAll`-worthy name to `values` without adding
+ * it here is an excess-property error, and adding a name here without a
+ * matching `values` entry fails to compile for the opposite reason (`Record`
+ * requires every key). `src/workspace/registry.ts` imports this type FROM
+ * here — never the reverse — so this write path never depends on the
+ * registry, same "no runtime behaviour lives in the registry"
+ * discipline `src/headers/registry.ts` documents for its own medium.
+ */
+export const WORKSPACE_PLACEHOLDERS = ["KEY", "SUMMARY", "TYPE", "PARENT", "GROUND_TRUTH"] as const;
+export type WorkspacePlaceholder = (typeof WORKSPACE_PLACEHOLDERS)[number];
+
+/**
  * Selected by `issuetype` — the SAME lookup an issue resource and a PROJECT
  * resource both go through (BUTCHR-71): an issue names its Jira issue type
  * here ("Epic"/"Story"/"Task"), and a project resource's spawn config names
@@ -25,13 +45,16 @@ export const briefFor = (issuetype: string): string =>
   ({ epic: EPIC, story: STORY, task: TASK, project: PROJECT } as Record<string, string>)[issuetype.toLowerCase()] ?? DEFAULT;
 
 /** `groundTruth` fills `{{GROUND_TRUTH}}` (only CLAUDE.md carries that placeholder); omit it for templates that don't need it. */
-export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: string): string =>
-  template
-    .replaceAll("{{KEY}}", spec.key)
-    .replaceAll("{{SUMMARY}}", spec.summary)
-    .replaceAll("{{TYPE}}", spec.issuetype)
-    .replaceAll("{{PARENT}}", spec.parent ?? "(none — you are top-level)")
-    .replaceAll("{{GROUND_TRUTH}}", groundTruth ?? "");
+export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: string): string => {
+  const values: Record<WorkspacePlaceholder, string> = {
+    KEY: spec.key,
+    SUMMARY: spec.summary,
+    TYPE: spec.issuetype,
+    PARENT: spec.parent ?? "(none — you are top-level)",
+    GROUND_TRUTH: groundTruth ?? "",
+  };
+  return WORKSPACE_PLACEHOLDERS.reduce((acc, name) => acc.replaceAll(`{{${name}}}`, values[name]), template);
+};
 
 /** Model per issue type: epics think hardest, tasks run fast. A project resource (BUTCHR-71) gets the SAME tier an epic gets, not the task default — it makes epic-level product judgment, not fast mechanical work. */
 export const modelFor = (issuetype: string): string =>
