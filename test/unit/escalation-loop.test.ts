@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { createEscalator, type CommentRow } from "../../src/agents/escalation-loop.js";
+import { createEscalator, UNRESPONSIVE_MARKER, type CommentRow } from "../../src/agents/escalation-loop.js";
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
-import { fingerprint } from "../../src/agents/escalate.js";
+import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src/agents/escalate.js";
 import { tellWorker } from "../../src/tools/relationship.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
@@ -64,7 +64,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"] } = {}) {
+function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -74,6 +74,8 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
   let nextId = 1;
   let readCalls = 0;
   let commentsCalls = 0;
+  let ownChannelCommentsCalls = 0;
+  let ownChannelCommentsFail = opts.ownChannelCommentsFail ?? false;
   const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
 
   const escalator = createEscalator({
@@ -90,6 +92,20 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
       if (opts.commentsFail) throw new Error("jira unreachable");
       return commentRows;
     },
+    // BUTCHR-124: the sustained-unresponsive alarm's own read-back — kept
+    // separate from `comments` above (issue-only, unchanged) so a test can
+    // fail ONE without the other. Shares the same `commentRows` state so a
+    // posted [butchr:unresponsive] notice is visible to a later adoption
+    // check, matching production (both eventually read the resource's own
+    // channel). MUST REJECT on `ownChannelCommentsFail`, never resolve to []
+    // — this is exactly the fail-closed contract escalateUnresponsive relies on.
+    ownChannelComments: async () => {
+      ownChannelCommentsCalls++;
+      await delay();
+      if (ownChannelCommentsFail) throw new Error("could not read own channel");
+      return commentRows;
+    },
+    unresponsiveMinutes: opts.unresponsiveMinutes ?? 5,
     now: () => clock,
     log: (line) => logs.push(line),
     ...(opts.captures ? { captures: opts.captures } : {}),
@@ -108,6 +124,8 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
     setPaneText: (t: string) => { paneText = t; },
     get readCalls() { return readCalls; },
     get commentsCalls() { return commentsCalls; },
+    get ownChannelCommentsCalls() { return ownChannelCommentsCalls; },
+    setOwnChannelCommentsFail: (v: boolean) => { ownChannelCommentsFail = v; },
     addHumanComment: (body: string) => {
       commentRows = [{ id: String(nextId++), body, created: new Date(clock).toISOString() }, ...commentRows];
     },
@@ -133,9 +151,17 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
       for (const c of calls) await escalator.onBlocked(c.paneId, c.issue, c.prompt, seq);
     },
     // One "poll": the pane was blocked but its text did not parse.
-    noPrompt: (paneId: string, issue: string | null, text: string) => {
+    // BUTCHR-124: onNoPrompt is `void` in production (fire-and-forget, like
+    // onExposed) — its own sustained-unresponsive escalation attempt runs in
+    // an internal, unawaited async IIFE. This helper is itself async and
+    // flushes microtasks (`Bun.sleep(0)`, same technique the onExposed test
+    // above already uses via a real `Bun.sleep`) so a caller that awaits it
+    // observes the escalation's effects (posted/logs) deterministically,
+    // without changing onNoPrompt's own production signature.
+    noPrompt: async (paneId: string, issue: string | null, text: string) => {
       seq++;
       escalator.onNoPrompt(paneId, issue, text, seq);
+      await Bun.sleep(0);
     },
     get seq() { return seq; },
   };
@@ -956,6 +982,322 @@ describe("createEscalator — unparseable blocked panes (KAN-756, item C)", () =
     h.noPrompt("p1", "KAN-1", "never blocked before");
     expect(h.logs.some((l) => /debounce reset/.test(l))).toBe(false);
     expect(h.logs.some((l) => /blocked with no parseable dialog/.test(l))).toBe(true);
+  });
+});
+
+// BUTCHR-124: sustained blocked-and-unparseable — distinct from KAN-756 item
+// C above (which only proves the log line is deduplicated). This alarm must
+// additionally SPEAK on a channel a human reads once the condition is
+// SUSTAINED, be visibly distinct from [butchr:blocked], never look
+// answerable, be rate-capped, survive a restart (or state the cost), and
+// fail CLOSED on a read it cannot verify. D2's negative case is covered by
+// the "never fires" describe block below; D7 (no behaviour change to the
+// parseable path) is covered by every existing describe block above still
+// passing unmodified.
+describe("createEscalator — sustained blocked-and-unparseable alarm (BUTCHR-124)", () => {
+  test("does not fire below the threshold — one minute short of 5", async () => {
+    const h = harness({ unresponsiveMinutes: 5 });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "some garbled scroll");
+    h.setClock(4 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "some garbled scroll"); // consecutive, 4 minutes elapsed
+    expect(h.posted).toEqual([]);
+  });
+
+  test("fires at exactly the threshold, once, on consecutive polls, and not again", async () => {
+    const h = harness({ unresponsiveMinutes: 5 });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "some garbled scroll"); // firstObservedAt=0
+    h.setClock(4 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "some garbled scroll"); // 4m — not yet
+    expect(h.posted).toEqual([]);
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "some garbled scroll"); // 5m — fires
+    expect(h.posted.length).toBe(1);
+    expect(h.posted[0]!.issue).toBe("KAN-1");
+    // Further polls in the SAME episode never post again.
+    h.setClock(20 * 60_000);
+    for (let i = 0; i < 5; i++) await h.noPrompt("p1", "KAN-1", "some garbled scroll");
+    expect(h.posted.length).toBe(1);
+  });
+
+  test("a gap (the herd stops reporting the pane blocked at all) resets the sustained count — a later re-entry starts fresh, not from the original floor", async () => {
+    const h = harness({ unresponsiveMinutes: 5 });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // firstObservedAt=0
+    h.setClock(4 * 60_000 + 50_000); // 4m50s — close, but not yet
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    expect(h.posted).toEqual([]);
+
+    h.notBlocked([]); // the herd no longer reports p1 blocked at all — onPoll's own reset
+    h.setClock(5 * 60_000); // 5 minutes since the ORIGINAL floor — would have fired without the gap
+    await h.noPrompt("p1", "KAN-1", "garbled"); // fresh episode: 0 minutes elapsed from ITS OWN floor
+    expect(h.posted).toEqual([]); // proves the gap actually reset the floor, not merely delayed a check
+
+    h.setClock(10 * 60_000); // 5 minutes after the FRESH floor
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    expect(h.posted.length).toBe(1);
+  });
+
+  test("a gap via the pane becoming briefly PARSEABLE (onBlocked fires instead) also resets the sustained count — proven independent of onPoll", async () => {
+    const h = harness({ unresponsiveMinutes: 5 });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // pollSeq 1, firstObservedAt=0
+    await h.poll("p1", "KAN-1", prompt); // pollSeq 2: parses this poll — onNoPrompt not called
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // pollSeq 3: NOT consecutive with pollSeq 1 (gap of 2)
+    expect(h.posted.filter((c) => c.text.includes(UNRESPONSIVE_MARKER))).toEqual([]); // fresh episode, not yet 5m old
+  });
+
+  describe("negative case D2(a) — unparseable but never sustained", () => {
+    test("a handful of unparseable polls, all below threshold, post nothing", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setClock(0);
+      for (let i = 0; i < 5; i++) {
+        h.setClock(i * 30_000); // 30s apart — 2 minutes total, well under 5
+        await h.noPrompt("p1", "KAN-1", `garbled ${i}`);
+      }
+      expect(h.posted).toEqual([]);
+    });
+
+    test("a pane with no resolvable issue key is never tracked or escalated, however long it stays unparseable", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setClock(0);
+      await h.noPrompt("p1", null, "garbled");
+      h.setClock(60 * 60_000); // 1 hour later, still the same (consecutive) episode
+      await h.noPrompt("p1", null, "garbled");
+      expect(h.posted).toEqual([]);
+      expect(h.ownChannelCommentsCalls).toBe(0); // never even attempts a read-back with no target
+    });
+  });
+
+  describe("negative case D2(b) — a parseable dialog produces nothing new on the unresponsive channel", () => {
+    test("many consecutive onBlocked polls (parseable, escalating normally) never post a [butchr:unresponsive] comment", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      const prompt = parsePrompt(REAL)!;
+      h.setClock(0);
+      for (let i = 0; i < 10; i++) {
+        h.setClock(i * 60_000);
+        await h.poll("p1", "KAN-1", prompt);
+      }
+      // The existing [butchr:blocked] path escalates as usual (unchanged, D7)...
+      expect(h.posted.some((c) => c.text.startsWith(BLOCKED_MARKER))).toBe(true);
+      // ...but the new alarm never fires for a pane that always parses.
+      expect(h.posted.some((c) => c.text.startsWith(UNRESPONSIVE_MARKER))).toBe(false);
+    });
+  });
+
+  describe("D3 — comment content: distinct marker, names the resource, states duration and the ask, never answerable", () => {
+    test("the posted notice is visibly distinct from [butchr:blocked], names the issue and pane, states elapsed minutes, and is never parsed as a directive", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      expect(h.posted.length).toBe(1);
+      const text = h.posted[0]!.text;
+
+      expect(text.startsWith(UNRESPONSIVE_MARKER)).toBe(true);
+      expect(text.startsWith(BLOCKED_MARKER)).toBe(false);
+      expect(text).not.toContain(BLOCKED_MARKER);
+      expect(text).toContain("KAN-1"); // names the resource
+      expect(text).toContain("5 minute"); // says how long
+      expect(text).toMatch(/human should look|investigate|restart the agent/i); // what a human is asked to do
+      expect(text).not.toMatch(/^fingerprint: /m); // no dialog fingerprint line
+      expect(text).not.toMatch(/ANSWER <n>|ANSWER TEXT/); // no ANSWER protocol invited
+
+      // The §3c requirement, verified directly against the real parser, not
+      // just "no line happens to start with ANSWER": this comment must never
+      // be picked up as a directive, by construction.
+      expect(parseDirective(text)).toBeNull();
+    });
+
+    test("never carries the raw unparseable pane text (no secret-leak surface, matching escalate()'s own discipline)", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setPaneText("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+      expect(h.posted.length).toBe(1);
+      expect(h.posted[0]!.text).not.toContain("AWS_SECRET_ACCESS_KEY");
+    });
+  });
+
+  describe("D4 — rate cap: bounded notices per TICKET, not one per poll", () => {
+    // The dedupe key is the PANE (see D5 below), so a repeat episode on the
+    // SAME pane always adopts that pane's one prior comment and never even
+    // reaches the cap check again — dedupe alone already bounds that case to
+    // exactly one comment, ever. What the cap actually guards is DIFFERENT
+    // panes escalating fresh notices onto the SAME ticket (e.g. the herd
+    // recreating an agent's pane more than once in an hour) — so these tests
+    // use a fresh pane id per episode, on purpose, not the same one.
+    test("a 4th DIFFERENT pane escalating to the same ticket within an hour is capped — logged, not posted", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      async function earnEpisode(paneId: string, startMs: number) {
+        h.setClock(startMs);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+        h.setClock(startMs + 5 * 60_000);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+      }
+      await earnEpisode("p0", 0);
+      await earnEpisode("p1", 10 * 60_000);
+      await earnEpisode("p2", 20 * 60_000);
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(3);
+
+      await earnEpisode("p3", 30 * 60_000); // still inside the same rolling hour as episode 1
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(3); // capped, not a 4th
+      expect(h.logs.some((l) => /WARNING: \[unresponsive\] rate cap reached.*KAN-1/.test(l))).toBe(true);
+    });
+
+    test("cap window slides: after an hour, a fresh pane's episode posts again", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      async function earnEpisode(paneId: string, startMs: number) {
+        h.setClock(startMs);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+        h.setClock(startMs + 5 * 60_000);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+      }
+      await earnEpisode("p0", 0);
+      await earnEpisode("p1", 10 * 60_000);
+      await earnEpisode("p2", 20 * 60_000);
+      await earnEpisode("p3", 30 * 60_000); // capped (4th within the hour)
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(3);
+
+      await earnEpisode("p4", 61 * 60_000); // more than an hour after episode 1
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(4);
+    });
+
+    test("a permanently stuck SAME pane, flickering through many reset episodes, produces exactly ONE comment ever (dedupe alone already bounds it tighter than the cap)", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      async function earnEpisode(startMs: number) {
+        h.setClock(startMs);
+        await h.noPrompt("p1", "KAN-1", "garbled");
+        h.setClock(startMs + 5 * 60_000);
+        await h.noPrompt("p1", "KAN-1", "garbled");
+        h.notBlocked([]); // flicker: end this episode so the next starts a fresh floor
+      }
+      for (let i = 0; i < 6; i++) await earnEpisode(i * 10 * 60_000);
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(1);
+      expect(h.logs.filter((l) => /adopted existing notice/.test(l)).length).toBe(5); // episodes 2-6 all adopt episode 1's comment
+    });
+  });
+
+  describe("D5 — restart-adoption: a prior [butchr:unresponsive] notice is adopted, not re-posted", () => {
+    test("adopts an existing notice carrying the same `pane:` key instead of re-posting", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.addHumanComment(`${UNRESPONSIVE_MARKER} KAN-1's pane has been reported blocked for 5 minute(s), and its text does not parse as a recognized dialog.\n\npane: [p1]`);
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      expect(h.posted).toEqual([]); // adopted, not re-posted
+      expect(h.logs.some((l) => /adopted existing notice.*daemon restart/.test(l))).toBe(true);
+    });
+
+    test("an adopted episode still counts toward the rate-cap budget (mirrors escalate()'s own KAN-756 item F)", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      for (let i = 0; i < 3; i++) {
+        h.addHumanComment(`${UNRESPONSIVE_MARKER} KAN-1's pane has been reported blocked for 5 minute(s), and its text does not parse as a recognized dialog.\n\npane: [p${i}]`);
+      }
+      for (let i = 0; i < 3; i++) {
+        h.setClock(i * 20 * 60_000);
+        await h.noPrompt(`p${i}`, "KAN-1", "garbled");
+        h.setClock(i * 20 * 60_000 + 5 * 60_000);
+        await h.noPrompt(`p${i}`, "KAN-1", "garbled");
+      }
+      expect(h.posted).toEqual([]); // all 3 adopted, budget spent without a single fresh post
+    });
+
+    // Rule 2b (BUTCHR-124 review comment 17217): "the read succeeded" is not
+    // "I matched the right thing" — a successful string match needs a
+    // post-condition proving it isn't a false positive. This is the
+    // regression case that motivated `paneKey`'s bracket delimiters: a
+    // shorter pane id that is a PREFIX of a longer one must never adopt the
+    // longer pane's notice.
+    test("a pane id that is a PREFIX of another pane's id never adopts that pane's notice (Rule 2b post-condition)", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.addHumanComment(`${UNRESPONSIVE_MARKER} KAN-1's pane has been reported blocked for 5 minute(s), and its text does not parse as a recognized dialog.\n\npane: [p12]`);
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled"); // paneId "p1" is a PREFIX of "p12" above
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      // Must post its OWN fresh notice for p1 — not silently adopt p12's.
+      expect(h.posted.length).toBe(1);
+      expect(h.logs.some((l) => /adopted existing notice/.test(l))).toBe(false);
+      expect(h.posted[0]!.text).toContain("pane: [p1]");
+    });
+  });
+
+  describe("D10 — fails CLOSED: a read it cannot verify must never be treated as 'nothing exists'", () => {
+    test("a failed read-back posts nothing, logs a WARNING distinguishing 'could not check' from 'checked, found nothing', and does not latch the episode as handled", async () => {
+      const h = harness({ unresponsiveMinutes: 5, ownChannelCommentsFail: true });
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled"); // threshold crossed, but the read-back fails
+      expect(h.posted).toEqual([]);
+      expect(h.logs.some((l) => /WARNING: \[unresponsive\] could not verify/.test(l))).toBe(true);
+      const attemptsAfterFirstFailure = h.ownChannelCommentsCalls;
+      expect(attemptsAfterFirstFailure).toBeGreaterThan(0);
+
+      // Still failing on the NEXT poll: it must retry (not have silently
+      // latched "handled" on the failed attempt) — proven by a SECOND
+      // attempt actually happening.
+      h.setClock(6 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      expect(h.posted).toEqual([]);
+      expect(h.ownChannelCommentsCalls).toBeGreaterThan(attemptsAfterFirstFailure);
+    });
+
+    test("once the read-back recovers, the SAME episode escalates normally — the earlier failures cost a delay, never a lost signal", async () => {
+      const h = harness({ unresponsiveMinutes: 5, ownChannelCommentsFail: true });
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled"); // fails, retries pending
+      expect(h.posted).toEqual([]);
+
+      h.setOwnChannelCommentsFail(false);
+      h.setClock(6 * 60_000);
+      await h.noPrompt("p1", "KAN-1", "garbled"); // recovers — same episode, still consecutive
+      expect(h.posted.length).toBe(1);
+      expect(h.posted[0]!.text.startsWith(UNRESPONSIVE_MARKER)).toBe(true);
+    });
+  });
+
+  describe("routing: the same deps.addComment seam a PROJECT-keyed target already gets for free (speakOnOwnChannel)", () => {
+    test("a project-shaped key (BUTCHR-96 style: no issue-number suffix) is passed straight through to addComment, exactly like the parseable path already proves", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setClock(0);
+      await h.noPrompt("p1", "BUTCHR", "garbled");
+      h.setClock(5 * 60_000);
+      await h.noPrompt("p1", "BUTCHR", "garbled");
+      expect(h.posted.length).toBe(1);
+      expect(h.posted[0]!.issue).toBe("BUTCHR");
+    });
+  });
+
+  describe("overlapping attempts never double-post", () => {
+    test("two overlapping onNoPrompt calls that both cross the threshold escalate exactly once", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      h.setClock(0);
+      await h.noPrompt("p1", "KAN-1", "garbled"); // earn the episode up to just-under-threshold first
+      h.setClock(5 * 60_000);
+      // Two overlapping polls, both observing the threshold already crossed.
+      // Production calls onNoPrompt fire-and-forget (never awaited) on a 5s
+      // timer, so a slow Jira round-trip from the FIRST poll can still be in
+      // flight when the SECOND poll's onNoPrompt runs — this reproduces that
+      // by firing both without awaiting either before the second starts. The
+      // `unresponsiveInFlight` guard (mirrors onBlocked's own `inFlight`) must
+      // make the second call a no-op rather than a second concurrent attempt.
+      await Promise.all([
+        h.noPrompt("p1", "KAN-1", "garbled"),
+        h.noPrompt("p1", "KAN-1", "garbled"),
+      ]);
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(1);
+    });
   });
 });
 

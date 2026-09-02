@@ -1,6 +1,7 @@
 import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
 import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
 import type { CaptureSink } from "./session-limit-watch.js";
+import { findMarked, RateCap, HOUR_MS } from "./escalation-helper.js";
 
 const FOLLOWUP_MS = 15 * 60_000;
 const DEBOUNCE_POLLS = 2;
@@ -12,6 +13,19 @@ const CLOCK_SKEW_GRACE_MS = 120_000;
 
 export interface CommentRow { id: string; body: string; created: string }
 
+/**
+ * BUTCHR-124: marker for the sustained-blocked-and-unparseable alarm —
+ * deliberately distinct from escalate.ts's `MARKER` (`[butchr:blocked]`) so a
+ * reader can tell the two apart at a glance: `[butchr:blocked]` means "here
+ * is a decision you can make" (a fingerprint, an ANSWER protocol);
+ * `[butchr:unresponsive]` means "come look at this pane" — there is no
+ * parsed dialog, so there is nothing to answer. It carries NO fingerprint
+ * and no ANSWER instructions, and (verified: neither `MARKER` nor any
+ * `ANSWER `-prefixed line ever appears in `unresponsiveComment`'s output —
+ * see the pinned test) is never picked up by `parseDirective`.
+ */
+export const UNRESPONSIVE_MARKER = "[butchr:unresponsive]";
+
 export interface EscalatorDeps {
   read: (paneId: string) => Promise<string>;
   send: (paneId: string, text: string) => Promise<void>;
@@ -20,6 +34,39 @@ export interface EscalatorDeps {
   comments: (issue: string) => Promise<CommentRow[]>;
   now: () => number;
   log: (line: string) => void;
+  /**
+   * BUTCHR-124: minutes a pane must be reported blocked, with text that does
+   * not parse as a recognized dialog, CONTINUOUSLY (see onNoPrompt), before
+   * the sustained-unresponsive alarm fires. Mirrors parkedMinutes/
+   * idleDialogMinutes/stalledMinutes — an in-memory floor, so a daemon
+   * restart mid-episode costs at most one threshold's delay (see onNoPrompt's
+   * doc comment on `unresponsive`).
+   */
+  unresponsiveMinutes: number;
+  /**
+   * BUTCHR-124: recent messages on `key`'s OWN CHANNEL — the read-back
+   * symmetric to `addComment`'s `speakOnOwnChannel` routing (an ISSUE's Jira
+   * comments for an issue key; a PROJECT's Confluence root-doc FOOTER
+   * comments for a project key — see src/tools/speak.ts, src/tools/docs.ts's
+   * `projectRootDoc`, and `AtlassianOps.getPageComments`'s "per-page only,
+   * never the batch form" warning). Used ONLY by the sustained-unresponsive
+   * alarm's restart-adoption dedupe — deliberately separate from `comments`
+   * above (issue-only, unchanged, still used exactly as before by the
+   * parseable-dialog `escalate()` — D7).
+   *
+   * MUST FAIL BY REJECTING on any read failure — never resolve to an empty
+   * array to represent "could not check". `comments` above already does
+   * exactly that (`.catch(() => [])` at every call site in this file), which
+   * is a confident-zero: a failed read and a successful-empty read become
+   * the same branch, so a transient failure right after a restart reads as
+   * "no prior notice exists" and posts a duplicate. That is `escalate()`'s
+   * existing, unrelated, OUT-OF-SCOPE-for-this-ticket behaviour (flagged at
+   * review, not fixed here — see the doc). This dependency must not repeat
+   * it: `escalateUnresponsive` below treats a REJECTED promise as "could not
+   * verify — skip writing this poll, retry next time" and a RESOLVED one
+   * (even an empty array) as "verified: checked, and this is what's there".
+   */
+  ownChannelComments: (key: string) => Promise<CommentRow[]>;
   /**
    * BUTCHR-16: durable, LOCAL-DISK-ONLY landing spot for a blocked pane's
    * full text at the moment it escalates — evidence for the NEXT unknown
@@ -82,6 +129,63 @@ function hashText(s: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * BUTCHR-124: max unresponsive-alarm comments per TARGET (issue or project
+ * key) per hour, via the shared `RateCap` primitive (escalation-helper.ts).
+ * Keyed by TARGET, deliberately NOT by pane — parked.ts's own choice, not
+ * escalate()'s: escalate()'s per-pane budget makes sense there because its
+ * dedupe key is the DIALOG's fingerprint, so a genuinely different dialog on
+ * the SAME pane is a real, distinct, budget-worthy event. Here the dedupe
+ * key (`paneKey`, below) is the PANE itself, not its content — so a repeat
+ * episode on the SAME pane always finds and adopts that pane's one prior
+ * comment (see `escalateUnresponsive`'s own doc comment on that tradeoff)
+ * and never even reaches this check again. A per-PANE cap would therefore
+ * only ever see each pane's fresh, all-allowed first attempt and could never
+ * actually fire. What this cap protects against instead is what parked.ts's
+ * target-keyed cap protects against: several DIFFERENT panes (e.g. an
+ * agent's pane recreated by the herd under the same ticket, more than once
+ * in an hour) each escalating their own fresh notice onto the SAME ticket.
+ */
+const UNRESPONSIVE_MAX_PER_HOUR = 3;
+
+/**
+ * The DEDUPE/ADOPTION key embedded in `unresponsiveComment`'s last line —
+ * factored out so `escalateUnresponsive`'s `findMarked` lookup can never
+ * drift from what the comment actually contains. Bracket-delimited on BOTH
+ * sides, not bare `pane: ${paneId}`: `findMarked` (escalation-helper.ts)
+ * matches by plain substring `includes`, so an unanchored needle is a real
+ * false-positive-adoption risk whenever one pane id is a PREFIX of
+ * another's — e.g. paneId `p1` would substring-match a DIFFERENT episode's
+ * `pane: p12` line (`"pane: p12".includes("pane: p1")` is true). Rule 2b
+ * (BUTCHR-124 review): a successful string match is not proof it matched
+ * the RIGHT thing — the closing `]` is the post-condition that rules out
+ * every longer paneId as a false match, without depending on trailing
+ * whitespace (which Jira/Confluence may or may not preserve).
+ */
+function paneKey(paneId: string): string {
+  return `pane: [${paneId}]`;
+}
+
+/**
+ * The comment posted for a sustained blocked-and-unparseable pane.
+ * Deliberately observational (report what was measured, let the reader
+ * conclude — parked.ts's register) and deliberately carries NO fingerprint
+ * and NO `ANSWER` instruction (§3c of BUTCHR-124): there is no parsed
+ * dialog, so there is nothing to answer, and the comment must not look
+ * answerable. `paneKey(paneId)` is a stable ADOPTION key for restart dedupe
+ * (see `findMarked` below) — not a fingerprint, and not meant to be quoted
+ * back the way `[butchr:blocked]`'s `fingerprint: <fp>` is.
+ */
+function unresponsiveComment(issue: string, paneId: string, elapsedMinutes: number): string {
+  return [
+    `${UNRESPONSIVE_MARKER} ${issue}'s pane has been reported blocked for ${elapsedMinutes} minute(s), and its text does not parse as a recognized dialog.`,
+    "",
+    "This is NOT an answerable prompt — there is no fingerprint here and no ANSWER protocol for it. A human should look at the pane directly and decide: answer whatever is actually on screen, restart the agent, or investigate why it is stuck.",
+    "",
+    paneKey(paneId),
+  ].join("\n");
 }
 
 /** Global cap on escalation capture files kept at once — same discipline as session-limit-watch's CAPTURE_MAX_FILES, kept separate because it recognizes a different filename shape and must never evict a session-limit capture (or vice versa). */
@@ -200,6 +304,81 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     let s = countedFingerprints.get(paneId);
     if (!s) { s = new Set(); countedFingerprints.set(paneId, s); }
     return s;
+  }
+
+  // ===========================================================================
+  // BUTCHR-124: sustained blocked-and-unparseable — a fully separate tracker
+  // from `state`/PaneState above. Deliberately disjoint state: `state` exists
+  // to debounce and then DELIVER an answer to a PARSEABLE dialog; this exists
+  // only to ALARM on a pane that has none. Mixing them would risk exactly the
+  // regression D7 forbids — any behaviour change to the parseable path.
+  // ===========================================================================
+
+  interface UnresponsiveEntry {
+    /**
+     * Daemon's first observation of this pane's CURRENT sustained-unparseable
+     * episode — same reasoning as StalledTracker/IdleDialogTracker/
+     * ParkedTracker: a conservative floor that can only DELAY the alarm
+     * across a daemon restart (a fresh floor starts from the restart's first
+     * qualifying poll), never fabricate one. Never persisted to disk — see
+     * `unresponsiveMinutes`'s doc comment on EscalatorDeps for the restart
+     * cost this implies.
+     */
+    firstObservedAt: number;
+    /** The pollSeq this episode was last observed on — a gap (a different value than lastPollSeq+1) ends the episode, exactly like PaneState's own lastPollSeq. */
+    lastPollSeq: number;
+    /** Set once this episode has been through escalateUnresponsive (posted, adopted, or rate-capped) — gates further attempts for the SAME episode, mirroring PaneState.escalatedAt. */
+    escalatedAt?: number;
+  }
+  const unresponsive = new Map<string, UnresponsiveEntry>();
+  const unresponsiveInFlight = new Set<string>();
+  const unresponsiveCap = new RateCap(UNRESPONSIVE_MAX_PER_HOUR, HOUR_MS);
+
+  /**
+   * Post (or adopt) the sustained-unresponsive notice for one episode.
+   * Dedupe/adoption first, exactly like parked.ts's postStage — a daemon
+   * restart mid-episode finds its own prior comment (keyed on `pane:
+   * <paneId>`, a stable ADOPTION key, never presented as a fingerprint — see
+   * unresponsiveComment's doc comment) and adopts it rather than re-posting.
+   * KNOWN LIMITATION, same one parked.ts accepts for its own stage comments:
+   * this dedupe is keyed on the pane alone, not on a per-episode identity, so
+   * a LONG-AGO episode's comment (still sitting on the ticket) could in
+   * principle be adopted by a genuinely NEW episode on the same pane much
+   * later, silently skipping a fresh notice. Accepted deliberately, stated
+   * here rather than hidden — see the doc for the full writeup.
+   *
+   * FAILS CLOSED (review finding on this ticket): unlike `escalate()`'s own
+   * comments fetch elsewhere in this file (which `.catch`es into an empty
+   * array — a confident-zero this function must not repeat), a rejected
+   * `deps.ownChannelComments` here is caught HERE, logged, and turned into a
+   * `null` return — "could not verify, did not write anything" — never a
+   * silent fall-through to "nothing exists, safe to post". The caller
+   * (onNoPrompt) must leave `escalatedAt` unset on a `null` result so the
+   * NEXT qualifying poll retries, exactly like parked.ts's own
+   * comments-fetch-failure branch (`rows === null` -> `return null` ->
+   * nothing posted, nothing latched).
+   */
+  async function escalateUnresponsive(paneId: string, issue: string, elapsedMinutes: number): Promise<number | null> {
+    let rows: CommentRow[];
+    try {
+      rows = await deps.ownChannelComments(issue);
+    } catch (e) {
+      log(`WARNING: [unresponsive] could not verify existing notices for ${issue} pane ${paneId} — skipping this poll's attempt rather than risk a duplicate: ${(e as Error)?.message ?? e}`);
+      return null;
+    }
+    const existing = findMarked(rows, UNRESPONSIVE_MARKER, [paneKey(paneId)]);
+    if (existing) {
+      log(`[unresponsive] adopted existing notice for ${issue} pane ${paneId} from comment ${existing.id} (daemon restart)`);
+      return Date.parse(existing.created) || deps.now();
+    }
+    if (!unresponsiveCap.allow(issue, deps.now())) {
+      log(`WARNING: [unresponsive] rate cap reached (${UNRESPONSIVE_MAX_PER_HOUR}/hour) for ${issue} — pane ${paneId}'s notice is being logged only, not posted`);
+      return deps.now();
+    }
+    await deps.addComment(issue, unresponsiveComment(issue, paneId, elapsedMinutes));
+    unresponsiveCap.record(issue, deps.now());
+    log(`[unresponsive] escalated ${issue} pane ${paneId} (${elapsedMinutes}m sustained blocked+unparseable)`);
+    return deps.now();
   }
 
   async function escalate(paneId: string, issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
@@ -453,6 +632,15 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
         resetDebounce(paneId);
       }
     }
+    // BUTCHR-124: a pane the herd no longer reports blocked at all ends its
+    // sustained-unresponsive episode too, exactly like the parseable-dialog
+    // debounce above — belt and suspenders alongside onNoPrompt's own gap
+    // detection (this covers the case where the pane simply stops being
+    // called at all, which the pollSeq check alone would only notice the
+    // NEXT time onNoPrompt happens to fire for it, if ever).
+    for (const paneId of unresponsive.keys()) {
+      if (!blocked.has(paneId)) unresponsive.delete(paneId);
+    }
   }
 
   function onNoPrompt(paneId: string, issue: string | null, text: string, pollSeq: number): void {
@@ -468,6 +656,54 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       lastUnparseableHash.set(paneId, h);
       log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
     }
+
+    // BUTCHR-124: sustained blocked-and-unparseable alarm. No addressable
+    // target — mirrors onBlocked's own refusal for issue === null — so there
+    // is nothing to track or escalate.
+    if (issue === null) return;
+
+    const prior = unresponsive.get(paneId);
+    // Stale/out-of-order guard, same reasoning as handleBlocked's: a LATER
+    // poll's onNoPrompt can resolve before an EARLIER one's (fire-and-forget
+    // callers), and an out-of-order pollSeq must never fabricate or destroy
+    // a more current observation.
+    if (prior && pollSeq <= prior.lastPollSeq) return;
+    // "Consecutive" mirrors PaneState's own definition: the SAME pane
+    // observed sustained-unparseable on the very next pollSeq. Any gap —
+    // reported not-blocked (onPoll above already deletes the entry for
+    // that), or blocked-but-NOW-parseable (onBlocked fires instead, so
+    // onNoPrompt simply isn't called that poll, which this pollSeq check
+    // catches on its own) — resets the episode to a fresh first observation,
+    // exactly like D6 requires.
+    const consecutive = !!prior && pollSeq === prior.lastPollSeq + 1;
+    const u: UnresponsiveEntry = consecutive ? prior! : { firstObservedAt: deps.now(), lastPollSeq: pollSeq };
+    u.lastPollSeq = pollSeq;
+    unresponsive.set(paneId, u);
+
+    if (u.escalatedAt !== undefined) return; // this episode already handled, one way or another
+    const elapsedMinutes = Math.floor((deps.now() - u.firstObservedAt) / 60_000);
+    if (elapsedMinutes < deps.unresponsiveMinutes) return;
+    if (unresponsiveInFlight.has(paneId)) return; // an escalation attempt for this pane is already in flight
+
+    unresponsiveInFlight.add(paneId);
+    void (async () => {
+      try {
+        // A `null` result means "could not verify — nothing was written":
+        // escalatedAt stays unset so the NEXT qualifying poll retries this
+        // episode from scratch, exactly like parked.ts's own comments-fetch
+        // failure. Only a non-null result (posted, adopted, or rate-capped —
+        // all of which are a definite, checked outcome) latches the episode.
+        const result = await escalateUnresponsive(paneId, issue, elapsedMinutes);
+        if (result !== null) u.escalatedAt = result;
+      } catch (e) {
+        // escalateUnresponsive already catches its own read failure; this
+        // only guards an unexpected throw elsewhere (e.g. deps.addComment)
+        // — same fail-safe-by-not-latching behaviour applies.
+        log(`[unresponsive] error escalating ${issue} pane ${paneId}: ${(e as Error)?.message ?? e}`);
+      } finally {
+        unresponsiveInFlight.delete(paneId);
+      }
+    })();
   }
 
   return { onBlocked, onPoll, onNoPrompt };
