@@ -54,6 +54,7 @@ describe("atlassianTools", () => {
       "get_doc", "get_doc_comments",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
+      "list_peers",
       "new_worker", "prioritize_worker", "report_to_boss",
       "set_doc", "shelve_worker", "start_worker", "submit_to_boss",
       "tell_worker",
@@ -1675,5 +1676,176 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
     const { tools } = docCommentsRig({ "1": [{ id: "10", body: "hello from a reviewer", author: "712020:abc" }] });
     const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
     expect(result.results).toEqual([{ id: "10", body: "hello from a reviewer", author: "712020:abc" }]);
+  });
+});
+
+// BUTCHR-184/BUTCHR-188: list_peers, the enumeration half of "two projects
+// can talk sideways" — see resolveEligibleProjects (src/resources/project.ts)
+// for the SINGLE resolver this verb and staffing discovery both consume.
+// Failure conditions stated first, per test, same discipline as check_in's
+// own block.
+describe("list_peers (BUTCHR-184/BUTCHR-188: enumerate the other eligible projects, excluding the caller)", () => {
+  function peersRig(opts: {
+    myAccountId?: string;
+    projects: Array<{ key: string; name: string; leadAccountId: string }>;
+    properties: Record<string, { rootDoc?: { id?: string } } | undefined>; // undefined = genuine 404
+    propertyFailures?: Record<string, Error>;
+  }) {
+    const properties = new Map(
+      Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, { rootDoc?: { id?: string } }][],
+    );
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async () => ({ results: [] }),
+      search: async () => ({ issues: [] }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async () => ({ ok: true }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: opts.projects.map((p) => ({ key: p.key, name: p.name, lead: { accountId: p.leadAccountId } })) }),
+      getMyself: async () => ({ accountId: opts.myAccountId ?? "acct-me" }),
+      getProjectProperty: async (key: string) => {
+        const p = properties.get(key);
+        if (!p) throw new Error(`no property for ${key}`);
+        return p;
+      },
+      getProjectPropertyOrNull: async (key: string) => {
+        if (opts.propertyFailures?.[key]) throw opts.propertyFailures[key];
+        return properties.get(key) ?? null;
+      },
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools };
+  }
+
+  // REQUIRED (1/4): the guard is missing entirely, or refuses with no
+  // explanation an issue caller could act on.
+  test("refuses an ISSUE caller, naming why", async () => {
+    const { tools } = peersRig({ projects: [], properties: {} });
+    const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+    await expect(tools.list_peers!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
+  });
+
+  test("refuses a connection with no x-issue", async () => {
+    const { tools } = peersRig({ projects: [], properties: {} });
+    const conn = { headers: {} } as any;
+    await expect(tools.list_peers!.handler({}, conn)).rejects.toThrow(/refusing/);
+  });
+
+  // REQUIRED (2/4): the caller's own project appearing in its own peer
+  // list — the resolver has no notion of "self", so the exclusion must be
+  // applied by list_peers itself; removing that filter is what this test
+  // must catch.
+  test("excludes the caller from its own list, even though it is equally eligible", async () => {
+    const { tools } = peersRig({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+        { key: "DROVR", name: "Drovr", leadAccountId: "acct-A" },
+      ],
+      properties: {
+        BUTCHR: { rootDoc: { id: "doc-butchr" } },
+        DROVR: { rootDoc: { id: "doc-drovr" } },
+      },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.list_peers!.handler({}, conn)) as { results: Array<{ key: string; name: string }> };
+    expect(result.results).toEqual([{ key: "DROVR", name: "Drovr" }]);
+  });
+
+  // REQUIRED (3/4): a project with no readable butchr property (a genuine
+  // 404) still showing up as a peer.
+  test("a project that is live but has no readable butchr property is NOT a peer", async () => {
+    const { tools } = peersRig({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+        { key: "NOPROP", name: "No Property", leadAccountId: "acct-A" },
+      ],
+      properties: {
+        BUTCHR: { rootDoc: { id: "doc-butchr" } },
+        NOPROP: undefined,
+      },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.list_peers!.handler({}, conn)) as { results: Array<{ key: string; name: string }> };
+    expect(result.results).toEqual([]);
+  });
+
+  // REQUIRED (4/4): leadership is not actually enforced, so a project led by
+  // a totally different account leaks into the peer list.
+  test("a project led by a DIFFERENT account is NOT a peer", async () => {
+    const { tools } = peersRig({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+        { key: "OTHER", name: "Someone Else's", leadAccountId: "acct-B" },
+      ],
+      properties: {
+        BUTCHR: { rootDoc: { id: "doc-butchr" } },
+        OTHER: { rootDoc: { id: "doc-other" } },
+      },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.list_peers!.handler({}, conn)) as { results: Array<{ key: string; name: string }> };
+    expect(result.results).toEqual([]);
+  });
+
+  // Not one of the four required behaviors, but the ticket's central
+  // distinction: eligibility, not the staffing allowlist. list_peers has no
+  // allowlist to consult at all (atlassianTools receives no such
+  // dependency) — this proves an eligible project appears as a peer with
+  // nothing beyond leadership + a readable property, which is the whole
+  // point (an unstaffed-but-eligible project is still a valid peer).
+  test("results carry only key/name — no rootDocId or page url leaks into the verb's return", async () => {
+    const { tools } = peersRig({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+        { key: "DROVR", name: "Drovr", leadAccountId: "acct-A" },
+      ],
+      properties: {
+        BUTCHR: { rootDoc: { id: "doc-butchr" } },
+        DROVR: { rootDoc: { id: "doc-drovr" } },
+      },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.list_peers!.handler({}, conn)) as { results: Array<Record<string, unknown>> };
+    expect(result.results).toEqual([{ key: "DROVR", name: "Drovr" }]);
+    expect(Object.keys(result.results[0]!).sort()).toEqual(["key", "name"]);
+  });
+
+  // Worth a test though not one of the required four (BUTCHR-188): a
+  // non-404 read failure must propagate rather than being swallowed into a
+  // shorter-than-true peer list.
+  test("a NON-404 property read failure propagates rather than silently excluding that project", async () => {
+    const { tools } = peersRig({
+      myAccountId: "acct-A",
+      projects: [{ key: "FLAKY", name: "Flaky", leadAccountId: "acct-A" }],
+      properties: { FLAKY: { rootDoc: { id: "doc-flaky" } } },
+      propertyFailures: { FLAKY: new Error("503 Service Unavailable (simulated transient failure)") },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.list_peers!.handler({}, conn)).rejects.toThrow(/503/);
   });
 });
