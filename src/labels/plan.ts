@@ -93,6 +93,57 @@ export type AgentLabel = "working" | "idle" | "blocked" | "stalled" | "none";
 export type ObservedAgentLabel = Exclude<AgentLabel, "stalled">;
 
 /**
+ * BUTCHR-144/BUTCHR-155: value-level anchor for AgentLabel. TypeScript types
+ * are erased at runtime, so the bare `type AgentLabel` above cannot by itself
+ * produce a runtime list of its members — this Record is what a runtime
+ * consumer (the startup sweep, ./sweep.ts) derives that list from. Extending
+ * AgentLabel without adding a matching key here fails to compile ("Property
+ * '<newlabel>' is missing"), the same closed-Record door ./registry.ts's
+ * LABEL_REGISTRY uses for the same reason (see that file's header, "door
+ * 1") — this is a second, INDEPENDENT anchor for a different consumer, not a
+ * shared one: ./registry.ts's own header states it must never be imported BY
+ * this file, ./sync.ts, or ./sweep.ts, specifically so its role stays pure
+ * documentation with zero runtime effect (AC-7).
+ *
+ * Deliberately no exclusion mechanism: every member of AgentLabel is always
+ * selected, because as of BUTCHR-144/BUTCHR-155 all five belong in the
+ * sweep's selection and none is known to need excluding. `Record<AgentLabel,
+ * true>` makes silent, by-omission exclusion impossible today — an omitted
+ * key is a compile error, proven in test/unit/labels-plan.test.ts. If a
+ * future member should ever be excluded from the sweep's selection, that
+ * exclusion must be a deliberate change to THIS Record's value type (e.g.
+ * `true | { excludedBecause: string }`, filtered when building the selection
+ * below) — never a silent omission, and never expressible by just leaving a
+ * key out, which this type does not allow.
+ *
+ * WHAT THIS ANCHOR CANNOT SEE: it forces every AgentLabel member to be
+ * present as a KEY here — completeness, not correctness of what a caller
+ * does with the result. It cannot force a consumer to actually read
+ * `ALL_AGENT_LABEL_KEYS` below rather than hand-rolling a list that happens
+ * to agree with it today; that a real consumer (SWEEP_JQL in ./sweep.ts) is
+ * genuinely DERIVED from this array, and not just coincidentally consistent
+ * with it, is a separate claim this Record alone cannot prove — it is
+ * checked at runtime in test/unit/labels-sweep.test.ts instead, because a
+ * bare type/Record cannot compel a caller to use it.
+ */
+const ALL_AGENT_LABELS: Record<AgentLabel, true> = {
+  working: true,
+  idle: true,
+  blocked: true,
+  stalled: true,
+  none: true,
+};
+
+/**
+ * `AGENT_PREFIX`-qualified form of every AgentLabel member, derived from
+ * ALL_AGENT_LABELS above — grows automatically, and ONLY by editing that
+ * Record, if AgentLabel grows. The startup sweep (./sweep.ts) builds its JQL
+ * selection from this array instead of the hand-written list BUTCHR-144
+ * found `agent:stalled` missing from.
+ */
+export const ALL_AGENT_LABEL_KEYS: readonly string[] = (Object.keys(ALL_AGENT_LABELS) as AgentLabel[]).map((label) => AGENT_PREFIX + label);
+
+/**
  * idle and blocked map directly. "done" — herdr's status for an agent sitting
  * at its prompt after finishing a turn (confirmed against a live `herdr agent
  * list`: several done agents doing nothing) — is idle in every sense this
