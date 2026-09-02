@@ -523,6 +523,94 @@ describe("start_worker / finish_worker / adopt_worker: BUTCHR-58 — butchr:shel
   });
 });
 
+describe("adopt_worker: BUTCHR-108/BUTCHR-137 — butchr:orphan means UNDIRECTED, so adoption withdraws it for EITHER disposition", () => {
+  test("disposition \"start\" on a fresh orphan clears butchr:orphan BEFORE transitioning, and ends up visible to the parked detector like any normal directed ticket (AC5)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL, "team:infra"] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(calls).toEqual(["removeLabels", "transition"]); // order pinned, not just presence
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).not.toContain(EXEMPT_LABEL); // AC5: a "start" adoption never cargo-cults the exemption in either
+    expect(w.labels).toContain("team:infra"); // only the orphan label is removed, nothing else
+  });
+
+  test("disposition \"shelve\" on a fresh orphan clears butchr:orphan and adds butchr:shelved in the same call — the two labels never end up coexisting, and the ticket ends up correctly exempt from the parked detector (AC5)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      addLabels: async (...a) => { calls.push("addLabels"); return ops.addLabels(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    expect(calls).toEqual(["removeLabels", "addLabels"]); // the orphan clear happens before the exemption is added
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("To Do");
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("a ticket that never carried butchr:orphan makes no removeLabels call for it — zero extra cost", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress");
+  });
+
+  test("re-adoption of an already-adopted ticket (the alreadyAdopted no-op path, disposition \"start\") still clears a stale butchr:orphan", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Already fully adopted by every OTHER measure (linked, assigned, In Progress) —
+    // a naive "skip everything when alreadyAdopted" implementation would leave this
+    // stale label behind, exactly the residue this fix exists to stop producing.
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress", labels: [ORPHAN_LABEL] });
+    let assignCalls = 0, linkCalls = 0, transitionCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(assignCalls).toBe(0);
+    expect(linkCalls).toBe(0);
+    expect(transitionCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL); // but the stale orphan label is still cleared
+  });
+
+  test("re-adoption of an already-adopted ticket (the alreadyAdopted no-op path, disposition \"shelve\") still clears a stale butchr:orphan, keeping butchr:shelved", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.story, status: "To Do", labels: [EXEMPT_LABEL, ORPHAN_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "still not ready" });
+    expect(result.alreadyAdopted).toBe(true);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).toContain(EXEMPT_LABEL); // "shelve" never clears its own exemption label, only the orphan one
+  });
+});
+
 describe("start_worker / finish_worker / prioritize_worker / tell_worker: ownership refusal (continued)", () => {
   test("prioritize_worker refuses a stranger's key AND the caller's OWN key, distinctly", async () => {
     const { ops, addIssue, issues } = makeWorld();
@@ -1287,6 +1375,25 @@ describe("adoptWorker: PROJECT caller adopts an existing EPIC (BUTCHR-71 Contrac
     const result = await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
     expect(result.alreadyAdopted).toBe(true);
     expect(assignCalls).toBe(0);
+  });
+
+  test("BUTCHR-108/BUTCHR-137: clears a stale butchr:orphan on an adopted epic too — symmetry / defence-in-depth, since file_where_it_belongs can never create an orphan Epic through this codebase's own write path", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", labels: [ORPHAN_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL);
+  });
+
+  test("BUTCHR-108/BUTCHR-137: no removeLabels call at all when the adopted epic never carried butchr:orphan — zero extra cost", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(removeCalls).toBe(0);
   });
 });
 

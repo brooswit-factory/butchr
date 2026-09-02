@@ -671,6 +671,15 @@ export interface AdoptWorkerResult {
  * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
  * below for why that check is not gated on `alreadyAdopted`.
  *
+ * SEPARATELY, THIS CALL ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`)
+ * whenever the adopted ticket carries it — for BOTH dispositions, unlike
+ * `EXEMPT_LABEL` above, and likewise not gated on `alreadyAdopted`
+ * (BUTCHR-108/BUTCHR-137). `ORPHAN_LABEL` means UNDIRECTED, not shelved, and
+ * a ticket adopted with `"shelve"` is exactly as directed as one adopted
+ * with `"start"` — it has a boss, a link, and a recorded decision either
+ * way. See the comment at that removeLabels call below for the full
+ * argument.
+ *
  * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
  * "shelve" disposition, the reason is posted whenever this call does ANY
  * real adoption work at all (`!alreadyAdopted`) — even if the ticket
@@ -758,6 +767,25 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
 
   const doc = await ensureDoc(ops, workerKey);
 
+  // CLEARS ORPHAN_LABEL WHENEVER IT'S PRESENT — REGARDLESS OF DISPOSITION,
+  // AND NOT GATED ON `alreadyAdopted` EITHER (BUTCHR-108/BUTCHR-137). The
+  // gating on EXEMPT_LABEL just below is specific to what THAT label means
+  // (CURRENTLY shelved, a state only "start" reverses); ORPHAN_LABEL means
+  // something different — UNDIRECTED — and a ticket adopted with "shelve" is
+  // exactly as directed as one adopted with "start": either way it now has a
+  // boss, a link, and a recorded decision, so this clear runs for BOTH. Reuses
+  // `labels` from the fetch above — no extra Jira call. Not gated on
+  // `alreadyAdopted`, by the same BUTCHR-50 argument EXEMPT_LABEL's own clear
+  // makes below: an otherwise fully idempotent re-adoption must still clear a
+  // stale orphan label, or a live, directed ticket keeps silently polluting
+  // the undirected-ticket query forever — exactly the residue this fix
+  // exists to stop producing. Cleared BEFORE any transition below — same
+  // "never leave a partial state where the detector is silently wrong"
+  // ordering EXEMPT_LABEL's own clear and startWorker's comment already use.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
+
   // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
   // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
   // this path already reads the issue and computes labelsOf(issue), so this
@@ -820,6 +848,17 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
  * boss (there is no equivalent "explicit move" verb for project
  * membership here — moving an issue between Jira projects is out of scope
  * for this tool surface, not silently omitted).
+ *
+ * ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`) WHENEVER PRESENT, SAME AS THE
+ * ISSUE-CALLER PATH ABOVE — argued explicitly here rather than left implicit
+ * (BUTCHR-108/BUTCHR-137): `fileWhereItBelongs` can only ever create a Story
+ * or a Task (its `issuetype` input is typed that way), so an orphan Epic can
+ * never arrive here through this codebase's own write path today. Clearing
+ * it here anyway is a symmetry / defence-in-depth call, not a reachable-bug
+ * fix — the label could still land on an Epic by hand, or from a future
+ * caller this tool surface doesn't control. It costs nothing to add: this
+ * path already fetches and computes `labels` for its own idempotence check,
+ * so the clear reuses that fetch exactly like the issue-caller path's does.
  */
 async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   const issue = await ops.getIssue(workerKey);
@@ -869,6 +908,16 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     : undefined;
 
   const doc = await ensureDoc(ops, workerKey);
+
+  // Same BUTCHR-108/BUTCHR-137 fix as the issue-caller path: clear a stale
+  // ORPHAN_LABEL whenever it's present, for BOTH dispositions and not gated
+  // on `alreadyAdopted` — see this function's own doc comment above for why
+  // this path clears it too (symmetry / defence-in-depth, argued there), and
+  // adoptWorker's ORPHAN_LABEL comment for the full disposition-gating
+  // reasoning. Reuses `labels` from the fetch above — no extra Jira call.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
 
   // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
   // on a "start" disposition whenever it's present, not gated on
@@ -1313,7 +1362,20 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
 // The deliberate-orphan escape: file_where_it_belongs
 // ---------------------------------------------------------------------------
 
-/** `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL filter. Never combined with `EXEMPT_LABEL`: see fileWhereItBelongs's doc comment for why an orphan can never trip the parked-ticket detector. */
+/**
+ * `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL
+ * filter. Applied exactly once, at creation, by `fileWhereItBelongs`.
+ * WITHDRAWN by `adoptWorker` / `adoptProjectWorker` (BUTCHR-108/BUTCHR-137)
+ * the moment the ticket gains a boss — for either disposition, not gated on
+ * idempotence — see the comment at those `removeLabels` calls for the full
+ * reasoning.
+ *
+ * Never combined with `EXEMPT_LABEL` (`butchr:shelved`) IN THE SAME CALL:
+ * `fileWhereItBelongs` never applies `EXEMPT_LABEL` at creation (see its own
+ * doc comment for why an orphan can't trip the parked-ticket detector), and
+ * `adoptWorker`'s `"shelve"` path withdraws `ORPHAN_LABEL` in the same call
+ * it adds `EXEMPT_LABEL` — so a live ticket never ends up carrying both.
+ */
 export const ORPHAN_LABEL = "butchr:orphan";
 
 /** A destination is either a named existing Epic, or prose explaining why a new one is needed. Neither is a fallback for the other. */
@@ -1450,7 +1512,10 @@ export interface FileWhereItBelongsResult {
  * link off the active set, and this ticket has none — the parked detector
  * structurally cannot see it, so that label here would be cargo-culted state
  * meaning nothing. Labelled `ORPHAN_LABEL` instead, which is what actually
- * makes it discoverable (a saved JQL filter).
+ * makes it discoverable (a saved JQL filter) — withdrawn by `adoptWorker` /
+ * `adoptProjectWorker` the moment this ticket gains a boss and stops being
+ * undirected (BUTCHR-108/BUTCHR-137); see the comment at those
+ * `removeLabels` calls.
  *
  * WRITE ORDER, AND WHY: unlike new_worker, there is no "worst survivable
  * state" to protect against here, because this ticket never gets a boss link
