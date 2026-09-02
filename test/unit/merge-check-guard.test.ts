@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { buildWorkspace } from "../../src/agents/workspace.js";
+import { buildWorkspace, knownBriefTypes } from "../../src/agents/workspace.js";
 import { prReviewStateNudge } from "../../src/agents/pr-nudge.js";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -52,13 +52,22 @@ const EXCLUSIONS: ReadonlyArray<{ path: string; reason: string }> = [
   { path: "test/unit/workspace.test.ts", reason: "names the forbidden pair in a negative brief assertion/comment, not as instruction" },
   { path: "src/labels/pr.ts", reason: "code comment documents the GitHub REST API's own reviewDecision semantics, not an agent instruction" },
   { path: "Confluence glossary (ASSIST space)", reason: "named upstream as a fifth instruction channel; lives outside this repo, invisible to a unit test" },
+  { path: "briefs/task.md (`[review] APPROVED ... @ <sha>` mentions)", reason: "BUTCHR-165: author-side — text a task READS when it wakes to decide whether to merge, never an instruction to EMIT a `[review]` line. A task has no worker below it to review, so unlike epic/story/project it never sends one down." },
 ];
 
 interface Channel { label: string; text: string }
 
 // BRIEFS — the actual files `buildWorkspace()` writes into a real agent
 // workspace (CLAUDE.md + the interpolated brief.md), for every issue type
-// briefFor() serves plus the default fallback ("Bug"). Reading the files
+// `briefFor()` maps explicitly PLUS one representative ("Bug") of the
+// DEFAULT fallback every unmapped type gets. The mapped types are DERIVED
+// from `knownBriefTypes()` (workspace.ts's own table), not hand-copied here
+// as a literal list — BUTCHR-149: a hardcoded four-element array
+// (["Epic","Story","Task","Bug"]) is exactly how `briefs/project.md` went
+// unbuilt, unread, and unasserted-against when the `project` tier was added
+// to that table but not to this one. "Bug" stays a literal on purpose: it
+// isn't a tracked key, it's a stand-in for "any type nobody mapped", so
+// there is nothing for it to derive from. Reading the files
 // buildWorkspace() writes, rather than the brief.md template alone, is what
 // makes this channel catch CLAUDE.md too — the first instruction file an
 // agent reads, and a real, separate delivered artifact from brief.md.
@@ -67,7 +76,9 @@ function briefChannels(): Channel[] {
   const prevEnv = process.env.BUTCHR_WORKSPACES;
   process.env.BUTCHR_WORKSPACES = root;
   try {
-    return ["Epic", "Story", "Task", "Bug"].flatMap((t) => {
+    const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    const types = [...knownBriefTypes().map(capitalize), "Bug"];
+    return types.flatMap((t) => {
       const dir = buildWorkspace({ key: `MCG-${t}`, issuetype: t, summary: "verify merge-check coverage", parent: null }, "http://localhost:7717/mcp");
       return [
         { label: `brief:${t}:CLAUDE.md`, text: readFileSync(join(dir, "CLAUDE.md"), "utf8") },
@@ -188,6 +199,93 @@ const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 // is broken. Do not delete this assertion to get green; fix the text.
 const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 
+// BUTCHR-149 (project.md) + BUTCHR-165 (epic.md, story.md): all three are
+// pure REVIEWERS of the tier below them (project reviews epic's PR, epic
+// reviews story's PR, story reviews task's PR) — none of the three merges a
+// PR of its own, so none belongs in MERGE_INSTRUCTING_BRIEFS (that list
+// asserts the AUTHOR-side stale-approval check: reviews[].commit.oid,
+// last-decisive ordering, base-merge caveat). What each of these three DOES
+// carry, and must keep carrying, is a narrower reviewer-side instruction:
+// the `[review] APPROVED|CHANGES_REQUESTED <pr-url> @ <sha>` line it sends
+// DOWN to its worker, with the sha sourced correctly. This is not
+// hypothetical: while delivering BUTCHR-135's correction to this exact
+// protocol text, briefs/project.md was the one channel that did NOT receive
+// the transcription caveat that briefs/story.md and briefs/epic.md received
+// in the same change (caveat-phrase counts at that point: task 2, story 4,
+// epic 2, project 0) — and no test caught it, because until BUTCHR-149
+// nothing read this file at all, and until now nothing asserted the SAME
+// instruction in epic.md/story.md either, even though both already carried
+// it correctly. briefs/task.md is deliberately NOT here — see EXCLUSIONS:
+// it only ever READS a `[review]` line (author-side), it never emits one,
+// because a task has no worker below it to review.
+const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:brief.md", "brief:Story:brief.md"];
+
+// The `[review]` line format itself — BOTH verdicts required as two
+// SEPARATE patterns, not one regex that only happens to match the APPROVED
+// half (BUTCHR-149 round 1: deleting the CHANGES_REQUESTED clause from
+// briefs/project.md left a single combined-looking assertion green, because
+// it never actually required the reject half). Each is whitespace-tolerant
+// across the line wrap this repo's ~80-column hand-wrapping produces
+// between "@" and the sha placeholder (see briefs/project.md's own
+// rendering of the APPROVED line, which wraps; CHANGES_REQUESTED does not
+// today, but nothing here assumes it won't).
+//
+// BUTCHR-165, measured directly rather than assumed: briefs/project.md
+// writes the placeholder as `<sha>`, while briefs/epic.md and
+// briefs/story.md both write it as `<full 40-char sha>` — two genuinely
+// different, both-correct renderings of the same instruction (project.md's
+// paragraph doesn't carry a "40-char" figure elsewhere to draw the longer
+// form from; epic.md/story.md's does). SHA_PLACEHOLDER is an ALTERNATION of
+// exactly those two known-shipped literal strings — not a wildcard and not
+// "any token after @" — so this stays exactly as strict as the
+// single-string version it replaces for every channel it already covered,
+// while also accepting the one other literal string this repo actually
+// ships. A regex loosened to `@\s*\S+` or similar would defeat the point of
+// this whole file (it would accept "@ headRefOid" or "@ nothing-in-
+// particular"); an alternation of two named, verified-shipped strings does
+// not.
+const SHA_PLACEHOLDER = "(?:<sha>|<full 40-char sha>)";
+const REVIEW_LINE_APPROVED = new RegExp(String.raw`\[review\]\s+APPROVED\s+<pr-url>\s+@\s*${SHA_PLACEHOLDER}`);
+const REVIEW_LINE_CHANGES_REQUESTED = new RegExp(String.raw`\[review\]\s+CHANGES_REQUESTED\s+<pr-url>\s+@\s*${SHA_PLACEHOLDER}`);
+
+// Mirrors BASE_MERGE_CAVEAT's two-independent-marker design, for the same
+// reason: a maintainer rewording either sentence while keeping its meaning
+// should stay green, and only an actual deletion of the caveat should go
+// red. "pasted verbatim" names the required sourcing (from `gh pr view
+// --json headRefOid`); "retyped by hand" denies the alternative — this is
+// the actual point of the caveat, not just its topic. Both phrases are
+// present in briefs/project.md today (verified when this was written).
+const TRANSCRIPTION_CAVEAT = /(?=[\s\S]*pasted verbatim)(?=[\s\S]*retyped by hand)/i;
+
+// BUTCHR-165, found by mutation-testing this exact assertion against
+// briefs/story.md (see the PR description): checking TRANSCRIPTION_CAVEAT
+// against the WHOLE channel text is vacuous for story.md specifically.
+// Unlike project.md and epic.md — each of which carries "pasted verbatim"
+// and "retyped by hand" exactly ONCE — briefs/story.md carries the pair
+// TWICE: once in the reviewer-side paragraph this test means to guard (the
+// one directly following the `[review] APPROVED <pr-url> ...` line), and
+// once more, unrelated, ~4.6KB later in story.md's OWN author-side
+// "verify the LAST decisive review" reading instructions (the same text
+// task.md carries, since a story is also a worker that reads a `[review]`
+// line sent down to it). Deleting only the reviewer-side caveat sentence
+// left the whole-channel regex green, because the distant author-side
+// occurrence of the identical two phrases still satisfied it — measured
+// directly: `perl -0pi -e 's/retyped by hand/X/' briefs/story.md` (first
+// occurrence only) produced NO test failure until this fix. A window
+// anchored at the `[review] APPROVED <pr-url>` match and extending 400
+// characters forward comfortably contains the near, reviewer-side caveat
+// (measured today: "pasted verbatim" and "retyped by hand" sit 151-292
+// characters after that match in all three of project.md/epic.md/story.md)
+// while excluding story.md's distant, unrelated author-side occurrence
+// (measured today: ~4.6KB after that same match) — so this scoping fixes
+// story.md's vacuity without changing behavior for project.md or epic.md,
+// which only ever had the one, near occurrence anyway.
+function textNear(text: string, marker: RegExp, span: number): string {
+  const m = marker.exec(text);
+  if (!m) return "";
+  return text.slice(m.index, m.index + span);
+}
+
 describe("merge-check instruction channels (BUTCHR-56)", () => {
   test("non-vacuity: every channel group actually resolves to content, and it's the content we expect", () => {
     const briefs = briefChannels();
@@ -239,6 +337,31 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
       // See BASE_MERGE_CAVEAT above for the forwarding address to BUTCHR-73:
       // this assertion is EXPECTED to go red once that hole is closed.
       expect(c.text, `${c.label} should carry the base-merge caveat (BUTCHR-74)`).toMatch(BASE_MERGE_CAVEAT);
+    }
+  });
+
+  // BUTCHR-149: briefs/project.md previously appeared in NO channel this
+  // file builds or asserts against at all — that gap is what BUTCHR-149
+  // closed. BUTCHR-165: briefs/epic.md and briefs/story.md carry the exact
+  // same reviewer-side instruction (each is the reviewer of the tier below
+  // it) and were left just as unasserted — this extends the same treatment
+  // to both. Deliberately separate from the test above: none of the three
+  // must ever be pulled into MERGE_INSTRUCTING_BRIEFS (none merges its own
+  // PR), so this asserts the narrower, actually-true claim instead.
+  test("the project/epic/story briefs instruct the reviewer-side [review]-line transcription caveat (BUTCHR-149, BUTCHR-165)", () => {
+    const briefs = briefChannels().filter((c) => REVIEW_LINE_INSTRUCTING_BRIEFS.includes(c.label));
+    expect(briefs.length).toBe(REVIEW_LINE_INSTRUCTING_BRIEFS.length); // the explicit list actually matched something
+
+    for (const c of briefs) {
+      expect(c.text, `${c.label} should carry the [review] APPROVED line format`).toMatch(REVIEW_LINE_APPROVED);
+      expect(c.text, `${c.label} should carry the [review] CHANGES_REQUESTED line format`).toMatch(REVIEW_LINE_CHANGES_REQUESTED);
+      // Scoped to a window right after the reviewer-side APPROVED line, not
+      // the whole channel — see textNear's comment for why: briefs/story.md
+      // carries this same phrase pair a second time, unrelated, in its own
+      // author-side reading instructions, which would otherwise make this
+      // assertion vacuous for that one channel.
+      const nearReviewLine = textNear(c.text, REVIEW_LINE_APPROVED, 400);
+      expect(nearReviewLine, `${c.label} should carry the sha transcription caveat NEAR its reviewer-side [review] line`).toMatch(TRANSCRIPTION_CAVEAT);
     }
   });
 });
