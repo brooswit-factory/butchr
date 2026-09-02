@@ -252,26 +252,44 @@ an explicit "include administrators" / empty-bypass-list setting to bind it.*
 
 - **The fleet's other GitHub identity, resolved: CITED, first-hand for that
   token, from `BUTCHR-134`** (I did not run this myself, so it is not
-  MEASURED here — re-run it as an admin identity to confirm both readings
-  at once): `BUTCHR-134` runs as `booswrit` and reports, this session:
+  MEASURED here): `BUTCHR-134` runs as `booswrit` and reports, this
+  session:
   ```
   $ gh api user --jq '.login'
   booswrit
   $ gh api repos/brooswit-factory/butchr --jq '.permissions'
   {"admin":false,"maintain":false,"pull":true,"push":true,"triage":true}
   ```
-  Combined with `docs/identity-model.md`'s account map — exactly two
-  GitHub logins operate in this repo, `wroosbit` and `booswrit` — this
-  identifies the specific second identity precisely, unlike the earlier,
-  more hedged reading this document carried before `BUTCHR-134`'s review.
+- **A premise this document carried through an earlier revision was
+  wrong, and is corrected here rather than quietly fixed: "exactly two
+  GitHub logins operate in this repo" is true of who *authors and reviews*
+  PRs, but was over-generalised into "no third account exists at all,"
+  which is false.** A non-admin token with push access can enumerate
+  collaborators directly — **MEASURED, this session, my own token, not
+  cited from `BUTCHR-134` or `BUTCHR-131`:**
+  ```
+  $ gh api repos/brooswit-factory/butchr/collaborators \
+      --jq '.[] | {login, admin: .permissions.admin, push: .permissions.push}'
+  {"login":"brooswit","admin":true,"push":true}
+  {"login":"wroosbit","admin":false,"push":true}
+  {"login":"booswrit","admin":false,"push":true}
+  $ gh pr list --repo brooswit-factory/butchr --state all --limit 30 \
+      --json author -q '[.[].author.login] | group_by(.) | map({login:.[0], n:length})'
+  [{"login":"booswrit","n":11},{"login":"wroosbit","n":19}]
+  ```
+  **Three collaborators, not two. `brooswit` holds admin, and authored none
+  of the last 30 PRs** — a real, distinct account that is not one of the
+  two identities that do the fleet's ordinary work.
 
-**Verdict on C: neither of the fleet's two GitHub identities holds admin
-on this repository.** `wroosbit` — MEASURED, this session, my own token.
-`booswrit` — CITED, first-hand for that token, from `BUTCHR-134`, same
-session. **Both proposals below are therefore enforceable against every
-identity that actually authors or merges PRs in this repo, not advisory
-against one of them** — this materially strengthens both, and §3/§5 are
-written on that footing rather than the earlier hedge.
+**Verdict on C, corrected: an admin account exists on this repository
+(`brooswit`) — MEASURED. Neither of the two identities that actually
+author/merge PRs (`wroosbit` — MEASURED; `booswrit` — CITED, first-hand
+from `BUTCHR-134`) holds admin.** Both proposals below are therefore
+enforceable against the two identities doing the fleet's ordinary work,
+**and** a genuine escape hatch exists via the admin account for exactly
+the deadlock Proposal 2 can create (§4, §5) — two separate facts, not to
+be conflated: enforcement against the ordinary-work identities, and the
+existence of a third account able to intervene when they get stuck.
 
 ### D. Is stale-review dismissal (`dismiss_stale_reviews`) currently on?
 
@@ -578,10 +596,15 @@ account to absorb a re-review if the pinned boss account's *agent process*
 matters, cited from that ticket rather than re-derived here.
 `docs/identity-model-decision.md` §1 records the fleet as holding three
 Atlassian accounts in total, not two — the third is the human's own
-identity, not assigned to any agent tier. That third account is exactly
-the "until a human intervenes" fallback this document already names below,
-not a fourth, undiscovered agent identity — scoped here so this claim does
-not read as contradicting that document sitting next to this one.
+identity, not assigned to any agent tier. **On the GitHub side
+specifically — the side that actually matters for who can submit a
+review — this document's own §1C measures the same shape independently:
+three collaborators exist on this repository, and the third, `brooswit`,
+holds admin and authored none of the last 30 PRs.** Neither third account
+(Atlassian or GitHub) is an agent identity assigned to a tier; both are
+exactly the "until a human/admin intervenes" fallback named in §4/§5, not
+a spare agent that would make a stalled re-review routine rather than
+exceptional.
 
 ---
 
@@ -690,17 +713,19 @@ merge at all until one arrived.
 
 **What breaks:** the liveness cost `BUTCHR-134`'s §3.5(b) names as
 structural, restated in its own terms: with exactly two GitHub identities
-serving the fleet's tiers and each tier pinned to one, **there is no third
-*agent* account anywhere to absorb a re-review** (the fleet's third
-Atlassian account, per `docs/identity-model-decision.md` §1, is the
-human's own identity — the fallback this section already names, not a
-spare agent). A worker whose approval is
+authoring/reviewing the fleet's ordinary work and each tier pinned to one,
+**there is no third *agent* identity anywhere to absorb a re-review**
+(§1C — a third GitHub collaborator, `brooswit`, does exist and holds
+admin, but is not an agent identity assigned to any tier; §4 names it as
+the escape hatch, not as a spare reviewer). A worker whose approval is
 dismissed cannot repair it (GitHub refuses self-approval, confirmed
 elsewhere in this fleet — `docs/identity-model-decision.md` §0) and must
 wait on the one specific boss agent process that reviewed it. If that
-process has exited, the PR is stuck until a human intervenes — not a
-"some friction" cost, a structural one, independent of anything measured
-in this window.
+process has exited, the PR is stuck **until a human with access
+intervenes — not "some friction," but not "unrecoverable" either: §4
+names the specific account that can do it.** The cost is real regardless:
+autonomy is lost, and nothing here claims that account is monitored for
+this purpose.
 
 **Admin-bypass question (§2C):** identical footing to Proposal 1 — neither
 identity holds admin, so wherever this proposal's gate does bind (i.e. the
@@ -733,22 +758,30 @@ configures, not as an abstract matrix:
 **With BOTH on:** a worker whose approval is dismissed by a routine
 base-merge (12 of 13 events in this window) cannot merge and cannot
 un-stick itself — the gate (`count ≥ 1`) now enforces exactly what
-dismissal just removed. If its boss process has ended, the PR is stuck for
-a human. **Under Proposal 1 alone**, the same base-merge is survivable —
-the stale approval still counts, satisfying the gate, which is also why
-Proposal 1 alone does not close BUTCHR-114's finding (§3). **Under
-Proposal 2 alone** (`count: 0` + dismissal), the worker is unblocked (no
-gate requires an approval, dismissed or not, to be standing) but the
-guarantee is fully advisory — nothing stops an unreviewed-at-merge-time PR
-like #170/#171/#178 from merging anyway, dismissal or not, exactly as
-today.
+dismissal just removed. If its boss process has ended, the PR is stuck
+**until a human intervenes — and, per §1C, an account able to do so
+(`brooswit`, admin) demonstrably exists on this repository, not merely
+"presumably someone with GitHub access eventually notices."** This is
+named plainly as what it is and is not: it does not remove the liveness
+cost — the PR is still stuck, autonomy is still lost, and nothing here
+claims `brooswit` is monitored or responsive — it changes the failure mode
+from *"structurally stuck, full stop"* to *"stuck until a human with the
+access intervenes,"* which is a real, if modest, mitigation of the
+liveness risk's severity, not its existence. **Under Proposal 1 alone**,
+the same base-merge is survivable — the stale approval still counts,
+satisfying the gate, which is also why Proposal 1 alone does not close
+BUTCHR-114's finding (§3). **Under Proposal 2 alone** (`count: 0` +
+dismissal), the worker is unblocked (no gate requires an approval,
+dismissed or not, to be standing) but the guarantee is fully advisory —
+nothing stops an unreviewed-at-merge-time PR like #170/#171/#178 from
+merging anyway, dismissal or not, exactly as today.
 
 | combination | integrity (does an unreviewed-diff merge get caught) | autonomy (worker merges its own approved PR without a human) | liveness (does a boss's exit strand a PR) |
 |---|---|---|---|
 | **neither** (today) | No — §1B/§1D both confirm | Yes, always | No |
 | **1 only** | No — stale approval still satisfies the gate (§3, Proposal 1) | Yes, always | No |
 | **2 only** | No — nothing requires the (possibly dismissed) approval to be restored before merge | Yes, always | No |
-| **both** | Yes — a dismissed approval cannot satisfy the gate | **No, in 61% of this window's approved main-based PRs** (§2) | **Yes, structurally, per §3.5(b)** — for however many of those 61% land on a boss that has exited |
+| **both** | Yes — a dismissed approval cannot satisfy the gate | **No, in 61% of this window's approved main-based PRs** (§2) | **Yes, for the pinned boss identity — but not unrecoverable: an admin account (`brooswit`, §1C) exists and can unstick a deadlocked PR.** No agent identity can absorb the re-review; a human with access can. |
 
 **This table is the trade named plainly, as the ticket asked: only "both"
 buys the integrity property BUTCHR-114's finding is about, and it buys it
@@ -791,11 +824,22 @@ update habit becomes.
   Costs the same residual (§2.3), because the enforcement point (merge
   time) cannot move review earlier than whenever the boss actually looks.
 - **A second identity that re-approves automatically on a
-  content-equivalence check:** **not a free option** — per
-  `BUTCHR-134`'s §3.5(b), the fleet has no spare identity; this requires
-  provisioning a new account, which is itself an operator action with its
-  own cost (not costed further here — out of this ticket's scope to
-  design a bot identity).
+  content-equivalence check — repriced, per §1C's correction:** an earlier
+  revision of this document, following a premise `BUTCHR-134` retracted,
+  priced this as "requires provisioning a new account." **A third account,
+  `brooswit`, already exists on this repository and holds admin (§1C,
+  MEASURED).** The real cost is not creating an identity — it is
+  **staffing an existing account as a reviewing agent**: giving it
+  credentials an automated process can use, building the
+  content-equivalence check itself, and deciding whether an account that
+  already holds admin is the right one to also run an automated re-approval
+  bot (arguably the wrong choice on its own, since it would concentrate
+  bypass authority and automated-approval authority in one identity) — or
+  provisioning yet another account instead, back to the original framing.
+  **Materially cheaper than either this document or `BUTCHR-134` initially
+  implied, but still not free, and not designed here** — out of this
+  ticket's scope to design a bot identity or decide which account should
+  run it.
 - **Treat the `[review] APPROVED <pr-url> @ <sha>` Jira line as the
   authoritative record instead of a settings change at all:** this is
   the fleet's existing convention — `docs/identity-model-decision.md` §6
@@ -822,10 +866,14 @@ update habit becomes.
 Proposal 1, on the evidence in this document.** §4's table shows "both" is
 the only combination that buys the integrity property, and §2/§4 show it
 would have cost autonomy on 61% of this window's approved main-based
-merges and carries a structural liveness risk (§3.5(b)) that this window's
-short span (9.3 hours) cannot bound — every stall in this window happened
-to recover, but the mechanism that makes recovery non-guaranteed (a
-two-identity fleet with no spare account) is independent of window length.
+merges and carries a liveness risk that this window's short span
+(9.3 hours) cannot bound — every stall in this window happened to recover
+via the pinned boss agent itself, and no case in this window needed the
+admin escape hatch (§1C, §4) at all. **The escape hatch changes the risk
+from unrecoverable to recoverable-only-by-a-human-with-access; it does not
+make the cost small** — every one of those 61% would still lose its
+autonomous merge and wait on either its specific boss agent or a human
+intervention that is not this document's to promise will be timely.
 **A three-way trade this lopsided, traded away by a settings change rather
 than a choice made deliberately each time, is not what this document
 recommends**, even though it is the only combination that closes
@@ -865,6 +913,16 @@ costed recommendation, not a predetermined one; the numbers in §2 and the
 nesting in §3/§4 are what produced this answer, not a starting preference
 being confirmed.
 
+**On the admin escape hatch named in §4: it slightly weakens the case
+against Proposal 2 without overturning it, and this document agrees with
+that framing rather than disputing it.** A deadlocked PR under "both" is
+recoverable by a human with access, not permanently stuck — a real
+mitigation of severity. It does not change the headline numbers (61% of
+approved main-based merges still lose their autonomous-merge property, 12:1
+still bear no relation to new authored work) and it does not change who
+pays the cost first (the pinned boss agent, then a human, never the worker
+itself). The recommendation is unchanged by it.
+
 **One data point for that recommendation, from this ticket's own write
 path while this story ran, filed as `BUTCHR-140`:** `correct_worker`
 failed on this ticket's own description with `CONTENT_LIMIT_EXCEEDED`
@@ -893,7 +951,7 @@ away.
 
 | item | why it could not be settled from this vantage | check a person with admin could run |
 |---|---|---|
-| Whether **any** account holds admin on this repo at all (§1C) | Both measured identities (`wroosbit` MEASURED, `booswrit` CITED first-hand from `BUTCHR-134`) read `admin: false`. Neither of us can enumerate collaborators to see whether some third, non-agent account holds it | `gh api repos/brooswit-factory/butchr --jq '.permissions'` as any other collaborator, or Settings → Collaborators and teams — confirms both readings above at once and closes this residual |
+| ~~Whether any account holds admin on this repo at all~~ — **closed, §1C:** `brooswit` holds admin (MEASURED, `gh api repos/.../collaborators`); `wroosbit`/`booswrit` do not. Kept as a row only to record that this was previously listed as unclosable and was wrong to be — an earlier revision of this document asserted "no third account exists" without running the one read that would have caught it | — (closed) |
 | `required_status_checks.strict` — the actual "require branches up to date before merging" flag (§1.5(a)) | Absent from `GET /branches/main`'s `protection` summary, which is documented here as a *summary*, not a full enumeration — its absence is reported as a gap, not read as `false` | `gh api repos/brooswit-factory/butchr/branches/main/protection --jq '.required_status_checks.strict'` as an admin identity, or Settings → Branches → edit the rule |
 | `enforce_admins` / whether an admin token can bypass `main`'s protection entirely, beyond what `enforcement_level: everyone` on `required_status_checks` already implies for that one component | Not present in the non-admin summary; the summary shows *one* component's own enforcement level, not a repo-wide bypass-admins flag | `gh api repos/brooswit-factory/butchr/branches/main/protection --jq '.enforce_admins'` as an admin identity |
 | Whether a boss agent's continued *process* liveness (not account existence) would hold for a re-review requested outside this window's 9.3-hour span (§2.4) | No case of a multi-hour-or-longer stall occurred in the sampled window to observe | Not a settings check — an operational/staffing question about how long a boss agent process is kept alive relative to its worker's PR lifecycle |
