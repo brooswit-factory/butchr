@@ -39,6 +39,18 @@ export interface Config {
    */
   parkedMinutes: number;
   /**
+   * BUTCHR-124: minutes a pane must be reported blocked, with text that does
+   * not parse as a recognized dialog, CONTINUOUSLY, before the
+   * sustained-blocked-and-unparseable alarm fires (see
+   * src/agents/escalation-loop.ts's `onNoPrompt`/`unresponsive` tracker).
+   * Default 5: long enough that a brief unparseable blip during ordinary
+   * work (a menu mid-render, a spinner frame) never trips it — those resolve
+   * within one 5s poll, nowhere near 5 minutes of CONSECUTIVE polls all
+   * failing to parse — short enough that a genuine hang is surfaced well
+   * before the ~66-minute incident (BUTCHR-102) that motivated this alarm.
+   */
+  unresponsiveMinutes: number;
+  /**
    * BUTCHR-5/16: minutes a pane's herdr status must read idle/done,
    * CONTINUOUSLY, before its text is even read to check for an end-of-pane
    * dialog herdr's own classification missed (the second, herdr-independent
@@ -111,6 +123,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
+  BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
@@ -142,6 +155,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
+  const unresponsiveMinutes = env.BUTCHR_UNRESPONSIVE_MINUTES ? Number(env.BUTCHR_UNRESPONSIVE_MINUTES) : 5;
+  if (!Number.isFinite(unresponsiveMinutes) || unresponsiveMinutes <= 0) throw new Error(`BUTCHR_UNRESPONSIVE_MINUTES is not a positive number: ${env.BUTCHR_UNRESPONSIVE_MINUTES}`);
+
   const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
@@ -160,6 +176,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     parkedMinutes,
+    unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
@@ -273,7 +290,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +

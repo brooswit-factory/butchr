@@ -56,6 +56,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("unresponsiveMinutes defaults to 5, honours BUTCHR_UNRESPONSIVE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).unresponsiveMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_UNRESPONSIVE_MINUTES: "15" }, noRead).unresponsiveMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_UNRESPONSIVE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_UNRESPONSIVE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_UNRESPONSIVE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_UNRESPONSIVE_MINUTES/);
+  });
+
   test("pollStaleMs defaults to 60000, honours BUTCHR_POLL_STALE_MS, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).pollStaleMs).toBe(60_000);
     expect(loadConfig({ ...base, BUTCHR_POLL_STALE_MS: "30000" }, noRead).pollStaleMs).toBe(30_000);
