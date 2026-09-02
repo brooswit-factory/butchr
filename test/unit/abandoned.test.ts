@@ -136,10 +136,38 @@ describe("createAbandonedDetector: escalation path (through addComment, per the 
     expect(jira.posted[0]!.text.startsWith(MARKER)).toBe(true);
     expect(jira.posted[0]!.text).toContain("BOSS-1");
     expect(jira.posted[0]!.text).toContain("fingerprint: WORK-1");
+    expect(jira.posted[0]!.text).toContain("boss: BOSS-1");
     expect(jira.posted[0]!.text).toContain("stage: 1");
     expect(jira.posted[0]!.text).toContain("30 minutes");
     // Observational, not accusatory.
     expect(jira.posted[0]!.text.toLowerCase()).not.toContain("mistake");
+    // REGRESSION (review finding #2): elapsedMinutes is this daemon's own
+    // observation age, not the real Jira transition time — stage 1 must say
+    // "observed Done", matching stages 2/3, never assert "reached Done" as
+    // if the transition moment itself were measured.
+    expect(jira.posted[0]!.text).toContain("observed Done");
+    expect(jira.posted[0]!.text).not.toContain("reached Done");
+  });
+
+  // REGRESSION (review finding #1): a worker with TWO Done inward Implements
+  // stubs must escalate BOTH pairs independently — before the fix, stage
+  // 1/2's dedupe identity (`fingerprint: ${worker}`, `stage: N`) omitted the
+  // boss, so the second pair's postStage call found the first pair's
+  // comment (same worker, same stage, same target) and silently "adopted"
+  // it instead of posting its own — BOSS-B was never named anywhere.
+  test("a worker with TWO Done bosses escalates to BOTH, independently — the dedupe identity must include the boss, not just the worker", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    const det = createAbandonedDetector({ now: () => now, minutes: 30, addComment: jira.addComment, comments: jira.comments, links: jira.links });
+    const worker = iss("WORK-1", "In Progress", { issuelinks: [bossLink("BOSS-A", "Done"), bossLink("BOSS-B", "Done")] });
+
+    now = 0; await det.check([worker]);
+    now = 30 * MIN; await det.check([worker]); // stage 1 for BOTH (worker, boss) pairs
+
+    expect(jira.posted.length).toBe(2);
+    expect(jira.posted.every((p) => p.target === "WORK-1")).toBe(true);
+    const bossesNamed = jira.posted.map((p) => (p.text.includes("boss: BOSS-A") ? "BOSS-A" : p.text.includes("boss: BOSS-B") ? "BOSS-B" : null)).sort();
+    expect(bossesNamed).toEqual(["BOSS-A", "BOSS-B"]); // both bosses named — before the fix, this was ["BOSS-A", null] (BOSS-B silently adopted BOSS-A's comment)
   });
 
   test("it does NOT escalate again on the next poll (dedupe): re-running check() at the same or later time posts nothing further for stage 1", async () => {

@@ -232,19 +232,39 @@ export class AbandonedTracker {
  * daemon can see state (linked, Done, for how long) but not intent, and a
  * boss that closed moments before discharging its last worker is
  * byte-identical in Jira to one that broke a promise. Report what was
- * measured — including the actual elapsed time — and let the reader draw
- * the conclusion. Every action named is a HUMAN or BOSS action (§2: this
- * module signals, it never repairs) — never something this daemon will do
- * itself.
+ * MEASURED — including the actual elapsed time — and let the reader draw
+ * the conclusion. Every stage says "observed Done", never "reached Done":
+ * `elapsedMinutes` is the age of THIS DAEMON'S OWN first observation of the
+ * pair (`firstObservedAt`), not of the real Jira transition — those
+ * coincide only when the daemon happened to be watching at the moment the
+ * boss closed, and `firstObservedAt` can start arbitrarily later (a daemon
+ * restart, or the worker only just entering In Progress/In Review). Every
+ * action named is a HUMAN or BOSS action (§2: this module signals, it
+ * never repairs) — never something this daemon will do itself.
+ *
+ * Every stage body also carries an explicit `boss: ${boss}` line, in
+ * addition to `fingerprint: ${worker}` — REQUIRED, not decorative: a worker
+ * can carry two Done inward Implements stubs (see `abandonedCandidates`'s
+ * own doc comment on the reachable double-link case), producing two
+ * DISTINCT (worker, boss) pairs that would otherwise share the exact same
+ * `postStage` dedupe identity (`fingerprint: ${worker}`, `stage: N`) and
+ * the SAME target at stages 1/2 (the worker's own ticket) — and can share
+ * the same target at stage 3 too, if both bosses resolve to the same
+ * grandboss. Without `boss` in the identity, the second pair's escalation
+ * silently `findMarked`s the first pair's comment and "adopts" it instead
+ * of posting its own — the second abandonment is detected, tracked, and
+ * never spoken, which is exactly this module's own worst failure mode
+ * (§2). `boss` in `need` (see `postStage` below) closes this.
  */
 
 function stage1Comment(worker: string, boss: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} this ticket's Implements boss, ${boss}, reached Done ${elapsedMinutes} minutes ago while ${worker} is still open. ${boss} will never call finish_worker on ${worker}, answer it, or start it again.`,
+    `${MARKER} this ticket's Implements boss, ${boss}, was observed Done ${elapsedMinutes} minutes ago while ${worker} is still open. ${boss} will never call finish_worker on ${worker}, answer it, or start it again.`,
     "",
     `If the work here is actually finished, ask a human or ${boss}'s own boss to review and close ${worker} — a worker cannot close itself (finish_worker is not ${worker}'s to call on itself). If it is not finished, this may be a broken promise: surface it to a human rather than waiting further.`,
     "",
     `fingerprint: ${worker}`,
+    `boss: ${boss}`,
     "stage: 1",
   ].join("\n");
 }
@@ -256,6 +276,7 @@ function stage2Comment(worker: string, boss: string, elapsedMinutes: number): st
     `If the work here is actually finished, ask a human or ${boss}'s own boss to review and close ${worker}. If it is not finished, surface it to a human.`,
     "",
     `fingerprint: ${worker}`,
+    `boss: ${boss}`,
     "stage: 2",
   ].join("\n");
 }
@@ -267,6 +288,7 @@ function stage3EscalatedComment(worker: string, boss: string, grandBoss: string,
     `Prompt ${grandBoss} to review ${worker} and either have it closed (if the work is finished) or given a new boss.`,
     "",
     `fingerprint: ${worker}`,
+    `boss: ${boss}`,
     "stage: 3",
   ].join("\n");
 }
@@ -278,6 +300,7 @@ function stage3TerminalComment(worker: string, boss: string, elapsedMinutes: num
     `${boss} is a human-owned ticket (it has no Implements boss of its own) — a human should review ${worker} directly and either close it (if the work is finished) or give it a new boss.`,
     "",
     `fingerprint: ${worker}`,
+    `boss: ${boss}`,
     "stage: 3",
   ].join("\n");
 }
@@ -345,14 +368,25 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
   const minutesMs = deps.minutes * 60_000;
   const log = (line: string) => deps.log?.(line);
 
-  /** Post (or adopt an already-posted) comment for one stage. Same dedupe/adoption + fail-closed discipline as `parked.ts`'s `postStage` — see that function's doc comment for the full reasoning; not repeated here. */
-  async function postStage(target: string, stageTag: "1" | "2" | "3", worker: string, body: string): Promise<number | null> {
+  /**
+   * Post (or adopt an already-posted) comment for one stage. Same dedupe/
+   * adoption + fail-closed discipline as `parked.ts`'s `postStage` — see
+   * that function's doc comment for the full reasoning; not repeated here.
+   *
+   * `need` includes `boss`, not just `fingerprint`/`stage` — REQUIRED (see
+   * the doc comment above the stage-comment builders): a worker can carry
+   * two Done inward Implements stubs, and without `boss` in the identity
+   * the second pair's escalation would `findMarked` the first pair's
+   * comment (same worker, same stage, same or overlapping target) and
+   * silently adopt it instead of posting its own.
+   */
+  async function postStage(target: string, stageTag: "1" | "2" | "3", worker: string, boss: string, body: string): Promise<number | null> {
     const rows = await deps.comments(target).catch((e) => {
       log(`WARNING: [abandoned] comments fetch failed for ${target}: ${(e as Error)?.message ?? e}`);
       return null;
     });
     if (rows === null) return null;
-    const need = [`fingerprint: ${worker}`, `stage: ${stageTag}`];
+    const need = [`fingerprint: ${worker}`, `boss: ${boss}`, `stage: ${stageTag}`];
     const existing = findMarked(rows, MARKER, need);
     if (existing) {
       const adoptedAt = Date.parse(existing.created) || deps.now();
@@ -386,14 +420,14 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
 
         if (e.stage1At === undefined) {
           if (now - e.firstObservedAt < minutesMs) continue;
-          const at = await postStage(worker.key, "1", worker.key, stage1Comment(worker.key, boss, elapsedMinutes));
+          const at = await postStage(worker.key, "1", worker.key, boss, stage1Comment(worker.key, boss, elapsedMinutes));
           if (at !== null) e.stage1At = at;
           continue;
         }
 
         if (e.stage2At === undefined) {
           if (now - e.stage1At < minutesMs) continue;
-          const at = await postStage(worker.key, "2", worker.key, stage2Comment(worker.key, boss, elapsedMinutes));
+          const at = await postStage(worker.key, "2", worker.key, boss, stage2Comment(worker.key, boss, elapsedMinutes));
           if (at !== null) e.stage2At = at;
           continue;
         }
@@ -415,7 +449,7 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
           if (links === null) continue;
           const grandBoss = links.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
           if (grandBoss) {
-            const at = await postStage(grandBoss, "3", worker.key, stage3EscalatedComment(worker.key, boss, grandBoss, elapsedMinutes));
+            const at = await postStage(grandBoss, "3", worker.key, boss, stage3EscalatedComment(worker.key, boss, grandBoss, elapsedMinutes));
             if (at !== null) e.stage3At = at;
           } else {
             // Terminal case: a boss with no inward Implements link of its
@@ -425,7 +459,7 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
             // boss's own (Done) ticket and log a WARNING an operator's
             // `journalctl | grep WARNING` will actually surface.
             log(`WARNING: [abandoned] ${worker.key} abandoned under ${boss}, which has no boss of its own to escalate to — re-posting on ${boss}`);
-            const at = await postStage(boss, "3", worker.key, stage3TerminalComment(worker.key, boss, elapsedMinutes));
+            const at = await postStage(boss, "3", worker.key, boss, stage3TerminalComment(worker.key, boss, elapsedMinutes));
             if (at !== null) e.stage3At = at;
           }
         }
