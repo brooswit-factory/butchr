@@ -141,16 +141,24 @@ const LAST_DECISIVE_REVIEW = /last\s+decisive\s+review/i;
 const MERGE_INSTRUCTING_BRIEFS = ["brief:Story:brief.md", "brief:Task:brief.md"];
 const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 
-// BUTCHR-74: `reviews[].commit.oid` is not the immutable fallback the text
-// used to claim it was — confirmed on two PRs (#135, #136) that GitHub can
-// silently rewrite it to a later commit after a base-merge, and on #136
-// (three reviews) an OLDER review kept its original recorded sha while a
-// LATER review's recorded commit had already moved. Only a review's own
-// written-at-submission body text stays fixed; any structured field can
-// move, and this check reads the LAST decisive review — exactly the one
-// most likely to have been rewritten. Every merge-instructing channel must
-// say so (without asserting a rewrite mechanism beyond what's observed)
-// and must not describe the check as sufficient.
+// BUTCHR-74, refined by BUTCHR-138 (docs/review-commit-immutability.md —
+// read that document for the full measurement rather than this comment):
+// `reviews[].commit.oid` is not the immutable fallback the text used to
+// claim it was — no structured API surface is (REST-list, REST-by-id and
+// GraphQL all move together). BUTCHR-138's controlled arms narrowed this
+// past BUTCHR-74's original #135/#136 observation: a plain commit never
+// moves it; a CLEAN merge (no content beyond the auto-merge of its
+// parents) moves it forward to match the new head, asynchronously
+// (~30-56s observed); a merge carrying content of its own does NOT move
+// it. Only a review's own written-at-submission body text is immutable —
+// this check still reads the LAST decisive review's structured field, so
+// it inherits that field's non-immutability regardless of which case
+// applies. Every merge-instructing channel must say so (without asserting
+// a rewrite mechanism — six were proposed and killed; see the doc) and
+// must not describe the check as sufficient: a mismatch is a real signal,
+// a match is the narrower claim that the branch's own contribution didn't
+// change, not that nothing unreviewed landed (a clean base-merge imports
+// `main`'s own, separately-reviewed content).
 //
 // Requires TWO independent short markers to both be present, anywhere in
 // the channel, rather than one token or one long sentence:

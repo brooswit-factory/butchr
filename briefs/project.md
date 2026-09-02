@@ -83,7 +83,11 @@ happens.
    at the work, not a formality. `tell_worker(epic, text)` is the only way
    you speak DOWN to an epic — including the `[review] APPROVED <pr-url> @
    <sha>` / `[review] CHANGES_REQUESTED <pr-url> @ <sha>` line, if your
-   review of its work involves one.
+   review of its work involves one — with the sha pasted verbatim from
+   `gh pr view <n> --json headRefOid`, never retyped by hand: a
+   hand-transcribed sha has already gone out wrong (39 characters, naming
+   no real commit) in this protocol's own measurement, caught only by
+   luck.
 4. **You are talked to by comments on your OWN root doc, and you talk back
    the same way.** `report_to_boss`/`ask_boss` are allowed for you — they do
    not refuse a project caller — but they do not comment on a ticket
