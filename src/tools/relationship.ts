@@ -1058,6 +1058,253 @@ function correctionArchiveBody(why: string, oldDescription: string | undefined, 
   return parts.join("\n\n");
 }
 
+/**
+ * The Jira Cloud limit for a COMMENT body (BUTCHR-145/BUTCHR-140) — a
+ * different field from `JIRA_DESCRIPTION_CHAR_LIMIT` above even though both
+ * currently read 32767 (Atlassian's support KB for
+ * `CommentBodyCharacterLimitExceededException` independently lands on the
+ * same figure, cited on that constant's own comment), so this is its OWN
+ * constant rather than the same one reused across two fields that could in
+ * principle diverge.
+ *
+ * ESTABLISHED LIVE, not inherited (Requirement 1), with a THREE-WAY
+ * discrimination from a single artefact rather than the usual two:
+ * BUTCHR-145 posted a 32,011-character prose probe on its own ticket (id
+ * 17461 — see that ticket's comment thread; two earlier probes built from
+ * long runs of a single repeated character were independently found to be
+ * unreliably transmitted — see the note below — and were superseded by
+ * this one before being trusted) containing multi-byte guillemet markers
+ * (‹ ›), which happen to separate three different size measures at once.
+ * Verified by BOTH ends of the round trip: the comment was diffed
+ * byte-for-byte against a locally-saved reference file after posting (all
+ * 320 embedded position markers present, in order, none missing) — not
+ * measured by length alone. Re-measured independently via `jira_get_issue`
+ * after posting:
+ *   - plain-text characters (JS string `.length`): 32,580 — UNDER 32767
+ *   - UTF-8 bytes of that same text:                33,870 — OVER 32767
+ *   - serialized ADF (the actual wire payload `addComment` sends; see
+ *     `adf()` in atlassian-real.ts, which wraps a comment's whole body in
+ *     exactly one paragraph with one text node): 35,904 — OVER 32767
+ * Jira ACCEPTED the comment. Since the plain-text measure was the only one
+ * of the three still under the cap, the cap is checked against PLAIN-TEXT
+ * CHARACTER COUNT specifically — not UTF-8 bytes, and not the serialized
+ * ADF payload — the same measure `JIRA_DESCRIPTION_CHAR_LIMIT` already
+ * uses for the description field. `postCorrectionArchive` below therefore
+ * splits on plain-text `.length`, not on byte length or
+ * `JSON.stringify(adf(text)).length`.
+ *
+ * THE BOUNDARY IS BRACKETED, NOT PRECISELY MEASURED: the same 32,580-plain
+ * -character comment above was ACCEPTED; BUTCHR-139's independently
+ * recorded correction #3 (a real, unrelated ticket, not a probe) was
+ * REFUSED with `CONTENT_LIMIT_EXCEEDED` at a plain-text archive size of
+ * roughly 33,950. So the true boundary sits somewhere in (32,580, 33,950]
+ * — and the documented 32767 figure falls inside that bracket, 187
+ * characters above the highest accepted value measured here. This
+ * corroborates 32767 from this corpus; it does not claim to have found the
+ * exact integer boundary by bisection, and no further probing was done to
+ * narrow it further (BUTCHR-140's explicit instruction, once the bracket
+ * was already tighter than needed).
+ *
+ * A NARROWER CAVEAT THAN FIRST SUSPECTED, worth recording because it
+ * surprised both BUTCHR-140 and me: two earlier probes on this ticket,
+ * built from long runs of a SINGLE repeated character (all newlines),
+ * showed the STORED comment shorter than the exact count constructed and
+ * verified locally before posting (one stored roughly half of what was
+ * sent). That looked at first like it might threaten this feature's core
+ * lossless-reassembly promise. It does not: two follow-up probes built
+ * from ORDINARY, VARIED PROSE — one at 8,000 characters, one at the full
+ * 32,011 used above — both round-tripped losslessly, byte-for-byte against
+ * a saved reference, markers included. So whatever caused the earlier loss
+ * is specific to long runs of one repeated character (never true of a real
+ * archive body, which mixes `why` prose with a description's own text) and
+ * is not a general defect in the comment-write path this feature depends
+ * on. Filed as its own open question for BUTCHR-140/the epic to route, not
+ * BUTCHR-145's to fix.
+ */
+export const JIRA_COMMENT_CHAR_LIMIT = 32767;
+
+/**
+ * Marks a chained archive as BROKEN — some but not all of its parts
+ * managed to post. Posted as a best-effort follow-up (same discipline as
+ * `CORRECTION_REJECTED_MARKER`'s own catch below) immediately after
+ * whichever part failed, so it is the very next comment a reader
+ * encounters after the last part that DID post.
+ *
+ * Deliberately its OWN marker, not `CORRECTION_REJECTED_MARKER`: that one
+ * means "the archive is complete but the REPLACE that followed it was
+ * rejected" — a different failure at a different step. This one means "the
+ * archive itself never finished" — precisely the shape of defect
+ * Requirement 3 exists to make self-evident. The per-part "(part i of N)"
+ * header (see `partHeader` below) is necessary but NOT sufficient on its
+ * own: a reader who never sees part 3 needs a POSITIVE signal that the
+ * chain broke, not just the absence of a part they may not think to look
+ * for. This comment is that signal. AN EXPORTED CONSTANT, NEVER RETYPED —
+ * including in tests, which read this symbol — same reasoning as every
+ * other marker in this file: a literal duplicated in two places eventually
+ * drifts into two different literals, and a grep that silently misses half
+ * the corpus answers wrong instead of not at all.
+ */
+export const CORRECTION_CHAIN_INCOMPLETE_MARKER = "[correction-incomplete]";
+
+/**
+ * The "(part i of N)" header a chained archive part carries right after
+ * `CORRECTION_MARKER` — visible in the part itself (Requirement 2: "a
+ * reader holding only part 2 must be able to tell that parts 1 and 3
+ * exist").
+ */
+function partHeader(i: number, n: number): string {
+  return `(part ${i} of ${n}) `;
+}
+
+/**
+ * Reserved width for `partHeader`, sized for up to 4-digit part counts
+ * (9999) rather than computed from the ACTUAL i/N digit width. A real
+ * correction will never come close to needing that many parts — at this
+ * function's per-part budget an archive body would have to run past 100 MB
+ * to require it — so this is deliberately generous rather than tight,
+ * which keeps the per-part budget below stable (it does not shrink as N
+ * grows past 9/99/999) and leaves real headroom past the boundary, exactly
+ * as Requirement 2 asks for ("leave real headroom rather than aiming
+ * exactly at the boundary").
+ */
+const PART_HEADER_RESERVED_LEN = partHeader(9999, 9999).length;
+
+/**
+ * Flat extra safety margin subtracted from every part's budget, on top of
+ * `PART_HEADER_RESERVED_LEN`'s own headroom — defends against overhead this
+ * function did not anticipate (e.g. a future identity-tag format change)
+ * turning a just-fitting part into an oversized one.
+ */
+const CHAIN_SAFETY_MARGIN = 100;
+
+/**
+ * Splits `text` into chunks of at most `maxChunkLen` UTF-16 code units
+ * each, NEVER inside a surrogate pair — slicing a JS string at an
+ * arbitrary index can otherwise cut an astral-plane character in half,
+ * silently corrupting it (Requirement 2's "do not split inside a UTF-16
+ * surrogate pair"). Pure: concatenating the returned chunks, in order,
+ * reproduces `text` EXACTLY — the property Requirement 2's lossless
+ * reassembly requirement depends on.
+ */
+function splitPreservingSurrogates(text: string, maxChunkLen: number): string[] {
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + maxChunkLen, text.length);
+    if (end < text.length) {
+      const code = text.charCodeAt(end - 1);
+      // A high surrogate (0xD800-0xDBFF) at the very end of the slice means
+      // its low surrogate is the NEXT character — cutting here would split
+      // the pair. Back off by one so the whole pair moves to the next chunk.
+      if (code >= 0xd800 && code <= 0xdbff) {
+        end -= 1;
+        // Pathological only: a budget of 1 landing exactly on a pair. Keep
+        // the pair together rather than ever emit a chunk that splits it.
+        if (end <= i) end = Math.min(i + maxChunkLen + 1, text.length);
+      }
+    }
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
+/**
+ * Posts the archive comment(s) for `correctWorker`, BEFORE any edit —
+ * exactly ONE comment for an ordinary under-cap correction (byte-for-byte
+ * what this step did before Requirement 2: same body, same wording, no
+ * user-visible difference), or a chained, numbered sequence of comments
+ * when the full archive body would exceed `JIRA_COMMENT_CHAR_LIMIT`.
+ *
+ * FAILS CLOSED, same guarantee this step always made: any failure — the
+ * single comment, or any part of a chain — throws, and the caller
+ * (`correctWorker`) must not proceed to the edit; the worker's
+ * description/summary stay untouched. A mid-chain failure additionally
+ * posts a best-effort `CORRECTION_CHAIN_INCOMPLETE_MARKER` comment
+ * (Requirement 3) so a reader with only the comment thread can never
+ * mistake the partial chain for a complete one.
+ */
+async function postCorrectionArchive(
+  ops: AtlassianOps,
+  callerKey: string,
+  workerKey: string,
+  why: string,
+  oldDescription: string | undefined,
+  oldSummary: string | undefined,
+): Promise<void> {
+  const body = correctionArchiveBody(why, oldDescription, oldSummary);
+  const singleComment = tagComment(callerKey, `${CORRECTION_MARKER} ${body}`);
+  if (singleComment.length <= JIRA_COMMENT_CHAR_LIMIT) {
+    try {
+      await ops.addComment(workerKey, singleComment);
+    } catch (e) {
+      throw new Error(
+        `correct_worker: the archive comment failed to post on ${workerKey} (${(e as Error).message}) — refusing to edit without first preserving the superseded text; ${workerKey} is UNCHANGED.`,
+      );
+    }
+    return;
+  }
+
+  // Chained archive: the identity tag and CORRECTION_MARKER are re-paid on
+  // EVERY part, so the splittable payload per part is the comment cap minus
+  // that per-part overhead, minus the reserved part-header width, minus a
+  // flat safety margin.
+  const tagPrefixLen = `[${callerKey}] `.length;
+  const overhead = tagPrefixLen + CORRECTION_MARKER.length + 1 + PART_HEADER_RESERVED_LEN + CHAIN_SAFETY_MARGIN;
+  const perPartBudget = JIRA_COMMENT_CHAR_LIMIT - overhead;
+  if (perPartBudget <= 0) {
+    throw new Error(`correct_worker: cannot chain the archive comment on ${workerKey} — the identity tag and markers alone leave no room under Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap; ${workerKey} is UNCHANGED.`);
+  }
+  const chunks = splitPreservingSurrogates(body, perPartBudget);
+  const n = chunks.length;
+  for (let idx = 0; idx < n; idx++) {
+    const i = idx + 1;
+    const partComment = tagComment(callerKey, `${CORRECTION_MARKER} ${partHeader(i, n)}${chunks[idx]}`);
+    try {
+      await ops.addComment(workerKey, partComment);
+    } catch (e) {
+      const postError = (e as Error).message;
+      try {
+        await ops.addComment(
+          workerKey,
+          tagComment(
+            callerKey,
+            `${CORRECTION_CHAIN_INCOMPLETE_MARKER} the archive immediately above is INCOMPLETE: it needed ${n} ${CORRECTION_MARKER} parts to preserve the superseded text losslessly, and only ${i - 1} of them posted before part ${i} failed (${postError}). Do NOT treat the ${CORRECTION_MARKER} part(s) above as the full superseded text — some of it is missing from this ticket. ${workerKey}'s description/summary were NOT changed; this correction was refused. Safe to retry.`,
+          ),
+        );
+      } catch {
+        // Best-effort, same discipline as CORRECTION_REJECTED_MARKER's own
+        // catch below: a reader who never sees this annotation still gets
+        // the correct, already-established error thrown next — never a
+        // secondary error about the annotation itself failing to post.
+      }
+      throw new Error(
+        `correct_worker: the archive comment for ${workerKey} exceeded Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap and had to be split into ${n} parts; part ${i} of ${n} failed to post (${postError}) — refusing to edit without a complete archive; ${workerKey} is UNCHANGED. Safe to retry.`,
+      );
+    }
+  }
+}
+
+/**
+ * Margin (characters) below `JIRA_DESCRIPTION_CHAR_LIMIT` at which a
+ * successful correction's `result.message` warns about the NEXT one
+ * (Requirement 4). Chosen as headroom for a typical `why` — the live
+ * BUTCHR-139 case's refused correction supplied a `why` of roughly 2,400
+ * characters — plus the archive's fixed preamble/marker text (a few
+ * hundred characters; see `correctionArchiveBody`), rounded up generously.
+ * A description within this margin of the limit will very likely need its
+ * next archive split across multiple comments, even for an ordinarily
+ * sized `why`.
+ *
+ * WORDED FOR THE WORLD AFTER THIS CHANGE (Requirement 4's trap, and
+ * BUTCHR-130's own corrected AC5): crossing the boundary no longer causes a
+ * FAILURE — `postCorrectionArchive` above chains instead — so this warning
+ * says "the next correction will still succeed, but its archive will be
+ * split," never "the next correction will fail." A warning worded the old
+ * way would be false the moment this file's own fix landed.
+ */
+const NEAR_BOUNDARY_MARGIN = 3000;
+
 export interface CorrectWorkerInput {
   description?: string;
   summary?: string;
@@ -1213,14 +1460,7 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
   const oldDescription = input.description !== undefined ? adfToText(descriptionOf(issue) as Parameters<typeof adfToText>[0]) : undefined;
   const oldSummary = input.summary !== undefined ? (summaryOf(issue) ?? "") : undefined;
 
-  const archiveBody = tagComment(callerKey, `${CORRECTION_MARKER} ${correctionArchiveBody(input.why, oldDescription, oldSummary)}`);
-  try {
-    await ops.addComment(workerKey, archiveBody);
-  } catch (e) {
-    throw new Error(
-      `correct_worker: the archive comment failed to post on ${workerKey} (${(e as Error).message}) — refusing to edit without first preserving the superseded text; ${workerKey} is UNCHANGED.`,
-    );
-  }
+  await postCorrectionArchive(ops, callerKey, workerKey, input.why, oldDescription, oldSummary);
 
   try {
     await ops.correctText(workerKey, {
@@ -1249,7 +1489,17 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
     ? `correct_worker: ${workerKey}'s ${correctedDescription ? "description and summary" : "summary"} corrected; the superseded text was archived first (${CORRECTION_MARKER}). NOTE: a summary is SNAPSHOTTED into a workspace's brief.md/CLAUDE.md at build time — this correction updates Jira, the board and every future read, but does NOT rewrite the workspace already on disk for an agent currently running on ${workerKey}. If a running agent needs to know, follow up with tell_worker.`
     : `correct_worker: ${workerKey}'s description corrected; the superseded text was archived first (${CORRECTION_MARKER}). A description is read live (jira_get_issue), so this reaches every future reader immediately, including any agent that spawns later.`;
 
-  return { key: workerKey, correctedDescription, correctedSummary, message };
+  // Requirement 4: warn on THIS successful correction when the description
+  // it just wrote is close enough to JIRA_DESCRIPTION_CHAR_LIMIT that the
+  // NEXT correction's archive will likely need Requirement 2's chaining.
+  // Worded for the world AFTER this fix (see NEAR_BOUNDARY_MARGIN's own
+  // comment): the next correction will still SUCCEED, never "will fail".
+  const nearBoundaryWarning =
+    correctedDescription && input.description!.length > JIRA_DESCRIPTION_CHAR_LIMIT - NEAR_BOUNDARY_MARGIN
+      ? ` WARNING: ${workerKey}'s description is now ${input.description!.length} characters, within ${NEAR_BOUNDARY_MARGIN} of Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit — the NEXT correction on ${workerKey} will still succeed, but its archive will likely be split across multiple ${CORRECTION_MARKER} comments and be harder to read as one piece.`
+      : "";
+
+  return { key: workerKey, correctedDescription, correctedSummary, message: message + nearBoundaryWarning };
 }
 
 /**
