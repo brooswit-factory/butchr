@@ -4,6 +4,7 @@ import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src/agents/escalate.js";
 import { tellWorker } from "../../src/tools/relationship.js";
+import { speakOnOwnChannel, createOwnChannelComments } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
@@ -1508,5 +1509,121 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
     expect(h.posted.length).toBe(1); // still escalates
     expect(h.posted[0]!.text).not.toContain("captured to");
     expect(h.logs.some((l) => /escalation capture failed/.test(l))).toBe(true);
+  });
+});
+
+// BUTCHR-141/§2.6, acceptance criterion 6: "you are changing a branch that
+// gates two existing alarms, prove both alarms still fire." The
+// sustained-unresponsive alarm above is proven throughout this file against
+// a hand-written `ownChannelComments` fake — deliberately kept, per that
+// dep's own doc comment on EscalatorDeps, since it IS the contract this
+// module consumes. What is NEW here: `createEscalator` rewired to the REAL,
+// extracted `createOwnChannelComments` (src/tools/speak.ts) — the same
+// function `src/daemon/index.ts` now wires into both this escalator and the
+// crash-loop detectors — proving the extraction did not silently break the
+// one caller this file exists to guard. Real `AtlassianOps` fake, real
+// `speakOnOwnChannel` write path, real project-tier storage-format
+// unwrapping — nothing hand-reproduced.
+describe("createEscalator wired to the REAL extracted createOwnChannelComments (BUTCHR-141/§2.6) — adoption did not become silence", () => {
+  function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string }> } {
+    const jiraComments: Array<{ key: string; text: string }> = [];
+    const pageComments: Array<{ id: string; body: string }> = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({}),
+      search: async () => ({}),
+      addComment: async (key: string, text: string) => { jiraComments.push({ key, text }); return { ok: true }; },
+      linkIssues: async () => ({}),
+      transition: async () => ({}),
+      createIssue: async () => ({}),
+      setPriority: async () => ({}),
+      assign: async () => ({}),
+      correctText: async () => ({}),
+      createPage: async () => ({}),
+      getPage: async (id: string) => ({ title: "root doc", body: { storage: { value: "<p>hi</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({}),
+      getProjectProperty: async (projectKey: string) => {
+        if (projectKey !== "BUTCHR") throw new Error(`fake: no "butchr" property for ${projectKey}`);
+        return { space: { key: "BUTCHR" }, rootDoc: { id: "42" } };
+      },
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({}),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      commentOnPage: async (_pageId: string, body: string) => {
+        const id = String(1000 + pageComments.length);
+        pageComments.push({ id, body });
+        return { ok: true, id };
+      },
+      getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
+      ...overrides,
+    };
+    return { ops, jiraComments, pageComments };
+  }
+
+  test("ISSUE key: the sustained-unresponsive alarm posts, and a simulated daemon restart adopts it (no duplicate) through the real reader", async () => {
+    const { ops, jiraComments } = makeOps();
+    let clock = 0;
+    const issueComments = async (key: string): Promise<CommentRow[]> => jiraComments.filter((c) => c.key === key).map((c, i) => ({ id: String(i), body: c.text, created: new Date(clock).toISOString() }));
+    const ownChannelComments = createOwnChannelComments(ops, issueComments);
+    const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+
+    const before = createEscalator({
+      read: async () => "garbled", send: async () => {}, addComment,
+      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+    });
+    clock = 0; before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "KAN-1", "garbled", 1);
+    clock = 5 * 60_000; before.onNoPrompt("p1", "KAN-1", "garbled", 2);
+    await Bun.sleep(0);
+    expect(jiraComments.length).toBe(1);
+    expect(jiraComments[0]!.text.startsWith(UNRESPONSIVE_MARKER)).toBe(true);
+
+    // Simulate the restart: a fresh escalator, no in-memory state, same underlying channel.
+    const after = createEscalator({
+      read: async () => "garbled", send: async () => {}, addComment,
+      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+    });
+    after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "KAN-1", "garbled", 1);
+    clock = 10 * 60_000; after.onNoPrompt("p1", "KAN-1", "garbled", 2);
+    await Bun.sleep(0);
+    expect(jiraComments.length).toBe(1); // adopted, not re-posted — still reports, adoption did not become silence
+  });
+
+  test("PROJECT key: the sustained-unresponsive alarm posts to the root doc through the real storage-format unwrap, and a simulated daemon restart adopts it", async () => {
+    const { ops, pageComments } = makeOps();
+    let clock = 0;
+    const ownChannelComments = createOwnChannelComments(ops, async () => []);
+    const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+
+    const before = createEscalator({
+      read: async () => "garbled", send: async () => {}, addComment,
+      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+    });
+    before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "BUTCHR", "garbled", 1);
+    clock = 5 * 60_000; before.onNoPrompt("p1", "BUTCHR", "garbled", 2);
+    await Bun.sleep(0);
+    expect(pageComments.length).toBe(1); // posted for real, through the real wrap
+    expect(pageComments[0]!.body.startsWith(UNRESPONSIVE_MARKER)).toBe(false); // wrapped in <p>...</p> — the raw write does NOT start with the bare marker
+    expect(pageComments[0]!.body).toContain(UNRESPONSIVE_MARKER); // but still contains it, wrapped
+
+    const after = createEscalator({
+      read: async () => "garbled", send: async () => {}, addComment,
+      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+    });
+    after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "BUTCHR", "garbled", 1);
+    clock = 10 * 60_000; after.onNoPrompt("p1", "BUTCHR", "garbled", 2);
+    await Bun.sleep(0);
+    expect(pageComments.length).toBe(1); // adopted via the real unwrap — NOT re-posted (BUTCHR-129's defect stays fixed post-extraction)
   });
 });

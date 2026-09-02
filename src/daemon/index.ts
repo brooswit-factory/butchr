@@ -13,7 +13,7 @@ import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
-import { createEscalator, type CommentRow } from "../agents/escalation-loop.js";
+import { createEscalator } from "../agents/escalation-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -30,9 +30,9 @@ import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
-import { speakOnOwnChannel, unwrapStorageParagraph } from "../tools/speak.js";
+import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
-import { projectRootDoc } from "../tools/docs.js";
+import { createCrashLoopDetector } from "../agents/crash-loop.js";
 
 let config;
 try {
@@ -174,75 +174,17 @@ const parkedDetector = createParkedDetector({
   links: (issue) => atlassian.links(issue),
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-95/123/124: reads a resource's own channel — shared by BOTH the
-// frozen-asleep detector below (dedupe-by-adoption across a daemon restart)
-// and the blocked-dialog escalator further down this file (`escalator`'s
-// `ownChannelComments` dep) — symmetric with WHERE `speakOnOwnChannel`
-// (src/tools/speak.ts) posts: an issue's ticket, or (a project has none)
-// its Confluence root doc. NOT `ops.getIssueComments`: that op deliberately
-// returns `{id}` only (see its own doc comment on AtlassianOps) and both
-// callers' dedupe needs `body` to find their own marker, so an issue id
-// reads through the same `atlassian.comments` client `stalled`/
-// `parkedDetector` above already use. A project id has no ticket at all
-// (measured: `GET /rest/api/3/issue/BUTCHR` -> 404) — and even setting that
-// failure aside, an ISSUE-shaped read would still be the WRONG RESOURCE for
-// a project (its speech is a Confluence footer comment on its root doc, not
-// a Jira comment) — so it resolves its root doc the same way
-// `speakOnOwnChannel` does and reads footer comments via
-// `ops.getPageComments`, called with exactly ONE id (`doc.id`, resolved
-// fresh from THIS project's own property read) — never the batch
-// `?id=A&id=B` form (that op's own doc comment: MEASURED to return HTTP 200
-// while silently ignoring the id filter, two pages holding two comments
-// coming back with 16 results spanning 10 unrelated pageIds). A 2xx here is
-// evidence about the transport, not proof of reading the right resource —
-// the single-id, path-scoped call is what makes that true anyway, not a
-// post-hoc check on the response. Deliberately never catches here either:
-// both branches reject on failure exactly as written, so each caller's own
-// fail-closed handling (frozen-asleep.ts's `postComplaint`,
-// escalation-loop.ts's `escalateUnresponsive`) sees a real rejection rather
-// than a laundered empty result. `getPageComments` has no `created`
-// timestamp on its rows — mapped to `""`, which `Date.parse` turns into
-// `NaN`, which each caller already falls back to its own `now()` for.
-//
-// UNWRAPPING (BUTCHR-129, found at PR #180 review, CHANGES_REQUESTED @
-// 1be6208): `getPageComments` requests `bodyFormat: "storage"` and returns
-// raw storage-format XHTML — the SAME wrapped-and-escaped shape
-// `speakOnOwnChannel` writes (`<p>${escapeStorageText(text)}</p>`,
-// src/tools/speak.ts), not the plain text a caller posted. Read literally,
-// a row's body starts with `<p>[butchr:frozen]` or `<p>[butchr:unresponsive]`,
-// not the bare marker — the exact string `findMarked` (escalation-helper.ts)
-// anchors on with `startsWith(marker)`, so restart-adoption silently never
-// matched on the project tier for EITHER caller until this unwrap was
-// applied here. Fixed by `unwrapStorageParagraph` — speak.ts's own exported
-// inverse of the wrapping it writes, kept there so this can never drift from
-// `escapeStorageText` and so every project-tier read-back reuses the SAME
-// inverse. See that function's own doc comment for the decode-order
-// reasoning, and test/unit/speak.test.ts / test/unit/frozen-asleep.test.ts
-// for round-trip proof against a REAL `speakOnOwnChannel`-written input, not
-// a hand-simplified stand-in.
-//
-// THIS IS RULE 2b'S THIRD FORM (right resource, right call, wrong
-// REPRESENTATION) — a fixture that hands back plain text for both tiers is
-// faithful to `CommentRow`'s TYPE and still disagrees with what this real
-// reader produces in exactly the dimension `findMarked` anchors on; that
-// shape of fixture is what let this defect through two reviews before
-// BUTCHR-129.
-//
-// ONE READER, TWO CALLERS (BUTCHR-129 DoD 4): a near-identical
-// `commentsOnOwnChannel` used to exist here, wired only into
-// `frozenAsleepDetector` below and NOT unwrapping — that was the defect.
-// Deleted in favour of this one, now wired into both `frozenAsleepDetector`
-// and `escalator` (further down this file), so there is exactly one
-// project-aware comment reader in this file — grep to confirm rather than
-// trusting this comment.
-async function ownChannelComments(key: string): Promise<CommentRow[]> {
-  if (isProjectId(key)) {
-    const doc = await projectRootDoc(ops, key);
-    const { results } = await ops.getPageComments(doc.id);
-    return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
-  }
-  return atlassian.comments(key);
-}
+// BUTCHR-95/123/124/141: reads a resource's own channel — shared by the
+// frozen-asleep detector below, BOTH crash-loop detector instances further
+// down, and the blocked-dialog escalator (`escalator`'s `ownChannelComments`
+// dep) — the one project-aware comment reader in this codebase, EXTRACTED
+// (BUTCHR-141/§2.6) into `createOwnChannelComments` (src/tools/speak.ts) so
+// it is importable into a unit test directly, rather than reproduced by
+// hand there — see that function's own doc comment for the full mechanism
+// (routing, the single-id call shape, and the BUTCHR-129 unwrap history).
+// `issueComments` is injected as `atlassian.comments`, the same client
+// `stalled`/`parkedDetector` above already use.
+const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comments(key));
 // BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
 // src/agents/frozen-asleep.ts for the full mechanism. `addComment` reuses the
 // SAME `speakOnOwnChannel` seam the blocked-dialog escalator already wires
@@ -250,6 +192,30 @@ async function ownChannelComments(key: string): Promise<CommentRow[]> {
 const frozenAsleepDetector = createFrozenAsleepDetector({
   now: () => Date.now(),
   minutes: config.atRestMinutes,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
+// for the full mechanism. TWO SEPARATE INSTANCES, one per loop (unlike
+// frozenAsleepDetector above, which only the project tier can ever produce a
+// candidate for): a crash loop has no such restriction, and each
+// `runResourceLoop` call needs its own tracker for the same reason
+// `RespawnGuard` is one instance per call rather than module-level. Both
+// reuse the SAME `speakOnOwnChannel`/`ownChannelComments` seams — no second
+// Atlassian writer or reader.
+const issueCrashLoopDetector = createCrashLoopDetector({
+  now: () => Date.now(),
+  count: config.crashLoopCount,
+  windowMinutes: config.crashLoopWindowMinutes,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
+const projectCrashLoopDetector = createCrashLoopDetector({
+  now: () => Date.now(),
+  count: config.crashLoopCount,
+  windowMinutes: config.crashLoopWindowMinutes,
   addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
@@ -362,6 +328,9 @@ runResourceLoop(issueResourceType, {
   },
   syncLabels,
   checkParked: parkedDetector.check,
+  // BUTCHR-141: the issue tier is the fast, high-volume loop (15s) — the one
+  // most likely to actually observe a crash loop reach its threshold quickly.
+  checkCrashLoop: issueCrashLoopDetector.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -424,6 +393,11 @@ runResourceLoop(projectResourceType, {
   // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
   // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
   checkFrozenAsleep: frozenAsleepDetector.check,
+  // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
+  // single-tier restriction, and the project tier is the slower loop where a
+  // real crash loop still needs to reach the threshold well inside the
+  // configured window (see crashLoopCount's own doc comment, config.ts).
+  checkCrashLoop: projectCrashLoopDetector.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
@@ -432,9 +406,11 @@ runResourceLoop(projectResourceType, {
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
-// speakOnOwnChannel routing above) is defined once, earlier in this file —
-// see its own doc comment there — and shared with `frozenAsleepDetector`
-// above rather than redefined per caller (BUTCHR-129).
+// speakOnOwnChannel routing above) is built once, earlier in this file, from
+// the extracted `createOwnChannelComments` (src/tools/speak.ts, BUTCHR-141/
+// §2.6) — and shared with `frozenAsleepDetector`, `issueCrashLoopDetector`
+// and `projectCrashLoopDetector` above, and `escalator` below, rather than
+// redefined per caller (BUTCHR-129/BUTCHR-141).
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for
