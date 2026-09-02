@@ -190,9 +190,9 @@ export class CrashLoopTracker {
  */
 function crashLoopComment(id: string, count: number, windowMinutes: number): string {
   return [
-    `${MARKER} ${id} has been spawned ${count} times in the last ${windowMinutes} minutes — it is being respawned without ever staying up.`,
+    `${MARKER} ${id} has been spawned ${count} times in the last ${windowMinutes} minutes.`,
     "",
-    `This is a report, not a suppression: nothing about ${id}'s spawning is being blocked or rate-limited by this comment, and it will keep being spawned on every poll exactly as before. If it cannot succeed on its own (a startup crash, a session-limit refusal that never clears, a swallowed kickoff, a workspace that fails to build), a human should look at why it keeps dying rather than waiting for it to recover unattended.`,
+    `This is a report, not a suppression: nothing about ${id}'s spawning is being blocked or rate-limited by this comment, and it will keep being spawned on every poll exactly as before. Whatever the cause (a startup crash, a session-limit refusal that never clears, a swallowed kickoff, a workspace that fails to build), a human should look at why it keeps being spawned rather than waiting for the pattern to stop unattended.`,
     "",
     resourceKey(id),
   ].join("\n");
