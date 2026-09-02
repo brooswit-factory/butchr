@@ -52,9 +52,40 @@ export interface Discovery<T> {
   related?(active: readonly string[]): Promise<RelatedResource<T>[]>;
 }
 
+/**
+ * Whether a resource currently deserves a live agent, an answer with THREE
+ * states (BUTCHR-66/83) rather than a boolean — sleep is not a fifth
+ * `ResourceType<T>` member, it is a third answer to the question
+ * `Activation<T>` already asks:
+ *
+ * - `"active"` — deserves a live agent right now. Spawn if absent, respawn
+ *   if stale, stop when it leaves this state.
+ * - `"asleep"` — legitimately at rest. Never spawn, never stop, never
+ *   respawn, never alarm. An ABSENT agent is healthy AND a PRESENT one (just
+ *   woken, mid-work, about to exit) is healthy and must be left alone to
+ *   finish and exit by itself.
+ * - `"inactive"` — must not have an agent. Stop if running.
+ *
+ * What makes `"asleep"` a genuinely distinct third state rather than a
+ * rename of `"inactive"`: inactive means STOP; asleep means LEAVE ALONE in
+ * BOTH directions (never spawn, but also never stop one that is currently
+ * running). A boolean cannot express that — this is a widening forced by the
+ * domain, not chosen for convenience.
+ */
+export type ActivationVerdict = "active" | "asleep" | "inactive";
+
 export interface Activation<T> {
-  /** Whether `resource` currently deserves a live agent. */
-  isActive(resource: T): boolean;
+  /**
+   * `resource`'s current activation verdict — see `ActivationVerdict`. A
+   * PURE function of the resource exactly as `discovery.search()` returned
+   * it: no event, no diff, no prev-snapshot, no payload. This is what makes
+   * "the state is the message" structural rather than disciplinary — a wake
+   * is not a message delivered to the loop, it is this function answering
+   * `"active"` where it previously answered `"asleep"`, computed from the
+   * resource alone. A resource type that never sleeps (e.g. the issue tier,
+   * `src/resources/issue.ts`) simply never returns `"asleep"`.
+   */
+  verdictFor(resource: T): ActivationVerdict;
 }
 
 /**
