@@ -213,10 +213,17 @@ const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 // — and no test caught it, because until now nothing read this file at all.
 const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md"];
 
-// The `[review]` line format itself, whitespace-tolerant across the line
-// wrap this repo's ~80-column hand-wrapping produces between "@" and
-// "<sha>" (see briefs/project.md's own rendering of this line).
-const REVIEW_LINE_FORMAT = /\[review\]\s+APPROVED\s+<pr-url>\s+@\s*<sha>/;
+// The `[review]` line format itself — BOTH verdicts required as two
+// SEPARATE patterns, not one regex that only happens to match the APPROVED
+// half (BUTCHR-149 round 1: deleting the CHANGES_REQUESTED clause from
+// briefs/project.md left a single combined-looking assertion green, because
+// it never actually required the reject half). Each is whitespace-tolerant
+// across the line wrap this repo's ~80-column hand-wrapping produces
+// between "@" and "<sha>" (see briefs/project.md's own rendering of the
+// APPROVED line, which wraps; CHANGES_REQUESTED does not today, but nothing
+// here assumes it won't).
+const REVIEW_LINE_APPROVED = /\[review\]\s+APPROVED\s+<pr-url>\s+@\s*<sha>/;
+const REVIEW_LINE_CHANGES_REQUESTED = /\[review\]\s+CHANGES_REQUESTED\s+<pr-url>\s+@\s*<sha>/;
 
 // Mirrors BASE_MERGE_CAVEAT's two-independent-marker design, for the same
 // reason: a maintainer rewording either sentence while keeping its meaning
@@ -291,7 +298,8 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
     expect(briefs.length).toBe(REVIEW_LINE_INSTRUCTING_BRIEFS.length); // the explicit list actually matched something
 
     for (const c of briefs) {
-      expect(c.text, `${c.label} should carry the [review] line format`).toMatch(REVIEW_LINE_FORMAT);
+      expect(c.text, `${c.label} should carry the [review] APPROVED line format`).toMatch(REVIEW_LINE_APPROVED);
+      expect(c.text, `${c.label} should carry the [review] CHANGES_REQUESTED line format`).toMatch(REVIEW_LINE_CHANGES_REQUESTED);
       expect(c.text, `${c.label} should carry the sha transcription caveat`).toMatch(TRANSCRIPTION_CAVEAT);
     }
   });
