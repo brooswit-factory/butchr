@@ -927,6 +927,60 @@ export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, wor
 export const CORRECTION_MARKER = "[correction]";
 
 /**
+ * Marks a follow-up comment `correctWorker` posts when the replace (the
+ * write AFTER the archive) fails for a reason the size pre-check below did
+ * not catch — a transient network fault, a permissions change, anything
+ * else Jira can reject with. Placed right after the identity tag, same
+ * idiom as `CORRECTION_MARKER`/`ASK_MARKER`. AN EXPORTED CONSTANT, NEVER
+ * RETYPED — including in tests, which read this symbol — for the same
+ * reason `CORRECTION_MARKER`'s own comment gives: a marker duplicated as a
+ * literal eventually drifts into two different literals, and a grep that
+ * silently misses half the corpus answers wrong instead of not at all.
+ * This is BUTCHR-136's fix for the gap BUTCHR-128 measured: the thrown
+ * error already tells the CALLER a rejected write happened, but nothing
+ * durable told a later reader of the ticket itself — this comment is that
+ * durable record, posted immediately after the `[correction]` archive it
+ * is annotating, best-effort (see `correctWorker`'s catch block: its own
+ * failure must never mask the original edit error).
+ */
+export const CORRECTION_REJECTED_MARKER = "[correction-rejected]";
+
+/**
+ * Body for the `CORRECTION_REJECTED_MARKER` follow-up comment — mirrors
+ * `correctionArchiveBody`'s shape so the two read as one family. Points at
+ * "the archive comment immediately above" rather than an ID: comments are
+ * posted in order and this one is always the very next one, so a reader
+ * never needs anything but position to connect the two.
+ */
+function correctionRejectedAnnotationBody(workerKey: string, editError: string): string {
+  return [
+    `the ${CORRECTION_MARKER} archive comment immediately above records a write that was REJECTED.`,
+    `The edit meant to replace it failed (${editError}) after the archive was posted, so the archived text above did NOT get superseded — ${workerKey}'s description/summary are UNCHANGED. Treat the archived text above as still current, not history. Safe to retry.`,
+  ].join("\n\n");
+}
+
+/**
+ * Documented, non-configurable Jira Cloud limits, established rather than
+ * guessed (BUTCHR-136): `description` is bounded by Jira's
+ * `jira.text.field.character.limit`, fixed at 32767 in Cloud and not
+ * configurable there — Atlassian's own support KB for the exact error this
+ * verb catches (`CONTENT_LIMIT_EXCEEDED`) quotes the caller-facing text
+ * verbatim as "The entered text is too long. It exceeds the allowed limit
+ * of 32,767 characters." `summary` is a separate system field with its own
+ * fixed 255-character limit ("Summary can't exceed 255 characters") — the
+ * two fields are NOT the same limit, which is why this is two constants,
+ * not one reused twice.
+ *
+ * Sanity-checked against this corpus's own falsifier before shipping:
+ * BUTCHR-125 holds a description Jira ACCEPTED at 30,091 characters
+ * (BUTCHR-100's measurement, cited on BUTCHR-128/BUTCHR-130) — any
+ * description limit at or below 30,091 would be wrong on its face, and
+ * 32767 clears that bar.
+ */
+export const JIRA_DESCRIPTION_CHAR_LIMIT = 32767;
+export const JIRA_SUMMARY_CHAR_LIMIT = 255;
+
+/**
  * The archive comment body `correctWorker` posts BEFORE overwriting — see
  * `correctWorker`'s own doc comment for the ordering this exists to serve.
  * `CORRECTION_MARKER` is added by the caller via `tagComment`, not here, so
@@ -1004,8 +1058,26 @@ export interface CorrectWorkerResult {
  *   3. `why` empty or whitespace-only — same discipline `shelveWorker`
  *      already applies to its own `reason`: an intention nobody wrote down
  *      is indistinguishable six weeks later from a mistake.
- *   4. `assertOwnWorker` — the existing ownership helper, reused unchanged;
+ *   4. oversized `description`/`summary` — BUTCHR-136: refused against the
+ *      REAL, documented Jira Cloud limits (`JIRA_DESCRIPTION_CHAR_LIMIT`,
+ *      `JIRA_SUMMARY_CHAR_LIMIT`) BEFORE the archive comment is posted, so
+ *      an oversized correction leaves the worker byte-for-byte untouched
+ *      instead of an archive comment with no replacement to match it. This
+ *      is a cheap, no-Jira-read check like 1-3 above, so it belongs here,
+ *      not after the ownership read.
+ *   5. `assertOwnWorker` — the existing ownership helper, reused unchanged;
  *      this is the only place ownership is checked, on purpose.
+ *
+ * WHEN THE REPLACE FAILS FOR ANY OTHER REASON — a pre-check on size cannot
+ * cover a transient network fault, a permissions change, or any other
+ * ground Jira might reject on. In that case the archive already stands, so
+ * the catch below posts a best-effort `CORRECTION_REJECTED_MARKER`
+ * follow-up comment marking that archive as recording a write that was
+ * REJECTED, then re-throws the ORIGINAL error unchanged. "Best-effort"
+ * means exactly that: the follow-up post is wrapped in its own try/catch
+ * that swallows its own failure — a reader who never sees the annotation
+ * still gets the original, already-correct error, never a secondary one
+ * about the annotation itself failing.
  *
  * ARCHIVE BEFORE OVERWRITE — THE ORDERING IS THE DESIGN, not decoration:
  * this reads the worker's CURRENT description/summary, posts them as a
@@ -1065,6 +1137,16 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
   if (!input.why.trim()) {
     throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
+  if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
+  if (input.summary !== undefined && input.summary.length > JIRA_SUMMARY_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new summary is ${input.summary.length} characters, over Jira's ${JIRA_SUMMARY_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
   await assertOwnWorker(ops, "correct_worker", callerKey, workerKey);
 
   const issue = await ops.getIssue(workerKey);
@@ -1088,8 +1170,18 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
     });
   } catch (e) {
+    const editError = (e as Error).message;
+    try {
+      await ops.addComment(workerKey, tagComment(callerKey, `${CORRECTION_REJECTED_MARKER} ${correctionRejectedAnnotationBody(workerKey, editError)}`));
+    } catch {
+      // Best-effort, by design: the annotation is a nice-to-have durable
+      // record, not a substitute for the ORIGINAL error thrown below. A
+      // reader who never sees this comment still gets the correct,
+      // already-established error text — never a secondary error about the
+      // annotation itself failing to post.
+    }
     throw new Error(
-      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${(e as Error).message}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
+      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${editError}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
     );
   }
 
