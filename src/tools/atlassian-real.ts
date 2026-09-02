@@ -290,12 +290,27 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // MEASURED live: GET /wiki/api/v2/pages/{id}/footer-comments -> 200.
     // bodyFormat "storage" requested explicitly, same convention as getPage,
     // so a caller reading `.body` never has to guess which representation
-    // came back. Reshaped to {id, body} pairs, same spirit as getChildPages'
-    // reshape — a caller wants the comment text, not confluence.js's nested
-    // {body: {storage: {value}}} shape.
+    // came back. Reshaped to {id, body, author} tuples, same spirit as
+    // getChildPages' reshape — a caller wants the comment text, not
+    // confluence.js's nested {body: {storage: {value}}} shape.
+    //
+    // AUTHOR (BUTCHR-109): confluence.js's own v2 response schema
+    // (node_modules/confluence.js/dist/v2/models/{footerComment,
+    // pageFooterComments}.d.ts, this package's pinned version) types
+    // `results[].version.authorId` as a normal field on the default footer-
+    // comments response — UNLIKE Jira's `project.lead` (see searchProjects'
+    // doc comment above), this endpoint's own request schema
+    // (GetPageFooterCommentsSchema) exposes no `expand` parameter at all, so
+    // there is no separate opt-in this call could be missing. NOT
+    // reconfirmed by a live call against this fleet's own credential — a
+    // task-tier agent building this had no Atlassian credential of its own
+    // to probe with (see BUTCHR-109's PR body/doc). Read defensively either
+    // way: `c?.version?.authorId` is left `undefined`, never thrown or
+    // defaulted to a placeholder, if a live response ever omits it despite
+    // the schema.
     getPageComments: (pageId) =>
       wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
-        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "" })),
+        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "", author: c?.version?.authorId })),
       })),
 
     // MEASURED live (2026-09-01, re-confirmed after an initial "null" read
