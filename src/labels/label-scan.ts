@@ -9,6 +9,15 @@ import * as ts from "typescript";
  * `const FOO = "butchr:foo"` declared anywhere, never routed through
  * `LABEL_REGISTRY` at all.
  *
+ * BUTCHR-172/BUTCHR-154 — this scanner and `../media/family-scan.ts` are
+ * exact complements, cross-referenced from both files on purpose: THIS file
+ * reads only WHOLE-literal labels and deliberately ignores a label-shaped
+ * substring embedded inside a larger literal (see AC-9(a) below — that
+ * discipline is exactly why this scanner correctly said nothing about the
+ * pre-BUTCHR-155 `SWEEP_JQL`). `../media/family-scan.ts` looks ONLY at
+ * substrings inside a larger literal, and is the machine check for that
+ * specific gap. Neither weakens the other.
+ *
  * WHAT THIS SCANS: every `.ts` file under `src/` (never `test/` or
  * `scripts/` — see "WHAT THIS CANNOT SEE" below), for a string literal whose ENTIRE value —
  * not a substring of a longer string — matches `agent:`, `pr:`, or `butchr:`
