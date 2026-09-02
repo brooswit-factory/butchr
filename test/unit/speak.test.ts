@@ -26,6 +26,7 @@ function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; ji
     createIssue: async () => ({}),
     setPriority: async () => ({}),
     assign: async () => ({}),
+    correctText: async () => ({}),
     createPage: async () => ({}),
     getPage: async (id: string) => ({ title: "root doc", body: { storage: { value: "<p>hi</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
     updatePage: async () => ({ ok: true }),

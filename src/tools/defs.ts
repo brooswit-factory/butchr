@@ -4,8 +4,8 @@ import type { AtlassianOps } from "./atlassian.js";
 import { getDoc, setDoc, getProjectDoc, setProjectDoc } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
-  newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker,
-  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER,
+  newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER, CORRECTION_MARKER,
   type Disposition,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
@@ -548,6 +548,35 @@ export function atlassianTools(
         const r = await prioritizeWorker(ops, who, key, priority);
         noted(c, [key]);
         return orOk(r, { ok: true, key, priority });
+      },
+    },
+    correct_worker: {
+      description:
+        "Correct ONE OF THE CALLER'S OWN workers' description and/or summary IN PLACE — a REPLACE, never an append — after archiving the PREVIOUS VERSION as a comment first (tagged `[correction]`, greppable across the corpus, carrying `why`). " +
+        "TWO LEGITIMATE USE CASES, BOTH NORMAL, NEITHER A MISUSE: (a) correcting text that is actually wrong, and (b) a boss adding a LATE-ARRIVING REQUIREMENT to a child ticket it already filed — the original text was correct when written and simply stopped being current. This is NOT only a repair tool. " +
+        "YOU SUPPLY: `key`, `description` (optional — full replacement text), `summary` (optional — full replacement text), and a REQUIRED `why` — WHY THE TEXT CHANGED, covering both use cases above, not only \"what was wrong\" (same discipline as shelve_worker's `reason` — an intention nobody wrote down is indistinguishable six weeks later from a mistake). " +
+        "REFUSES: the CALLER'S OWN key (checked before any Jira read) — your own brief is your boss's judgment, never your own; an agent that could rewrite its own definition of done could launder a failure into a success, indistinguishable from one that was always right — ask your own boss instead (ask_boss/report_to_boss). Also refuses a `key` that is not one of the caller's own workers; refuses when NEITHER `description` nor `summary` is given (a correction that corrects nothing is a mistake, not a no-op); refuses an empty/whitespace `why`. " +
+        "TWO LIMITATIONS, READ BEFORE YOU CALL THIS: (1) an EPIC has no boss, so no AGENT can ever correct an epic's description with this verb — not that nobody can; a person can still edit it directly in the Jira UI, the same \"the human is the fallback, not the first responder\" arrangement this fleet already runs on elsewhere. (2) a `description` is read LIVE — every `jira_get_issue` reaches it immediately, including an agent that spawns later — but a `summary` is SNAPSHOTTED into a workspace's `brief.md`/`CLAUDE.md` at build time: correcting it updates Jira, the board and every future read, but will NOT rewrite the `brief.md` already on disk for an agent currently running on that worker; follow up with `tell_worker` if that agent needs to know. " +
+        "ARCHIVE BEFORE OVERWRITE: reads the worker's CURRENT description/summary, posts them as the PREVIOUS VERSION in a `[correction]`-marked comment (with `why`), and ONLY THEN edits. If the archive comment fails, this REFUSES and nothing changes. If the edit fails AFTER a successful archive, one harmless extra comment sits on the worker and its description/summary are UNCHANGED — safe to retry. " +
+        "Has no predecessor: correcting or updating a ticket's most-read text was previously only ever a comment posted underneath it, which never made the text itself right again.",
+      input: { key: z.string(), description: z.string().optional(), summary: z.string().optional(), why: z.string() },
+      handler: async (a, c) => {
+        const p = a as { key: string; description?: string; summary?: string; why: string };
+        const who = requireCaller(c, "correct_worker");
+        // `!== undefined`, NOT truthy — a supplied `description: ""` (e.g. clearing a
+        // malformed description, the BUTCHR-51 shape) is a real, intentional call and
+        // must reach correctWorker as "description was given", not get silently
+        // dropped and misreported as "neither field was given" (found in review,
+        // BUTCHR-60: a truthy check here was the one layer in this diff that didn't
+        // match the `!== undefined` discipline correctWorker/correctText already use).
+        audit(c, `correct_worker ${p.key} description=${p.description !== undefined} summary=${p.summary !== undefined} why="${p.why.slice(0, 60)}"`);
+        const result = await correctWorker(ops, who, p.key, {
+          ...(p.description !== undefined ? { description: p.description } : {}),
+          ...(p.summary !== undefined ? { summary: p.summary } : {}),
+          why: p.why,
+        });
+        noted(c, [p.key]); // the correction's own write — recorded against the CALLER as writer, never the worker, so the "your ticket changed" nudge is suppressed for the corrector and still delivered to the worker
+        return result;
       },
     },
     tell_worker: {

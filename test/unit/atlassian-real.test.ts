@@ -124,3 +124,66 @@ describe("realAtlassian confluence_search_pages", () => {
     expect(got).toEqual({ results: [{ content: { id: "10715137" }, title: "t", url: "/spaces/SD/pages/10715137" }] });
   });
 });
+
+describe("realAtlassian correctText (BUTCHR-60)", () => {
+  function rigJira() {
+    const editIssueCalls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issues: {
+          editIssue: (p: unknown) => {
+            editIssueCalls.push(p);
+            return Promise.resolve(undefined); // editIssue's real empty-201-body shape
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    return editIssueCalls;
+  }
+
+  test("wraps a non-empty description with adf(), leaves summary a plain string, and writes only the field(s) actually supplied", async () => {
+    const editIssueCalls = rigJira();
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+
+    await ops.correctText("KAN-9", { description: "new text" });
+    expect(editIssueCalls[0]).toEqual({
+      issueIdOrKey: "KAN-9",
+      fields: { description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "new text" }] }] } },
+    });
+
+    await ops.correctText("KAN-9", { summary: "new summary" });
+    expect(editIssueCalls[1]).toEqual({ issueIdOrKey: "KAN-9", fields: { summary: "new summary" } }); // summary NOT wrapped
+
+    await ops.correctText("KAN-9", { description: "d", summary: "s" });
+    expect(editIssueCalls[2]).toEqual({
+      issueIdOrKey: "KAN-9",
+      fields: {
+        description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "d" }] }] },
+        summary: "s",
+      },
+    });
+  });
+
+  test("an empty-string description emits the valid empty-paragraph ADF form, NOT adf('')'s empty text node (found in review: `adf(\"\")` is not valid ADF and was never measured against the real API)", async () => {
+    const editIssueCalls = rigJira();
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+
+    await ops.correctText("KAN-9", { description: "" });
+    expect(editIssueCalls[0]).toEqual({
+      issueIdOrKey: "KAN-9",
+      fields: { description: { type: "doc", version: 1, content: [{ type: "paragraph" }] } }, // paragraph with NO content — not { text: "" }
+    });
+  });
+
+  test("an empty-string summary is passed through UNCHANGED, not refused or dropped here — Jira itself requires a non-empty summary and is left to reject it with its own error (decided in review, BUTCHR-60)", async () => {
+    const editIssueCalls = rigJira();
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+
+    await ops.correctText("KAN-9", { summary: "" });
+    expect(editIssueCalls[0]).toEqual({ issueIdOrKey: "KAN-9", fields: { summary: "" } });
+  });
+});

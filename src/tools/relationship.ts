@@ -1,6 +1,7 @@
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
+import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel } from "./speak.js";
 
@@ -42,6 +43,13 @@ function assigneeAccountIdOf(issue: unknown): string | undefined {
 }
 function labelsOf(issue: unknown): string[] {
   return (issue as { fields?: { labels?: string[] } })?.fields?.labels ?? [];
+}
+/** Jira's description field is ADF (a doc node), not plain text — flattened by the caller via `adfToText`, never here, so this stays a pure structural read like its siblings above. */
+function descriptionOf(issue: unknown): unknown {
+  return (issue as { fields?: { description?: unknown } })?.fields?.description;
+}
+function summaryOf(issue: unknown): string | undefined {
+  return (issue as { fields?: { summary?: string } })?.fields?.summary;
 }
 
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
@@ -651,6 +659,200 @@ export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, wor
   }
   await assertOwnWorker(ops, "prioritize_worker", callerKey, workerKey);
   return ops.setPriority(workerKey, priority);
+}
+
+/**
+ * Marks the archive comment `correctWorker` posts before it overwrites a
+ * worker's description/summary — greppable across the whole corpus, the
+ * same idea as ASK_MARKER, placed right after the identity tag. Added on
+ * review (BUTCHR-53's approval of BUTCHR-41's design) specifically because
+ * this is the one verb in this fleet that destroys evidence by design,
+ * guarded only by the archive step and an ownership check: "show me every
+ * change anyone ever made to authored text, and the stated reason for each"
+ * is only possible if the archive comments share one shape. AN EXPORTED
+ * CONSTANT, NEVER RETYPED — including in tests, which must read this symbol
+ * rather than hardcode the literal — because a marker that exists as a
+ * literal in two places will eventually exist as two different literals,
+ * and a grep that silently misses half the corrections is worse than no
+ * grep at all: it answers, just wrongly. Deliberately ONE marker, not one
+ * per use case (see `correctWorker`'s own doc comment for why a correction
+ * and an additive update share this marker rather than getting their own).
+ * STATED HERE VERBATIM because briefs need to quote it, same as ASK_MARKER.
+ */
+export const CORRECTION_MARKER = "[correction]";
+
+/**
+ * The archive comment body `correctWorker` posts BEFORE overwriting — see
+ * `correctWorker`'s own doc comment for the ordering this exists to serve.
+ * `CORRECTION_MARKER` is added by the caller via `tagComment`, not here, so
+ * this function only ever builds the body. Calls the quoted text the
+ * PREVIOUS VERSION, superseded by the current description/summary — never
+ * "the wrong text": `why` covers a genuine correction as much as a boss
+ * adding a late-arriving requirement to a ticket it already filed, and only
+ * the first of those is "wrong". "Superseded" is accurate for both; "wrong"
+ * is accurate for only one. What stays constant either way is the part that
+ * matters: the ticket's CURRENT description/summary is authoritative, this
+ * comment is history, not instruction.
+ */
+function correctionArchiveBody(why: string, oldDescription: string | undefined, oldSummary: string | undefined): string {
+  const parts = [`why: ${why}`, "The text below is the PREVIOUS VERSION — superseded by the ticket's CURRENT description/summary, kept here as history, not instruction."];
+  if (oldDescription !== undefined) parts.push("--- previous description ---", oldDescription.trim() ? oldDescription : "(was empty)");
+  if (oldSummary !== undefined) parts.push("--- previous summary ---", oldSummary.trim() ? oldSummary : "(was empty)");
+  return parts.join("\n\n");
+}
+
+export interface CorrectWorkerInput {
+  description?: string;
+  summary?: string;
+  /** Why the text changed — a genuine correction ("this was wrong") AND a late-arriving requirement added to an already-filed ticket ("this was incomplete") are both legitimate; this is NOT restricted to "what was wrong". */
+  why: string;
+}
+export interface CorrectWorkerResult {
+  key: string;
+  correctedDescription: boolean;
+  correctedSummary: boolean;
+  /** States, in words, what this correction reaches and (when a summary was corrected) what it does NOT — see the function comment's "TWO FIELDS, TWO DIFFERENT REACHES" section. */
+  message: string;
+}
+
+/**
+ * Corrects ONE OF THE CALLER'S OWN workers' description and/or summary IN
+ * PLACE — a REPLACE, never an append — after archiving the superseded text
+ * as a comment first. Built for BUTCHR-41: no agent in this fleet could
+ * previously edit a ticket's most-read text, so every correction was a
+ * comment posted UNDERNEATH text that stayed wrong forever, and an agent
+ * that reads the description carefully and the comments quickly (the
+ * normal, correct ratio) built the wrong thing while believing it had read
+ * the ticket. Nothing errored. The design decision this implements — an
+ * edit verb, chosen over an append-only rendered correction block and over
+ * moving the authoritative brief into the doc — was argued and approved on
+ * BUTCHR-41 before this was built; that ticket carries the reasoning, this
+ * comment states the contract and the ordering.
+ *
+ * TWO LEGITIMATE USE CASES, ONE VERB, ONE MARKER — do not read `why` as
+ * "what was wrong" only. A boss also reaches for this when it holds a
+ * genuinely NEW fact its worker's ticket predates — a late-arriving
+ * requirement added AFTER the child was already filed — which is not an
+ * error in the original text, just text that stopped being current. Both
+ * are "the text changed, and here is why"; only the first is "wrong". Kept
+ * as ONE verb and ONE marker (`CORRECTION_MARKER`) rather than splitting a
+ * second one for the additive case: two markers means two greps, and
+ * someone eventually runs only one and gets a confidently incomplete
+ * answer, which is worse than no answer. The archive wording below reflects
+ * this — it calls the old text the PREVIOUS VERSION, never "the wrong
+ * text", because "superseded" is accurate for both cases and "wrong" is
+ * accurate for only one.
+ *
+ * REFUSALS, IN THE ORDER THEY ARE CHECKED — cheapest, no-Jira-read checks
+ * first, exactly as `shelveWorker` orders its own reason check before its
+ * ownership read:
+ *   1. `workerKey === callerKey` — refused BEFORE any Jira read, the same
+ *      shape `prioritizeWorker` already refuses for: your own brief is your
+ *      boss's judgment, never your own. An agent that could rewrite its own
+ *      definition of done could launder a failure into a success, and the
+ *      resulting ticket would be indistinguishable from one that was always
+ *      right — a WORSE artefact than the stale text this verb exists to
+ *      fix, because stale text is at least honestly wrong. The route up
+ *      still exists and is unchanged: ask_boss / report_to_boss.
+ *   2. neither `description` nor `summary` given — a correction that
+ *      corrects nothing is a mistake, not a no-op.
+ *   3. `why` empty or whitespace-only — same discipline `shelveWorker`
+ *      already applies to its own `reason`: an intention nobody wrote down
+ *      is indistinguishable six weeks later from a mistake.
+ *   4. `assertOwnWorker` — the existing ownership helper, reused unchanged;
+ *      this is the only place ownership is checked, on purpose.
+ *
+ * ARCHIVE BEFORE OVERWRITE — THE ORDERING IS THE DESIGN, not decoration:
+ * this reads the worker's CURRENT description/summary, posts them as a
+ * `CORRECTION_MARKER`-tagged comment, and ONLY THEN performs the edit. If
+ * the archive comment fails, this REFUSES and does not edit. Stated so the
+ * ordering can be CHECKED, not trusted, the same standard `newWorker`'s own
+ * comment holds itself to: archive fails -> nothing is destroyed, the call
+ * refuses, the worker is unchanged; edit fails AFTER a successful archive
+ * -> one harmless extra comment sits on the worker, its description/summary
+ * are UNCHANGED, and retrying is safe. This is why no separate rendered
+ * "correction block" is needed: the audit trail lives in the COMMENT
+ * STREAM, which this factory already treats as the event log, and the
+ * description holds what is true now. Today the truth is a comment under
+ * wrong text; after this call, the wrong text is a comment under the
+ * truth — that inversion is the entire point.
+ *
+ * TWO FIELDS, TWO DIFFERENT REACHES — NOT THE SAME PROBLEM, and this is the
+ * honest half of the feature, stated in `result.message`, not just here:
+ * A DESCRIPTION is read LIVE — every read goes through `jira_get_issue`, so
+ * correcting it reaches every future reader, including an agent that spawns
+ * later, with no further action by anyone. A SUMMARY is SNAPSHOTTED — the
+ * workspace builder interpolates it into `brief.md`/`CLAUDE.md` at
+ * workspace-build time, so correcting it updates Jira, the board and every
+ * future read, but does NOT rewrite the `brief.md` already on disk for an
+ * agent that is currently running. Rewriting live workspaces is
+ * deliberately OUT OF SCOPE. `result.message` names this limitation ONLY
+ * when a summary was actually corrected, and points at `tell_worker` as the
+ * follow-up if a running agent needs to know.
+ *
+ * A KNOWN LIMITATION THIS DOES NOT COVER, BY DESIGN, NOT OVERSIGHT: an EPIC
+ * has no boss, so `assertOwnWorker` can never resolve one as "one of the
+ * caller's own workers" — NO AGENT can ever correct an epic's description
+ * with this verb. Stated precisely, because the imprecise version would
+ * itself be the failure mode this whole verb exists to fix: this is NOT
+ * "nobody can correct it" — a person can still edit it directly in the Jira
+ * UI, the same "the human is the fallback, not the first responder"
+ * arrangement this fleet already runs on elsewhere. This is not a hole; it
+ * is refusal 1 applied to the one tier where "your own boss" and "yourself"
+ * would otherwise collapse to the same agent. `finish_without_a_boss` is
+ * the closest precedent in this file: a narrow, deliberately
+ * non-generalized exception for the bossless top tier, meant to narrow to
+ * nothing as a tier above epics gets built, not to be widened into a
+ * `correct_without_a_boss`. See BUTCHR-53's review comments on BUTCHR-41
+ * for the full ruling.
+ */
+export async function correctWorker(ops: AtlassianOps, callerKey: string, workerKey: string, input: CorrectWorkerInput): Promise<CorrectWorkerResult> {
+  if (workerKey === callerKey) {
+    throw new Error(
+      `correct_worker: refusing to correct ${callerKey}'s own description/summary — your own brief is your boss's judgment, never your own; an agent that can rewrite its own definition of done can launder a failure into a success, and the resulting ticket would be indistinguishable from one that was always right. Ask your own boss to correct it instead (ask_boss / report_to_boss) — it can correct you, you cannot correct yourself.`,
+    );
+  }
+  if (input.description === undefined && input.summary === undefined) {
+    throw new Error("correct_worker: neither `description` nor `summary` was given — a correction that corrects nothing is a mistake, not a no-op");
+  }
+  if (!input.why.trim()) {
+    throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
+  }
+  await assertOwnWorker(ops, "correct_worker", callerKey, workerKey);
+
+  const issue = await ops.getIssue(workerKey);
+  // adfToText's node type isn't exported (src/atlassian/client.ts) — pulled
+  // structurally via Parameters rather than duplicating or widening to `any`.
+  const oldDescription = input.description !== undefined ? adfToText(descriptionOf(issue) as Parameters<typeof adfToText>[0]) : undefined;
+  const oldSummary = input.summary !== undefined ? (summaryOf(issue) ?? "") : undefined;
+
+  const archiveBody = tagComment(callerKey, `${CORRECTION_MARKER} ${correctionArchiveBody(input.why, oldDescription, oldSummary)}`);
+  try {
+    await ops.addComment(workerKey, archiveBody);
+  } catch (e) {
+    throw new Error(
+      `correct_worker: the archive comment failed to post on ${workerKey} (${(e as Error).message}) — refusing to edit without first preserving the superseded text; ${workerKey} is UNCHANGED.`,
+    );
+  }
+
+  try {
+    await ops.correctText(workerKey, {
+      ...(input.description !== undefined ? { description: input.description } : {}),
+      ...(input.summary !== undefined ? { summary: input.summary } : {}),
+    });
+  } catch (e) {
+    throw new Error(
+      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${(e as Error).message}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
+    );
+  }
+
+  const correctedDescription = input.description !== undefined;
+  const correctedSummary = input.summary !== undefined;
+  const message = correctedSummary
+    ? `correct_worker: ${workerKey}'s ${correctedDescription ? "description and summary" : "summary"} corrected; the superseded text was archived first (${CORRECTION_MARKER}). NOTE: a summary is SNAPSHOTTED into a workspace's brief.md/CLAUDE.md at build time — this correction updates Jira, the board and every future read, but does NOT rewrite the workspace already on disk for an agent currently running on ${workerKey}. If a running agent needs to know, follow up with tell_worker.`
+    : `correct_worker: ${workerKey}'s description corrected; the superseded text was archived first (${CORRECTION_MARKER}). A description is read live (jira_get_issue), so this reaches every future reader immediately, including any agent that spawns later.`;
+
+  return { key: workerKey, correctedDescription, correctedSummary, message };
 }
 
 /**
