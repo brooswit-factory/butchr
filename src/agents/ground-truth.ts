@@ -47,6 +47,11 @@ function readSystemdInfo(): SystemdInfo {
   }
 }
 
+/** This process's own `SystemdInfo`, from its own `/proc/self/cgroup` — the same read `deriveGroundTruth` uses, exposed directly for callers (BUTCHR-54's build-identity) that need it without a `mcpUrl` to derive the rest of `GroundTruth` from. */
+export function currentSystemdInfo(): SystemdInfo {
+  return readSystemdInfo();
+}
+
 /** The port a URL like the one passed into `buildWorkspace` actually serves on — never a guessed default; `undefined` (not a fake port) if `mcpUrl` doesn't even parse as a URL. */
 function portFromMcpUrl(mcpUrl: string): number | undefined {
   let url: URL;

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { hostname } from "node:os";
-import { deriveGroundTruth, groundTruthText, parseCgroup } from "../../src/agents/ground-truth.js";
+import { currentSystemdInfo, deriveGroundTruth, groundTruthText, parseCgroup } from "../../src/agents/ground-truth.js";
 
 describe("parseCgroup", () => {
   test("user unit: last *.service is the unit, journalctl uses --user", () => {
@@ -43,6 +43,12 @@ describe("deriveGroundTruth", () => {
 
   test("port is honestly undefined (never a fake number) when mcpUrl isn't a parseable URL", () => {
     expect(deriveGroundTruth("not-a-url").port).toBeUndefined();
+  });
+});
+
+describe("currentSystemdInfo", () => {
+  test("matches deriveGroundTruth's own systemd field — same underlying read, exposed directly for a caller with no mcpUrl (BUTCHR-54's build-identity)", () => {
+    expect(currentSystemdInfo()).toEqual(deriveGroundTruth("http://localhost:7719/mcp").systemd);
   });
 });
 

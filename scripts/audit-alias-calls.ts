@@ -44,6 +44,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { parseCgroup, type SystemdInfo } from "../src/agents/ground-truth.js";
 import { parseAliasAuditLine, type AliasClass } from "../src/tools/alias-audit.js";
+import type { ShaProvenance } from "../src/agents/build-identity.js";
 
 // ---------------------------------------------------------------------------
 // PURE: parsing `ss -ltne` text into candidate sockets.
@@ -203,6 +204,92 @@ export function decideReadability(opts: {
 }
 
 // ---------------------------------------------------------------------------
+// PURE: BUTCHR-54 — the running build identity a `/health` response carries
+// (or doesn't). A completely separate axis from journal readability above: a
+// daemon can be journal-readable and build-unknown (the realistic case
+// TODAY, since deploy-on-merge is off — every daemon on the host is running
+// an OLD build with no `build` field at all), or the reverse. Neither may
+// mask the other, so this is its own outcome type, never folded into
+// `ReadOutcome`.
+// ---------------------------------------------------------------------------
+
+export interface BuildInfo {
+  sha: string | null;
+  shaProvenance: ShaProvenance | null;
+  shaDirty: boolean | null;
+  shaUnknownReason: string | null;
+  version: string | null;
+  startedAt: string | null;
+  pid: number | null;
+}
+
+export type BuildOutcome = { known: true; info: BuildInfo } | { known: false; reason: string };
+
+/**
+ * The exact acceptance case DoD #4 names: a daemon that answers `/health`
+ * daemon-shaped (so it's discovered and counted) but carries no `build`
+ * field at all — because it predates this ticket, or deploy-on-merge is off
+ * and it's simply still running an old build — must come back `known:
+ * false` with a stated reason, NEVER silently defaulted or blank. Also
+ * tolerant of a malformed `build` (wrong types) rather than throwing: an
+ * unexpected shape from a future/foreign daemon version is exactly the kind
+ * of surprise this command must survive, not another failure mode.
+ */
+export function decideBuildIdentity(healthBody: unknown): BuildOutcome {
+  const UNREPORTED = "this daemon does not report a build identity; it predates the field, or is running an older build";
+  if (!healthBody || typeof healthBody !== "object" || !("build" in healthBody)) return { known: false, reason: UNREPORTED };
+  const raw = (healthBody as { build?: unknown }).build;
+  if (!raw || typeof raw !== "object") return { known: false, reason: UNREPORTED };
+  const b = raw as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+  const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+  const provenance: ShaProvenance | null = b.shaProvenance === "baked" || b.shaProvenance === "git-at-start" ? b.shaProvenance : null;
+  return {
+    known: true,
+    info: {
+      sha: str(b.sha),
+      shaProvenance: provenance,
+      shaDirty: bool(b.shaDirty),
+      shaUnknownReason: str(b.shaUnknownReason),
+      version: str(b.version),
+      startedAt: str(b.startedAt),
+      pid: num(b.pid),
+    },
+  };
+}
+
+/** `HH`-free, honest uptime string from an ISO `startedAt` — "unknown" (never a fabricated duration) when `startedAt` is absent or unparseable. */
+export function formatUptime(startedAt: string | null, nowMs: number): string {
+  if (!startedAt) return "unknown";
+  const startMs = Date.parse(startedAt);
+  if (Number.isNaN(startMs)) return "unknown";
+  const totalSec = Math.max(0, Math.floor((nowMs - startMs) / 1000));
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  const parts: string[] = [];
+  if (days) parts.push(`${days}d`);
+  if (days || hours) parts.push(`${hours}h`);
+  if (days || hours || mins) parts.push(`${mins}m`);
+  parts.push(`${secs}s`);
+  return parts.join(" ");
+}
+
+/** One report line per identity: the running sha/version/uptime, or an explicit unknown — never blank, never omitted (see `decideBuildIdentity`'s doc comment). */
+export function formatBuildLine(outcome: BuildOutcome, nowMs: number): string {
+  if (!outcome.known) return `build: unknown — ${outcome.reason}`;
+  const i = outcome.info;
+  const shaDetail = i.sha
+    ? ` (${i.shaProvenance ?? "unknown provenance"}${i.shaDirty ? ", dirty working tree at start" : ""})`
+    : i.shaUnknownReason
+      ? ` (${i.shaUnknownReason})`
+      : "";
+  return `build: sha=${i.sha ?? "unknown"}${shaDetail} version=${i.version ?? "unknown"} uptime=${formatUptime(i.startedAt, nowMs)} pid=${i.pid ?? "unknown"}`;
+}
+
+// ---------------------------------------------------------------------------
 // PURE: per-identity classification tally, and the one overall verdict.
 // ---------------------------------------------------------------------------
 
@@ -215,10 +302,18 @@ export interface IdentityReport {
   sanctioned: number;
   ambiguous: number;
   unknown: number;
+  /**
+   * BUTCHR-54. Optional only so existing literal `IdentityReport`s built
+   * before this field existed (this file's own test suite) keep compiling
+   * unchanged; every report `main()` actually produces below always sets it
+   * — `formatReport` falls back to an explicit "not probed" outcome when
+   * it's absent, never a blank line.
+   */
+  build?: BuildOutcome;
 }
 
-/** Fold a readable identity's raw lines into per-classification counts; an unreadable identity carries all-zero counts (its `outcome` is what actually matters). */
-export function buildIdentityReport(opts: { uid: number; unit: string; journalNote: string; outcome: ReadOutcome }): IdentityReport {
+/** Fold a readable identity's raw lines into per-classification counts; an unreadable identity carries all-zero counts (its `outcome` is what actually matters). `build` is a second, independent axis (see `BuildOutcome`'s doc comment) — passed through untouched, never derived from `outcome`. */
+export function buildIdentityReport(opts: { uid: number; unit: string; journalNote: string; outcome: ReadOutcome; build?: BuildOutcome }): IdentityReport {
   const counts: Record<AliasClass | "unknown", number> = { drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0 };
   if (opts.outcome.readable) {
     for (const line of opts.outcome.lines) {
@@ -226,7 +321,7 @@ export function buildIdentityReport(opts: { uid: number; unit: string; journalNo
       if (parsed) counts[parsed.classification]++;
     }
   }
-  return { uid: opts.uid, unit: opts.unit, journalNote: opts.journalNote, outcome: opts.outcome, ...counts };
+  return { uid: opts.uid, unit: opts.unit, journalNote: opts.journalNote, outcome: opts.outcome, ...counts, ...(opts.build ? { build: opts.build } : {}) };
 }
 
 export type Verdict = "CONDITION_MET" | "CONDITION_NOT_MET" | "INCONCLUSIVE";
@@ -261,8 +356,18 @@ export function computeVerdict(identities: IdentityReport[]): VerdictResult {
   return { verdict: "CONDITION_MET", unreadable, totals };
 }
 
-/** Render the full per-identity + verdict report as text for stdout. Pure — takes the already-computed reports, prints nothing itself. */
-export function formatReport(identities: IdentityReport[], result: VerdictResult): string {
+/** Sentinel for an `IdentityReport` built (almost always by a test) without a `build` outcome — never actually produced by `main()`, which always passes one. Distinct wording from `decideBuildIdentity`'s "predates the field" reason: this means "nobody even asked", not "asked and got nothing". */
+const BUILD_NOT_PROBED: BuildOutcome = { known: false, reason: "build identity was not probed" };
+
+/**
+ * Render the full per-identity + verdict report as text for stdout. Pure —
+ * takes the already-computed reports (plus `nowMs`, for the one relative
+ * value — uptime — this renders), prints nothing itself. Build identity
+ * (BUTCHR-54) is printed for EVERY identity regardless of journal
+ * readability, and vice versa — the two axes never mask each other (see
+ * `BuildOutcome`'s doc comment).
+ */
+export function formatReport(identities: IdentityReport[], result: VerdictResult, nowMs: number): string {
   const lines: string[] = [];
   for (const id of identities) {
     if (id.outcome.readable) {
@@ -273,6 +378,7 @@ export function formatReport(identities: IdentityReport[], result: VerdictResult
     } else {
       lines.push(`identity uid=${id.uid} unit=${id.unit} — UNREADABLE: ${id.outcome.reason} (${id.journalNote})`);
     }
+    lines.push(`  ${formatBuildLine(id.build ?? BUILD_NOT_PROBED, nowMs)}`);
   }
   lines.push("");
   lines.push(
@@ -339,17 +445,22 @@ export function describeSkippedUnit(cgroup: string | null): string {
   return info.kind === "none" ? "(not a systemd unit)" : info.unit;
 }
 
-async function isButchrHealth(port: number): Promise<boolean> {
+/** `/health`'s body when (and only when) it's daemon-shaped; `null` on any failure or a non-daemon-shaped response. The one live probe both discovery (`isButchrHealth`) and build-identity extraction (`decideBuildIdentity`) are built on — never a second, divergent probe. */
+async function fetchHealthBody(port: number): Promise<unknown | null> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 1000);
     const res = await fetch(`http://localhost:${port}/health`, { signal: controller.signal });
     clearTimeout(timeout);
     const body = (await res.json()) as { ok?: unknown; components?: unknown };
-    return typeof body.ok === "boolean" && Array.isArray(body.components);
+    return typeof body.ok === "boolean" && Array.isArray(body.components) ? body : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function isButchrHealth(port: number): Promise<boolean> {
+  return (await fetchHealthBody(port)) !== null;
 }
 
 // A long-lived host's full journal for a unit can run into hundreds of
@@ -405,6 +516,17 @@ async function main(): Promise<void> {
 
   const reports: IdentityReport[] = [];
   for (const identity of byIdentity.values()) {
+    // One /health round trip per identity (not per readability branch below):
+    // liveness AND build identity (BUTCHR-54) both come from the same probe,
+    // never a second, potentially-divergent one.
+    // Promise.all, never Promise.race: race resolves on the first SETTLED
+    // promise, so a fast miss from one socket could beat a slower hit from
+    // another and understate liveness — `some`/`find` are exact regardless
+    // of which port answers first.
+    const bodies = await Promise.all(identity.ports.map(fetchHealthBody));
+    const liveNow = bodies.some((b) => b !== null);
+    const build = decideBuildIdentity(bodies.find((b) => b !== null) ?? null);
+
     if (identity.uid === null || identity.cgroup === null) {
       reports.push(
         buildIdentityReport({
@@ -412,6 +534,7 @@ async function main(): Promise<void> {
           unit: "(unknown)",
           journalNote: "ss -ltne reported no uid/cgroup for this confirmed daemon socket",
           outcome: { readable: false, reason: "ss -ltne did not expose uid/cgroup for this socket — this host disagrees with the verified-unprivileged route this script assumes; investigate before trusting anything else here" },
+          build,
         }),
       );
       continue;
@@ -419,24 +542,19 @@ async function main(): Promise<void> {
     const systemd = parseCgroup(identity.cgroup);
     const unit = systemd.kind === "none" ? "(none)" : systemd.unit;
     const invocation = journalInvocationFor(systemd, identity.uid, readerUid);
-    // Promise.all, never Promise.race: race resolves on the first SETTLED
-    // promise, so a fast `false` from one socket could beat a slower `true`
-    // from another and understate liveness — `some` is exact regardless of
-    // which port answers first.
-    const liveNow = (await Promise.all(identity.ports.map(isButchrHealth))).some(Boolean);
 
     if (!invocation.command) {
-      reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome: { readable: false, reason: invocation.note } }));
+      reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome: { readable: false, reason: invocation.note }, build }));
       continue;
     }
 
     const probe = runJournalctl(invocation.command);
     const outcome = decideReadability({ probe, targetUid: identity.uid, readerUid, confirmedLiveViaHealth: liveNow });
-    reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome }));
+    reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome, build }));
   }
 
   const result = computeVerdict(reports);
-  console.log(formatReport(reports, result));
+  console.log(formatReport(reports, result, Date.now()));
 
   process.exit(result.verdict === "CONDITION_MET" ? 0 : result.verdict === "CONDITION_NOT_MET" ? 1 : 2);
 }
