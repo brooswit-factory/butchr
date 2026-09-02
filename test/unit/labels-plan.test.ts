@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canHavePr, desiredLabels, diffLabels, isDaemonLabel } from "../../src/labels/plan.js";
+import { ALL_AGENT_LABEL_KEYS, canHavePr, desiredLabels, diffLabels, isDaemonLabel, type AgentLabel } from "../../src/labels/plan.js";
 
 describe("canHavePr", () => {
   test("epics never have a branch, so they can never have a PR (case-insensitive)", () => {
@@ -107,5 +107,37 @@ describe("diffLabels", () => {
     const diff = diffLabels(["needs-design", "pr:approved"], ["agent:idle", "pr:approved"]);
     expect(diff.add).toEqual([]); // "needs-design" is not daemon-owned, so it's dropped, not added
     expect(diff.remove).toEqual(["agent:idle"]);
+  });
+});
+
+// BUTCHR-144/BUTCHR-155: the startup sweep's SWEEP_JQL (src/labels/sweep.ts)
+// used to select on a hand-written `labels IN (...)` list that never included
+// "agent:stalled" — a ticket carrying it was never revisited once inactive,
+// so it kept the stale label indefinitely. ALL_AGENT_LABEL_KEYS is the
+// value-level anchor that fix derives from; see src/labels/plan.ts's header
+// on ALL_AGENT_LABELS for the full argument.
+describe("ALL_AGENT_LABEL_KEYS (BUTCHR-144/BUTCHR-155: the sweep's selection is derived from AgentLabel, not hand-maintained)", () => {
+  // 5 members today (BUTCHR-144's own union count) — update this list
+  // deliberately, alongside AgentLabel in ./plan.ts, not by reflex.
+  test("contains exactly one agent:-prefixed key per AgentLabel member, nothing else", () => {
+    expect([...ALL_AGENT_LABEL_KEYS].sort()).toEqual(["agent:blocked", "agent:idle", "agent:none", "agent:stalled", "agent:working"]);
+  });
+
+  // THE FALSIFIER for this test and the one above it in src/labels/sweep.ts's
+  // "SWEEP_JQL's labels IN (...) clause" describe block: this test would
+  // still PASS while BUTCHR-144's bug is present if TypeScript allowed a
+  // `Record<AgentLabel, true>` literal to omit a key — it does not. Omitting
+  // any one of the five keys below is a compile error ("Property '<name>' is
+  // missing"), enforced by `bun run typecheck` on every PR, the same door
+  // src/labels/registry.ts's LABEL_REGISTRY uses (see its own
+  // "@ts-expect-error" tests further down this describe block's sibling file,
+  // test/unit/labels-registry.test.ts). This is the mechanism that forces
+  // ALL_AGENT_LABEL_KEYS above — and therefore SWEEP_JQL's selection in
+  // src/labels/sweep.ts — to grow the moment AgentLabel grows, at the
+  // developer's desk, before review, rather than at review time or never.
+  test("omitting a member from a Record<AgentLabel, true> does not compile", () => {
+    // @ts-expect-error — Record<AgentLabel, true> requires all five keys; "stalled" is missing here.
+    const incomplete: Record<AgentLabel, true> = { working: true, idle: true, blocked: true, none: true };
+    expect(incomplete).toBeDefined();
   });
 });

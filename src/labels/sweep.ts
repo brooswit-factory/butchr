@@ -1,5 +1,5 @@
 import type { JiraIssue } from "../atlassian/types.js";
-import { isAgentLabel } from "./plan.js";
+import { ALL_AGENT_LABEL_KEYS, isAgentLabel } from "./plan.js";
 import type { LabelWriter } from "./sync.js";
 
 export interface SweepDeps {
@@ -9,7 +9,20 @@ export interface SweepDeps {
   log?: (line: string) => void;
 }
 
-const SWEEP_JQL = 'assignee = currentUser() AND status NOT IN ("In Progress", "In Review") AND labels IN ("agent:working", "agent:idle", "agent:blocked", "agent:none")';
+/**
+ * BUTCHR-144/BUTCHR-155: the `labels IN (...)` clause is DERIVED from
+ * `ALL_AGENT_LABEL_KEYS` (./plan.ts), not hand-maintained here — that array
+ * is itself anchored to the `AgentLabel` union via a value-level Record (see
+ * ./plan.ts's `ALL_AGENT_LABELS` and its header for why a bare `type` cannot
+ * do this alone, and for what that anchor cannot see). Before BUTCHR-155,
+ * this was a hand-written literal list of four values that never included
+ * `agent:stalled` — a ticket carrying that label was never selected by this
+ * sweep, so it kept the stale label indefinitely after going inactive while
+ * the daemon was down. See test/unit/labels-sweep.test.ts for the runtime
+ * check that this clause really is built from that array, not merely
+ * consistent with it today.
+ */
+const SWEEP_JQL = `assignee = currentUser() AND status NOT IN ("In Progress", "In Review") AND labels IN (${ALL_AGENT_LABEL_KEYS.map((l) => `"${l}"`).join(", ")})`;
 
 /**
  * One-time startup sweep for `agent:*` labels stranded by a ticket that went
