@@ -31,6 +31,14 @@ import { WORKSPACE_PLACEHOLDERS, type WorkspacePlaceholder } from "../agents/wor
  * both build against that measured mechanism, not the ticket's original
  * headline.
  *
+ * BUTCHR-172/BUTCHR-154: `../media/registry.ts` is the INDEX of all four
+ * media (this one included) and the grading of how strongly each one's
+ * records are made safe — NOT a shared abstraction over this file,
+ * `src/labels/registry.ts`, and `src/headers/registry.ts`; unifying the
+ * three was considered there and declined, on grounds this file's own
+ * "GENUINE MISMATCH" paragraph below already argues for the workspace
+ * medium specifically.
+ *
  * TWO DOORS, SAME SHAPE AS `src/headers/registry.ts`'s AND
  * `src/labels/registry.ts`'s, NEITHER PROVING WHAT IT LOOKS LIKE IT PROVES:
  *   1. THE TYPE-LEVEL DOOR (this file). `WORKSPACE_REGISTRY` is typed
