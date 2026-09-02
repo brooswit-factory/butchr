@@ -210,11 +210,94 @@ const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 
 const describeRole = (role: "Story" | "Task" | "Epic", id: string | undefined): string =>
   id ? truncAccountId(id) : `unset — ${role} creation will be refused`;
 
+type Role = "story" | "task" | "epic";
+const ROLE_ENV_VAR: Record<Role, string> = { story: "BUTCHR_ASSIGNEE_STORY", task: "BUTCHR_ASSIGNEE_TASK", epic: "BUTCHR_ASSIGNEE_EPIC" };
+/** Ranks a role by hierarchy depth so a colliding pair can be named as "the OWNER that owns this OWNED" rather than an unordered set — matches the phrasing new_worker/adopt_worker's own S1 collision message uses (src/tools/relationship.ts). */
+const ROLE_RANK: Record<Role, number> = { epic: 0, story: 1, task: 2 };
+
+/**
+ * BUTCHR-110/S2: every pair among the SET roles whose accountId is
+ * IDENTICAL — unset is a DIFFERENT condition (see `describeRole` above,
+ * unaffected by this) and is never reported here. Pairwise across exactly
+ * {story, task, epic}: the project↔epic hop is deliberately NOT compared
+ * here (see `describeConfig`'s own honesty clause below for why, and why
+ * that omission must be STATED rather than silent).
+ */
+function collidingRolePairs(assignees: Config["assignees"]): Array<[Role, Role]> {
+  const set = (Object.keys(ROLE_ENV_VAR) as Role[]).filter((r) => assignees[r]);
+  const pairs: Array<[Role, Role]> = [];
+  for (let i = 0; i < set.length; i++) {
+    for (let j = i + 1; j < set.length; j++) {
+      const a = set[i]!;
+      const b = set[j]!;
+      if (assignees[a] === assignees[b]) pairs.push([a, b]);
+    }
+  }
+  return pairs;
+}
+
+/**
+ * BUTCHR-110/S2 — THE HONESTY CLAUSE, the graded part of this check
+ * (measured by BUTCHR-100, 2026-09-02): a daemon whose LOCAL role map has
+ * only STORY and TASK set, both different accounts, reports a clean boot
+ * under a naive pairwise comparison — even when a live Epic in the SAME
+ * fleet, staffed by a DIFFERENT daemon under a different Unix user, carries
+ * an assignee identical to this daemon's task role. This daemon's role map
+ * has no epic entry at all, so it has nothing local to compare that Epic
+ * against — the collapsed epic↔task hop is real and this check cannot see
+ * it. A clean report is read as "checked and safe", so the clean case is
+ * exactly the one that must not be silent about what it did not look at.
+ * This clause is therefore ALWAYS present — collision or none — never only
+ * alongside a finding (a clause that only shows up when there's a problem
+ * is decoration, not honesty).
+ *
+ * Also carries the (weaker, still true) per-daemon scoping: the role map is
+ * per-daemon and two daemons in this fleet have been observed to disagree
+ * about it, so a line that reads as a statement about "the fleet" would be
+ * plausible-but-wrong for a reader on a different daemon.
+ *
+ * DELIBERATELY DOES NOT CLOSE THE GAP: the project↔epic hop's caller side is
+ * this daemon's Atlassian CREDENTIAL, whose accountId is not known without a
+ * Jira call (`ops.getMyself()`), and this function — like all of
+ * `loadConfig`/`describeConfig` — is pure and synchronous by design. Adding
+ * a Jira call here is out of scope (BUTCHR-103, reaffirmed on this ticket).
+ * The OPTIONAL bounded improvement the ticket allows — comparing each
+ * configured role against the accountId this daemon itself runs as, if that
+ * accountId falls out of a call already made at startup — is SKIPPED: as of
+ * this change, `src/daemon/index.ts` calls `describeConfig` synchronously,
+ * directly after `app.listen`, before any Atlassian call of any kind (the
+ * first `ops.getMyself()` in this codebase runs later, inside the project
+ * resource loop's own poll — async, and gated behind a non-empty
+ * `BUTCHR_PROJECT_ALLOWLIST` besides). Taking the improvement would mean
+ * adding a call and/or moving this check out of the pure rendering
+ * function, both explicitly out of scope here — so it is skipped, and S1
+ * (`new_worker`/`adopt_worker`, src/tools/relationship.ts) remains the check
+ * that actually catches the project↔epic hop, and the case measured above.
+ */
+function describeCollisions(assignees: Config["assignees"]): string {
+  const pairs = collidingRolePairs(assignees);
+  const hopLines = pairs.map(([a, b]) => {
+    const [owner, owned] = ROLE_RANK[a] < ROLE_RANK[b] ? [a, b] : [b, a];
+    return (
+      `${ROLE_ENV_VAR[a]} and ${ROLE_ENV_VAR[b]} (the ${a} and ${b} roles) are the SAME accountId on THIS daemon (${truncAccountId(assignees[a]!)}) — ` +
+      `the ${owner} that owns a ${owned} will not be able to approve its PR: GitHub refuses an approval from the PR's own author`
+    );
+  });
+  const found = hopLines.length ? hopLines.join("; ") : "none among this daemon's currently-SET roles";
+  const honesty =
+    "this compares LOCALLY CONFIGURED role variables ONLY; a tier staffed by a DIFFERENT daemon has no local variable here to compare against " +
+    "(measured, BUTCHR-100 2026-09-02: a daemon with only story/task set can report clean while a live Epic staffed elsewhere collapses onto its task role); " +
+    "a clean report here is NOT evidence every review hop on this Epic's fleet is sound — the project↔epic hop in particular is never checked here at all (no Jira call at config load); " +
+    "new_worker/adopt_worker's own staffing-time check (S1) is what actually catches what this cannot";
+  return `${found} — ${honesty}`;
+}
+
 /** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
+  `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"}`;
