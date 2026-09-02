@@ -13,7 +13,7 @@ import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
-import { createEscalator } from "../agents/escalation-loop.js";
+import { createEscalator, type CommentRow } from "../agents/escalation-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -30,10 +30,9 @@ import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
-import { speakOnOwnChannel } from "../tools/speak.js";
+import { speakOnOwnChannel, unwrapStorageParagraph } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { projectRootDoc } from "../tools/docs.js";
-import type { CommentRow } from "../agents/escalation-helper.js";
 
 let config;
 try {
@@ -394,6 +393,44 @@ runResourceLoop(projectResourceType, {
   onNotifySuccess: () => projectNotifyHealth.recordSuccess(),
 });
 
+// BUTCHR-124: the read half symmetric to the `addComment` dep's
+// speakOnOwnChannel routing just above — an ISSUE key's Jira comments (the
+// SAME reader `atlassian.comments` already is), a PROJECT key's Confluence
+// root-doc FOOTER comments (`projectRootDoc` + `ops.getPageComments`, the
+// documented "per-page only, never the batch form" reader — see
+// AtlassianOps.getPageComments's own doc comment). Deliberately NEVER
+// catches here: both branches reject on failure exactly as written, so
+// `escalateUnresponsive`'s own fail-closed handling (src/agents/
+// escalation-loop.ts) sees a real rejection rather than a laundered empty
+// result. `getPageComments` has no `created` timestamp on its rows — mapped
+// to `""`, which `Date.parse` turns into `NaN`, which the caller already
+// falls back to `deps.now()` for.
+//
+// REVIEW FINDING (PR #180, CHANGES_REQUESTED @ 1be6208): `getPageComments`
+// requests `bodyFormat: "storage"` and returns raw storage-format XHTML — the
+// SAME wrapped-and-escaped shape `speakOnOwnChannel` writes
+// (`<p>${escapeStorageText(text)}</p>`, src/tools/speak.ts), not the plain
+// text a caller posted. Read literally, a row's body starts with
+// `<p>[butchr:unresponsive]`, not `[butchr:unresponsive]` — the exact
+// string `findMarked` (escalation-helper.ts) anchors on with
+// `startsWith(marker)`, so restart-adoption silently never matched on the
+// project tier, the one this whole ticket was chosen to cover. Fixed by
+// `unwrapStorageParagraph` — speak.ts's own exported inverse of the wrapping
+// it writes, kept there so this can never drift from `escapeStorageText` and
+// so a later project-tier read-back reuses the SAME inverse. See that
+// function's doc comment for the decode-order reasoning and
+// test/unit/speak.test.ts for the round-trip proof against a REAL
+// `<p>${escapeStorageText(unresponsiveComment(...))}</p>` input, not a
+// hand-simplified stand-in.
+async function ownChannelComments(key: string): Promise<CommentRow[]> {
+  if (isProjectId(key)) {
+    const doc = await projectRootDoc(ops, key);
+    const { results } = await ops.getPageComments(doc.id);
+    return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
+  }
+  return atlassian.comments(key);
+}
+
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for
 // issues that are currently blocked AND already escalated, never on the 15s
@@ -412,6 +449,8 @@ const escalator = createEscalator({
   // the same seam BUTCHR-71 already shipped for report_to_boss/ask_boss.
   addComment: async (issue, text) => { await speakOnOwnChannel(ops, issue, text); },
   comments: (issue) => atlassian.comments(issue),
+  ownChannelComments,
+  unresponsiveMinutes: config.unresponsiveMinutes,
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
   // BUTCHR-16: durably capture the full pane text at the moment a dialog
