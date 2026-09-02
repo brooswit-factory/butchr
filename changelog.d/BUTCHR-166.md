@@ -1,0 +1,4 @@
+bump: patch
+
+### Fixed
+- Correct two label-scanner coverage overclaims in `src/labels/registry.ts` (AC-9(a)) and `src/labels/label-scan.ts` ("WHAT THIS CANNOT SEE"): both previously claimed the literal scanner finds none of the daemon-owned `agent:*`/`pr:*` label values, and is "silent about them by construction." It is not silent — it finds all nine, but only circularly, as `LABEL_REGISTRY`'s own declared keys in `registry.ts`, never at the concatenation sites (`AGENT_PREFIX + suffix` / `PR_PREFIX + prState` in `src/labels/sync.ts`) where those labels are actually emitted. The scanner's conclusion — it is not a coverage proof for the `agent:`/`pr:` families — was already correct and is unchanged; only the false stated reason is replaced, with the circularity mechanism above rather than a fresh count.
