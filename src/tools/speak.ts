@@ -1,6 +1,7 @@
 import type { AtlassianOps } from "./atlassian.js";
 import { projectRootDoc } from "./docs.js";
 import { isProjectId } from "../resources/id.js";
+import { advanceProjectWatermark } from "../resources/project.js";
 
 /**
  * WHERE A RESOURCE SPEAKS — named and required by the epic (BUTCHR-62, ruled
@@ -29,28 +30,35 @@ import { isProjectId } from "../resources/id.js";
  * before being posted — `ops.commentOnPage` takes storage-format XHTML, and
  * `taggedText` here is always plain text.
  *
- * A KNOWN HAZARD THIS FUNCTION DOES NOT SOLVE, STATED RATHER THAN FIXED —
- * per the epic's explicit instruction on BUTCHR-71, this is written down and
- * then left alone: a PROJECT calling this posts a Confluence COMMENT on its
- * own root doc, and "the root doc received a comment" is one of the THREE
- * WAKE EVENTS the project resource type (BUTCHR-67) will wake a project on.
+ * HAZARD 1, CLOSED HERE (BUTCHR-67/BUTCHR-81) — was a known-but-unfixed risk
+ * left by BUTCHR-71: a PROJECT calling this posts a Confluence COMMENT on
+ * its own root doc, and "the root doc received a comment" is one of the
+ * project resource type's three wake triggers (src/resources/project.ts).
  * Left alone, a project's own `report_to_boss`/`ask_boss` call would wake
- * ITSELF, in a loop. This fleet's own-write ledger
- * (src/jira-watch/own-writes.ts) exists for exactly this class of problem —
- * BUT it records JIRA writes keyed by issue; a project's root-doc comment is
- * a CONFLUENCE write, a different write surface the existing ledger does
- * not cover today. And because a Confluence comment does NOT bump the
- * page's own version (measured live by the epic on BUTCHR-62, 2026-09-01:
- * version 5 before, 5 after a comment), comment-watching and
- * version-watching are two SEPARATE polls — so this self-wake risk travels
- * specifically on the COMMENT poll BUTCHR-67 will build, not the version
- * one. BUTCHR-67 owns solving this; it is written down here, precisely,
- * so that story inherits the hazard instead of discovering it live.
+ * ITSELF, in a loop. The fix is NOT the Jira-keyed own-write ledger
+ * (src/jira-watch/own-writes.ts) — MEASURED unusable for a project key (its
+ * `search("key IN (...)")` silently returns empty for a bare project key)
+ * — it is a WATERMARK: immediately after `commentOnPage` succeeds, this
+ * function advances that project's `wake.comment` watermark
+ * (src/resources/project.ts's `advanceProjectWatermark`) to the id
+ * `commentOnPage` just returned. The very next poll's discovery read sees
+ * that comment already caught up, so neither `verdictFor` nor `eventRules`
+ * counts it as a pending trigger. A FOREIGN comment never calls this
+ * function, so it is never watermarked here and still wakes the project —
+ * the failure condition this fix must not also swallow (see
+ * test/unit/project-resource-type.test.ts). The watermark write is
+ * fail-open (a rejected write is caught, not thrown): the comment itself
+ * already succeeded by the time this runs, and a secondary bookkeeping
+ * failure must never surface as a failed `report_to_boss`/`ask_boss` call.
  */
 export async function speakOnOwnChannel(ops: AtlassianOps, callerKey: string, taggedText: string): Promise<unknown> {
   if (isProjectId(callerKey)) {
     const doc = await projectRootDoc(ops, callerKey);
-    return ops.commentOnPage(doc.id, `<p>${escapeStorageText(taggedText)}</p>`);
+    const created = (await ops.commentOnPage(doc.id, `<p>${escapeStorageText(taggedText)}</p>`)) as { id?: string } | undefined;
+    if (created?.id) {
+      await advanceProjectWatermark(ops, callerKey, { comment: created.id }).catch(() => {});
+    }
+    return created;
   }
   return ops.addComment(callerKey, taggedText);
 }
