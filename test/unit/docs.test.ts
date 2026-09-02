@@ -109,6 +109,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
   getMyself: async () => ({ accountId: "test-account" }),
   setProjectProperty: async () => ({ ok: true }),
   getPageVersions: async () => ({}),
+  getIssueComments: async () => ({ results: [] }),
   getProjectPropertyOrNull: async () => null,
   };
 

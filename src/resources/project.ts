@@ -147,7 +147,7 @@
  * constant's own comment for the call-count budget behind the number).
  */
 import type { AtlassianOps } from "../tools/atlassian.js";
-import type { JiraComment, JiraIssue } from "../atlassian/types.js";
+import type { JiraIssue } from "../atlassian/types.js";
 import type {
   Activation,
   EventPoll,
@@ -401,19 +401,24 @@ const projectKeyOfIssue = (key: string): string => key.split("-", 1)[0]!;
 export interface ProjectResourceDeps {
   ops: AtlassianOps;
   /**
-   * Jira-shaped reads (rule 3: epics in review, and their comments) — the
-   * SAME shape `src/resources/issue.ts`'s `IssueResourceDeps` already takes,
+   * Jira-shaped epic-in-review read (rule 3) — the SAME shape
+   * `src/resources/issue.ts`'s `IssueResourceDeps.search` already takes,
    * wired from the daemon's existing `atlassian` client, per the ticket's
    * instruction not to add Confluence-shaped work to that client or a third
-   * one. `comments` is REQUIRED, not optional: rule 3's epic axis watermarks
-   * each epic's newest comment id, deliberately NOT its `updated` field —
-   * see `ProjectWatermark.epics`'s doc comment for the measured reason
-   * (label-sync churn on an in-review ticket bumps `updated` every 1-3
-   * minutes, faster than this story's own poll interval, which would leave
-   * an `updated`-keyed watermark permanently behind).
+   * one. Per-epic COMMENTS are read via `ops.getIssueComments` instead of a
+   * second injected dependency (BUTCHR-81, found at review): that op is the
+   * exact same reader (same endpoint, same newest-first ordering, same cap)
+   * `check_in`'s (src/tools/defs.ts) epic-watermark write already uses, so
+   * the two can never disagree — see `getIssueComments`'s own doc comment
+   * on AtlassianOps for the "one reader, not two" reasoning. Rule 3's epic
+   * axis watermarks each epic's newest comment id, deliberately NOT its
+   * `updated` field — see `ProjectWatermark.epics`'s doc comment for the
+   * measured reason (label-sync churn on an in-review ticket bumps
+   * `updated` every 1-3 minutes, faster than this story's own poll
+   * interval, which would leave an `updated`-keyed watermark permanently
+   * behind).
    */
   search: (jql: string) => Promise<JiraIssue[]>;
-  comments: (key: string) => Promise<readonly JiraComment[]>;
 }
 
 interface EligibleCandidate {
@@ -495,13 +500,15 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     eligible.map(async (p, i): Promise<ProjectResource> => {
       const rootDocId = p.property.rootDoc!.id!;
       const epics = epicsByProject.get(p.key) ?? [];
-      // One comments() call per IN-REVIEW epic only (usually zero epics,
-      // per this file's own call-count budget) — deliberately not batched
-      // (there is no bulk comments read), and deliberately not `updated`
-      // (see ProjectWatermark.epics's doc comment for the measured
-      // label-churn reason).
+      // One getIssueComments() call per IN-REVIEW epic only (usually zero
+      // epics, per this file's own call-count budget) — deliberately not
+      // batched (there is no bulk comments read), and deliberately not
+      // `updated` (see ProjectWatermark.epics's doc comment for the
+      // measured label-churn reason). The SAME reader `check_in`
+      // (src/tools/defs.ts) uses to watermark this same axis — see
+      // `getIssueComments`'s own doc comment on AtlassianOps.
       const observedEpics: ProjectEpic[] = await Promise.all(
-        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId(await deps.comments(epic.key)) })),
+        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId((await deps.ops.getIssueComments(epic.key)).results) })),
       );
       const wake = p.property.wake;
       return {

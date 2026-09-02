@@ -154,7 +154,7 @@ interface FakeWorld {
   ops: AtlassianOps;
   deps: ProjectResourceDeps;
   properties: Map<string, Record<string, unknown>>;
-  calls: { getPageVersions: string[][]; getPageComments: string[]; search: string[]; getProjectPropertyOrNull: string[] };
+  calls: { getPageVersions: string[][]; getPageComments: string[]; getIssueComments: string[]; search: string[]; getProjectPropertyOrNull: string[] };
 }
 
 function fakeWorld(opts: {
@@ -168,7 +168,7 @@ function fakeWorld(opts: {
   epicComments?: Record<string, Array<{ id: string }>>;
 }): FakeWorld {
   const properties = new Map(Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, Record<string, unknown>][]);
-  const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], search: [] as string[], getProjectPropertyOrNull: [] as string[] };
+  const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], getIssueComments: [] as string[], search: [] as string[], getProjectPropertyOrNull: [] as string[] };
 
   const unimplemented = (name: string) => async (..._a: unknown[]) => {
     throw new Error(`fake ops: ${name} not used by this test`);
@@ -232,6 +232,10 @@ function fakeWorld(opts: {
       calls.getPageComments.push(pageId);
       return { results: opts.pageComments?.[pageId] ?? [] };
     },
+    getIssueComments: async (key: string) => {
+      calls.getIssueComments.push(key);
+      return { results: opts.epicComments?.[key] ?? [] };
+    },
   };
 
   const deps: ProjectResourceDeps = {
@@ -240,7 +244,6 @@ function fakeWorld(opts: {
       calls.search.push(jql);
       return opts.epicsInReview ?? [];
     },
-    comments: async (key: string) => (opts.epicComments?.[key] ?? []) as never,
   };
 
   return { ops, deps, properties, calls };

@@ -259,4 +259,24 @@ export interface AtlassianOps {
    * thrown error — callers must treat absence as "unknown", not "version 0".
    */
   getPageVersions(pageIds: readonly string[]): Promise<Record<string, number>>;
+
+  /**
+   * A Jira issue's own comments, NEWEST FIRST, capped — the SAME ordering
+   * and cap as `src/atlassian/client.ts`'s `AtlassianClient.comments()`
+   * (`orderBy: "-created", maxResults: 20`), deliberately, not a second
+   * independent reader.
+   *
+   * WHY THIS EXISTS (BUTCHR-81, found at review): the `check_in` tool
+   * (src/tools/defs.ts) originally read an in-review epic's comments via
+   * plain `getIssue`'s EMBEDDED `fields.comment` block, which is
+   * ASCENDING/oldest-first (MEASURED live) with an unconfirmed cap — if
+   * that block is ever truncated, `newestCommentId` over it silently
+   * returns a STALE id, disagreeing with discovery's own reader (which is
+   * newest-first and therefore always correct regardless of any cap). Two
+   * readers of "the same fact" that can disagree is exactly the class of
+   * bug this epic has already ruled against twice (the Confluence comment
+   * capability itself, and `getPageComments`) — "one reader, not two".
+   * This op is that one reader, reused by both discovery and `check_in`.
+   */
+  getIssueComments(key: string): Promise<{ results: Array<{ id: string }> }>;
 }

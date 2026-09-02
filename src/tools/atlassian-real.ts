@@ -337,5 +337,13 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       for (const p of r?.results ?? []) if (p?.id != null && p?.version?.number != null) out[String(p.id)] = p.version.number;
       return out;
     },
+
+    // Same endpoint, same ordering/cap as src/atlassian/client.ts's own
+    // `comments()` — see this op's doc comment on AtlassianOps for why that
+    // match is load-bearing rather than incidental.
+    getIssueComments: (key) =>
+      jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", maxResults: 20 }).then((r: any) => ({
+        results: (r?.comments ?? []).map((c: any) => ({ id: c.id })),
+      })),
   };
 }

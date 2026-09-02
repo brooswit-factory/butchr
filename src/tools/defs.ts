@@ -657,16 +657,18 @@ export function atlassianTools(
         // empty ({} correctly clears every previously-recorded entry for a
         // project with nothing in review right now).
         //
-        // getIssue (not the batched search) per in-review epic, deliberately:
-        // a plain getIssue already returns `fields.comment.comments` with no
-        // extra `fields` param (MEASURED live, BUTCHR-81 2026-09-01) — this
-        // reuses that rather than widening `ops.search`'s fields for every
-        // caller of the shared jira_search tool. Usually zero calls: most
-        // polls have no epic in review at all.
+        // ops.getIssueComments (NOT getIssue's embedded fields.comment
+        // block) per in-review epic, deliberately: an EARLIER version of
+        // this read used getIssue's embedded block, which was found at
+        // review to be ASCENDING/oldest-first with an unconfirmed cap — if
+        // ever truncated, it silently disagrees with discovery's own
+        // reader (which is newest-first and always correct). getIssueComments
+        // is the SAME reader discovery uses (see its own doc comment on
+        // AtlassianOps), so the two can never disagree by construction.
+        // Usually zero calls: most polls have no epic in review at all.
         const epics: Record<string, string | null> = {};
         for (const epic of epicsRaw?.issues ?? []) {
-          const full = (await ops.getIssue(epic.key)) as { fields?: { comment?: { comments?: Array<{ id: string }> } } };
-          epics[epic.key] = newestCommentId(full.fields?.comment?.comments ?? []);
+          epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
         }
         audit(c, `check_in (version=${version ?? "?"}, comment=${comment ?? "none"}, epics in review=${Object.keys(epics).length})`);
         await advanceProjectWatermark(ops, who, {

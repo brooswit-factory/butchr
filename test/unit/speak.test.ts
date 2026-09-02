@@ -59,6 +59,7 @@ function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; ji
       return { ok: true };
     },
     getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
     getProjectPropertyOrNull: async (projectKey: string) => properties.get(projectKey) ?? null,
     ...overrides,
   };
