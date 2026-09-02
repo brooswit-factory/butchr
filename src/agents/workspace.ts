@@ -8,6 +8,8 @@ import STORY from "../../briefs/story.md" with { type: "text" };
 import TASK from "../../briefs/task.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
+import { buildIdentity } from "./build-identity.js";
+import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 
 export interface SpawnSpec { key: string; issuetype: string; summary: string; parent: string | null }
@@ -76,7 +78,7 @@ export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string): string {
   const dir = join(workspaceRoot(), spec.key);
   mkdirSync(dir, { recursive: true });
-  const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl));
+  const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
   writeFileSync(join(dir, "CLAUDE.md"), interpolate(CLAUDE_MD, spec, groundTruth));
   writeFileSync(join(dir, "brief.md"), interpolate(briefFor(spec.issuetype), spec));
   writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: { "x-issue": spec.key } } } }, null, 2));
