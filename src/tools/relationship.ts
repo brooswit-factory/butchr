@@ -961,15 +961,24 @@ function correctionRejectedAnnotationBody(workerKey: string, editError: string):
 
 /**
  * Documented, non-configurable Jira Cloud limits, established rather than
- * guessed (BUTCHR-136): `description` is bounded by Jira's
- * `jira.text.field.character.limit`, fixed at 32767 in Cloud and not
- * configurable there — Atlassian's own support KB for the exact error this
- * verb catches (`CONTENT_LIMIT_EXCEEDED`) quotes the caller-facing text
- * verbatim as "The entered text is too long. It exceeds the allowed limit
- * of 32,767 characters." `summary` is a separate system field with its own
- * fixed 255-character limit ("Summary can't exceed 255 characters") — the
- * two fields are NOT the same limit, which is why this is two constants,
- * not one reused twice.
+ * guessed (BUTCHR-136, corrected on review): Jira Cloud enforces a fixed
+ * 32767-character limit on rich-text fields, `description` included — this
+ * is NOT the `jira.text.field.character.limit` advanced setting (that
+ * setting is a Server/Data Center mechanism, configurable there, and does
+ * not exist as a readable or writable Cloud setting at all; asserting
+ * "fixed... and not configurable" under that name would be true on Server/DC
+ * for the wrong reason and wrong on Cloud, where the setting is simply
+ * absent). The 32767 figure itself is corroborated, not sourced, by
+ * Atlassian's support KB for `CommentBodyCharacterLimitExceededException`
+ * (a Cloud Migration Assistant comment-body limit) quoting the same string
+ * verbatim: "The entered text is too long. It exceeds the allowed limit of
+ * 32,767 characters." — that KB is about a different field in a different
+ * tool, cited here only because it independently lands on the same number
+ * as the `CONTENT_LIMIT_EXCEEDED` error this verb actually catches.
+ * `summary` is a separate system field with its own fixed 255-character
+ * Cloud limit ("Summary can't exceed 255 characters") — the two fields are
+ * NOT the same limit, which is why this is two constants, not one reused
+ * twice.
  *
  * Sanity-checked against this corpus's own falsifier before shipping:
  * BUTCHR-125 holds a description Jira ACCEPTED at 30,091 characters
