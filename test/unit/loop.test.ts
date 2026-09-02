@@ -176,6 +176,160 @@ describe("reconcileNow storm guard (RespawnGuard)", () => {
   });
 });
 
+describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/stop/respawn must not abort the whole poll", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+
+  /**
+   * THE TICKET'S OWN FALSIFIER, reproduced as an automated test: this exact
+   * fixture (desired = {BAD-1, GOOD-1, STALE-1}; running = {OLD-1, STALE-1};
+   * STALE-1 stale; BAD-1's spawn throws) is what BUTCHR-147's own probe ran
+   * at the base commit (df65dc8) — measured there: threw out of
+   * `reconcileNow` entirely, `spawns: ["GOOD-1"]` (already in flight when the
+   * `Promise.all` rejected), `stops: []`, `respawned: []`. THIS TEST FAILS ON
+   * THAT BASE COMMIT and PASSES on this branch — the DoD's required
+   * fails-on-base/passes-on-branch proof.
+   */
+  test("a rejecting BAD-1 spawn no longer aborts GOOD-1's spawn, OLD-1's stop, or STALE-1's respawn — and reconcileNow itself does not throw", async () => {
+    const herd = fakeHerd(
+      ["OLD-1", "STALE-1"],
+      [{ issue: "STALE-1", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "x"] }],
+    );
+    const originalSpawn = herd.spawn.bind(herd);
+    herd.spawn = async (sp) => {
+      if (sp.key === "BAD-1") throw new Error("workspace.create failed");
+      await originalSpawn(sp);
+    };
+    const desired = new Map([["BAD-1", spec("BAD-1")], ["GOOD-1", spec("GOOD-1")], ["STALE-1", spec("STALE-1")]]);
+    const respawned: string[] = [];
+    // The whole call must resolve, not reject.
+    await reconcileNow(herd, desired, { onRespawn: async (issue) => { respawned.push(issue); } });
+
+    expect(herd.spawned.sort()).toEqual(["GOOD-1", "STALE-1"]); // GOOD-1 spawned fresh; STALE-1 respawned
+    expect(herd.stopped.sort()).toEqual(["OLD-1", "STALE-1"]);  // OLD-1 stopped as no-longer-desired; STALE-1 stopped as part of its respawn
+    expect(respawned).toEqual(["STALE-1"]);
+    expect([...herd.running].sort()).toEqual(["GOOD-1", "STALE-1"]); // BAD-1 never made it in; OLD-1 is gone
+  });
+
+  test("a rejecting herd.stop for one resource does not prevent another resource's stop this same poll", async () => {
+    const herd = fakeHerd(["BAD-STOP", "OK-STOP"]);
+    const originalStop = herd.stop.bind(herd);
+    herd.stop = async (i) => {
+      if (i === "BAD-STOP") throw new Error("pane.close failed");
+      await originalStop(i);
+    };
+    await reconcileNow(herd, new Map()); // neither desired — both should be attempted
+    expect(herd.stopped).toEqual(["OK-STOP"]); // OK-STOP's stop actually completed; BAD-STOP's threw before recording
+    expect([...herd.running]).toEqual(["BAD-STOP"]); // OK-STOP left `running`; BAD-STOP's failed stop left it running still
+  });
+
+  test("a rejecting spawn-half of one respawn does not prevent another resource's respawn this same poll, and onRespawn fires only for the one that fully succeeded", async () => {
+    const herd = fakeHerd(
+      ["BAD-RESPAWN", "OK-RESPAWN"],
+      [
+        { issue: "BAD-RESPAWN", reason: "x", observedArgv: [] },
+        { issue: "OK-RESPAWN", reason: "y", observedArgv: [] },
+      ],
+    );
+    const originalSpawn = herd.spawn.bind(herd);
+    herd.spawn = async (sp) => {
+      if (sp.key === "BAD-RESPAWN") throw new Error("agent.start failed");
+      await originalSpawn(sp);
+    };
+    const desired = new Map([["BAD-RESPAWN", spec("BAD-RESPAWN")], ["OK-RESPAWN", spec("OK-RESPAWN")]]);
+    const respawned: string[] = [];
+    await reconcileNow(herd, desired, { onRespawn: async (issue) => { respawned.push(issue); } });
+
+    expect(herd.stopped.sort()).toEqual(["BAD-RESPAWN", "OK-RESPAWN"]); // both stop halves ran
+    expect(herd.spawned).toEqual(["OK-RESPAWN"]); // only the succeeding spawn half landed
+    expect(respawned).toEqual(["OK-RESPAWN"]); // onRespawn must NOT fire for the failed one (§7)
+    expect([...herd.running]).toEqual(["OK-RESPAWN"]); // BAD-RESPAWN left stopped-and-unattended, not running
+  });
+
+  test("a rejecting stop-half of one respawn never attempts that resource's spawn half, and onRespawn does not fire for it", async () => {
+    const herd = fakeHerd(["BAD-RESPAWN"], [{ issue: "BAD-RESPAWN", reason: "x", observedArgv: [] }]);
+    herd.stop = async () => { throw new Error("pane.close failed"); };
+    const desired = new Map([["BAD-RESPAWN", spec("BAD-RESPAWN")]]);
+    const respawned: string[] = [];
+    await reconcileNow(herd, desired, { onRespawn: async (issue) => { respawned.push(issue); } });
+    expect(herd.spawned).toEqual([]); // spawn half never attempted once stop threw
+    expect(respawned).toEqual([]);
+  });
+
+  test("checkReconcileFailure is called ONCE per poll, after every isolated attempt, with exactly the failures this poll produced plus desired.keys() AND herd.runningIssues() (REVIEW FIX, PR #204 round 1)", async () => {
+    const herd = fakeHerd(["OLD"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    herd.running.add("STALE");
+    herd.spawn = async (sp) => {
+      if (sp.key === "BAD") throw new Error("boom-spawn");
+      if (sp.key === "STALE") throw new Error("boom-respawn-spawn");
+    };
+    const desired = new Map([["BAD", spec("BAD")], ["STALE", spec("STALE")]]);
+    const calls: Array<{ failures: readonly { id: string; stage: string; error: unknown }[]; desired: readonly string[]; running: readonly string[] }> = [];
+    await reconcileNow(herd, desired, {
+      checkReconcileFailure: async (failures, desiredKeys, running) => { calls.push({ failures, desired: desiredKeys, running }); },
+    });
+    expect(calls.length).toBe(1);
+    const byId = Object.fromEntries(calls[0]!.failures.map((f) => [f.id, f]));
+    expect(byId["BAD"]!.stage).toBe("spawn");
+    expect((byId["BAD"]!.error as Error).message).toBe("boom-spawn");
+    expect(byId["STALE"]!.stage).toBe("respawn");
+    expect((byId["STALE"]!.error as Error).message).toBe("boom-respawn-spawn");
+    expect(calls[0]!.desired.slice().sort()).toEqual(["BAD", "STALE"]);
+    // OLD (running, not desired) is a `plan.stop` candidate — it must be
+    // visible in `running` even though it is absent from `desired`, or the
+    // detector's own fix (union `desired` with `running` for pruning) has
+    // nothing to prune against. This is the exact defect PR #204's review
+    // caught: before the fix, `running` was never passed at all.
+    expect(calls[0]!.running.slice().sort()).toEqual(["OLD", "STALE"]);
+  });
+
+  test("negative case: an ordinary poll with no rejection behaves EXACTLY as before — checkReconcileFailure is called with an empty failures array, same spawns/stops/respawns/onRespawn as with the hook omitted entirely", async () => {
+    const makeHerd = () => fakeHerd(["OLD", "STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const spec2 = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const desired = new Map([["NEW", spec2("NEW")], ["STALE", spec2("STALE")]]);
+
+    const withoutHook = makeHerd();
+    const respawnedWithout: string[] = [];
+    await reconcileNow(withoutHook, desired, { onRespawn: async (i) => { respawnedWithout.push(i); } });
+
+    const withHook = makeHerd();
+    const respawnedWith: string[] = [];
+    const failureCalls: unknown[][] = [];
+    await reconcileNow(withHook, desired, {
+      onRespawn: async (i) => { respawnedWith.push(i); },
+      checkReconcileFailure: async (failures) => { failureCalls.push([...failures]); },
+    });
+
+    expect(withHook.spawned.sort()).toEqual(withoutHook.spawned.sort());
+    expect(withHook.stopped.sort()).toEqual(withoutHook.stopped.sort());
+    expect(respawnedWith).toEqual(respawnedWithout);
+    expect(failureCalls).toEqual([[]]); // called once, with zero failures
+  });
+
+  test("a genuinely daemon-level failure (herd.runningIssues() rejecting) still propagates out of reconcileNow — isolation never widens to swallow this (§7)", async () => {
+    const herd: Herd = {
+      async runningIssues() { throw new Error("herdr down"); },
+      async staleIssues() { return []; },
+      async spawn() {},
+      async stop() {},
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    await expect(reconcileNow(herd, new Map([["A", spec("A")]]))).rejects.toThrow("herdr down");
+  });
+
+  test("a genuinely daemon-level failure (herd.staleIssues() rejecting) still propagates out of reconcileNow", async () => {
+    const herd: Herd = {
+      async runningIssues() { return []; },
+      async staleIssues() { throw new Error("herdr down"); },
+      async spawn() {},
+      async stop() {},
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    await expect(reconcileNow(herd, new Map([["A", spec("A")]]))).rejects.toThrow("herdr down");
+  });
+});
+
 describe("startLoop: parent is membership only — never notified", () => {
   test("a changed child notifies its own agent only; its parent is NOT notified", async () => {
     const herd = fakeHerd();

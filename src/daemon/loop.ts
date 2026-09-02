@@ -4,6 +4,8 @@ import { planReconcile } from "../reconcile/plan.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
+import type { ReconcileFailure } from "../agents/reconcile-failure.js";
+export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
 export type { NotifyReason } from "../resources/types.js";
 import type { NotifyReason } from "../resources/types.js";
 
@@ -209,6 +211,20 @@ export interface ReconcileOptions {
    * this ticket, and any caller with nothing to report through).
    */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
+  /**
+   * BUTCHR-147: audible-only isolated-failure detection. Called ONCE per
+   * poll, AFTER the spawn/stop/respawn stages below have all been attempted
+   * (isolated — see this function's own doc comment), with the set of
+   * per-resource failures this poll actually produced and `desired.keys()`
+   * (for pruning — see src/agents/reconcile-failure.ts). Its return value is
+   * `void` and is NEVER consulted: like `checkCrashLoop`, it only observes
+   * and speaks, never gates or retries anything itself — every failed
+   * resource is retried again next poll exactly as before regardless of
+   * what this hook does. Optional; omitted, no isolated-failure detection
+   * runs (every caller before this ticket, and any caller with nothing to
+   * report through).
+   */
+  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
 }
 
 /**
@@ -221,6 +237,38 @@ export interface ReconcileOptions {
  *
  * Generic over resource id already (an opaque string key + SpawnSpec) —
  * nothing here is issue-shaped, so this needed no change for BUTCHR-69.
+ *
+ * BUTCHR-147 — FAULT ISOLATION, PER RESOURCE: a rejecting `herd.spawn`,
+ * `herd.stop`, or the `herd.stop`/`herd.spawn` pair inside one `respawn`
+ * iteration is caught and recorded (never re-thrown) so it can never abort
+ * this function or affect any OTHER resource's spawn/stop/respawn this same
+ * poll — measured, before this fix, via `Promise.all` rejecting on the
+ * first rejecting `herd.spawn` and aborting `stop`/`respawn` for the entire
+ * fleet (see this ticket's own probe). Only `herd.staleIssues()` and
+ * `herd.runningIssues()` above are DELIBERATELY left unwrapped: a rejection
+ * there means the poll has no valid snapshot to reconcile against at all, so
+ * it must still fail this function and propagate (see `checkReconcileFailure`'s
+ * own doc comment, and this ticket's own report for why this is a genuinely
+ * different failure than an isolated herd.spawn/stop/respawn rejection).
+ *
+ * `/health` DECISION (BUTCHR-147 §6), STATED HERE BECAUSE THIS IS THE SITE
+ * THAT CHANGED IT: before this ticket, ANY rejecting herd.spawn/stop/respawn
+ * threw out of this function, which propagated out of the poll's fetch stage
+ * and skipped `onPollSuccess` — so a single failing resource degraded the
+ * poll-loop `/health` component BY ACCIDENT, and misleadingly: the daemon was
+ * alive and correctly reconciling every OTHER resource the whole time. This
+ * is a DELIBERATE REVERSAL: an isolated per-resource failure no longer
+ * throws out of `reconcileNow` at all, so it no longer prevents
+ * `onPollSuccess` (src/daemon/loop.ts's `runResourceLoop`) from firing.
+ * `/health`'s poll-loop component now reports exactly what it claims to be a
+ * liveness signal for — whether the poll loop itself is alive — and no
+ * longer doubles as a misdirected per-resource error signal. The per-resource
+ * fact instead surfaces on that resource's OWN channel via
+ * `checkReconcileFailure` above, which is where an operator can actually act
+ * on it (see src/agents/reconcile-failure.ts). A genuinely daemon-level
+ * failure (herd.staleIssues()/runningIssues() rejecting, above) still
+ * throws, still skips `onPollSuccess`, and still degrades `/health` — that
+ * case is untouched by this reversal.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
   const guard = opts.guard ?? new RespawnGuard();
@@ -259,8 +307,31 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // notifications included — for N times that wait. Each issue's spawn is
   // independent (its own workspace directory, its own pane), so nothing
   // requires them to run one after another.
-  await Promise.all(plan.spawn.map((issue) => herd.spawn(desired.get(issue)!)));
-  for (const issue of plan.stop) await herd.stop(issue);
+  //
+  // BUTCHR-147: each mapped async function catches its OWN rejection — the
+  // outer `Promise.all` therefore never rejects on a bad spawn, unlike
+  // before this ticket. One resource's `workspace.create`/`agent.start`
+  // failure is recorded into `failures` and never touches any other
+  // resource's spawn this same `Promise.all`.
+  const failures: ReconcileFailure[] = [];
+  await Promise.all(plan.spawn.map(async (issue) => {
+    try {
+      await herd.spawn(desired.get(issue)!);
+    } catch (e) {
+      failures.push({ id: issue, stage: "spawn", error: e });
+    }
+  }));
+  // BUTCHR-147: sequential, same as before (stop has no documented wait to
+  // parallelize against) — but each iteration's rejection is now caught so
+  // one bad `herd.stop` no longer aborts the REST of this loop (every other
+  // resource still gets stopped this poll) or the `respawn` loop below.
+  for (const issue of plan.stop) {
+    try {
+      await herd.stop(issue);
+    } catch (e) {
+      failures.push({ id: issue, stage: "stop", error: e });
+    }
+  }
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
     if (!guard.admit(issue, poll)) {
@@ -271,10 +342,68 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       );
       continue;
     }
-    await herd.stop(issue);
-    await herd.spawn(desired.get(issue)!);
+    // BUTCHR-147 §7: `guard.admit` above already recorded this respawn
+    // BEFORE `stop` runs (RespawnGuard's own contract, untouched by this
+    // ticket — see this function's own report for why a failed respawn does
+    // NOT need to release the guard slot: a resource left stopped-and-not-
+    // respawned below is no longer `running`, so it can never again satisfy
+    // `stale ∩ desired ∩ running` — the guard's own condition for firing —
+    // until it is freshly spawned and found stale again; it falls into the
+    // ORDINARY `spawn` list on the very next poll instead, unaffected by
+    // this guard window at all).
+    try {
+      await herd.stop(issue);
+      await herd.spawn(desired.get(issue)!);
+    } catch (e) {
+      // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
+      // is unaffected. If `stop` succeeded but `spawn` then threw, `issue`
+      // is now stopped and not respawned — left unattended until the next
+      // poll's ORDINARY `spawn` list picks it up (see the guard comment
+      // above), same one-poll delay this resource would have had anyway
+      // under the OLD (whole-poll-aborting) behaviour, since polling is
+      // periodic regardless. `opts.onRespawn` is deliberately NOT called
+      // here (see immediately below): the herd-level respawn itself failed,
+      // so there is nothing to notify about.
+      failures.push({ id: issue, stage: "respawn", error: e });
+      continue;
+    }
+    // BUTCHR-147 §7: only reached when BOTH herd.stop and herd.spawn above
+    // succeeded — `opts.onRespawn` (the daemon's `[butchr:respawn]` Jira
+    // notice, wired in src/daemon/index.ts) must not fire for a respawn
+    // whose herd-level half failed. Deliberately left OUTSIDE the try/catch
+    // above, unchanged from before this ticket: `onRespawn` is a caller-
+    // supplied NOTIFICATION hook, not a herd operation, and this ticket's
+    // isolation scope is herd.spawn/stop/respawn specifically (its own
+    // title) — production wiring already guarantees this callback never
+    // throws (see daemon/index.ts's own `.catch` around its Jira comment).
     if (opts.onRespawn) await opts.onRespawn(issue, info.reason, info.observedArgv);
   }
+  // BUTCHR-147: called once per poll, after every isolated spawn/stop/respawn
+  // attempt above — never gates or delays anything (see ReconcileOptions.checkReconcileFailure's own doc comment).
+  // REVIEW FIX (PR #204 round 1): `running` (captured once, above, same
+  // array `planReconcile` itself used) is now passed alongside `desired` —
+  // the detector's own pruning needs BOTH to safely track a `plan.stop`
+  // failure, which is never in `desired` (see reconcile-failure.ts's
+  // `ReconcileFailureDetector.check` doc comment for the full reasoning).
+  //
+  // NOT double-wrapped in a try/catch here (PR #204 review, non-blocking):
+  // deliberately consistent with `checkCrashLoop` immediately above, not
+  // with `checkParked`'s belt-and-suspenders wrap in `runResourceLoop`
+  // below — a real disagreement between two call sites in this same file,
+  // called out explicitly by the reviewer. The choice made here: this
+  // detector's OWN "never throws" contract (`check`'s internal try/catch,
+  // src/agents/reconcile-failure.ts) is exactly as load-bearing as
+  // `checkCrashLoop`'s equivalent guarantee at the call site directly
+  // above, which has never been double-wrapped either — a second wrapper
+  // HERE would add no guarantee beyond what `check`'s own try/catch already
+  // gives, only a duplicate of it. `checkParked`'s extra wrap is not doing
+  // the same job: it exists because that hook runs several calls further
+  // into the SAME fetch-stage function, so a regression to ITS "never
+  // throws" contract would otherwise take `onPollSuccess` down with it in a
+  // way harder to trace back to the actual offender. If `check`'s own
+  // try/catch here is ever removed or narrowed, this call site becomes
+  // exactly that same hazard and should be wrapped too.
+  if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
 }
 
 /**
@@ -397,6 +526,8 @@ export interface GenericLoopDeps<T> {
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
   /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
+  /** BUTCHR-147: see `ReconcileOptions.checkReconcileFailure`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance, same reasoning as `checkCrashLoop` above. Optional; omitted, no isolated-failure detection runs. */
+  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -479,6 +610,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
+        ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
