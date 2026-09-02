@@ -26,6 +26,24 @@ export interface CommentRow { id: string; body: string; created: string }
  */
 export const UNRESPONSIVE_MARKER = "[butchr:unresponsive]";
 
+/**
+ * BUTCHR-171: the follow-up nudge's own discriminator, checked ALONGSIDE
+ * (never instead of) a fingerprint substring — see the constant's use-site
+ * below for why both are required together. Both the escalation
+ * (`escalationComment`, escalate.ts) and this follow-up start with the SAME
+ * `MARKER` and both mention the fingerprint in their text, which is exactly
+ * why a single-signal discriminator is not safe here: this tag exists SO
+ * THAT an escalation is never mistaken for an already-posted follow-up
+ * (which would silently suppress a real escalation — the single most
+ * dangerous direction, this epic's outcome inverted) and a follow-up is
+ * never mistaken for an escalation (which would corrupt `escalatedAt`'s
+ * origin, this file's `escalate()` adoption). Deliberately NOT reusing
+ * escalate.ts's `fingerprint: ` (colon) spelling anywhere in the follow-up
+ * text below — that exact substring is what `escalate()`'s own adoption
+ * check anchors on, and reusing it would make a follow-up match it too.
+ */
+export const FOLLOWUP_STAGE = "[stage: followup]";
+
 export interface EscalatorDeps {
   read: (paneId: string) => Promise<string>;
   send: (paneId: string, text: string) => Promise<void>;
@@ -627,12 +645,30 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
 
     if (s.followedUpAt === undefined && deps.now() - escalatedAtMs >= FOLLOWUP_MS) {
-      await deps.addComment(
-        issue,
-        `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket so it escalates to whoever watches you.`,
-      );
-      s.followedUpAt = deps.now();
-      log(`follow-up posted ${issue} fp=${s.fp}`);
+      // BUTCHR-171: durable dedupe, mirroring escalate()'s own restart-safe
+      // adoption — read-the-channel-and-adopt-your-own-prior-comment instead
+      // of trusting the in-memory `followedUpAt` alone (which a restart
+      // clears, turning "no memory of nudging" into "never nudged"). Reuses
+      // the SAME `rows` already fetched above for the directive scan — one
+      // channel snapshot per poll, not a second read. `FOLLOWUP_STAGE` plus
+      // the fingerprint is required TOGETHER so this can only ever adopt
+      // ITS OWN prior follow-up for THIS episode's fingerprint, never a
+      // stale follow-up for a since-replaced dialog, and — the collision
+      // this constant's own doc comment names — never the escalation
+      // comment itself, which carries neither `FOLLOWUP_STAGE` nor this
+      // parenthesised fingerprint spelling.
+      const existingFollowup = findMarked(rows, MARKER, [FOLLOWUP_STAGE, `(fingerprint ${s.fp})`]);
+      if (existingFollowup) {
+        s.followedUpAt = Date.parse(existingFollowup.created) || deps.now();
+        log(`adopted existing follow-up ${issue} fp=${s.fp} from comment ${existingFollowup.id} (daemon restart)`);
+      } else {
+        await deps.addComment(
+          issue,
+          `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket so it escalates to whoever watches you. ${FOLLOWUP_STAGE}`,
+        );
+        s.followedUpAt = deps.now();
+        log(`follow-up posted ${issue} fp=${s.fp}`);
+      }
     }
   }
 

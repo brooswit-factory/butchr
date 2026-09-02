@@ -162,9 +162,31 @@ export interface CommentRow { id: string; body: string; created: string }
  * post-hoc check on the response. Deliberately never catches here either:
  * both branches reject on failure exactly as written, so each caller's own
  * fail-closed handling sees a real rejection rather than a laundered empty
- * result. `getPageComments` has no `created` timestamp on its rows — mapped
- * to `""`, which `Date.parse` turns into `NaN`, which each caller already
- * falls back to its own `now()` for.
+ * result.
+ *
+ * `created` (BUTCHR-171, correcting the paragraph this replaces): mapped
+ * from `ops.getPageComments`' own `created` field when present — sourced
+ * from the footer comment's `version.createdAt` (see `AtlassianOps.
+ * getPageComments`'s doc comment for what that timestamp actually measures
+ * and the last-edited-vs-created distinction it accepts). Falls back to
+ * `""` ONLY for the row-level case where the underlying read genuinely
+ * carried no timestamp — never to `Date.now()`/`deps.now()`: a caller that
+ * cannot tell "unavailable" from "just now" would treat a stale row as
+ * fresh, exactly backwards from what the recency filter this feeds
+ * (escalation-loop.ts's `CLOCK_SKEW_GRACE_MS` check) exists to do.
+ *
+ * ORDERING (BUTCHR-171): `getPageComments` requests no `sort` (see its own
+ * doc comment) and this function no longer trusts its return order —
+ * `results` is sorted here, newest-first by NUMERIC comment id, before
+ * mapping. Confluence footer-comment ids are monotonically increasing
+ * platform-wide (MEASURED live, `src/resources/project.ts`'s
+ * `newestCommentId` doc comment; INHERITED here, not independently
+ * re-measured). Id order, not `created`, is what settles this: `created`
+ * can be `""` per-row (see above) and is a last-edited time even when
+ * present, neither of which a stable total order can be built on, while a
+ * platform-monotonic id can. This is a POST-CONDITION this function
+ * enforces itself, not a request the API is trusted to honour — it holds
+ * even if `getPageComments`'s own return order changes.
  *
  * UNWRAPPING (BUTCHR-129, found at PR #180 review, CHANGES_REQUESTED @
  * 1be6208): `getPageComments` requests `bodyFormat: "storage"` and returns
@@ -194,7 +216,9 @@ export function createOwnChannelComments(
     if (isProjectId(key)) {
       const doc = await projectRootDoc(ops, key);
       const { results } = await ops.getPageComments(doc.id);
-      return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
+      return [...results]
+        .sort((a, b) => Number(b.id) - Number(a.id))
+        .map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: r.created ?? "" }));
     }
     return [...(await issueComments(key))];
   };
