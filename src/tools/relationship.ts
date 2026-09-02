@@ -1,7 +1,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
+import { findBossKey, findWorkers, ensureDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
@@ -310,6 +310,65 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
     throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
   return issue;
+}
+
+/**
+ * BUTCHR-193 — the shared "open worker" check behind all three closing
+ * doors (finish_worker, finish_without_a_boss, submit_to_boss). ONE
+ * DEFINITION, justified here, so a future reader who disagrees has exactly
+ * one place to argue with: a worker is OPEN unless its status is Done, or
+ * it carries `EXEMPT_LABEL` (`butchr:shelved`) — a recorded, reasoned
+ * deferral (`shelve_worker`), not silent abandonment. To Do, In Progress and
+ * In Review are ALL open: an In Review worker still has a live review hop
+ * ahead of it (its own boss's `finish_worker`), and closing the boss out
+ * from under that hop is exactly the shape of the BUTCHR-127/BUTCHR-159
+ * defect this exists to catch — reaching a terminal state does not mean the
+ * worker's own doorway has closed, only Done means that.
+ *
+ * COST, PER §2/§2b of this ticket's own spec (MEASURED, not assumed — see
+ * `findWorkers`'s own doc comment in docs.ts): `issue`'s own payload already
+ * carries every worker's key AND status via `findWorkers`, no extra Jira
+ * call — so the common case (no workers, or every worker already Done)
+ * costs EXACTLY ZERO extra reads, preserving whatever cost profile the
+ * caller already had before this guard existed. The label read this
+ * function needs to tell "genuinely open" from "deliberately shelved" is
+ * NOT on that payload (MEASURED: the outward stub's hydrated field set
+ * never includes `labels`) — so it is paid with one extra `getIssue` PER
+ * NON-DONE WORKER, and only then: exactly the path where this is already
+ * about to refuse, never the healthy common case.
+ */
+async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef[]> {
+  const nonDone = findWorkers(issue).filter((w) => w.status !== "Done");
+  if (nonDone.length === 0) return [];
+  const open: WorkerRef[] = [];
+  for (const w of nonDone) {
+    const full = await ops.getIssue(w.key);
+    if (!labelsOf(full).includes(EXEMPT_LABEL)) {
+      open.push({ key: w.key, status: statusOf(full) ?? w.status });
+    }
+  }
+  return open;
+}
+
+/**
+ * The refusal message shared by all three closing doors — deliberately
+ * matching the teaching voice `finishWithoutABoss`'s own has-a-boss refusal
+ * already uses (see that function): names every offending worker WITH its
+ * status, and BOTH discharge verbs by name, so an agent that hits this can
+ * act without reading any ticket, this one included. No exemption, no
+ * grandfather clause — BUTCHR-92's own rejected carve-out (see this ticket's
+ * PR body) is exactly the shape this message refuses to offer: the only
+ * ways through are finishing the worker for real, or recording a deliberate
+ * deferral with `shelve_worker`.
+ */
+function openWorkersRefusal(verb: string, key: string, open: WorkerRef[]): string {
+  const plural = open.length > 1;
+  const list = open.map((w) => `${w.key} (${w.status ?? "unknown status"})`).join(", ");
+  return (
+    `${verb}: ${key} still has open worker${plural ? "s" : ""} it undertook to close: ${list} — refusing. ` +
+    `For each: finish_worker it if the work is actually done, or shelve_worker(worker, reason) to record a deliberate deferral with a stated activation condition, not a silent one. ` +
+    `A boss reaching Done or In Review while a worker it undertook to close is still open is the exact failure BUTCHR-193 exists to stop — it happened once already (BUTCHR-127/BUTCHR-159) and was only caught because a human remembered.`
+  );
 }
 
 /**
@@ -664,6 +723,15 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
  * A worker never finishes itself — see submit_to_boss; the review hop is the
  * point.
  *
+ * BUTCHR-193: ALSO REFUSES WHEN THE WORKER BEING CLOSED STILL HAS OPEN
+ * WORKERS OF ITS OWN — the guard looks at the WORKER's own children (the
+ * caller's grandchildren), not the caller's, since it is the worker's own
+ * undertaking to close ITS workers that this call is about to make
+ * unreachable. Reuses the fetch `assertOwnWorker` already made — see
+ * `openWorkers`'s own doc comment for the exact cost. The message names
+ * every offending worker with its status and both discharge paths
+ * (`finish_worker`, `shelve_worker`) by name.
+ *
  * CLEARS `EXEMPT_LABEL` FIRST, ONLY IF PRESENT, THEN TRANSITIONS — same
  * ordering and reasoning as `startWorker` above. Done is not shelved: a
  * finished ticket that still carries the exemption is the exact residue this
@@ -672,6 +740,8 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
  */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("finish_worker", workerKey, open));
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
@@ -1734,8 +1804,24 @@ export async function askBoss(ops: AtlassianOps, callerKey: string, text: string
   return speakOnOwnChannel(ops, callerKey, tagComment(callerKey, `${ASK_MARKER} ${text}`));
 }
 
-/** The caller's OWN ticket -> In Review. No arguments at all — the one transition an agent is always entitled to make about itself. */
+/**
+ * The caller's OWN ticket -> In Review. No arguments at all — the one
+ * transition an agent is always entitled to make about itself.
+ *
+ * BUTCHR-193: REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS OWN —
+ * the one added `getIssue` this verb pays that it didn't before (see
+ * `openWorkers`'s own doc comment for the full cost accounting). Deliberately
+ * the EARLIEST of the three closing-door guards an agent can hit: it tells
+ * the agent that can actually fix the problem, at the moment it becomes that
+ * agent's problem, rather than surfacing later as a refusal its BOSS hits
+ * about somebody else's children. `finish_worker`'s own guard alone would
+ * already catch the same defect one hop later — this one is earlier, better-
+ * placed feedback, not the load-bearing catch.
+ */
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
+  const issue = await ops.getIssue(callerKey);
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("submit_to_boss", callerKey, open));
   return ops.transition(callerKey, "In Review");
 }
 
@@ -1787,6 +1873,17 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  * question belongs to whoever decides if and when the project tier above
  * epics gets built — a human call, not an agent's to make by building or
  * not building this.
+ *
+ * BUTCHR-193: ALSO REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS
+ * OWN — ADDITIVE AND ORTHOGONAL to the has-a-boss refusal above, which this
+ * leaves byte-identical (condition, message, and position): that refusal
+ * narrows the UPWARD precondition (BUTCHR-92's still-shelved narrowing,
+ * refuse a caller that HAS a boss); this adds a DOWNWARD one (refuse a
+ * caller that HAS OPEN WORKERS). They compose without touching each other.
+ * See `openWorkers` for what "open" means and its cost, and this ticket's
+ * PR body for why this does not reproduce BUTCHR-92's circle: that circle
+ * had no exit for ANY caller; this refusal always has one — finish_worker
+ * the worker for real, or shelve_worker it with a reason.
  */
 export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
@@ -1796,6 +1893,8 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
       `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");
 }
 
