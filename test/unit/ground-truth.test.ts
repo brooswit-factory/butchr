@@ -59,6 +59,7 @@ describe("groundTruthText", () => {
       port: 7719,
       pid: 4242,
       systemd: { kind: "user", unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" },
+      measuredAt: "2026-09-02T05:19:06.000Z",
     });
     expect(text).toContain("servyboi");
     expect(text).toContain("7719");
@@ -70,13 +71,24 @@ describe("groundTruthText", () => {
   });
 
   test("honest 'no journal to read' text when not under systemd, never a guessed unit", () => {
-    const text = groundTruthText({ hostname: "servyboi", port: 7719, pid: 4242, systemd: { kind: "none" } });
+    const text = groundTruthText({ hostname: "servyboi", port: 7719, pid: 4242, systemd: { kind: "none" }, measuredAt: "2026-09-02T05:19:06.000Z" });
     expect(text).toContain("not running under a systemd unit — no journal to read");
     expect(text).toContain("systemd unit: (none");
   });
 
   test("honest 'unknown' port text when mcpUrl didn't parse, never a fake number", () => {
-    const text = groundTruthText({ hostname: "servyboi", port: undefined, pid: 4242, systemd: { kind: "none" } });
+    const text = groundTruthText({ hostname: "servyboi", port: undefined, pid: 4242, systemd: { kind: "none" }, measuredAt: "2026-09-02T05:19:06.000Z" });
     expect(text).toContain("port: unknown");
+  });
+
+  // BUTCHR-169: this record is registered `GROUND_TRUTH` in
+  // src/workspace/registry.ts as deliberately, permanently un-withdrawn —
+  // this pins the one honesty concession that entry's reason relies on: a
+  // timestamp a reader COULD compare against, even though nothing here
+  // compares it automatically. Losing this line silently would make that
+  // registry entry's reason false without any test noticing.
+  test("carries a measured-at timestamp so staleness is at least detectable by a reader, never automatically", () => {
+    const text = groundTruthText({ hostname: "servyboi", port: 7719, pid: 4242, systemd: { kind: "none" }, measuredAt: "2026-09-02T05:19:06.000Z" });
+    expect(text).toContain("measured at: 2026-09-02T05:19:06.000Z");
   });
 });
