@@ -166,6 +166,14 @@ function fakeWorld(opts: {
   pageComments?: Record<string, Array<{ id: string; body: string }>>;
   epicsInReview?: JiraIssue[];
   epicComments?: Record<string, Array<{ id: string }>>;
+  // BUTCHR-91/BUTCHR-68: defaults to admitting every project passed in
+  // `projects` — every PRE-EXISTING test in this file constructs a
+  // `fakeWorld` without this field and must keep exercising exactly the
+  // lead/eligibility behavior it already asserts, unaffected by the
+  // allowlist this ticket adds. Pass an explicit `allowlist` only in a test
+  // that means to exercise the allowlist itself (see the "allowlist" describe
+  // block below).
+  allowlist?: readonly string[];
 }): FakeWorld {
   const properties = new Map(Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, Record<string, unknown>][]);
   const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], getIssueComments: [] as string[], search: [] as string[], getProjectPropertyOrNull: [] as string[] };
@@ -244,6 +252,7 @@ function fakeWorld(opts: {
       calls.search.push(jql);
       return opts.epicsInReview ?? [];
     },
+    allowlist: new Set(opts.allowlist ?? opts.projects.map((p) => p.key)),
   };
 
   return { ops, deps, properties, calls };
@@ -283,6 +292,59 @@ describe("discovery — Declaration 1 (client-side lead filter)", () => {
     });
     const result = await createProjectResourceType(w.deps).discovery.search();
     expect(result.map((p) => p.key)).toEqual(["ACME"]);
+  });
+});
+
+describe("discovery — allowlist (BUTCHR-91/BUTCHR-68: opt-in staffing scope, default OFF)", () => {
+  // Failure condition, stated first: an EMPTY allowlist must yield ZERO
+  // projects even though both live projects are led by this credential and
+  // fully eligible — the same shape a naive (allowlist-less) wiring would
+  // staff. A one-sided assertion here (just "result is []") would also pass
+  // a reject-everything implementation, so this is paired with the very
+  // next test — the SAME two projects, only `allowlist` differs — proving
+  // the empty result comes from the allowlist actually filtering, not from
+  // a stub that always returns nothing.
+  test("empty allowlist -> zero projects staffed, even though both candidates are led and eligible", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "ACME", name: "Acme", leadAccountId: "acct-A" },
+        { key: "BETA", name: "Beta", leadAccountId: "acct-A" },
+      ],
+      properties: { ACME: PROPERTY_A, BETA: PROPERTY_B },
+      pageVersions: { "doc-A": 1, "doc-B": 1 },
+      allowlist: [],
+    });
+    const result = await createProjectResourceType(w.deps).discovery.search();
+    expect(result).toEqual([]);
+    // The own control: none of the per-project I/O below ran either — an
+    // unlisted project must cost nothing beyond the in-memory filter (see
+    // `loadProjects`'s own comment on this).
+    expect(w.calls.getProjectPropertyOrNull).toEqual([]);
+    expect(w.calls.getPageVersions).toEqual([]);
+    expect(w.calls.getPageComments).toEqual([]);
+  });
+
+  // The control half of the pair above, and the direct proof of Definition
+  // of Done item 2(b): the SAME two led-and-eligible candidates, only ACME
+  // named in the allowlist -> ACME staffed, BETA excluded despite being
+  // equally led and equally eligible. Failure condition: BETA appearing in
+  // the result, or ACME missing, either one means the filter isn't scoping
+  // to exactly the named key.
+  test("allowlist naming ACME -> exactly ACME staffed; BETA (equally led, equally eligible) excluded", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "ACME", name: "Acme", leadAccountId: "acct-A" },
+        { key: "BETA", name: "Beta", leadAccountId: "acct-A" },
+      ],
+      properties: { ACME: PROPERTY_A, BETA: PROPERTY_B },
+      pageVersions: { "doc-A": 1, "doc-B": 1 },
+      allowlist: ["ACME"],
+    });
+    const result = await createProjectResourceType(w.deps).discovery.search();
+    expect(result.map((p) => p.key)).toEqual(["ACME"]);
+    expect(result[0]!.eligible).toBe(true);
   });
 });
 

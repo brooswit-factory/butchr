@@ -8,6 +8,8 @@ import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
+import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
+import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -102,6 +104,26 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
+// BUTCHR-91/BUTCHR-68: the project tier's own pair of liveness components,
+// so `/health` (and an operator asking "is the project tier deployed?")
+// gets a truthful answer even when its allowlist is empty — the loop below
+// always starts, so these always report SOMETHING (starting/ok/stale)
+// rather than being silently absent. Threshold is a 4x multiple of the
+// project loop's OWN 5-minute interval, mirroring the issue tier's own
+// ratio above (60_000 / 15_000 = 4) rather than reusing `config.pollStaleMs`
+// (tuned for a 15s loop; applied to a 5-minute one it would flap red on
+// perfectly normal cadence).
+const PROJECT_POLL_STALE_MS = PROJECT_POLL_INTERVAL_MS * 4;
+const projectLoopHealth = createLoopHealth({
+  name: "projectPollLoop",
+  thresholdMs: PROJECT_POLL_STALE_MS,
+  log: (line) => console.error(line),
+});
+const projectNotifyHealth = createLoopHealth({
+  name: "projectNotify",
+  thresholdMs: PROJECT_POLL_STALE_MS,
+  log: (line) => console.error(line),
+});
 
 const { app, mcp } = buildApp({
   state: async () => {
@@ -118,7 +140,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity)),
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity)),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -215,6 +237,15 @@ const issueResourceType = createIssueResourceType({
 
 runResourceLoop(issueResourceType, {
   herd,
+  // BUTCHR-91/BUTCHR-68: required as of the project tier's own second
+  // `runResourceLoop` instance below — both loops share this ONE `herd`
+  // (one flat `butchr-*` agent namespace), so each must scope its own
+  // reconcile to only the ids it owns or they evict each other's agents on
+  // every poll (see loop.ts's `scopedHerd` doc comment for the measured
+  // mechanism). `isIssueKey`/`isProjectId` (src/resources/id.ts) are
+  // mutually exclusive by construction — a project loop's agent can never
+  // also match this predicate.
+  ownsId: isIssueKey,
   notify: async (issue, about, reason) => {
     // BUTCHR-87: `reason?.pr` keeps its own dedicated rendering
     // (prReviewStateNudge, src/agents/pr-nudge.ts — guarded by
@@ -254,6 +285,64 @@ runResourceLoop(issueResourceType, {
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
   onPollSuccess: () => loopHealth.recordSuccess(),
   onNotifySuccess: () => notifyHealth.recordSuccess(),
+});
+
+// BUTCHR-91/BUTCHR-68: the project tier's own second `runResourceLoop`
+// instance — the SAME `ops` (realAtlassian) and the SAME `atlassian.search`
+// Jira client the issue tier already uses above; no second Atlassian
+// client, no third credential path. OPT-IN, default OFF:
+// `config.projectAllowlist` is empty unless BUTCHR_PROJECT_ALLOWLIST is
+// set, and the allowlist is enforced inside `loadProjects`
+// (src/resources/project.ts) itself — the SOLE discovery path
+// `createProjectResourceType` exposes — so an unlisted project can never
+// reach `eligible`/`active` by any route this daemon takes, regardless of
+// what this wiring does or forgets to do.
+//
+// DESIGN CHOICE, stated per the ticket: this loop ALWAYS STARTS, even with
+// an empty allowlist, rather than being conditionally constructed only when
+// the allowlist is non-empty. An operator reading `/health` or this
+// daemon's own logs to answer "is the project tier deployed?" gets a
+// truthful answer either way: `projectPollLoop`/`projectNotify` always show
+// up in `/health`, and this file's own startup banner (`describeConfig`,
+// above) states the allowlist plainly — a loop that silently doesn't exist
+// at all whenever the list is empty would be indistinguishable, from
+// outside, from this code never having shipped. The cost of always starting
+// it is one poll's worth of `getMyself()` + `searchProjects("live")` every
+// `PROJECT_POLL_INTERVAL_MS` (5 min) even at zero allowlisted projects —
+// negligible, and it never reaches any per-project I/O (property/version/
+// comment reads), since `loadProjects` filters the allowlist before any of
+// that runs.
+const projectResourceType = createProjectResourceType({
+  ops,
+  search: (jql) => atlassian.search(jql),
+  allowlist: new Set(config.projectAllowlist),
+});
+
+runResourceLoop(projectResourceType, {
+  herd,
+  // See the issue loop's own `ownsId` comment above — the other half of the
+  // same fix, via the disjoint predicate.
+  ownsId: isProjectId,
+  notify: async (project, about, reason) => {
+    // Projects have no `pr`-reason path (`createProjectEventRules` never
+    // populates `reason` at all — src/resources/project.ts) and no related/
+    // Implements-chain concept (`about === project` always, per that
+    // module's own `eventRules.poll`), so this is a simplified sibling of
+    // the issue loop's own notify closure above, not a call into it — the
+    // issue loop's own call site above is left byte-for-byte untouched.
+    const msg = changeNudge(project, about, reason);
+    void notifyIssue(mcp, project, msg);
+    const outcome = await herd.nudge(project, msg).catch((): NudgeResult => ({ delivered: false }));
+    const promptState = outcome.refusal
+      ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
+      : outcome.delivered ? "delivered" : "refused/absent";
+    console.error(`  [notify] ${project} ← ${about}: channel pushed, prompt ${promptState}`);
+  },
+  log: (line) => console.error(`  ${line}`),
+  intervalMs: PROJECT_POLL_INTERVAL_MS,
+  onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
+  onPollSuccess: () => projectLoopHealth.recordSuccess(),
+  onNotifySuccess: () => projectNotifyHealth.recordSuccess(),
 });
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own

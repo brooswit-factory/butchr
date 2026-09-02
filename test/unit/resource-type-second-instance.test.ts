@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { runResourceLoop } from "../../src/daemon/loop.js";
+import { planReconcile } from "../../src/reconcile/plan.js";
+import { isIssueKey, isProjectId } from "../../src/resources/id.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { EventPoll, EventVerdict, ResourceType } from "../../src/resources/types.js";
 
@@ -153,6 +155,10 @@ describe("a second, deliberately non-issue-shaped resource type — runResourceL
     const resourceType = widgetResourceType(polls, [["W1"]]);
     const stop = runResourceLoop(resourceType, {
       herd,
+      // BUTCHR-91/BUTCHR-68: this fixture isn't exercising the new per-type
+      // herd scoping, so own everything — preserves this test's exact
+      // pre-existing behavior.
+      ownsId: () => true,
       notify: (issue) => {
         notified.push(issue);
       },
@@ -177,6 +183,10 @@ describe("a second, deliberately non-issue-shaped resource type — runResourceL
     const resourceType = widgetResourceType(polls, [[]]);
     const stop = runResourceLoop(resourceType, {
       herd,
+      // BUTCHR-91/BUTCHR-68: this fixture isn't exercising the new per-type
+      // herd scoping, so own everything — preserves this test's exact
+      // pre-existing behavior.
+      ownsId: () => true,
       notify: (issue) => {
         notified.push(issue);
       },
@@ -196,12 +206,84 @@ describe("a second, deliberately non-issue-shaped resource type — runResourceL
       eventRules: { async poll() { return { changedPrimary: [], changedRelated: [], async decide() { return { deliver: false }; } }; } },
       spawnConfig: { specFor: (w) => ({ key: w.id, issuetype: "widget", summary: w.payload, parent: null }) },
     };
-    const stop = runResourceLoop(resourceType, { herd, notify: () => {}, intervalMs: 10 });
+    const stop = runResourceLoop(resourceType, { herd, ownsId: () => true, notify: () => {}, intervalMs: 10 });
     await new Promise((r) => setTimeout(r, 30));
     expect(herd.spawned).toContain("W3");
     active = false;
     await new Promise((r) => setTimeout(r, 30));
     stop();
     expect(herd.stopped).toContain("W3");
+  });
+});
+
+/**
+ * BUTCHR-91/BUTCHR-68: the mutual-eviction hazard — TWO resource types
+ * sharing ONE `Herd` (exactly the shape the issue tier and the project tier
+ * have in production, src/daemon/index.ts). `HerdrHerd` maps every
+ * `butchr-*` agent into one flat namespace with no resource-type scoping,
+ * so `herd.runningIssues()` for one loop and for the other returns the
+ * IDENTICAL list — `reconcileNow`'s `stop = running - desired - atRest`
+ * (src/reconcile/plan.ts) then reads the OTHER loop's running agent as
+ * "running but not desired" and stops it. Fixed by `loop.ts`'s
+ * `scopedHerd`, driven by `GenericLoopDeps<T>.ownsId` — see that file's own
+ * doc comment for the mechanism.
+ */
+function simpleResourceType(desired: () => readonly string[]): ResourceType<string> {
+  return {
+    discovery: { idOf: (id) => id, search: async () => [...desired()] },
+    activation: { verdictFor: () => "active" },
+    eventRules: { async poll(): Promise<EventPoll> { return { changedPrimary: [], changedRelated: [], async decide(): Promise<EventVerdict> { return { deliver: false }; } }; } },
+    spawnConfig: { specFor: (id) => ({ key: id, issuetype: "x", summary: "", parent: null }) },
+  };
+}
+
+describe("mutual-eviction hazard (BUTCHR-91/BUTCHR-68) — two resource types sharing one Herd", () => {
+  // NEGATIVE CONTROL, stated first: proves the bug is real, not a
+  // strawman — mirrors the exact running/desired shape measured live on
+  // this ticket (BUTCHR-68/BUTCHR-91/BUTCHR agents). WITHOUT per-type
+  // scoping, planReconcile's naive `stop = running - desired` computed for
+  // EITHER loop's own desired set catches the OTHER loop's agent(s) too.
+  // If this ever stops failing, the mechanism this ticket's fix closes has
+  // changed and every test below needs re-examining.
+  test("negative control: without per-type scoping, each loop's naive stop = running - desired DOES catch the other loop's agent(s)", () => {
+    const running = ["BUTCHR-68", "BUTCHR-91", "BUTCHR"]; // 2 issue agents + 1 project agent
+    expect(planReconcile(["BUTCHR-68", "BUTCHR-91"], running).stop).toEqual(["BUTCHR"]);
+    expect(planReconcile(["BUTCHR"], running).stop).toEqual(["BUTCHR-68", "BUTCHR-91"]);
+  });
+
+  // Failure condition: PROJ1 (a foreign, project-shaped agent already
+  // running) appears in this issue loop's `stop` at all — that is the
+  // mutual-eviction bug reproduced through the real `runResourceLoop` +
+  // `ownsId` fix. Paired with the very next assertion so this cannot be a
+  // stop-nothing implementation in disguise: TASK-2, no longer in this
+  // loop's OWN desired set, must still be stopped.
+  test("issue loop (ownsId: isIssueKey): does not evict a foreign project-shaped agent, but still evicts its own now-undesired agent", async () => {
+    const herd = fakeHerd();
+    await herd.spawn({ key: "PROJ1", issuetype: "project", summary: "", parent: null }); // foreign — already running
+    await herd.spawn({ key: "TASK-2", issuetype: "task", summary: "", parent: null });   // own type — about to fall out of desired
+    const issueLike = simpleResourceType(() => ["TASK-1"]); // TASK-2 deliberately absent
+    const stop = runResourceLoop(issueLike, { herd, ownsId: isIssueKey, notify: () => {}, intervalMs: 10 });
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+    expect(herd.stopped).not.toContain("PROJ1"); // foreign-type protection
+    expect(herd.stopped).toContain("TASK-2");    // own-type eviction still works
+    expect(herd.spawned).toContain("TASK-1");    // still spawns its own desired agent
+  });
+
+  // The mirror image, both directions required per the ticket ("a test
+  // proving the issue loop's stop does NOT contain a project agent... AND a
+  // test proving the project loop's stop does NOT contain any issue
+  // agent").
+  test("project loop (ownsId: isProjectId): does not evict a foreign issue-shaped agent, but still evicts its own now-undesired agent", async () => {
+    const herd = fakeHerd();
+    await herd.spawn({ key: "TASK-1", issuetype: "task", summary: "", parent: null });    // foreign — already running
+    await herd.spawn({ key: "PROJ2", issuetype: "project", summary: "", parent: null });  // own type — about to fall out of desired
+    const projectLike = simpleResourceType(() => ["PROJ1"]); // PROJ2 deliberately absent
+    const stop = runResourceLoop(projectLike, { herd, ownsId: isProjectId, notify: () => {}, intervalMs: 10 });
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+    expect(herd.stopped).not.toContain("TASK-1"); // foreign-type protection
+    expect(herd.stopped).toContain("PROJ2");      // own-type eviction still works
+    expect(herd.spawned).toContain("PROJ1");      // still spawns its own desired agent
   });
 });

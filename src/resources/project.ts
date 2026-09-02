@@ -419,6 +419,25 @@ export interface ProjectResourceDeps {
    * behind).
    */
   search: (jql: string) => Promise<JiraIssue[]>;
+  /**
+   * BUTCHR-91/BUTCHR-68: the opt-in scope for staffing — a project key must
+   * be a member of this set to be admitted past the lead filter at all.
+   * Applied inside `loadProjects` below, the SOLE discovery path this
+   * module exposes (`createProjectResourceType`'s `discovery.search` calls
+   * nothing else), so a caller cannot reach an eligible/active
+   * `ProjectResource` for a non-allowlisted key by any other route — there
+   * is no second entry point downstream (spawnConfig/activation/eventRules
+   * all operate on whatever discovery already returned) that could bypass
+   * this filter. REQUIRED, not optional-with-a-default: the daemon wiring
+   * (src/daemon/index.ts) must construct this from its own config
+   * deliberately, so "I forgot to pass an allowlist" is a compile error,
+   * not a silent staff-everyone default. An EMPTY set is the deliberate
+   * default at the config layer (src/config/config.ts's
+   * `BUTCHR_PROJECT_ALLOWLIST`, unset by default) — empty here means zero
+   * projects ever reach `led`, so zero are staffed, regardless of how many
+   * live projects this credential actually leads.
+   */
+  allowlist: ReadonlySet<string>;
 }
 
 interface EligibleCandidate {
@@ -455,7 +474,13 @@ interface EligibleCandidate {
 async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[]> {
   const me = await deps.ops.getMyself();
   const raw = await deps.ops.searchProjects("live");
-  const led = raw.values.filter((p) => p.lead?.accountId === me.accountId);
+  // BUTCHR-91/BUTCHR-68: the allowlist is applied HERE, alongside the lead
+  // filter, before any per-project I/O (property/version/comment reads)
+  // happens for a candidate — an unlisted project costs nothing beyond this
+  // one in-memory check, and never reaches `eligible`/`led`-derived output
+  // at all. See `ProjectResourceDeps.allowlist`'s own doc comment for why
+  // this is the one place the filter needs to live.
+  const led = raw.values.filter((p) => p.lead?.accountId === me.accountId && deps.allowlist.has(p.key));
 
   const properties = await Promise.all(
     led.map(async (p): Promise<EligibleCandidate | null> => {

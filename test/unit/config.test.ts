@@ -109,4 +109,22 @@ describe("loadConfig", () => {
   test("describeConfig includes captureDir", () => {
     expect(describeConfig(loadConfig({ ...base, BUTCHR_CAPTURE_DIR: "/tmp/captures" }, noRead))).toContain("captureDir=/tmp/captures");
   });
+
+  // BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope, default
+  // OFF. Paired control, same shape as the github-orgs tests above: an
+  // implementation that always returns [] (reject-everything) would pass
+  // the first assertion alone but fail the second; one that ignores the env
+  // entirely and returns something non-empty by default would fail the
+  // first. Only a real comma-split-and-trim parser passes both.
+  test("projectAllowlist defaults to empty when BUTCHR_PROJECT_ALLOWLIST is unset", () => {
+    expect(loadConfig(base, noRead).projectAllowlist).toEqual([]);
+  });
+  test("projectAllowlist is comma-split and trimmed when BUTCHR_PROJECT_ALLOWLIST is set", () => {
+    const c = loadConfig({ ...base, BUTCHR_PROJECT_ALLOWLIST: "ACME, BETA ,GAMMA" }, noRead);
+    expect(c.projectAllowlist).toEqual(["ACME", "BETA", "GAMMA"]);
+  });
+  test("describeConfig states the allowlist plainly — empty as an explicit 'staffs nothing', non-empty as the actual keys", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("projectAllowlist=EMPTY — project tier staffs nothing");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_PROJECT_ALLOWLIST: "ACME" }, noRead))).toContain("projectAllowlist=ACME");
+  });
 });
