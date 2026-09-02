@@ -110,10 +110,14 @@ import { listTsFiles } from "../labels/label-scan.js";
  *     most ONE family member, so no literal ever crosses this scanner's
  *     "two or more DISTINCT members in one literal" threshold, even though
  *     the selection they jointly form can still be incomplete.
- *   - `test/` and `scripts/` are unscanned, same reasoning as
- *     `label-scan.ts`/`header-scan.ts`: fixtures use family-shaped literals
- *     freely by design, and `scripts/` is operator tooling, not the write
- *     path.
+ *
+ * SEPARATELY, THIS SCANNER'S CORPUS ITSELF IS BOUNDED, THE SAME WAY
+ * `label-scan.ts`'s/`header-scan.ts`'s IS — a scope limit, not one more
+ * shape of selection drift, though a real hand-enumerated collision sitting
+ * inside either would be exactly as invisible as one of the four above:
+ *   - `test/` and `scripts/` are unscanned: fixtures use family-shaped
+ *     literals freely by design, and `scripts/` is operator tooling, not
+ *     the write path.
  *   - Non-`.ts` files, and anything generated under `src/` (none checked in
  *     today; re-examine this assumption if that changes).
  *
