@@ -393,12 +393,29 @@ export async function advanceProjectWatermark(
 }
 
 /**
- * Largest comment id by NUMERIC value (Confluence footer-comment ids are
- * monotonically increasing platform-wide, confirmed live) — never by API
- * return order, since `getPageComments` requests no `sort` and this module
- * does not depend on one. Exported: the project tool surface's `check_in`
- * verb (src/tools/defs.ts) reuses this exact function rather than a second
+ * Largest comment id by NUMERIC value — never by API return order, since
+ * `getPageComments` requests no `sort` and this module does not depend on
+ * one. Exported: the project tool surface's `check_in` verb
+ * (src/tools/defs.ts) reuses this exact function rather than a second
  * "find the newest comment" implementation.
+ *
+ * CORRECTED (BUTCHR-198/BUTCHR-202): this doc comment used to assert that
+ * Confluence footer-comment ids are "monotonically increasing
+ * platform-wide, confirmed live". That was false. MEASURED, independently,
+ * on two different project root docs: id order and creation-time order
+ * disagree — on one doc, id `17334328` was created at `14:58:06.003Z` and
+ * id `17104948` was created 24s LATER, at `14:58:30.387Z` (the later
+ * comment's id is lower by 229,380). Replaying this project's own root-doc
+ * footer comments in creation order against a max-id watermark, 6 of 10
+ * would never have been seen. A max-by-numeric-id reduce, which is what
+ * this function does, can therefore return the SAME value across a poll
+ * even though a genuinely new (but lower-id) comment has arrived — the
+ * comment is silently never observed, not merely mis-ordered. This
+ * function, and every caller comparing its output against a watermark
+ * (`projectVerdict`/`createProjectEventRules` in this file, `check_in` in
+ * src/tools/defs.ts), is KNOWN-WRONG pending BUTCHR-198's fix. This ticket
+ * (BUTCHR-202) documents the finding; it deliberately does not change this
+ * function's behavior.
  */
 export function newestCommentId(comments: readonly { id: string }[]): string | null {
   if (!comments.length) return null;

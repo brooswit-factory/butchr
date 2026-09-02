@@ -185,15 +185,25 @@ export interface CommentRow { id: string; body: string; created: string }
  * ORDERING (BUTCHR-171): `getPageComments` requests no `sort` (see its own
  * doc comment) and this function no longer trusts its return order —
  * `results` is sorted here, newest-first by NUMERIC comment id, before
- * mapping. Confluence footer-comment ids are monotonically increasing
- * platform-wide (MEASURED live, `src/resources/project.ts`'s
- * `newestCommentId` doc comment; INHERITED here, not independently
- * re-measured). Id order, not `created`, is what settles this: `created`
- * can be `""` per-row (see above) and is a last-edited time even when
- * present, neither of which a stable total order can be built on, while a
- * platform-monotonic id can. This is a POST-CONDITION this function
- * enforces itself, not a request the API is trusted to honour — it holds
- * even if `getPageComments`'s own return order changes.
+ * mapping.
+ *
+ * CORRECTED (BUTCHR-198/BUTCHR-202): this doc comment used to assert that
+ * Confluence footer-comment ids are "monotonically increasing
+ * platform-wide", inherited without re-measurement from
+ * `src/resources/project.ts`'s `newestCommentId` doc comment. That claim
+ * was false there and is false here too — see `newestCommentId`'s own doc
+ * comment for the measurement (two independent root docs, a later comment
+ * with a lower id, replay of real data losing 6 of 10 comments against a
+ * max-id rule). The sort above is therefore NOT the stable total order this
+ * comment used to claim it was: sorting by numeric id can put a
+ * later-created comment BEHIND an earlier one, the same failure mode as the
+ * watermark comparison this same false premise motivated. This function's
+ * own callers — `escalation-loop.ts`'s dedupe among them — read the result
+ * as newest-first; that expectation is KNOWN-WRONG pending BUTCHR-198's
+ * fix. Left uncorrected in behavior here deliberately (BUTCHR-202 documents
+ * the finding, it does not fix it) — `created`, discussed below, is not a
+ * usable substitute total order either (per-row `""` fallback, and a
+ * last-edited rather than created time even when present).
  *
  * UNWRAPPING (BUTCHR-129, found at PR #180 review, CHANGES_REQUESTED @
  * 1be6208): `getPageComments` requests `bodyFormat: "storage"` and returns
