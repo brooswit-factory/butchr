@@ -35,13 +35,19 @@ import { WORKSPACE_PLACEHOLDERS, type WorkspacePlaceholder } from "../agents/wor
  * `src/labels/registry.ts`'s, NEITHER PROVING WHAT IT LOOKS LIKE IT PROVES:
  *   1. THE TYPE-LEVEL DOOR (this file). `WORKSPACE_REGISTRY` is typed
  *      `Record<WorkspacePlaceholder, WorkspaceRegistryEntry>` —
- *      `WorkspacePlaceholder` (`src/agents/workspace.ts`) is a CLOSED union
- *      derived DIRECTLY from `interpolate()`'s own substitution table (see
- *      that file's comment on `WORKSPACE_PLACEHOLDERS` for how), not a
- *      hand-maintained parallel list that could drift from it. Extending the
- *      substitution table without extending `WORKSPACE_PLACEHOLDERS` fails
- *      to compile there; extending `WorkspacePlaceholder` without a matching
- *      entry here fails to compile HERE. This door sees every placeholder
+ *      `WorkspacePlaceholder` (`src/agents/workspace.ts`) is a CLOSED union —
+ *      `WORKSPACE_PLACEHOLDERS`, a plain hand-written array — but, unlike a
+ *      free-floating list that could silently drift from what `interpolate()`
+ *      actually substitutes, `interpolate()`'s OWN substitution table
+ *      (`values`) is itself typed `Record<WorkspacePlaceholder, string>` (see
+ *      that file's comment for the exact shape). That typing is what ties
+ *      the two together in BOTH directions: a `values` entry for a name NOT
+ *      in `WORKSPACE_PLACEHOLDERS` is an excess-property error, and a name
+ *      IN `WORKSPACE_PLACEHOLDERS` with no matching `values` entry fails to
+ *      compile there for the opposite reason (`Record` requires every key).
+ *      Extending `WorkspacePlaceholder` without a matching entry here fails
+ *      to compile HERE too, the same door `HEADER_REGISTRY`'s type check
+ *      already demonstrates. This door sees every placeholder
  *      `interpolate()` is CAPABLE of substituting — including one no
  *      template currently uses (see TYPE below) — but it does NOT
  *      see a workspace record written by some OTHER path entirely (a file
@@ -253,7 +259,7 @@ export const WORKSPACE_REGISTRY: Readonly<Record<WorkspacePlaceholder, Workspace
       "FIXED AT THE SOURCE, NOT SUPPRESSED — this was the false-at-write-time instance BUTCHR-169's own investigation found (and its boss independently confirmed and insisted on fixing forward, withdrawing an earlier instruction to file it elsewhere): this fleet's boss/worker relationship is carried ENTIRELY by Jira Implements issue links, never by Jira's native `parent` field, and SpawnSpec.parent read `issue.parent` directly before this ticket — EMPIRICALLY ALWAYS NULL for every issue in this project (verified against three live tickets, none carrying a `parent` field; every boss/worker relationship shows up only under `issuelinks`), not merely a value that could eventually go stale. scripts/migrate-links.ts confirms the history: this fleet MIGRATED from Jira's native parent field to Implements links for a predecessor project, so the old derivation was reading a field this fleet deliberately stopped populating. task.md/story.md's old text ('Your boss is the story named in your ticket, not {{PARENT}}' / 'Your parent epic is {{PARENT}}.') rendered a confusing, self-contradictory claim on EVERY spawn of a ticket with a real boss — reproduced live in this ticket's own workspace and in its boss BUTCHR-153's workspace, not merely asserted. Now that the derivation is honest, both templates were restored to assert {{PARENT}} plainly (see this ticket's diff) rather than routing around it — the fix closes the false claim at its source instead of teaching every reader to distrust a field that could have simply been made true.",
     withdrawnBy: null,
     neverWithdrawnReason:
-      "A GENUINELY DIFFERENT shape than KEY's (both null, for different reasons — do not conflate them): this IS a live, in-use assertion, and it CAN still go stale in the one way any Implements-link-derived fact can — a ticket re-parented (relinked to a different boss) AFTER its workspace was already built. No verb in this codebase rewrites an already-built workspace's brief.md when a re-parent happens (re-parenting isn't even a verb this fleet exposes today — see src/tools/relationship.ts). Declared un-withdrawn because that residual gap is narrow enough, and re-parenting rare enough, that inventing a rewrite/notify mechanism for it specifically was judged not worth building here — SUMMARY's withdrawal path (correctWorker's best-effort brief.md rewrite) does not extend to PARENT because nothing in this codebase's relationship verbs currently changes a ticket's boss after creation for correctWorker to react to. If that changes, this entry needs revisiting, not silent reuse.",
+      "A GENUINELY DIFFERENT shape than KEY's (both null, for different reasons — do not conflate them): this IS a live, in-use assertion, and it CAN still go stale in the one way any Implements-link-derived fact can — a ticket re-parented (relinked to a different boss) AFTER its workspace was already built. CORRECTED IN REVIEW (this ticket's own reviewer, on this same PR): an earlier draft of this reason claimed re-parenting 'isn't even a verb this fleet exposes' — FALSE, and reachable from the live tool roster, not a hypothetical: jira_link_issues (src/tools/defs.ts, calling ops.linkIssues) creates or changes an Implements link on an EXISTING issue, and adoptWorker's own refusal message (src/tools/relationship.ts: 'adopt_worker: ... is already linked to a different boss ... stealing another boss's worker must be an explicit act ... use jira_link_issues only if this is deliberate') names that exact verb as the sanctioned way to do it. So the gap this entry declares is REAL and REACHABLE, not merely theoretical — the honest justification for withdrawnBy: null is narrower than 'impossible': no verb in this codebase rewrites an ALREADY-BUILT workspace's brief.md when a re-parent happens via jira_link_issues (buildWorkspace runs once, at spawn time, and jira_link_issues never touches a workspace directory); the residual window this leaves is a ticket re-parented AFTER its workspace exists AND before any subsequent correct_worker summary correction re-derives {{PARENT}} fresh as a side effect (see SUMMARY's own withdrawnBy above — that path DOES repair PARENT opportunistically, just not on the re-parent event itself). Declared un-withdrawn because re-parenting an already-staffed, already-running ticket is judged rare on this fleet's own evidence (adopt_worker's refusal exists specifically to make it a deliberate, logged act rather than an accident), and building a DEDICATED rewrite/notify mechanism for this one narrow window — distinct from SUMMARY's, which already exists for an unrelated reason — was judged not worth it here. If jira_link_issues usage against already-staffed tickets turns out to be more common than assumed, this entry needs revisiting on that evidence, not by silent reuse of this reasoning.",
   },
   GROUND_TRUTH: {
     appliedBy:

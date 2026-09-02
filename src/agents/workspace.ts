@@ -16,15 +16,17 @@ export interface SpawnSpec { key: string; issuetype: string; summary: string; pa
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
  * into a workspace file — the type-level door `src/workspace/registry.ts`
  * mirrors (see that file's header for the rule this joins, and why the
- * registry lives there, not here). Declared as a real, derived union — not a
- * parallel, hand-maintained one that could drift from `interpolate()`'s own
- * implementation — by having `interpolate()` build its substitution table as
- * a `Record<WorkspacePlaceholder, string>` literal below: adding a
- * `.replaceAll` call without adding its name here fails to compile (missing
- * property), and adding a name here without a matching value fails to
- * compile too (`Record` requires every key). `src/workspace/registry.ts`
- * imports this type FROM here — never the reverse — so this write path never
- * depends on the registry, same "no runtime behaviour lives in the registry"
+ * registry lives there, not here). This array is the hand-written source of
+ * truth (a closed union has to start somewhere written down), and what
+ * keeps it from silently drifting from what `interpolate()` actually
+ * substitutes is the OTHER direction of the tie: `interpolate()`'s own
+ * substitution table (`values`, below) is typed `Record<WorkspacePlaceholder,
+ * string>`, so adding a `.replaceAll`-worthy name to `values` without adding
+ * it here is an excess-property error, and adding a name here without a
+ * matching `values` entry fails to compile for the opposite reason (`Record`
+ * requires every key). `src/workspace/registry.ts` imports this type FROM
+ * here — never the reverse — so this write path never depends on the
+ * registry, same "no runtime behaviour lives in the registry"
  * discipline `src/headers/registry.ts` documents for its own medium.
  */
 export const WORKSPACE_PLACEHOLDERS = ["KEY", "SUMMARY", "TYPE", "PARENT", "GROUND_TRUTH"] as const;
