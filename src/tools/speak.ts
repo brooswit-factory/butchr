@@ -120,3 +120,82 @@ export function unwrapStorageParagraph(body: string): string {
   const inner = m ? m[1]! : body;
   return inner.replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
 }
+
+/** A read from a resource's own channel, id-comparable with `escalation-helper.ts`'s `CommentRow` (structurally identical — no shared import needed; see this function's own doc comment for why). */
+export interface CommentRow { id: string; body: string; created: string }
+
+/**
+ * BUTCHR-141/§2.6 — the read half symmetric to `speakOnOwnChannel` above,
+ * EXTRACTED from `src/daemon/index.ts` (a MOVE, not a rewrite: same
+ * behaviour, dependencies injected instead of closed over module-scope
+ * `ops`/`atlassian`). Before this extraction the function lived as an
+ * unexported local in `index.ts`, a file that bootstraps a real
+ * Atlassian/herdr daemon (`process.exit` on missing config) at import — so
+ * its own representation-bug history (see below) could only ever be tested
+ * by hand-reproducing its two mapping lines in a unit test, never by
+ * importing and exercising the REAL reader. That gap is what let a
+ * representation defect through two independent reviewers (BUTCHR-129) —
+ * this extraction is what makes the real reader importable, so a test can
+ * exercise it against a body a REAL `speakOnOwnChannel` call produced
+ * instead.
+ *
+ * THERE MUST BE EXACTLY ONE OF THESE IN THE CODEBASE — an issue's Jira
+ * comments for an issue key; a project's Confluence root-doc FOOTER comments
+ * for a project key, via the SAME `projectRootDoc` resolution
+ * `speakOnOwnChannel`'s own project branch uses. NOT `ops.getIssueComments`:
+ * that op deliberately returns `{id}` only (see its own doc comment on
+ * `AtlassianOps`) and every caller's dedupe needs `body` to find its own
+ * marker — `issueComments` is injected instead so this module stays
+ * dependency-free of any specific Jira client. A project id has no ticket at
+ * all (measured live: `GET /rest/api/3/issue/BUTCHR` -> 404) — and even
+ * setting that failure aside, an ISSUE-shaped read would still be the WRONG
+ * RESOURCE for a project (its speech is a Confluence footer comment on its
+ * root doc, not a Jira comment) — so a project id resolves its root doc the
+ * same way `speakOnOwnChannel` does and reads footer comments via
+ * `ops.getPageComments`, called with exactly ONE id (`doc.id`, resolved
+ * fresh from THIS project's own property read) — never the batch `?id=A&id=B`
+ * form (`getPageComments`'s own doc comment: MEASURED to return HTTP 200
+ * while silently ignoring the id filter, two pages holding two comments
+ * coming back with 16 results spanning 10 unrelated pageIds). A 2xx here is
+ * evidence about the transport, not proof of reading the right resource —
+ * the single-id, path-scoped call is what makes that true anyway, not a
+ * post-hoc check on the response. Deliberately never catches here either:
+ * both branches reject on failure exactly as written, so each caller's own
+ * fail-closed handling sees a real rejection rather than a laundered empty
+ * result. `getPageComments` has no `created` timestamp on its rows — mapped
+ * to `""`, which `Date.parse` turns into `NaN`, which each caller already
+ * falls back to its own `now()` for.
+ *
+ * UNWRAPPING (BUTCHR-129, found at PR #180 review, CHANGES_REQUESTED @
+ * 1be6208): `getPageComments` requests `bodyFormat: "storage"` and returns
+ * raw storage-format XHTML — the SAME wrapped-and-escaped shape
+ * `speakOnOwnChannel` writes (`<p>${escapeStorageText(text)}</p>`, above),
+ * not the plain text a caller posted. Read literally, a row's body starts
+ * with `<p>[butchr:frozen]` or `<p>[butchr:unresponsive]`, not the bare
+ * marker — the exact string `findMarked` (escalation-helper.ts) anchors on
+ * with `startsWith(marker)`, so restart-adoption silently never matched on
+ * the project tier for EITHER caller until this unwrap was applied. Fixed by
+ * `unwrapStorageParagraph`, this file's own exported inverse of the wrapping
+ * it writes — kept in the SAME module so this can never drift from
+ * `escapeStorageText`.
+ *
+ * THIS IS RULE 2b'S THIRD FORM (right resource, right call, wrong
+ * REPRESENTATION) — a fixture that hands back plain text for both tiers is
+ * faithful to `CommentRow`'s TYPE and still disagrees with what this real
+ * reader produces in exactly the dimension `findMarked` anchors on; that
+ * shape of fixture is what let this defect through two reviews before
+ * BUTCHR-129.
+ */
+export function createOwnChannelComments(
+  ops: AtlassianOps,
+  issueComments: (key: string) => Promise<readonly CommentRow[]>,
+): (key: string) => Promise<CommentRow[]> {
+  return async function ownChannelComments(key: string): Promise<CommentRow[]> {
+    if (isProjectId(key)) {
+      const doc = await projectRootDoc(ops, key);
+      const { results } = await ops.getPageComments(doc.id);
+      return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
+    }
+    return [...(await issueComments(key))];
+  };
+}

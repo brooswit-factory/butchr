@@ -57,6 +57,36 @@ export interface Config {
    */
   atRestMinutes: number;
   /**
+   * BUTCHR-141: spawns of the SAME resource within `crashLoopWindowMinutes`
+   * (rolling, not consecutive polls) before the crash-loop detector
+   * (src/agents/crash-loop.ts) posts its audible, observational complaint —
+   * never gates or suppresses the spawn itself (see that module's own top
+   * comment). Default 5, chosen and re-derivable against both poll tiers:
+   * on the issue tier (15s `intervalMs`, and `HerdrHerd.spawn()` itself
+   * blocks for `KICKOFF_VERIFY_MS` — 12s, src/agents/herd.ts — before
+   * returning), a real crash loop reaches 5 spawns in well under 60 minutes;
+   * on the project tier (`PROJECT_POLL_INTERVAL_MS`, 5 minutes), 5 spawns is
+   * ~25 minutes, comfortably inside the 60-minute window below. A healthy
+   * resource (spawned once, stays running) or a single ordinary respawn
+   * (stale-argv replacement, which never appears in `plan.spawn` at all —
+   * `respawn` is a disjoint list `RespawnGuard` already guards) never comes
+   * close.
+   */
+  crashLoopCount: number;
+  /**
+   * BUTCHR-141: the rolling window, in minutes, `crashLoopCount` is measured
+   * over. Default 60 — see `crashLoopCount`'s own doc comment for why an
+   * hour comfortably covers the project tier's own 5-minute poll cadence,
+   * and this ticket's own report/doc for the project-tier wake-cycle
+   * false-positive check this number was chosen against (a project resource
+   * that legitimately wakes, works and sleeps repeatedly cannot reach 5
+   * genuine spawn-work-exit cycles inside 60 minutes at a 5-minute poll
+   * cadence without sustained, rapid external interaction the project
+   * tier's own design does not expect — see src/resources/project.ts's
+   * `PROJECT_POLL_INTERVAL_MS` doc comment).
+   */
+  crashLoopWindowMinutes: number;
+  /**
    * BUTCHR-124: minutes a pane must be reported blocked, with text that does
    * not parse as a recognized dialog, CONTINUOUSLY, before the
    * sustained-blocked-and-unparseable alarm fires (see
@@ -142,6 +172,8 @@ export interface ConfigEnv {
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
+  BUTCHR_CRASHLOOP_COUNT?: string | undefined;
+  BUTCHR_CRASHLOOP_WINDOW_MINUTES?: string | undefined;
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
@@ -176,6 +208,12 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const atRestMinutes = env.BUTCHR_ATREST_MINUTES ? Number(env.BUTCHR_ATREST_MINUTES) : 10;
   if (!Number.isFinite(atRestMinutes) || atRestMinutes <= 0) throw new Error(`BUTCHR_ATREST_MINUTES is not a positive number: ${env.BUTCHR_ATREST_MINUTES}`);
+
+  const crashLoopCount = env.BUTCHR_CRASHLOOP_COUNT ? Number(env.BUTCHR_CRASHLOOP_COUNT) : 5;
+  if (!Number.isFinite(crashLoopCount) || crashLoopCount <= 0) throw new Error(`BUTCHR_CRASHLOOP_COUNT is not a positive number: ${env.BUTCHR_CRASHLOOP_COUNT}`);
+  const crashLoopWindowMinutes = env.BUTCHR_CRASHLOOP_WINDOW_MINUTES ? Number(env.BUTCHR_CRASHLOOP_WINDOW_MINUTES) : 60;
+  if (!Number.isFinite(crashLoopWindowMinutes) || crashLoopWindowMinutes <= 0) throw new Error(`BUTCHR_CRASHLOOP_WINDOW_MINUTES is not a positive number: ${env.BUTCHR_CRASHLOOP_WINDOW_MINUTES}`);
+
   const unresponsiveMinutes = env.BUTCHR_UNRESPONSIVE_MINUTES ? Number(env.BUTCHR_UNRESPONSIVE_MINUTES) : 5;
   if (!Number.isFinite(unresponsiveMinutes) || unresponsiveMinutes <= 0) throw new Error(`BUTCHR_UNRESPONSIVE_MINUTES is not a positive number: ${env.BUTCHR_UNRESPONSIVE_MINUTES}`);
 
@@ -198,6 +236,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     stalledMinutes,
     parkedMinutes,
     atRestMinutes,
+    crashLoopCount,
+    crashLoopWindowMinutes,
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
@@ -312,7 +352,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +
