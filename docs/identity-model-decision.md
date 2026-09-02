@@ -140,10 +140,10 @@ harder to sustain against two independent live instances than one — this is
 evidence about exactly the premise Deliverable 1 turns on, not decoration.
 
 **Conclusion: the triangle is CONFIRMED.** `epic ≠ task` is a constraint the
-fleet depends on, `{epic, story, task}` are pairwise-adjacent, and the
-fleet's current 2-account deployment is provably insufficient to cover all
-three simultaneously — which is exactly what the epic→task row above shows,
-live, twice.
+fleet depends on, `{epic, story, task}` are pairwise-adjacent, and the two
+Atlassian accounts serving the fleet's four agent tiers today (precision on
+"two" below) are provably insufficient to cover all three simultaneously —
+which is exactly what the epic→task row above shows, live, twice.
 
 *Falsification, stated in advance and still open:* this premise would be
 refuted by a future code change that makes `adopt_worker` refuse cross-tier
@@ -160,6 +160,53 @@ unobserved. `project` does not raise the chromatic number past 3: it can
 reuse `epic`'s off-triangle colour (`story`'s account, or a distinct one),
 exactly as it already does today (`project` and `story` both `e160cf60`).
 
+### The stated rationale for today's allocation is written down, and is false
+
+**Not an allocation nobody decided — a decision built on a documented
+premise this epic refutes.** The ASSIST space's own operational page, "The
+fleet: machines, identities and how a deploy is done" (page id `12943361`,
+version 2, owned and last verified 2026-08-31 by the assistant) — read
+first-hand this session, not relayed — states, under "Identities":
+
+> "Three Atlassian accounts cover four tiers today. John Winstead is the
+> human and, for now, the assistant. Wroos Bit runs epics and tasks; boos
+> writ runs stories and leads the six product projects. **Epics and tasks
+> may share an account because the review chain only constrains adjacent
+> tiers.**"
+
+That final clause is precisely the premise §1 above refutes. "The review
+chain only constrains adjacent tiers" is true of `new_worker`'s chain
+(`project→epic→story→task`, each hop adjacent) but false of `adopt_worker`,
+which lets any tier become the direct boss of an orphan Story or Task —
+`BUTCHR-96` and `BUTCHR-105` are both epic-to-task, skipping story, in the
+fleet's ordinary course, not a hypothetical. **The account allocation that
+produced today's epic↔task collision was not an oversight — it followed a
+written rationale, and the rationale is wrong precisely where `adopt_worker`
+is concerned.** That is a stronger, more specific claim than "the gap is
+structural" (already argued above, per BUTCHR-62's own decision): it says
+*why* the collision looked safe to whoever accepted it — the documented
+model of the review chain that they were reading did not include the
+shortcut edge at all. **Naming this is this document's job; correcting the
+ASSIST page is not — it belongs to the assistant, in another space, and
+`BUTCHR-100` has raised who fixes it upward. Not edited here.**
+
+### Precision on "two accounts" — the fleet holds three; two serve agent tiers
+
+The same ASSIST page is also the source for a fact this document (and
+`docs/identity-model.md`) have both stated loosely: **the fleet's four
+agent-facing tiers (project/epic/story/task) run on two Atlassian
+accounts — but the fleet itself has three**, not two. The third,
+`John Winstead`, is the human's own identity, currently also used by "the
+assistant" (the ASSIST page's own words) — not assigned to any of the four
+tiers this document maps. Wherever this document or `docs/identity-model.md`
+says "the fleet runs on two accounts," read it as "the four agent tiers run
+on two of the fleet's three Atlassian accounts" — `docs/identity-model.md`'s
+looser phrasing is a finding for `BUTCHR-104` to route, not silently
+corrected here (see this document's closing note on that page).
+
+**Whether the third account changes §2's recommendation is addressed there,
+not assumed here.**
+
 ---
 
 ## 2. The recommended mapping, with its residue named
@@ -169,12 +216,48 @@ Two directions were on the table; a third was invited. I recommend
 this recommendation against `.env.example`'s merged (Direction A) guidance
 in §4.
 
-### Direction A — add a third identity (rejected as the primary recommendation, see below)
+### Direction A — dedicate a new agent identity to the epic tier (rejected as the primary recommendation, see below)
 
 **What it does:** set `BUTCHR_ASSIGNEE_EPIC`, on the daemon serving the
-project tier, to a fourth Atlassian accountId distinct from
-`BUTCHR_ASSIGNEE_STORY`, `BUTCHR_ASSIGNEE_TASK`, and that daemon's own
-project-lead identity. No code change; no tool behaviour changes.
+project tier, to a distinct Atlassian accountId — not currently used by any
+of the four agent tiers — different from `BUTCHR_ASSIGNEE_STORY`,
+`BUTCHR_ASSIGNEE_TASK`, and that daemon's own project-lead identity. No code
+change; no tool behaviour changes.
+
+**Does the fleet's existing third account satisfy this, so nothing new need
+be provisioned? Considered and declined, not assumed.** The fleet already
+holds a third Atlassian account beyond the two agent tiers use —
+`John Winstead`'s, the human's own identity, which the ASSIST page states
+"the assistant" also runs on "for now" (see the previous subsection). It is
+numerically available: pointing `BUTCHR_ASSIGNEE_EPIC` at it would satisfy
+every constraint `.env.example` states. **I do not recommend it**, for
+reasons distinct from, but the same shape as, the workaround this document
+already rejects (approving from another account's credentials manufactures
+an identity that isn't genuinely separate for the tier's own use):
+- It is a **standing identity with its own ongoing purpose** ("the human and,
+  for now, the assistant" — not a dedicated service account), not idle
+  capacity waiting to be assigned. Repointing it to an autonomous Epic-tier
+  agent process gives that process the human's own Atlassian/GitHub
+  credential and its full privileges — a materially larger blast radius than
+  a dedicated bot account, and a decision about the human's own identity,
+  not a fleet-configuration one.
+- Every future Epic-authored PR or Jira action would be attributed to
+  `John Winstead` on the record, indistinguishable after the fact from the
+  human's own action — the exact "second identity that doesn't genuinely
+  exist for this purpose" shape, just aimed at a real person's account
+  instead of a fabricated one.
+- Repointing it is explicitly the kind of account action this ticket's own
+  hard boundary excludes ("do not create or re-point any Atlassian or
+  GitHub account") — even naming it as a candidate value edges toward
+  choosing it, which is why this is written as a considered-and-declined
+  finding rather than a proposed value.
+
+So: **achieving `epic ∉ {story, task, project-lead}` under Direction A still
+requires provisioning one genuinely new, dedicated account** — the fleet's
+total would go from three to four, not be satisfied by its existing third.
+If a reader disagrees with the reasoning above, that is a call for
+`BUTCHR-100`/the human to make explicitly, not one this ticket makes by
+omission.
 
 **What it fixes:** epic→task becomes cross-account by construction — the
 one row that is same-account today.
@@ -191,7 +274,8 @@ practice, not given an invented live verdict), but it is reachable today
 with no code change, by the same `adopt_worker` call already in ordinary
 use.
 
-**Cost:** one new Atlassian account, one operator action (see §4), zero code
+**Cost:** one new, dedicated Atlassian account (declining to reuse the
+fleet's existing third — see above), one operator action (see §4), zero code
 risk.
 
 ### Direction B — staff by hop, not by type (RECOMMENDED)
@@ -401,12 +485,16 @@ separately.
    daemon has never been observed serving a project caller, and this
    variable is only read at Epic-staffing time by whichever daemon a project
    caller's `new_worker`/`adopt_worker` call actually lands on.
-3. **To which value:** a new Atlassian accountId, distinct from
-   `BUTCHR_ASSIGNEE_STORY` (`712020:e160cf60-...`), `BUTCHR_ASSIGNEE_TASK`
-   (`712020:619ec5ec-...`), and that daemon's own project-lead identity
-   (currently `e160cf60` also — see §0/§3). **I am not inventing this
-   accountId**; it must be a genuinely new Atlassian account the operator
-   creates or already holds, distinct from all three.
+3. **To which value:** a genuinely new, dedicated Atlassian accountId,
+   distinct from `BUTCHR_ASSIGNEE_STORY` (`712020:e160cf60-...`),
+   `BUTCHR_ASSIGNEE_TASK` (`712020:619ec5ec-...`), and that daemon's own
+   project-lead identity (currently `e160cf60` also — see §0/§3). **Not**
+   the fleet's existing third Atlassian account (`John Winstead`, the
+   human's/assistant's — see §2's "Does the fleet's existing third account
+   satisfy this?") — considered and declined there, not silently assumed
+   available here. **I am not inventing this accountId**; it must be a
+   fourth account, beyond the fleet's current three, that the operator
+   creates.
 4. **Order:**
    a. Confirm no `new_worker`/`adopt_worker`(Epic) call, and no
       project-tier review action (`finish_worker`/`tell_worker` on a live
@@ -545,24 +633,42 @@ detail:**
    from `ss -ltnp` cross-checked against `systemctl --user show -p MainPID`
    (agreeing, `695036`) — not from `ENVIRONMENT.md`, whose recorded pid goes
    stale across restarts; `readlink /proc/695036/cwd` → a checkout at
-   `/home/wroosbit/code/brooswit/butchr`, HEAD `36db3e4`, **12 commits
-   behind `origin/main`** (`git rev-list --count HEAD..origin/main` = 12,
-   fetched fresh this session); `grep -rl describeCollisions src/` in that
+   `/home/wroosbit/code/brooswit/butchr` (**not** the canonical
+   `~/code/<owner>/<repo>` clone the briefs name — `~/code/brooswit-factory/butchr`
+   exists on this host too, at a wholly different commit; resolving the
+   *live pid's* cwd, as this check does, is what keeps that distinction from
+   mattering), HEAD `36db3e4`. `grep -rl describeCollisions src/` in that
    checkout → **no match**; `docs/identity-model.md` → **absent from that
    tree entirely.** `BUTCHR-104` independently measured its own daemon
-   (`booswrit`, port `7718`) at a *different* checkout path, **5 commits
-   behind**, same two symbols absent. **Both daemons started before #177
-   merged; neither is running it — and "how far behind" is per-daemon (5 vs.
-   12) and does not generalise to a fleet-wide number**, the same shape as
-   `docs/identity-model.md`'s own H1 finding that role maps are per-daemon,
-   not global. **This is not something this ticket deploys or restarts to
-   fix — that is an operational action under the same rule as the role
-   variables, already escalated to the operator by `BUTCHR-100`.** To check
-   whether this has changed: resolve the *live* pid for your own daemon
-   (never from a cached `ENVIRONMENT.md`), read `/proc/<live pid>/cwd`, and
-   `grep -rl describeCollisions` in *that* checkout's `src/` — a match means
-   this marker has caught up; no match means it has not, regardless of what
-   `origin/main` looks like.
+   (`booswrit`, port `7718`) at the same relative path
+   (`~/code/brooswit/butchr`, a different Unix user's home), same two
+   symbols absent, same HEAD `36db3e4`. **Both daemons started before #177
+   merged; neither is running it.**
+
+   **A "how far behind" count is not reported here, on review — the first
+   attempt at one was wrong, and the way it was wrong is worth keeping as
+   its own finding.** `git rev-list --count HEAD..origin/main`, run inside a
+   clone, measures against *that clone's own last-fetched* `origin/main`
+   remote-tracking ref, not against `origin/main` as it stands on GitHub
+   right now. Two agents running the identical command against the
+   identical `HEAD` can get different counts — 5 in one clone, 12 in the
+   other, on this exact pair — with **nothing in either result signalling
+   which one is stale**; a `git fetch` in one clone changed its own answer
+   from 5 to 12 with no change to `HEAD` at all. That is a live instance of
+   this whole document's own theme: a check that runs cleanly and still
+   misleads. **The instruction for a later reader: `git fetch origin` in
+   the daemon's own clone before counting, or compare `HEAD`'s sha directly
+   against `origin/main`'s sha rather than counting commits at all** — a
+   sha comparison has no stale-ref failure mode a count does not also have,
+   but at least makes "behind by how much" not the load-bearing fact.
+
+   **This is not something this ticket deploys or restarts to fix** — that
+   is an operational action under the same rule as the role variables,
+   already escalated to the operator by `BUTCHR-100`. To check whether this
+   has changed: resolve the *live* pid for your own daemon (never from a
+   cached `ENVIRONMENT.md`), read `/proc/<live pid>/cwd`, and `grep -rl
+   describeCollisions` in *that* checkout's `src/` — a match means this
+   marker has caught up; no match means it has not.
 2. **The `[review] APPROVED/CHANGES_REQUESTED <pr-url> @ <sha>` line on the
    worker's own ticket** (this fleet's existing convention, per BUTCHR-73)
    is append-only and cannot follow a branch the way `reviews[].commit.oid`
