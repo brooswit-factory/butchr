@@ -28,6 +28,7 @@ import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
+import { speakOnOwnChannel } from "../tools/speak.js";
 
 let config;
 try {
@@ -262,7 +263,16 @@ runResourceLoop(issueResourceType, {
 const escalator = createEscalator({
   read: readPane,
   send: sendPane,
-  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  // HAZARD 2 (BUTCHR-67/BUTCHR-81): a blocked PROJECT agent's resolved id is
+  // a project key, not addressable via `ops.addComment` (MEASURED live,
+  // BUTCHR-62 2026-09-01: GET /rest/api/3/issue/BUTCHR -> 404) — the write
+  // failed silently, caught and logged, and the escalation ended its life
+  // in a daemon log nobody watches. This is a wiring-seam change only: for
+  // an issue key, `speakOnOwnChannel` calls `ops.addComment(issue, text)`
+  // exactly as before (see src/tools/speak.ts) — zero issue-tier behaviour
+  // change — and for a project key it routes to that project's root doc via
+  // the same seam BUTCHR-71 already shipped for report_to_boss/ask_boss.
+  addComment: async (issue, text) => { await speakOnOwnChannel(ops, issue, text); },
   comments: (issue) => atlassian.comments(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
