@@ -323,6 +323,8 @@ function integrationHarness(minutes: number) {
       commentRows = [{ id: String(nextId++), body: text, created: new Date(nowMs).toISOString() }, ...commentRows];
     },
     comments: async () => commentRows,
+    ownChannelComments: async () => commentRows,
+    unresponsiveMinutes: 5,
     now: () => nowMs,
     log: () => {},
   });

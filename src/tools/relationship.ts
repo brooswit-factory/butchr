@@ -24,9 +24,13 @@ function tagComment(who: string, text: string): string {
 /** Marks an `ask_boss` comment as a QUESTION AWAITING AN ANSWER — distinguishes it from a plain `report_to_boss`, and lets a boss find unanswered questions without reading every comment its workers wrote. Placed right after the identity tag. STATED HERE VERBATIM because BUTCHR-30's briefs need to quote it. */
 export const ASK_MARKER = "[ask]";
 
+/** The role env var that governs a given issuetype's staffing (src/config/config.ts's `Config.assignees`). Shared by `noRoleMsg` below and BUTCHR-110's collision messages so the two never drift apart on naming. */
+function envVarFor(issuetype: "Story" | "Task" | "Epic"): string {
+  return issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : issuetype === "Task" ? "BUTCHR_ASSIGNEE_TASK" : "BUTCHR_ASSIGNEE_EPIC";
+}
+
 function noRoleMsg(verb: string, issuetype: "Story" | "Task" | "Epic"): string {
-  const envVar = issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : issuetype === "Task" ? "BUTCHR_ASSIGNEE_TASK" : "BUTCHR_ASSIGNEE_EPIC";
-  return `${verb}: no assignee for a ${issuetype} — set ${envVar} (an Atlassian accountId) on this daemon, or adopt/create it with an explicit assignee via jira_assign/jira_create_issue`;
+  return `${verb}: no assignee for a ${issuetype} — set ${envVarFor(issuetype)} (an Atlassian accountId) on this daemon, or adopt/create it with an explicit assignee via jira_assign/jira_create_issue`;
 }
 
 function issuetypeOf(issue: unknown): string | undefined {
@@ -54,6 +58,138 @@ function summaryOf(issue: unknown): string | undefined {
 
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
 const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
+
+// ---------------------------------------------------------------------------
+// BUTCHR-110: tier-identity collision — RECORD, never refuse (BUTCHR-103's
+// decision). A boss (issue OR project tier) staffs a worker by assigning it
+// an accountId drawn from this daemon's role map; when that accountId is the
+// SAME as the boss's OWN accountId, the review hop between them is dead on
+// arrival — `gh pr review --approve` refuses an approval from the PR's own
+// author. Refusing the staffing call itself would deadlock the fleet (an
+// agent has no permitted way to edit a BUTCHR_ASSIGNEE_* value), so instead
+// this makes the collision LOUD: a result field, an audit line (written by
+// the caller in src/tools/defs.ts, from the field this returns), and a
+// durable comment on the worker's own ticket (written here, since only this
+// module has the worker's key at the point the collision is known).
+// ---------------------------------------------------------------------------
+
+/** AccountIds are not secrets; truncated to match src/config/config.ts's own startup-banner format exactly (BUTCHR-110) — never invent a second truncation convention for the same value. */
+const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
+
+type CollisionTier = "project" | "epic" | "story" | "task";
+
+/**
+ * One side of a possible collision. `describe` is a FULL CLAUSE naming
+ * provenance, not just a variable name — BUTCHR-103's review of this ticket
+ * (2026-09-02) rejected a bare `envVarFor(tier)` label on the CALLER side:
+ * the caller's accountId is read from the caller's own TICKET, which can
+ * differ from what that tier's role variable is currently set to (that is
+ * the whole reason it's read from the ticket at all), so a label that reads
+ * as "this variable produced this value" can name the WRONG variable to
+ * fix — measured concretely on the exact daemon BUTCHR-100 already measured
+ * for S2's honesty clause: `BUTCHR_ASSIGNEE_EPIC` UNSET locally, an Epic
+ * staffed by a DIFFERENT daemon collides anyway, and a naive label would
+ * tell an operator to edit a variable that governs nothing here and did not
+ * produce the value shown. `describe` is therefore built by each call site,
+ * which knows whether its own accountId truly came from a local role
+ * variable (the CHILD side always does) or was merely observed on a ticket
+ * (an ISSUE caller) or is this daemon's own credential (a PROJECT caller).
+ */
+interface CollisionSide {
+  tier: CollisionTier;
+  describe: string;
+  accountId: string | undefined;
+}
+
+/** The CHILD side's accountId always comes straight from this daemon's own role map (it's what `ops.assign`/`ops.createIssue` was just called with) — "governs" is literally true here, unlike the caller side. */
+function childSide(tier: "Epic" | "Story" | "Task", accountId: string | undefined): CollisionSide {
+  return { tier: tier.toLowerCase() as CollisionTier, describe: `${envVarFor(tier)} (governs this daemon's ${tier.toLowerCase()} tier)`, accountId };
+}
+
+/**
+ * The ISSUE-CALLER side. The accountId is OBSERVED on `callerKey`'s own
+ * ticket, never asserted to have come FROM the local role variable for the
+ * caller's tier — those can differ, which is the entire reason this reads
+ * the ticket rather than the variable. `describe` states both facts
+ * separately: where the value was actually observed, and what the local
+ * variable for that tier is currently set to (or that it's unset here) —
+ * so a reader can tell "the caller's actual identity" from "what this
+ * daemon's config says that tier's identity normally is" and is never told
+ * to edit a variable that did not produce the collision.
+ */
+function callerIssueSide(tier: "Epic" | "Story" | "Task", callerKey: string, roles: Roles, accountId: string | undefined): CollisionSide {
+  const envVar = envVarFor(tier);
+  const local = tier === "Story" ? roles.story : tier === "Task" ? roles.task : roles.epic;
+  const localState = local ? `currently set to ${truncAccountId(local)} here` : "UNSET here";
+  return {
+    tier: tier.toLowerCase() as CollisionTier,
+    describe: `the caller (${tier.toLowerCase()} tier, accountId observed on ${callerKey}'s own assignee — normally governed by ${envVar} on this daemon, which is ${localState})`,
+    accountId,
+  };
+}
+
+/** The PROJECT-CALLER side. There is no role variable to potentially mismatch — `ops.getMyself()` IS this daemon's own credential, full stop — so this can name it directly, same as the child side. */
+function callerProjectSide(accountId: string | undefined): CollisionSide {
+  return { tier: "project", describe: "ATLASSIAN_EMAIL (this daemon's own Atlassian credential — the project tier has no role variable)", accountId };
+}
+
+/**
+ * Pure comparison — no I/O. `undefined` on either side (an unset role, a
+ * caller ticket with no assignee at all, or a collision CHECK that could
+ * not run — see `resolveCallerIdentity` below) is NOT a collision, only a
+ * genuine accountId equality is. Returns the full message (naming both
+ * sides' provenance, both tiers, the specific hop, and the shared
+ * accountId) or `undefined`.
+ */
+function collisionBetween(caller: CollisionSide, child: CollisionSide): string | undefined {
+  if (!caller.accountId || !child.accountId || caller.accountId !== child.accountId) return undefined;
+  return (
+    `${caller.describe} and ${child.describe} resolve to the SAME Atlassian accountId (${truncAccountId(caller.accountId)}) — ` +
+    `the ${caller.tier} that owns this ${child.tier} will not be able to approve its PR: GitHub refuses a pull request approval from the PR's own author. ` +
+    `This hop has no second identity behind it; RECORDED here rather than refused (BUTCHR-103's decision) — the call above still succeeds.`
+  );
+}
+
+/**
+ * Posts `message` as a comment on the worker's own ticket (`workerKey`) —
+ * the ticket whose PR will not be approvable, read by both the boss and the
+ * author. FAIL-SAFE, NEVER FAIL-SILENT: a failed write is folded INTO the
+ * returned text rather than swallowed bare (this project has already
+ * catalogued a load-bearing write hidden behind a bare `.catch(() => {})` as
+ * a defect — success and failure must never look identical to the caller).
+ * The staffing call this is called from never fails because of this.
+ */
+async function traceCollision(ops: AtlassianOps, workerKey: string, who: string, message: string): Promise<string> {
+  try {
+    await ops.addComment(workerKey, tagComment(who, message));
+    return message;
+  } catch (e) {
+    return `${message} — THE DURABLE TRACE COMMENT ON ${workerKey} COULD NOT BE WRITTEN (${(e as Error).message}): this warning exists ONLY in this tool result and the daemon's audit log, not as a comment on the ticket.`;
+  }
+}
+
+/**
+ * BUTCHR-110 (review fix, 2026-09-02): the collision check's OWN reads —
+ * `adopt_worker`'s extra `ops.getIssue(callerKey)`, and `ops.getMyself()`
+ * for a PROJECT caller — must never turn a successful staffing call into a
+ * failure, the SAME standard `traceCollision` above already holds for the
+ * trace comment. Without this guard a transient read failure here throws
+ * the whole staffing call — for `adopt_worker`, AFTER `assign`/`linkIssues`
+ * already succeeded and BEFORE the disposition is applied, producing
+ * exactly the "linked and assigned but undeclared" state this file's own
+ * `adoptWorker` doc comment names as the state `adopt_worker` itself exists
+ * to REPAIR, not to create. Converts any rejection into an `unknown`
+ * message instead of throwing — "not checked" must never look like
+ * "checked and clean" — the same principle behind S2's own honesty clause
+ * (`src/config/config.ts`), applied here to S1's check itself.
+ */
+async function resolveCollisionSide<T>(read: () => Promise<T>, whatFailed: string): Promise<{ value: T; unknown?: undefined } | { value?: undefined; unknown: string }> {
+  try {
+    return { value: await read() };
+  } catch (e) {
+    return { unknown: `the tier-identity collision check could not run: ${whatFailed} (${(e as Error).message}) — this hop was NOT checked for a shared identity.` };
+  }
+}
 
 /**
  * Returns the fetched issue (not just void) so callers that need it for a
@@ -152,6 +288,10 @@ export interface NewWorkerResult {
   member?: string;
   doc: DocResult;
   disposition: Disposition["kind"];
+  /** BUTCHR-110: present ONLY when the caller's own accountId and the child's about-to-be-assigned accountId collide — see this file's own "tier-identity collision" section above. A distinct, greppable key so an agent that skims the result still catches it; absent entirely on a healthy hop (never present-but-empty). */
+  identityCollision?: string;
+  /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (this daemon's identity, for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`, since a failed check has no verdict to report. "Not checked" must never look like "checked and clean". */
+  identityUnknown?: string;
 }
 
 /**
@@ -277,6 +417,20 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     }
   }
 
+  // (3.5) BUTCHR-110: tier-identity collision — RECORD, never refuse (see
+  // this file's own section above `CHILD_TYPE`). The caller's accountId
+  // comes from the caller's OWN ticket, already fetched above for type/
+  // project inference — no extra Jira call here — never from the role
+  // variable that governs the caller's tier: those can differ (a
+  // hand-assigned ticket), and the observed value is the one that decides
+  // whether GitHub will refuse the review. `callerType` is known to be
+  // "Story" or "Epic" here (childType resolved above via CHILD_TYPE).
+  const collisionMsg = collisionBetween(
+    callerIssueSide(callerType as "Story" | "Epic", callerKey, roles, assigneeAccountIdOf(callerIssue)),
+    childSide(childType, role),
+  );
+  const identityCollision = collisionMsg ? await traceCollision(ops, key, callerKey, collisionMsg) : undefined;
+
   // (4) doc — last, on purpose. `ensureDoc` is convergent (BUTCHR-33), so a
   // failure here is reported but NOT rolled back: the ticket is already a
   // fully declared worker (steps 2/3 succeeded), and nothing downstream
@@ -294,7 +448,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     );
   }
 
-  return { key, implements: callerKey, doc, disposition: disposition.kind };
+  return { key, implements: callerKey, doc, disposition: disposition.kind, ...(identityCollision ? { identityCollision } : {}) };
 }
 
 /**
@@ -372,6 +526,21 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     }
   }
 
+  // (2.5) BUTCHR-110: tier-identity collision — RECORD, never refuse. For a
+  // PROJECT caller there is no role variable on the caller's own side (the
+  // project tier is governed by this daemon's Atlassian CREDENTIAL, not a
+  // BUTCHR_ASSIGNEE_* var) — `ops.getMyself()` is the same call BUTCHR-67's
+  // discovery lead-filter already uses (src/resources/project.ts) to answer
+  // "the account this credential runs as", reused here rather than adding a
+  // second way to ask the same question. GUARDED (review fix, 2026-09-01):
+  // this read runs AFTER the disposition, so the epic is already fully
+  // declared either way — but an unguarded throw here would still hand the
+  // caller a raw transport error instead of a clean result, so it gets the
+  // same fail-safe treatment as every other collision-check read.
+  const me = await resolveCollisionSide(() => ops.getMyself(), "reading this daemon's own Atlassian identity (getMyself) failed");
+  const collisionMsg = me.value ? collisionBetween(callerProjectSide(me.value.accountId), childSide("Epic", role)) : undefined;
+  const identityCollision = collisionMsg ? await traceCollision(ops, key, projectKey, collisionMsg) : undefined;
+
   // (3) doc — last, on purpose; see newWorker's own step-4 comment (same reasoning).
   let doc: DocResult;
   try {
@@ -383,7 +552,11 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     );
   }
 
-  return { key, member: projectKey, doc, disposition: disposition.kind };
+  return {
+    key, member: projectKey, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(me.unknown ? { identityUnknown: me.unknown } : {}),
+  };
 }
 
 /**
@@ -459,6 +632,10 @@ export interface AdoptWorkerResult {
   alreadyAdopted: boolean;
   doc: DocResult;
   disposition: Disposition["kind"];
+  /** BUTCHR-110: present ONLY when the caller's own accountId and the adopted ticket's about-to-be-assigned accountId collide — see the "tier-identity collision" section near the top of this file. Computed and reported on EVERY call (including a fully idempotent re-adoption), because it states a fact about current state, not an action taken — but the underlying ticket COMMENT is only (re-)posted when this call does real adoption work (`!alreadyAdopted`); see the comment at this field's call site for why. */
+  identityCollision?: string;
+  /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (the caller's own ticket, or this daemon's identity for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`. "Not checked" must never look like "checked and clean". */
+  identityUnknown?: string;
 }
 
 /**
@@ -493,6 +670,15 @@ export interface AdoptWorkerResult {
  * whenever the adopted ticket carries it, whether or not this call is
  * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
  * below for why that check is not gated on `alreadyAdopted`.
+ *
+ * SEPARATELY, THIS CALL ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`)
+ * whenever the adopted ticket carries it — for BOTH dispositions, unlike
+ * `EXEMPT_LABEL` above, and likewise not gated on `alreadyAdopted`
+ * (BUTCHR-108/BUTCHR-137). `ORPHAN_LABEL` means UNDIRECTED, not shelved, and
+ * a ticket adopted with `"shelve"` is exactly as directed as one adopted
+ * with `"start"` — it has a boss, a link, and a recorded decision either
+ * way. See the comment at that removeLabels call below for the full
+ * argument.
  *
  * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
  * "shelve" disposition, the reason is posted whenever this call does ANY
@@ -538,7 +724,67 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     if (!linkedCorrectly) await ops.linkIssues(workerKey, callerKey, "Implements");
   }
 
+  // BUTCHR-110: tier-identity collision — RECORD, never refuse. UNLIKE
+  // new_worker's issue path, adopt_worker never otherwise reads the
+  // CALLER's own ticket (only the ADOPTED ticket, above) — this is one
+  // extra Jira read, paid here as the price of the check, per this
+  // ticket's own S1 spec. Caller's accountId comes from the caller's
+  // ACTUAL ticket, never from the role variable governing the caller's
+  // tier (those can differ — a hand-assigned ticket).
+  //
+  // GUARDED (review fix, 2026-09-02): this read runs AFTER `assign`/
+  // `linkIssues` above and BEFORE the disposition below — an unguarded
+  // throw here would leave the ticket assigned and linked but UNDECLARED,
+  // exactly the damaging partial state this function's own doc comment
+  // names, and which `adopt_worker` itself exists to REPAIR, not to create.
+  // A read failure therefore never throws: it's reported as `identityUnknown`
+  // on the result instead, and the call proceeds exactly as if this
+  // collision check did not exist. "Not checked" must never look like
+  // "checked and clean".
+  const callerRead = await resolveCollisionSide(() => ops.getIssue(callerKey), `reading ${callerKey}'s own assignee failed`);
+  const callerType = callerRead.value ? (issuetypeOf(callerRead.value) as "Story" | "Task" | "Epic" | undefined) : undefined;
+  const callerAccountId = callerRead.value ? assigneeAccountIdOf(callerRead.value) : undefined;
+  const collisionMsg = callerType
+    ? collisionBetween(callerIssueSide(callerType, callerKey, roles, callerAccountId), childSide(issuetype, role))
+    : undefined;
+  // THE COMMENT IS POSTED ONLY WHEN THIS CALL DOES REAL ADOPTION WORK
+  // (`!alreadyAdopted`) — deliberately mirroring the shelve-reason comment's
+  // OWN idiom just above (and its own doc comment on `adoptWorker`): a fully
+  // idempotent re-adoption changes nothing else about the ticket, and
+  // re-posting an identical collision comment on every subsequent no-op
+  // check (e.g. a boss re-adopting on every restart to reconcile state)
+  // would spam the ticket with duplicates carrying no new information. The
+  // RESULT FIELD and the AUDIT LINE (written by the caller in
+  // src/tools/defs.ts from this field) are NOT gated the same way — both
+  // are read-only per call, cost nothing to repeat, and "loud on every
+  // call that could go wrong" is the point — so they are computed here
+  // regardless of `alreadyAdopted`.
+  const identityCollision = collisionMsg
+    ? alreadyAdopted
+      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written on the call this hop is actually adopted, not on every subsequent no-op check)`
+      : await traceCollision(ops, workerKey, callerKey, collisionMsg)
+    : undefined;
+
   const doc = await ensureDoc(ops, workerKey);
+
+  // CLEARS ORPHAN_LABEL WHENEVER IT'S PRESENT — REGARDLESS OF DISPOSITION,
+  // AND NOT GATED ON `alreadyAdopted` EITHER (BUTCHR-108/BUTCHR-137). The
+  // gating on EXEMPT_LABEL just below is specific to what THAT label means
+  // (CURRENTLY shelved, a state only "start" reverses); ORPHAN_LABEL means
+  // something different — UNDIRECTED — and a ticket adopted with "shelve" is
+  // exactly as directed as one adopted with "start": either way it now has a
+  // boss, a link, and a recorded decision, so this clear runs for BOTH. Reuses
+  // `labels` from the fetch above — no extra Jira call. Not gated on
+  // `alreadyAdopted`, by the same BUTCHR-50 argument EXEMPT_LABEL's own clear
+  // makes below: an otherwise fully idempotent re-adoption must still clear a
+  // stale orphan label, or a live, directed ticket keeps silently polluting
+  // the undirected-ticket query forever — exactly the residue this fix
+  // exists to stop producing. Cleared BEFORE any transition below — same
+  // "never leave a partial state where the detector is silently wrong"
+  // ordering EXEMPT_LABEL's own clear and startWorker's comment already use.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
 
   // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
   // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
@@ -582,7 +828,11 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     }
   }
 
-  return { key: workerKey, alreadyAdopted, doc, disposition: disposition.kind };
+  return {
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
+  };
 }
 
 /**
@@ -598,6 +848,17 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
  * boss (there is no equivalent "explicit move" verb for project
  * membership here — moving an issue between Jira projects is out of scope
  * for this tool surface, not silently omitted).
+ *
+ * ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`) WHENEVER PRESENT, SAME AS THE
+ * ISSUE-CALLER PATH ABOVE — argued explicitly here rather than left implicit
+ * (BUTCHR-108/BUTCHR-137): `fileWhereItBelongs` can only ever create a Story
+ * or a Task (its `issuetype` input is typed that way), so an orphan Epic can
+ * never arrive here through this codebase's own write path today. Clearing
+ * it here anyway is a symmetry / defence-in-depth call, not a reachable-bug
+ * fix — the label could still land on an Epic by hand, or from a future
+ * caller this tool surface doesn't control. It costs nothing to add: this
+ * path already fetches and computes `labels` for its own idempotence check,
+ * so the clear reuses that fetch exactly like the issue-caller path's does.
  */
 async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   const issue = await ops.getIssue(workerKey);
@@ -627,7 +888,36 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
 
   if (!alreadyAdopted && !assignedCorrectly) await ops.assign(workerKey, role);
 
+  // BUTCHR-110: tier-identity collision — RECORD, never refuse. The project
+  // tier has no role variable of its own; the caller's accountId is this
+  // daemon's own Atlassian CREDENTIAL (`ops.getMyself()` — the same call
+  // BUTCHR-67's discovery lead-filter already uses, src/resources/
+  // project.ts). Comment-posting is gated on `!alreadyAdopted`, same
+  // reasoning as the issue-caller path (adoptWorker, above) — see its own
+  // comment at the equivalent call site for why.
+  //
+  // GUARDED (review fix, 2026-09-02): this read runs AFTER `assign` above
+  // and BEFORE the disposition below — same partial-state hazard as
+  // adoptWorker's own guarded read; see its comment for the full reasoning.
+  const me = await resolveCollisionSide(() => ops.getMyself(), "reading this daemon's own Atlassian identity (getMyself) failed");
+  const collisionMsg = me.value ? collisionBetween(callerProjectSide(me.value.accountId), childSide("Epic", role)) : undefined;
+  const identityCollision = collisionMsg
+    ? alreadyAdopted
+      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written on the call this hop is actually adopted, not on every subsequent no-op check)`
+      : await traceCollision(ops, workerKey, projectKey, collisionMsg)
+    : undefined;
+
   const doc = await ensureDoc(ops, workerKey);
+
+  // Same BUTCHR-108/BUTCHR-137 fix as the issue-caller path: clear a stale
+  // ORPHAN_LABEL whenever it's present, for BOTH dispositions and not gated
+  // on `alreadyAdopted` — see this function's own doc comment above for why
+  // this path clears it too (symmetry / defence-in-depth, argued there), and
+  // adoptWorker's ORPHAN_LABEL comment for the full disposition-gating
+  // reasoning. Reuses `labels` from the fetch above — no extra Jira call.
+  if (labels.includes(ORPHAN_LABEL)) {
+    await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
+  }
 
   // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
   // on a "start" disposition whenever it's present, not gated on
@@ -649,7 +939,11 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     }
   }
 
-  return { key: workerKey, alreadyAdopted, doc, disposition: disposition.kind };
+  return {
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(me.unknown ? { identityUnknown: me.unknown } : {}),
+  };
 }
 
 /** Revises a worker's priority. Refuses a key that is not one of the caller's own workers, AND refuses the caller's OWN key — your priority is your boss's judgment, never your own. */
@@ -680,6 +974,69 @@ export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, wor
  * STATED HERE VERBATIM because briefs need to quote it, same as ASK_MARKER.
  */
 export const CORRECTION_MARKER = "[correction]";
+
+/**
+ * Marks a follow-up comment `correctWorker` posts when the replace (the
+ * write AFTER the archive) fails for a reason the size pre-check below did
+ * not catch — a transient network fault, a permissions change, anything
+ * else Jira can reject with. Placed right after the identity tag, same
+ * idiom as `CORRECTION_MARKER`/`ASK_MARKER`. AN EXPORTED CONSTANT, NEVER
+ * RETYPED — including in tests, which read this symbol — for the same
+ * reason `CORRECTION_MARKER`'s own comment gives: a marker duplicated as a
+ * literal eventually drifts into two different literals, and a grep that
+ * silently misses half the corpus answers wrong instead of not at all.
+ * This is BUTCHR-136's fix for the gap BUTCHR-128 measured: the thrown
+ * error already tells the CALLER a rejected write happened, but nothing
+ * durable told a later reader of the ticket itself — this comment is that
+ * durable record, posted immediately after the `[correction]` archive it
+ * is annotating, best-effort (see `correctWorker`'s catch block: its own
+ * failure must never mask the original edit error).
+ */
+export const CORRECTION_REJECTED_MARKER = "[correction-rejected]";
+
+/**
+ * Body for the `CORRECTION_REJECTED_MARKER` follow-up comment — mirrors
+ * `correctionArchiveBody`'s shape so the two read as one family. Points at
+ * "the archive comment immediately above" rather than an ID: comments are
+ * posted in order and this one is always the very next one, so a reader
+ * never needs anything but position to connect the two.
+ */
+function correctionRejectedAnnotationBody(workerKey: string, editError: string): string {
+  return [
+    `the ${CORRECTION_MARKER} archive comment immediately above records a write that was REJECTED.`,
+    `The edit meant to replace it failed (${editError}) after the archive was posted, so the archived text above did NOT get superseded — ${workerKey}'s description/summary are UNCHANGED. Treat the archived text above as still current, not history. Safe to retry.`,
+  ].join("\n\n");
+}
+
+/**
+ * Documented, non-configurable Jira Cloud limits, established rather than
+ * guessed (BUTCHR-136, corrected on review): Jira Cloud enforces a fixed
+ * 32767-character limit on rich-text fields, `description` included — this
+ * is NOT the `jira.text.field.character.limit` advanced setting (that
+ * setting is a Server/Data Center mechanism, configurable there, and does
+ * not exist as a readable or writable Cloud setting at all; asserting
+ * "fixed... and not configurable" under that name would be true on Server/DC
+ * for the wrong reason and wrong on Cloud, where the setting is simply
+ * absent). The 32767 figure itself is corroborated, not sourced, by
+ * Atlassian's support KB for `CommentBodyCharacterLimitExceededException`
+ * (a Cloud Migration Assistant comment-body limit) quoting the same string
+ * verbatim: "The entered text is too long. It exceeds the allowed limit of
+ * 32,767 characters." — that KB is about a different field in a different
+ * tool, cited here only because it independently lands on the same number
+ * as the `CONTENT_LIMIT_EXCEEDED` error this verb actually catches.
+ * `summary` is a separate system field with its own fixed 255-character
+ * Cloud limit ("Summary can't exceed 255 characters") — the two fields are
+ * NOT the same limit, which is why this is two constants, not one reused
+ * twice.
+ *
+ * Sanity-checked against this corpus's own falsifier before shipping:
+ * BUTCHR-125 holds a description Jira ACCEPTED at 30,091 characters
+ * (BUTCHR-100's measurement, cited on BUTCHR-128/BUTCHR-130) — any
+ * description limit at or below 30,091 would be wrong on its face, and
+ * 32767 clears that bar.
+ */
+export const JIRA_DESCRIPTION_CHAR_LIMIT = 32767;
+export const JIRA_SUMMARY_CHAR_LIMIT = 255;
 
 /**
  * The archive comment body `correctWorker` posts BEFORE overwriting — see
@@ -759,8 +1116,26 @@ export interface CorrectWorkerResult {
  *   3. `why` empty or whitespace-only — same discipline `shelveWorker`
  *      already applies to its own `reason`: an intention nobody wrote down
  *      is indistinguishable six weeks later from a mistake.
- *   4. `assertOwnWorker` — the existing ownership helper, reused unchanged;
+ *   4. oversized `description`/`summary` — BUTCHR-136: refused against the
+ *      REAL, documented Jira Cloud limits (`JIRA_DESCRIPTION_CHAR_LIMIT`,
+ *      `JIRA_SUMMARY_CHAR_LIMIT`) BEFORE the archive comment is posted, so
+ *      an oversized correction leaves the worker byte-for-byte untouched
+ *      instead of an archive comment with no replacement to match it. This
+ *      is a cheap, no-Jira-read check like 1-3 above, so it belongs here,
+ *      not after the ownership read.
+ *   5. `assertOwnWorker` — the existing ownership helper, reused unchanged;
  *      this is the only place ownership is checked, on purpose.
+ *
+ * WHEN THE REPLACE FAILS FOR ANY OTHER REASON — a pre-check on size cannot
+ * cover a transient network fault, a permissions change, or any other
+ * ground Jira might reject on. In that case the archive already stands, so
+ * the catch below posts a best-effort `CORRECTION_REJECTED_MARKER`
+ * follow-up comment marking that archive as recording a write that was
+ * REJECTED, then re-throws the ORIGINAL error unchanged. "Best-effort"
+ * means exactly that: the follow-up post is wrapped in its own try/catch
+ * that swallows its own failure — a reader who never sees the annotation
+ * still gets the original, already-correct error, never a secondary one
+ * about the annotation itself failing.
  *
  * ARCHIVE BEFORE OVERWRITE — THE ORDERING IS THE DESIGN, not decoration:
  * this reads the worker's CURRENT description/summary, posts them as a
@@ -820,6 +1195,16 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
   if (!input.why.trim()) {
     throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
+  if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
+  if (input.summary !== undefined && input.summary.length > JIRA_SUMMARY_CHAR_LIMIT) {
+    throw new Error(
+      `correct_worker: refusing — the new summary is ${input.summary.length} characters, over Jira's ${JIRA_SUMMARY_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
+    );
+  }
   await assertOwnWorker(ops, "correct_worker", callerKey, workerKey);
 
   const issue = await ops.getIssue(workerKey);
@@ -843,8 +1228,18 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
     });
   } catch (e) {
+    const editError = (e as Error).message;
+    try {
+      await ops.addComment(workerKey, tagComment(callerKey, `${CORRECTION_REJECTED_MARKER} ${correctionRejectedAnnotationBody(workerKey, editError)}`));
+    } catch {
+      // Best-effort, by design: the annotation is a nice-to-have durable
+      // record, not a substitute for the ORIGINAL error thrown below. A
+      // reader who never sees this comment still gets the correct,
+      // already-established error text — never a secondary error about the
+      // annotation itself failing to post.
+    }
     throw new Error(
-      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${(e as Error).message}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
+      `correct_worker: archived the superseded text on ${workerKey} (see the ${CORRECTION_MARKER} comment) but the edit itself failed (${editError}) — one harmless extra comment now sits on ${workerKey}; its description/summary are UNCHANGED. Safe to retry.`,
     );
   }
 
@@ -967,7 +1362,20 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
 // The deliberate-orphan escape: file_where_it_belongs
 // ---------------------------------------------------------------------------
 
-/** `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL filter. Never combined with `EXEMPT_LABEL`: see fileWhereItBelongs's doc comment for why an orphan can never trip the parked-ticket detector. */
+/**
+ * `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL
+ * filter. Applied exactly once, at creation, by `fileWhereItBelongs`.
+ * WITHDRAWN by `adoptWorker` / `adoptProjectWorker` (BUTCHR-108/BUTCHR-137)
+ * the moment the ticket gains a boss — for either disposition, not gated on
+ * idempotence — see the comment at those `removeLabels` calls for the full
+ * reasoning.
+ *
+ * Never combined with `EXEMPT_LABEL` (`butchr:shelved`) IN THE SAME CALL:
+ * `fileWhereItBelongs` never applies `EXEMPT_LABEL` at creation (see its own
+ * doc comment for why an orphan can't trip the parked-ticket detector), and
+ * `adoptWorker`'s `"shelve"` path withdraws `ORPHAN_LABEL` in the same call
+ * it adds `EXEMPT_LABEL` — so a live ticket never ends up carrying both.
+ */
 export const ORPHAN_LABEL = "butchr:orphan";
 
 /** A destination is either a named existing Epic, or prose explaining why a new one is needed. Neither is a fallback for the other. */
@@ -1104,7 +1512,10 @@ export interface FileWhereItBelongsResult {
  * link off the active set, and this ticket has none — the parked detector
  * structurally cannot see it, so that label here would be cargo-culted state
  * meaning nothing. Labelled `ORPHAN_LABEL` instead, which is what actually
- * makes it discoverable (a saved JQL filter).
+ * makes it discoverable (a saved JQL filter) — withdrawn by `adoptWorker` /
+ * `adoptProjectWorker` the moment this ticket gains a boss and stops being
+ * undirected (BUTCHR-108/BUTCHR-137); see the comment at those
+ * `removeLabels` calls.
  *
  * WRITE ORDER, AND WHY: unlike new_worker, there is no "worst survivable
  * state" to protect against here, because this ticket never gets a boss link
