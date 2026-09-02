@@ -169,6 +169,7 @@ function makeWorld() {
   getMyself: async () => ({ accountId: "test-account" }),
   setProjectProperty: async () => ({ ok: true }),
   getPageVersions: async () => ({}),
+  getProjectPropertyOrNull: async () => null,
   };
 
   return { ops, issues, pages, addIssue, setProjectProperty };

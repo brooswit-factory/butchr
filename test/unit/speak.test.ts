@@ -59,6 +59,7 @@ function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; ji
       return { ok: true };
     },
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async (projectKey: string) => properties.get(projectKey) ?? null,
     ...overrides,
   };
   return { ops, jiraComments, pageComments, properties };

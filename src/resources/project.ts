@@ -180,14 +180,34 @@ export interface ProjectWatermark {
   version: number | null;
   /** Last root-doc footer-comment id this project has been acted on through, or `null` if never recorded. */
   comment: string | null;
-  /** Per in-review epic key -> last footer-comment id on that epic acted on (`null` = the epic itself was acted on with no comment yet watermarked). A key ABSENT from this map means "never acted on this epic being in review at all". */
-  epics: Readonly<Record<string, string | null>>;
+  /**
+   * Per in-review epic key -> the epic's OWN `updated` timestamp (ISO-8601,
+   * Jira's own field) at the moment it was last acted on. A key ABSENT from
+   * this map means "never acted on this epic being in review at all".
+   *
+   * DELIBERATELY `updated`, NOT a comment id (BUTCHR-81 defect, caught at
+   * review before merge): a per-epic `newestCommentId` watermark cannot
+   * detect an epic RE-ENTERING review with no new comment (`submit_to_boss`
+   * transitions status; it does not necessarily comment) — a stale,
+   * never-pruned map entry from the epic's PRIOR review episode would still
+   * equal the freshly observed value and the project would wrongly stay
+   * `asleep`. Jira's `updated` field bumps on EVERY field change to an
+   * issue, status transitions included (MEASURED live, BUTCHR-81
+   * 2026-09-01: posting a comment alone moved `updated` forward) — so
+   * leaving review and re-entering it is, by itself, at least one
+   * transition that necessarily advances `updated` past whatever was
+   * watermarked during the previous review episode. No pruning is needed:
+   * the compared VALUE, not the map's membership, is what makes re-entry
+   * observable.
+   */
+  epics: Readonly<Record<string, string>>;
 }
 
 /** One epic currently `In Review` in a project, as `loadProject` observed it this poll. */
 export interface ProjectEpic {
   key: string;
-  newestCommentId: string | null;
+  /** This epic's own Jira `updated` field — see `ProjectWatermark.epics`'s doc comment for why this, not a comment id. */
+  updated: string;
 }
 
 /**
@@ -235,10 +255,13 @@ export function projectVerdict(p: ProjectResource): ActivationVerdict {
   const wm = p.watermark;
   const versionBehind = p.observedVersion !== null && p.observedVersion !== wm.version;
   const commentBehind = p.observedCommentId !== null && p.observedCommentId !== wm.comment;
-  const epicsBehind = p.observedEpics.some((e) => {
-    if (!(e.key in wm.epics)) return true;
-    return e.newestCommentId !== null && e.newestCommentId !== wm.epics[e.key];
-  });
+  // A single comparison covers BOTH "entered review" and "commented while in
+  // review": absence from `wm.epics` (never acted on) and a stale `updated`
+  // (acted on, but review re-entered or commented on since) are both simply
+  // "the current updated does not equal the watermarked one" — see
+  // `ProjectWatermark.epics`'s doc comment for why `updated` rather than a
+  // comment id makes this a single check instead of two.
+  const epicsBehind = p.observedEpics.some((e) => e.updated !== wm.epics[e.key]);
   return versionBehind || commentBehind || epicsBehind ? "active" : "asleep";
 }
 
@@ -307,7 +330,7 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
-  patch: { version?: number; comment?: string; epic?: { key: string; commentId: string | null } },
+  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string>> },
 ): Promise<void> {
   // Fail open on an unreadable property (e.g. genuinely absent — 404) rather
   // than throwing: this write path is reachable from speakOnOwnChannel only
@@ -319,8 +342,11 @@ export async function advanceProjectWatermark(
   // own eligibility check already treats as ineligible.
   const current = await ops.getProjectProperty(projectKey, PROPERTY_KEY).catch(() => undefined) as Record<string, unknown> | undefined ?? {};
   const wake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
-  const epics = { ...(wake.epics ?? {}) };
-  if (patch.epic) epics[patch.epic.key] = patch.epic.commentId;
+  // `epics` merges (never replaces) so watermarking one or a few epics in
+  // one call never drops another epic's already-recorded entry — the same
+  // additive discipline `addLabels`/`removeLabels` (atlassian-real.ts) use
+  // for read-modify-write over a shared collection.
+  const epics = { ...(wake.epics ?? {}), ...(patch.epics ?? {}) };
   const nextWake: ProjectWatermark = {
     version: patch.version ?? wake.version ?? null,
     comment: patch.comment ?? wake.comment ?? null,
@@ -340,9 +366,16 @@ const projectKeyOfIssue = (key: string): string => key.split("-", 1)[0]!;
 
 export interface ProjectResourceDeps {
   ops: AtlassianOps;
-  /** Jira-shaped reads (rule 3: epics in review, and their comments) — the SAME shape `src/resources/issue.ts`'s `IssueResourceDeps` already takes, wired from the daemon's existing `atlassian` client, per the ticket's instruction not to add Confluence-shaped work to that client or a third one. */
+  /**
+   * Jira-shaped read (rule 3: epics in review) — the SAME shape
+   * `src/resources/issue.ts`'s `IssueResourceDeps.search` already takes,
+   * wired from the daemon's existing `atlassian` client, per the ticket's
+   * instruction not to add Confluence-shaped work to that client or a third
+   * one. No per-epic `comments()` dependency: rule 3's epic axis watermarks
+   * the epic's own `updated` field (already returned by this same search),
+   * not a comment id — see `ProjectWatermark.epics`'s doc comment.
+   */
   search: (jql: string) => Promise<JiraIssue[]>;
-  comments: (key: string) => Promise<readonly JiraComment[]>;
 }
 
 interface EligibleCandidate {
@@ -351,7 +384,31 @@ interface EligibleCandidate {
   property: { rootDoc?: { id?: string }; wake?: Partial<ProjectWatermark> };
 }
 
-/** One poll's worth of discovery I/O — see this file's top comment for the batching this function performs and why (project search, PROJECT_POLL_INTERVAL_MS's doc comment for the call-count budget). */
+/**
+ * One poll's worth of discovery I/O — see this file's top comment for the
+ * batching this function performs and why (project search,
+ * PROJECT_POLL_INTERVAL_MS's doc comment for the call-count budget).
+ *
+ * FAILURE-MODE DECISION (BUTCHR-81, raised by BUTCHR-66's reviewer): a
+ * genuinely missing `butchr` property (404 — the archive/sample-project
+ * case, Declaration 2's own eligibility signal) is expected and must not
+ * fail this poll; ANY OTHER per-project read failure (rate limit, timeout,
+ * permission change, …) here or anywhere else in this function is left to
+ * PROPAGATE and fail the WHOLE poll, deliberately, rather than being
+ * swallowed into a shorter-than-true result.
+ *
+ * Why fail the whole poll rather than return the rest: `desiredFrom`
+ * (src/daemon/loop.ts) treats "absent from this poll's discovery result" as
+ * "stop this resource's agent" — the SAME reconciler behaviour that makes a
+ * short list dangerous for a RUNNING project agent, not merely a missed
+ * wake. A project this poll couldn't read is a project this poll knows
+ * NOTHING new about; the safe default is to change nothing (retry at the
+ * next poll, `PROJECT_POLL_INTERVAL_MS` later) rather than to report it
+ * gone. Only the ONE read that is EXPECTED to reject for a large, known
+ * fraction of candidates (the property read, for every ineligible project)
+ * gets a narrow, explicit not-found conversion; every other call in this
+ * function is intentionally left uncaught.
+ */
 async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[]> {
   const me = await deps.ops.getMyself();
   const raw = await deps.ops.searchProjects("live");
@@ -359,13 +416,11 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
 
   const properties = await Promise.all(
     led.map(async (p): Promise<EligibleCandidate | null> => {
-      try {
-        const property = (await deps.ops.getProjectProperty(p.key, PROPERTY_KEY)) as EligibleCandidate["property"] | undefined;
-        if (!property?.rootDoc?.id) return null;
-        return { key: p.key, name: p.name, property };
-      } catch {
-        return null; // unreadable (e.g. 404 — no `butchr` property at all) -> ineligible, not a thrown error
-      }
+      // Only a clean NOT-FOUND is ineligibility; any other rejection
+      // propagates (see this function's own doc comment above).
+      const property = (await deps.ops.getProjectPropertyOrNull(p.key, PROPERTY_KEY)) as EligibleCandidate["property"] | null;
+      if (!property?.rootDoc?.id) return null;
+      return { key: p.key, name: p.name, property };
     }),
   );
   const eligible = properties.filter((p): p is EligibleCandidate => p !== null);
@@ -402,9 +457,9 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     eligible.map(async (p, i): Promise<ProjectResource> => {
       const rootDocId = p.property.rootDoc!.id!;
       const epics = epicsByProject.get(p.key) ?? [];
-      const observedEpics: ProjectEpic[] = await Promise.all(
-        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: (await deps.comments(epic.key))[0]?.id ?? null })),
-      );
+      // No extra call per epic: `updated` is already on every issue the
+      // rule-3 JQL search returned.
+      const observedEpics: ProjectEpic[] = epics.map((epic): ProjectEpic => ({ key: epic.key, updated: epic.updated }));
       const wake = p.property.wake;
       return {
         key: p.key,
@@ -436,8 +491,8 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
   if (prev.observedVersion !== next.observedVersion) return true;
   if (prev.observedCommentId !== next.observedCommentId) return true;
   if (prev.observedEpics.length !== next.observedEpics.length) return true;
-  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.newestCommentId]));
-  return next.observedEpics.some((e) => prevEpics.get(e.key) !== e.newestCommentId || !prevEpics.has(e.key));
+  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.updated]));
+  return next.observedEpics.some((e) => prevEpics.get(e.key) !== e.updated || !prevEpics.has(e.key));
 }
 
 /**

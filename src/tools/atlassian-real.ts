@@ -177,6 +177,15 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     getProjectProperty: (projectKey, propertyKey) =>
       jira.projectProperties.getProjectProperty({ projectIdOrKey: projectKey, propertyKey }).then((r: any) => r?.value),
 
+    // Same call as getProjectProperty; only the not-found conversion
+    // differs — same isNotFoundError check getRemoteLink already uses below,
+    // so a genuine 404 resolves null and anything else still rejects.
+    getProjectPropertyOrNull: (projectKey, propertyKey) =>
+      jira.projectProperties.getProjectProperty({ projectIdOrKey: projectKey, propertyKey }).then((r: any) => r?.value).catch((e: unknown) => {
+        if (isNotFoundError(e)) return null;
+        throw e;
+      }),
+
     // getRemoteIssueLinks with a `globalId` 404s (jira.js throws NotFoundError)
     // when no such link exists, rather than resolving an empty result (MEASURED
     // live against BUTCHR-33) — every caller wants one "not found" shape, so

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   advanceProjectWatermark,
+  createProjectEventRules,
   createProjectResourceType,
   projectIdOf,
   projectVerdict,
@@ -10,7 +11,7 @@ import {
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
-import type { JiraComment, JiraIssue } from "../../src/atlassian/types.js";
+import type { JiraIssue } from "../../src/atlassian/types.js";
 
 // BUTCHR-67/BUTCHR-81. Failure conditions are stated in each describe/test's
 // own comment, per this ticket's evidence-discipline requirement — a check
@@ -51,29 +52,55 @@ describe("projectVerdict — the pure activation/nudge predicate", () => {
   });
 
   test("an epic never before seen in review -> active (absent from watermark.epics == never acted on)", () => {
-    expect(projectVerdict(project({ observedEpics: [{ key: "ACME-1", newestCommentId: null }] }))).toBe("active");
+    expect(projectVerdict(project({ observedEpics: [{ key: "ACME-1", updated: "2026-01-01T00:00:00.000Z" }] }))).toBe("active");
   });
 
-  test("an epic already watermarked, no new comment since -> asleep", () => {
+  test("an epic already watermarked at its current updated timestamp -> asleep", () => {
     expect(
       projectVerdict(
         project({
-          observedEpics: [{ key: "ACME-1", newestCommentId: "50" }],
-          watermark: { version: 5, comment: "100", epics: { "ACME-1": "50" } },
+          observedEpics: [{ key: "ACME-1", updated: "2026-01-01T00:00:00.000Z" }],
+          watermark: { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } },
         }),
       ),
     ).toBe("asleep");
   });
 
-  test("an epic's newest comment moved past its watermark -> active", () => {
+  test("an epic's updated timestamp moved past its watermark -> active", () => {
     expect(
       projectVerdict(
         project({
-          observedEpics: [{ key: "ACME-1", newestCommentId: "51" }],
-          watermark: { version: 5, comment: "100", epics: { "ACME-1": "50" } },
+          observedEpics: [{ key: "ACME-1", updated: "2026-01-02T00:00:00.000Z" }],
+          watermark: { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } },
         }),
       ),
     ).toBe("active");
+  });
+
+  // BUTCHR-81 DEFECT, FOUND AT REVIEW: a per-epic watermark keyed by comment
+  // id alone cannot detect an epic RE-ENTERING review with no new comment
+  // (submit_to_boss transitions status; it does not necessarily comment).
+  // Failure condition, written first: an epic that enters review, is acted
+  // on (watermarked), LEAVES review, and RE-ENTERS with NO new comment must
+  // still produce "active" — because re-entry is itself a Jira `updated`
+  // transition, strictly newer than whatever was watermarked during the
+  // prior review episode. This is the test that would have failed against
+  // the old newestCommentId-keyed design (where re-entry with no comment
+  // left the watermark's stale comment id equal to the still-unchanged
+  // "newest comment id", wrongly staying asleep).
+  test("BUTCHR-81 regression: an epic that leaves review and RE-ENTERS with no new comment still wakes the project", () => {
+    // Episode 1: watermarked while first in review, at updated=T2 (after the
+    // project's own review comment bumped it past its entry time T1).
+    const watermarkFromFirstEpisode = { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" /* T2 */ } };
+    // Episode 2: epic left review (a transition, bumps updated to T3), then
+    // re-entered review (another transition, bumps updated to T4) with NO
+    // new comment posted in between. T4 > T2 unconditionally, since at least
+    // two transitions happened after T2.
+    const reenteredWithNoComment = project({
+      observedEpics: [{ key: "ACME-1", updated: "2026-01-03T00:00:00.000Z" /* T4, strictly after T2 */ }],
+      watermark: watermarkFromFirstEpisode,
+    });
+    expect(projectVerdict(reenteredWithNoComment)).toBe("active");
   });
 
   test("a never-recorded (null) watermark with something observed -> active (fail-open, matches the issue tier's baseline philosophy)", () => {
@@ -105,26 +132,26 @@ describe("PROJECT_ACTIVATION / PROJECT_SPAWN_CONFIG / projectIdOf", () => {
   });
 });
 
-// --- A fake AtlassianOps + Jira-search/comments deps for discovery tests ---
+// --- A fake AtlassianOps + Jira-search deps for discovery tests ---
 
 interface FakeWorld {
   ops: AtlassianOps;
   deps: ProjectResourceDeps;
   properties: Map<string, Record<string, unknown>>;
-  calls: { getPageVersions: string[][]; getPageComments: string[]; search: string[]; getProjectProperty: string[] };
+  calls: { getPageVersions: string[][]; getPageComments: string[]; search: string[]; getProjectPropertyOrNull: string[] };
 }
 
 function fakeWorld(opts: {
   myAccountId: string;
   projects: Array<{ key: string; name: string; leadAccountId: string }>;
-  properties: Record<string, Record<string, unknown> | undefined>; // undefined = 404 (unreadable)
+  properties: Record<string, Record<string, unknown> | undefined>; // undefined = genuine 404 (ineligible)
+  propertyFailures?: Record<string, Error>; // a NON-404 failure — must propagate, never silently ineligible
   pageVersions?: Record<string, number>;
   pageComments?: Record<string, Array<{ id: string; body: string }>>;
   epicsInReview?: JiraIssue[];
-  epicComments?: Record<string, JiraComment[]>;
 }): FakeWorld {
   const properties = new Map(Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, Record<string, unknown>][]);
-  const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], search: [] as string[], getProjectProperty: [] as string[] };
+  const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], search: [] as string[], getProjectPropertyOrNull: [] as string[] };
 
   const unimplemented = (name: string) => async (..._a: unknown[]) => {
     throw new Error(`fake ops: ${name} not used by this test`);
@@ -158,11 +185,20 @@ function fakeWorld(opts: {
     searchProjects: async (_status) => ({
       values: opts.projects.map((p) => ({ key: p.key, name: p.name, lead: { accountId: p.leadAccountId } })),
     }),
+    // Still throw-always, matching the real op's contract — used only by
+    // advanceProjectWatermark's read-modify-write in these tests.
     getProjectProperty: async (key: string) => {
-      calls.getProjectProperty.push(key);
       const p = properties.get(key);
       if (!p) throw new Error(`fake: 404, no "butchr" property for ${key}`);
       return p;
+    },
+    // discovery's own read: null on a genuine 404, THROWS (propagates) on
+    // any configured non-404 failure — the both-directions distinction
+    // BUTCHR-81's review required.
+    getProjectPropertyOrNull: async (key: string) => {
+      calls.getProjectPropertyOrNull.push(key);
+      if (opts.propertyFailures?.[key]) throw opts.propertyFailures[key];
+      return properties.get(key) ?? null;
     },
     setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
       properties.set(key, value as Record<string, unknown>);
@@ -186,7 +222,6 @@ function fakeWorld(opts: {
       calls.search.push(jql);
       return opts.epicsInReview ?? [];
     },
-    comments: async (key: string) => opts.epicComments?.[key] ?? [],
   };
 
   return { ops, deps, properties, calls };
@@ -264,6 +299,55 @@ describe("discovery — Declaration 2 (entity-property eligibility, independent 
   });
 });
 
+describe("discovery — BUTCHR-81 DEFECT #2 (found at review): a transient property-read failure must never demote a project to ineligible/inactive", () => {
+  // The chain the reviewer traced: a bare catch around getProjectProperty ->
+  // any error (404 OR a transient 429/500/timeout) -> null -> pushed into
+  // the `ineligible` list with `eligible: false` -> `projectVerdict`
+  // "inactive" -> BUTCHR-66's `desiredFrom`/`atRestFrom` place "inactive" in
+  // NEITHER desired nor resting -> the reconciler's `stop` set -> a RUNNING
+  // agent gets killed mid-work over one blipped read. Both directions
+  // asserted together, same "both-directions" discipline as the lead filter
+  // (a one-sided proof would have passed the broken implementation too).
+  test("a genuine 404 (no butchr property) -> ineligible, exactly as Declaration 2 requires", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [{ key: "GONE", name: "Gone", leadAccountId: "acct-A" }],
+      properties: { GONE: undefined }, // genuine 404
+    });
+    const [gone] = await createProjectResourceType(w.deps).discovery.search();
+    expect(gone!.eligible).toBe(false);
+  });
+
+  test("a NON-404 failure (rate limit / timeout / permission change) on the property read propagates and fails the WHOLE poll — it must NOT come back as an ineligible/inactive project", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [{ key: "FLAKY", name: "Flaky", leadAccountId: "acct-A" }],
+      properties: { FLAKY: PROPERTY_A },
+      propertyFailures: { FLAKY: new Error("503 Service Unavailable (simulated transient failure)") },
+    });
+    await expect(createProjectResourceType(w.deps).discovery.search()).rejects.toThrow(/503/);
+    // The failure propagated rather than resolving to a short/misclassified
+    // list — a caller (runResourceLoop's fetch stage) that sees this
+    // rejection changes nothing this poll, which is the safe direction
+    // (retries at the next PROJECT_POLL_INTERVAL_MS) rather than reporting
+    // FLAKY as a project the reconciler should stop.
+  });
+
+  test("one project's non-404 failure fails the poll even when OTHER projects would have resolved fine — no silent partial result", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "GOOD", name: "Good", leadAccountId: "acct-A" },
+        { key: "FLAKY", name: "Flaky", leadAccountId: "acct-A" },
+      ],
+      properties: { GOOD: PROPERTY_A, FLAKY: PROPERTY_B },
+      propertyFailures: { FLAKY: new Error("network timeout (simulated)") },
+      pageVersions: { "doc-A": 1, "doc-B": 1 },
+    });
+    await expect(createProjectResourceType(w.deps).discovery.search()).rejects.toThrow(/timeout/);
+  });
+});
+
 describe("discovery — call-count budget (batching)", () => {
   test("root-doc versions are read in ONE batched call across all eligible projects, not one per project", async () => {
     const w = fakeWorld({
@@ -294,7 +378,7 @@ describe("discovery — call-count budget (batching)", () => {
     expect(w.calls.getPageComments.sort()).toEqual(["doc-A", "doc-B"]);
   });
 
-  test("rule-3 epics-in-review are fetched in ONE JQL call across all eligible projects", async () => {
+  test("rule-3 epics-in-review are fetched in ONE JQL call across all eligible projects, no per-epic call", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [
@@ -311,23 +395,22 @@ describe("discovery — call-count budget (batching)", () => {
   });
 });
 
-describe("discovery — rule 3 grouping and per-epic comment reads", () => {
-  test("epics-in-review are grouped back to their own project by key prefix, and only in-review epics get a comments() call", async () => {
+describe("discovery — rule 3 grouping", () => {
+  test("epics-in-review are grouped back to their own project by key prefix, carrying the epic's own `updated` field with no extra call", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [{ key: "ACME", name: "Acme", leadAccountId: "acct-A" }],
       properties: { ACME: PROPERTY_A },
       pageVersions: { "doc-A": 1 },
       epicsInReview: [
-        { key: "ACME-10", summary: "Epic 10", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] },
+        { key: "ACME-10", summary: "Epic 10", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "2026-01-01T00:00:00.000Z", labels: [] },
       ],
-      epicComments: { "ACME-10": [{ id: "c1", body: "hi", created: "", authorEmail: "" }] },
     });
     const [acme] = await createProjectResourceType(w.deps).discovery.search();
-    expect(acme!.observedEpics).toEqual([{ key: "ACME-10", newestCommentId: "c1" }]);
+    expect(acme!.observedEpics).toEqual([{ key: "ACME-10", updated: "2026-01-01T00:00:00.000Z" }]);
   });
 
-  test("no epics in review -> observedEpics is empty and no comments() call happens for any epic", async () => {
+  test("no epics in review -> observedEpics is empty", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [{ key: "ACME", name: "Acme", leadAccountId: "acct-A" }],
@@ -345,12 +428,12 @@ describe("discovery — watermark round-trip", () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [{ key: "ACME", name: "Acme", leadAccountId: "acct-A" }],
-      properties: { ACME: { ...PROPERTY_A, wake: { version: 4, comment: "99", epics: { "ACME-1": "50" } } } },
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 4, comment: "99", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } } } },
       pageVersions: { "doc-A": 4 },
       pageComments: { "doc-A": [{ id: "99", body: "hi" }] },
     });
     const [acme] = await createProjectResourceType(w.deps).discovery.search();
-    expect(acme!.watermark).toEqual({ version: 4, comment: "99", epics: { "ACME-1": "50" } });
+    expect(acme!.watermark).toEqual({ version: 4, comment: "99", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } });
     expect(projectVerdict(acme!)).toBe("asleep"); // fully caught up
   });
 
@@ -369,7 +452,6 @@ describe("discovery — watermark round-trip", () => {
 
 describe("eventRules.poll — the nudge path for an already-awake agent", () => {
   test("changedPrimary is empty when nothing observed differs between polls", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const p = project();
     const poll = await rules.poll({ primary: [p], related: [] }, { primary: [p], related: [] });
@@ -377,7 +459,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   });
 
   test("changedPrimary includes a key whose observed version/comment/epics differ from the previous poll", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const before = project({ observedVersion: 5 });
     const after = project({ observedVersion: 6 });
@@ -386,7 +467,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   });
 
   test("decide() delivers only when the CURRENT (next) state is genuinely behind its watermark", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const behind = project({ observedVersion: 6 }); // watermark still at 5
     const poll = await rules.poll({ primary: [project()], related: [] }, { primary: [behind], related: [] });
@@ -401,7 +481,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   // own comment. Failure condition: deliver:true here means the nudge path
   // re-notifies a project about its own report_to_boss call.
   test("HAZARD 1: a comment change that is ALREADY watermarked (own write) is suppressed on the nudge path too", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const before = project({ observedCommentId: "100", watermark: { version: 5, comment: "100", epics: {} } });
     const selfWritten = project({ observedCommentId: "101", watermark: { version: 5, comment: "101", epics: {} } });
@@ -412,7 +491,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   });
 
   test("a FOREIGN comment (watermark still behind) still delivers on the nudge path", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const before = project({ observedCommentId: "100", watermark: { version: 5, comment: "100", epics: {} } });
     const foreign = project({ observedCommentId: "102", watermark: { version: 5, comment: "100", epics: {} } });
@@ -422,7 +500,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   });
 
   test("decide() on a key not present in the next snapshot delivers false rather than throwing", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const poll = await rules.poll({ primary: [project()], related: [] }, { primary: [], related: [] });
     const verdict = await poll.decide("ACME", "ACME", "primary");
@@ -430,7 +507,6 @@ describe("eventRules.poll — the nudge path for an already-awake agent", () => 
   });
 
   test("changedRelated is always empty — projects have no related/Implements-chain concept", async () => {
-    const { createProjectEventRules } = await import("../../src/resources/project.js");
     const rules = createProjectEventRules();
     const poll = await rules.poll({ primary: [], related: [] }, { primary: [], related: [] });
     expect(poll.changedRelated).toEqual([]);
@@ -463,14 +539,28 @@ describe("advanceProjectWatermark", () => {
     expect(w.properties.get("ACME")!.wake).toEqual({ version: 7, comment: "200", epics: {} });
   });
 
-  test("advancing one epic's watermark merges into the epics map rather than replacing it", async () => {
+  test("advancing epic watermarks merges into the epics map rather than replacing it, and can batch multiple epics in one call", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [],
-      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "10" } } } },
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } } } },
     });
-    await advanceProjectWatermark(w.ops, "ACME", { epic: { key: "ACME-2", commentId: "20" } });
-    expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: null, epics: { "ACME-1": "10", "ACME-2": "20" } });
+    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-2": "2026-01-02T00:00:00.000Z", "ACME-3": "2026-01-03T00:00:00.000Z" } });
+    expect(w.properties.get("ACME")!.wake).toEqual({
+      version: 1,
+      comment: null,
+      epics: { "ACME-1": "2026-01-01T00:00:00.000Z", "ACME-2": "2026-01-02T00:00:00.000Z", "ACME-3": "2026-01-03T00:00:00.000Z" },
+    });
+  });
+
+  test("re-watermarking an epic already in the map OVERWRITES its entry (this is exactly how re-entry stays detectable next time)", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [],
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } } } },
+    });
+    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-1": "2026-01-05T00:00:00.000Z" } });
+    expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: null, epics: { "ACME-1": "2026-01-05T00:00:00.000Z" } });
   });
 
   test("no prior butchr property at all -> starts from an empty base rather than throwing", async () => {

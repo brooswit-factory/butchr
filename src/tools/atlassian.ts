@@ -40,6 +40,33 @@ export interface AtlassianOps {
   getProjectProperty(projectKey: string, propertyKey: string): Promise<unknown>;
 
   /**
+   * The same read as `getProjectProperty`, with ONE difference: a genuine
+   * NOT-FOUND (the property doesn't exist) resolves `null` instead of
+   * rejecting — the same "one not-found shape instead of a try/catch each"
+   * convention `getRemoteLink` already established below. Any OTHER
+   * rejection (rate limit, timeout, permission change, …) still rejects —
+   * this op narrows what counts as "not found", it does not swallow
+   * everything.
+   *
+   * BUTCHR-67/BUTCHR-81's own reason for adding this alongside
+   * `getProjectProperty` rather than changing that op's existing
+   * throw-always contract: `src/tools/docs.ts`'s `projectRootDoc` already
+   * depends on `getProjectProperty` throwing on ANY failure (it converts
+   * every rejection into one "unreadable, refusing" error, by design,
+   * regardless of cause) — narrowing that op's contract would be an
+   * unaudited behaviour change to an existing, already-tested consumer.
+   * `src/resources/project.ts`'s discovery is the one caller that actually
+   * needs to tell "genuinely no property" (an activation answer — ineligible)
+   * apart from "couldn't read it this poll" (must NOT be treated as an
+   * activation answer at all — MEASURED, BUTCHR-81 2026-09-01: conflating
+   * the two let one transient read failure demote a project to `inactive`,
+   * which stops a running agent rather than merely skipping a wake), so
+   * this op exists for that caller specifically rather than reshaping a
+   * shared one.
+   */
+  getProjectPropertyOrNull(projectKey: string, propertyKey: string): Promise<unknown | null>;
+
+  /**
    * Read one remote issue link by its `globalId`. Resolves `null` when no
    * such link exists — the real impl converts Jira's 404 into `null` so
    * every caller has one "not found" shape instead of a try/catch each.

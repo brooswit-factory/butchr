@@ -33,6 +33,7 @@ function rig(roles: { story?: string; task?: string } = {}) {
     getMyself: async () => ({ accountId: "test-account" }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -134,6 +135,7 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
@@ -176,6 +178,7 @@ describe("onWrite hook (own-write ledger feed)", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -262,6 +265,7 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -450,6 +454,7 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
@@ -471,6 +476,7 @@ describe("confluence_update_page result normalization", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.confluence_update_page!.handler({ id: "10715137", body: "<p>x</p>" }, { headers: {} } as any);
@@ -496,6 +502,7 @@ describe("confluence_search_pages", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -568,6 +575,7 @@ describe("confluence_create_page parentId", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -599,6 +607,7 @@ describe("jira_assign (KAN-810)", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -675,6 +684,7 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     return { tools };
@@ -743,6 +753,7 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
       getMyself: async () => ({ accountId: 'test-account' }),
       setProjectProperty: async () => ({ ok: true }),
       getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
       };
       return { tools: atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer])) };
     })();
@@ -781,6 +792,7 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     return atlassianTools(ops, () => {}, { story: "acct-story", task: "acct-task" });
   }
@@ -823,6 +835,7 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l));
@@ -853,6 +866,7 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -882,6 +896,7 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { story: "acct-story" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -908,6 +923,7 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -946,6 +962,7 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     return { ops, tools: atlassianTools(ops, () => {}, roles) };
   }
@@ -976,6 +993,7 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, (l) => audits.push(l), { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
     const conn = { headers: { "x-issue": "KAN-1" } } as any;
@@ -1138,6 +1156,7 @@ describe("finish_without_a_boss (BUTCHR-39): wiring — x-issue, schema shape, a
     getMyself: async () => ({ accountId: 'test-account' }),
     setProjectProperty: async () => ({ ok: true }),
     getPageVersions: async () => ({}),
+    getProjectPropertyOrNull: async () => null,
     };
     return ops;
   }
@@ -1214,6 +1233,7 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
       getMyself: async () => ({ accountId: 'test-account' }),
       setProjectProperty: async () => ({ ok: true }),
       getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {}, rolesOverride as any);
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
@@ -1286,6 +1306,7 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
       getMyself: async () => ({ accountId: 'test-account' }),
       setProjectProperty: async () => ({ ok: true }),
       getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
