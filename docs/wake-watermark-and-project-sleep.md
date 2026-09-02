@@ -387,16 +387,17 @@ and is then bounded, and `checkFrozenAsleep` FIRES — **the agent simply does
 not exit of its own accord.** It is reaped by that safety net about fifteen
 minutes later, and its pane IS returned.
 
-Three earlier drafts of this page reached different conclusions on weaker
-evidence, all withdrawn and all recorded below rather than deleted, because a
-withdrawn verdict is part of the record:
+Four withdrawals are recorded below rather than deleted, because a withdrawn
+claim is part of the record:
 
 - a FAILED on a window later voided by a herdr restart;
 - an UNOBSERVABLE taken while an unconsumed wake trigger was still pending;
 - a FAILED whose stated mechanism — "the verdict never says asleep; the exit
   path has never been reached" — was **the opposite of the truth**, built on a
   complaint-absence read eleven minutes too early, after a daemon restart had
-  silently reset the very clock that negative depended on.
+  silently reset the very clock that negative depended on;
+- and the retraction of that third one, which corrected three places and
+  **missed the pull request's own title** — see "A FOURTH WITHDRAWAL" below.
 
 BUTCHR-187's own vantage point could not observe the project agent that
 demonstration 6 is about (see above); the story's own vantage point can, and
@@ -482,6 +483,25 @@ information at all.
 
 *An absent result is evidence about the search.* The search was mistimed, and the
 mistiming was checkable against a mechanism this page already described.
+
+## A FOURTH WITHDRAWAL: the retraction that missed its own headline
+
+The mechanism claim above was retracted in three places — this document, the
+story's Confluence doc, and the pull request's body. **It was left standing in
+the PR's title**, as "the mechanism located in `projectVerdict`", until the
+reviewer caught it.
+
+Recorded because the shape is worth more than the fix. **A retraction that
+leaves the headline intact is not a retraction.** The title is the only line
+that appears in a PR index or a link to the work, so a reader who read nothing
+else would have carried away precisely the claim being withdrawn — and it
+contradicted the document it shipped alongside. Staleness reading as
+authoritative, in the most-read and least-re-checked line.
+
+The generalisable part: the three places that got corrected were the three
+being actively thought about. The one that was missed was written first and
+then stopped being looked at. **When withdrawing a claim, enumerate where it
+was asserted rather than correcting where you happen to be reading.**
 
 ## OBSERVED — what actually happened
 
