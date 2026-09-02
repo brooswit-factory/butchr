@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { desiredFrom, reconcileNow, startLoop, RespawnGuard } from "../../src/daemon/loop.js";
+import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd } from "../../src/daemon/loop.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
+import { HerdrHerd } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
 
@@ -18,6 +19,54 @@ function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: 
   };
 }
 const iss = (key: string, status: string, parent: string | null = null): JiraIssue => ({ key, status, summary: "s", issuetype: "Task", assignee: "a", parent, updated: "t", labels: [] });
+
+/**
+ * BUTCHR-91 review fix, regression test: `scopedHerd` must work over a REAL
+ * `HerdrHerd` class instance, not just the plain object literals every
+ * other `Herd` fixture in this file (and every other test file) uses.
+ *
+ * WHY A PLAIN OBJECT WOULD NOT CATCH THIS (the control the review asked
+ * for): on a plain object literal, `spawn`/`stop`/`nudge`/`paneFor` are OWN
+ * enumerable properties, so `{ ...plainHerd, runningIssues, staleIssues }`
+ * copies them straight through — object spread "works". `HerdrHerd`
+ * defines those same members as CLASS METHODS, which live on the
+ * prototype, not on the instance — object spread copies only an instance's
+ * OWN enumerable properties (`herdr`/`mcpUrl`/`wait` here), never anything
+ * inherited from its prototype. So the exact same spread expression
+ * silently produces a fully-working herd from a plain object and a
+ * herd with `spawn`/`stop`/`nudge`/`paneFor` all `undefined` from a real
+ * `HerdrHerd` — a defect invisible to any test (or to TypeScript, which
+ * checks against the declared `Herd` INTERFACE, not an object's runtime
+ * enumerability) built only on plain-object fixtures. MEASURED, both
+ * directions, below.
+ */
+describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's methods, not just plain-object fixtures", () => {
+  test("negative control: the naive `{ ...herd, ... }` spread drops a real HerdrHerd's spawn/stop/nudge/paneFor", () => {
+    const real = new HerdrHerd({} as never, "http://x/mcp");
+    const naiveSpread = { ...real, runningIssues: real.runningIssues, staleIssues: real.staleIssues } as unknown as Herd;
+    expect(typeof naiveSpread.spawn).toBe("undefined");
+    expect(typeof naiveSpread.stop).toBe("undefined");
+    expect(typeof naiveSpread.nudge).toBe("undefined");
+    expect(typeof naiveSpread.paneFor).toBe("undefined");
+  });
+
+  test("scopedHerd's actual (explicit-delegation) implementation preserves every method of a real HerdrHerd instance", () => {
+    const real = new HerdrHerd({} as never, "http://x/mcp");
+    const scoped = scopedHerd(real, () => true);
+    expect(typeof scoped.spawn).toBe("function");
+    expect(typeof scoped.stop).toBe("function");
+    expect(typeof scoped.nudge).toBe("function");
+    expect(typeof scoped.paneFor).toBe("function");
+    expect(typeof scoped.runningIssues).toBe("function");
+    expect(typeof scoped.staleIssues).toBe("function");
+  });
+
+  test("scopedHerd's filtering still applies: runningIssues()/staleIssues() are scoped to ownsId, even over a real HerdrHerd instance", async () => {
+    const real = new HerdrHerd({ agent: { list: async () => ({ agents: [{ name: "butchr-task-1", pane_id: "p1" }, { name: "butchr-proj1", pane_id: "p2" }] }) } } as never, "http://x/mcp");
+    const scoped = scopedHerd(real, (id) => id.startsWith("TASK"));
+    expect(await scoped.runningIssues()).toEqual(["TASK-1"]);
+  });
+});
 
 describe("reconcileNow", () => {
   test("spawns active-not-running and stops running-not-active", async () => {
