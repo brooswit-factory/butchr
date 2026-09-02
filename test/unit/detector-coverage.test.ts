@@ -48,4 +48,20 @@ describe("createCoverageTracker", () => {
     t.recordChecked("stalled");
     expect(t.snapshot()).toEqual([{ name: "stalled", checkedCount: 2, declinedCount: 1, lastDeclinedAt: new Date(100).toISOString() }]);
   });
+
+  // PR #228 review: snapshot()'s doc comment used to claim "most-recently-
+  // declined first" — the implementation (a Map, insertion order) never did
+  // that. Pins the CORRECTED claim (plain first-seen order, independent of
+  // who declined or when) so the doc comment can't drift from the
+  // implementation again without this test catching it.
+  test("snapshot() returns names in first-seen (insertion) order, regardless of which ones later decline or when", () => {
+    let now = 1000;
+    const t = createCoverageTracker(() => now);
+    t.recordChecked("alpha"); // first-seen, never declines
+    now = 2000;
+    t.recordDeclined("beta"); // second-seen, declines early
+    now = 3000;
+    t.recordDeclined("gamma"); // third-seen, declines LATEST — would sort first under the old (wrong) doc claim
+    expect(t.snapshot().map((e) => e.name)).toEqual(["alpha", "beta", "gamma"]);
+  });
 });

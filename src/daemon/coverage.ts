@@ -49,7 +49,7 @@ export interface CoverageRecorder {
 }
 
 export interface CoverageTracker extends CoverageRecorder {
-  /** Every name ever recorded, most-recently-declined first among those with a decline, then the rest in first-seen order — order is not load-bearing, callers should sort/filter as they need. */
+  /** Every name ever recorded, in first-seen (insertion) order — not load-bearing, a caller that cares about recency should sort/filter the result itself (e.g. by `lastDeclinedAt`). */
   snapshot(): DetectorCoverage[];
 }
 
