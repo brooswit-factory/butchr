@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { speakOnOwnChannel, unwrapStorageParagraph } from "../../src/tools/speak.js";
+import { speakOnOwnChannel, unwrapStorageParagraph, createOwnChannelComments } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 // BUTCHR-71 / BUTCHR-62: "where a resource speaks" — an issue on its own
@@ -188,5 +188,52 @@ describe("unwrapStorageParagraph", () => {
   test("a body that is NOT <p>...</p>-wrapped (a foreign comment on the same page) passes through, still unescaped", () => {
     expect(unwrapStorageParagraph("plain text, no wrapper at all")).toBe("plain text, no wrapper at all");
     expect(unwrapStorageParagraph("a &lt; b, no paragraph tags")).toBe("a < b, no paragraph tags");
+  });
+});
+
+// BUTCHR-141/§2.6: `createOwnChannelComments` is EXTRACTED from
+// src/daemon/index.ts (a move, not a rewrite) so the real reader — not a
+// hand-reproduced stand-in — is importable into a unit test. Every project-
+// tier test below round-trips through a REAL `speakOnOwnChannel` write, same
+// discipline as `unwrapStorageParagraph`'s own tests above and for the same
+// reason: a fixture that hands back plain text for both tiers is faithful to
+// the TYPE and still disagrees with the real reader in the one dimension
+// (representation) that matters (Rule 2b's third form, BUTCHR-129).
+describe("createOwnChannelComments", () => {
+  test("an ISSUE key routes to the injected issueComments reader, unchanged — never touches the Confluence path", async () => {
+    const { ops } = makeOps();
+    let issueCalls = 0;
+    const issueComments = async (key: string) => { issueCalls++; return [{ id: "c1", body: `hi ${key}`, created: "t" }]; };
+    const reader = createOwnChannelComments(ops, issueComments);
+    const rows = await reader("BUTCHR-71");
+    expect(issueCalls).toBe(1);
+    expect(rows).toEqual([{ id: "c1", body: "hi BUTCHR-71", created: "t" }]);
+  });
+
+  test("a PROJECT key resolves its root doc and reads footer comments via getPageComments, called with exactly ONE id — never the injected issueComments reader", async () => {
+    const { ops } = makeOps({ getPageComments: async (pageId: string) => (pageId === "42" ? { results: [{ id: "c1", body: "<p>hi</p>" }] } : { results: [] }) });
+    const issueComments = async () => { throw new Error("must not be called for a project key"); };
+    const reader = createOwnChannelComments(ops, issueComments);
+    const rows = await reader("BUTCHR");
+    expect(rows).toEqual([{ id: "c1", body: "hi", created: "" }]); // unwrapped, and `created` mapped to "" (getPageComments has no timestamp)
+  });
+
+  test("END TO END: a project-tier row written by a REAL speakOnOwnChannel call round-trips back unwrapped, matching findMarked's startsWith(marker) anchor", async () => {
+    const { ops, pageComments } = makeOps();
+    const marker = "[butchr:crashloop]";
+    const text = `${marker} BUTCHR has been spawned 5 times in the last 60 minutes...\n\nresource: [BUTCHR]`;
+    await speakOnOwnChannel(ops, "BUTCHR", text);
+    const opsWithComments: AtlassianOps = { ...ops, getPageComments: async () => ({ results: pageComments.map((c, i) => ({ id: `c${i}`, body: c.body })) }) };
+    const reader = createOwnChannelComments(opsWithComments, async () => []);
+    const rows = await reader("BUTCHR");
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.body).toBe(text); // exact round trip
+    expect(rows[0]!.body.startsWith(marker)).toBe(true); // the defect BUTCHR-129 fixed: a raw (still-wrapped) body would fail this
+  });
+
+  test("a project root-doc resolution failure rejects (never a laundered empty array) — the caller's own fail-closed handling depends on this", async () => {
+    const { ops } = makeOps({ getProjectProperty: async () => { throw new Error("404"); } });
+    const reader = createOwnChannelComments(ops, async () => []);
+    await expect(reader("BUTCHR")).rejects.toThrow();
   });
 });

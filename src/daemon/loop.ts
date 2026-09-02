@@ -197,6 +197,18 @@ export interface ReconcileOptions {
    * original, unbounded behaviour every existing caller already has.
    */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * BUTCHR-141: audible-only crash-loop detection. Called BEFORE the spawn
+   * loop below runs, with this poll's `plan.spawn` and `desired.keys()` —
+   * see src/agents/crash-loop.ts for the full mechanism (the candidate set,
+   * the pruning trap, the threshold/window reasoning, and the fleet-wide
+   * confident-zero guard). Its return value is `void` and is NEVER consulted
+   * here: unlike `checkFrozenAsleep` above, this hook must not change
+   * `plan.spawn`/`herd.spawn` in any way — it only observes and speaks.
+   * Optional; omitted, no crash-loop detection runs (every caller before
+   * this ticket, and any caller with nothing to report through).
+   */
+  checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
 }
 
 /**
@@ -234,6 +246,12 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     }
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
+  // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
+  // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
+  // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
+  // (not `plan.spawn`) is what the detector prunes its own tracking against —
+  // the pruning trap that module's top comment names.
+  if (opts.checkCrashLoop) await opts.checkCrashLoop(plan.spawn, [...desired.keys()]);
   // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
   // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
   // burst of N new spawns (e.g. several stories activating in one poll)
@@ -377,6 +395,8 @@ export interface GenericLoopDeps<T> {
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
   /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
+  checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -458,6 +478,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
+        ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
