@@ -1,6 +1,6 @@
 # changelog.d/ — per-PR changelog fragments
 
-Every PR that touches a gated file (`src/`, `schema/`, or `package.json`) must
+Every PR that touches a gated file (`src/`, `schema/`, `package.json`, or `briefs/`) must
 add exactly one new fragment here: `changelog.d/<TICKET>.md`. One file per PR
 means two concurrent PRs never touch the same line of the same file — nothing
 to rebase away, no discarded approvals. Do **not** append to a shared

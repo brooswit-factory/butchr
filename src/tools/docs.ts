@@ -150,6 +150,61 @@ export async function getDoc(ops: AtlassianOps, key: string): Promise<GetDocResu
 }
 
 /**
+ * Resolves a PROJECT's doc: the page named by that project's `butchr`
+ * entity property, at `rootDoc.id` — reusing `getProjectProperty`, the same
+ * reader `ensureDoc` already calls below, rather than adding a second one.
+ * NEVER CREATES A PAGE: a project's root doc always already exists (every
+ * live product project, and ASSIST, is provisioned with one ahead of any
+ * project agent running — BUTCHR-62's own doc), so unlike `ensureDoc` there
+ * is no create/nest/label step here at all, for either `getProjectDoc` or
+ * `setProjectDoc` below. A missing property or missing `rootDoc.id` is a
+ * REFUSAL naming the project and what's missing, never a fallback to
+ * creating a page or to a space default — creating a stray page here would
+ * be unrecoverable in a corpus where nothing is ever archived.
+ */
+export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Promise<DocResult> {
+  let prop: { rootDoc?: { id?: string } } | undefined;
+  try {
+    prop = (await ops.getProjectProperty(projectKey, "butchr")) as typeof prop;
+  } catch (e) {
+    throw new Error(`project ${projectKey}: "butchr" entity property is unreadable — refusing rather than guessing a root doc (${(e as Error).message})`);
+  }
+  const rootDocId = prop?.rootDoc?.id;
+  if (!rootDocId) {
+    throw new Error(`project ${projectKey}: "butchr" entity property is missing rootDoc.id — refusing rather than falling back to a space default`);
+  }
+  const page = (await ops.getPage(rootDocId)) as { title?: string; body?: { storage?: { value?: string } }; _links?: { base?: string; webui?: string } } | undefined;
+  return {
+    id: rootDocId,
+    url: `${page?._links?.base ?? ""}${page?._links?.webui ?? ""}`,
+    title: page?.title ?? "",
+    body: page?.body?.storage?.value ?? "",
+  };
+}
+
+/** Pure read of a PROJECT's root doc — the project-caller counterpart to `getDoc`. Never creates one; see `projectRootDoc`'s own doc comment. */
+export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Promise<GetDocResult> {
+  const doc = await projectRootDoc(ops, projectKey);
+  return { found: true, ...doc };
+}
+
+/**
+ * Full-body replace of a PROJECT's root doc — the project-caller counterpart
+ * to `setDoc`. NEVER calls `ensureDoc`: a root doc always already exists
+ * (see `projectRootDoc`), so there is no create/nest/label path here, only
+ * resolve-then-replace. Unlike `setDoc`, `title` stays optional even on the
+ * very first call: the `[unwritten]` provisional-title gate is an ISSUE-doc
+ * concept (a freshly created per-ticket page needs a real title before it
+ * can stop looking unwritten) — a root doc is provisioned ahead of time with
+ * a real title already, so there is no provisional state to graduate out of.
+ */
+export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<DocResult> {
+  const doc = await projectRootDoc(ops, projectKey);
+  await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
+  return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
+}
+
+/**
  * Exhaustive scan of `parentId`'s DIRECT children for one labelled
  * `label` — step 3 of ensureDoc.
  *
@@ -254,6 +309,17 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
   }
 
   // (2) resolve the boss via Implements; recurse for the parent page, or bottom out at the root doc.
+  //
+  // VERIFIED FOR BUTCHR-71's CONTRACT 2, NOT ASSUMED: an Epic created by a
+  // PROJECT caller (src/tools/relationship.ts's `newWorker` project branch)
+  // gets NO Implements link at all — a project/epic relationship is
+  // membership, not a link — so `findBossKey` on such an Epic returns `null`
+  // exactly like any other bossless ticket, and `parentId` bottoms out at
+  // `rootDocId` here. `rootDocId` was just read (step 0) from the SAME
+  // project's `butchr` property the Epic's own `projectKey` (`key.split("-")[0]`
+  // above) belongs to — the project that created it. So the epic's doc nests
+  // under that project's own root doc with NO second code path: this branch
+  // already does the right thing for a project-created Epic, unchanged.
   const issue = await ops.getIssue(key);
   const bossKey = findBossKey(issue);
   const parentId = bossKey ? (await ensureDoc(ops, bossKey, depth + 1)).id : rootDocId;

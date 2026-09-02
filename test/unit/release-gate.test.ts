@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { evaluate, type Facts } from "../../scripts/release/gate.js";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { evaluate, requiresRelease, type Facts } from "../../scripts/release/gate.js";
 import { parseFragment, type Fragment } from "../../scripts/release/fragments.js";
+
+const ROOT = join(import.meta.dir, "..", "..");
 
 const frag = (path: string, body: string): Fragment => parseFragment(path, body);
 const log = (versions: string[] = ["0.1.0"]) => "# Changelog\n" + versions.map((v) => `## [${v}] - 2026-08-24\n### Fixed\n- x\n`).join("");
@@ -95,5 +99,80 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
 
   test("no gated files changed still passes even with a fragment present (fragment isn't required, but isn't forbidden either)", () => {
     expect(evaluate({ ...base, changedFiles: ["README.md"] }).ok).toBe(true);
+  });
+
+  test("a briefs-only change with no fragment fails, naming exactly what to add (BUTCHR-55)", () => {
+    const reasons = failing({ changedFiles: ["briefs/task.md"], newFragments: [] });
+    expect(reasons.some((r) => /no changelog\.d\/ fragment was added/.test(r) && /changelog\.d\/<TICKET>\.md/.test(r) && /bump: major\|minor\|patch/.test(r))).toBe(true);
+  });
+
+  test("a briefs-only change with a fragment passes, same as any other gated change (BUTCHR-55)", () => {
+    expect(evaluate({ ...base, changedFiles: ["briefs/task.md"] }).ok).toBe(true);
+  });
+});
+
+/**
+ * Generalises the BUTCHR-55 fix: rather than re-asserting the five briefs by
+ * name, this walks EVERY file under src/, regardless of extension, for a
+ * build-time asset import (an `import ... from "<path>" with { type: ... }`
+ * attribute — the same shape `grep -rn 'with *{ *type:' src/` finds) and
+ * asserts `requiresRelease` covers whatever path it resolves to. The
+ * ASSET_IMPORT regex is what decides whether a file contributes a path, not
+ * its extension: a file contributes a path if and only if its raw text
+ * contains the `from "..." with { ... type: ... }` shape SOMEWHERE, whether
+ * or not that text is real code — the regex is unanchored, so it matches
+ * inside prose, a doc-comment, or a fenced code example just as readily as
+ * inside a real import statement. There is no extension allowlist to go
+ * stale (BUTCHR-72). A future embedded asset placed outside src/, schema/,
+ * package.json or briefs/ — in a .ts file or any other — fails this test
+ * instead of silently reopening the hole this ticket closed.
+ *
+ * TRADE MADE DELIBERATELY, AND ITS FAILURE DIRECTION (BUTCHR-72): walking
+ * every file, not just code files, means ASSET_IMPORT can match an
+ * illustrative example inside a prose/doc file (e.g. a .md file's code
+ * fence showing the import syntax) exactly as it would a real import —
+ * whether that trips this test depends only on where the example's path
+ * resolves, never on whether it's real code. Confirmed: an example whose
+ * relative path resolves to somewhere already under src/ stays green
+ * (harmless — src/ is gated regardless); one whose relative path resolves
+ * outside src/ to an ungated location FAILS this test even though nothing
+ * real imports anything. That is the accepted failure direction — this
+ * predicate now fails LOUD on a correct file rather than SILENT on a real
+ * asset import, and a false negative (the latter) is the defect this ticket
+ * exists to close, so that is the right side to err on. If this test ever
+ * goes red on a file that isn't a real import, either gate the illustrative
+ * path or move the example so its relative path stays inside src/.
+ */
+describe("every build-time asset import reachable from src/ is a gated path (BUTCHR-55)", () => {
+  const ASSET_IMPORT = /from\s+["']([^"']+)["']\s+with\s*\{[^}]*type:[^}]*\}/g;
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) { out.push(...walk(p)); continue; }
+      out.push(p);
+    }
+    return out;
+  }
+
+  function embeddedAssetPaths(): string[] {
+    const found: string[] = [];
+    for (const file of walk(join(ROOT, "src"))) {
+      const text = readFileSync(file, "utf8");
+      for (const m of text.matchAll(ASSET_IMPORT)) {
+        found.push(relative(ROOT, join(dirname(file), m[1]!)));
+      }
+    }
+    return found;
+  }
+
+  test("the finder actually finds something — a vacuous scan would pass the coverage test for the wrong reason", () => {
+    expect(embeddedAssetPaths().length).toBeGreaterThan(0);
+  });
+
+  test("every build-time embedded asset import is covered by requiresRelease", () => {
+    const uncovered = embeddedAssetPaths().filter((p) => !requiresRelease([p]));
+    expect(uncovered, `these build-time embedded assets are NOT on the gated path list, so a change to them ships silently: ${uncovered.join(", ")}`).toEqual([]);
   });
 });

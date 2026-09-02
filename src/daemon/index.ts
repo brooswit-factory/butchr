@@ -3,7 +3,7 @@ import { HerdrClient } from "@brooswit/herdr-sdk";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
-import { createLoopHealth } from "./health.js";
+import { combineHealth, createLoopHealth } from "./health.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { startLoop, type RelatedIssue } from "./loop.js";
 import { watchedKeys } from "../jira-watch/routes.js";
@@ -85,6 +85,20 @@ const loopHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
+// Notify-stage liveness (BUTCHR-57): a SECOND, independent positive
+// heartbeat — the poll (fetch) stage completing says nothing about whether
+// the notify stage (loop.ts's onChange: diff, suppress, `deps.notify`) is
+// actually running, since startLoop records onPollSuccess at the end of the
+// FETCH stage only. Reuses `config.pollStaleMs` rather than adding a second
+// threshold knob: loop.ts now runs the notify stage on the SAME cadence as
+// the poll stage (every tick, not only when something changed — see the
+// `hash` override in startLoop), so a threshold tuned for "a poll took too
+// long" is equally the right threshold for "a notify pass took too long".
+const notifyHealth = createLoopHealth({
+  name: "notify",
+  thresholdMs: config.pollStaleMs,
+  log: (line) => console.error(line),
+});
 
 const { app, mcp } = buildApp({
   state: async () => {
@@ -101,7 +115,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => loopHealth.status(),
+  health: () => combineHealth([loopHealth, notifyHealth]),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -259,6 +273,7 @@ startLoop({
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
   onPollSuccess: () => loopHealth.recordSuccess(),
+  onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own

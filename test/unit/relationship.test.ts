@@ -6,7 +6,7 @@ import {
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
-const ROLES = { story: "acct-story", task: "acct-task" };
+const ROLES = { story: "acct-story", task: "acct-task", epic: "acct-epic" };
 
 /**
  * A small stateful Jira+Confluence world implementing the full AtlassianOps
@@ -134,10 +134,18 @@ function makeWorld() {
       i.labels = [...new Set([...i.labels, ...labels])];
       return { ok: true };
     },
+    removeLabels: async (key: string, labels: readonly string[]) => {
+      const i = requireIssue(key);
+      const toRemove = new Set(labels);
+      i.labels = i.labels.filter((l) => !toRemove.has(l));
+      return { ok: true };
+    },
     deleteIssue: async (key: string) => {
       if (!issues.delete(key)) throw new Error(`fake world: no such issue ${key}`);
       return { ok: true };
     },
+  commentOnPage: async () => ({ ok: true }),
+  getPageComments: async () => ({ results: [] }),
   };
 
   return { ops, issues, pages, addIssue, setProjectProperty };
@@ -371,6 +379,125 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
     expect(issues.get("BUTCHR-2")!.status).toBe("Done");
   });
 
+});
+
+describe("start_worker / finish_worker / adopt_worker: BUTCHR-58 — butchr:shelved means CURRENTLY shelved, so reactivating withdraws it", () => {
+  test("start_worker on a worker carrying butchr:shelved removes it BEFORE transitioning (the ordering IS the design decision)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do", labels: [EXEMPT_LABEL, "team:infra"] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await startWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(calls).toEqual(["removeLabels", "transition"]); // order pinned, not just presence
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+    expect(w.labels).toContain("team:infra"); // only the exemption is removed, nothing else
+  });
+
+  test("start_worker on a worker WITHOUT the label makes no removeLabels call at all — zero extra cost for the common case", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await startWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+  });
+
+  test("finish_worker on a worker carrying butchr:shelved removes it BEFORE transitioning to Done — same ordering as start_worker", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: [EXEMPT_LABEL] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await finishWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(calls).toEqual(["removeLabels", "transition"]);
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("Done");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+
+  test("finish_worker on a worker WITHOUT the label makes no removeLabels call at all", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await finishWorker(spied, "BUTCHR-1", "BUTCHR-2");
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+  });
+
+  test("adopt_worker with disposition \"start\" on a ticket carrying the label clears it (fresh adoption)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [EXEMPT_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+
+  test("adopt_worker with disposition \"start\" clears a stale label even on an otherwise fully idempotent re-adoption (already linked, assigned, In Progress)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Already fully adopted by every OTHER measure — this is the residue case:
+    // alreadyAdopted would be true by the old definition, and a naive
+    // "skip everything when alreadyAdopted" implementation reproduces the bug.
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.story, status: "In Progress", labels: [EXEMPT_LABEL] });
+    let assignCalls = 0, linkCalls = 0, transitionCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(assignCalls).toBe(0); // already correct — no redundant write
+    expect(linkCalls).toBe(0); // already correct — no redundant write
+    expect(transitionCalls).toBe(0); // already In Progress — no redundant write
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(EXEMPT_LABEL); // but the stale label is still cleared
+  });
+
+  test("adopt_worker with disposition \"shelve\" still SETS the label — existing behaviour does not regress", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("To Do");
+    expect(w.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("THE ROUND TRIP IS THE BUG: shelve_worker then start_worker leaves the ticket's label set with no trace of the exemption", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(issues.get("BUTCHR-2")!.labels).toContain(EXEMPT_LABEL);
+    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(EXEMPT_LABEL);
+  });
+});
+
+describe("start_worker / finish_worker / prioritize_worker / tell_worker: ownership refusal (continued)", () => {
   test("prioritize_worker refuses a stranger's key AND the caller's OWN key, distinctly", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
@@ -843,5 +970,201 @@ describe("finishWithoutABoss", () => {
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey at all
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+// ===========================================================================
+// BUTCHR-71: a PROJECT-keyed caller. "BUTCHR" (no hyphen) is a project id by
+// src/resources/id.ts's isProjectId — every function below must recognize it
+// as such and take the project-caller branch, never try to ops.getIssue("BUTCHR").
+// ===========================================================================
+
+describe("newWorker: PROJECT caller creates an EPIC (BUTCHR-71 Contract 2)", () => {
+  test("creates an Epic in the caller's project, staffed by roles.epic, disposition applied — same shape as the issue-caller path", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
+    const child = issues.get(result.key)!;
+    expect(child.issuetype).toBe("Epic");
+    expect(child.project).toBe("BUTCHR");
+    expect(child.assignee).toBe(ROLES.epic);
+    expect(child.status).toBe("In Progress");
+  });
+
+  test("NO Implements link is ever made — bossKey stays undefined — and the result reports `member`, NEVER a lying `implements`", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
+    expect(issues.get(result.key)!.bossKey).toBeUndefined();
+    expect(result.member).toBe("BUTCHR");
+    expect(result).not.toHaveProperty("implements");
+  });
+
+  test("missing roles.epic refuses, naming BUTCHR_ASSIGNEE_EPIC — never silently falls back to roles.story/roles.task", async () => {
+    const { ops, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    await expect(newWorker(ops, { story: "s", task: "t" }, "BUTCHR", { summary: "s", disposition: { kind: "start" } }))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_EPIC/);
+  });
+
+  test("shelve: the label lands in the CREATE call, plus a reason comment; NO transition", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "shelve", reason: "waiting on the roadmap" } });
+    const child = issues.get(result.key)!;
+    expect(child.labels).toContain(EXEMPT_LABEL);
+    expect(child.status).toBe("To Do");
+    expect(child.comments.some((c) => c.includes("waiting on the roadmap"))).toBe(true);
+    expect(child.comments.some((c) => c.startsWith("[BUTCHR]"))).toBe(true); // identity-tagged with the PROJECT key
+  });
+
+  test("the epic's doc nests under the PROJECT's own root doc — verified via ensureDoc's existing bossless-bottoms-out-at-root path, no second code path", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
+    expect(pages.get(result.doc.id)!.parentId).toBe(ROOT_DOC_ID);
+  });
+
+  test("disposition failure rolls back (deletes) the created epic — same reasoning as the issue-caller path, minus the link step", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const broken: AtlassianOps = { ...ops, transition: async () => { throw new Error("no such transition"); } };
+    const before = issues.size;
+    await expect(newWorker(broken, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } }))
+      .rejects.toThrow(/rolled back \(deleted\); nothing survives/);
+    expect(issues.size).toBe(before); // the created epic is gone
+  });
+});
+
+describe("adoptWorker: PROJECT caller adopts an existing EPIC (BUTCHR-71 Contract 3)", () => {
+  test("adopts an orphan epic already in the caller's own project: assigns by roles.epic, no link is ever made", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.assignee).toBe(ROLES.epic);
+    expect(w.status).toBe("In Progress");
+    expect(w.bossKey).toBeUndefined(); // membership, never a link
+  });
+
+  test("REFUSES an epic that belongs to a DIFFERENT project — sharp, just like the issue-caller path's different-boss refusal", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("OTHER-9", { issuetype: "Epic", project: "OTHER" });
+    await expect(adoptWorker(ops, ROLES, "BUTCHR", "OTHER-9", { kind: "start" }))
+      .rejects.toThrow(/OTHER-9 belongs to project OTHER, not BUTCHR/);
+  });
+
+  test("REFUSES a Story or Task in the caller's OWN project — only an Epic is adoptable by a project caller", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-5", { issuetype: "Story", project: "BUTCHR" });
+    await expect(adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-5", { kind: "start" }))
+      .rejects.toThrow(/cannot be adopted by a project caller/);
+  });
+
+  test("missing roles.epic refuses, naming BUTCHR_ASSIGNEE_EPIC", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    await expect(adoptWorker(ops, { story: "s", task: "t" }, "BUTCHR", "BUTCHR-9", { kind: "start" }))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_EPIC/);
+  });
+
+  test("IDEMPOTENT: an epic already a member, already assigned by role, and already in the disposition's state changes nothing", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.epic, status: "In Progress" });
+    let assignCalls = 0;
+    const spied: AtlassianOps = { ...ops, assign: async (...a) => { assignCalls++; return ops.assign(...a); } };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(assignCalls).toBe(0);
+  });
+});
+
+describe("start_worker / finish_worker / shelve_worker / prioritize_worker / tell_worker: PROJECT-caller ownership by MEMBERSHIP (BUTCHR-71 Contract 3)", () => {
+  test("finish_worker closes an epic that is a member of the caller's project", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    await finishWorker(ops, "BUTCHR", "BUTCHR-9");
+    expect(issues.get("BUTCHR-9")!.status).toBe("Done");
+  });
+
+  test("tell_worker comments on an epic that is a member of the caller's project", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    await tellWorker(ops, "BUTCHR", "BUTCHR-9", "[review] APPROVED https://example/pr/1 @ deadbeef");
+    expect(issues.get("BUTCHR-9")!.comments).toEqual(["[BUTCHR] [review] APPROVED https://example/pr/1 @ deadbeef"]);
+  });
+
+  test("start_worker / shelve_worker / prioritize_worker all work on the caller's own epic too", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", status: "To Do" });
+    await startWorker(ops, "BUTCHR", "BUTCHR-9");
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress");
+    await shelveWorker(ops, "BUTCHR", "BUTCHR-9", "waiting on a dependency");
+    expect(issues.get("BUTCHR-9")!.status).toBe("To Do");
+    expect(issues.get("BUTCHR-9")!.labels).toContain(EXEMPT_LABEL);
+    await prioritizeWorker(ops, "BUTCHR", "BUTCHR-9", "High");
+    expect(issues.get("BUTCHR-9")!.priority).toBe("High");
+  });
+
+  test("prioritize_worker REFUSES the caller's OWN key for a project caller too — your priority is your boss's judgment, never your own", async () => {
+    const { ops, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    await expect(prioritizeWorker(ops, "BUTCHR", "BUTCHR", "High")).rejects.toThrow(/your own/);
+  });
+
+  test("REFUSES (a) an epic in a DIFFERENT project — names which project it actually belongs to", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("OTHER-9", { issuetype: "Epic", project: "OTHER" });
+    await expect(finishWorker(ops, "BUTCHR", "OTHER-9")).rejects.toThrow(/it belongs to project OTHER, not BUTCHR/);
+    await expect(tellWorker(ops, "BUTCHR", "OTHER-9", "hi")).rejects.toThrow(/it belongs to project OTHER, not BUTCHR/);
+  });
+
+  test("REFUSES (b) a Story or a Task in the caller's OWN project — membership alone is not enough; only an Epic is the project's own worker", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-5", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-6", { issuetype: "Task", project: "BUTCHR" });
+    await expect(finishWorker(ops, "BUTCHR", "BUTCHR-5")).rejects.toThrow(/not an Epic/);
+    await expect(finishWorker(ops, "BUTCHR", "BUTCHR-6")).rejects.toThrow(/not an Epic/);
+    await expect(tellWorker(ops, "BUTCHR", "BUTCHR-5", "hi")).rejects.toThrow();
+  });
+});
+
+describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not a Jira comment (BUTCHR-71 spec correction)", () => {
+  test("reportToBoss posts a Confluence footer comment on the project's root doc, identity-tagged, never ops.addComment", async () => {
+    const { ops, issues, pages, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [] });
+    let commentedPageId: string | undefined;
+    let commentedBody: string | undefined;
+    const spied: AtlassianOps = {
+      ...ops,
+      commentOnPage: async (pageId: string, body: string) => { commentedPageId = pageId; commentedBody = body; return { ok: true }; },
+      addComment: async () => { throw new Error("must never be called for a project caller"); },
+    };
+    await reportToBoss(spied, "BUTCHR", "status update");
+    expect(commentedPageId).toBe(ROOT_DOC_ID);
+    expect(commentedBody).toContain("[BUTCHR] status update");
+    void issues;
+  });
+
+  test("askBoss carries the SAME [ask] marker convention onto the project's root doc", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [] });
+    let commentedBody: string | undefined;
+    const spied: AtlassianOps = { ...ops, commentOnPage: async (_id: string, body: string) => { commentedBody = body; return { ok: true }; } };
+    await askBoss(spied, "BUTCHR", "which approach?");
+    expect(commentedBody).toContain(`[BUTCHR] ${ASK_MARKER} which approach?`);
   });
 });

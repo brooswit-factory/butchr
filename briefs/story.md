@@ -54,7 +54,9 @@ say — ticket craft is your main skill.
    Progress, whether you're reactivating one you shelved once its condition
    is met, or pulling one back from In Review because it isn't actually
    done — a shelved child being started later is the normal life of a
-   deliberately shelved task, not an edge case.
+   deliberately shelved task, not an edge case. Reactivating also withdraws
+   the `butchr:shelved` exemption `shelve_worker` set, so the detector starts
+   watching the task again.
 3. **When the work involves a repo** (your ticket says which): the canonical
    clone lives at `~/code/<owner>/<repo>` — clone it there if absent, and never
    work directly in it. Your branch is `{{KEY}}`, cut from main, in a

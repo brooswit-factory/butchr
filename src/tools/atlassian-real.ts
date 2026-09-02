@@ -215,6 +215,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: merged } });
     },
 
+    // The inverse of addLabels above, same read-modify-write reasoning: no
+    // subtractive endpoint, so read current labels, filter, write back.
+    // Filtering out a label that isn't present is a no-op.
+    removeLabels: async (key, labels) => {
+      const current: any = await jira.issues.getIssue({ issueIdOrKey: key, fields: ["labels"] });
+      const existing: string[] = current?.fields?.labels ?? [];
+      const toRemove = new Set(labels);
+      const remaining = existing.filter((l) => !toRemove.has(l));
+      return jira.issues.editIssue({ issueIdOrKey: key, fields: { labels: remaining } });
+    },
+
     // MEASURED against this daemon's own credential (BUTCHR-35, 2026-08-31):
     // GET /rest/api/3/mypermissions?projectKey=BUTCHR&permissions=DELETE_ISSUES
     // returned {"DELETE_ISSUES":{...,"havePermission":false}}, and a live
@@ -222,5 +233,25 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // not have permission to delete issues in this project." — see the
     // AtlassianOps doc comment for why this op is called anyway.
     deleteIssue: (key) => jira.issues.deleteIssue({ issueIdOrKey: key }),
+
+    // MEASURED live (BUTCHR-62, 2026-09-01): POST /wiki/api/v2/footer-comments
+    // with {pageId, body: {representation: "storage", value}} -> 201. A
+    // FOOTER comment, not an inline one — confluence.js's v2 `comment`
+    // namespace keeps the two as separate methods (createFooterComment vs
+    // createInlineComment); this deliberately uses the footer one, the plain
+    // "comment on this page" concept a human sees at the bottom of it.
+    commentOnPage: (pageId, body) =>
+      wiki.comment.createFooterComment({ pageId, body: { representation: "storage", value: body } }),
+
+    // MEASURED live: GET /wiki/api/v2/pages/{id}/footer-comments -> 200.
+    // bodyFormat "storage" requested explicitly, same convention as getPage,
+    // so a caller reading `.body` never has to guess which representation
+    // came back. Reshaped to {id, body} pairs, same spirit as getChildPages'
+    // reshape — a caller wants the comment text, not confluence.js's nested
+    // {body: {storage: {value}}} shape.
+    getPageComments: (pageId) =>
+      wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
+        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "" })),
+      })),
   };
 }

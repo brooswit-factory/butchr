@@ -85,8 +85,13 @@ detects this itself (`src/agents/parked.ts`) after `BUTCHR_PARKED_MINUTES`
 escalates up the Implements chain if the boss still hasn't acted — arriving
 at a human-owned ticket by construction, since epics are the human's
 (above). A deliberately-shelved backlog item can be exempted with the
-`butchr:shelved` label — any actor may set it (a human today, or an
-automated shelving tool in future) — which the daemon only ever reads.
+`butchr:shelved` label — any actor may set it (a human by hand, or
+`shelve_worker`) — which the daemon's own poll/sweep machinery only ever
+reads. It means CURRENTLY shelved, a state rather than a history:
+`start_worker`/`finish_worker`/`adopt_worker(..., "start")` clear it as part
+of reversing the decision it recorded, so reactivating a worker also
+withdraws its exemption and the detector starts watching it again. A label
+set by hand, outside those verbs, is cleared by nobody but whoever set it.
 
 ## Tools: the daemon MCP is a thin proxy
 

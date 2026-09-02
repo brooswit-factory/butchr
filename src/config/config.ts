@@ -64,11 +64,18 @@ export interface Config {
   pollStaleMs: number;
   /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
-   * issuetype. Both are optional so a daemon that only ever reads Jira still
-   * boots; the refusal for an unstaffable Story/Task happens per-call, at
-   * create time (see src/tools/defs.ts), not here.
+   * issuetype. All three are optional so a daemon that only ever reads Jira
+   * still boots; the refusal for an unstaffable Story/Task/Epic happens
+   * per-call, at create time (see src/tools/defs.ts), not here. `epic`
+   * (BUTCHR-71) staffs the Epic a PROJECT caller's `new_worker`/
+   * `adopt_worker` creates or adopts — DELIBERATELY never falls back to
+   * `story`/`task` (or vice versa): the epic tier and the project tier must
+   * NOT resolve to the same Atlassian account, because a project approving
+   * an epic (`finish_worker`/`tell_worker`) is the cross-account review hop
+   * the whole project-tier identity design exists for, and GitHub will not
+   * accept a PR approval from the PR's own author.
    */
-  assignees: { story?: string; task?: string };
+  assignees: { story?: string; task?: string; epic?: string };
   /**
    * BUTCHR-12: directory the session-limit watcher's evidence captures land
    * in. Default `.captures` under the workspace root — dot-prefixed so it
@@ -94,6 +101,7 @@ export interface ConfigEnv {
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
+  BUTCHR_ASSIGNEE_EPIC?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
 }
 
@@ -126,6 +134,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
+  const assigneeEpic = env.BUTCHR_ASSIGNEE_EPIC?.trim();
 
   const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
 
@@ -142,6 +151,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
+      ...(assigneeEpic ? { epic: assigneeEpic } : {}),
     },
     captureDir,
   };
@@ -156,7 +166,7 @@ function required(v: string | undefined, name: string): string {
 const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
 
 /** Names the consequence, not just the fact of being unset — an operator should see this before an agent trips over it. */
-const describeRole = (role: "Story" | "Task", id: string | undefined): string =>
+const describeRole = (role: "Story" | "Task" | "Epic", id: string | undefined): string =>
   id ? truncAccountId(id) : `unset — ${role} creation will be refused`;
 
 /** Never logs a token value; use this to describe a config safely. */
@@ -164,5 +174,5 @@ export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
-  `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} ` +
+  `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `captureDir=${c.captureDir}`;

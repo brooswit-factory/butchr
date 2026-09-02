@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ApiError } from "confluence.js/core";
-import { getDoc, setDoc, ensureDoc, labelForKey, JIRA_KEY_RE } from "../../src/tools/docs.js";
+import { getDoc, setDoc, ensureDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
@@ -65,6 +65,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
     addLabels: async () => ({ ok: true }),
+    removeLabels: async () => ({ ok: true }),
     deleteIssue: async () => ({ ok: true }),
 
     getProjectProperty: async (projectKey: string) => {
@@ -101,6 +102,8 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label] });
       return { id, title: p.title, url: pageUrl(id) };
     },
+  commentOnPage: async () => ({ ok: true }),
+  getPageComments: async () => ({ results: [] }),
   };
 
   return { ops, issues, pages, projectProperties, addIssue, setProjectProperty, upsertCalls: () => upsertRemoteLinkCalls };
@@ -380,6 +383,88 @@ describe("docs.ts: the provisional body's ASSIST pointer", () => {
     // Replaced wholesale, pointer included. That is correct: by now the agent has
     // read it, and the doc's job has changed from orienting its author to recording.
     expect(pages.get(doc.id)!.body).toBe("<p>what actually happened</p>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-71, Contract 1: a PROJECT's doc resolves to its ROOT DOC — never
+// created, never ensureDoc'd. What would make each check below FAIL, stated
+// up front: getProjectDoc/setProjectDoc calling ensureDoc (creating a page)
+// would fail "never creates a page"; reading the wrong page id would fail
+// the round-trip test; a missing property or rootDoc.id NOT throwing would
+// fail the refusal tests; set_doc requiring `title` on first write for a
+// project would fail the "title stays optional" test (a root doc, unlike a
+// fresh per-ticket page, already has a real title from provisioning).
+// ---------------------------------------------------------------------------
+describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Contract 1)", () => {
+  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>, id: string, title: string, body: string) {
+    // A project's root doc is provisioned AHEAD OF TIME (BUTCHR-62's doc: six
+    // product projects + ASSIST already carry one) — seeded directly here,
+    // never via ensureDoc, matching that reality.
+    pages.set(id, { parentId: "", title, body, labels: [] });
+  }
+
+  test("resolves the project's root doc via the EXISTING entity-property reader — same shape ensureDoc already reads, no second reader", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedRootDoc(pages, "77", "BUTCHR — product brief", "<p>the brief</p>");
+    setProjectProperty("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "77" } });
+    const doc = await projectRootDoc(ops, "BUTCHR");
+    expect(doc.id).toBe("77");
+    expect(doc.title).toBe("BUTCHR — product brief");
+    expect(doc.body).toBe("<p>the brief</p>");
+  });
+
+  test("REFUSES, naming the project, when the butchr entity property is unreadable — never falls back to creating a page", async () => {
+    const { ops, pages } = makeWorld(); // no setProjectProperty call at all
+    await expect(projectRootDoc(ops, "BUTCHR")).rejects.toThrow(/BUTCHR.*unreadable/s);
+    expect(pages.size).toBe(0); // nothing was created
+  });
+
+  test("REFUSES, naming the project, when rootDoc.id is missing from an otherwise-readable property", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", { space: { key: "BUTCHR" } }); // no rootDoc at all
+    await expect(projectRootDoc(ops, "BUTCHR")).rejects.toThrow(/BUTCHR.*rootDoc\.id/s);
+    expect(pages.size).toBe(0);
+  });
+
+  test("getProjectDoc never creates a page, unlike get_doc's own ensureDoc-backed sibling for an issue with no doc yet", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedRootDoc(pages, "5", "CATA — product brief", "<p>hi</p>");
+    setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "5" } });
+    const before = pages.size;
+    const result = await getProjectDoc(ops, "CATA");
+    expect(result).toEqual({ found: true, id: "5", url: expect.any(String), title: "CATA — product brief", body: "<p>hi</p>" });
+    expect(pages.size).toBe(before); // no page was created
+  });
+
+  test("setProjectDoc is a full-body replace of the root doc, NEVER calling ensureDoc — no create/nest/label path for a project caller", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedRootDoc(pages, "9", "SCHEM — product brief", "<p>stale</p>");
+    setProjectProperty("SCHEM", { space: { key: "SCHEM" }, rootDoc: { id: "9" } });
+    const before = pages.size;
+    const result = await setProjectDoc(ops, "SCHEM", "<p>current</p>");
+    expect(pages.get("9")!.body).toBe("<p>current</p>");
+    expect(pages.size).toBe(before); // still no new page
+    expect(result.title).toBe("SCHEM — product brief"); // title unchanged, since none was passed
+  });
+
+  test("title stays OPTIONAL on a project's very first set_doc call — unlike an issue's provisional-title gate, a root doc already has a real title", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedRootDoc(pages, "3", "RINTH — product brief", "<p>anything</p>");
+    setProjectProperty("RINTH", { space: { key: "RINTH" }, rootDoc: { id: "3" } });
+    // No title passed, and this must NOT throw the way set_doc would for an
+    // issue whose doc still carries "[unwritten]".
+    await expect(setProjectDoc(ops, "RINTH", "<p>new body, no title</p>")).resolves.toBeDefined();
+    expect(pages.get("3")!.title).toBe("RINTH — product brief"); // unchanged
+  });
+
+  test("setProjectDoc CAN retitle when a title is passed", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedRootDoc(pages, "4", "old title", "<p>x</p>");
+    setProjectProperty("KAN", { space: { key: "KAN" }, rootDoc: { id: "4" } });
+    const result = await setProjectDoc(ops, "KAN", "<p>x</p>", "new title");
+    expect(result.title).toBe("new title");
+    expect(pages.get("4")!.title).toBe("new title");
   });
 });
 
