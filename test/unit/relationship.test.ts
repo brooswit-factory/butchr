@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
+  CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -702,15 +703,41 @@ describe("correctWorker", () => {
     expect(issues.get("BUTCHR-2")!.description).toBe("old"); // UNCHANGED
   });
 
-  test("edit failing AFTER a successful archive: one harmless extra comment, description UNCHANGED, error says safe to retry", async () => {
+  test("edit failing AFTER a successful archive: a REJECTED annotation follows it each time, description UNCHANGED, error says safe to retry", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
     addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
     const failingOps: AtlassianOps = { ...ops, correctText: async () => { throw new Error("edit API down"); } };
     await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/UNCHANGED/);
     await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/retry/i);
-    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(2); // the archive lands each time (safe to retry)
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments).toHaveLength(4); // archive + REJECTED annotation, twice (safe to retry)
+    expect(comments[0]).toContain(CORRECTION_MARKER);
+    expect(comments[1]).toContain(CORRECTION_REJECTED_MARKER);
+    expect(comments[1]).toMatch(/REJECTED/);
+    expect(comments[2]).toContain(CORRECTION_MARKER);
+    expect(comments[3]).toContain(CORRECTION_REJECTED_MARKER);
     expect(issues.get("BUTCHR-2")!.description).toBe("old"); // the edit never took
+  });
+
+  test("edit fails and the REJECTED annotation itself also fails: the ORIGINAL edit error still surfaces, unmasked", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    let addCommentCalls = 0;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      correctText: async () => { throw new Error("edit API down"); },
+      addComment: async (key: string, text: string) => {
+        addCommentCalls++;
+        if (addCommentCalls === 1) return ops.addComment(key, text); // the archive itself still succeeds
+        throw new Error("comment API down too"); // the follow-up annotation attempt fails
+      },
+    };
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/edit API down/);
+    // a catch that rethrew the annotation's own error, or swallowed the original, would fail the assertion above.
+    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(1); // only the archive landed; the failed annotation attempt wrote nothing
+    expect(issues.get("BUTCHR-2")!.description).toBe("old");
   });
 
   test("a description-only call writes ONLY description — summary is untouched", async () => {
@@ -740,6 +767,48 @@ describe("correctWorker", () => {
     const summaryToo = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "newer summary", why: "reason 2" });
     expect(summaryToo.message).toMatch(/SNAPSHOTTED/);
     expect(summaryToo.message).toMatch(/tell_worker/);
+  });
+
+  test("refuses an oversized `description` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    let addCommentCalls = 0, correctTextCalls = 0;
+    const countingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { addCommentCalls++; return ops.addComment(key, text); },
+      correctText: async (key: string, p) => { correctTextCalls++; return ops.correctText(key, p); },
+    };
+    const oversized = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT + 1);
+    await expect(correctWorker(countingOps, "BUTCHR-1", "BUTCHR-2", { description: oversized, why: "reason" })).rejects.toThrow(new RegExp(String(JIRA_DESCRIPTION_CHAR_LIMIT)));
+    expect(addCommentCalls).toBe(0); // no archive was posted
+    expect(correctTextCalls).toBe(0); // no edit was attempted
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // byte-for-byte untouched
+  });
+
+  test("refuses an oversized `summary` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+    let addCommentCalls = 0, correctTextCalls = 0;
+    const countingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { addCommentCalls++; return ops.addComment(key, text); },
+      correctText: async (key: string, p) => { correctTextCalls++; return ops.correctText(key, p); },
+    };
+    const oversized = "x".repeat(JIRA_SUMMARY_CHAR_LIMIT + 1);
+    await expect(correctWorker(countingOps, "BUTCHR-1", "BUTCHR-2", { summary: oversized, why: "reason" })).rejects.toThrow(new RegExp(String(JIRA_SUMMARY_CHAR_LIMIT)));
+    expect(addCommentCalls).toBe(0);
+    expect(correctTextCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.summary).toBe("old summary");
+  });
+
+  test("does NOT refuse a description exactly AT the limit — the check is `>`, not `>=`", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const atLimit = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT);
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: atLimit, why: "reason" })).resolves.toBeDefined();
   });
 });
 
