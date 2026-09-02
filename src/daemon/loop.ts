@@ -341,6 +341,14 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
     async () => {
       const issues = await resourceType.discovery.search();
       const desired = desiredFrom(issues, resourceType);
+      // Two separate passes over `issues`, each re-calling `verdictFor` per
+      // item — deliberately not refactored into one pass. They can never
+      // disagree about a given item (never both include, or both exclude,
+      // its id) BECAUSE `verdictFor` is synchronous and pure over `T`: two
+      // calls with the same resource object, in the same tick, always
+      // return the same verdict. An async or side-effecting `verdictFor`
+      // would not have that guarantee — this is the concrete cost of ever
+      // relaxing that constraint.
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(deps.herd, desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
