@@ -1,0 +1,118 @@
+{
+  "timestampUtc": "2026-09-02T09:41:27.754Z",
+  "repo": "brooswit-factory/butchr",
+  "pr": 188,
+  "commands": [
+    "gh api repos/brooswit-factory/butchr/pulls/188/reviews",
+    "gh api repos/brooswit-factory/butchr/pulls/188/reviews/5087810116",
+    "gh pr view 188 --repo brooswit-factory/butchr --json reviews",
+    "gh pr view 188 --repo brooswit-factory/butchr --json headRefOid,reviewDecision,state,mergedAt"
+  ],
+  "restList": [
+    {
+      "id": 5087810116,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HSRA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm A (base-merge).\n\nREVIEWED-SHA: 54311340c1986254c015372283edc300df7ce1d9\n\nThis is a throwaway measurement instrument, not a deliverable. Approving it is an act of running the experiment, not a judgement that anything should merge. DO NOT MERGE. Verified before approving: single new file under docs/review-commit-immutability/, 5 added lines, self-describing as scratch; branch is 13 commits behind origin/main, so the Arm A base-merge will produce a real merge commit rather than a fast-forward.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test in BUTCHR-138. Compare it against .commit_id at T0 and again at T1.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/188#pullrequestreview-5087810116",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/188",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/188#pullrequestreview-5087810116"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/188"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:02Z",
+      "commit_id": "aeba3bb812b6d8ad91f750f978d99785308d4625"
+    }
+  ],
+  "restById": {
+    "5087810116": {
+      "id": 5087810116,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HSRA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm A (base-merge).\n\nREVIEWED-SHA: 54311340c1986254c015372283edc300df7ce1d9\n\nThis is a throwaway measurement instrument, not a deliverable. Approving it is an act of running the experiment, not a judgement that anything should merge. DO NOT MERGE. Verified before approving: single new file under docs/review-commit-immutability/, 5 added lines, self-describing as scratch; branch is 13 commits behind origin/main, so the Arm A base-merge will produce a real merge commit rather than a fast-forward.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test in BUTCHR-138. Compare it against .commit_id at T0 and again at T1.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/188#pullrequestreview-5087810116",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/188",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/188#pullrequestreview-5087810116"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/188"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:02Z",
+      "commit_id": "aeba3bb812b6d8ad91f750f978d99785308d4625"
+    }
+  },
+  "graphql": [
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL0HSRA",
+      "author": {
+        "login": "booswrit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm A (base-merge).\n\nREVIEWED-SHA: 54311340c1986254c015372283edc300df7ce1d9\n\nThis is a throwaway measurement instrument, not a deliverable. Approving it is an act of running the experiment, not a judgement that anything should merge. DO NOT MERGE. Verified before approving: single new file under docs/review-commit-immutability/, 5 added lines, self-describing as scratch; branch is 13 commits behind origin/main, so the Arm A base-merge will produce a real merge commit rather than a fast-forward.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test in BUTCHR-138. Compare it against .commit_id at T0 and again at T1.",
+      "submittedAt": "2026-09-02T09:19:02Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "aeba3bb812b6d8ad91f750f978d99785308d4625"
+      }
+    }
+  ],
+  "prMeta": {
+    "headRefOid": "9f034e69d71629141128f80445f1d12c0b29a991",
+    "mergedAt": null,
+    "reviewDecision": "APPROVED",
+    "state": "OPEN"
+  }
+}
