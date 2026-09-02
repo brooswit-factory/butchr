@@ -51,7 +51,7 @@ describe("atlassianTools", () => {
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
-      "get_doc",
+      "get_doc", "get_doc_comments",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
       "new_worker", "prioritize_worker", "report_to_boss",
@@ -1557,5 +1557,123 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     await tools.check_in!.handler({}, conn);
     expect((properties.get("BUTCHR") as any).wake.comment).toBe("42"); // untouched — omitted from the patch, not overwritten with null
+  });
+});
+
+// BUTCHR-109: get_doc_comments, the inbound half of "a project is talked to
+// by commenting on its root doc" (check_in above is the OUTBOUND half's
+// watermark, not a reply channel). Failure conditions stated first, per
+// test, same discipline as check_in's own block.
+describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by commenting on its root doc" — the inbound half)', () => {
+  // Two DISTINCT pages, each with its own distinct comment, keyed by pageId —
+  // this is what makes the control test below meaningful: a reader that
+  // ignored the `id` argument (the batch-endpoint bug BUTCHR-107 names by
+  // name) would return BOTH pages' comments no matter which page was asked
+  // for, and this rig is shaped so that mistake is visible in the assertion,
+  // not hidden by both pages coincidentally holding the same text.
+  function docCommentsRig(byPage: Record<string, Array<{ id: string; body: string; author?: string }>>, opts: { rootDocId?: string } = {}) {
+    const properties = new Map<string, unknown>([["BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: opts.rootDocId ?? "1" } }]]);
+    const getPageCommentsCalls: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async () => ({ results: [] }),
+      search: async () => ({ issues: [] }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async () => ({ ok: true }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      // The reader under test: PER-PAGE, keyed strictly by the `pageId`
+      // argument — never the batch `?id=A&id=B` shape this ticket forbids
+      // (see getPageComments' own doc comment on AtlassianOps). A pageId
+      // this rig wasn't seeded with throws, deliberately, rather than
+      // silently returning `[]` or every page's comments — a lookup that
+      // can fail loudly on a wrong id is what makes the control below able
+      // to fail at all.
+      getPageComments: async (pageId: string) => {
+        getPageCommentsCalls.push(pageId);
+        if (!(pageId in byPage)) throw new Error(`docCommentsRig: no comments seeded for page ${pageId}`);
+        return { results: byPage[pageId]! };
+      },
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async (key: string) => {
+        const p = properties.get(key);
+        if (!p) throw new Error(`no property for ${key}`);
+        return p;
+      },
+      getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools, getPageCommentsCalls };
+  }
+
+  const PROJECT_CALLER = { headers: { "x-issue": "BUTCHR" } } as any;
+  const ISSUE_CALLER = { headers: { "x-issue": "BUTCHR-1" } } as any;
+
+  // Failure this exists to catch: the guard is missing entirely, or refuses
+  // with no explanation an issue caller could act on.
+  test("refuses an ISSUE caller, naming why AND pointing at the read it already has (jira_get_issue)", async () => {
+    const { tools } = docCommentsRig({ "1": [] });
+    await expect(tools.get_doc_comments!.handler({}, ISSUE_CALLER)).rejects.toThrow(/refusing an issue caller/);
+    await expect(tools.get_doc_comments!.handler({}, ISSUE_CALLER)).rejects.toThrow(/jira_get_issue/);
+  });
+
+  test("refuses a connection with no x-issue", async () => {
+    const { tools } = docCommentsRig({ "1": [] });
+    const conn = { headers: {} } as any;
+    await expect(tools.get_doc_comments!.handler({}, conn)).rejects.toThrow(/refusing/);
+  });
+
+  // THE REQUIRED CONTROL (BUTCHR-107's own instruction): fails if the reader
+  // ignores the page id and returns cross-page comments — exactly the
+  // MEASURED batch-endpoint trap ("12 results for two unrelated pages")
+  // named in this ticket's own description. It would also fail if
+  // get_doc_comments passed the wrong page id to ops.getPageComments (e.g.
+  // a hardcoded/stale one) — docCommentsRig throws on an unseeded id, but
+  // page "2" (page B) IS seeded here, so a wrong-id bug would surface as
+  // "page B's comment leaked into page A's result", not as a throw.
+  test("asserts a DIFFERENT page's comment is NOT returned — fails against a reader that ignores the page id (the batch-endpoint bug this ticket exists to avoid)", async () => {
+    const { tools, getPageCommentsCalls } = docCommentsRig(
+      {
+        "1": [{ id: "10", body: "comment on page A", author: "acc-a" }],
+        "2": [{ id: "20", body: "comment on page B — must never appear for project BUTCHR", author: "acc-b" }],
+      },
+      { rootDocId: "1" },
+    );
+    const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+    expect(getPageCommentsCalls).toEqual(["1"]); // never page "2", never a batched call
+    const bodies = result.results.map((c) => c.body);
+    expect(bodies).toContain("comment on page A");
+    expect(bodies).not.toContain("comment on page B — must never appear for project BUTCHR");
+  });
+
+  // Fails if the reshape drops a field — e.g. `author` left `undefined`
+  // because the underlying read needs an explicit expansion this op doesn't
+  // request (the exact MEASURED trap this codebase already hit once on
+  // Jira's `project.lead`; see getPageComments' doc comment on
+  // AtlassianOps for what was checked this time).
+  test("a project caller gets id, body AND author back, all populated", async () => {
+    const { tools } = docCommentsRig({ "1": [{ id: "10", body: "hello from a reviewer", author: "712020:abc" }] });
+    const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+    expect(result.results).toEqual([{ id: "10", body: "hello from a reviewer", author: "712020:abc" }]);
   });
 });
