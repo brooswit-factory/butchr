@@ -1159,11 +1159,13 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
     expect(audits.some((a) => a.includes("correct_worker KAN-9 description=true summary=false"))).toBe(true);
   });
 
-  test("the description states both review-mandated limitations up front (the bossless-epic wording, WITH its named recourse, and the summary-snapshot caveat), the self-refusal rationale, the archive marker, and both legitimate use cases (correction AND a late-arriving requirement)", () => {
+  test("the description states both review-mandated limitations up front (the epic-ownership wording — a project caller CAN correct its own epics, self-correction still refused at every tier, WITH the named Jira-UI recourse — and the summary-snapshot caveat), the self-refusal rationale, the archive marker, and both legitimate use cases (correction AND a late-arriving requirement)", () => {
     const { tools } = rigWorker();
     const d = tools.correct_worker!.description;
-    expect(d).toMatch(/no AGENT can ever correct an epic's description/);
-    expect(d).toMatch(/person can still edit it directly in the Jira UI/); // the named recourse — half 1 without half 2 is the failure mode this ticket exists to fix
+    expect(d).toMatch(/a project agent CAN correct one of its own epics' descriptions/); // BUTCHR-88: the corrected claim — a project caller IS an accepted owner of its own epics
+    expect(d).not.toMatch(/no AGENT can ever correct/); // the retracted false claim must not reappear verbatim
+    expect(d).not.toMatch(/epic has no boss/i); // the retracted false premise must not reappear either, under any casing
+    expect(d).toMatch(/a person editing it directly in the Jira UI/); // the named recourse — half 1 without half 2 is the failure mode this ticket exists to fix
     expect(d).toMatch(/SNAPSHOTTED/);
     expect(d).toMatch(/launder a failure into a success/);
     expect(d).toMatch(/\[correction\]/);

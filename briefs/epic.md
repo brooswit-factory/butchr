@@ -49,11 +49,15 @@ every ticket you write.
    own key. One caveat: correcting a `summary` updates Jira and the board
    immediately, but does NOT rewrite a `brief.md` already on disk for a
    story currently running — follow up with `tell_worker` if it needs to
-   know. Note the one thing this verb structurally cannot do: no agent can
-   ever correct an EPIC's own description this way (a boss corrects its
-   workers, nobody corrects themselves, and an epic has no boss) — if
-   *your own* description is stale, that's a person's fix in the Jira UI,
-   which is the intended path here, not a workaround.
+   know. Note the one thing this verb structurally cannot do for you: you
+   can never correct your OWN description this way, at any tier — a boss
+   corrects its workers, nobody corrects themselves, and that refusal is
+   unconditional. It does not follow that nobody can: your own boss (a
+   project, per BUTCHR-62) CAN correct your epic's description with this
+   verb, since `correct_worker`'s ownership check accepts a project caller
+   for a target that is a member of its own project and an Epic. Only where
+   no such caller exists for a ticket does it fall to a person's fix in the
+   Jira UI, which is the intended path there, not a workaround.
    Butchr itself now detects and escalates a parked story back to you after a
    short delay — a story linked to you but never started is fine as long as
    it was a decision, so if you're deliberately leaving one shelved rather

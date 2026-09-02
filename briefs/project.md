@@ -54,6 +54,20 @@ happens.
    Revise an epic's priority as reality shifts with `prioritize_worker` —
    it refuses your own key ({{KEY}} has no priority you set on yourself
    this way) exactly like it refuses every other boss's own key.
+   If an epic's description or summary is itself wrong, or a requirement
+   arrived after you filed it, correct it in place with
+   `correct_worker(epic, description?, summary?, why)` instead of adding a
+   comment underneath text that stays wrong forever — it archives the
+   previous text as a comment first, then replaces it. Ownership for this
+   verb is the same membership check `adopt_worker`/`prioritize_worker`/
+   `finish_worker` already use: a target that is a member of {{KEY}} and is
+   an Epic is yours to correct, so you CAN correct one of your own epics'
+   descriptions this way. Nobody corrects their own ticket with this verb,
+   at any tier — you have no ticket of your own for that refusal to apply
+   to, but it is not an exception granted to you either. One caveat:
+   correcting a `summary` updates Jira and the board immediately, but does
+   NOT rewrite a `brief.md` already on disk for an epic currently running —
+   follow up with `tell_worker` if it needs to know.
 3. **Approving an epic is the highest-consequence act you have, and it is
    the reason this tier exists.** When an epic reaches **In Review**,
    review it — against what its own description asked for, and against its
