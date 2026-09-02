@@ -113,6 +113,25 @@ describe("createCrashLoopDetector: the threshold itself", () => {
     expect(text.toLowerCase()).not.toContain("mistake");
   });
 
+  test("the posted complaint text asserts no outcome — never claims the resource ran, stayed up, or died, only that it was spawned repeatedly", async () => {
+    let now = 0;
+    const chan = fakeChannel();
+    const det = createCrashLoopDetector({ now: () => now, count: 5, windowMinutes: 60, addComment: chan.addComment, comments: chan.comments });
+    for (let i = 0; i < 5; i++) {
+      now = i * MIN;
+      await det.check(["BUTCHR-1"], ["BUTCHR-1"]);
+    }
+    expect(chan.posted.length).toBe(1);
+    const text = chan.posted[0]!.text.toLowerCase();
+    // BUTCHR-161: both clauses used to assert the agent ran and then either
+    // failed to stay up or died — false when the spawn never started at all
+    // (e.g. workspace.create returning no root pane). None of these phrases
+    // may appear in the posted text.
+    for (const phrase of ["stay up", "staying up", "stayed up", "dying", "died", "recover"]) {
+      expect(text).not.toContain(phrase);
+    }
+  });
+
   test("a spawn count that never reaches the threshold within the rolling window produces nothing — old spawns fall out of the window", async () => {
     let now = 0;
     const chan = fakeChannel();
