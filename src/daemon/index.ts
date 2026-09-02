@@ -5,6 +5,7 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
@@ -115,7 +116,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth]),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity)),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
