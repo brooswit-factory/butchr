@@ -136,24 +136,33 @@ export function createLabelSync(deps: SyncDeps) {
         // spawn, continuously idle" streak sees every poll, not just the
         // ones where the result might matter.
         const stalledResult = deps.stalled ? await deps.stalled.check(issue.key, observed) : false;
-        // `null` means the comments fetch failed — "could not verify", a
-        // THIRD outcome that must never be treated as "confirmed stalled"
-        // (the defect this ticket removes) NOR as "confirmed not stalled"
-        // (that would silently clear a real streak's candidacy). Skip
-        // writing `agent:stalled` THIS poll and say so distinctly; the
-        // streak itself isn't lost — `StalledTracker.observe` already ran
-        // inside `deps.stalled.check` before the fetch was attempted, so
-        // `firstObservedAt`/`streakBroken` are untouched and the next poll
-        // re-examines the ticket. This only delays the label, never loses it.
-        if (stalledResult === null) deps.log?.(`WARNING: [labels] ${issue.key} stalled check could not verify (comments fetch failed) — not writing agent:stalled this poll`);
         const stalledNow = stalledResult === true;
         // Logged unconditionally, every poll it holds — unlike the LABEL
         // below, which is deliberately delayed by the stabilizer so a single
         // flickering poll never writes Jira. An operator watching the log
         // should see this the instant it's true, not two polls later.
         if (stalledNow) deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since first observed, zero comments from this account for the configured window`);
-        const candidate: AgentLabel = observed === "idle" && stalledNow ? "stalled" : observed;
         const applied = agentLabelOf(issue.labels);
+        // `null` means the comments fetch failed — "could not verify", a
+        // THIRD outcome that must never be treated as "confirmed stalled"
+        // (the defect this ticket removes) NOR as "confirmed not stalled".
+        // The latter is its own trap: naively falling through to `observed`
+        // (always "idle" here — `check` only fetches comments once the
+        // idle/done streak already qualifies) makes THIS dimension's
+        // candidate "idle" regardless of what's actually applied, so on a
+        // ticket that already carries `agent:stalled`, two consecutive
+        // could-not-verify polls "confirm" a flip to idle through the SAME
+        // stabilizer any real transition uses — silently erasing a true
+        // stalled signal. The candidate on a `null` poll is `applied`
+        // itself instead: fed through the stabilizer unchanged, it resolves
+        // as "no candidate change", so this dimension is left exactly as it
+        // was applied, whatever that value is. Only the TRACKER's internal
+        // streak bookkeeping (`StalledTracker.observe`, which already ran
+        // inside `deps.stalled.check` before the fetch was attempted) is
+        // guaranteed delay-not-lose; this is what makes the LABEL itself
+        // delay-not-lose too, by construction rather than by accident.
+        if (stalledResult === null) deps.log?.(`WARNING: [labels] ${issue.key} stalled check could not verify (comments fetch failed) — leaving agent:${applied ?? "none"} as applied this poll`);
+        const candidate: AgentLabel = stalledResult === null ? (applied ?? observed) : (observed === "idle" && stalledNow ? "stalled" : observed);
         const { label, suppressed } = stabilizer.resolve(issue.key, applied, candidate);
         if (suppressed) deps.log?.(`[labels] ${issue.key} agent:${candidate} unconfirmed (holding agent:${applied}) — flip suppressed`);
         stalled = label === "stalled";
