@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
+import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
@@ -263,6 +264,63 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
     } finally {
       pollHealth.stop();
       notifyHealth.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-54: /health carries this daemon's own build identity as a SIBLING
+// field, never an entry in components[] — build identity is not a liveness
+// signal, so it must never be able to flip `ok`. Driven through the real
+// production composition (combineHealth + buildApp + this process's own
+// `buildIdentity` singleton, not a hand-rolled fixture) and a real listening
+// server, per the ticket's own "assert on the actual endpoint response"
+// requirement.
+describe("/health carries build identity as a sibling of components, never inside it (BUTCHR-54)", () => {
+  test("combineHealth's optional build param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    const build = toBuildReport(buildIdentity);
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], build),
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.build).toEqual(build);
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "sha" in c || "version" in c)).toBe(false);
+      // A daemon that doesn't know its own sha is not thereby unhealthy: `ok`
+      // here reflects pollLoop's own state (starting, since recordSuccess was
+      // never called), completely independent of whether build.sha is known.
+      expect(body.ok).toBe(false);
+      expect(body.build!.pid).toBe(process.pid);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting build (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.build).toBeUndefined();
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
       await mcp.closeAll();
       app.stop();
     }

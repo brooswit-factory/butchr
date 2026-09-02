@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test";
 import {
   buildIdentityReport,
   computeVerdict,
+  decideBuildIdentity,
   decideReadability,
   describeSkippedUnit,
+  formatBuildLine,
   formatReport,
+  formatUptime,
   journalInvocationFor,
   looksLikeButchrUnit,
   parseSsListeners,
   partitionCandidates,
+  type BuildOutcome,
   type IdentityReport,
   type SsListener,
 } from "../../scripts/audit-alias-calls.js";
@@ -279,9 +283,142 @@ describe("formatReport", () => {
       outcome: { readable: false, reason: "cross-user" }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
     };
     const result = computeVerdict([id]);
-    const text = formatReport([id], result);
+    const text = formatReport([id], result, Date.parse("2026-01-01T00:00:00.000Z"));
     expect(text).toContain("uid=1002");
     expect(text).toContain("UNREADABLE");
     expect(text).toContain("VERDICT: INCONCLUSIVE");
+  });
+});
+
+describe("decideBuildIdentity — BUTCHR-54: build identity is a SEPARATE axis from journal readability", () => {
+  // THE CASE THE TICKET NAMES AS THE ONE YOU WILL ACTUALLY HIT: deploy-on-merge
+  // is off, so a daemon discovered right now answers /health daemon-shaped but
+  // predates this field entirely. Must be an explicit, worded unknown — never
+  // a blank column, never silently folded into "known: true" with nulls.
+  test("a daemon-shaped /health body with no build field at all: explicit unknown, exact wording", () => {
+    const outcome = decideBuildIdentity({ ok: true, components: [] });
+    expect(outcome).toEqual({
+      known: false,
+      reason: "this daemon does not report a build identity; it predates the field, or is running an older build",
+    });
+  });
+
+  test("a fully-populated build field: known, every field parsed through", () => {
+    const outcome = decideBuildIdentity({
+      ok: true,
+      components: [],
+      build: {
+        sha: "a".repeat(40), shaProvenance: "baked", shaDirty: true, shaUnknownReason: null,
+        version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 4242,
+        unit: "butchr.service", journalctl: "journalctl --user -u butchr.service",
+      },
+    });
+    expect(outcome).toEqual({
+      known: true,
+      info: {
+        sha: "a".repeat(40), shaProvenance: "baked", shaDirty: true, shaUnknownReason: null,
+        version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 4242,
+      },
+    });
+  });
+
+  test("a build field reporting its OWN honest sha-unknown (git-at-start failed on that daemon): known: true, sha: null, reason carried through", () => {
+    const outcome = decideBuildIdentity({
+      ok: true, components: [],
+      build: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no readable git repository", version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "" },
+    });
+    expect(outcome).toEqual({ known: true, info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no readable git repository", version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1 } });
+  });
+
+  test("null / non-object input never throws — explicit unknown, same wording", () => {
+    expect(decideBuildIdentity(null).known).toBe(false);
+    expect(decideBuildIdentity(undefined).known).toBe(false);
+    expect(decideBuildIdentity("not an object").known).toBe(false);
+  });
+
+  test("a malformed build field (wrong types) degrades individual fields to null/unknown rather than throwing or fabricating", () => {
+    const outcome = decideBuildIdentity({ ok: true, components: [], build: { sha: 12345, shaProvenance: "not-a-real-provenance", version: 9 } }) as Extract<BuildOutcome, { known: true }>;
+    expect(outcome.known).toBe(true);
+    expect(outcome.info.sha).toBeNull();
+    expect(outcome.info.shaProvenance).toBeNull();
+    expect(outcome.info.version).toBeNull();
+  });
+});
+
+describe("formatUptime", () => {
+  const START = Date.parse("2026-01-01T00:00:00.000Z");
+  test("no startedAt: honest unknown, never a fabricated duration", () => {
+    expect(formatUptime(null, START)).toBe("unknown");
+  });
+  test("unparseable startedAt: honest unknown", () => {
+    expect(formatUptime("not a date", START)).toBe("unknown");
+  });
+  test("seconds only", () => {
+    expect(formatUptime("2026-01-01T00:00:00.000Z", START + 42_000)).toBe("42s");
+  });
+  test("hours + minutes + seconds", () => {
+    expect(formatUptime("2026-01-01T00:00:00.000Z", START + (2 * 3600 + 5 * 60 + 9) * 1000)).toBe("2h 5m 9s");
+  });
+  test("days included once uptime crosses a day", () => {
+    expect(formatUptime("2026-01-01T00:00:00.000Z", START + (3 * 86400 + 3661) * 1000)).toBe("3d 1h 1m 1s");
+  });
+});
+
+describe("formatBuildLine", () => {
+  const now = Date.parse("2026-01-01T01:00:00.000Z");
+  test("unknown outcome: the reason, verbatim", () => {
+    expect(formatBuildLine({ known: false, reason: "this daemon does not report a build identity; it predates the field, or is running an older build" }, now))
+      .toBe("build: unknown — this daemon does not report a build identity; it predates the field, or is running an older build");
+  });
+  test("known, baked, clean: sha + provenance + version + uptime + pid, no dirty note", () => {
+    const line = formatBuildLine({ known: true, info: { sha: "a".repeat(40), shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 4242 } }, now);
+    expect(line).toBe(`build: sha=${"a".repeat(40)} (baked) version=1.2.3 uptime=1h 0m 0s pid=4242`);
+  });
+  test("known, git-at-start, dirty: dirty note included", () => {
+    const line = formatBuildLine({ known: true, info: { sha: "b".repeat(40), shaProvenance: "git-at-start", shaDirty: true, shaUnknownReason: null, version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1 } }, now);
+    expect(line).toContain("dirty working tree at start");
+  });
+  test("known, but this daemon's OWN sha is unknown: reason surfaces inline, never a blank sha", () => {
+    const line = formatBuildLine({ known: true, info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no readable git repository above /dist", version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1 } }, now);
+    expect(line).toBe("build: sha=unknown (no readable git repository above /dist) version=1.2.3 uptime=1h 0m 0s pid=1");
+  });
+});
+
+describe("formatReport carries the build line for every identity, alongside — never instead of — the readability report", () => {
+  test("an UNREADABLE identity with a KNOWN build still prints both, independently", () => {
+    const id: IdentityReport = {
+      uid: 1001, unit: "butchr.service", journalNote: "own identity",
+      outcome: { readable: false, reason: "zero lines, unconfirmed" },
+      drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      build: { known: true, info: { sha: "c".repeat(40), shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1 } },
+    };
+    const text = formatReport([id], computeVerdict([id]), Date.parse("2026-01-01T00:00:00.000Z"));
+    expect(text).toContain("UNREADABLE");
+    expect(text).toContain(`sha=${"c".repeat(40)}`);
+  });
+
+  // THE OLD-BUILD-WITH-NO-FIELD CASE, end to end through formatReport: a
+  // READABLE identity (journal is fine) whose /health simply predates this
+  // ticket must still show an explicit build-unknown line, never a blank one
+  // and never one that borrows the journal axis's "readable" status.
+  test("a READABLE identity with build identity genuinely unreported: readable journal, explicit build-unknown, never conflated", () => {
+    const id: IdentityReport = {
+      uid: 1001, unit: "butchr.service", journalNote: "own identity",
+      outcome: { readable: true, totalLines: 2, lines: [] },
+      drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      build: decideBuildIdentity({ ok: true, components: [] }),
+    };
+    const text = formatReport([id], computeVerdict([id]), Date.parse("2026-01-01T00:00:00.000Z"));
+    expect(text).toContain("READABLE");
+    expect(text).toContain("build: unknown — this daemon does not report a build identity");
+  });
+
+  test("an IdentityReport built without a `build` field at all (pre-BUTCHR-54 literal): a distinct \"not probed\" line, never a crash or a blank", () => {
+    const id: IdentityReport = {
+      uid: 1002, unit: "butchr.service", journalNote: "foreign identity",
+      outcome: { readable: false, reason: "cross-user" }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+    };
+    const text = formatReport([id], computeVerdict([id]), Date.now());
+    expect(text).toContain("build: unknown — build identity was not probed");
   });
 });
