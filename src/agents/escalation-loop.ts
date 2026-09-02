@@ -2,6 +2,7 @@ import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
 import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
 import type { CaptureSink } from "./session-limit-watch.js";
 import { findMarked, RateCap, HOUR_MS } from "./escalation-helper.js";
+import type { CoverageRecorder } from "../daemon/coverage.js";
 
 const FOLLOWUP_MS = 15 * 60_000;
 const DEBOUNCE_POLLS = 2;
@@ -26,12 +27,28 @@ export interface CommentRow { id: string; body: string; created: string }
  */
 export const UNRESPONSIVE_MARKER = "[butchr:unresponsive]";
 
+/**
+ * BUTCHR-171: the follow-up nudge's own discriminator, checked ALONGSIDE
+ * (never instead of) a fingerprint substring — see the constant's use-site
+ * below for why both are required together. Both the escalation
+ * (`escalationComment`, escalate.ts) and this follow-up start with the SAME
+ * `MARKER` and both mention the fingerprint in their text, which is exactly
+ * why a single-signal discriminator is not safe here: this tag exists SO
+ * THAT an escalation is never mistaken for an already-posted follow-up
+ * (which would silently suppress a real escalation — the single most
+ * dangerous direction, this epic's outcome inverted) and a follow-up is
+ * never mistaken for an escalation (which would corrupt `escalatedAt`'s
+ * origin, this file's `escalate()` adoption). Deliberately NOT reusing
+ * escalate.ts's `fingerprint: ` (colon) spelling anywhere in the follow-up
+ * text below — that exact substring is what `escalate()`'s own adoption
+ * check anchors on, and reusing it would make a follow-up match it too.
+ */
+export const FOLLOWUP_STAGE = "[stage: followup]";
+
 export interface EscalatorDeps {
   read: (paneId: string) => Promise<string>;
   send: (paneId: string, text: string) => Promise<void>;
   addComment: (issue: string, text: string) => Promise<void>;
-  /** Recent comments on an issue, newest-first is fine; plain text bodies. */
-  comments: (issue: string) => Promise<CommentRow[]>;
   now: () => number;
   log: (line: string) => void;
   /**
@@ -44,27 +61,31 @@ export interface EscalatorDeps {
    */
   unresponsiveMinutes: number;
   /**
-   * BUTCHR-124: recent messages on `key`'s OWN CHANNEL — the read-back
-   * symmetric to `addComment`'s `speakOnOwnChannel` routing (an ISSUE's Jira
-   * comments for an issue key; a PROJECT's Confluence root-doc FOOTER
-   * comments for a project key — see src/tools/speak.ts, src/tools/docs.ts's
-   * `projectRootDoc`, and `AtlassianOps.getPageComments`'s "per-page only,
-   * never the batch form" warning). Used ONLY by the sustained-unresponsive
-   * alarm's restart-adoption dedupe — deliberately separate from `comments`
-   * above (issue-only, unchanged, still used exactly as before by the
-   * parseable-dialog `escalate()` — D7).
+   * BUTCHR-124/BUTCHR-159: recent messages on `key`'s OWN CHANNEL — the
+   * read-back symmetric to `addComment`'s `speakOnOwnChannel` routing (an
+   * ISSUE's Jira comments for an issue key; a PROJECT's Confluence root-doc
+   * FOOTER comments for a project key — see src/tools/speak.ts,
+   * src/tools/docs.ts's `projectRootDoc`, and `AtlassianOps.getPageComments`'s
+   * "per-page only, never the batch form" warning).
+   *
+   * THE ONLY comment-read dep on this interface: BUTCHR-159 removed the
+   * former issue-only `comments` dep and rewired every reader in this file —
+   * `escalate()`'s dedupe/adoption check, `handleBlocked`'s directive/
+   * follow-up check, and `escalateUnresponsive`'s restart-adoption check —
+   * through this one tier-aware seam instead. Before that, `escalate()` and
+   * `handleBlocked` read the issue-only dep (a 404 for a project key) and
+   * `.catch`ed a rejection into `[]` — a confident-zero that made "could not
+   * check" indistinguishable from "checked, found nothing": it posted a
+   * DUPLICATE escalation at the dedupe site, and — far worse, since neither
+   * follow-up gate term below reads the fetch outcome — made a blocked
+   * PROJECT agent's `ANSWER` unfindable FOREVER at the directive site while
+   * telling its boss the daemon was still waiting.
    *
    * MUST FAIL BY REJECTING on any read failure — never resolve to an empty
-   * array to represent "could not check". `comments` above already does
-   * exactly that (`.catch(() => [])` at every call site in this file), which
-   * is a confident-zero: a failed read and a successful-empty read become
-   * the same branch, so a transient failure right after a restart reads as
-   * "no prior notice exists" and posts a duplicate. That is `escalate()`'s
-   * existing, unrelated, OUT-OF-SCOPE-for-this-ticket behaviour (flagged at
-   * review, not fixed here — see the doc). This dependency must not repeat
-   * it: `escalateUnresponsive` below treats a REJECTED promise as "could not
-   * verify — skip writing this poll, retry next time" and a RESOLVED one
-   * (even an empty array) as "verified: checked, and this is what's there".
+   * array to represent "could not check": every caller below treats a
+   * REJECTED promise as "could not verify — write nothing this poll, retry
+   * next time" and a RESOLVED one (even an empty array) as "verified:
+   * checked, and this is what's there".
    */
   ownChannelComments: (key: string) => Promise<CommentRow[]>;
   /**
@@ -78,6 +99,20 @@ export interface EscalatorDeps {
    * exactly as it did before this ticket (comment only, no capture).
    */
   captures?: CaptureSink;
+  /**
+   * BUTCHR-179: reports the unresponsive-alarm's own declining verification
+   * (`escalateUnresponsive`'s `ownChannelComments` read) on `/health` — see
+   * src/daemon/coverage.ts. `recordChecked("escalation:unresponsive")` on a
+   * resolved read (adopted, rate-capped, or freshly posted — all a
+   * completed check), `recordDeclined("escalation:unresponsive")` on the
+   * caught rejection. Optional; omitted, coverage is simply not reported for
+   * this dimension, exactly as before this ticket. The other two declining
+   * sites in this module (`escalate`'s dedupe check, `handleBlocked`'s
+   * directive/follow-up check) are NOT wired to this yet — see BUTCHR-179's
+   * own report for why (deliberately scoped to two modules total, not all
+   * declining call sites in this one).
+   */
+  coverage?: CoverageRecorder;
 }
 
 interface PaneState {
@@ -354,11 +389,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * later, silently skipping a fresh notice. Accepted deliberately, stated
    * here rather than hidden — see the doc for the full writeup.
    *
-   * FAILS CLOSED (review finding on this ticket): unlike `escalate()`'s own
-   * comments fetch elsewhere in this file (which `.catch`es into an empty
-   * array — a confident-zero this function must not repeat), a rejected
-   * `deps.ownChannelComments` here is caught HERE, logged, and turned into a
-   * `null` return — "could not verify, did not write anything" — never a
+   * FAILS CLOSED — matching `escalate()`'s and `handleBlocked`'s own fix
+   * (BUTCHR-159; before it, `escalate()`'s dedupe read `.catch`ed a
+   * rejection into an empty array, a confident-zero this function was
+   * written not to repeat — all three comment-reads in this file now share
+   * this discipline): a rejected `deps.ownChannelComments` here is caught
+   * HERE, logged, and turned into a `null` return — "could not verify, did
+   * not write anything" — never a
    * silent fall-through to "nothing exists, safe to post". The caller
    * (onNoPrompt) must leave `escalatedAt` unset on a `null` result so the
    * NEXT qualifying poll retries, exactly like parked.ts's own
@@ -377,8 +414,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     let rows: CommentRow[];
     try {
       rows = await deps.ownChannelComments(issue);
+      // BUTCHR-179: a resolved read is a COMPLETED check, whatever it finds
+      // downstream (adopted, rate-capped, or freshly posted) — coverage is
+      // about whether verification happened, not what it decided.
+      deps.coverage?.recordChecked("escalation:unresponsive");
     } catch (e) {
       log(`WARNING: [unresponsive] could not verify existing notices for ${issue} pane ${paneId} — skipping this poll's attempt rather than risk a duplicate: ${(e as Error)?.message ?? e}`);
+      deps.coverage?.recordDeclined("escalation:unresponsive");
       return null;
     }
     const existing = findMarked(rows, UNRESPONSIVE_MARKER, [paneKey(paneId)]);
@@ -400,11 +442,27 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     return deps.now();
   }
 
+  /**
+   * BUTCHR-159: the dedupe/adoption read routes through `deps.
+   * ownChannelComments` — the tier-aware reader (an issue's Jira comments,
+   * or a project's Confluence root-doc footer comments) — and FAILS CLOSED
+   * on a rejected read: a read this function cannot verify must never be
+   * treated as "no prior escalation exists". Before this fix that reading
+   * posted a DUPLICATE on the issue tier, and was permanently wrong on the
+   * project tier (an issue-shaped read against a project key is the WRONG
+   * RESOURCE, not merely a flaky one — it failed every time, forever). A
+   * failed read here leaves `s.escalatedAt` unset, so the NEXT qualifying
+   * poll retries this function from scratch — nothing is posted, and
+   * nothing is lost, only delayed.
+   */
   async function escalate(paneId: string, issue: string, prompt: Prompt, fp: string, s: PaneState): Promise<void> {
-    const rows = await deps.comments(issue).catch((e) => {
-      log(`comments fetch failed for ${issue}: ${(e as Error)?.message ?? e}`);
-      return [] as CommentRow[];
-    });
+    let rows: CommentRow[];
+    try {
+      rows = await deps.ownChannelComments(issue);
+    } catch (e) {
+      log(`WARNING: [escalate] could not verify existing escalation for ${issue} pane ${paneId} — skipping this poll's attempt rather than risk a duplicate: ${(e as Error)?.message ?? e}`);
+      return;
+    }
     const existing = rows.find((r) => r.body.startsWith(MARKER) && r.body.includes(`fingerprint: ${fp}`));
     const counted = countedFor(paneId);
     if (existing) {
@@ -566,16 +624,48 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       return;
     }
 
-    const rows = await deps.comments(issue).catch((e) => {
-      log(`comments fetch failed for ${issue}: ${(e as Error)?.message ?? e}`);
-      return [] as CommentRow[];
-    });
+    // BUTCHR-159: routes through the tier-aware reader and FAILS CLOSED — a
+    // read this function cannot verify must never be treated as "nobody
+    // replied". Before this fix the read `.catch`ed a rejection into an
+    // empty array and fell straight through to the follow-up gate below
+    // (neither gate term reads the fetch outcome, only elapsed time), so a
+    // failed read didn't just lose the ANSWER — it told the boss the daemon
+    // was STILL WAITING while the unread ANSWER sat a few rows above the
+    // nudge. A failed read now returns before that gate is even reached:
+    // nothing is posted, and `s.followedUpAt` stays unset so the NEXT
+    // qualifying poll retries — a suppressed follow-up delays, never loses.
+    let rows: CommentRow[];
+    try {
+      rows = await deps.ownChannelComments(issue);
+    } catch (e) {
+      log(`WARNING: [directive] could not verify ${issue}'s own channel for pane ${paneId} — skipping this poll's directive/follow-up check rather than risk a false "nobody replied": ${(e as Error)?.message ?? e}`);
+      return;
+    }
     const escalatedAtMs = s.escalatedAt;
     const consumed = consumedFor(paneId);
     let directive: Directive | null = null;
     let directiveCommentId: string | null = null;
     for (const r of rows) {
-      if (Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS) continue;
+      // BUTCHR-171 review fix (Finding 1): `Date.parse(r.created)` on an
+      // empty/unparseable `created` is `NaN`, and `NaN < x` is ALWAYS
+      // `false` — an unguarded comparison here treats "recency unknown"
+      // identically to "definitely current", reopening this ticket's own
+      // replay hazard for exactly the row shape (no retrievable timestamp)
+      // it exists to close. Explicit and deliberate, matching this file's
+      // own EscalatorDeps doc comment on `ownChannelComments` ("MUST FAIL
+      // BY REJECTING... never resolve to empty to represent 'could not
+      // check'"): a row whose recency cannot be verified is treated as
+      // suspect and skipped, the same conservative default this file
+      // already applies when the whole channel read fails, not treated as
+      // safe-by-default. The tradeoff this accepts is the opposite
+      // direction: a genuine ANSWER on a row with NO retrievable timestamp
+      // (measured live as essentially unreachable — `version.createdAt` is
+      // populated on the default response, see AtlassianOps.getPageComments)
+      // would never be found. Given the choice, replaying a stale decision
+      // into a live pane is the worse failure of the two — an action taken
+      // on unverifiable grounds, not merely a missed reminder.
+      const createdMs = Date.parse(r.created);
+      if (Number.isNaN(createdMs) || createdMs < escalatedAtMs - CLOCK_SKEW_GRACE_MS) continue;
       if (consumed.has(r.id)) continue; // an answer is consumed exactly once, across fingerprint resets
       const d = parseDirective(r.body);
       if (d) { directive = d; directiveCommentId = r.id; break; } // newest-first comments(); first match wins
@@ -594,12 +684,30 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
 
     if (s.followedUpAt === undefined && deps.now() - escalatedAtMs >= FOLLOWUP_MS) {
-      await deps.addComment(
-        issue,
-        `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket so it escalates to whoever watches you.`,
-      );
-      s.followedUpAt = deps.now();
-      log(`follow-up posted ${issue} fp=${s.fp}`);
+      // BUTCHR-171: durable dedupe, mirroring escalate()'s own restart-safe
+      // adoption — read-the-channel-and-adopt-your-own-prior-comment instead
+      // of trusting the in-memory `followedUpAt` alone (which a restart
+      // clears, turning "no memory of nudging" into "never nudged"). Reuses
+      // the SAME `rows` already fetched above for the directive scan — one
+      // channel snapshot per poll, not a second read. `FOLLOWUP_STAGE` plus
+      // the fingerprint is required TOGETHER so this can only ever adopt
+      // ITS OWN prior follow-up for THIS episode's fingerprint, never a
+      // stale follow-up for a since-replaced dialog, and — the collision
+      // this constant's own doc comment names — never the escalation
+      // comment itself, which carries neither `FOLLOWUP_STAGE` nor this
+      // parenthesised fingerprint spelling.
+      const existingFollowup = findMarked(rows, MARKER, [FOLLOWUP_STAGE, `(fingerprint ${s.fp})`]);
+      if (existingFollowup) {
+        s.followedUpAt = Date.parse(existingFollowup.created) || deps.now();
+        log(`adopted existing follow-up ${issue} fp=${s.fp} from comment ${existingFollowup.id} (daemon restart)`);
+      } else {
+        await deps.addComment(
+          issue,
+          `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket so it escalates to whoever watches you. ${FOLLOWUP_STAGE}`,
+        );
+        s.followedUpAt = deps.now();
+        log(`follow-up posted ${issue} fp=${s.fp}`);
+      }
     }
   }
 

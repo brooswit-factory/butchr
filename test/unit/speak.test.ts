@@ -215,7 +215,44 @@ describe("createOwnChannelComments", () => {
     const issueComments = async () => { throw new Error("must not be called for a project key"); };
     const reader = createOwnChannelComments(ops, issueComments);
     const rows = await reader("BUTCHR");
-    expect(rows).toEqual([{ id: "c1", body: "hi", created: "" }]); // unwrapped, and `created` mapped to "" (getPageComments has no timestamp)
+    expect(rows).toEqual([{ id: "c1", body: "hi", created: "" }]); // unwrapped; this ROW carries no `created` from the fake, mapped to "" (never synthesised) — see the dedicated `created` tests below for the case where a real timestamp IS present
+  });
+
+  // BUTCHR-171: `speak.test.ts:218` (pre-fix line) used to assert
+  // `created: ""` UNCONDITIONALLY — pinning the bug where the mapping
+  // dropped every timestamp regardless of what getPageComments returned.
+  // This replaces that pin: `created` must now PASS THROUGH a real
+  // timestamp when the underlying read carries one.
+  test("a PROJECT key's `created` passes through a real timestamp from getPageComments, never dropped to \"\"", async () => {
+    const { ops } = makeOps({
+      getPageComments: async (pageId: string) =>
+        pageId === "42" ? { results: [{ id: "c1", body: "<p>hi</p>", created: "2026-01-01T00:00:00.000Z" }] } : { results: [] },
+    });
+    const reader = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+    const rows = await reader("BUTCHR");
+    expect(rows).toEqual([{ id: "c1", body: "hi", created: "2026-01-01T00:00:00.000Z" }]);
+  });
+
+  // BUTCHR-171 Consequence 3: getPageComments requests no `sort` (its own
+  // doc comment), so this function must defend ordering itself rather than
+  // trust the raw return order — sorted newest-first by NUMERIC id. A
+  // same-digit-count fixture cannot catch a lexicographic-vs-numeric bug
+  // ("9" < "10" is already true as strings when digit counts match), per
+  // BUTCHR-156's own measurement — this fixture deliberately crosses a
+  // digit-count boundary ("9" vs "1000") to prove the comparison is numeric.
+  test("PROJECT-tier rows are ordered newest-first by NUMERIC id, not raw API order or lexicographic order", async () => {
+    const { ops } = makeOps({
+      getPageComments: async () => ({
+        results: [
+          { id: "9", body: "<p>oldest, single digit</p>" },
+          { id: "1000", body: "<p>newest, four digits</p>" },
+          { id: "42", body: "<p>middle</p>" },
+        ],
+      }),
+    });
+    const reader = createOwnChannelComments(ops, async () => []);
+    const rows = await reader("BUTCHR");
+    expect(rows.map((r) => r.id)).toEqual(["1000", "42", "9"]); // numeric descending; a LEXICOGRAPHIC sort would instead put "9" ahead of "1000" and "42" (string "1..." < string "9"), exactly the digit-count-boundary failure this fixture exists to catch
   });
 
   test("END TO END: a project-tier row written by a REAL speakOnOwnChannel call round-trips back unwrapped, matching findMarked's startsWith(marker) anchor", async () => {

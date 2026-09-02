@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createEscalator, UNRESPONSIVE_MARKER, type CommentRow } from "../../src/agents/escalation-loop.js";
+import { createEscalator, UNRESPONSIVE_MARKER, FOLLOWUP_STAGE, type CommentRow } from "../../src/agents/escalation-loop.js";
+import type { CoverageRecorder } from "../../src/daemon/coverage.js";
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src/agents/escalate.js";
@@ -65,7 +66,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -74,7 +75,6 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
   let commentRows: CommentRow[] = [];
   let nextId = 1;
   let readCalls = 0;
-  let commentsCalls = 0;
   let ownChannelCommentsCalls = 0;
   let ownChannelCommentsFail = opts.ownChannelCommentsFail ?? false;
   const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
@@ -87,19 +87,11 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
       posted.push({ issue, text });
       commentRows = [{ id: String(nextId++), body: text, created: new Date(clock).toISOString() }, ...commentRows];
     },
-    comments: async () => {
-      commentsCalls++;
-      await delay();
-      if (opts.commentsFail) throw new Error("jira unreachable");
-      return commentRows;
-    },
-    // BUTCHR-124: the sustained-unresponsive alarm's own read-back — kept
-    // separate from `comments` above (issue-only, unchanged) so a test can
-    // fail ONE without the other. Shares the same `commentRows` state so a
-    // posted [butchr:unresponsive] notice is visible to a later adoption
-    // check, matching production (both eventually read the resource's own
-    // channel). MUST REJECT on `ownChannelCommentsFail`, never resolve to []
-    // — this is exactly the fail-closed contract escalateUnresponsive relies on.
+    // BUTCHR-159: THE ONLY comment-read dep now — `escalate()`'s dedupe,
+    // `handleBlocked`'s directive/follow-up check, and the sustained-
+    // unresponsive alarm's own restart-adoption check all go through this
+    // one fake. MUST REJECT on `ownChannelCommentsFail`, never resolve to []
+    // — this is exactly the fail-closed contract every caller relies on.
     ownChannelComments: async () => {
       ownChannelCommentsCalls++;
       await delay();
@@ -110,6 +102,7 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
     now: () => clock,
     log: (line) => logs.push(line),
     ...(opts.captures ? { captures: opts.captures } : {}),
+    ...(opts.coverage ? { coverage: opts.coverage } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -124,7 +117,6 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
     setClock: (ms: number) => { clock = ms; },
     setPaneText: (t: string) => { paneText = t; },
     get readCalls() { return readCalls; },
-    get commentsCalls() { return commentsCalls; },
     get ownChannelCommentsCalls() { return ownChannelCommentsCalls; },
     setOwnChannelCommentsFail: (v: boolean) => { ownChannelCommentsFail = v; },
     addHumanComment: (body: string) => {
@@ -452,16 +444,59 @@ describe("createEscalator — 15-minute follow-up", () => {
   });
 });
 
-describe("createEscalator — Jira errors never throw into the poll loop", () => {
-  test("a failing comments() fetch is caught and logged, both while escalating and while checking for a directive", async () => {
-    const h = harness({ commentsFail: true });
+// BUTCHR-159: a rejected `ownChannelComments` read must never throw into the
+// poll loop, and must never be treated as "nothing there" — it fails
+// CLOSED, at both call sites, writing nothing until the read can be
+// verified again. A suppressed write only DELAYS (retried on the next
+// qualifying poll), never LOSES.
+describe("createEscalator — a failed read fails CLOSED and never throws into the poll loop", () => {
+  test("site 1 (dedupe/escalate): a failing read posts nothing — no escalation risked on an unverified dedupe check — and escalates normally once the read recovers", async () => {
+    const h = harness({ ownChannelCommentsFail: true });
+    const prompt = parsePrompt(REAL)!;
+    const fp = fingerprint(prompt);
+    await h.poll("p1", "KAN-1", prompt); // debounce
+    await h.poll("p1", "KAN-1", prompt); // would escalate, but the dedupe read fails
+    expect(h.posted.length).toBe(0); // fails CLOSED: nothing posted while the read is unverified
+    expect(h.logs.some((l) => /WARNING: \[escalate\] could not verify existing escalation for KAN-1 pane p1/.test(l))).toBe(true);
+
+    // Still failing: the debounce already passed, so every further poll
+    // retries escalate() again — still nothing posted, never a throw.
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(0);
+
+    // The read recovers: the SAME dialog escalates on the very next poll —
+    // delayed, never lost.
+    h.setOwnChannelCommentsFail(false);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1);
+    expect(h.posted[0]!.text).toContain(`fingerprint: ${fp}`);
+  });
+
+  test("site 2 (directive/follow-up): a failing read after a successful escalation posts no follow-up, distinguishes 'could not check' from 'nobody replied', and the suppressed follow-up fires once the read recovers — delayed, never lost", async () => {
+    const h = harness();
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", "KAN-1", prompt); // debounce
-    await h.poll("p1", "KAN-1", prompt); // escalate — comments() fails, falls back to []
-    expect(h.posted.length).toBe(1); // still escalates despite the failed idempotency check
-    await h.poll("p1", "KAN-1", prompt); // directive check — comments() fails again
+    await h.poll("p1", "KAN-1", prompt); // escalates — read succeeds
     expect(h.posted.length).toBe(1);
-    expect(h.logs.filter((l) => /comments fetch failed for KAN-1: jira unreachable/.test(l)).length).toBe(2);
+
+    h.setOwnChannelCommentsFail(true);
+    h.setClock(15 * 60_000); // past FOLLOWUP_MS
+    await h.poll("p1", "KAN-1", prompt); // directive/follow-up check — read fails
+    expect(h.posted.length).toBe(1); // no follow-up posted while the read cannot be verified
+    expect(h.logs.some((l) => /WARNING: \[directive\] could not verify KAN-1's own channel for pane p1/.test(l))).toBe(true);
+
+    // Still failing well past the window: still nothing posted, and
+    // followedUpAt is never latched on a failed attempt.
+    h.setClock(20 * 60_000);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1);
+
+    // The read recovers: the SAME suppressed follow-up fires on the next
+    // qualifying poll.
+    h.setOwnChannelCommentsFail(false);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(2);
+    expect(h.posted[1]!.text).toMatch(/still waiting on the decision/);
   });
 });
 
@@ -757,22 +792,22 @@ describe("createEscalator — escalated state survives a flicker (KAN-756 PR #40
     expect(h.posted.length).toBe(2);
   });
 
-  test("flickers on an already-escalated pane cost exactly one comments() fetch per blocked poll — no extra re-adoption round-trip on top", async () => {
+  test("flickers on an already-escalated pane cost exactly one ownChannelComments() fetch per blocked poll — no extra re-adoption round-trip on top", async () => {
     const h = harness();
     const prompt = parsePrompt(REAL)!;
-    await h.poll("p1", "KAN-1", prompt); // debounce — no comments() call yet
-    expect(h.commentsCalls).toBe(0);
-    await h.poll("p1", "KAN-1", prompt); // escalates — 1 comments() call (idempotency check)
-    expect(h.commentsCalls).toBe(1);
+    await h.poll("p1", "KAN-1", prompt); // debounce — no ownChannelComments() call yet
+    expect(h.ownChannelCommentsCalls).toBe(0);
+    await h.poll("p1", "KAN-1", prompt); // escalates — 1 ownChannelComments() call (idempotency check)
+    expect(h.ownChannelCommentsCalls).toBe(1);
 
     for (let i = 1; i <= 5; i++) {
-      h.notBlocked([]); // no comments() call — nothing blocked this tick
+      h.notBlocked([]); // no ownChannelComments() call — nothing blocked this tick
       await h.poll("p1", "KAN-1", prompt); // directive-check phase — exactly 1 more
-      expect(h.commentsCalls).toBe(1 + i);
+      expect(h.ownChannelCommentsCalls).toBe(1 + i);
     }
     // If escalatedAt had been lost on any flicker, that poll would instead
-    // re-enter escalate() and ALSO adopt — still one comments() call, but
-    // with an "adopted existing escalation" log line and a second entry in
+    // re-enter escalate() and ALSO adopt — still one ownChannelComments()
+    // call, but with an "adopted existing escalation" log line and a second entry in
     // the rate-cap budget. Neither happened.
     expect(h.logs.filter((l) => /adopted existing escalation/.test(l)).length).toBe(0);
     expect(h.posted.length).toBe(1); // never re-escalated
@@ -1347,6 +1382,76 @@ describe("createEscalator — sustained blocked-and-unparseable alarm (BUTCHR-12
   });
 });
 
+function fakeCoverage() {
+  const calls: Array<{ op: "checked" | "declined"; name: string }> = [];
+  return { calls, recordChecked: (name: string) => calls.push({ op: "checked", name }), recordDeclined: (name: string) => calls.push({ op: "declined", name }) };
+}
+
+// BUTCHR-179: this module is the second of two modules the mechanism is
+// wired into (deliberately narrow scope — see BUTCHR-179's own report for
+// why the other declining sites, in this module and five others, are named
+// but not yet instrumented). `escalateUnresponsive`'s `ownChannelComments`
+// read is the producer; these tests are its consumer half — proving a
+// resolved read reports "checked" and a rejected one reports "declined",
+// never collapsed the way a naive `if (result)` would.
+describe("createEscalator — coverage recording for the unresponsive alarm (BUTCHR-179)", () => {
+  test("a successful read (adopts nothing, posts fresh) records checked, never declined", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // fires: one successful ownChannelComments() read
+    expect(coverage.calls).toEqual([{ op: "checked", name: "escalation:unresponsive" }]);
+  });
+
+  test("a rejected read records declined, never checked — the naive-collapse trap this criterion exists to catch", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage, ownChannelCommentsFail: true });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // threshold reached, but the read rejects
+    expect(coverage.calls).toEqual([{ op: "declined", name: "escalation:unresponsive" }]);
+    expect(h.posted).toEqual([]); // and, unchanged: nothing was written on a declined poll
+  });
+
+  test("declined-then-recovered: a later successful poll for the SAME still-unlatched episode records checked, not a second declined", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage, ownChannelCommentsFail: true });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // declines
+    h.setOwnChannelCommentsFail(false);
+    h.setClock(6 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // recovers: retries the same unlatched episode
+    expect(coverage.calls).toEqual([
+      { op: "declined", name: "escalation:unresponsive" },
+      { op: "checked", name: "escalation:unresponsive" },
+    ]);
+  });
+
+  test("below the sustained threshold, escalateUnresponsive is never called at all — no coverage event either way", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(4 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // still short of 5m
+    expect(coverage.calls).toEqual([]);
+  });
+
+  test("omitting coverage entirely (existing callers/fixtures) does not throw — fully backward compatible", async () => {
+    const h = harness({ unresponsiveMinutes: 5 }); // no coverage option
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    expect(h.posted.length).toBe(1);
+  });
+});
+
 // BUTCHR-16: the escalation carries the pane text via a durable local capture
 // (never raw text in the Jira comment itself), so the NEXT unknown shape can
 // be fixtured from the escalation — the fixture for the effort-recommendation
@@ -1525,9 +1630,15 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
 // `speakOnOwnChannel` write path, real project-tier storage-format
 // unwrapping — nothing hand-reproduced.
 describe("createEscalator wired to the REAL extracted createOwnChannelComments (BUTCHR-141/§2.6) — adoption did not become silence", () => {
-  function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string }> } {
+  // `now`, BUTCHR-171: defaults to a fixed clock matching every pre-existing
+  // caller of this fixture (all use `now: () => 0` on the escalator they
+  // build from these `ops`) — pass the SAME clock the escalator uses when a
+  // test needs its posted comments' `created` to track real elapsed time,
+  // so the recency filter this fixture's rows now feed (Consequence 1's fix)
+  // never disagrees with the clock the test itself believes it's running on.
+  function makeOps(overrides: Partial<AtlassianOps> = {}, now: () => number = () => 0): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string; created: string }> } {
     const jiraComments: Array<{ key: string; text: string }> = [];
-    const pageComments: Array<{ id: string; body: string }> = [];
+    const pageComments: Array<{ id: string; body: string; created: string }> = [];
     const ops: AtlassianOps = {
       getIssue: async () => ({}),
       search: async () => ({}),
@@ -1557,10 +1668,16 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
       deleteIssue: async () => ({ ok: true }),
       commentOnPage: async (_pageId: string, body: string) => {
         const id = String(1000 + pageComments.length);
-        pageComments.push({ id, body });
+        pageComments.push({ id, body, created: new Date(now()).toISOString() });
         return { ok: true, id };
       },
-      getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
+      // BUTCHR-171 correction: this reversal is fixture convenience ONLY
+      // (pageComments is pushed oldest-first) — getPageComments requests no
+      // `sort` and is NOT newest-first the way AtlassianClient.comments()
+      // is; the false claim previously here pinned exactly that confusion.
+      // Callers must not (and, since BUTCHR-171, do not — see
+      // createOwnChannelComments' own numeric-id sort) trust this raw order.
+      getPageComments: async () => ({ results: [...pageComments].reverse() }),
       searchProjects: async () => ({ values: [] }),
       getMyself: async () => ({ accountId: "test-account" }),
       setProjectProperty: async () => ({ ok: true }),
@@ -1581,7 +1698,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const before = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     clock = 0; before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "KAN-1", "garbled", 1);
     clock = 5 * 60_000; before.onNoPrompt("p1", "KAN-1", "garbled", 2);
@@ -1592,7 +1709,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
     // Simulate the restart: a fresh escalator, no in-memory state, same underlying channel.
     const after = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "KAN-1", "garbled", 1);
     clock = 10 * 60_000; after.onNoPrompt("p1", "KAN-1", "garbled", 2);
@@ -1608,7 +1725,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const before = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "BUTCHR", "garbled", 1);
     clock = 5 * 60_000; before.onNoPrompt("p1", "BUTCHR", "garbled", 2);
@@ -1619,11 +1736,322 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const after = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "BUTCHR", "garbled", 1);
     clock = 10 * 60_000; after.onNoPrompt("p1", "BUTCHR", "garbled", 2);
     await Bun.sleep(0);
     expect(pageComments.length).toBe(1); // adopted via the real unwrap — NOT re-posted (BUTCHR-129's defect stays fixed post-extraction)
+  });
+
+  // BUTCHR-159: extends this block to the PARSEABLE blocked/directive path —
+  // `escalate()`'s dedupe and `handleBlocked`'s directive/follow-up check —
+  // through the SAME real `createOwnChannelComments`/`speakOnOwnChannel`
+  // seam already proven above for the sustained-unresponsive alarm. Before
+  // this ticket, both of these read the issue-only `comments` dep (a 404 for
+  // a project key): `escalate()`'s dedupe read failed every call, which is
+  // the ONLY reason a blocked PROJECT agent's escalation was ever audible at
+  // all (§2's "the bug is load-bearing"); `handleBlocked`'s directive read
+  // failed every call too, so a project-keyed `ANSWER` could never be found.
+  // These two tests are the anti-inversion guard the ticket names explicitly:
+  // a naive "just fail closed" fix makes the first test below regress from
+  // POST to SILENCE, and the second proves the actual point of this ticket
+  // — a project-keyed ANSWER is now findable at all.
+  describe("the blocked/directive path (BUTCHR-159) — project tier", () => {
+    test("PROJECT key: a blocked-dialog escalation still POSTS after the fail-closed fix — the anti-inversion guard", async () => {
+      const { ops, pageComments } = makeOps();
+      const ownChannelComments = createOwnChannelComments(ops, async () => []);
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const escalator = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      const prompt = parsePrompt(REAL)!;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — dedupe read is a REAL project-tier read, not a stub
+      const escalation = pageComments.find((c) => c.body.includes(BLOCKED_MARKER));
+      expect(escalation).toBeDefined(); // NOT silently suppressed by the fail-closed fix
+      expect(escalation!.body).toContain(`fingerprint: ${fingerprint(prompt)}`);
+
+      // A daemon restart (fresh escalator, same underlying channel) must
+      // ADOPT this comment through the real reader, not re-post — proving
+      // the dedupe read genuinely reaches the resource the escalation itself
+      // was written to, not merely a stub that happens to return [].
+      const restarted = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      await restarted.onBlocked("p1", "BUTCHR", prompt, 1);
+      await restarted.onBlocked("p1", "BUTCHR", prompt, 2);
+      expect(pageComments.filter((c) => c.body.includes(BLOCKED_MARKER)).length).toBe(1); // adopted, not duplicated
+    });
+
+    test("PROJECT key: a project-keyed target's ANSWER directive is FOUND and delivered through the real reader — the whole point of this ticket", async () => {
+      const { ops } = makeOps();
+      const ownChannelComments = createOwnChannelComments(ops, async () => []);
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const sent: Array<{ pane: string; text: string }> = [];
+      const escalator = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      const prompt = parsePrompt(REAL)!;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates
+      const fp = fingerprint(prompt);
+
+      // The real write path a boss's ANSWER reply takes for a project-keyed
+      // target: speakOnOwnChannel's project branch, storage-format wrapped —
+      // NOT a hand-typed plain-text CommentRow standing in for it.
+      await speakOnOwnChannel(ops, "BUTCHR", `ANSWER 2 ${fp}`);
+
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3); // directive check — must find it through the real unwrap
+      expect(sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+    });
+  });
+
+  // BUTCHR-171: real `created` timestamps + defined ordering on the project
+  // tier (root-causing Consequences 1 and 3), and the follow-up nudge's own
+  // durable dedupe (Consequence 2) — all exercised through the SAME real
+  // `createOwnChannelComments`/`speakOnOwnChannel` seam the block above
+  // proves reaches the real resource, not a stand-in. A dedicated ops fake
+  // is needed here (not the block's own `makeOps` used bare) because these
+  // tests must control EACH comment's own `created` timestamp independently
+  // — the shared fake never modelled timestamps at all (that omission was
+  // the bug), and page comments are stored in raw INSERTION order, never
+  // reversed, so ordering correctness comes only from
+  // `createOwnChannelComments`'s own post-condition sort, never the fake.
+  describe("BUTCHR-171: project-tier created/ordering + follow-up durable dedupe", () => {
+    // BUTCHR-127's own documented trap, re-verified here rather than
+    // trusted secondhand: `escalate()`'s adoption does
+    // `Date.parse(existing.created) || deps.now()`, and `Date.parse` of
+    // epoch zero ("1970-01-01T00:00:00.000Z") IS `0` — a legitimate,
+    // correctly-parsed value that is nonetheless FALSY, so `|| deps.now()`
+    // silently discards it and substitutes the restart's own clock instead.
+    // A `clock.now` (or a hand-set `created`) starting at literal `0` would
+    // trigger exactly that fallback and corrupt every test below in a way
+    // that happens to still look plausible (a defined `escalatedAt`, just
+    // the WRONG one) — every clock in this block is offset from a non-zero
+    // BASE for that reason, never from epoch zero.
+    const BASE = 1_700_000_000_000;
+
+    function makeTimedProjectOps(clock: { now: number }): { ops: AtlassianOps; rows: Array<{ id: string; body: string; created: string }> } {
+      const rows: Array<{ id: string; body: string; created: string }> = [];
+      let nextId = 1;
+      const { ops } = makeOps({
+        commentOnPage: async (_pageId: string, body: string) => {
+          const id = String(nextId++);
+          rows.push({ id, body, created: new Date(clock.now).toISOString() });
+          return { ok: true, id };
+        },
+        getPageComments: async () => ({ results: rows.map((r) => ({ ...r })) }),
+      });
+      return { ops, rows };
+    }
+
+    const isEscalationBody = (body: string) => body.includes("is waiting on a decision:");
+    const isFollowupBody = (body: string) => body.includes(FOLLOWUP_STAGE);
+
+    test("Consequence 1, REPRODUCED THEN FIXED: a stale pre-escalation ANSWER (same fingerprint) is skipped by the recency filter, never delivered — even after a simulated restart adopts the escalation by a REAL timestamp", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+      const fp = fingerprint(prompt);
+
+      // A STALE answer for THIS SAME fingerprint, already on the channel
+      // BEFORE any escalation exists for this episode — the scenario
+      // Consequence 1 describes (an old ANSWER becoming eligible again).
+      // Injected directly (bypassing commentOnPage) so its `created` can be
+      // set independently of `clock`, the way a genuinely old comment would
+      // already have an old timestamp regardless of when this test runs.
+      rows.push({ id: "1", body: `<p>ANSWER 1 ${fp}</p>`, created: new Date(BASE - 60 * 60_000).toISOString() });
+
+      // Escalate for real, 1 hour after the stale row — comfortably outside
+      // CLOCK_SKEW_GRACE_MS (2 minutes), so a working filter has an
+      // unambiguous case to get right.
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — posts a REAL escalation comment with a REAL `created`
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1);
+
+      // Simulate a restart 1 minute after the escalation (well under the
+      // 15-minute follow-up window, so the follow-up path stays inert and
+      // this test isolates Consequence 1 only). A fresh escalator has no
+      // in-memory `s.escalatedAt` — it must ADOPT the existing escalation
+      // via its real `created`, not the restart's own clock.
+      clock.now += 60_000;
+      const sent: Array<{ pane: string; text: string }> = [];
+      const after = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adopts the existing escalation by its REAL created time
+      await after.onBlocked("p1", "BUTCHR", prompt, 3); // directive/follow-up check, now that escalatedAt is set
+
+      // THE FIX, PROVEN: the stale same-fingerprint ANSWER from an hour
+      // before this episode's escalation is never delivered as a directive.
+      expect(sent).toEqual([]);
+
+      // And the filter is not simply over-broad: a FRESH answer posted
+      // after the (adopted) escalation time IS still found and delivered —
+      // recency-skipping the stale row is not accidentally skipping every
+      // row.
+      await speakOnOwnChannel(ops, "BUTCHR", `ANSWER 2 ${fp}`);
+      await after.onBlocked("p1", "BUTCHR", prompt, 4);
+      expect(sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+
+      // MUTATION-TESTED (manually, not committed as a step here): with
+      // speak.ts's project-tier mapping reverted to the pre-fix
+      // `created: ""`, this test's `expect(sent).toEqual([])` assertion
+      // fails — `sent` contains the stale `ANSWER 1` delivery instead,
+      // because `Date.parse("")` is `NaN` and `NaN < x` is always `false`,
+      // so the recency filter never skips the row. Reported on BUTCHR-171
+      // with the exact revert diff and the failing assertion.
+    });
+
+    // BUTCHR-171 review, Finding 1: `created: r.created ?? ""` alone does
+    // NOT close Consequence 1 for a row whose underlying read genuinely
+    // carried no timestamp — `Date.parse("")` is `NaN`, and an unguarded
+    // `NaN < x` is always `false`, so such a row was previously treated as
+    // indistinguishable from "definitely current". escalation-loop.ts's
+    // recency filter now checks `Number.isNaN(...)` explicitly and skips
+    // it. This row shape is injected directly (not via commentOnPage,
+    // which always stamps a real clock-derived `created`) because it
+    // models a read that genuinely returned no `version`/`createdAt` at
+    // all — the same shape `atlassian-real.test.ts`'s "a row with no
+    // version... maps `created` to undefined" test proves is reachable.
+    test("Finding 1 fix: a directive row with NO retrievable created (recency unknown) is treated as suspect and skipped, never delivered", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+      const fp = fingerprint(prompt);
+
+      const sent: Array<{ pane: string; text: string }> = [];
+      const escalator = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates
+
+      // A matching ANSWER whose row carries no retrievable `created` at
+      // all — recency-UNKNOWN, not recency-zero.
+      rows.push({ id: String(rows.length + 1), body: `<p>ANSWER 2 ${fp}</p>`, created: "" });
+
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3);
+      expect(sent).toEqual([]); // unverifiable recency is treated as suspect, never as current
+
+      // MUTATION-TESTED (manually, not committed as a step here): with the
+      // `Number.isNaN(createdMs) ||` guard removed from escalation-loop.ts's
+      // recency filter, this assertion fails — `sent` contains the
+      // delivery instead, reproducing exactly what the review's own probe
+      // (`PROBE_VERDICT=DELIVERED`) found on the pre-fix code.
+    });
+
+    test("BUTCHR-127's shape, FIXED: restarts 30 minutes apart (> the 15-minute follow-up window) now yield escalations=1 followups=1, not followups=2", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalates at t=BASE
+
+      clock.now = BASE + 15 * 60_000 + 1; // just past the follow-up window, same (non-restarted) escalator
+      await before.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up posted at t=BASE+900001
+
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1);
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1);
+
+      // Restart 30 minutes after the ORIGINAL escalation (BUTCHR-127's own
+      // shape) — a fresh escalator, no in-memory state at all.
+      clock.now = BASE + 30 * 60_000;
+      const after = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adopts the existing escalation
+      await after.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up check: must ADOPT the existing follow-up, not re-post
+
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1); // escalations=1 — already true pre-fix, unchanged
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1); // followups=1 — THE FIX: was 2 pre-fix (this exact scenario is why)
+    });
+
+    test("collision direction 1: an escalation comment is never adopted as an already-posted follow-up (the SILENCE bug this ticket forbids)", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const escalator = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — ONLY an escalation comment exists, no follow-up yet
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(0);
+
+      clock.now = BASE + 15 * 60_000 + 1;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up check
+
+      // If the escalation comment were ever mistaken for an existing
+      // follow-up (both start with MARKER), the follow-up would be
+      // silently skipped here — zero posted. It must actually post.
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1);
+    });
+
+    test("collision direction 2: a follow-up comment is never adopted as the escalation on restart, even though it is NEWER and sorts first", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1);
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalation posted at t=BASE, id="1"
+
+      clock.now = BASE + 15 * 60_000 + 1;
+      await before.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up posted at t=BASE+900001, id="2" — NEWER than the escalation, sorts first
+
+      const escalationRow = rows.find((r) => isEscalationBody(r.body))!;
+      const followupRow = rows.find((r) => isFollowupBody(r.body))!;
+      expect(Number(followupRow.id)).toBeGreaterThan(Number(escalationRow.id)); // confirms the follow-up genuinely sorts first newest-first
+
+      clock.now = BASE + 30 * 60_000;
+      const logs: string[] = [];
+      const after = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: (line) => logs.push(line),
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1);
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adoption check runs here
+
+      // The adoption log line names WHICH comment id was adopted as "the
+      // escalation" — it must be the escalation row's id, never the
+      // (newer, first-in-scan-order) follow-up row's id.
+      const adoptLine = logs.find((l) => l.includes("adopted existing escalation")); // escalation-loop.ts's internal log() prepends "[prompts] "
+      expect(adoptLine).toBeDefined();
+      expect(adoptLine).toContain(`from comment ${escalationRow.id}`);
+      expect(adoptLine).not.toContain(`from comment ${followupRow.id}`);
+    });
   });
 });
