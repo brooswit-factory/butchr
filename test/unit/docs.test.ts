@@ -105,6 +105,12 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     },
   commentOnPage: async () => ({ ok: true }),
   getPageComments: async () => ({ results: [] }),
+  searchProjects: async () => ({ values: [] }),
+  getMyself: async () => ({ accountId: "test-account" }),
+  setProjectProperty: async () => ({ ok: true }),
+  getPageVersions: async () => ({}),
+  getIssueComments: async () => ({ results: [] }),
+  getProjectPropertyOrNull: async () => null,
   };
 
   return { ops, issues, pages, projectProperties, addIssue, setProjectProperty, upsertCalls: () => upsertRemoteLinkCalls };

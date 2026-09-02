@@ -177,6 +177,15 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     getProjectProperty: (projectKey, propertyKey) =>
       jira.projectProperties.getProjectProperty({ projectIdOrKey: projectKey, propertyKey }).then((r: any) => r?.value),
 
+    // Same call as getProjectProperty; only the not-found conversion
+    // differs — same isNotFoundError check getRemoteLink already uses below,
+    // so a genuine 404 resolves null and anything else still rejects.
+    getProjectPropertyOrNull: (projectKey, propertyKey) =>
+      jira.projectProperties.getProjectProperty({ projectIdOrKey: projectKey, propertyKey }).then((r: any) => r?.value).catch((e: unknown) => {
+        if (isNotFoundError(e)) return null;
+        throw e;
+      }),
+
     // getRemoteIssueLinks with a `globalId` 404s (jira.js throws NotFoundError)
     // when no such link exists, rather than resolving an empty result (MEASURED
     // live against BUTCHR-33) — every caller wants one "not found" shape, so
@@ -287,6 +296,54 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     getPageComments: (pageId) =>
       wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
         results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "" })),
+      })),
+
+    // MEASURED live (2026-09-01, re-confirmed after an initial "null" read
+    // turned out to understate it): `expand: "lead"` is REQUIRED for
+    // `values[].lead` to be populated at all — omitted, the key is ABSENT
+    // entirely (`"lead" in project` is false for every project), not merely
+    // `null`. That distinction matters for a filter reading
+    // `project.lead?.accountId`: on an absent field it evaluates to
+    // `undefined` for every project and therefore matches ZERO of them —
+    // silently, the SAME observable result a correct filter given a wrong
+    // account id also produces. A "wrong id returns zero" control alone
+    // cannot distinguish "the filter works" from "the filter is broken and
+    // rejects everything" — see this op's doc comment on AtlassianOps and
+    // this codebase's tests (project-resource-type.test.ts) for why BOTH a
+    // wrong-id-returns-zero AND a right-id-returns-exactly-what-it-should
+    // proof are required together, never just the first.
+    searchProjects: (status) =>
+      jira.projects.searchProjects({ status: [status], expand: "lead" }).then((r: any) => ({
+        values: (r?.values ?? []).map((p: any) => ({ key: p.key, name: p.name, lead: p.lead ? { accountId: p.lead.accountId } : undefined })),
+      })),
+
+    getMyself: () => jira.myself.getCurrentUser().then((r: any) => ({ accountId: r.accountId })),
+
+    // Full-value replace, per jira.js's setProjectProperty (there is no
+    // partial-update variant) — see this op's doc comment on AtlassianOps
+    // for the live permission measurement and why read-modify-write lives
+    // in the caller.
+    setProjectProperty: (projectKey, propertyKey, value) =>
+      jira.projectProperties.setProjectProperty({ projectIdOrKey: projectKey, propertyKey, body: value as Record<string, unknown> }),
+
+    // MEASURED live (BUTCHR-67, 2026-09-01): `id` here is z.ZodArray<z.ZodNumber>
+    // (confluence.js's GetPagesSchema) — page ids are passed as numbers, not
+    // the string ids every other op in this file uses; converted at the
+    // boundary so callers still deal only in strings.
+    getPageVersions: async (pageIds) => {
+      if (!pageIds.length) return {};
+      const r: any = await wiki.page.getPages({ id: pageIds.map(Number) });
+      const out: Record<string, number> = {};
+      for (const p of r?.results ?? []) if (p?.id != null && p?.version?.number != null) out[String(p.id)] = p.version.number;
+      return out;
+    },
+
+    // Same endpoint, same ordering/cap as src/atlassian/client.ts's own
+    // `comments()` — see this op's doc comment on AtlassianOps for why that
+    // match is load-bearing rather than incidental.
+    getIssueComments: (key) =>
+      jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", maxResults: 20 }).then((r: any) => ({
+        results: (r?.comments ?? []).map((c: any) => ({ id: c.id })),
       })),
   };
 }

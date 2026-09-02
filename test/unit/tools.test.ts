@@ -29,6 +29,12 @@ function rig(roles: { story?: string; task?: string } = {}) {
     ...fakeDocOps({ correctText: rec("correctText") }),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: "test-account" }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
   };
   const audits: string[] = [];
   const tools = atlassianTools(ops, (l) => audits.push(l), roles);
@@ -41,6 +47,7 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
+      "check_in",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
@@ -126,6 +133,12 @@ describe("jira_link_issues invalid MCP result (KAN-764)", () => {
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_link_issues!.handler({ from: "KAN-2", to: "KAN-9" }, conn);
@@ -164,6 +177,12 @@ describe("onWrite hook (own-write ledger feed)", () => {
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -246,6 +265,12 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
       ...opsOverrides,
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -430,6 +455,12 @@ describe("jira_set_priority result normalization (KAN-803)", () => {
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.jira_set_priority!.handler({ key: "KAN-1", priority: "High" }, { headers: {} } as any);
@@ -447,6 +478,12 @@ describe("confluence_update_page result normalization", () => {
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const result = await tools.confluence_update_page!.handler({ id: "10715137", body: "<p>x</p>" }, { headers: {} } as any);
@@ -468,6 +505,12 @@ describe("confluence_search_pages", () => {
       ...opsOverrides,
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -536,6 +579,12 @@ describe("confluence_create_page parentId", () => {
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: {} } as any;
@@ -563,6 +612,12 @@ describe("jira_assign (KAN-810)", () => {
       ...opsOverrides,
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), customRoles);
@@ -635,6 +690,12 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
       ...opsOverrides,
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     return { tools };
@@ -699,6 +760,12 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
         ...fakeDocOps(),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
       };
       return { tools: atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer])) };
     })();
@@ -733,6 +800,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     return atlassianTools(ops, () => {}, { story: "acct-story", task: "acct-task" });
   }
@@ -771,6 +844,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l));
@@ -797,6 +876,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -822,6 +907,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { story: "acct-story" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -844,6 +935,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const writes: Array<[string[], string]> = [];
     const tools = atlassianTools(ops, () => {}, { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
@@ -878,6 +975,12 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     return { ops, tools: atlassianTools(ops, () => {}, roles) };
   }
@@ -904,6 +1007,12 @@ describe("file_where_it_belongs (BUTCHR-37): wiring — x-issue, schema shape, a
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, (l) => audits.push(l), { task: "acct-task" }, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
     const conn = { headers: { "x-issue": "KAN-1" } } as any;
@@ -952,6 +1061,12 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps(),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
     };
     return { ops, tools: atlassianTools(ops, () => {}, roles) };
   }
@@ -987,6 +1102,12 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps({ correctText: async () => { calls.push("correctText"); return { ok: true }; } }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, (l) => audits.push(l), {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
     const conn = { headers: { "x-issue": "KAN-1" } } as any;
@@ -1018,6 +1139,12 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps({ correctText: async (key, p) => { calls.push([key, p]); return { ok: true }; } }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), {});
@@ -1062,6 +1189,12 @@ describe("finish_without_a_boss (BUTCHR-39): wiring — x-issue, schema shape, a
       ...fakeDocOps(),
     commentOnPage: async () => ({ ok: true }),
     getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: 'test-account' }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
     };
     return ops;
   }
@@ -1134,6 +1267,12 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
       ...fakeDocOps({ getProjectProperty: async () => ({ space: { key: "BUTCHR" }, rootDoc: { id: "1" } }) }),
       commentOnPage: async (pageId: string, body: string) => { pageComments.push({ pageId, body }); return { ok: true }; },
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {}, rolesOverride as any);
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
@@ -1202,6 +1341,12 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
       ...fakeDocOps(),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, () => {});
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
@@ -1212,5 +1357,125 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
   test("file_where_it_belongs REFUSES a project caller, naming why (no coherent case-B bottom)", async () => {
     const { tools, conn } = projectRig();
     await expect(tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "BUTCHR-9" }, conn)).rejects.toThrow(/refusing a project caller/);
+  });
+});
+
+// BUTCHR-81's own scope addition: check_in, the project agent's last act
+// before exiting (watermark checkpoint). Failure conditions stated first,
+// per test.
+describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark checkpoint)", () => {
+  function checkInRig(opts: {
+    epicsInReview?: Array<{ key: string }>;
+    epicComments?: Record<string, Array<{ id: string }>>;
+    rootDocComments?: Array<{ id: string; body: string }>;
+    rootDocVersion?: number;
+  } = {}) {
+    const properties = new Map<string, unknown>([["BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" } }]]);
+    const setPropertyCalls: unknown[] = [];
+    const searchCalls: string[] = [];
+    const getIssueCommentsCalls: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async (key: string) => {
+        getIssueCommentsCalls.push(key);
+        return { results: opts.epicComments?.[key] ?? [] };
+      },
+      search: async (jql: string) => {
+        searchCalls.push(jql);
+        return { issues: (opts.epicsInReview ?? []).map((e) => ({ key: e.key })) };
+      },
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async () => ({ ok: true }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: opts.rootDocComments ?? [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async (key: string) => {
+        const p = properties.get(key);
+        if (!p) throw new Error(`no property for ${key}`);
+        return p;
+      },
+      getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        setPropertyCalls.push(value);
+        properties.set(key, value);
+        return { ok: true };
+      },
+      getPageVersions: async () => ({ "1": opts.rootDocVersion ?? 3 }),
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools, properties, setPropertyCalls, searchCalls, getIssueCommentsCalls };
+  }
+
+  test("refuses an ISSUE caller — an issue never sleeps and has no watermark to advance", async () => {
+    const { tools } = checkInRig();
+    const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+    await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
+  });
+
+  test("refuses a connection with no x-issue", async () => {
+    const { tools } = checkInRig();
+    const conn = { headers: {} } as any;
+    await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing/);
+  });
+
+  test("with nothing in review: watermarks version and comment, and REPLACES epics with {} (pruning any stale entries)", async () => {
+    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }] });
+    // Seed a stale epic entry, as if watermarked during a PRIOR review episode.
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: null, epics: { "BUTCHR-9": "50" } } });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = await tools.check_in!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, comment: "99", epics: {} });
+    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, comment: "99", epics: {} }); // BUTCHR-9 pruned
+  });
+
+  // BUTCHR-81 (found at review): check_in must read epic comments via the
+  // SAME reader discovery uses (getIssueComments — newest-first, capped),
+  // never getIssue's embedded fields.comment block (measured ascending/
+  // oldest-first with an unconfirmed cap) — otherwise the two readers could
+  // disagree on "newest" and the watermark would never catch up.
+  test("with an epic in review: fetches ITS comments via getIssueComments (the SAME reader discovery uses, not getIssue's embedded block), and watermarks it", async () => {
+    const { tools, properties, getIssueCommentsCalls } = checkInRig({
+      epicsInReview: [{ key: "BUTCHR-9" }],
+      epicComments: { "BUTCHR-9": [{ id: "101" }, { id: "202" }] },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string> };
+    expect(result.epics).toEqual({ "BUTCHR-9": "202" }); // newest by numeric value
+    expect(getIssueCommentsCalls).toEqual(["BUTCHR-9"]);
+    expect((properties.get("BUTCHR") as any).wake.epics).toEqual({ "BUTCHR-9": "202" });
+  });
+
+  test("no epics in review at all -> zero getIssueComments calls (the usual case)", async () => {
+    const { tools, getIssueCommentsCalls } = checkInRig({ epicsInReview: [] });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.check_in!.handler({}, conn);
+    expect(getIssueCommentsCalls).toEqual([]);
+  });
+
+  test("no root-doc comments yet -> comment watermark stays unadvanced (null), not clobbered to null over a real prior value", async () => {
+    const { tools, properties } = checkInRig({ rootDocComments: [] });
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: "42", epics: {} } });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.check_in!.handler({}, conn);
+    expect((properties.get("BUTCHR") as any).wake.comment).toBe("42"); // untouched — omitted from the patch, not overwritten with null
   });
 });
