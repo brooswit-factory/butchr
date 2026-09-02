@@ -636,6 +636,10 @@ export interface AdoptWorkerResult {
   identityCollision?: string;
   /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (the caller's own ticket, or this daemon's identity for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`. "Not checked" must never look like "checked and clean". */
   identityUnknown?: string;
+  /** BUTCHR-151/BUTCHR-157: present ONLY when this call found a stale `[ORPHAN]` description header and successfully retired it (see `retireOrphanHeader`) — absent in the overwhelmingly common case (a normal, never-orphaned worker). Mutually exclusive with `orphanHeaderNotWithdrawn`. */
+  orphanHeaderWithdrawn?: string;
+  /** BUTCHR-151/BUTCHR-157: present ONLY when a header-shaped block WAS found but could not be safely or successfully retired (ambiguous shape, or the write itself failed) — same "not checked must never look like checked and clean" principle as `identityUnknown`. Never blocks the adoption itself. */
+  orphanHeaderNotWithdrawn?: string;
 }
 
 /**
@@ -786,6 +790,26 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
   }
 
+  // BUTCHR-151/BUTCHR-157: retire a stale [ORPHAN] description header, for
+  // BOTH dispositions — the same "adopted with 'shelve' is exactly as
+  // directed as adopted with 'start'" reasoning the ORPHAN_LABEL clear just
+  // above already uses — and NOT gated on `alreadyAdopted`, same reason: an
+  // otherwise fully idempotent re-adoption still retires a header that
+  // somehow survived a previous adoption (e.g. this daemon ran an older
+  // version of this function then), rather than leaving the prose stale
+  // forever with no other reachable remedy (mirroring ORPHAN_LABEL's own
+  // "only reachable remedy is a re-adoption" argument). GATED ON THE
+  // DESCRIPTION ITSELF, not on `labels.includes(ORPHAN_LABEL)` — deliberately
+  // decoupled from the label's presence: a ticket whose orphan label was
+  // already cleared by some other means but whose header was not must still
+  // get its header looked at here, and gating on the label would silently
+  // skip exactly that case. `retireOrphanHeader` never throws (see its own
+  // doc comment) — a failure in this secondary concern is reported on the
+  // result, never allowed to abort or corrupt the adoption already in
+  // progress (the ordering/partial-state discipline this function's own doc
+  // comment and the `resolveCollisionSide` guard above already hold to).
+  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, callerKey, disposition.kind);
+
   // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
   // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
   // this path already reads the issue and computes labelsOf(issue), so this
@@ -832,6 +856,8 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
     ...(identityCollision ? { identityCollision } : {}),
     ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
+    ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
+    ...(headerOutcome && !headerOutcome.retired ? { orphanHeaderNotWithdrawn: headerOutcome.message } : {}),
   };
 }
 
@@ -919,6 +945,15 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
   }
 
+  // BUTCHR-151/BUTCHR-157: same header retirement as the issue-caller path
+  // above, argued there in full — declared defence-in-depth here for the
+  // same reason the ORPHAN_LABEL clear just above is: `fileWhereItBelongs`
+  // can only ever create a Story or a Task, so an orphan Epic (and thus an
+  // Epic carrying an [ORPHAN] header) cannot arrive through this codebase's
+  // own write path today. Costs nothing extra to add — reuses the `issue`
+  // already fetched for this path's own idempotence check.
+  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, projectKey, disposition.kind);
+
   // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
   // on a "start" disposition whenever it's present, not gated on
   // `alreadyAdopted` — see adoptWorker's own comment on this for the full
@@ -943,6 +978,8 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
+    ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
+    ...(headerOutcome && !headerOutcome.retired ? { orphanHeaderNotWithdrawn: headerOutcome.message } : {}),
   };
 }
 
@@ -1628,6 +1665,20 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
  */
 export const ORPHAN_LABEL = "butchr:orphan";
 
+/**
+ * Marks the archive comment `retireOrphanHeader` posts before it rewrites a
+ * ticket's description — the description-header analogue of
+ * `CORRECTION_MARKER`, deliberately its OWN, DISTINCT marker rather than a
+ * reuse of `CORRECTION_MARKER`: this fires automatically, on every orphan
+ * adoption, as a declared consequence of gaining a boss — not a human
+ * judgment call that "this text was wrong or stale", which is what
+ * `CORRECTION_MARKER`/`correct_worker` mean. Using the same marker for both
+ * would make a future "show me every hand correction" grep silently include
+ * every routine adoption too. AN EXPORTED CONSTANT, NEVER RETYPED, same
+ * reasoning as every other marker in this file.
+ */
+export const HEADER_WITHDRAWN_MARKER = "[header-withdrawn]";
+
 /** A destination is either a named existing Epic, or prose explaining why a new one is needed. Neither is a fallback for the other. */
 export type OrphanDestination = { kind: "epic"; key: string } | { kind: "reason"; text: string };
 
@@ -1692,16 +1743,240 @@ export function classifyDestination(raw: string): OrphanDestination {
   return { kind: "reason", text: trimmed };
 }
 
+/**
+ * Every distinct description-header "kind" this codebase bakes into a
+ * ticket's own description — the type-level door `src/headers/registry.ts`'s
+ * `HEADER_REGISTRY` is keyed by (BUTCHR-151/BUTCHR-157: the description-
+ * header medium's analogue of `src/labels/registry.ts`'s `RegisteredLabel`).
+ * `HEADER_REGISTRY` is typed `Record<DescriptionHeaderKind, ...>`, so adding
+ * a member here without a matching registry entry fails to compile — same
+ * mechanism, same reason: a declaration that can be extended silently is the
+ * bug this whole family exists to catch. There is exactly one member today.
+ */
+export type DescriptionHeaderKind = "orphan";
+
+/**
+ * The bracketed marker tag for each `DescriptionHeaderKind`, single-sourced
+ * here so the registry and the source scanner (`src/headers/header-scan.ts`)
+ * never retype the literal — the same discipline `CORRECTION_MARKER`'s own
+ * comment states: a marker duplicated as a literal in two places eventually
+ * drifts into two different literals.
+ */
+export const HEADER_TAGS: Readonly<Record<DescriptionHeaderKind, string>> = { orphan: "ORPHAN" };
+
+/**
+ * The header's first and last lines — STATIC regardless of `destination`/
+ * `filerKey`, unlike the two lines between them — exported so
+ * `retireOrphanHeader` below can locate the block by content instead of by
+ * counting lines (the middle "Destination: …" line can itself span more
+ * than one line when a filer's reason prose contains a newline).
+ */
+export const ORPHAN_HEADER_OPEN_LINE = "[ORPHAN] This ticket has no boss. It was filed here on purpose, outside its filer's own scope.";
+export const ORPHAN_HEADER_CLOSE_LINE = "It is not linked to anything yet — a boss makes it theirs by calling adopt_worker. Until then, nobody owns it.";
+
 /** The header block baked into the created ticket's OWN description — see fileWhereItBelongs's doc comment for why this, not a comment, is where the destination is recorded. */
 function orphanHeader(destination: OrphanDestination, filerKey: string): string {
   const where = destination.kind === "epic" ? `Epic ${destination.key}` : `a NEW epic (none exists yet) — reason given: "${destination.text}"`;
-  return [
-    "[ORPHAN] This ticket has no boss. It was filed here on purpose, outside its filer's own scope.",
-    `Filed by: ${filerKey}`,
-    `Destination: ${where}`,
-    "It is not linked to anything yet — a boss makes it theirs by calling adopt_worker. Until then, nobody owns it.",
-  ].join("\n");
+  return [ORPHAN_HEADER_OPEN_LINE, `Filed by: ${filerKey}`, `Destination: ${where}`, ORPHAN_HEADER_CLOSE_LINE].join("\n");
 }
+
+/**
+ * The declared withdrawal owner for the `[ORPHAN]` description header
+ * (BUTCHR-151/BUTCHR-157) — `HEADER_REGISTRY["orphan"].withdrawnBy` in
+ * `src/headers/registry.ts` names this function by name. Called from BOTH
+ * `adoptWorker` and `adoptProjectWorker`, for BOTH dispositions, in the same
+ * spirit as the `ORPHAN_LABEL` clear those two functions already make —
+ * "the header must not outlive the same call" the label withdrawal fires in.
+ *
+ * NEVER THROWS. Every branch returns a result describing what happened; the
+ * one exception is a truly unexpected bug, which callers must treat the same
+ * way they already treat `resolveCollisionSide`'s guarded reads — reported,
+ * never allowed to abort or corrupt the adoption in progress. See the two
+ * call sites for how the result is folded into `AdoptWorkerResult` without
+ * ever throwing.
+ *
+ * SURGICAL BY CONSTRUCTION — never touches the ticket at all unless it can
+ * find the header UNAMBIGUOUSLY:
+ *   - ABSENT (the overwhelmingly common case: any ticket not created by
+ *     `fileWhereItBelongs`, or one whose header was already retired):
+ *     `text` does not begin, at position 0, with `ORPHAN_HEADER_OPEN_LINE`.
+ *     Silent no-op — `undefined` is returned, not a result object, so
+ *     callers can skip folding anything into `AdoptWorkerResult` at all in
+ *     the common case (matching how `identityCollision`/`identityUnknown`
+ *     are only ever present on a call where there was something to say).
+ *   - HAND-EDITED: the opening line is present at position 0 but
+ *     `ORPHAN_HEADER_CLOSE_LINE` cannot be found anywhere after it — the
+ *     block was partially edited (or the two lines separated by unrelated
+ *     text) and this function cannot safely guess where "the header" ends.
+ *     Refuses to touch the description; reports why.
+ *   - APPEARS TWICE: `ORPHAN_HEADER_OPEN_LINE` occurs a second time anywhere
+ *     in the text (header duplicated, or reappearing further down in a body
+ *     someone pasted). Refuses to guess which occurrence is real; reports
+ *     why. (A quoted MENTION of the header inside unrelated prose — e.g. a
+ *     ticket discussing this very defect — cannot trigger this: the check
+ *     requires the OPEN line to sit at position 0 to engage at all, and a
+ *     quote embedded mid-body never does.)
+ *   - HEADER RELOCATED, NOT AT THE START: if a human has moved the header
+ *     block away from position 0 (or it was never there — same bytes,
+ *     different origin), this function treats it as ABSENT, not "found
+ *     elsewhere" — deliberately: text that merely CONTAINS the header's
+ *     wording, not at the very start where `fileWhereItBelongs` always
+ *     places it, is no longer distinguishable from a ticket quoting it as
+ *     history (see BUTCHR-144's own `[correction]` comment for a real
+ *     example of exactly that). Never guessed at; always left alone.
+ *
+ * ARCHIVE BEFORE OVERWRITE, LIKE `correctWorker` — BUT ITS OWN, LIGHTER
+ * MECHANISM, ARGUED HERE RATHER THAN REUSED, AND WHY: `correctWorker`'s
+ * chained-archive machinery (`postCorrectionArchive`, `JIRA_COMMENT_CHAR_
+ * LIMIT` splitting) exists because a human-authored description can run
+ * close to Jira's 32767-character field limit, so its own archive comment
+ * can too. A description HEADER, by contrast, is fixed, small, machine-
+ * generated boilerplate — four lines plus one filer's destination reason —
+ * with no realistic path to Jira's comment cap; building or reusing chaining
+ * for it would defend a limit this shape cannot reach. So this posts ONE
+ * plain comment, under its OWN marker (`HEADER_WITHDRAWN_MARKER`, not
+ * `CORRECTION_MARKER` — see that constant's own comment for why they must
+ * stay distinct), and if that single comment is ever rejected as oversized
+ * (it never has been, and is not expected to be), this reports the failure
+ * honestly rather than silently truncating or attempting to chain — the
+ * same "say what happened, never pretend" standard as everything else here.
+ *
+ * WHY THE DESCRIPTION IS REWRITTEN AT ALL, RATHER THAN DELETED TO BLANK:
+ * `[ORPHAN] … nobody owns it` is replaced with a TRUTHFUL SUCCESSOR line —
+ * `registry.ts`'s own doc-title marker is the model this follows (the
+ * `[unwritten]` marker is retired by being REPLACED with a real, outcome-
+ * shaped title, never blanked) — so the description keeps asserting
+ * something, and that something is now true. The filer's identity is parsed
+ * back out of the retired header text itself (`Filed by: …`) rather than
+ * threaded through as a new parameter, so this function's only inputs are
+ * what `adoptWorker`/`adoptProjectWorker` already have in hand.
+ *
+ * WHAT "BYTE FOR BYTE" MEANS HERE, REASONED EXPLICITLY (Requirement 5): Jira
+ * descriptions are ADF, not plain text. This reads via `adfToText` (the same
+ * flattening `correctWorker` already uses) and writes via `ops.correctText`,
+ * whose real implementation (`adfForCorrection` in `atlassian-real.ts`)
+ * ALWAYS re-wraps whatever plain text it is given as a SINGLE paragraph, a
+ * SINGLE text node — this is a pre-existing property of `correctText` itself
+ * (the only description-replace primitive this codebase has), not something
+ * this function introduces. Any rich ADF structure below the header — real
+ * multiple paragraphs, headings, bullet lists, bold/italic marks — is
+ * already collapsed to plain text by `adfToText` before this function ever
+ * sees it, and was already collapsed the same way for every `correct_worker`
+ * call that has ever run in this fleet. So "preserve everything below the
+ * header, byte for byte" is honoured at the granularity this codebase's one
+ * write primitive actually offers: the FLATTENED PLAIN TEXT below the header
+ * is preserved character-for-character, untouched, never re-derived or
+ * summarized — this function slices `text`, it never re-generates it. A
+ * freshly-filed orphan (the overwhelmingly common case this function acts
+ * on) round-trips perfectly regardless: `fileWhereItBelongs` itself builds
+ * the whole description as ONE plain string handed to `adf()`, which
+ * produces exactly one paragraph, one text node — so `adfToText` recovers
+ * that exact string with no loss to begin with, and there is nothing this
+ * function's own rewrite could newly destroy.
+ */
+async function retireOrphanHeader(
+  ops: AtlassianOps,
+  issue: unknown,
+  workerKey: string,
+  callerKey: string,
+  dispositionKind: Disposition["kind"],
+): Promise<{ retired: boolean; message: string } | undefined> {
+  const text = adfToText(descriptionOf(issue) as Parameters<typeof adfToText>[0]);
+  if (!text.startsWith(ORPHAN_HEADER_OPEN_LINE)) return undefined;
+
+  if (text.indexOf(ORPHAN_HEADER_OPEN_LINE, 1) !== -1) {
+    return {
+      retired: false,
+      message: `${workerKey}'s [ORPHAN] header opening line appears more than once in its description — refusing to guess which occurrence is the real header; the description is UNCHANGED. Needs a human or correct_worker fix.`,
+    };
+  }
+
+  const closeIdx = text.indexOf(ORPHAN_HEADER_CLOSE_LINE);
+  if (closeIdx === -1) {
+    return {
+      retired: false,
+      message: `${workerKey}'s description starts with the [ORPHAN] header's opening line but its closing line is missing — looks hand-edited; refusing to guess where the header ends, the description is UNCHANGED.`,
+    };
+  }
+
+  const headerBlock = text.slice(0, closeIdx + ORPHAN_HEADER_CLOSE_LINE.length);
+  const filerMatch = /^Filed by: (.+)$/m.exec(headerBlock);
+  const filerKey = filerMatch?.[1]?.trim() || "an earlier filer";
+
+  const afterHeader = text.slice(headerBlock.length);
+  const rest = afterHeader.startsWith("\n\n---\n\n") ? afterHeader.slice("\n\n---\n\n".length) : afterHeader.replace(/^\n+/, "");
+
+  const successor = [
+    `[ADOPTED] This ticket has a boss (${callerKey}) and is linked via Implements — adopted ${new Date().toISOString()} by adopt_worker (disposition: ${dispositionKind}).`,
+    `It was filed as an orphan by ${filerKey}; the retired [ORPHAN] header (its full text, including the destination it named) is preserved in the ${HEADER_WITHDRAWN_MARKER} comment on this ticket, not repeated here.`,
+  ].join("\n");
+  const newText = rest ? `${successor}\n\n---\n\n${rest}` : successor;
+
+  const archiveBody = [
+    `the [ORPHAN] header below was retired because ${workerKey} now has a boss (${callerKey}) — adopt_worker replaced it with a truthful successor line in the description; everything below the header was preserved unchanged.`,
+    "--- retired header ---",
+    headerBlock,
+  ].join("\n\n");
+  try {
+    await ops.addComment(workerKey, tagComment(callerKey, `${HEADER_WITHDRAWN_MARKER} ${archiveBody}`));
+  } catch (e) {
+    return {
+      retired: false,
+      message: `found ${workerKey}'s stale [ORPHAN] header but the archive comment failed to post (${(e as Error).message}) — refusing to rewrite the description without first preserving the retired text; the header is UNCHANGED. Safe to retry (e.g. on the next adopt_worker call, or by hand with correct_worker).`,
+    };
+  }
+
+  try {
+    await ops.correctText(workerKey, { description: newText });
+  } catch (e) {
+    return {
+      retired: false,
+      message: `archived ${workerKey}'s retired [ORPHAN] header (see the ${HEADER_WITHDRAWN_MARKER} comment) but the description rewrite failed (${(e as Error).message}) — one harmless extra comment now sits on ${workerKey}; its description is UNCHANGED. Safe to retry.`,
+    };
+  }
+
+  return {
+    retired: true,
+    message: `${workerKey}'s stale [ORPHAN] header was retired (archived under ${HEADER_WITHDRAWN_MARKER}) and replaced with a truthful successor line naming its new boss (${callerKey}); everything below the header was preserved unchanged.`,
+  };
+}
+
+/**
+ * THE RETROACTIVE QUESTION (BUTCHR-151/BUTCHR-157 Requirement 4), ANSWERED
+ * EXPLICITLY: tickets adopted BEFORE this fix landed may still carry a stale
+ * `[ORPHAN]` header — `retireOrphanHeader` only ever runs from inside
+ * `adopt_worker`/`adopt_worker`'s project-caller sibling, so a ticket that
+ * was already adopted under the old code path will not have this function
+ * run against it again on its own. DECIDED: NOT repaired retroactively by
+ * this change, and this is a deliberate declaration, not an oversight left
+ * for someone to notice the way `butchr:orphan`'s missing withdrawal path
+ * itself was:
+ *   1. The one CONCRETELY KNOWN instance in this corpus (BUTCHR-144) is
+ *      already fixed — repaired by hand with `correct_worker`, recorded in
+ *      its own `[correction]` comment, specifically BECAUSE no machine path
+ *      existed yet. This ticket's own fix does not need to re-repair it.
+ *   2. There is no cheap, reliable way to FIND every other stale-header
+ *      ticket in the corpus: `butchr:orphan` is already withdrawn on every
+ *      one of them (that is the whole reason the header alone is stale — the
+ *      label side of BUTCHR-108/BUTCHR-137 already worked), so no saved JQL
+ *      filter can select "ticket adopted with a leftover header" — finding
+ *      one requires a full-text description scan across the whole project,
+ *      an unbounded, un-scoped read this ticket's own definition of done
+ *      does not ask for and this Task's own scope does not include running.
+ *   3. Retroactively rewriting an unknown, unbounded set of OTHER tickets'
+ *      descriptions from inside a single Task's scope — tickets this Task
+ *      does not own, outside its own Implements chain — is exactly the kind
+ *      of wide-blast-radius action a worker in this fleet does not take
+ *      unilaterally; if a bulk sweep is ever wanted, it is its own bounded
+ *      unit of work (a script or a follow-up ticket, filed with
+ *      `file_where_it_belongs` if warranted), not a side effect buried in
+ *      this one.
+ * This declaration is the answer this Requirement asks for, stated where a
+ * reader of the code lands (here) and repeated in this ticket's changelog
+ * fragment — silently shipping "the header medium is closed" while an
+ * unknown number of stale headers remain would be exactly the fresh cached
+ * assertion this epic exists to stop producing.
+ */
 
 /** The pushed notice's body — worded so a human reading it cold (case A on the epic, case B on the topmost ticket) knows what was filed, by whom, where it's meant to go, and that it isn't anyone's yet. */
 function orphanNotice(filerKey: string, key: string, summary: string, destination: OrphanDestination, noticeTarget: string): string {

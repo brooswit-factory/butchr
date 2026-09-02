@@ -3,6 +3,7 @@ import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
   CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
+  ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -608,6 +609,177 @@ describe("adopt_worker: BUTCHR-108/BUTCHR-137 — butchr:orphan means UNDIRECTED
     const w = issues.get("BUTCHR-9")!;
     expect(w.labels).not.toContain(ORPHAN_LABEL);
     expect(w.labels).toContain(EXEMPT_LABEL); // "shelve" never clears its own exemption label, only the orphan one
+  });
+});
+
+describe("adopt_worker: BUTCHR-151/BUTCHR-157 — retiring a stale [ORPHAN] description header in the same call as the label withdrawal", () => {
+  // Mirrors adf() in src/atlassian/client.ts EXACTLY (one paragraph, one text
+  // node) — what a REAL fileWhereItBelongs-created ticket's description
+  // looks like on the wire, not a test shortcut. correctWorker's own "happy
+  // path" test uses the same shape for the same reason.
+  const adfDoc = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+  const HEADER = [ORPHAN_HEADER_OPEN_LINE, "Filed by: BUTCHR-5", 'Destination: Epic BUTCHR-1', ORPHAN_HEADER_CLOSE_LINE].join("\n");
+
+  test("disposition \"start\": header retired, archived under HEADER_WITHDRAWN_MARKER BEFORE the rewrite, body preserved byte for byte, result names the outcome", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL], description: adfDoc(`${HEADER}\n\n---\n\nDo the actual task body here.`) });
+
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      addComment: async (...a) => { calls.push("addComment"); return ops.addComment(...a); },
+      correctText: async (...a) => { calls.push("correctText"); return ops.correctText(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+
+    // ORDER: label clear, then archive-before-overwrite, then the eventual transition.
+    expect(calls).toEqual(["removeLabels", "addComment", "correctText", "transition"]);
+
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.comments).toHaveLength(1);
+    expect(w.comments[0]!.startsWith(`[BUTCHR-1] ${HEADER_WITHDRAWN_MARKER}`)).toBe(true);
+    expect(w.comments[0]).toContain(HEADER); // the retired header's exact text is preserved in the archive
+    const newDescription = w.description as string;
+    expect(newDescription.startsWith("[ORPHAN]")).toBe(false); // no longer the stale header
+    expect(newDescription.startsWith("[ADOPTED]")).toBe(true); // a truthful successor, not a blank
+    expect(newDescription).toContain("BUTCHR-1"); // names the new boss
+    expect(newDescription).toContain("BUTCHR-5"); // names the original filer, parsed back out of the retired header
+    expect(newDescription).toContain("Do the actual task body here."); // preserved, byte for byte
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+  });
+
+  test("disposition \"shelve\": header retired in the SAME call that adds butchr:shelved and posts the shelve reason", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready yet" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).toContain(EXEMPT_LABEL);
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    // Two comments: the header archive, then the shelve reason — the header
+    // block was the ENTIRE description (no body given at filing), so the
+    // rewritten description is just the successor line, no trailing separator.
+    expect(w.comments).toHaveLength(2);
+    expect(w.comments[0]).toContain(HEADER_WITHDRAWN_MARKER);
+    expect(w.comments[1]).toContain("not ready yet");
+    const newDescription = w.description as string;
+    expect(newDescription).toContain("[ADOPTED]");
+    expect(newDescription.endsWith("not repeated here.")).toBe(true); // no "---" body separator when there was no body
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+  });
+
+  test("a ticket with no header at all: silent no-op — neither result field is set, no extra Jira call", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", description: adfDoc("just an ordinary task description") });
+    let correctTextCalls = 0;
+    const spied: AtlassianOps = { ...ops, correctText: async (...a) => { correctTextCalls++; return ops.correctText(...a); } };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+    expect(correctTextCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc("just an ordinary task description")); // byte for byte untouched
+  });
+
+  test("a ticket with NO description at all: silent no-op, never throws", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // adoption itself still completed normally
+  });
+
+  test("HAND-EDITED (open line present, close line missing): refuses to guess, description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const hacked = `${ORPHAN_HEADER_OPEN_LINE}\nsomeone deleted the rest of this block and wrote their own note instead.`;
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(hacked) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderWithdrawn).toBeUndefined();
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/hand-edited/);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(hacked)); // untouched
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // never blocked
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL); // the label withdrawal is unaffected by the header failure
+  });
+
+  test("APPEARS TWICE: refuses to guess which occurrence is real, description UNCHANGED", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const duplicated = `${HEADER}\n\n---\n\n${HEADER}`;
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", description: adfDoc(duplicated) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/more than once/);
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(duplicated));
+  });
+
+  test("archive comment fails: refuses to rewrite without first preserving the retired text — description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    let correctTextCalls = 0;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { if (text.includes(HEADER_WITHDRAWN_MARKER)) throw new Error("comment API down"); return ops.addComment(key, text); },
+      correctText: async (...a) => { correctTextCalls++; return ops.correctText(...a); },
+    };
+    const result = await adoptWorker(failingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/archive comment failed/);
+    expect(correctTextCalls).toBe(0); // never attempted the rewrite without a successful archive first
+    expect(issues.get("BUTCHR-9")!.description).toEqual(adfDoc(HEADER));
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress"); // the adoption itself is never blocked by this
+  });
+
+  test("the rewrite itself fails AFTER a successful archive: one harmless extra comment, description UNCHANGED, adoption still proceeds", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    const failingOps: AtlassianOps = { ...ops, correctText: async () => { throw new Error("edit API down"); } };
+    const result = await adoptWorker(failingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.orphanHeaderNotWithdrawn).toMatch(/rewrite failed/);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.comments).toHaveLength(1); // the archive landed
+    expect(w.comments[0]).toContain(HEADER_WITHDRAWN_MARKER);
+    expect(w.description).toEqual(adfDoc(HEADER)); // the edit never took
+    expect(w.status).toBe("In Progress"); // adoption proceeded regardless
+  });
+
+  test("re-adoption (alreadyAdopted no-op path) still retires a header that somehow survived a prior adoption — NOT gated on alreadyAdopted, mirroring ORPHAN_LABEL's own rule", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress", description: adfDoc(HEADER) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
+    expect(issues.get("BUTCHR-9")!.description as string).toContain("[ADOPTED]");
+  });
+
+  test("PROJECT caller adopting an Epic: same header retirement, defence-in-depth path", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", labels: [ORPHAN_LABEL], description: adfDoc(HEADER) });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect((w.description as string)).toContain("[ADOPTED]");
+    expect((w.description as string)).toContain("BUTCHR"); // names the project as the new boss
+    expect(result.orphanHeaderWithdrawn).toBeDefined();
   });
 });
 
