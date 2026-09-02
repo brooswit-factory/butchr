@@ -436,6 +436,28 @@ export interface ProjectResourceDeps {
    * `BUTCHR_PROJECT_ALLOWLIST`, unset by default) — empty here means zero
    * projects ever reach `led`, so zero are staffed, regardless of how many
    * live projects this credential actually leads.
+   *
+   * This is a ROLLOUT GATE, not an eligibility rule: eligibility is a
+   * property of the project resource itself (this module's top comment,
+   * Declaration 2 — live, led by this credential, and carrying a readable
+   * `butchr` entity property naming a root doc), and is decided entirely
+   * without consulting this set. A project absent from here is eligible but
+   * deliberately not yet staffed — a different claim from "not eligible" —
+   * because `projectVerdict` is fail-open by construction and no project on
+   * this site has ever been checked in on: unlisted-but-eligible is the
+   * state of every currently-eligible project, by design, until an operator
+   * opts each one in by hand. Widening this set one key at a time, after
+   * watching that project's agent behave safely under supervision, is the
+   * intended path to trusting the fail-open verdict for it. Removing the
+   * gate outright — reverting to "eligible implies staffed" — is not
+   * expected to become reasonable on this codebase's current design: the
+   * hazard it guards against (every eligible project going `active`
+   * unattended on the very first poll) is a property of `projectVerdict`
+   * being fail-open, not of the current project population, so it would
+   * take a change to that verdict logic itself (e.g. requiring an explicit
+   * per-project opt-in signal read FROM Jira/Confluence instead of from
+   * this in-process set) before the gate could be retired rather than just
+   * widened.
    */
   allowlist: ReadonlySet<string>;
 }
