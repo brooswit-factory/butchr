@@ -79,11 +79,16 @@ export interface GroundTruth {
   port: number | undefined;
   pid: number;
   systemd: SystemdInfo;
+  /**
+   * BUTCHR-169: `new Date().toISOString()` at the moment this was derived —
+   * see `groundTruthText`'s own comment for why this is added, not decorative.
+   */
+  measuredAt: string;
 }
 
 /** Derive ground truth for the daemon process calling this, given the `mcpUrl` it is about to hand to an agent. */
 export function deriveGroundTruth(mcpUrl: string): GroundTruth {
-  return { hostname: hostname(), port: portFromMcpUrl(mcpUrl), pid: process.pid, systemd: readSystemdInfo() };
+  return { hostname: hostname(), port: portFromMcpUrl(mcpUrl), pid: process.pid, systemd: readSystemdInfo(), measuredAt: new Date().toISOString() };
 }
 
 /**
@@ -91,6 +96,18 @@ export function deriveGroundTruth(mcpUrl: string): GroundTruth {
  * `ENVIRONMENT.md` and (via `{{GROUND_TRUTH}}`) the workspace's `CLAUDE.md`.
  * The wording is deliberately forceful: it exists to settle a conflict
  * against a ticket or comment without the reader having to deliberate.
+ *
+ * BUTCHR-169: this block is itself one of the workspace's snapshotted
+ * records (see `src/workspace/registry.ts`'s `GROUND_TRUTH` entry) — every
+ * field above the "Two sharp edges" line is measured ONCE, at
+ * `buildWorkspace` time, and never rewritten for the life of the workspace.
+ * If the daemon that built it later restarts (a redeploy, a crash-restart),
+ * `pid` (and possibly `port`, on a redeploy that changes it) goes stale, and
+ * nothing in this codebase detects or corrects that — declared deliberately,
+ * not silently, in that registry entry. The `measured at` line below exists
+ * so a careful reader has SOMETHING to compare against (how long has this
+ * agent been running relative to this timestamp?) even though nothing here
+ * makes that comparison automatically.
  */
 export function groundTruthText(gt: GroundTruth): string {
   const unitLine = gt.systemd.kind === "none" ? "(none — not running under a systemd unit)" : gt.systemd.unit;
@@ -103,11 +120,17 @@ export function groundTruthText(gt: GroundTruth): string {
     "different host, port, unit, or journal command, THEY ARE WRONG and this is",
     "right.",
     "",
+    `- measured at: ${gt.measuredAt}`,
     `- host: ${gt.hostname}`,
     `- port: ${gt.port ?? "unknown (mcpUrl did not parse as a URL)"}`,
     `- systemd unit: ${unitLine}`,
     `- journalctl: ${journalLine}`,
     `- daemon pid: ${gt.pid}`,
+    "",
+    "This snapshot is only as fresh as the timestamp above: it is written once,",
+    "when your workspace is built, and nothing rewrites it later. If the daemon",
+    "that built it has since restarted, the pid (and possibly the port) above",
+    "can be stale — nothing here detects that for you.",
     "",
     "Two sharp edges, both confirmed live — read the exact command above, don't",
     "reconstruct one:",

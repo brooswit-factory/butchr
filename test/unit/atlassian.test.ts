@@ -27,6 +27,31 @@ describe("AtlassianClient", () => {
     const c2 = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [{ key: "K", fields: {} }] } }));
     expect((await c2.search("x"))[0]).toMatchObject({ key: "K", summary: "", assignee: null });
   });
+  // BUTCHR-169: ISSUE_SPAWN_CONFIG.specFor (src/resources/issue.ts) derives a
+  // spawned ticket's boss from issuelinks on the SEARCH result — this is the
+  // batching that makes that possible without a second, per-issue API call
+  // on every poll. If "issuelinks" ever silently drops out of this fields
+  // param, specFor's parent derivation goes quietly back to always-null,
+  // exactly the defect BUTCHR-169 fixed — this guard is what would catch
+  // that regression.
+  test("search requests issuelinks in fields, so a boss can be derived without a second call", async () => {
+    const seen: { url: string; auth: string | undefined }[] = [];
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [] } }, seen));
+    await c.search("x");
+    expect(seen[0]!.url).toContain("issuelinks");
+  });
+  test("search maps issuelinks using the SAME direction convention as links() — same parser, one place to be right", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "KAN-757", fields: { summary: "s", issuelinks: [{ id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } }] } }] },
+    }));
+    const issues = await c.search("x");
+    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759" }]);
+  });
+  test("search leaves issuelinks UNDEFINED (never a fabricated []) when the response omits the field entirely — 'unknown', not 'confirmed none'", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [{ key: "K", fields: { summary: "s" } }] } }));
+    const issues = await c.search("x");
+    expect("issuelinks" in issues[0]!).toBe(false);
+  });
   test("links reads both directions", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-1": { fields: { issuelinks: [
       { type: { name: "Blocks" }, outwardIssue: { key: "KAN-2" } },
