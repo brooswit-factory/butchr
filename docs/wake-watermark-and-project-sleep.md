@@ -1,14 +1,22 @@
 # Wake watermark persistence and the project tier's sleep cycle (BUTCHR-187, implementing BUTCHR-119)
 
-Answers, by direct measurement against the live production daemon and the
-live Jira/Confluence artefact, two questions BUTCHR-68 left FAILED:
+Answers, by direct measurement against a live production daemon and the
+live Jira/Confluence artefact, one of two questions BUTCHR-68 left FAILED
+— and documents, as a finding in its own right, why this document does
+not attempt to answer the other one:
 
 1. Does the project tier's `wake` watermark write (`advanceProjectWatermark`
    -> `AtlassianOps.setProjectProperty`) now persist, without corrupting the
-   other keys already on the `butchr` project entity property?
+   other keys already on the `butchr` project entity property? **Answered
+   here: PROVEN**, independently reconfirmed.
 2. Does a project agent that has caught up on its watermark actually EXIT —
    row gone from `herdr agent list`, pane released — rather than merely
-   reporting `agent_status: "done"`?
+   reporting `agent_status: "done"`? **Not answered here.** This agent's
+   own daemon turned out to be the wrong one to observe it from (see
+   "Two `butchr` daemons, one host, side by side" below) — a live,
+   worked instance of the exact "right question, wrong daemon" trap this
+   estate's own docs warn about. The verdict is recorded on story
+   BUTCHR-119 instead, from the daemon that can actually see it.
 
 Filed under story BUTCHR-119, epic BUTCHR-115. The causal chain this
 measurement is checking, as stated by the story:
@@ -51,17 +59,18 @@ for why an inherited environment fact is worthless to a different reader).
   read of a different ref said.
 - `herdr` instance used for every Signal-2 read: `HERDR_SOCKET_PATH=
   /home/wroosbit/.config/herdr/herdr.sock`, this session's own user
-  (`wroosbit`) socket. Confirmed to be the correct instance for this
-  daemon two ways: (a) `systemctl --user status herdr.service` shows this
-  socket's `herdr server` process (pid 190643) has been running
+  (`wroosbit`) socket. Confirmed to be a real, correctly-functioning
+  instance two ways: (a) `systemctl --user status herdr.service` shows
+  this socket's `herdr server` process (pid 190643) has been running
   continuously since `2026-08-21 12:39:48 PDT` — no restart anywhere near
-  this measurement window, so nothing here can be explained by an
-  observation-tool restart; (b) this very agent's own row
+  this measurement window; (b) this very agent's own row
   (`butchr-butchr-187`, `cwd: /home/wroosbit/butchr-workspaces/BUTCHR-187`)
-  appears correctly in its output. A second, DIFFERENT herdr process
-  (pid 167214) exists on this host under a different Unix user
-  (`booswrit`) — exactly the "invisible to your own tooling" trap the
-  story warns about — and was not used for anything in this document.
+  appears correctly in its output. **What this does NOT establish — see
+  "A wrong-daemon measurement, caught before publishing" below — is that
+  this is the herdr/daemon pair that staffs the project agent under test.**
+  It is not. A second, DIFFERENT herdr process (pid 167214) exists on this
+  host under a different Unix user (`booswrit`) and was never queried by
+  this document.
 
 ## Checks and their failure conditions, as required by the story to be
 ## written down before being run
@@ -164,8 +173,8 @@ agent_status: "working"
 The story states this is consistent with BUTCHR-68's own independent
 record of `w47:p1` being held continuously since 06:43 the previous day.
 **Treated here as an inherited claim, not settled fact** — per the story's
-own instruction, and because (see "An unresolved tension" below) this
-document found a fact in the running code that is in tension with it.
+own instruction, and because this agent could not independently observe
+`w47:p1` at all from its own vantage point (see "Signal 2" below for why).
 
 ## Signal 1 result: PROVEN — independently reconfirmed, not merely inherited
 
@@ -203,7 +212,7 @@ production under the exact condition it exists for, observed on the
 artefact by two independent agents at two different times, not inferred
 from an absence of errors. Signal 1 is **PROVEN**.
 
-## Signal 2 — demonstration 6: observations
+## Signal 2 — demonstration 6: observations, and a wrong-daemon measurement caught before publishing
 
 ### The story's own snapshot, inherited
 
@@ -214,177 +223,186 @@ per the `done`/`idle` trap above.)
 ### A positive control the story obtained and handed down
 
 Between `14:42Z` and `14:45Z`, the unrelated row `butchr-butchr-164`
-vanished from `herdr agent list` entirely, releasing pane `wBC:p1`. This is
-what makes a later "row absent" interpretable at all: without a
-demonstrated case of this exact instrument catching a real release, a
-"row absent" result could not be distinguished from "this instrument
-cannot see releases" (the blocked-read-is-a-fact-about-the-instrument
-trap). Not independently re-derivable by this agent (the row is long gone
-by the time this agent could check) — inherited, but the underlying
-mechanism (row disappearing = release) is the same one this document's own
-polls exercise below, on the SAME `herdr` instance, confirmed above to be
-the correct one.
+vanished from `herdr agent list` entirely, releasing pane `wBC:p1` — on
+the story's own herd. Recorded here as inherited context for the section
+below, not as something this agent's own instrument corroborated (see
+next section for why).
 
-### This agent's own, independently timestamped polls
+### This agent's own polls, and the check that invalidates them as Signal-2 evidence
 
-All four against the same confirmed-correct `herdr` instance, all parsed
-as JSON (never `grep -q`), all printing what was matched:
+This agent independently polled `herdr agent list` four times looking for
+a row named `butchr-butchr` (all parsed as JSON, all timestamped):
 
-| # | UTC timestamp | `butchr-butchr` row |
+| # | UTC timestamp | `butchr-butchr` row (on THIS agent's herd) |
 |---|---|---|
-| 1 | `2026-09-02T14:48:16.518Z` | **ABSENT** |
-| 2 | `2026-09-02T14:49:36.213Z` | **ABSENT** |
-| 3 | `2026-09-02T14:50:43.575Z` | **ABSENT** |
-| 4 | `2026-09-02T14:51:05.191Z` | **ABSENT** |
+| 1 | `2026-09-02T14:48:16.518Z` | absent |
+| 2 | `2026-09-02T14:49:36.213Z` | absent |
+| 3 | `2026-09-02T14:50:43.575Z` | absent |
+| 4 | `2026-09-02T14:51:05.191Z` | absent |
 
-Four consecutive polls, spanning ~2m49s, all absent — satisfies the
-story's "at least three consecutive polls" bar against a one-poll blink.
-No poll in this window returned an error or an ambiguous read; every poll
-returned a well-formed agent list containing OTHER rows (this agent's own
-row among them), so this is not a case of "instrument unreadable."
+**This agent's first draft of this document treated that as Signal 2
+PROVEN-as-an-observation.** That draft was wrong, and the mechanism by
+which it was wrong is itself the single most reusable finding in this
+document — recorded here rather than quietly deleted, per this repo's own
+convention (see `docs/review-commit-immutability.md`) of keeping a caught
+mistake visible rather than erasing it.
 
-**Beyond the row: the whole workspace is gone, not just the agent's
-status.** `herdr workspace list`, checked at the same time as poll 3-4, has
-no workspace with id `w47` at all — not merely an agent-status change on a
-surviving pane, but the container itself torn down. This is a stronger
-observation than a status flip: `pane.close()` (the code Signal 2's check
-targets, above) is consistent with this outcome.
+**What actually happened, established by running the story's own decision
+procedure against fresh reads (not reused from earlier in this
+document):**
 
-**Meaning, stated separately:** the project agent's row and its pane/
-workspace were observed to be gone, in a sustained way (not a blink), by
-the time this agent began observing (first read `2026-09-02T14:48:16Z`,
-i.e. sometime in the ~3-minute window after the story's own
-`14:45:07Z` "still present" snapshot). **The row-disappeared /
-pane-released FACT is well established.** What that fact is attributable
-to is addressed next, separately, because the two are not the same claim.
+- This agent's `ENVIRONMENT.md` names host `servyboi`, port `7717`. A
+  **fresh** `GET /health` at `2026-09-02T14:55:10Z` — not the earlier read
+  quoted under "Environment" above — returned `pid: 1000239`,
+  `startedAt: 2026-09-02T14:21:08.427Z`, **identical** to this agent's very
+  first check of the same session. No restart occurred; this is not a
+  stale-pid situation.
+- `ps -o pid=,user=,args= -p 1000239` → owned by Unix user `wroosbit` —
+  the same user this agent runs as. So pid 1000239 is legitimately this
+  agent's own daemon, not a permissions artefact.
+- `tr '\0' '\n' < /proc/1000239/environ | grep ALLOWLIST` → **no match.**
+  `BUTCHR_PROJECT_ALLOWLIST` is genuinely unset on this process, live,
+  printed directly (not inferred from a stale banner).
+- Scanning this agent's own `herdr agent list` (same instance described
+  under "Environment" above, confirmed un-restarted since `2026-08-21`)
+  for anything shaped like a project id (`^[A-Z][A-Z0-9_]*$`, no
+  `-<digits>` suffix — `isProjectId`, `src/resources/id.ts`) across all 15
+  currently-tracked rows: **zero matches.**
 
-## An unresolved tension this document found, and could not resolve from outside observation alone
+That last point is the correction to the table above: the four "absent"
+polls were not four observations of a row disappearing. **This herd never
+had a project-tier row on it at any point this agent could check.** "Never
+present" and "present, then released" produce an identical `herdr agent
+list` reading (no row) but are not the same claim, and this document's
+first draft conflated them — exactly the fusing-observation-with-meaning
+error the story's def-of-done explicitly warns against, caught here by
+re-deriving the check from scratch rather than trusting the earlier
+framing.
 
-While establishing Signal 2's check (see the `plan.stop` derivation
-quoted above), this agent also re-checked, against the exact deployed
-commit, how the project tier's `desired` and `atRest` sets are computed —
-because both feed directly into whether `stop` fires.
+**Independent corroboration that this is a genuinely different daemon,
+not a reading error, inherited from the story** (obtained by the story
+from ITS OWN vantage point — a different Unix user than this agent, and
+so not independently reproducible here; recorded as inherited, not
+verified first-hand):
 
-**This daemon's own startup log line, unprompted, printed:**
+- The story's `/health` (its own port, not this agent's) reports
+  `pid: 1015210`, `startedAt: 2026-09-02T14:47:10.673Z`, same
+  `build.sha: d386322a9f3e15fa0d32a64e9324f68de1dcd870` — a restart of the
+  same build, not a new deploy.
+- Its `BUTCHR_PROJECT_ALLOWLIST` environment value:
+  `BUTCHR,CATA,SCHEM,SICKOS,RINTH,LIBS,DROVR,CNDLX` — non-empty, and
+  contains `BUTCHR`.
+- Its own `herdr agent list`, checked at `14:51:34Z`, `14:52:04Z` and
+  `14:52:34Z`, shows `BUTCHR:w47:p1:idle` present and unchanged across all
+  three reads, alongside seven other project-tier rows.
+- A set comparison the story ran on its own side at `14:52:37Z`: its
+  allowlist (8 keys) and its running project-tier agents (8 keys) are
+  **exactly equal**, zero difference either direction — the project tier
+  it observes is fully staffed to its allowlist, which this agent's own
+  daemon (allowlist empty, zero project agents running) could not
+  possibly produce.
 
-```
-projectAllowlist=EMPTY — project tier staffs nothing
-```
+This agent attempted to read pid 1015210 directly to corroborate the
+above first-hand and could not: it is not a pid this agent's own
+`/proc` access covers (the earlier draft's `/proc/1000239/...` reads
+were of THIS agent's own daemon, pid 1000239 — a coincidentally similar
+but materially different pid). This document does not know this host's
+full topology of daemons/Unix users beyond what the story reported and
+what this agent independently confirmed about its own daemon; per the
+story's explicit instruction, that topology was not investigated further.
 
-(`src/config/config.ts`'s `describeConfig`.) Checked at TWO daemon boots:
-this one (`2026-09-02T14:21:08Z`) and the immediately preceding one
-(the routine hourly deploy at `2026-09-01T21:43:04` local) — both EMPTY.
-`BUTCHR_PROJECT_ALLOWLIST` is a process-start env var, so it cannot have
-changed without a restart; none occurred between those two boots and this
-measurement.
+**Meaning, stated separately from the observation:** this agent's own
+`herdr`/daemon vantage point (host `servyboi`, port `7717`, pid `1000239`,
+user `wroosbit`) is confirmed, live, to be a daemon whose project tier
+stops nothing and starts nothing for `BUTCHR` — not because of anything
+to do with the wake watermark, but because it was never given `BUTCHR` on
+its allowlist. **Demonstration 6 is UNOBSERVABLE from this vantage
+point** — not FAILED (nothing here shows the mechanism doesn't work) and
+not PROVEN (nothing here shows it does). This finding — that a
+right-question/wrong-daemon read produces a real, well-formed, internally
+consistent, and completely wrong answer, one that looked exactly like a
+clean PROVEN result until re-derived from first principles — is itself
+the concrete, reusable value of this section, independent of demonstration
+6's own outcome.
 
-`src/resources/project.ts`, `loadProjects`, at the exact deployed commit:
+### Two `butchr` daemons, one host, side by side — a worked instance of "right question, wrong daemon"
 
-```
-const led = raw.values.filter((p) => p.lead?.accountId === me.accountId && deps.allowlist.has(p.key));
-```
+`ENVIRONMENT.md`'s own warning ("a host can run more than one butchr
+daemon, and one can be owned by another user and invisible to your own
+`ss -ltnp`") is usually abstract. This measurement made it concrete, with
+both sides' numbers gathered independently and placed next to each other
+— worth recording as a finding in its own right, not just as an aside
+inside Signal 2's story, because a future reader hitting two contradictory
+`herdr` results will have exactly this shape to check against:
 
-With the allowlist empty, `led` — and everything the function derives from
-it (`eligible`, `ineligible`, and therefore its entire return value) — is
-`[]` on every single poll, unconditionally. `src/daemon/loop.ts`'s poll
-body confirms `desired` and `atRest` are both computed from that exact
-same `issues` array (`desiredFrom(issues, ...)`, `atRestFrom(issues, ...)`)
-with no other source. So under this daemon's live, currently-running
-configuration: **`BUTCHR` never reaches `eligible`, is never a member of
-`desired`, and is never a member of `atRest` — regardless of what
-`projectVerdict`/the wake watermark says.** `stop = running − desired −
-atRest` therefore contains `BUTCHR` on every project poll in which it is
-running, **unconditionally** — the exact same outcome the wake-fix path
-would also produce once the watermark catches up, but reached by a
-completely different, wake-independent route.
+| | This agent's daemon | The story's daemon |
+|---|---|---|
+| host : port | `servyboi` : `7717` | `servyboi` : `7718` (same host) |
+| pid | `1000239` | `1015210` |
+| Unix user | `wroosbit` | (different user — this agent could not read its `/proc`) |
+| `startedAt` | `2026-09-02T14:21:08.427Z`, no restart across this whole measurement | `2026-09-02T14:47:10.673Z` (a restart of the same `build.sha`, not a new deploy) |
+| `build.sha` | `d386322a9f3e15fa0d32a64e9324f68de1dcd870` | `d386322a9f3e15fa0d32a64e9324f68de1dcd870` (same build) |
+| `herdr` socket | `/home/wroosbit/.config/herdr/herdr.sock` (pid 190643, up since `2026-08-21`) | a different socket, under the story's own user — not queried by this agent |
+| `BUTCHR_PROJECT_ALLOWLIST` | unset (confirmed by printing the matching `grep` line — no match) | `BUTCHR,CATA,SCHEM,SICKOS,RINTH,LIBS,DROVR,CNDLX` |
+| project-tier rows on that herd | **zero project-shaped rows among the 15 agents tracked by the herdr at `/home/wroosbit/.config/herdr/herdr.sock`, checked at `2026-09-02T14:55:19Z`** — not "the row disappeared," never present | eight, one per allowlist entry; running-set == allowlist-set exactly (checked by the story at `2026-09-02T14:52:37Z`) |
 
-**This also answers the story's def-of-done item about what `atRest` was
-observed doing during the post-watermark window: it could not have been
-protecting `BUTCHR` at all, because `BUTCHR` was never in the set
-`atRestFrom` computes over in the first place.** Whatever stopped the
-pane, it did not pass through an `atRest`-guarded window for this
-project, under this configuration — not because the guard failed, but
-because this project was never a candidate for it. (`atRest` itself was
-not touched, loosened, or investigated further — out of scope per the
-story, and this finding does not require touching it.)
-
-**The tension this creates, stated plainly:** the same allowlist gate has,
-on the story's own telling, been `EMPTY` across at least the last two
-daemon boots (spanning the period `BUTCHR-68` reports `w47:p1` as
-continuously held since `06:43` the previous day). If `stop` really does
-include `BUTCHR` unconditionally on every ~5-minute project poll whenever
-it is running, that predicts repeated stop attempts throughout that
-24+-hour window — in tension with a pane reportedly held continuously
-across it. This document could not resolve that tension: it did not find
-a log line recording an explicit `herd.stop("BUTCHR")` call or its
-outcome (success or failure) at any point, before or during this
-measurement, and does not know whether the pane was being
-closed-and-silently-recreated by some other mechanism, whether earlier
-`stop` attempts were failing, or whether the "continuously held" premise
-itself (inherited from BUTCHR-68, explicitly flagged by the story as not
-settled fact) does not hold up. **Named here as NOT ESTABLISHED rather
-than guessed at.**
-
-**Practical consequence for THIS measurement:** because the allowlist gate
-is independently sufficient to force the exact same observable outcome
-(row gone, pane released) regardless of the wake watermark's value, this
-document cannot, from `herdr`/Jira observation alone, distinguish:
-
-- (a) the wake watermark persisted -> `projectVerdict` correctly computed
-  `"asleep"` -> excluded from `desired`, protected briefly by `atRest`
-  until settled -> `stop` -> pane released (the mechanism this story
-  exists to prove), from
-- (b) `BUTCHR` was never eligible/desired/at-rest at all, this poll or any
-  other, because of the allowlist gate -> `stop` -> pane released,
-  entirely independent of the watermark.
-
-Both produce byte-identical `herdr agent list` output. This agent raised
-this specific tension to the story (`ask_boss` on BUTCHR-187,
-`2026-09-02T14:50:39Z`) before committing verdict language here, precisely
-because a wrong claim in the flattering direction is the one this ticket
-warns is least likely to be caught by the agent making it.
+The port discovery itself (`7717` vs. `7718`, same host) came out of this
+comparison — neither agent could have found it from its own side alone,
+since each side's own `ENVIRONMENT.md`/`/health` only ever names its own
+daemon. **Both readings, taken alone, were internally consistent and
+neither instrument errored or returned an ambiguous result** — that is
+what makes this shape dangerous: a second read of the SAME wrong daemon
+would have agreed with the first perfectly, and been equally wrong. The
+only thing that caught it was cross-checking against a second,
+INDEPENDENT source (the story's own vantage point), not a repeated read
+from the same one — the general form of "arrange for a second source
+before you need one" this ticket asks for throughout.
 
 ## Signal 2 verdict
 
-- **The observation** — `butchr-butchr`'s row and pane/workspace gone,
-  sustained across four consecutive independently-timestamped polls
-  spanning ~2m49s, following a successful watermark write, with a positive
-  control proving the instrument can see a real release — is **PROVEN**.
-- **The causal claim demonstration 6 exists to establish** — that this
-  release happened BECAUSE the persisted wake watermark caused
-  `projectVerdict` to compute `"asleep"` — is **NOT ESTABLISHED**. A fully
-  sufficient, independently-verified alternative explanation
-  (`projectAllowlist=EMPTY` on the currently-running daemon, which forces
-  the identical `stop` outcome regardless of watermark state) was found in
-  the exact deployed source and could not be ruled out from outside
-  observation. "Not established" is stated here as a first-class result,
-  per the story's own instruction, rather than resolved by picking
-  whichever reading flatters this increment.
+**Not recorded in this document — recorded on story BUTCHR-119, not here,
+and a reader of this page should go there for it rather than assume it
+was forgotten.** This agent's vantage point cannot observe the project
+agent that demonstration 6 is about (see above); the story's own vantage
+point can, and per the story's own instruction ("if you are not \[on the
+right daemon\], say so plainly and hand back what you have — I will take
+the measurements from here and that is a complete delivery on your side,
+not a shortfall"), the story took the measurement from its own daemon
+(port `7718`, pid `1015210`, eight project agents under continuous
+observation, `BUTCHR` among them) and will record demonstration 6's
+PROVEN/FAILED verdict there.
 
-This is not a claim that the fix does not work — Signal 1 shows the write
-genuinely persists, cleanly, with no data loss, which is real, hard-won
-progress this story asked for. It is a claim that **this specific
-environment's current configuration cannot currently distinguish "the fix
-caused the sleep" from "the sleep would have happened regardless of the
-fix,"** and that distinguishing them needs either a resolution of the
-allowlist tension above, or a repeat of this observation once `BUTCHR` is
-confirmed to sit on `BUTCHR_PROJECT_ALLOWLIST` with the watermark
-deliberately made stale first (so `projectVerdict` would name it
-`"active"`, and a stop in that state would be unambiguous evidence the
-allowlist path, not the verdict path, was firing).
+What this document DOES establish, first-hand, and stands behind:
+
+- **Signal 1 is PROVEN** — see above — and is unaffected by any of this,
+  because the Jira/Confluence artefact it reads is a single shared
+  resource with no per-daemon view; this agent's independent read of it
+  matches the story's exactly.
+- **This agent's own daemon cannot perform demonstration 6 at all**,
+  confirmed by direct, fresh, first-hand measurement (not inherited): its
+  `BUTCHR_PROJECT_ALLOWLIST` is empty, live, and its herd has never
+  contained a `BUTCHR` project-tier agent.
+- **A live specimen of "right question, wrong daemon"** producing a
+  confidently-wrong PROVEN-shaped answer, caught by re-deriving the check
+  rather than by a second read agreeing with the first (a second read of
+  the SAME wrong daemon would have agreed perfectly and been equally
+  wrong — the trap this repo's other docs and this ticket both name as
+  the dangerous one).
 
 ## What this document could not establish
 
-- Why the pane was reportedly held continuously for 24+ hours under a
-  config that (per the code read here) should force a stop attempt on
-  every ~5-minute project poll — see "An unresolved tension" above.
-- Whether the `2026-09-02T14:21:59Z` log line `[labels] BUTCHR: quiet
-  label writes enabled (ADMINISTER_PROJECTS)` is the same administrative
-  grant the story refers to as unblocking the property write, or a
-  separate permission surface. Circumstantial (same daemon boot, close in
-  time to the grant being expected) but not independently confirmed to be
-  the identical grant.
-- Whether `herd.stop("BUTCHR")` was actually attempted-and-failed multiple
-  times before this measurement window, attempted-and-succeeded exactly
-  once, or never attempted at all before now — no log line recording this
-  call's outcome was found for the project id specifically.
+- The full daemon/Unix-user topology of this host — how many
+  `butchr.service` instances exist, under which users, and which one(s)
+  are authoritative for which projects. Not investigated further, per the
+  story's explicit instruction not to chase the multi-daemon situation
+  itself.
+- Whether the `2026-09-02T14:21:59Z` log line, on THIS agent's own
+  (wrong-for-this-purpose) daemon, `[labels] BUTCHR: quiet label writes
+  enabled (ADMINISTER_PROJECTS)`, is the same administrative grant the
+  story refers to as unblocking the property write, or a separate
+  permission surface — and, now that this agent's daemon is known not to
+  be the one staffing `BUTCHR`'s project agent, whether that log line is
+  even relevant to demonstration 6 at all.
+- Demonstration 6 itself — PROVEN or FAILED — which this document
+  explicitly does not attempt to resolve from inherited snapshots of a
+  daemon this agent cannot independently query, for the reasons above.
