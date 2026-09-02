@@ -56,6 +56,24 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("crashLoopCount defaults to 5, honours BUTCHR_CRASHLOOP_COUNT, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).crashLoopCount).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_CRASHLOOP_COUNT: "3" }, noRead).crashLoopCount).toBe(3);
+    expect(() => loadConfig({ ...base, BUTCHR_CRASHLOOP_COUNT: "0" }, noRead)).toThrow(/BUTCHR_CRASHLOOP_COUNT/);
+    expect(() => loadConfig({ ...base, BUTCHR_CRASHLOOP_COUNT: "nope" }, noRead)).toThrow(/BUTCHR_CRASHLOOP_COUNT/);
+  });
+
+  test("crashLoopWindowMinutes defaults to 60, honours BUTCHR_CRASHLOOP_WINDOW_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).crashLoopWindowMinutes).toBe(60);
+    expect(loadConfig({ ...base, BUTCHR_CRASHLOOP_WINDOW_MINUTES: "30" }, noRead).crashLoopWindowMinutes).toBe(30);
+    expect(() => loadConfig({ ...base, BUTCHR_CRASHLOOP_WINDOW_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_CRASHLOOP_WINDOW_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_CRASHLOOP_WINDOW_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_CRASHLOOP_WINDOW_MINUTES/);
+  });
+
+  test("describeConfig includes crashLoopCount/crashLoopWindowMinutes", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("crashLoopCount=5 crashLoopWindowMinutes=60");
+  });
+
   test("unresponsiveMinutes defaults to 5, honours BUTCHR_UNRESPONSIVE_MINUTES, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).unresponsiveMinutes).toBe(5);
     expect(loadConfig({ ...base, BUTCHR_UNRESPONSIVE_MINUTES: "15" }, noRead).unresponsiveMinutes).toBe(15);

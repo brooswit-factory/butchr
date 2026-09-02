@@ -1,0 +1,310 @@
+{
+  "timestampUtc": "2026-09-02T09:52:23.358Z",
+  "repo": "brooswit-factory/butchr",
+  "pr": 190,
+  "commands": [
+    "gh api repos/brooswit-factory/butchr/pulls/190/reviews",
+    "gh api repos/brooswit-factory/butchr/pulls/190/reviews/5087810684",
+    "gh api repos/brooswit-factory/butchr/pulls/190/reviews/5088049611",
+    "gh api repos/brooswit-factory/butchr/pulls/190/reviews/5088066213",
+    "gh pr view 190 --repo brooswit-factory/butchr --json reviews",
+    "gh pr view 190 --repo brooswit-factory/butchr --json headRefOid,reviewDecision,state,mergedAt"
+  ],
+  "restList": [
+    {
+      "id": 5087810684,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HUfA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R1 at H1.\n\nREVIEWED-SHA: af4a01cf4ca16040f79f86fad863d9640e003611\n\nCHANGES_REQUESTED is requested here as an INSTRUMENT STATE, not as a criticism of this PR — there is nothing wrong with it. R1 exists to test whether CHANGES_REQUESTED freezes its recorded commit while APPROVED tracks the head. Throwaway; DO NOT MERGE. Verified: single new scratch file, 7 added lines; branch is 13 commits behind origin/main, so the step-4 base-merge to H4 will be a real merge.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. R1's body is the most valuable one to re-read at T1, because if the body holds while .commit_id moves, that is a direct answer to Q2.",
+      "state": "CHANGES_REQUESTED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5087810684",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5087810684"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:07Z",
+      "commit_id": "af4a01cf4ca16040f79f86fad863d9640e003611"
+    },
+    {
+      "id": 5088049611,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0V5yw",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R2 at H2.\n\nREVIEWED-SHA: 199195819ff61e3c55b992ef484da4918baa0d38\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. R2 is the review that was intended to separate state from recency; note that under the two-condition rule now standing, R2's chain is already broken by the H1->H2 plain commit, so a null here is expected and is NOT evidence for recency.\n\nThe sha above is written into this body deliberately: the review body is the one record measured so far to hold immutably while .commit_id moves.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088049611",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088049611"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:44:23Z",
+      "commit_id": "199195819ff61e3c55b992ef484da4918baa0d38"
+    },
+    {
+      "id": 5088066213,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0W6pQ",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R3 at H3.\n\nREVIEWED-SHA: 652d1af2cec59e0b7ea73ab007dc1c5902069c41\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. Verified before approving: H3 is a single-parent plain commit on top of H2, which is what Arm C's design requires. R3 is the review whose chain will be intact when the step-4 base-merge lands, so R3 is the one expected to advance.\n\nThe sha above is in this body deliberately: the body is the one record measured so far to hold immutably while .commit_id moves.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088066213",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088066213"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:46:17Z",
+      "commit_id": "5e49e76fd874c8eb5b63379b52d44a577e868d98"
+    }
+  ],
+  "restById": {
+    "5087810684": {
+      "id": 5087810684,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HUfA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R1 at H1.\n\nREVIEWED-SHA: af4a01cf4ca16040f79f86fad863d9640e003611\n\nCHANGES_REQUESTED is requested here as an INSTRUMENT STATE, not as a criticism of this PR — there is nothing wrong with it. R1 exists to test whether CHANGES_REQUESTED freezes its recorded commit while APPROVED tracks the head. Throwaway; DO NOT MERGE. Verified: single new scratch file, 7 added lines; branch is 13 commits behind origin/main, so the step-4 base-merge to H4 will be a real merge.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. R1's body is the most valuable one to re-read at T1, because if the body holds while .commit_id moves, that is a direct answer to Q2.",
+      "state": "CHANGES_REQUESTED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5087810684",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5087810684"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:07Z",
+      "commit_id": "af4a01cf4ca16040f79f86fad863d9640e003611"
+    },
+    "5088049611": {
+      "id": 5088049611,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0V5yw",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R2 at H2.\n\nREVIEWED-SHA: 199195819ff61e3c55b992ef484da4918baa0d38\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. R2 is the review that was intended to separate state from recency; note that under the two-condition rule now standing, R2's chain is already broken by the H1->H2 plain commit, so a null here is expected and is NOT evidence for recency.\n\nThe sha above is written into this body deliberately: the review body is the one record measured so far to hold immutably while .commit_id moves.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088049611",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088049611"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:44:23Z",
+      "commit_id": "199195819ff61e3c55b992ef484da4918baa0d38"
+    },
+    "5088066213": {
+      "id": 5088066213,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0W6pQ",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R3 at H3.\n\nREVIEWED-SHA: 652d1af2cec59e0b7ea73ab007dc1c5902069c41\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. Verified before approving: H3 is a single-parent plain commit on top of H2, which is what Arm C's design requires. R3 is the review whose chain will be intact when the step-4 base-merge lands, so R3 is the one expected to advance.\n\nThe sha above is in this body deliberately: the body is the one record measured so far to hold immutably while .commit_id moves.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088066213",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/190#pullrequestreview-5088066213"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/190"
+        }
+      },
+      "submitted_at": "2026-09-02T09:46:17Z",
+      "commit_id": "5e49e76fd874c8eb5b63379b52d44a577e868d98"
+    }
+  },
+  "graphql": [
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL0HUfA",
+      "author": {
+        "login": "booswrit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R1 at H1.\n\nREVIEWED-SHA: af4a01cf4ca16040f79f86fad863d9640e003611\n\nCHANGES_REQUESTED is requested here as an INSTRUMENT STATE, not as a criticism of this PR — there is nothing wrong with it. R1 exists to test whether CHANGES_REQUESTED freezes its recorded commit while APPROVED tracks the head. Throwaway; DO NOT MERGE. Verified: single new scratch file, 7 added lines; branch is 13 commits behind origin/main, so the step-4 base-merge to H4 will be a real merge.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. R1's body is the most valuable one to re-read at T1, because if the body holds while .commit_id moves, that is a direct answer to Q2.",
+      "submittedAt": "2026-09-02T09:19:07Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "CHANGES_REQUESTED",
+      "commit": {
+        "oid": "af4a01cf4ca16040f79f86fad863d9640e003611"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL0V5yw",
+      "author": {
+        "login": "booswrit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R2 at H2.\n\nREVIEWED-SHA: 199195819ff61e3c55b992ef484da4918baa0d38\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. R2 is the review that was intended to separate state from recency; note that under the two-condition rule now standing, R2's chain is already broken by the H1->H2 plain commit, so a null here is expected and is NOT evidence for recency.\n\nThe sha above is written into this body deliberately: the review body is the one record measured so far to hold immutably while .commit_id moves.",
+      "submittedAt": "2026-09-02T09:44:23Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "199195819ff61e3c55b992ef484da4918baa0d38"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL0W6pQ",
+      "author": {
+        "login": "booswrit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm C, review R3 at H3.\n\nREVIEWED-SHA: 652d1af2cec59e0b7ea73ab007dc1c5902069c41\n\nInstrument approval on a throwaway measurement PR. DO NOT MERGE. Verified before approving: H3 is a single-parent plain commit on top of H2, which is what Arm C's design requires. R3 is the review whose chain will be intact when the step-4 base-merge lands, so R3 is the one expected to advance.\n\nThe sha above is in this body deliberately: the body is the one record measured so far to hold immutably while .commit_id moves.",
+      "submittedAt": "2026-09-02T09:46:17Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "5e49e76fd874c8eb5b63379b52d44a577e868d98"
+      }
+    }
+  ],
+  "prMeta": {
+    "headRefOid": "5e49e76fd874c8eb5b63379b52d44a577e868d98",
+    "mergedAt": null,
+    "reviewDecision": "APPROVED",
+    "state": "CLOSED"
+  }
+}

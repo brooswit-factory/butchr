@@ -22,7 +22,7 @@ export const loadTestPathFor = (file: string) => `test/load/${file.replace(/\.ts
 export const RUNS_ON_IMPORT = new Set([
   "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/collate.ts",
   "scripts/release/notes.ts", "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
-  "scripts/verify-spawn-effort.ts", "scripts/verify-workspace-ground-truth.ts", "src/daemon/index.ts",
+  "scripts/verify-spawn-effort.ts", "scripts/verify-workspace-ground-truth.ts", "scripts/verify-review-commit-immutability.ts", "src/daemon/index.ts",
   // BUTCHR-54: a real build step (spawns `git`, invokes `Bun.build`, writes
   // `dist/`) — importing it must not actually run all that as a side effect
   // of a "does this load" check.
