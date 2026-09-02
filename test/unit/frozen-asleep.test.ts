@@ -380,7 +380,13 @@ describe("createFrozenAsleepDetector: the project-tier reader must read back wha
         pageComments.push({ id, body });
         return { ok: true, id };
       },
-      getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
+      // BUTCHR-171 correction: this reversal is fixture convenience ONLY
+      // (pageComments is pushed oldest-first) — getPageComments requests no
+      // `sort` and is NOT newest-first the way AtlassianClient.comments()
+      // is; the false claim previously here pinned exactly that confusion.
+      // Callers must not (and, since BUTCHR-171, do not — see
+      // createOwnChannelComments' own numeric-id sort) trust this raw order.
+      getPageComments: async () => ({ results: [...pageComments].reverse() }),
     });
     // The REAL, IMPORTED reader (src/tools/speak.ts) — not a reproduction.
     // `issueComments` is unreachable for a project key (BUTCHR), so a stub

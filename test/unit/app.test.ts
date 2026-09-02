@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
+import { createCoverageTracker } from "../../src/daemon/coverage.js";
 import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
@@ -318,6 +319,92 @@ describe("/health carries build identity as a sibling of components, never insid
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
       expect(body.build).toBeUndefined();
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-179: /health carries per-detector "could not check" coverage as a
+// SECOND sibling, alongside build (BUTCHR-54) — never inside components[],
+// and never able to flip `ok`, for the same reason build can't: a detector
+// declining to verify one ticket (a transient Atlassian fetch failure) does
+// not mean the DAEMON itself is unhealthy. Driven through the real
+// production composition (combineHealth + buildApp + a real listening
+// server), same as the build-identity tests above.
+describe("/health carries detector coverage as a sibling of components, and never flips ok (BUTCHR-179)", () => {
+  test("combineHealth's optional coverage param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const coverage = createCoverageTracker(() => 1_700_000_000_000);
+    coverage.recordChecked("stalled");
+    coverage.recordChecked("stalled");
+    coverage.recordDeclined("escalation:unresponsive");
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, coverage.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.coverage).toEqual([
+        { name: "stalled", checkedCount: 2, declinedCount: 0, lastDeclinedAt: null },
+        { name: "escalation:unresponsive", checkedCount: 0, declinedCount: 1, lastDeclinedAt: new Date(1_700_000_000_000).toISOString() },
+      ]);
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "checkedCount" in c || "declinedCount" in c)).toBe(false);
+      // A detector declining for one ticket is not thereby a daemon liveness
+      // failure: `ok` here reflects pollLoop's own state (fresh — recordSuccess
+      // was called), completely independent of the coverage snapshot's
+      // decline count.
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("a coverage snapshot full of declines still leaves ok true when every component is healthy — declining never fails closed the OTHER way", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const coverage = createCoverageTracker();
+    for (let i = 0; i < 5; i++) coverage.recordDeclined("stalled");
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, coverage.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.coverage).toEqual([{ name: "stalled", checkedCount: 0, declinedCount: 5, lastDeclinedAt: expect.any(String) }]);
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting coverage (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.coverage).toBeUndefined();
       expect(body.ok).toBe(true);
     } finally {
       health.stop();

@@ -310,9 +310,33 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // stays `c?.version?.authorId` — defensive by CHOICE now, not by doubt:
     // a value this codebase has already measured once is still worth
     // reading defensively, since nothing pins Atlassian to keep returning it.
+    //
+    // CREATED (BUTCHR-171): the same live measurement two comments up
+    // already lists `createdAt` among the observed `version` keys — this
+    // was a lead sitting unused, not a new read. Confirmed again here via
+    // confluence.js's OWN schema + runtime (v3.2.0, not live Confluence):
+    // `PageFooterCommentsSchema`'s `results[].version.createdAt` is
+    // declared `z.ZodCoercedDate`, and `createClient.js` runs every
+    // schema-declared response through `schema.safeParse`, returning the
+    // PARSED data on success — so `c.version.createdAt`, if present, is
+    // already a real `Date` object by the time it reaches this `.then`,
+    // never a string. `.toISOString()` converts it back to the ISO string
+    // `AtlassianOps.getPageComments` declares; `instanceof Date` guards the
+    // (undocumented, never observed, but not schema-impossible) case where
+    // the raw value fails coercion and the schema's own optionality lets it
+    // through as something else — read defensively for the same reason
+    // `author` above is, not because either has been observed to fail.
+    // Deliberately NOT `?? deps.now()` or any other synthesis: an
+    // unavailable `created` must read as unavailable (`undefined`), never
+    // as "just now" — see this op's doc comment on AtlassianOps.
     getPageComments: (pageId) =>
       wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
-        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "", author: c?.version?.authorId })),
+        results: (r?.results ?? []).map((c: any) => ({
+          id: c.id,
+          body: c?.body?.storage?.value ?? "",
+          author: c?.version?.authorId,
+          created: c?.version?.createdAt instanceof Date ? c.version.createdAt.toISOString() : undefined,
+        })),
       })),
 
     // MEASURED live (2026-09-01, re-confirmed after an initial "null" read

@@ -418,4 +418,97 @@ describe("createLabelSync", () => {
     await sync([]); // still gone; cleanup retried, now succeeds
     expect(calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:idle"] }]);
   });
+
+  // BUTCHR-179: syncLabels is the worked example (promoted to the STANDARD
+  // a coverage consumer must match) of correctly distinguishing all three
+  // stalled.check() outcomes. These tests are the CONSUMER half of that
+  // ticket: they prove `deps.coverage` is fed the right verb for each of
+  // the three states, not a naive `x === true`/`!x` collapse that would
+  // silently merge "not found" and "could not check" (or "found" and "not
+  // found") into the same bucket one line below the fix that removed the
+  // original collapse.
+  describe("coverage recording (BUTCHR-179)", () => {
+    function fakeCoverage() {
+      const calls: Array<{ op: "checked" | "declined"; name: string }> = [];
+      return { calls, recordChecked: (name: string) => calls.push({ op: "checked", name }), recordDeclined: (name: string) => calls.push({ op: "declined", name }) };
+    }
+
+    test("check() resolves true (found): recordChecked fires, recordDeclined never does", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(coverage.calls).toEqual([{ op: "checked", name: "stalled" }]);
+    });
+
+    test("check() resolves false (checked, not found): recordChecked fires — this is NOT a decline", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "working"]]),
+        stalled: { check: async () => false, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(coverage.calls).toEqual([{ op: "checked", name: "stalled" }]);
+    });
+
+    test("check() resolves null (could not check): recordDeclined fires — the naive-collapse trap this criterion exists to catch", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => null, forget: () => {} },
+        coverage,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(coverage.calls).toEqual([{ op: "declined", name: "stalled" }]);
+    });
+
+    test("all three states across consecutive polls produce three DISTINCT verbs, in order — nothing collapses", async () => {
+      const coverage = fakeCoverage();
+      const results: Array<boolean | null> = [true, false, null];
+      let i = 0;
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => results[i++]!, forget: () => {} },
+        coverage,
+      });
+      const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+      await sync([issue]);
+      await sync([issue]);
+      await sync([issue]);
+      expect(coverage.calls).toEqual([
+        { op: "checked", name: "stalled" },
+        { op: "checked", name: "stalled" },
+        { op: "declined", name: "stalled" },
+      ]);
+    });
+
+    test("no stalled checker configured (feature disabled): coverage is never touched — an absent detector must not claim coverage", async () => {
+      const coverage = fakeCoverage();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        coverage,
+        // no `stalled` dep at all
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(coverage.calls).toEqual([]);
+    });
+
+    test("omitting coverage entirely (existing callers/fixtures) does not throw — fully backward compatible", async () => {
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => null, forget: () => {} },
+      });
+      await expect(sync([iss("KAN-1", "In Progress", ["agent:idle"])])).resolves.toBeInstanceOf(Set);
+    });
+  });
 });

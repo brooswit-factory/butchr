@@ -1,5 +1,7 @@
 import { hostname } from "node:os";
 import { readFileSync } from "node:fs";
+import type { BuildIdentity } from "./build-identity.js";
+import { renderBuildCurrencyLines, type CurrencyVerdict } from "./build-currency.js";
 
 /**
  * The systemd unit this process runs under, derived from `/proc/self/cgroup`.
@@ -108,8 +110,17 @@ export function deriveGroundTruth(mcpUrl: string): GroundTruth {
  * so a careful reader has SOMETHING to compare against (how long has this
  * agent been running relative to this timestamp?) even though nothing here
  * makes that comparison automatically.
+ *
+ * BUTCHR-182 (implements BUTCHR-176): `measured at` says WHEN this was
+ * written, never WHICH BUILD wrote it or whether that build is current —
+ * this function now also takes `build` (BUTCHR-54's `BuildIdentity`
+ * singleton) and `currency` (`src/agents/build-currency.ts`'s comparison
+ * against the local `refs/remotes/origin/main`) and renders both via
+ * `renderBuildCurrencyLines`, so an agent reading THIS block — the one file
+ * it is told is authoritative — can also tell whether the code producing its
+ * fleet's behaviour is the code it thinks it is.
  */
-export function groundTruthText(gt: GroundTruth): string {
+export function groundTruthText(gt: GroundTruth, build: BuildIdentity, currency: CurrencyVerdict): string {
   const unitLine = gt.systemd.kind === "none" ? "(none — not running under a systemd unit)" : gt.systemd.unit;
   const journalLine = gt.systemd.kind === "none" ? "not running under a systemd unit — no journal to read" : gt.systemd.journalctl;
   return [
@@ -131,6 +142,21 @@ export function groundTruthText(gt: GroundTruth): string {
     "when your workspace is built, and nothing rewrites it later. If the daemon",
     "that built it has since restarted, the pid (and possibly the port) above",
     "can be stale — nothing here detects that for you.",
+    "",
+    "## Build identity & currency",
+    "",
+    "The host/port/unit/pid above are still true and still authoritative — this",
+    "section answers a DIFFERENT question: whether the CODE this daemon is",
+    "running is the code you'd expect. Everything below describes THIS DAEMON",
+    "specifically — the one that built this workspace — and says nothing about",
+    "any other daemon that may also be running on this host: a host can run",
+    "more than one butchr daemon, under different Unix users — confirmed live.",
+    "A verdict below that is not CURRENT means behaviour you see when talking",
+    "to this daemon may reflect older code than what's on the base branch —",
+    'test "this daemon is not running the code that does X" before filing "X',
+    'does not work" as a bug.',
+    "",
+    ...renderBuildCurrencyLines(build, currency),
     "",
     "Two sharp edges, both confirmed live — read the exact command above, don't",
     "reconstruct one:",

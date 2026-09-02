@@ -1,4 +1,5 @@
 import type { BuildReport } from "../agents/build-identity.js";
+import type { DetectorCoverage } from "./coverage.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -37,6 +38,20 @@ export interface HealthStatus {
    * suite, unaffected by this addition.
    */
   build?: BuildReport;
+  /**
+   * BUTCHR-179: per-detector verification coverage — a SECOND sibling,
+   * alongside `build`, for the same reason `build` is one: `ok` is the AND
+   * over liveness `components[]` on purpose, and a detector declining to
+   * verify one ticket this poll (an Atlassian fetch that failed) does not
+   * mean the DAEMON is unhealthy — the poll loop itself completed fine.
+   * Conflating the two would make an external, transient, already-logged
+   * Atlassian degradation flip `ok` red, which an uptime checker would read
+   * as "restart the daemon" — actively unhelpful, since a restart fixes
+   * nothing about Atlassian. Absent entirely when the caller doesn't pass
+   * one to `combineHealth` (see `src/daemon/coverage.ts`'s `CoverageTracker`
+   * and its call sites for what populates this in production).
+   */
+  coverage?: DetectorCoverage[];
 }
 
 export interface LoopHealthOptions {
@@ -73,13 +88,19 @@ export interface LoopHealth {
  * contract untouched (BUTCHR-18/BUTCHR-6's callers, and any test built on
  * that shape, are unaffected); a caller with more than one liveness signal to
  * report (the poll loop, the notify stage) calls each instance's `status()`
- * and combines the results here instead. `build` (BUTCHR-54) rides along as
- * a sibling field on the returned `HealthStatus` — see that type's own doc
- * comment for why it is never folded into `components[]`.
+ * and combines the results here instead. `build` (BUTCHR-54) and `coverage`
+ * (BUTCHR-179) both ride along as sibling fields on the returned
+ * `HealthStatus` — see each type's own doc comment for why neither is ever
+ * folded into `components[]`.
  */
-export const combineHealth = (components: readonly LoopHealth[], build?: BuildReport): HealthStatus => {
+export const combineHealth = (components: readonly LoopHealth[], build?: BuildReport, coverage?: readonly DetectorCoverage[]): HealthStatus => {
   const statuses = components.map((c) => c.status());
-  return { ok: statuses.every((s) => s.ok), components: statuses.flatMap((s) => s.components), ...(build ? { build } : {}) };
+  return {
+    ok: statuses.every((s) => s.ok),
+    components: statuses.flatMap((s) => s.components),
+    ...(build ? { build } : {}),
+    ...(coverage ? { coverage: [...coverage] } : {}),
+  };
 };
 
 const fmtSecs = (ms: number): string => `${Math.round(ms / 1000)}s`;
