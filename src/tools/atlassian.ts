@@ -178,18 +178,24 @@ export interface AtlassianOps {
    * this file's `getIssueComments` doc comment states the same rule for the
    * issue-comments axis).
    *
-   * NEVER THE BATCH `GET /wiki/api/v2/pages?id=A&id=B` SHAPED FORM: MEASURED
-   * live, a batch-shaped footer-comments call returns a plausible, WRONG
-   * count with no error (ignores the `id` filter entirely) — see
-   * `getPageVersions`'s own doc comment, which names this exact trap. This
-   * op is per-page ONLY; do not "optimize" it into a batch call.
+   * NEVER THE BATCH `GET /wiki/api/v2/footer-comments?id=A&id=B` SHAPED FORM:
+   * MEASURED live TWICE now (BUTCHR-107, once at this ticket's filing and
+   * again by its reviewer on 2026-09-02) — a batch-shaped call asking for 2
+   * pages holding 2 comments between them came back HTTP 200 with **16
+   * results spanning 10 distinct pageIds**, most of them unrelated pages
+   * nobody asked about; it ignores the `id` filter entirely, silently. See
+   * `getPageVersions`'s own doc comment, which names this exact trap for the
+   * version-read axis. This op is per-page ONLY; do not "optimize" it into a
+   * batch call.
    *
    * `author` is the commenting user's Atlassian accountId (`version.authorId`
    * on the raw footer-comment resource), OPTIONAL/UNDEFINED when the
    * underlying read didn't carry one — never defaulted to a placeholder
    * string, so a caller can tell "no author on this comment" from "this
-   * accountId". See atlassian-real.ts's implementation for what was actually
-   * checked about this field's presence.
+   * accountId". MEASURED live (BUTCHR-107 reviewer, 2026-09-02): present and
+   * populated on the default response, no `expand` needed or even available
+   * on this endpoint — see atlassian-real.ts's implementation for the full
+   * measurement.
    */
   getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string; author?: string }> }>;
 
