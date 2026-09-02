@@ -1,0 +1,118 @@
+{
+  "timestampUtc": "2026-09-02T09:51:55.453Z",
+  "repo": "brooswit-factory/butchr",
+  "pr": 189,
+  "commands": [
+    "gh api repos/brooswit-factory/butchr/pulls/189/reviews",
+    "gh api repos/brooswit-factory/butchr/pulls/189/reviews/5087810416",
+    "gh pr view 189 --repo brooswit-factory/butchr --json reviews",
+    "gh pr view 189 --repo brooswit-factory/butchr --json headRefOid,reviewDecision,state,mergedAt"
+  ],
+  "restList": [
+    {
+      "id": 5087810416,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HTcA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm B (plain commit).\n\nREVIEWED-SHA: 8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1\n\nThrowaway measurement instrument, not a deliverable. DO NOT MERGE. Verified: single new scratch file, 5 added lines; branch is level with origin/main (0 behind), which is correct for this arm — no base-merge is wanted here, only an ordinary commit on top.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. Compare against .commit_id at T0 and T1.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/189#pullrequestreview-5087810416",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/189",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/189#pullrequestreview-5087810416"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/189"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:05Z",
+      "commit_id": "8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1"
+    }
+  ],
+  "restById": {
+    "5087810416": {
+      "id": 5087810416,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL0HTcA",
+      "user": {
+        "login": "booswrit",
+        "id": 322290609,
+        "node_id": "U_kgDOEzXDsQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/322290609?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/booswrit",
+        "html_url": "https://github.com/booswrit",
+        "followers_url": "https://api.github.com/users/booswrit/followers",
+        "following_url": "https://api.github.com/users/booswrit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/booswrit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/booswrit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/booswrit/subscriptions",
+        "organizations_url": "https://api.github.com/users/booswrit/orgs",
+        "repos_url": "https://api.github.com/users/booswrit/repos",
+        "events_url": "https://api.github.com/users/booswrit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/booswrit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm B (plain commit).\n\nREVIEWED-SHA: 8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1\n\nThrowaway measurement instrument, not a deliverable. DO NOT MERGE. Verified: single new scratch file, 5 added lines; branch is level with origin/main (0 behind), which is correct for this arm — no base-merge is wanted here, only an ordinary commit on top.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. Compare against .commit_id at T0 and T1.",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/189#pullrequestreview-5087810416",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/189",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/189#pullrequestreview-5087810416"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/189"
+        }
+      },
+      "submitted_at": "2026-09-02T09:19:05Z",
+      "commit_id": "8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1"
+    }
+  },
+  "graphql": [
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL0HTcA",
+      "author": {
+        "login": "booswrit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "BUTCHR-114 reviewing as instrument for BUTCHR-138 Arm B (plain commit).\n\nREVIEWED-SHA: 8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1\n\nThrowaway measurement instrument, not a deliverable. DO NOT MERGE. Verified: single new scratch file, 5 added lines; branch is level with origin/main (0 behind), which is correct for this arm — no base-merge is wanted here, only an ordinary commit on top.\n\nThe sha above is written into this body deliberately: the review body is one of the two candidate immutable records under test. Compare against .commit_id at T0 and T1.",
+      "submittedAt": "2026-09-02T09:19:05Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "8beea0a93085cdfe0ad8823c3ad87c14c9f6c7d1"
+      }
+    }
+  ],
+  "prMeta": {
+    "headRefOid": "cf13c8d4924d011ce48a792ad5a669c852c84fe0",
+    "mergedAt": null,
+    "reviewDecision": "APPROVED",
+    "state": "OPEN"
+  }
+}
