@@ -1,3 +1,5 @@
+import type { BuildReport } from "../agents/build-identity.js";
+
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
  *
@@ -24,6 +26,17 @@ export interface ComponentHealth {
 export interface HealthStatus {
   ok: boolean;
   components: ComponentHealth[];
+  /**
+   * BUTCHR-54: this daemon's own running build identity (sha/version/start/
+   * pid/unit) — deliberately a SIBLING field, never an entry in
+   * `components[]`. `ok` is the AND over components on purpose (liveness);
+   * a daemon that doesn't know its own sha is not thereby unhealthy, so
+   * build identity must never be able to flip `ok`. Absent entirely when
+   * the caller (see src/daemon/index.ts) doesn't pass one to
+   * `combineHealth` — e.g. every existing test fixture in this file's test
+   * suite, unaffected by this addition.
+   */
+  build?: BuildReport;
 }
 
 export interface LoopHealthOptions {
@@ -60,11 +73,13 @@ export interface LoopHealth {
  * contract untouched (BUTCHR-18/BUTCHR-6's callers, and any test built on
  * that shape, are unaffected); a caller with more than one liveness signal to
  * report (the poll loop, the notify stage) calls each instance's `status()`
- * and combines the results here instead.
+ * and combines the results here instead. `build` (BUTCHR-54) rides along as
+ * a sibling field on the returned `HealthStatus` — see that type's own doc
+ * comment for why it is never folded into `components[]`.
  */
-export const combineHealth = (components: readonly LoopHealth[]): HealthStatus => {
+export const combineHealth = (components: readonly LoopHealth[], build?: BuildReport): HealthStatus => {
   const statuses = components.map((c) => c.status());
-  return { ok: statuses.every((s) => s.ok), components: statuses.flatMap((s) => s.components) };
+  return { ok: statuses.every((s) => s.ok), components: statuses.flatMap((s) => s.components), ...(build ? { build } : {}) };
 };
 
 const fmtSecs = (ms: number): string => `${Math.round(ms / 1000)}s`;

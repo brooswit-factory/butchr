@@ -25,7 +25,7 @@
     "test:unit": "bun test test/unit test/load && bun run scripts/coverage/gate.ts",
     "release:check": "bun run scripts/release/check.ts",
     "check": "bun run scripts/preflight.ts && bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
-    "build": "bun build src/daemon/index.ts --outfile dist/butchr.js --target bun && printf '#!/usr/bin/env bun\\n' | cat - dist/butchr.js > dist/butchr.tmp && mv dist/butchr.tmp dist/butchr.js && chmod +x dist/butchr.js"
+    "build": "bun run scripts/build/build.ts"
   },
   "dependencies": {
     "@brooswit/herdr-sdk": "^0.1.2",
