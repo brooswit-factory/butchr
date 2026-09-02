@@ -172,6 +172,13 @@ export interface ReconcileOptions {
   guard?: RespawnGuard;
   /** Called, with the exact line to log, when the storm guard suppresses a would-be respawn. */
   onSuppressed?: (issue: string, message: string) => void;
+  /**
+   * BUTCHR-66/83: resource ids currently `"asleep"` — see `planReconcile`'s
+   * `atRest` param, which this is threaded straight through to. Defaults to
+   * empty, so a caller with no asleep-capable resource type (every existing
+   * one) is unaffected.
+   */
+  atRest?: Iterable<string>;
 }
 
 /**
@@ -190,7 +197,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
-  const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys());
+  const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys(), opts.atRest ?? []);
   // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
   // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
   // burst of N new spawns (e.g. several stories activating in one poll)
@@ -222,12 +229,35 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
  * The issue tier's own call site (`runResourceLoop` below, via `startLoop`'s
  * compatibility shim) is `desiredFrom(issues, someIssueResourceType)`; a
  * second resource type calls this with its own instance, unchanged.
+ *
+ * BUTCHR-66/83: only a `"active"` verdict is desired. An `"asleep"` resource
+ * is deliberately excluded here, same as `"inactive"` — this is what makes
+ * `spawn = desired − running` and `respawn = stale ∩ desired ∩ running`
+ * automatically correct for sleep (see `planReconcile`'s doc comment for the
+ * one case that is NOT automatic: `stop`, which needs `atRestFrom` below).
  */
 export const desiredFrom = <T>(items: readonly T[], resourceType: Pick<ResourceType<T>, "activation" | "spawnConfig" | "discovery">): Map<string, SpawnSpec> => {
   const out = new Map<string, SpawnSpec>();
   for (const item of items) {
-    if (!resourceType.activation.isActive(item)) continue;
+    if (resourceType.activation.verdictFor(item) !== "active") continue;
     out.set(resourceType.discovery.idOf(item), resourceType.spawnConfig.specFor(item));
+  }
+  return out;
+};
+
+/**
+ * The at-rest set (BUTCHR-66/83): resource ids whose verdict is `"asleep"` —
+ * fed to `planReconcile`'s `atRest` param (via `reconcileNow`'s `opts.atRest`)
+ * so `stop = running − desired` does not also catch a currently-running
+ * asleep resource (the mid-exit race — see `ReconcileOptions.atRest`'s doc
+ * comment). Sibling to `desiredFrom`, over the same `(items, resourceType)`
+ * shape, so a resource type that never sleeps (e.g. the issue tier) simply
+ * always produces an empty set here.
+ */
+export const atRestFrom = <T>(items: readonly T[], resourceType: Pick<ResourceType<T>, "activation" | "discovery">): Set<string> => {
+  const out = new Set<string>();
+  for (const item of items) {
+    if (resourceType.activation.verdictFor(item) === "asleep") out.add(resourceType.discovery.idOf(item));
   }
   return out;
 };
@@ -311,10 +341,12 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
     async () => {
       const issues = await resourceType.discovery.search();
       const desired = desiredFrom(issues, resourceType);
+      const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(deps.herd, desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
+        atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
