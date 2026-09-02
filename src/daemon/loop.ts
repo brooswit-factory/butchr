@@ -287,11 +287,31 @@ interface Snapshot<T> {
  * never an enumeration over the shared namespace, so they were never the
  * vector for this hazard.
  */
-function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
+export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
+  // BUTCHR-91 review fix: NOT `{ ...herd, runningIssues: ..., staleIssues: ... }`.
+  // In production `herd` is a `HerdrHerd` CLASS INSTANCE — its methods
+  // (spawn/stop/nudge/paneFor) live on the prototype, which object spread
+  // does not copy (spread copies only the instance's own enumerable
+  // properties, e.g. `herdr`/`mcpUrl`/`wait` — measured: `{...new
+  // HerdrHerd(...)}.spawn` is `undefined`). Every `Herd` in this codebase's
+  // tests is a plain object literal, where methods ARE own enumerable
+  // properties, so the spread "works" there and ONLY there — the test
+  // suite and the type checker (which models the declared `Herd` interface,
+  // not runtime enumerability) both certified a path that throws
+  // `herd.spawn is not a function` on the first real poll that needs to
+  // spawn or stop anything, for BOTH loops, swallowed by `onError` into a
+  // `loop error:` line — the daemon looks healthy while silently staffing
+  // nothing. Explicit delegation avoids this entirely, and is strictly
+  // safer besides: an object literal typed `Herd` fails to COMPILE if
+  // `Herd` ever gains a member, where the spread would have silently kept
+  // dropping it.
   return {
-    ...herd,
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
     staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
+    spawn: (spec) => herd.spawn(spec),
+    stop: (issue) => herd.stop(issue),
+    paneFor: (issue) => herd.paneFor(issue),
+    nudge: (issue, text) => herd.nudge(issue, text),
   };
 }
 
