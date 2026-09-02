@@ -2,6 +2,7 @@ import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
 import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
 import type { CaptureSink } from "./session-limit-watch.js";
 import { findMarked, RateCap, HOUR_MS } from "./escalation-helper.js";
+import type { CoverageRecorder } from "../daemon/coverage.js";
 
 const FOLLOWUP_MS = 15 * 60_000;
 const DEBOUNCE_POLLS = 2;
@@ -98,6 +99,20 @@ export interface EscalatorDeps {
    * exactly as it did before this ticket (comment only, no capture).
    */
   captures?: CaptureSink;
+  /**
+   * BUTCHR-179: reports the unresponsive-alarm's own declining verification
+   * (`escalateUnresponsive`'s `ownChannelComments` read) on `/health` — see
+   * src/daemon/coverage.ts. `recordChecked("escalation:unresponsive")` on a
+   * resolved read (adopted, rate-capped, or freshly posted — all a
+   * completed check), `recordDeclined("escalation:unresponsive")` on the
+   * caught rejection. Optional; omitted, coverage is simply not reported for
+   * this dimension, exactly as before this ticket. The other two declining
+   * sites in this module (`escalate`'s dedupe check, `handleBlocked`'s
+   * directive/follow-up check) are NOT wired to this yet — see BUTCHR-179's
+   * own report for why (deliberately scoped to two modules total, not all
+   * declining call sites in this one).
+   */
+  coverage?: CoverageRecorder;
 }
 
 interface PaneState {
@@ -399,8 +414,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     let rows: CommentRow[];
     try {
       rows = await deps.ownChannelComments(issue);
+      // BUTCHR-179: a resolved read is a COMPLETED check, whatever it finds
+      // downstream (adopted, rate-capped, or freshly posted) — coverage is
+      // about whether verification happened, not what it decided.
+      deps.coverage?.recordChecked("escalation:unresponsive");
     } catch (e) {
       log(`WARNING: [unresponsive] could not verify existing notices for ${issue} pane ${paneId} — skipping this poll's attempt rather than risk a duplicate: ${(e as Error)?.message ?? e}`);
+      deps.coverage?.recordDeclined("escalation:unresponsive");
       return null;
     }
     const existing = findMarked(rows, UNRESPONSIVE_MARKER, [paneKey(paneId)]);

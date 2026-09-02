@@ -2,6 +2,7 @@ import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
+import type { CoverageRecorder } from "../daemon/coverage.js";
 
 export interface LabelWriter {
   updateLabels(key: string, ops: { add?: readonly string[]; remove?: readonly string[] }): Promise<void>;
@@ -15,6 +16,15 @@ export interface SyncDeps {
   prState?: (key: string) => Promise<PrLookup>;
   /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
   stalled?: StalledCheck;
+  /**
+   * BUTCHR-179: reports `stalled.check`'s three-state result on `/health`
+   * (src/daemon/coverage.ts) — `recordChecked` for a resolved `true`/`false`
+   * (a completed verification, regardless of its answer), `recordDeclined`
+   * for `null` (the comments fetch failed). Optional so every existing
+   * caller/fixture is unaffected; when omitted, coverage is simply not
+   * reported for this dimension, exactly as before this ticket.
+   */
+  coverage?: CoverageRecorder;
   /**
    * Called once per poll with the keys this poll wrote daemon-owned labels
    * for (only when non-empty), so the caller can feed the own-write ledger
@@ -136,6 +146,19 @@ export function createLabelSync(deps: SyncDeps) {
         // spawn, continuously idle" streak sees every poll, not just the
         // ones where the result might matter.
         const stalledResult = deps.stalled ? await deps.stalled.check(issue.key, observed) : false;
+        // BUTCHR-179: report coverage only when a check was actually
+        // attempted (deps.stalled configured) — `stalledResult === false`
+        // from the ternary's OTHER branch (the detector disabled entirely)
+        // must never count as "checked", or /health would claim coverage
+        // for a dimension that never runs on this deployment. A definitive
+        // true/false answer (whether or not stalled.ts's own cheap
+        // precondition even attempted a fetch) still counts as "checked":
+        // sync.ts's question is "did this poll produce a trustworthy
+        // answer", not "did it cost an HTTP call".
+        if (deps.stalled) {
+          if (stalledResult === null) deps.coverage?.recordDeclined("stalled");
+          else deps.coverage?.recordChecked("stalled");
+        }
         const stalledNow = stalledResult === true;
         // Logged unconditionally, every poll it holds — unlike the LABEL
         // below, which is deliberately delayed by the stabilizer so a single
