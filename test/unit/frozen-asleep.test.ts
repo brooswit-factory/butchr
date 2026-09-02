@@ -2,8 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createFrozenAsleepDetector, MARKER } from "../../src/agents/frozen-asleep.js";
 import { findMarked } from "../../src/agents/escalation-helper.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
-import { speakOnOwnChannel, unwrapStorageParagraph } from "../../src/tools/speak.js";
-import { projectRootDoc } from "../../src/tools/docs.js";
+import { speakOnOwnChannel, unwrapStorageParagraph, createOwnChannelComments } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -322,20 +321,16 @@ describe("createFrozenAsleepDetector: rate cap (BUTCHR-95/123 DoD 6)", () => {
 // every test below round-trips through the REAL `speakOnOwnChannel` write
 // path rather than hand-typing a "storage-format-looking" string.
 //
-// `commentsOnOwnChannel` itself is deleted (not merely patched) as of this
-// ticket — see src/daemon/index.ts's `ownChannelComments` doc comment and
-// DoD 4 (exactly one project-aware reader survives, grep-verified). It
-// cannot be imported here to prove "before/after" directly: it lived as an
+// `commentsOnOwnChannel` itself is deleted (not merely patched) as of
+// BUTCHR-129 — see src/daemon/index.ts's `ownChannelComments` doc comment.
+// The BEFORE/AFTER tests below reproduce its raw (deleted) mapping by hand,
+// since that shape no longer exists anywhere to import; the END TO END test
+// further down imports the REAL, EXTRACTED reader (`createOwnChannelComments`,
+// src/tools/speak.ts, BUTCHR-141/§2.6) rather than reproducing it — the
+// extraction is what makes that possible: before it, this reader lived as an
 // unexported local in src/daemon/index.ts, a file that bootstraps a real
-// Atlassian/herdr daemon (and `process.exit`s on missing config) at module
-// load, entirely unsuited to a unit test (confirmed booting separately —
-// see this ticket's PR description). Both mapping shapes it and
-// `ownChannelComments` used are one line of glue around `CommentRow`,
-// reproduced verbatim below (`body: r.body` vs
-// `body: unwrapStorageParagraph(r.body)`) around REAL, imported production
-// code (`speakOnOwnChannel`, `projectRootDoc`, `unwrapStorageParagraph`,
-// `findMarked`) — the only two lines that could plausibly diverge from
-// daemon/index.ts's own, and grepped there to confirm they match.
+// Atlassian/herdr daemon (`process.exit`s on missing config) at module load,
+// entirely unsuited to a unit test.
 describe("createFrozenAsleepDetector: the project-tier reader must read back what speakOnOwnChannel actually wrote (BUTCHR-129)", () => {
   test("BEFORE: the RAW mapping (`body: r.body`, the deleted commentsOnOwnChannel's shape) reproduces the defect — findMarked never matches a real project-tier write", async () => {
     const pageComments: Array<{ pageId: string; body: string }> = [];
@@ -376,7 +371,7 @@ describe("createFrozenAsleepDetector: the project-tier reader must read back wha
     expect(found?.id).toBe("c1"); // FIXED: restart-adoption finds its own prior complaint
   });
 
-  test("END TO END: createFrozenAsleepDetector itself, wired with a `comments` reader shaped exactly like ownChannelComments's project branch, adopts a REAL project-tier write across a simulated daemon restart instead of re-posting", async () => {
+  test("END TO END: createFrozenAsleepDetector itself, wired with the REAL EXTRACTED createOwnChannelComments (BUTCHR-141/§2.6), adopts a REAL project-tier write across a simulated daemon restart instead of re-posting", async () => {
     let now = 0;
     const pageComments: Array<{ id: string; body: string }> = [];
     const ops = makeOps({
@@ -387,15 +382,10 @@ describe("createFrozenAsleepDetector: the project-tier reader must read back wha
       },
       getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
     });
-    // Exactly `ownChannelComments`'s project branch (src/daemon/index.ts) —
-    // reproduced here because that function is unexported and its file
-    // cannot be imported into a unit test (see this describe block's own
-    // top comment).
-    const comments = async (key: string) => {
-      const doc = await projectRootDoc(ops, key);
-      const { results } = await ops.getPageComments(doc.id);
-      return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
-    };
+    // The REAL, IMPORTED reader (src/tools/speak.ts) — not a reproduction.
+    // `issueComments` is unreachable for a project key (BUTCHR), so a stub
+    // that throws proves this test never accidentally exercises that branch.
+    const comments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
     const addComment = async (id: string, text: string) => { await speakOnOwnChannel(ops, id, text); };
 
     const projectId = "BUTCHR";
