@@ -1,10 +1,19 @@
-# Review-commit immutability — measurement (BUTCHR-138)
+# Review-commit immutability — measurement (BUTCHR-138, reconciled by BUTCHR-181)
 
 Answers, by direct measurement, whether a submitted GitHub PR review's
 recorded commit (`commit_id` / `reviews[].commit.oid`) is immutable, and
 under which branch operations it moves. Filed under BUTCHR-114 /
 BUTCHR-131 ("Review-protocol integrity: a recorded approval must
 correspond to the code that actually merges").
+
+**This correction reaches this file, on `main`, and nothing else.** It
+does not reach an agent whose `brief.md` is served from a daemon's
+checked-out tree rather than freshly cloned from `main` (a real,
+independently-confirmed gap — see BUTCHR-181's report on its own ticket
+for the measurement). It does not rewrite a `brief.md` already sitting on
+disk for an agent that is mid-run. It never reaches a context an agent
+already loaded before this landed. Landing this file is necessary and is
+not sufficient; closing that gap is BUTCHR-150's, not this document's.
 
 Repeatable verifier: `scripts/verify-review-commit-immutability.ts`
 (`snapshot <owner/repo> <pr-number> [out-file]`, `diff <a.json> <b.json>`).
@@ -33,6 +42,16 @@ Raw snapshots taken during this measurement are committed under
   is hand-transcribed and this measurement caught a real transcription
   error on its first use, so it needs to be machine-generated or
   validated to be trustworthy as a remedy, not merely "unrewritable."
+- **Q3** (BUTCHR-181, reconciling a later contradicting report,
+  BUTCHR-156): both measurements reproduce, in their own scope. The
+  property above survives fully — corroborated further by real,
+  already-merged PRs (#218, #219) that were never part of this document's
+  own scratch arms. BUTCHR-156's "rewritten forward for every review" and
+  "the staleness check cannot fail" do not survive as stated — they are
+  over-reach from a sample drawn entirely from the one case this
+  document already predicts moves (chain-intact clean base-merges),
+  contradicted by this document's own PR #172 data one section below.
+  See "Reconciling BUTCHR-156" near the end of this document.
 
 ## Method
 
@@ -798,6 +817,144 @@ Labelled explicitly as gaps, not folded into the answers above:
   consistent with either no classic protection or an unreadable one from
   this account. Recorded, not resolved.
 
+## Reconciling BUTCHR-156 (BUTCHR-181)
+
+BUTCHR-156's closing doc reported, as a correction to this document:
+
+> `reviews[].commit_id` is rewritten forward to the current head **for
+> every review** — measured across five reviews on two PRs, including
+> onto commits that did not exist when the review was submitted. The
+> staleness check built on it **cannot fail**. … It is not a race.
+
+Both this document and BUTCHR-156 are measurements, not opinions, and as
+generalised they cannot both be true. This section states what survives.
+Every check below states its falsifier before the result.
+
+**Check 1 — does PR #172 (already in this document, "Step 0" above)
+refute "rewritten forward for every review"?** Falsifier: if every review
+on merged PR #172 reports `commit.oid` equal to the current `headRefOid`,
+BUTCHR-156's claim survives; if any review reports a distinct historical
+sha, the universal claim is false on its face. Re-run 2026-09-02,
+`gh pr view 172 --repo brooswit-factory/butchr --json state,mergedAt,headRefOid,reviews`:
+
+```
+state=MERGED head=d443e80c911106725889a7aa2a34743ec377740d
+  CHANGES_REQUESTED @ efffc7d7e837a6bd321b7ccb8bd4e0ccc4f1e473  submitted 07:11:27Z
+  CHANGES_REQUESTED @ 9f06f0f7a9f4f71bcb6b43d7379bf6ec4156605c  submitted 07:17:57Z
+  APPROVED          @ d443e80c911106725889a7aa2a34743ec377740d  submitted 07:25:46Z
+```
+
+Two of three reviews hold distinct historical shas, not the head.
+**"Rewritten forward for every review" is false**, refuted by data
+already inside this same document, unchanged since it was written — #172
+has no merge commits in its history at all (Step 0 above), so per the
+property already established here, nothing in it ever had an opportunity
+to advance.
+
+**Check 2 — do BUTCHR-156's own observations fit this document's
+established chain-condition-and-clean-merge rule, or are they a genuine
+new counter-example?** BUTCHR-156's finding was measured on real,
+already-merged PRs #218 and #219 (not this document's scratch arms).
+Falsifier: if the merge commits responsible for each forward move are
+**not** clean auto-merges of their two parents — i.e. `git merge-tree
+--write-tree <parent1> <parent2>` produces a tree that differs from the
+merge commit's actual tree — then BUTCHR-156's data sits outside the
+chain+clean rule and is a real counter-example the property does not
+cover. If every such merge tree matches its auto-merge computation
+exactly, the existing rule already explains the data with no new
+mechanism.
+
+Reviews on #218 (re-read 2026-09-02, `gh pr view 218 --json headRefOid,reviews`):
+recorded at `42dea3e5`, `d9297744`, `74d731b6` in turn, matching
+BUTCHR-156's own report of "three reviews, three different shas,
+re-pointed with no new review submitted." Parent check
+(`gh api repos/.../commits/<sha> -q '.parents[].sha'`):
+
+```
+d9297744c1  parents = 42dea3e521, fe610a5eae   (42dea3e5 = parent[0])
+74d731b69e  parents = d9297744c1, b71056f86c   (d9297744 = parent[0])
+```
+
+— chain intact, parent[0], at both hops, exactly this document's already-
+established condition. Merge-tree check (`git merge-tree --write-tree
+<p1> <p2>`, compared to the merge commit's own tree via `git cat-file -p
+<merge> | awk '/^tree/{print $2}'`):
+
+```
+merge d9297744c1  actual_tree=5c762c08...  computed_tree=5c762c08...  MATCH
+merge 74d731b69e  actual_tree=6f814392...  computed_tree=6f814392...  MATCH
+```
+
+Same result on #219's two merges (`1d34d5ee`→`8232c539`,
+`8232c539`→`f17c16a0`): both clean, both chain-intact, both MATCH. **All
+four merges BUTCHR-156's finding rests on are clean auto-merges with the
+chain condition satisfied — precisely the one case this document's own
+Arm A and Arm C already established moves the recorded commit forward.**
+Nothing here needed a new scratch arm to explain: BUTCHR-156's real-world
+data is corroboration of Arm A/Arm C, not a counter-example to them.
+Snapshots taken read-only via this document's own verifier and committed
+alongside the historical ones: `brooswit-factory-butchr-pr172-*.json`,
+`-pr218-*.json`, `-pr219-*.json` in `docs/review-commit-immutability/snapshots/`.
+
+**Conclusion: both measurements are correct within the scope each one
+actually sampled. The generalisations are what is wrong, not the
+underlying readings.** BUTCHR-156 sampled five reviews across two PRs,
+and by its own account ("normal here rather than an exception") every
+one of them was a re-review forced by a mandatory base-merge — which,
+under this document's already-published property, is exactly the
+subset predicted to advance. Generalising "moves in the one case that
+was sampled" to "for every review" and "cannot fail" is over-reach this
+document's own #172 data already refutes, and was refutable before
+BUTCHR-156 published it, since #172 predates BUTCHR-156.
+
+**On "it is not a race":** this document does not claim the underlying
+mechanism *is* a race. The mechanism is stated as UNDETERMINED (see
+"Mechanism" above); the ~30–56s propagation window is presented as a
+secondary hazard about reading too soon after a push, not as the
+headline explanation for *why* the field ever moves. BUTCHR-156's remark
+is not wrong that a race is not the (whole) mechanism — that was never
+asserted here — but it mischaracterises what this document actually
+frames as the headline claim (the branch-contribution property) versus
+what it frames as a narrower, secondary caveat (the propagation
+window). Read as "the propagation window is not the reason the record
+moves on a clean merge," it is correct and already consistent with this
+document.
+
+**One genuinely new finding from BUTCHR-156, kept rather than
+discarded:** branch protection on this repo requires the head to be
+up to date before merge, which forces exactly the repeated base-merges
+BUTCHR-156 observed. Per the property above, each *clean* one of those
+merges legitimately advances the structured `commit.oid` forward — but
+the **Jira `[review] @ <sha>` line does not move**, being append-only.
+A reviewer comparing a *current* head against an *older* `[review]`
+line's sha will see a mismatch after every mandatory base-merge, even
+when nothing of the branch's own content changed. This is a real,
+separate hazard from the transcription risk already documented under
+Q2 — a false-appearance of staleness on the manual remedy, driven by a
+required operation the property already predicts is safe. Folded into
+"What this implies for the remedy" below.
+
+### What this changes about BUTCHR-73
+
+BUTCHR-73 (filed 2026-09-01, still To Do, unstaffed) asserts in its own
+**summary** — read by anyone who sees the board without opening the
+ticket — that GitHub re-pointing a review's commit on a base-merge makes
+the staleness check return "a false MERGE OK on the ordinary path," and
+argues the check "cannot distinguish" a clean base-merge from one
+carrying unreviewed hand-resolved content. That ticket predates this
+document's Test 2b (the chain-intact evil-merge trial, run 2026-09-02),
+which measured the opposite on the one trial run: with the chain
+condition satisfied, a merge carrying content beyond a clean auto-merge
+did **not** advance the recorded commit — it stayed behind, and the
+`recorded == head` check would have correctly flagged it STALE. That is
+n=1, not a closed case (see "What remains unestablished" above), but it
+is a direct, measured answer to the specific worry BUTCHR-73's summary
+states as settled. This is a finding for BUTCHR-73's future owner to
+read, not a claim that BUTCHR-73's remedy work is unnecessary — the
+open gaps this document already lists (replication of Test 2b,
+squash-merge/rebase/force-push, a genuine textual conflict, parent[0]
+vs. any parent) are exactly what would firm this up.
+
 ### What this implies for the remedy (not designed here — see BUTCHR-131)
 
 Recorded as implications, not as a design — the remedy itself belongs to
@@ -830,3 +987,14 @@ a separate, gated story:
   (`git diff --stat <reviewed-sha>...<head>`) available — but this was
   not tested against force-push, rebase, or squash-merge, any of which
   could close that option.
+- **(BUTCHR-181)** Where branch protection requires an up-to-date head
+  before merge, mandatory base-merges are frequent, and each clean one
+  legitimately advances the structured field while the Jira `[review]`
+  line — append-only by design — does not. A reviewer comparing head
+  against an *older* `[review]` line's sha by string equality will see a
+  mismatch after every such required merge, even when nothing of the
+  branch's own content changed. That is a false-staleness signal on the
+  manual remedy, not evidence of an actual problem. The fix is the same
+  one already stated for the structured check: verify by content
+  (`git diff --stat <last [review] sha>...<head>`, or a fresh `[review]`
+  line after each forced base-merge), not by raw sha string equality.

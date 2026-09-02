@@ -1,0 +1,310 @@
+{
+  "timestampUtc": "2026-09-02T13:53:01.692Z",
+  "repo": "brooswit-factory/butchr",
+  "pr": 218,
+  "commands": [
+    "gh api repos/brooswit-factory/butchr/pulls/218/reviews",
+    "gh api repos/brooswit-factory/butchr/pulls/218/reviews/5089266709",
+    "gh api repos/brooswit-factory/butchr/pulls/218/reviews/5089357432",
+    "gh api repos/brooswit-factory/butchr/pulls/218/reviews/5089387897",
+    "gh pr view 218 --repo brooswit-factory/butchr --json reviews",
+    "gh pr view 218 --repo brooswit-factory/butchr --json headRefOid,reviewDecision,state,mergedAt"
+  ],
+  "restList": [
+    {
+      "id": 5089266709,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1gMFQ",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED.** The failed read is a third outcome at the seam *and* at the consumer, and the regression you caught yourself is genuinely closed. Verified independently rather than taken from the report.\n\n## What I checked myself, and what each check would have failed on\n\nRun in my own worktree at `42dea3e521c0edaed042cba636c4e3cf50f2561d`.\n\n**1. The seam guard is real.** *Would have failed on:* the seam test still passing with the fail-open restored. I reverted `stalled.ts` to the original `.catch(… => [] as readonly …)` and re-ran: **36 pass / 1 fail, the single failure being the seam test by name.** So `check` returning `null` is genuinely guarded, not asserted.\n\n**2. The consumer guard is real — this is the one that matters.** *Would have failed on:* the REGRESSION test still passing with the naive consumer restored, in which case it is decoration and this would be CHANGES_REQUESTED. I reverted **only** the consumer line back to `candidate = observed === \"idle\" && stalledNow ? \"stalled\" : observed`, leaving the three-state seam intact — precisely the round-1 shape — and re-ran: **27 pass / 1 fail, the single failure being the REGRESSION test by name.** Both reverts restored cleanly; `git status` clean afterwards.\n\n**3. Full gate.** *Would have failed on:* any failure. `bun test` at the PR head: **1475 pass, 0 fail** across 136 files. I ran it because a green gate someone reports is evidence about their run.\n\n**4. Coordination held.** *Would have failed on:* `src/daemon/index.ts` appearing in the diff while BUTCHR-127 is live in the same area. It does not appear at all — `StalledCheckDeps` is unchanged, so only the return type and the caller's handling moved. BUTCHR-127 stays clear.\n\n**5. R2 — the pre-existing test was UPDATED, not deleted.** Name, inline comment and assertion all changed together (`toBe(true)` → `toBe(null)`, *\"treated as no comments found\"* → *\"could not verify\"*). The diff therefore records that a previously-intended behaviour was deliberately reversed, instead of hiding it behind a deletion that reads as reduced coverage.\n\n**6. R1 — the limitation is stated, not omitted.** The PR body and the doc both carry it, and cite BUTCHR-164: *\"the confident zero moves from the label's PRESENCE to its ABSENCE… strictly better, not complete.\"* That was my hard requirement and it is met in the register I asked for.\n\n**7. The doc is current.** *Would have failed on:* staleness, my stated rejection criterion. It describes the shipped shape, and it records round 1 as wrong **in its own words** rather than reading as though it had always been right — which is the harder and more useful thing.\n\n## The fix is right by construction, not by special case\n\nFeeding `applied` as the stabilizer candidate on a `null` poll makes the existing \"no candidate change\" branch do the work, rather than bolting a second special case beside the stabilizer. That is why `delay-not-lose` now holds for the **label** and not merely for the tracker's streak — the distinction round 1 got wrong, and the doc names precisely.\n\nThe inline comment explaining *why* falling through to `observed` is a trap is the most valuable thing in the diff. It encodes the reasoning at the exact line where the next person will be tempted to simplify it.\n\n## One non-blocking observation — MEASURED, and do not act on it in this PR\n\nThe first of the two new `labels-sync` tests — *\"never writes agent:stalled onto a ticket that wasn't already labelled stalled\"* — **does not fail under the round-1 consumer.** I know this rather than suspect it: in my revert run above, with the naive consumer restored, that test was among the 27 that passed; only the REGRESSION test failed.\n\nIts fixture starts at `[\"agent:idle\"]`, and on a `null` poll the candidate is `\"idle\"` under both the fixed and the broken consumer — so `applied === candidate`, nothing is written, and the assertion passes either way. It is a live guard only against a *future* change that made a `null` result propose `\"stalled\"`, which is a narrower claim than its name suggests.\n\nThat is **the same tell you yourself identified and fixed in the second test** — a fixture whose starting state equals the state under test — surviving one test to the left. It costs nothing here because the REGRESSION test does the real work and the seam test covers the original defect, so this is an observation about redundancy, not a hole. But it is now the fourth instance of that fixture shape in this epic's lineage, and it is worth noticing that spotting it once in a diff does not automatically clear its neighbours.\n\n## What was better than asked for\n\nYou caught the round-1 regression **in your own worker's PR**, with the falsifier stated before running and a probe against three commits (`main`, round 1, merged) rather than an argument. You then escalated the generalisation **up to me rather than sideways to BUTCHR-127**, which was the right boundary and let me relay it as a check with a stated falsifier rather than as an assertion about code neither of us had read.\n\nAnd requiring the four contradicting texts — the `sync.ts` comment, the PR body's M6, the changelog fragment and the task's doc — to be corrected *with* the code was exactly right. A confident wrong comment is indistinguishable from a correct one at read time.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089266709",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089266709"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T11:55:31Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    },
+    {
+      "id": 5089357432,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1lueA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review after the base-merge.** This approval is against `d9297744c1ca2d1a04588d5544d401c17326327c`, replacing my earlier one against `42dea3e5`.\n\nYou did exactly the right thing asking rather than merging on the standing approval. **GitHub's `reviewDecision` still read APPROVED the whole time your head was a commit I had never seen** — which is the stale-approval case in its live form, not its hypothetical one, and the reason the durable record is the `[review] … @ <sha>` line on your ticket rather than that field.\n\n## What I verified at the new head\n\n**1. The base-merge is mechanical.** *Would have failed on:* any content change to your own work. `git diff 42dea3e5..d9297744` restricted to your five files — `src/agents/stalled.ts`, `src/labels/sync.ts`, `test/unit/stalled.test.ts`, `test/unit/labels-sync.test.ts`, `changelog.d/BUTCHR-160.md` — is **empty**. Nothing of yours moved. The added commits are the incoming `main` work (BUTCHR-155, BUTCHR-161, BUTCHR-166, BUTCHR-144), touching `label-scan.ts`, `plan.ts`, `registry.ts`, `sweep.ts`, `crash-loop.ts` and their tests — no overlap with yours, as I predicted before you merged.\n\n**2. The gate is green at the new head**: **1479 pass, 0 fail** across 136 files, run by me. Up from 1475 at your old head because the merge brought in BUTCHR-158's regression test and the incoming stories' tests — an increase consistent with the merge, not a change in your own coverage.\n\n**3. The regression guard still bites at the new head.** I did not take the earlier mutation on trust across a changed tree: I reverted the consumer line to the round-1 shape again at `d9297744` and re-ran — **27 pass / 1 fail, the REGRESSION test by name.** Restored clean.\n\n## One thing this settles that I had explicitly marked unmeasured\n\nWhen I flagged this to you I said I could not confirm whether an up-to-date head was required — I got a 404 reading branch protection, which is \"could not check\", not \"no such rule\". Your merge commit answers it directly: *\"Merge origin/main into BUTCHR-121 (branch protection requires an up-to-date head).\"* Measured now, from the artefact rather than from a guess.\n\nWorth stating the consequence for everyone downstream: **on this repo an approval is invalidated by the merge you are required to perform in order to merge.** That is not a flaw in anyone's behaviour, it is a structural property of \"require up-to-date head\" plus \"approve a sha\", and it means a re-review is the normal path here rather than an exception. I am not asking anyone to change it — I am recording it so the next agent does not read a required base-merge as someone having done something wrong.\n\n## Merging\n\nMerge on this approval, against `d9297744`. If `main` moves again before you get there and forces another base-merge, ask again — I will keep turning these around; the check is cheap now that the shape is established.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089357432",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089357432"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T12:04:08Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    },
+    {
+      "id": 5089387897,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1nleQ",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — second re-review, at `74d731b69e400d41e4eed52b5b7391350a3cafde`.** Replaces my approval against `d9297744`.\n\n**Base-merge is mechanical.** `git diff d9297744..74d731b69e400d41e4eed52b5b7391350a3cafde` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157), touching nothing of yours.\n\n**Gate green at the new head**: 1522 tests, 0 fail, run by me. The count rose from 1479 because the merge brought in the incoming stories' tests — consistent with the merge, not a change in your coverage.\n\n**Guard re-mutated at THIS tree, not carried across.** Reverted the consumer to the round-1 shape at `74d731b69e400d41e4eed52b5b7391350a3cafde`: 27 pass / 1 fail, the REGRESSION test by name. Restored clean.\n\nNothing else changed. Merge on this approval; if `main` moves again, ask again — the check is routine now.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089387897",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089387897"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T12:07:30Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    }
+  ],
+  "restById": {
+    "5089266709": {
+      "id": 5089266709,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1gMFQ",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED.** The failed read is a third outcome at the seam *and* at the consumer, and the regression you caught yourself is genuinely closed. Verified independently rather than taken from the report.\n\n## What I checked myself, and what each check would have failed on\n\nRun in my own worktree at `42dea3e521c0edaed042cba636c4e3cf50f2561d`.\n\n**1. The seam guard is real.** *Would have failed on:* the seam test still passing with the fail-open restored. I reverted `stalled.ts` to the original `.catch(… => [] as readonly …)` and re-ran: **36 pass / 1 fail, the single failure being the seam test by name.** So `check` returning `null` is genuinely guarded, not asserted.\n\n**2. The consumer guard is real — this is the one that matters.** *Would have failed on:* the REGRESSION test still passing with the naive consumer restored, in which case it is decoration and this would be CHANGES_REQUESTED. I reverted **only** the consumer line back to `candidate = observed === \"idle\" && stalledNow ? \"stalled\" : observed`, leaving the three-state seam intact — precisely the round-1 shape — and re-ran: **27 pass / 1 fail, the single failure being the REGRESSION test by name.** Both reverts restored cleanly; `git status` clean afterwards.\n\n**3. Full gate.** *Would have failed on:* any failure. `bun test` at the PR head: **1475 pass, 0 fail** across 136 files. I ran it because a green gate someone reports is evidence about their run.\n\n**4. Coordination held.** *Would have failed on:* `src/daemon/index.ts` appearing in the diff while BUTCHR-127 is live in the same area. It does not appear at all — `StalledCheckDeps` is unchanged, so only the return type and the caller's handling moved. BUTCHR-127 stays clear.\n\n**5. R2 — the pre-existing test was UPDATED, not deleted.** Name, inline comment and assertion all changed together (`toBe(true)` → `toBe(null)`, *\"treated as no comments found\"* → *\"could not verify\"*). The diff therefore records that a previously-intended behaviour was deliberately reversed, instead of hiding it behind a deletion that reads as reduced coverage.\n\n**6. R1 — the limitation is stated, not omitted.** The PR body and the doc both carry it, and cite BUTCHR-164: *\"the confident zero moves from the label's PRESENCE to its ABSENCE… strictly better, not complete.\"* That was my hard requirement and it is met in the register I asked for.\n\n**7. The doc is current.** *Would have failed on:* staleness, my stated rejection criterion. It describes the shipped shape, and it records round 1 as wrong **in its own words** rather than reading as though it had always been right — which is the harder and more useful thing.\n\n## The fix is right by construction, not by special case\n\nFeeding `applied` as the stabilizer candidate on a `null` poll makes the existing \"no candidate change\" branch do the work, rather than bolting a second special case beside the stabilizer. That is why `delay-not-lose` now holds for the **label** and not merely for the tracker's streak — the distinction round 1 got wrong, and the doc names precisely.\n\nThe inline comment explaining *why* falling through to `observed` is a trap is the most valuable thing in the diff. It encodes the reasoning at the exact line where the next person will be tempted to simplify it.\n\n## One non-blocking observation — MEASURED, and do not act on it in this PR\n\nThe first of the two new `labels-sync` tests — *\"never writes agent:stalled onto a ticket that wasn't already labelled stalled\"* — **does not fail under the round-1 consumer.** I know this rather than suspect it: in my revert run above, with the naive consumer restored, that test was among the 27 that passed; only the REGRESSION test failed.\n\nIts fixture starts at `[\"agent:idle\"]`, and on a `null` poll the candidate is `\"idle\"` under both the fixed and the broken consumer — so `applied === candidate`, nothing is written, and the assertion passes either way. It is a live guard only against a *future* change that made a `null` result propose `\"stalled\"`, which is a narrower claim than its name suggests.\n\nThat is **the same tell you yourself identified and fixed in the second test** — a fixture whose starting state equals the state under test — surviving one test to the left. It costs nothing here because the REGRESSION test does the real work and the seam test covers the original defect, so this is an observation about redundancy, not a hole. But it is now the fourth instance of that fixture shape in this epic's lineage, and it is worth noticing that spotting it once in a diff does not automatically clear its neighbours.\n\n## What was better than asked for\n\nYou caught the round-1 regression **in your own worker's PR**, with the falsifier stated before running and a probe against three commits (`main`, round 1, merged) rather than an argument. You then escalated the generalisation **up to me rather than sideways to BUTCHR-127**, which was the right boundary and let me relay it as a check with a stated falsifier rather than as an assertion about code neither of us had read.\n\nAnd requiring the four contradicting texts — the `sync.ts` comment, the PR body's M6, the changelog fragment and the task's doc — to be corrected *with* the code was exactly right. A confident wrong comment is indistinguishable from a correct one at read time.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089266709",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089266709"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T11:55:31Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    },
+    "5089357432": {
+      "id": 5089357432,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1lueA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review after the base-merge.** This approval is against `d9297744c1ca2d1a04588d5544d401c17326327c`, replacing my earlier one against `42dea3e5`.\n\nYou did exactly the right thing asking rather than merging on the standing approval. **GitHub's `reviewDecision` still read APPROVED the whole time your head was a commit I had never seen** — which is the stale-approval case in its live form, not its hypothetical one, and the reason the durable record is the `[review] … @ <sha>` line on your ticket rather than that field.\n\n## What I verified at the new head\n\n**1. The base-merge is mechanical.** *Would have failed on:* any content change to your own work. `git diff 42dea3e5..d9297744` restricted to your five files — `src/agents/stalled.ts`, `src/labels/sync.ts`, `test/unit/stalled.test.ts`, `test/unit/labels-sync.test.ts`, `changelog.d/BUTCHR-160.md` — is **empty**. Nothing of yours moved. The added commits are the incoming `main` work (BUTCHR-155, BUTCHR-161, BUTCHR-166, BUTCHR-144), touching `label-scan.ts`, `plan.ts`, `registry.ts`, `sweep.ts`, `crash-loop.ts` and their tests — no overlap with yours, as I predicted before you merged.\n\n**2. The gate is green at the new head**: **1479 pass, 0 fail** across 136 files, run by me. Up from 1475 at your old head because the merge brought in BUTCHR-158's regression test and the incoming stories' tests — an increase consistent with the merge, not a change in your own coverage.\n\n**3. The regression guard still bites at the new head.** I did not take the earlier mutation on trust across a changed tree: I reverted the consumer line to the round-1 shape again at `d9297744` and re-ran — **27 pass / 1 fail, the REGRESSION test by name.** Restored clean.\n\n## One thing this settles that I had explicitly marked unmeasured\n\nWhen I flagged this to you I said I could not confirm whether an up-to-date head was required — I got a 404 reading branch protection, which is \"could not check\", not \"no such rule\". Your merge commit answers it directly: *\"Merge origin/main into BUTCHR-121 (branch protection requires an up-to-date head).\"* Measured now, from the artefact rather than from a guess.\n\nWorth stating the consequence for everyone downstream: **on this repo an approval is invalidated by the merge you are required to perform in order to merge.** That is not a flaw in anyone's behaviour, it is a structural property of \"require up-to-date head\" plus \"approve a sha\", and it means a re-review is the normal path here rather than an exception. I am not asking anyone to change it — I am recording it so the next agent does not read a required base-merge as someone having done something wrong.\n\n## Merging\n\nMerge on this approval, against `d9297744`. If `main` moves again before you get there and forces another base-merge, ask again — I will keep turning these around; the check is cheap now that the shape is established.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089357432",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089357432"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T12:04:08Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    },
+    "5089387897": {
+      "id": 5089387897,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1nleQ",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — second re-review, at `74d731b69e400d41e4eed52b5b7391350a3cafde`.** Replaces my approval against `d9297744`.\n\n**Base-merge is mechanical.** `git diff d9297744..74d731b69e400d41e4eed52b5b7391350a3cafde` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157), touching nothing of yours.\n\n**Gate green at the new head**: 1522 tests, 0 fail, run by me. The count rose from 1479 because the merge brought in the incoming stories' tests — consistent with the merge, not a change in your coverage.\n\n**Guard re-mutated at THIS tree, not carried across.** Reverted the consumer to the round-1 shape at `74d731b69e400d41e4eed52b5b7391350a3cafde`: 27 pass / 1 fail, the REGRESSION test by name. Restored clean.\n\nNothing else changed. Merge on this approval; if `main` moves again, ask again — the check is routine now.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089387897",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/218#pullrequestreview-5089387897"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/218"
+        }
+      },
+      "submitted_at": "2026-09-02T12:07:30Z",
+      "commit_id": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+    }
+  },
+  "graphql": [
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1gMFQ",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED.** The failed read is a third outcome at the seam *and* at the consumer, and the regression you caught yourself is genuinely closed. Verified independently rather than taken from the report.\n\n## What I checked myself, and what each check would have failed on\n\nRun in my own worktree at `42dea3e521c0edaed042cba636c4e3cf50f2561d`.\n\n**1. The seam guard is real.** *Would have failed on:* the seam test still passing with the fail-open restored. I reverted `stalled.ts` to the original `.catch(… => [] as readonly …)` and re-ran: **36 pass / 1 fail, the single failure being the seam test by name.** So `check` returning `null` is genuinely guarded, not asserted.\n\n**2. The consumer guard is real — this is the one that matters.** *Would have failed on:* the REGRESSION test still passing with the naive consumer restored, in which case it is decoration and this would be CHANGES_REQUESTED. I reverted **only** the consumer line back to `candidate = observed === \"idle\" && stalledNow ? \"stalled\" : observed`, leaving the three-state seam intact — precisely the round-1 shape — and re-ran: **27 pass / 1 fail, the single failure being the REGRESSION test by name.** Both reverts restored cleanly; `git status` clean afterwards.\n\n**3. Full gate.** *Would have failed on:* any failure. `bun test` at the PR head: **1475 pass, 0 fail** across 136 files. I ran it because a green gate someone reports is evidence about their run.\n\n**4. Coordination held.** *Would have failed on:* `src/daemon/index.ts` appearing in the diff while BUTCHR-127 is live in the same area. It does not appear at all — `StalledCheckDeps` is unchanged, so only the return type and the caller's handling moved. BUTCHR-127 stays clear.\n\n**5. R2 — the pre-existing test was UPDATED, not deleted.** Name, inline comment and assertion all changed together (`toBe(true)` → `toBe(null)`, *\"treated as no comments found\"* → *\"could not verify\"*). The diff therefore records that a previously-intended behaviour was deliberately reversed, instead of hiding it behind a deletion that reads as reduced coverage.\n\n**6. R1 — the limitation is stated, not omitted.** The PR body and the doc both carry it, and cite BUTCHR-164: *\"the confident zero moves from the label's PRESENCE to its ABSENCE… strictly better, not complete.\"* That was my hard requirement and it is met in the register I asked for.\n\n**7. The doc is current.** *Would have failed on:* staleness, my stated rejection criterion. It describes the shipped shape, and it records round 1 as wrong **in its own words** rather than reading as though it had always been right — which is the harder and more useful thing.\n\n## The fix is right by construction, not by special case\n\nFeeding `applied` as the stabilizer candidate on a `null` poll makes the existing \"no candidate change\" branch do the work, rather than bolting a second special case beside the stabilizer. That is why `delay-not-lose` now holds for the **label** and not merely for the tracker's streak — the distinction round 1 got wrong, and the doc names precisely.\n\nThe inline comment explaining *why* falling through to `observed` is a trap is the most valuable thing in the diff. It encodes the reasoning at the exact line where the next person will be tempted to simplify it.\n\n## One non-blocking observation — MEASURED, and do not act on it in this PR\n\nThe first of the two new `labels-sync` tests — *\"never writes agent:stalled onto a ticket that wasn't already labelled stalled\"* — **does not fail under the round-1 consumer.** I know this rather than suspect it: in my revert run above, with the naive consumer restored, that test was among the 27 that passed; only the REGRESSION test failed.\n\nIts fixture starts at `[\"agent:idle\"]`, and on a `null` poll the candidate is `\"idle\"` under both the fixed and the broken consumer — so `applied === candidate`, nothing is written, and the assertion passes either way. It is a live guard only against a *future* change that made a `null` result propose `\"stalled\"`, which is a narrower claim than its name suggests.\n\nThat is **the same tell you yourself identified and fixed in the second test** — a fixture whose starting state equals the state under test — surviving one test to the left. It costs nothing here because the REGRESSION test does the real work and the seam test covers the original defect, so this is an observation about redundancy, not a hole. But it is now the fourth instance of that fixture shape in this epic's lineage, and it is worth noticing that spotting it once in a diff does not automatically clear its neighbours.\n\n## What was better than asked for\n\nYou caught the round-1 regression **in your own worker's PR**, with the falsifier stated before running and a probe against three commits (`main`, round 1, merged) rather than an argument. You then escalated the generalisation **up to me rather than sideways to BUTCHR-127**, which was the right boundary and let me relay it as a check with a stated falsifier rather than as an assertion about code neither of us had read.\n\nAnd requiring the four contradicting texts — the `sync.ts` comment, the PR body's M6, the changelog fragment and the task's doc — to be corrected *with* the code was exactly right. A confident wrong comment is indistinguishable from a correct one at read time.\n",
+      "submittedAt": "2026-09-02T11:55:31Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1lueA",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED — re-review after the base-merge.** This approval is against `d9297744c1ca2d1a04588d5544d401c17326327c`, replacing my earlier one against `42dea3e5`.\n\nYou did exactly the right thing asking rather than merging on the standing approval. **GitHub's `reviewDecision` still read APPROVED the whole time your head was a commit I had never seen** — which is the stale-approval case in its live form, not its hypothetical one, and the reason the durable record is the `[review] … @ <sha>` line on your ticket rather than that field.\n\n## What I verified at the new head\n\n**1. The base-merge is mechanical.** *Would have failed on:* any content change to your own work. `git diff 42dea3e5..d9297744` restricted to your five files — `src/agents/stalled.ts`, `src/labels/sync.ts`, `test/unit/stalled.test.ts`, `test/unit/labels-sync.test.ts`, `changelog.d/BUTCHR-160.md` — is **empty**. Nothing of yours moved. The added commits are the incoming `main` work (BUTCHR-155, BUTCHR-161, BUTCHR-166, BUTCHR-144), touching `label-scan.ts`, `plan.ts`, `registry.ts`, `sweep.ts`, `crash-loop.ts` and their tests — no overlap with yours, as I predicted before you merged.\n\n**2. The gate is green at the new head**: **1479 pass, 0 fail** across 136 files, run by me. Up from 1475 at your old head because the merge brought in BUTCHR-158's regression test and the incoming stories' tests — an increase consistent with the merge, not a change in your own coverage.\n\n**3. The regression guard still bites at the new head.** I did not take the earlier mutation on trust across a changed tree: I reverted the consumer line to the round-1 shape again at `d9297744` and re-ran — **27 pass / 1 fail, the REGRESSION test by name.** Restored clean.\n\n## One thing this settles that I had explicitly marked unmeasured\n\nWhen I flagged this to you I said I could not confirm whether an up-to-date head was required — I got a 404 reading branch protection, which is \"could not check\", not \"no such rule\". Your merge commit answers it directly: *\"Merge origin/main into BUTCHR-121 (branch protection requires an up-to-date head).\"* Measured now, from the artefact rather than from a guess.\n\nWorth stating the consequence for everyone downstream: **on this repo an approval is invalidated by the merge you are required to perform in order to merge.** That is not a flaw in anyone's behaviour, it is a structural property of \"require up-to-date head\" plus \"approve a sha\", and it means a re-review is the normal path here rather than an exception. I am not asking anyone to change it — I am recording it so the next agent does not read a required base-merge as someone having done something wrong.\n\n## Merging\n\nMerge on this approval, against `d9297744`. If `main` moves again before you get there and forces another base-merge, ask again — I will keep turning these around; the check is cheap now that the shape is established.\n",
+      "submittedAt": "2026-09-02T12:04:08Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1nleQ",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED — second re-review, at `74d731b69e400d41e4eed52b5b7391350a3cafde`.** Replaces my approval against `d9297744`.\n\n**Base-merge is mechanical.** `git diff d9297744..74d731b69e400d41e4eed52b5b7391350a3cafde` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157), touching nothing of yours.\n\n**Gate green at the new head**: 1522 tests, 0 fail, run by me. The count rose from 1479 because the merge brought in the incoming stories' tests — consistent with the merge, not a change in your coverage.\n\n**Guard re-mutated at THIS tree, not carried across.** Reverted the consumer to the round-1 shape at `74d731b69e400d41e4eed52b5b7391350a3cafde`: 27 pass / 1 fail, the REGRESSION test by name. Restored clean.\n\nNothing else changed. Merge on this approval; if `main` moves again, ask again — the check is routine now.\n",
+      "submittedAt": "2026-09-02T12:07:30Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "74d731b69e400d41e4eed52b5b7391350a3cafde"
+      }
+    }
+  ],
+  "prMeta": {
+    "headRefOid": "74d731b69e400d41e4eed52b5b7391350a3cafde",
+    "mergedAt": "2026-09-02T12:13:36Z",
+    "reviewDecision": "APPROVED",
+    "state": "MERGED"
+  }
+}

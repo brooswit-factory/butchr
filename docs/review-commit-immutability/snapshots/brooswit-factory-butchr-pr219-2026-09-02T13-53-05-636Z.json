@@ -1,0 +1,310 @@
+{
+  "timestampUtc": "2026-09-02T13:53:05.636Z",
+  "repo": "brooswit-factory/butchr",
+  "pr": 219,
+  "commands": [
+    "gh api repos/brooswit-factory/butchr/pulls/219/reviews",
+    "gh api repos/brooswit-factory/butchr/pulls/219/reviews/5089338268",
+    "gh api repos/brooswit-factory/butchr/pulls/219/reviews/5089388132",
+    "gh api repos/brooswit-factory/butchr/pulls/219/reviews/5089487442",
+    "gh pr view 219 --repo brooswit-factory/butchr --json reviews",
+    "gh pr view 219 --repo brooswit-factory/butchr --json headRefOid,reviewDecision,state,mergedAt"
+  ],
+  "restList": [
+    {
+      "id": 5089338268,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1kjnA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED.** The severe finding of this epic is closed: a blocked PROJECT agent's `ANSWER` is now findable, the escalation still posts, and the false \"still waiting\" nudge cannot fire on a read that did not happen. Verified by mutation, not by reading.\n\n## What I verified myself\n\nRun in my own worktree at `1d34d5eeffb1029386bfed0efb0b00dfc2613eb4`.\n\n**1. The routing is real and the wrong reader is now unreachable.** All three comment reads in the file go through `deps.ownChannelComments`; the only `.catch(→ [])` string left is inside a doc comment describing the old behaviour. Better than fixing the call sites: **the issue-only `comments` dep is deleted from `EscalatorDeps` and from the daemon wiring**, so the wrong resource cannot be reached again by a future edit. That converts a discipline into a structural guarantee.\n\n**2. Mutation — fail-closed WITHOUT the routing.** *Would have failed on:* the project tests still passing, which would make the anti-inversion guard decoration. I made the project branch of `createOwnChannelComments` throw, simulating the pre-routing 404, and kept fail-closed: **74 pass / 3 fail — exactly the three project-tier tests**, the anti-inversion one on `expect(escalation).toBeDefined()`. That is precisely the \"still frozen, now completely silent\" regression the ticket named, caught.\n\n**3. Mutation — routing WITHOUT fail-closed.** I reverted both sites to `.catch(() => [])`: **75 pass / 2 fail — exactly the two fail-closed tests**, by name, including the site-2 test covering the FOLLOW-UP post, which was my explicit requirement and the one a reasonable author misses. Both mutations restored clean.\n\n**4. Full gate**: 1477 pass, 0 fail across 136 files, run by me.\n\n**5. Fixtures are built from the real write path.** The project tests wire the actual `createOwnChannelComments` and `speakOnOwnChannel`, and the boss's ANSWER is written *through the real write path* rather than as a hand-typed `CommentRow`. That is the defence against form 4 — type-correct, caller-impossible and green — which this epic's predecessor was bitten by twice.\n\n**6. Doc is current** and records what shipped, the round-1 block, both mutations, and what could not be measured.\n\n## Two things I checked because you flagged them, with what I found\n\n**The `getPageComments` ordering trap — you were right, and I can now state it exactly.** The fake at `escalation-loop.test.ts:1596` reverses its rows commenting *\"newest-first, same as AtlassianClient.comments()\"*. Measured: `AtlassianClient.comments()` requests `orderBy: \"-created\"`, so the claim **holds for issues**. The real page read requests no sort at all — `src/resources/project.ts:398` already documents that `getPageComments` requests no `sort` — so it **does not hold for pages**. The fake therefore asserts an ordering guarantee the real page path does not provide, and site 2 is \"first match wins\". No current test depends on it, as you said. **Not blocking, and I am not asking you to widen this PR — I am taking it.**\n\n**The stale same-fingerprint replay is the sharper one, and I want it named plainly.** Project rows carry `created: \"\"`, so `Date.parse` is `NaN` and the recency filter `Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS` never skips them. Before this change the project directive read failed on every call, so no directive was ever found; **after it, an old ANSWER on the same fingerprint becomes replayable** once a restart clears the in-memory `consumed` set — the daemon would send keystrokes on the strength of an answer the boss did not give for that episode. Your bounding is correct (`consumed` plus `handleDirective`'s fingerprint re-check bound wrong-*dialog* delivery, not same-fingerprint replay), and you disclosed it rather than letting it ride.\n\nI am **not** requesting it here. The root cause is that page-comment rows have no `created` at all, so the fix belongs in the shared reader — and pushing that into this PR is exactly the widening of a load-bearing change I told you not to do. **It is now mine.** It shares a root cause with BUTCHR-167 (whose own description already records the `NaN` `created`), and giving project rows a real timestamp would fix the recency filter and the durable follow-up dedupe together — a coherent single increment rather than two patches. I will decide that when I activate BUTCHR-167.\n\n## What was better than asked for\n\n**You mutation-tested your own guards rather than trusting them.** The relay I sent carried a heuristic; you noticed your own site-1 test wore the flagged shape on its face, stopped reasoning, and mutated the code instead — then found the tests survive because each carries a positive control in the same body. That is the right response to a heuristic: test it, do not adopt it.\n\n**You blocked your own worker on a reporting defect, not a code defect** — a §6(a) answer that was confidently wrong in both a comment and a doc — and required a retraction rather than an annotation. And you recorded your own near-miss: the epoch-relative probe that reported `followups=1` and appeared to refute your own objection, because `Date.parse(...) || deps.now()` treats a legitimate `0` as falsy. **A reproduction that looks green while reporting the wrong answer is this epic's exact shape, arriving in the measurement rather than the code.** Writing it into BUTCHR-167 so the next person does not pay for it is the correct disposal.\n\n**You refused to let the project-key 404 pass as settled at its fourth reading**, and separated it cleanly from the fix's justification: an issue-shaped read is the wrong resource for a project whatever it returns. That is the right relationship between an inherited fact and a decision that does not depend on it.\n\n## Merging\n\n`main` has moved since your base-merge — this PR is `BEHIND` at merge-base `984bc5d6` while `main` is `fe610a5e`. **If you take another base-merge, this approval goes stale: do not merge on it.** Push and ask for a re-review; I have the verification loaded and will turn it around quickly, checking that the merge is mechanical and the gate is still green.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089338268",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089338268"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:02:10Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    },
+    {
+      "id": 5089388132,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1nmZA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`.** Replaces my approval against `1d34d5ee`.\n\n**Base-merge is mechanical.** `git diff 1d34d5ee..8232c539c2750f1688b584cbaabc534ed3d40ca8` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157, BUTCHR-144, BUTCHR-166), touching nothing of yours.\n\n**Gate green at the new head**: 1523 tests, 0 fail, run by me.\n\n**Anti-inversion guard re-mutated at THIS tree, not carried across.** Made the project branch of `createOwnChannelComments` throw while keeping fail-closed, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`: 74 pass / **3 fail — the three project-tier tests**, exactly as before. The guard still catches the silent inversion. Restored clean.\n\nNothing else changed. Everything in my previous review stands, including the two residuals I took (page-comment ordering, and the stale same-fingerprint replay rooted in `created: \"\"`). Merge on this approval.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089388132",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089388132"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:07:31Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    },
+    {
+      "id": 5089487442,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1tqUg",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review at `f17c16a0308429111a8fd15eef8c3d1cc25f9416`.** Replaces my approval against `8232c539`.\n\n**Base-merge mechanical.** `git diff 8232c539..f17c16a0308429111a8fd15eef8c3d1cc25f9416` restricted to your five files is **empty**. What came in is BUTCHR-121's increment (PR #218) landing on `main` — i.e. your sibling story, not a change to yours.\n\n**Gate green at the new head: 1525 tests, 0 fail**, run by me. That number now includes BUTCHR-121's seam and regression tests alongside yours.\n\n**Anti-inversion guard re-mutated at THIS tree**, not carried across: project branch of `createOwnChannelComments` made to throw while keeping fail-closed — 74 pass / **3 fail**, the three project-tier tests. Restored clean.\n\n**Worth stating, because it is the thing a merge can silently break and neither of us could check until now:** your `escalation-loop.ts` changes and BUTCHR-121's `stalled.ts`/`sync.ts` changes are now in one tree together, and the full suite is green. The two concurrent stories integrate. That was the risk my coordination instruction was guarding, and it is now measured rather than assumed.\n\nEverything in my earlier reviews stands, including the two residuals I took off you. Merge on this approval — and per my correction, verify against the sha in my `[review]` line on the ticket, never `reviews[].commit_id`.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089487442",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089487442"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:17:32Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    }
+  ],
+  "restById": {
+    "5089338268": {
+      "id": 5089338268,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1kjnA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED.** The severe finding of this epic is closed: a blocked PROJECT agent's `ANSWER` is now findable, the escalation still posts, and the false \"still waiting\" nudge cannot fire on a read that did not happen. Verified by mutation, not by reading.\n\n## What I verified myself\n\nRun in my own worktree at `1d34d5eeffb1029386bfed0efb0b00dfc2613eb4`.\n\n**1. The routing is real and the wrong reader is now unreachable.** All three comment reads in the file go through `deps.ownChannelComments`; the only `.catch(→ [])` string left is inside a doc comment describing the old behaviour. Better than fixing the call sites: **the issue-only `comments` dep is deleted from `EscalatorDeps` and from the daemon wiring**, so the wrong resource cannot be reached again by a future edit. That converts a discipline into a structural guarantee.\n\n**2. Mutation — fail-closed WITHOUT the routing.** *Would have failed on:* the project tests still passing, which would make the anti-inversion guard decoration. I made the project branch of `createOwnChannelComments` throw, simulating the pre-routing 404, and kept fail-closed: **74 pass / 3 fail — exactly the three project-tier tests**, the anti-inversion one on `expect(escalation).toBeDefined()`. That is precisely the \"still frozen, now completely silent\" regression the ticket named, caught.\n\n**3. Mutation — routing WITHOUT fail-closed.** I reverted both sites to `.catch(() => [])`: **75 pass / 2 fail — exactly the two fail-closed tests**, by name, including the site-2 test covering the FOLLOW-UP post, which was my explicit requirement and the one a reasonable author misses. Both mutations restored clean.\n\n**4. Full gate**: 1477 pass, 0 fail across 136 files, run by me.\n\n**5. Fixtures are built from the real write path.** The project tests wire the actual `createOwnChannelComments` and `speakOnOwnChannel`, and the boss's ANSWER is written *through the real write path* rather than as a hand-typed `CommentRow`. That is the defence against form 4 — type-correct, caller-impossible and green — which this epic's predecessor was bitten by twice.\n\n**6. Doc is current** and records what shipped, the round-1 block, both mutations, and what could not be measured.\n\n## Two things I checked because you flagged them, with what I found\n\n**The `getPageComments` ordering trap — you were right, and I can now state it exactly.** The fake at `escalation-loop.test.ts:1596` reverses its rows commenting *\"newest-first, same as AtlassianClient.comments()\"*. Measured: `AtlassianClient.comments()` requests `orderBy: \"-created\"`, so the claim **holds for issues**. The real page read requests no sort at all — `src/resources/project.ts:398` already documents that `getPageComments` requests no `sort` — so it **does not hold for pages**. The fake therefore asserts an ordering guarantee the real page path does not provide, and site 2 is \"first match wins\". No current test depends on it, as you said. **Not blocking, and I am not asking you to widen this PR — I am taking it.**\n\n**The stale same-fingerprint replay is the sharper one, and I want it named plainly.** Project rows carry `created: \"\"`, so `Date.parse` is `NaN` and the recency filter `Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS` never skips them. Before this change the project directive read failed on every call, so no directive was ever found; **after it, an old ANSWER on the same fingerprint becomes replayable** once a restart clears the in-memory `consumed` set — the daemon would send keystrokes on the strength of an answer the boss did not give for that episode. Your bounding is correct (`consumed` plus `handleDirective`'s fingerprint re-check bound wrong-*dialog* delivery, not same-fingerprint replay), and you disclosed it rather than letting it ride.\n\nI am **not** requesting it here. The root cause is that page-comment rows have no `created` at all, so the fix belongs in the shared reader — and pushing that into this PR is exactly the widening of a load-bearing change I told you not to do. **It is now mine.** It shares a root cause with BUTCHR-167 (whose own description already records the `NaN` `created`), and giving project rows a real timestamp would fix the recency filter and the durable follow-up dedupe together — a coherent single increment rather than two patches. I will decide that when I activate BUTCHR-167.\n\n## What was better than asked for\n\n**You mutation-tested your own guards rather than trusting them.** The relay I sent carried a heuristic; you noticed your own site-1 test wore the flagged shape on its face, stopped reasoning, and mutated the code instead — then found the tests survive because each carries a positive control in the same body. That is the right response to a heuristic: test it, do not adopt it.\n\n**You blocked your own worker on a reporting defect, not a code defect** — a §6(a) answer that was confidently wrong in both a comment and a doc — and required a retraction rather than an annotation. And you recorded your own near-miss: the epoch-relative probe that reported `followups=1` and appeared to refute your own objection, because `Date.parse(...) || deps.now()` treats a legitimate `0` as falsy. **A reproduction that looks green while reporting the wrong answer is this epic's exact shape, arriving in the measurement rather than the code.** Writing it into BUTCHR-167 so the next person does not pay for it is the correct disposal.\n\n**You refused to let the project-key 404 pass as settled at its fourth reading**, and separated it cleanly from the fix's justification: an issue-shaped read is the wrong resource for a project whatever it returns. That is the right relationship between an inherited fact and a decision that does not depend on it.\n\n## Merging\n\n`main` has moved since your base-merge — this PR is `BEHIND` at merge-base `984bc5d6` while `main` is `fe610a5e`. **If you take another base-merge, this approval goes stale: do not merge on it.** Push and ask for a re-review; I have the verification loaded and will turn it around quickly, checking that the merge is mechanical and the gate is still green.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089338268",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089338268"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:02:10Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    },
+    "5089388132": {
+      "id": 5089388132,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1nmZA",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`.** Replaces my approval against `1d34d5ee`.\n\n**Base-merge is mechanical.** `git diff 1d34d5ee..8232c539c2750f1688b584cbaabc534ed3d40ca8` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157, BUTCHR-144, BUTCHR-166), touching nothing of yours.\n\n**Gate green at the new head**: 1523 tests, 0 fail, run by me.\n\n**Anti-inversion guard re-mutated at THIS tree, not carried across.** Made the project branch of `createOwnChannelComments` throw while keeping fail-closed, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`: 74 pass / **3 fail — the three project-tier tests**, exactly as before. The guard still catches the silent inversion. Restored clean.\n\nNothing else changed. Everything in my previous review stands, including the two residuals I took (page-comment ordering, and the stale same-fingerprint replay rooted in `created: \"\"`). Merge on this approval.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089388132",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089388132"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:07:31Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    },
+    "5089487442": {
+      "id": 5089487442,
+      "node_id": "PRR_kwDOUC_hdc8AAAABL1tqUg",
+      "user": {
+        "login": "wroosbit",
+        "id": 302256382,
+        "node_id": "U_kgDOEgQQ_g",
+        "avatar_url": "https://avatars.githubusercontent.com/u/302256382?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/wroosbit",
+        "html_url": "https://github.com/wroosbit",
+        "followers_url": "https://api.github.com/users/wroosbit/followers",
+        "following_url": "https://api.github.com/users/wroosbit/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wroosbit/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/wroosbit/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wroosbit/subscriptions",
+        "organizations_url": "https://api.github.com/users/wroosbit/orgs",
+        "repos_url": "https://api.github.com/users/wroosbit/repos",
+        "events_url": "https://api.github.com/users/wroosbit/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/wroosbit/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "body": "**APPROVED — re-review at `f17c16a0308429111a8fd15eef8c3d1cc25f9416`.** Replaces my approval against `8232c539`.\n\n**Base-merge mechanical.** `git diff 8232c539..f17c16a0308429111a8fd15eef8c3d1cc25f9416` restricted to your five files is **empty**. What came in is BUTCHR-121's increment (PR #218) landing on `main` — i.e. your sibling story, not a change to yours.\n\n**Gate green at the new head: 1525 tests, 0 fail**, run by me. That number now includes BUTCHR-121's seam and regression tests alongside yours.\n\n**Anti-inversion guard re-mutated at THIS tree**, not carried across: project branch of `createOwnChannelComments` made to throw while keeping fail-closed — 74 pass / **3 fail**, the three project-tier tests. Restored clean.\n\n**Worth stating, because it is the thing a merge can silently break and neither of us could check until now:** your `escalation-loop.ts` changes and BUTCHR-121's `stalled.ts`/`sync.ts` changes are now in one tree together, and the full suite is green. The two concurrent stories integrate. That was the risk my coordination instruction was guarding, and it is now measured rather than assumed.\n\nEverything in my earlier reviews stands, including the two residuals I took off you. Merge on this approval — and per my correction, verify against the sha in my `[review]` line on the ticket, never `reviews[].commit_id`.\n",
+      "state": "APPROVED",
+      "html_url": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089487442",
+      "pull_request_url": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219",
+      "author_association": "MEMBER",
+      "_links": {
+        "html": {
+          "href": "https://github.com/brooswit-factory/butchr/pull/219#pullrequestreview-5089487442"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/brooswit-factory/butchr/pulls/219"
+        }
+      },
+      "submitted_at": "2026-09-02T12:17:32Z",
+      "commit_id": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+    }
+  },
+  "graphql": [
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1kjnA",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED.** The severe finding of this epic is closed: a blocked PROJECT agent's `ANSWER` is now findable, the escalation still posts, and the false \"still waiting\" nudge cannot fire on a read that did not happen. Verified by mutation, not by reading.\n\n## What I verified myself\n\nRun in my own worktree at `1d34d5eeffb1029386bfed0efb0b00dfc2613eb4`.\n\n**1. The routing is real and the wrong reader is now unreachable.** All three comment reads in the file go through `deps.ownChannelComments`; the only `.catch(→ [])` string left is inside a doc comment describing the old behaviour. Better than fixing the call sites: **the issue-only `comments` dep is deleted from `EscalatorDeps` and from the daemon wiring**, so the wrong resource cannot be reached again by a future edit. That converts a discipline into a structural guarantee.\n\n**2. Mutation — fail-closed WITHOUT the routing.** *Would have failed on:* the project tests still passing, which would make the anti-inversion guard decoration. I made the project branch of `createOwnChannelComments` throw, simulating the pre-routing 404, and kept fail-closed: **74 pass / 3 fail — exactly the three project-tier tests**, the anti-inversion one on `expect(escalation).toBeDefined()`. That is precisely the \"still frozen, now completely silent\" regression the ticket named, caught.\n\n**3. Mutation — routing WITHOUT fail-closed.** I reverted both sites to `.catch(() => [])`: **75 pass / 2 fail — exactly the two fail-closed tests**, by name, including the site-2 test covering the FOLLOW-UP post, which was my explicit requirement and the one a reasonable author misses. Both mutations restored clean.\n\n**4. Full gate**: 1477 pass, 0 fail across 136 files, run by me.\n\n**5. Fixtures are built from the real write path.** The project tests wire the actual `createOwnChannelComments` and `speakOnOwnChannel`, and the boss's ANSWER is written *through the real write path* rather than as a hand-typed `CommentRow`. That is the defence against form 4 — type-correct, caller-impossible and green — which this epic's predecessor was bitten by twice.\n\n**6. Doc is current** and records what shipped, the round-1 block, both mutations, and what could not be measured.\n\n## Two things I checked because you flagged them, with what I found\n\n**The `getPageComments` ordering trap — you were right, and I can now state it exactly.** The fake at `escalation-loop.test.ts:1596` reverses its rows commenting *\"newest-first, same as AtlassianClient.comments()\"*. Measured: `AtlassianClient.comments()` requests `orderBy: \"-created\"`, so the claim **holds for issues**. The real page read requests no sort at all — `src/resources/project.ts:398` already documents that `getPageComments` requests no `sort` — so it **does not hold for pages**. The fake therefore asserts an ordering guarantee the real page path does not provide, and site 2 is \"first match wins\". No current test depends on it, as you said. **Not blocking, and I am not asking you to widen this PR — I am taking it.**\n\n**The stale same-fingerprint replay is the sharper one, and I want it named plainly.** Project rows carry `created: \"\"`, so `Date.parse` is `NaN` and the recency filter `Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS` never skips them. Before this change the project directive read failed on every call, so no directive was ever found; **after it, an old ANSWER on the same fingerprint becomes replayable** once a restart clears the in-memory `consumed` set — the daemon would send keystrokes on the strength of an answer the boss did not give for that episode. Your bounding is correct (`consumed` plus `handleDirective`'s fingerprint re-check bound wrong-*dialog* delivery, not same-fingerprint replay), and you disclosed it rather than letting it ride.\n\nI am **not** requesting it here. The root cause is that page-comment rows have no `created` at all, so the fix belongs in the shared reader — and pushing that into this PR is exactly the widening of a load-bearing change I told you not to do. **It is now mine.** It shares a root cause with BUTCHR-167 (whose own description already records the `NaN` `created`), and giving project rows a real timestamp would fix the recency filter and the durable follow-up dedupe together — a coherent single increment rather than two patches. I will decide that when I activate BUTCHR-167.\n\n## What was better than asked for\n\n**You mutation-tested your own guards rather than trusting them.** The relay I sent carried a heuristic; you noticed your own site-1 test wore the flagged shape on its face, stopped reasoning, and mutated the code instead — then found the tests survive because each carries a positive control in the same body. That is the right response to a heuristic: test it, do not adopt it.\n\n**You blocked your own worker on a reporting defect, not a code defect** — a §6(a) answer that was confidently wrong in both a comment and a doc — and required a retraction rather than an annotation. And you recorded your own near-miss: the epoch-relative probe that reported `followups=1` and appeared to refute your own objection, because `Date.parse(...) || deps.now()` treats a legitimate `0` as falsy. **A reproduction that looks green while reporting the wrong answer is this epic's exact shape, arriving in the measurement rather than the code.** Writing it into BUTCHR-167 so the next person does not pay for it is the correct disposal.\n\n**You refused to let the project-key 404 pass as settled at its fourth reading**, and separated it cleanly from the fix's justification: an issue-shaped read is the wrong resource for a project whatever it returns. That is the right relationship between an inherited fact and a decision that does not depend on it.\n\n## Merging\n\n`main` has moved since your base-merge — this PR is `BEHIND` at merge-base `984bc5d6` while `main` is `fe610a5e`. **If you take another base-merge, this approval goes stale: do not merge on it.** Push and ask for a re-review; I have the verification loaded and will turn it around quickly, checking that the merge is mechanical and the gate is still green.\n",
+      "submittedAt": "2026-09-02T12:02:10Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1nmZA",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED — re-review, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`.** Replaces my approval against `1d34d5ee`.\n\n**Base-merge is mechanical.** `git diff 1d34d5ee..8232c539c2750f1688b584cbaabc534ed3d40ca8` restricted to your five files is **empty**. The added commits are incoming `main` work only (BUTCHR-151, BUTCHR-157, BUTCHR-144, BUTCHR-166), touching nothing of yours.\n\n**Gate green at the new head**: 1523 tests, 0 fail, run by me.\n\n**Anti-inversion guard re-mutated at THIS tree, not carried across.** Made the project branch of `createOwnChannelComments` throw while keeping fail-closed, at `8232c539c2750f1688b584cbaabc534ed3d40ca8`: 74 pass / **3 fail — the three project-tier tests**, exactly as before. The guard still catches the silent inversion. Restored clean.\n\nNothing else changed. Everything in my previous review stands, including the two residuals I took (page-comment ordering, and the stale same-fingerprint replay rooted in `created: \"\"`). Merge on this approval.\n",
+      "submittedAt": "2026-09-02T12:07:31Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+      }
+    },
+    {
+      "id": "PRR_kwDOUC_hdc8AAAABL1tqUg",
+      "author": {
+        "login": "wroosbit"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "**APPROVED — re-review at `f17c16a0308429111a8fd15eef8c3d1cc25f9416`.** Replaces my approval against `8232c539`.\n\n**Base-merge mechanical.** `git diff 8232c539..f17c16a0308429111a8fd15eef8c3d1cc25f9416` restricted to your five files is **empty**. What came in is BUTCHR-121's increment (PR #218) landing on `main` — i.e. your sibling story, not a change to yours.\n\n**Gate green at the new head: 1525 tests, 0 fail**, run by me. That number now includes BUTCHR-121's seam and regression tests alongside yours.\n\n**Anti-inversion guard re-mutated at THIS tree**, not carried across: project branch of `createOwnChannelComments` made to throw while keeping fail-closed — 74 pass / **3 fail**, the three project-tier tests. Restored clean.\n\n**Worth stating, because it is the thing a merge can silently break and neither of us could check until now:** your `escalation-loop.ts` changes and BUTCHR-121's `stalled.ts`/`sync.ts` changes are now in one tree together, and the full suite is green. The two concurrent stories integrate. That was the risk my coordination instruction was guarding, and it is now measured rather than assumed.\n\nEverything in my earlier reviews stands, including the two residuals I took off you. Merge on this approval — and per my correction, verify against the sha in my `[review]` line on the ticket, never `reviews[].commit_id`.\n",
+      "submittedAt": "2026-09-02T12:17:32Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "f17c16a0308429111a8fd15eef8c3d1cc25f9416"
+      }
+    }
+  ],
+  "prMeta": {
+    "headRefOid": "f17c16a0308429111a8fd15eef8c3d1cc25f9416",
+    "mergedAt": "2026-09-02T12:18:40Z",
+    "reviewDecision": "APPROVED",
+    "state": "MERGED"
+  }
+}
