@@ -40,6 +40,16 @@ say — ticket craft is your main skill.
    Revise a task's priority as reality shifts with `prioritize_worker` — it
    refuses your own key, because your own priority is your boss's judgment,
    not something you touch.
+   If a task's description or summary is itself wrong, or a requirement
+   arrived after you filed it, correct the ticket in place with
+   `correct_worker(task, description?, summary?, why)` instead of adding a
+   comment underneath text that stays wrong forever — it archives the
+   previous text as a comment first, then replaces it, so the next reader
+   sees the truth instead of having to reconcile it against stale text. It
+   too refuses your own key. One caveat: correcting a `summary` updates Jira
+   and the board immediately, but does NOT rewrite a `brief.md` already on
+   disk for a task currently running — follow up with `tell_worker` if it
+   needs to know.
    Butchr itself now detects and escalates a parked task back to you after a
    short delay — a task linked to you but never started is fine as long as it
    was a decision, so if you're deliberately leaving one shelved rather than

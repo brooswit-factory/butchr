@@ -11,6 +11,17 @@ export interface AtlassianOps {
   setPriority(key: string, priority: string): Promise<unknown>;
   /** Assign to an accountId. Never writes any other field. */
   assign(key: string, accountId: string): Promise<unknown>;
+  /**
+   * REPLACE `description` and/or `summary` — full-body replace of whichever
+   * field(s) are supplied, never an append. Writes ONLY the field(s) passed
+   * (same discipline `assign` above already documents for itself) — a
+   * caller that wants to touch just one of the two must not see the other
+   * disturbed. `correct_worker` (src/tools/relationship.ts) is the only
+   * caller, and it always archives the CURRENT text as a comment before
+   * calling this — this op itself does no archiving and no ownership check;
+   * it is a dumb single write.
+   */
+  correctText(key: string, p: { description?: string; summary?: string }): Promise<unknown>;
   /** `parentId` nests the page under it; omitted, Confluence lands it under the space's own default (the SD homepage today). */
   createPage(p: { spaceId: string; title: string; body: string; parentId?: string }): Promise<unknown>;
   getPage(id: string): Promise<unknown>;
