@@ -149,25 +149,66 @@ describe("createAbandonedDetector: escalation path (through addComment, per the 
     expect(jira.posted[0]!.text).not.toContain("reached Done");
   });
 
-  // REGRESSION (review finding #1): a worker with TWO Done inward Implements
-  // stubs must escalate BOTH pairs independently — before the fix, stage
-  // 1/2's dedupe identity (`fingerprint: ${worker}`, `stage: N`) omitted the
-  // boss, so the second pair's postStage call found the first pair's
-  // comment (same worker, same stage, same target) and silently "adopted"
-  // it instead of posting its own — BOSS-B was never named anywhere.
-  test("a worker with TWO Done bosses escalates to BOTH, independently — the dedupe identity must include the boss, not just the worker", async () => {
+  /** Exact value of a comment's `boss: <key>` line — never a bare `.includes()`, which a prefix-related key (BOSS-1 inside BOSS-19) would false-positive on (review finding #3). */
+  const bossLineOf = (text: string): string | undefined => text.split("\n").find((l) => l.startsWith("boss: "))?.slice("boss: ".length);
+  /** Exact value of a comment's `fingerprint: <key>` line, same reasoning. */
+  const fingerprintLineOf = (text: string): string | undefined => text.split("\n").find((l) => l.startsWith("fingerprint: "))?.slice("fingerprint: ".length);
+
+  // REGRESSION (review finding #1, then #3): a worker with TWO Done inward
+  // Implements stubs must escalate BOTH pairs independently — before finding
+  // #1's fix, stage 1/2's dedupe identity (`fingerprint: ${worker}`, `stage:
+  // N`) omitted the boss entirely, so the second pair adopted the first
+  // pair's comment. Before finding #3's fix, `need`'s `boss: ${boss}` entry
+  // was un-delimited and `findMarked` matches by bare substring, so a boss
+  // key that is a strict PREFIX of another (the norm in this project's own
+  // key shape — BUTCHR-1/BUTCHR-19/BUTCHR-192) still collapsed the two
+  // identities: `"boss: BOSS-19\n".includes("boss: BOSS-1")` is true. Uses
+  // prefix-related keys deliberately, so this test would actually fail
+  // without BOTH fixes.
+  test("a worker with TWO Done bosses, one a key-prefix of the other, escalates to BOTH independently — the dedupe identity must include the boss AND be delimited", async () => {
     let now = 0;
     const jira = fakeJira();
     const det = createAbandonedDetector({ now: () => now, minutes: 30, addComment: jira.addComment, comments: jira.comments, links: jira.links });
-    const worker = iss("WORK-1", "In Progress", { issuelinks: [bossLink("BOSS-A", "Done"), bossLink("BOSS-B", "Done")] });
+    // Order matters for this regression to actually reproduce the bug: the
+    // LONGER key (BOSS-19) must be processed FIRST so its comment already
+    // exists when the SHORTER key (BOSS-1) is searched for — only then does
+    // `"...boss: BOSS-19\n...".includes("boss: BOSS-1")` false-positive.
+    const worker = iss("WORK-1", "In Progress", { issuelinks: [bossLink("BOSS-19", "Done"), bossLink("BOSS-1", "Done")] });
 
     now = 0; await det.check([worker]);
     now = 30 * MIN; await det.check([worker]); // stage 1 for BOTH (worker, boss) pairs
 
     expect(jira.posted.length).toBe(2);
     expect(jira.posted.every((p) => p.target === "WORK-1")).toBe(true);
-    const bossesNamed = jira.posted.map((p) => (p.text.includes("boss: BOSS-A") ? "BOSS-A" : p.text.includes("boss: BOSS-B") ? "BOSS-B" : null)).sort();
-    expect(bossesNamed).toEqual(["BOSS-A", "BOSS-B"]); // both bosses named — before the fix, this was ["BOSS-A", null] (BOSS-B silently adopted BOSS-A's comment)
+    const bossesNamed = jira.posted.map((p) => bossLineOf(p.text)).sort();
+    expect(bossesNamed).toEqual(["BOSS-1", "BOSS-19"]); // both bosses named exactly — before either fix this collapsed to one post
+  });
+
+  // REGRESSION (review finding #3, stage-3 half): the SAME prefix collision
+  // is reachable on the bare `fingerprint:` line too, at stage 3, when TWO
+  // DIFFERENT WORKERS whose keys are prefix-related are both abandoned under
+  // bosses that resolve to the same stage-3 target. This half is inherited
+  // from parked.ts's own `findMarked` usage (reported upward, not this
+  // module's to fix), but the SAME one-line `need` delimiter closes it here.
+  test("two workers with prefix-related keys, both abandoned under the SAME terminal boss, both reach stage 3 independently", async () => {
+    let now = 0;
+    const jira = fakeJira(); // linksByKey empty for BOSS-1 -> no grandboss -> terminal case targets BOSS-1 itself for both
+    const det = createAbandonedDetector({ now: () => now, minutes: 1, addComment: jira.addComment, comments: jira.comments, links: jira.links });
+    const w1 = iss("WORK-1", "In Progress", { issuelinks: [bossLink("BOSS-1", "Done")] });
+    const w19 = iss("WORK-19", "In Progress", { issuelinks: [bossLink("BOSS-1", "Done")] });
+
+    // Same ordering requirement as the boss-prefix test above: WORK-19
+    // (longer key) must reach BOSS-1 first so its stage-3 comment already
+    // exists when WORK-1 (shorter key) is searched for.
+    now = 0 * MIN; await det.check([w19, w1]);
+    now = 1 * MIN; await det.check([w19, w1]); // stage 1 (own tickets, distinct targets — no collision possible here)
+    now = 2 * MIN; await det.check([w19, w1]); // stage 2 (own tickets)
+    now = 3 * MIN; await det.check([w19, w1]); // stage 3, terminal: BOTH target BOSS-1
+
+    const stage3OnBoss = jira.posted.filter((p) => p.target === "BOSS-1" && p.text.includes("stage: 3"));
+    expect(stage3OnBoss.length).toBe(2);
+    const workersNamed = stage3OnBoss.map((p) => fingerprintLineOf(p.text)).sort();
+    expect(workersNamed).toEqual(["WORK-1", "WORK-19"]); // both workers named exactly — before the fix WORK-1's stage 3 was silently adopted by WORK-19's (or vice versa)
   });
 
   test("it does NOT escalate again on the next poll (dedupe): re-running check() at the same or later time posts nothing further for stage 1", async () => {

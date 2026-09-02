@@ -386,7 +386,18 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
       return null;
     });
     if (rows === null) return null;
-    const need = [`fingerprint: ${worker}`, `boss: ${boss}`, `stage: ${stageTag}`];
+    // Trailing "\n" on the two variable-bearing entries: findMarked matches
+    // by bare substring (body.includes(...)), and this project's own key
+    // shape makes prefix collisions the NORM, not an exotic case
+    // (BUTCHR-1/BUTCHR-19/BUTCHR-192/BUTCHR-200) — "boss: BOSS-19".includes
+    // ("boss: BOSS-1") is true, so without a delimiter a boss/worker key
+    // that is a strict prefix of another silently collapses two distinct
+    // (worker, boss) pairs' dedupe identities back into one, reproducing
+    // exactly the finding the `boss:` line was added to fix. Every stage
+    // body joins with "\n" and both lines are followed by one, so this is
+    // sufficient. `stage:` needs no delimiter — its values ("1"/"2"/"3")
+    // have no prefix relation to each other.
+    const need = [`fingerprint: ${worker}\n`, `boss: ${boss}\n`, `stage: ${stageTag}`];
     const existing = findMarked(rows, MARKER, need);
     if (existing) {
       const adoptedAt = Date.parse(existing.created) || deps.now();
