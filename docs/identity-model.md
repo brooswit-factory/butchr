@@ -33,6 +33,21 @@ and compare:
    the H3 verdict below if the guidance now states the epic→task constraint,
    or states the constraints generally.
 
+**A rule this page's own history demonstrates, so apply it everywhere in
+here**: a claim written as *a measurement, with a date and a vantage point*
+stays good as written, even after the world moves on — it's a true
+statement about what was observed, when, from where. A claim written as *a
+fact about the world* (e.g. "there is no open PR right now") goes stale
+silently the moment the world changes, with nothing on the page to signal
+it. The epic→task Check 2 row below went stale twice in under twenty
+minutes this way while this very document was being drafted — first when
+`BUTCHR-100` answered a request that had been open when the ticket was
+written, then again when the "no open PR" fact it reported stopped being
+true a few minutes later (#172, this document's own PR, became one of the
+open PRs). Every row below is written in the first form deliberately;
+where you see the second form, that's a bug in this page to report, not a
+style choice to imitate.
+
 ## The role map is PER-DAEMON, not global — H1
 
 **H1 (per-daemon role maps that can disagree): CONFIRMED**, by direct
@@ -169,6 +184,31 @@ daemon whose Epic-tier ticket is nonetheless assigned, means a tier's
 *effective* identity is sometimes not recoverable from that daemon's role
 map at all — you have to read a live ticket.
 
+**The mechanism, now confirmed rather than left as a puzzle**: which
+daemon's role map actually staffs a given ticket is not "the daemon that
+will end up serving that ticket's own agent" — it's **the daemon serving
+whichever boss's `new_worker`/`adopt_worker` call created it.** MEASURED,
+by reading the wiring this session (`src/daemon/index.ts` line binding
+`atlassianTools(ops, undefined, config.assignees, recordOwnWrite)`, and
+`src/tools/defs.ts`'s `new_worker`/`adopt_worker` handlers, which close over
+that same `roles` value and never re-read it per-call): each daemon reads
+its own `config.assignees` from its own process environment exactly once,
+at boot, and every `new_worker`/`adopt_worker` call handled by that daemon
+process resolves the role from that one frozen snapshot — regardless of
+which ticket (`x-issue`) is calling. So `BUTCHR-100`'s assignment did not
+come from "the daemon that now serves `BUTCHR-100`'s own agent" (which
+happens to be Daemon A, mine, going by its `ENVIRONMENT.md`) — it came from
+whichever daemon's MCP endpoint the **project tier** was actually calling
+`new_worker`/`adopt_worker` on on 2026-09-01, at the moment `BUTCHR-100`
+was created. **A ticket's identity is set once, at staffing time, by the
+role map of the daemon that served the boss which staffed it — not by
+whichever daemon happens to serve that ticket's own agent later, and not by
+re-reading anyone's role map after the fact.** This is the sharper reading
+of H1: the risk is not just "two daemons disagree right now", it is "a
+ticket's account was frozen in by a role map that may since have changed on
+that same daemon, or that belonged to a different daemon than the one you'd
+naturally go check."
+
 ### Atlassian accountId → display name → GitHub login
 
 **No single tier can produce this whole table alone** — each row needs
@@ -264,12 +304,24 @@ since been corrected (`BUTCHR-103`'s scope, per `BUTCHR-100`'s own ticket).
 earlier creator-vs-assignee method it explicitly superseded): compare the
 Jira `assignee.accountId` of the boss ticket against the `assignee.accountId`
 of the worker ticket, for a boss/worker pair connected by a real Implements
-link, read fresh with `jira_get_issue` in this session. This needs no daemon
-access at all, which is why it also covers hops whose daemon is unreadable
-from here. It measures the **Atlassian account**, which is what a GitHub PR
-review turns on **once you also know the Atlassian-account → GitHub-login
-correspondence** (given above) — that second correspondence is a separate,
-weaker claim and is called out per-hop below.
+link, read fresh with `jira_get_issue` in this session. It measures the
+**Atlassian account**, which is what a GitHub PR review turns on **once you
+also know the Atlassian-account → GitHub-login correspondence** (given
+above) — that second correspondence is a separate, weaker claim and is
+called out per-hop below.
+
+**This is the primary method for a correctness reason, not merely an
+availability one.** It needs no daemon access at all, which does mean it
+still covers a hop whose daemon is unreadable from here — but "The wrinkle"
+above shows it is more than a fallback: a role-*variable* comparison
+provably misses a real collision (Daemon B's `_EPIC` is unset, yet a live
+Epic-tier ticket there is assigned the collision account anyway), while a
+live-*ticket*-assignee comparison cannot miss it, because it reads the
+account a tier's work actually landed under rather than a variable that
+may not have been the source of that assignment at all. **The effective
+assignee of a live ticket must be one side of every hop comparison; role
+variables are corroboration, never the primary instrument** — that is the
+rule this document's own D1 findings force, not a convenience.
 
 For `project→epic`, there is no worker-side "assignee" (a project has no
 ticket), so the applicable reading is the epic's `creator` (who ran
@@ -294,9 +346,9 @@ They did not differ.
 |---|---|---|---|---|---|
 | project → epic | `e160cf60` ("boos writ") — `BUTCHR-100.creator.accountId`, MEASURED via `jira_get_issue("BUTCHR-100")` this session | `619ec5ec` ("Wroos Bit") — `BUTCHR-100.assignee.accountId`, same call | live ticket read, this session | **cross-account** | equal accountIds on a re-read would flip this to same-account |
 | epic → story | `619ec5ec` — `BUTCHR-100.assignee.accountId` | `e160cf60` — `BUTCHR-99.assignee.accountId`, MEASURED via `jira_get_issue("BUTCHR-99")` this session | live ticket read, this session | **cross-account** | equal accountIds on a re-read would flip this |
-| story → task | `e160cf60` — `BUTCHR-99.assignee.accountId` | `619ec5ec` — `BUTCHR-106.assignee.accountId`, MEASURED via `jira_get_issue("BUTCHR-106")` this session (this is my own ticket) | live ticket read, this session, **plus** a live GitHub artefact: PR #167 (author `wroosbit`/Task) was `APPROVED` by `booswrit`/Story — MEASURED, `gh pr view 167 --json author,reviews` this session | **cross-account** (structural). **GitHub-layer live confirmation for THIS PR is outstanding** — `BUTCHR-99` reviews this ticket's own PR with `gh pr review --approve` after this document is published; the outcome was not yet known when this was written, and is not pre-written here. Check the `[review]` line on `BUTCHR-106` for the live result. | equal accountIds, or `BUTCHR-99`'s own review of this PR being refused with "cannot approve your own pull request", would flip this |
+| story → task | `e160cf60` — `BUTCHR-99.assignee.accountId` | `619ec5ec` — `BUTCHR-106.assignee.accountId`, MEASURED via `jira_get_issue("BUTCHR-106")` this session (this is my own ticket) | live ticket read, this session, **plus two live GitHub artefacts**: (1) PR #167 (author `wroosbit`/Task) was `APPROVED` by `booswrit`/Story — MEASURED, `gh pr view 167 --json author,reviews`; (2) **CITED from `BUTCHR-99`, current and positive, not historical**: on this ticket's own PR #172 (author `wroosbit`), `gh pr review 172 --request-changes` run as `booswrit` **succeeded** — `BUTCHR-99` verified by reading it back, `gh pr view 172 --json reviewDecision,reviews` → `CHANGES_REQUESTED` recorded for `booswrit` @ `efffc7d7e837a6bd321b7ccb8bd4e0ccc4f1e473`. This is meaningful evidence, not a formality: GitHub's self-review restriction blocks an author from submitting *either* `APPROVE` or `REQUEST_CHANGES` on their own PR — a self-review can only ever land as `COMMENT` (exactly what PR #170 shows, measured above). A formal, accepted `CHANGES_REQUESTED` from `booswrit` on a `wroosbit`-authored PR therefore demonstrates the two are distinct GitHub accounts, live, today, at the GitHub layer | **cross-account**, structurally and now also live-confirmed at the GitHub layer for a `CHANGES_REQUESTED`. **Stated at its actual limit**: this confirms REQUEST_CHANGES, not APPROVE — the definitive end-to-end positive confirmation is an accepted `APPROVE` on this same PR, which is pending on this document's own revision cycle and is deliberately not pre-written here; check the `[review]` line on `BUTCHR-106` for that outcome | equal accountIds, or a future review attempt from `booswrit` on a `wroosbit`-authored PR being REFUSED with "cannot approve/review your own pull request", would flip this |
 | epic → task (the `adopt_worker` shortcut) | `619ec5ec` — `BUTCHR-100.assignee.accountId` | `619ec5ec` — `BUTCHR-106.assignee.accountId` | live ticket read, this session — **EQUAL** | **same-account — guarantee ABSENT** | unequal accountIds on a re-read would refute the central collision this whole epic is about |
-| epic → task, Check 2 | — | — | **NOT EXECUTABLE FROM THE TASK TIER** (I cannot call `adopt_worker` and am not an Epic) — **and its substance is nonetheless settled, CITED from `BUTCHR-100`, which measured Check B first-hand on 2026-09-02 (see "The wrinkle" under D1): an Epic on its own daemon adopting a Task still resolves to the Epic's own account (`619ec5ec` = `619ec5ec`), so staffing is not fixed.** The *literal* live form (adopt a Task, PR, attempt `gh pr review --approve` today) was deliberately **not** re-run, for two stated reasons, not silently skipped: (1) factual — PR #170 is merged and `gh pr list --state open` on this repo returns none authored by the Task account, so there is currently no open PR to attempt an approval against; (2) principled — even given an open PR, a *successful* approval is the one outcome the check exists to catch, and running it live would leave a real GitHub approval on someone else's unreviewed work, damaging the exact guarantee under test, for a result (GitHub's own documented "cannot approve your own PR" rule) that isn't in doubt and says nothing about butchr's own staffing. Re-runnable, in its literal live form, by any Epic-tier agent at a moment an open Task-authored PR exists | — | if a live re-run of the literal form ever SUCCEEDS, or if a future Check B on any daemon finds the Epic and Task accounts DIFFER, report it to `BUTCHR-99` as REFUTED immediately, not folded in quietly |
+| epic → task, Check 2 | — | — | **NOT EXECUTABLE FROM THE TASK TIER** (I cannot call `adopt_worker` and am not an Epic) — **and its substance is nonetheless settled, CITED from `BUTCHR-100`, which measured Check B first-hand on 2026-09-02 (see "The wrinkle" under D1): an Epic on its own daemon adopting a Task still resolves to the Epic's own account (`619ec5ec` = `619ec5ec`), so staffing is not fixed.** The live approval refusal was last observed by `BUTCHR-62` on PR #170 (re-confirmed by me this session, above); **it was not, and will not be, re-run on demand — not because no open PR happened to exist (that fact moved twice within twenty minutes: none existed when `BUTCHR-100` checked, then #172 and #173 opened, both `wroosbit`/Task), but because the only PRs it could be attempted on are other agents' genuinely unreviewed work, and attempting it requires posting a real approval to a PR nobody has reviewed — which is exactly the guarantee this epic exists to protect.** A *successful* approval is the one outcome the check exists to detect; buying that observation by actually granting an unreviewed approval would damage the thing being measured, on someone else's ticket, to produce a result (GitHub's documented self-review rule) that already isn't in doubt. **Confirmed structurally instead — see the staffing measurement above — and re-runnable, honestly, by any Epic-tier agent that has a PR of its own adopted worker's genuinely awaiting its review**: that circumstance will occur in the ordinary course, and when it does the check runs for free, at no cost to anyone, because the approval being granted is one that was owed anyway | — | if a live re-run of the literal form ever SUCCEEDS, or if a future Check B on any daemon finds the Epic and Task accounts DIFFER, report it to `BUTCHR-99` as REFUTED immediately, not folded in quietly |
 | story → story (adopt_worker on a peer Story) | n/a | n/a | **not measured on a real ticket** — reasoned from source, see below | **same-account by construction — not-currently-reachable in observed practice** | reachable, and would need re-verifying against real tickets, the day a Story orphan gets adopted by another Story |
 | task → task (adopt_worker on a peer Task) | n/a | n/a | **not measured on a real ticket** — reasoned from source, see below | **same-account by construction — not-currently-reachable in observed practice** | same as above |
 
