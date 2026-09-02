@@ -6,10 +6,22 @@ import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
   CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
-  ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER,
+  ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER, guardShortProse, SWALLOWED_ARGUMENT_RE,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
+
+// A SYNTHETIC swallowed-argument shape for tests that don't need a real
+// historical specimen (BUTCHR-164/BUTCHR-127 below cover those). Built from
+// separate characters at call time rather than written as one literal, same
+// discipline as the fixture file: nothing in this source tree should ever
+// contain the corrupted tag shape as one contiguous run — see
+// swallowed-argument-specimens.ts's own doc comment for why.
+const LT = "<", SLASH = "/", GT = ">";
+function fakeSwallowedArg(argName: string, nextArgName: string): string {
+  return `a perfectly good ${argName} value, until here${LT}${SLASH}${argName}${GT}\n${LT}parameter name="${nextArgName}"${GT}text that was meant to be a separate ${nextArgName} argument`;
+}
 
 const ROLES = { story: "acct-story", task: "acct-task", epic: "acct-epic" };
 
@@ -1633,6 +1645,234 @@ describe("fileWhereItBelongs: partial-failure honesty — the ticket, once creat
     expect(thrown?.message).toMatch(/own first set_doc call/);
     // the notice still fired despite the doc failure — independent steps.
     expect(issues.get("BUTCHR-1")!.comments.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-177/BUTCHR-180: the swallowed-argument guard. A malformed tool call
+// can fold a LATER argument's text into an earlier SHORT-PROSE one (measured
+// twice: BUTCHR-127 via BUTCHR-102, BUTCHR-164 via BUTCHR-156, both on
+// file_where_it_belongs's `destination`) — this returned a normal result and
+// silently mangled the created ticket. guardShortProse (relationship.ts,
+// beside classifyDestination/destinationRefusal — the existing `destination`
+// validator this shares a file with) catches the SHAPE, not a length bound:
+// see MIN_REASON_CHARS's own comment for the opposite bound already living
+// here, which a pure length cap would collide with (BUTCHR-164's own
+// genuine reason is well over a thousand characters and must NOT be refused
+// for being long).
+// ---------------------------------------------------------------------------
+
+describe("guardShortProse: the shared swallowed-argument guard", () => {
+  test("ordinary short prose is unaffected — no false positive on normal text", () => {
+    expect(() => guardShortProse("some_verb", "reason", "waiting on a dependency")).not.toThrow();
+  });
+
+  test("a long, HONEST value is unaffected — length alone is never the trigger", () => {
+    const long = "a genuinely long, carefully argued reason. ".repeat(60); // ~2000 chars, no tag-shaped substring
+    expect(long.length).toBeGreaterThan(1500);
+    expect(() => guardShortProse("some_verb", "reason", long)).not.toThrow();
+  });
+
+  test("refuses a premature closing tag, naming the verb and argument, without reproducing the tag as one literal run", () => {
+    const bad = fakeSwallowedArg("reason", "description");
+    let thrown: Error | undefined;
+    try {
+      guardShortProse("shelve_worker", "reason", bad);
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).toMatch(/shelve_worker:/);
+    expect(thrown!.message).toContain("`reason`");
+    expect(thrown!.message).toMatch(/premature closing tag naming `reason`/);
+    // the refusal never reproduces "<" immediately followed by "/" and the
+    // name and ">" as one contiguous run — see guardShortProse's own doc
+    // comment for why (a caller pasting the refusal back in must not
+    // reproduce the very defect it is refusing).
+    expect(thrown!.message).not.toContain(`${LT}${SLASH}reason${GT}`);
+  });
+
+  test("refuses this harness's own `<parameter name=\"...\">` opening-wrapper shape too, not only a closing tag", () => {
+    // isolate JUST the opening-wrapper half of the shape (no closing tag
+    // present at all), to prove both regex branches are load-bearing.
+    const bad = `a fine value so far${LT}parameter name="description"${GT}rest of what should have been separate`;
+    expect(() => guardShortProse("new_worker", "summary", bad)).toThrow(/opens the NEXT tool-call argument \(naming `description`\)/);
+  });
+
+  test("THE FALSIFIER: BUTCHR-164's real captured mangled `destination` text is refused by this guard", () => {
+    // Stated before checking, per the ticket: if this does NOT throw, the
+    // defect is unfixed. It throws — see the fixture's own header comment
+    // for provenance (BUTCHR-175's archive comment on BUTCHR-164).
+    expect(SWALLOWED_ARGUMENT_RE.test(BUTCHR_164_MANGLED_DESTINATION)).toBe(true);
+    expect(() => guardShortProse("file_where_it_belongs", "destination", BUTCHR_164_MANGLED_DESTINATION)).toThrow();
+  });
+
+  test("THE FALSIFIER: BUTCHR-127's real captured mangled `destination` text is refused by this guard", () => {
+    expect(SWALLOWED_ARGUMENT_RE.test(BUTCHR_127_MANGLED_DESTINATION)).toBe(true);
+    expect(() => guardShortProse("file_where_it_belongs", "destination", BUTCHR_127_MANGLED_DESTINATION)).toThrow();
+  });
+});
+
+describe("classifyDestination / fileWhereItBelongs: the swallowed-argument guard on `destination`", () => {
+  test("classifyDestination refuses BUTCHR-164's real mangled destination text, teaching what a good destination looks like", () => {
+    expect(() => classifyDestination(BUTCHR_164_MANGLED_DESTINATION)).toThrow(/premature closing tag naming `destination`/);
+  });
+
+  test("classifyDestination refuses BUTCHR-127's real mangled destination text", () => {
+    expect(() => classifyDestination(BUTCHR_127_MANGLED_DESTINATION)).toThrow(/premature closing tag naming `destination`/);
+  });
+
+  test("fileWhereItBelongs: THE REGRESSION SCENARIO ITSELF — a swallowed destination is refused BEFORE the ticket is created, no comment posted anywhere, nothing half-written", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR" });
+    const before = issues.size;
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: BUTCHR_164_MANGLED_DESTINATION }))
+      .rejects.toThrow(/premature closing tag naming `destination`/);
+    expect(issues.size).toBe(before); // NO ticket was created
+    expect(issues.get("BUTCHR-7")!.comments).toEqual([]); // NO notice, NO comment, anywhere
+  });
+
+  test("a Jira-key-shaped destination is unaffected — the guard never fires on the ordinary case", () => {
+    expect(classifyDestination("BUTCHR-25")).toEqual({ kind: "epic", key: "BUTCHR-25" });
+  });
+
+  test("a genuinely long, honest reason (BUTCHR-164's real text MINUS the seam and everything after it) is NOT refused — the guard does not resurrect the length bound it replaces", () => {
+    const seamIndex = BUTCHR_164_MANGLED_DESTINATION.search(/<\//);
+    const genuinePart = BUTCHR_164_MANGLED_DESTINATION.slice(0, seamIndex);
+    expect(genuinePart.length).toBeGreaterThan(1000); // well over MIN_REASON_CHARS, on purpose
+    expect(() => classifyDestination(genuinePart)).not.toThrow();
+  });
+});
+
+describe("fileWhereItBelongs: the swallowed-argument guard on `summary`", () => {
+  test("refuses a swallowed `summary`, before the destination-epic read or the create call", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: bad, issuetype: "Task", destination: "BUTCHR-1" }))
+      .rejects.toThrow(/file_where_it_belongs: `summary` contains/);
+    expect(issues.size).toBe(before); // NO ticket created
+    expect(issues.get("BUTCHR-1")!.comments).toEqual([]); // NO notice posted on the named epic either
+  });
+});
+
+describe("correctWorker: the swallowed-argument guard on `why` and `summary`", () => {
+  test("refuses a swallowed `why`, before the archive comment is posted or the description is touched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const bad = fakeSwallowedArg("why", "description");
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: bad }))
+      .rejects.toThrow(/correct_worker: `why` contains/);
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // UNCHANGED
+    expect(issues.get("BUTCHR-2")!.comments).toEqual([]); // no archive comment posted
+  });
+
+  test("refuses a swallowed `summary`, same guarantee", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: bad, why: "reason" }))
+      .rejects.toThrow(/correct_worker: `summary` contains/);
+    expect(issues.get("BUTCHR-2")!.summary).toBe("old summary"); // UNCHANGED
+    expect(issues.get("BUTCHR-2")!.comments).toEqual([]);
+  });
+
+  test("`description` itself is NEVER guarded this way — a full-length replacement may legitimately contain this shape (e.g. quoting this very defect)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const describesTheDefect = `discussing the shape: ${LT}${SLASH}destination${GT} followed by ${LT}parameter name="description"${GT}`;
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: describesTheDefect, why: "documenting the defect" }))
+      .resolves.toBeDefined();
+    expect(issues.get("BUTCHR-2")!.description).toBe(describesTheDefect);
+  });
+});
+
+describe("shelveWorker: the swallowed-argument guard on `reason`", () => {
+  test("refuses a swallowed `reason`, before ownership is even checked or any label/transition/comment is written", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", bad)).rejects.toThrow(/shelve_worker: `reason` contains/);
+    const w = issues.get("BUTCHR-2")!;
+    expect(w.labels).toEqual([]);
+    expect(w.status).toBe("To Do"); // untouched (was already the default, but never transitioned)
+    expect(w.comments).toEqual([]);
+  });
+});
+
+describe("newWorker / newProjectWorker: the swallowed-argument guard on `summary` and the shelve `reason`", () => {
+  test("issue caller: refuses a swallowed `summary`, before the caller's own issue is even read", async () => {
+    const { ops, issues } = makeWorld();
+    let getIssueCalls = 0;
+    const throwingOps: AtlassianOps = { ...ops, getIssue: async (key: string) => { getIssueCalls++; throw new Error(`should not be read: ${key}`); } };
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(newWorker(throwingOps, ROLES, "BUTCHR-1", { summary: bad, disposition: { kind: "start" } }))
+      .rejects.toThrow(/new_worker: `summary` contains/);
+    expect(getIssueCalls).toBe(0); // refused before any Jira read
+    expect(issues.size).toBe(before);
+  });
+
+  test("issue caller: refuses a swallowed shelve `reason`, before create", async () => {
+    const { ops, issues, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const before = issues.size;
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "shelve", reason: bad } }))
+      .rejects.toThrow(/new_worker: `reason` contains/);
+    expect(issues.size).toBe(before); // no child created
+  });
+
+  test("PROJECT caller: refuses a swallowed `summary` too — newProjectWorker has its own copy of this check, not inherited from newWorker's routing", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const before = issues.size;
+    const bad = fakeSwallowedArg("summary", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR", { summary: bad, disposition: { kind: "start" } }))
+      .rejects.toThrow(/new_worker: `summary` contains/);
+    expect(issues.size).toBe(before);
+  });
+
+  test("PROJECT caller: refuses a swallowed shelve `reason` too", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const before = issues.size;
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "shelve", reason: bad } }))
+      .rejects.toThrow(/new_worker: `reason` contains/);
+    expect(issues.size).toBe(before);
+  });
+});
+
+describe("adoptWorker: the swallowed-argument guard on the shelve `reason`", () => {
+  test("issue caller: refuses a swallowed shelve `reason`, before the adopted ticket is even read", async () => {
+    const { ops, issues, addIssue } = makeWorld();
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    let getIssueCalls = 0;
+    const throwingOps: AtlassianOps = { ...ops, getIssue: async (key: string) => { getIssueCalls++; throw new Error(`should not be read: ${key}`); } };
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(adoptWorker(throwingOps, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: bad }))
+      .rejects.toThrow(/adopt_worker: `reason` contains/);
+    expect(getIssueCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.bossKey).toBeUndefined(); // never adopted
+  });
+
+  test("PROJECT caller: the SAME check (before isProjectId routing) also covers adoptProjectWorker — no duplicated check needed there", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    const bad = fakeSwallowedArg("reason", "description");
+    await expect(adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "shelve", reason: bad }))
+      .rejects.toThrow(/adopt_worker: `reason` contains/);
+    expect(issues.get("BUTCHR-9")!.assignee).toBeUndefined(); // never assigned — refused before any write
   });
 });
 
