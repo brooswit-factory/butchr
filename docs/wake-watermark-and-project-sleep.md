@@ -381,17 +381,22 @@ rewritten rather than left standing, because a page that promises a result
 it does not contain is exactly the staleness this repo's review convention
 exists to catch.)
 
-**The verdict is FAILED**, and the section below locates the mechanism:
-`projectVerdict` does not return `"asleep"` for BUTCHR even with all three
-wake rules caught up, so the project never leaves `desired` and its pane is
-never released. The defect is upstream of both `atRest` and the exit path.
+**The verdict is FAILED**, and the section below locates the mechanism
+narrowly: `projectVerdict` DOES return `"asleep"`, `atRest` protects the race
+and is then bounded, and `checkFrozenAsleep` FIRES — **the agent simply does
+not exit of its own accord.** It is reaped by that safety net about fifteen
+minutes later, and its pane IS returned.
 
-Two earlier drafts of this page reached different conclusions on weaker
-evidence — one recording FAILED on a window later voided by a herdr restart,
-one recording UNOBSERVABLE while an unconsumed wake trigger was still
-pending. Both were withdrawn before shipping. The section below records that
-history rather than deleting it, because a withdrawn verdict is part of the
-record.
+Three earlier drafts of this page reached different conclusions on weaker
+evidence, all withdrawn and all recorded below rather than deleted, because a
+withdrawn verdict is part of the record:
+
+- a FAILED on a window later voided by a herdr restart;
+- an UNOBSERVABLE taken while an unconsumed wake trigger was still pending;
+- a FAILED whose stated mechanism — "the verdict never says asleep; the exit
+  path has never been reached" — was **the opposite of the truth**, built on a
+  complaint-absence read eleven minutes too early, after a daemon restart had
+  silently reset the very clock that negative depended on.
 
 BUTCHR-187's own vantage point could not observe the project agent that
 demonstration 6 is about (see above); the story's own vantage point can, and
@@ -441,165 +446,165 @@ What this document DOES establish, first-hand, and stands behind:
 
 # Signal 2 / demonstration 6: **FAILED** — recorded by story BUTCHR-119
 
-Measured from the daemon that can see the project tier — the vantage point
-BUTCHR-187 correctly identified it did not have. Read your own host, port and
-unit from your own workspace's `ENVIRONMENT.md`; more than one butchr daemon
-runs on this host under different Unix users, and a wrong-daemon query returns
-REAL data about the wrong daemon.
+The agent does not exit of its own accord. **It is reaped by a safety net about
+fifteen minutes later, and its pane IS returned.** Everything around the exit
+step — the verdict, the guard, and the guard's time bound — works.
 
-**OBSERVATION and MEANING are kept separate below, as everywhere on this page.**
+Read your own host, port and unit from your own workspace's `ENVIRONMENT.md`.
 
-## OBSERVED
+**OBSERVATION and MEANING are kept separate below.**
 
-Watermark advance, then 22 consecutive polls at 60s:
+## ⚠ A WRONG MECHANISM CLAIM WAS PUBLISHED HERE AND IS WITHDRAWN
 
-```
-advance                      17:04:02Z   version 16 -> 17 , comment 17334326 -> 17760259
-polls after the advance      22 consecutive, 17:04:02Z .. 17:25:12Z
-BUTCHR row                   PRESENT on ALL 22, pane wDJ:p1 throughout
-BUTCHR_ABSENT polls          0
-HERDR_UNREADABLE polls       0
-five non-wake keys           byte-intact on all 22 polls
-[butchr:frozen] on root doc  0    (12 footer comments, PER-PAGE form, HTTP 200)
-[frozen] in daemon journal   0    (whole post-deploy window, LOCAL --since)
-```
+An earlier version of this section stated: *"`projectVerdict` is not returning
+`"asleep"` for BUTCHR … the defect is upstream of both `atRest` and the exit
+path … the exit path has never been reached."*
 
-All three wake rules caught up, each read off the artefact it is computed from:
+**That is FALSE. It is withdrawn, and recorded rather than deleted.**
+
+It rested on the absence of a `[butchr:frozen]` complaint at 17:25:34Z. **That
+read was simply too early**, and for a reason the withdrawn text had itself
+documented two paragraphs earlier:
 
 ```
-wake.version = 17         root doc 11600050 current version.number = 17    -> caught up
-wake.comment = 17760259   newest footer comment id = 17760259              -> caught up
-wake.epics   = {}         BUTCHR epics with status "In Review" = 0         -> caught up
+17:04:02Z  watermark advanced
+17:21:13Z  DAEMON RESTART (deploy 55ec1424 -> 4b19e775)
+17:25:34Z  the complaint read  <-- TOO EARLY
+17:36:16Z  [butchr:frozen] BUTCHR posted
 ```
 
-Rule 3 was checked BEFORE concluding, with its failure condition stated first:
-*any BUTCHR epic In Review and absent from `wake.epics` would be a genuine
-pending trigger, making `"active"` correct behaviour and leaving the window
-uninformative.* Zero found.
+`frozen-asleep.ts` says of its own tracking: *"all tracking here is in-memory
+only. A daemon restart loses every `firstObservedAt` floor"*, and of the field:
+*"Never persisted."* The 17:21:13Z restart wiped every floor, so at 17:25:34Z the
+daemon was four minutes old and could not have accumulated the ten-minute bound.
+**There were ZERO qualifying polls, not two.** The negative carried no
+information at all.
 
-## MEANING — FAILED, and the mechanism is LOCATED
+*An absent result is evidence about the search.* The search was mistimed, and the
+mistiming was checkable against a mechanism this page already described.
 
-**The project agent does not exit and its pane is not released, with nothing
-left for it to do.**
-
-The verdict rests on row presence and the pane, never on a status word — every
-one of those 22 polls read `done`, and `mapAgentStatus` maps both `done` and
-`idle` to idle. Only an absent row (`raw == null`) means no agent.
-
-**It is the verdict, not the guard and not the exit path.** The frozen-asleep
-detector is obliged to SPEAK FIRST, ACT SECOND: it posts `[butchr:frozen]` on
-the resource's own channel *before* protection is ever withdrawn, and it also
-logs `[frozen]`. BUTCHR's `firstObservedAt` could start no later than ~17:07;
-the bound is 10 minutes; project polls land ~17:17 and ~17:22. **Two qualifying
-polls passed with nothing on either channel.**
-
-Therefore BUTCHR is **not in `restingRunning` at all** — `projectVerdict` is not
-returning `"asleep"` for it, despite every wake rule being caught up:
+## OBSERVED — what actually happened
 
 ```
-projectVerdict never says "asleep"
-  -> the project never leaves `desired`
-    -> `stop = running − desired − atRest` never contains it
-      -> the pane is never released
+17:04:02Z  watermark advanced: version 16 -> 17, comment 17334326 -> 17760259
+17:05:22Z  all three wake rules caught up; nothing pending
+17:04-17:25 22 consecutive polls, butchr-butchr PRESENT on every one, 0 absent,
+           0 unreadable, five non-wake keys byte-intact throughout
+17:21:13Z  daemon restart (deploy)
+17:36:16Z  [frozen] BUTCHR past the 10-minute atRest bound (15m) —
+           complaint posted, no longer protected
+17:36:16.349Z  root doc footer comment 16777415:
+           "[butchr:frozen] BUTCHR has read \"asleep\" with its agent still
+            running, continuously, for 15 minutes … Its agent is being
+            stopped now."
+17:41:15Z  NEW butchr-butchr agent (pid 112822). Old agent pid 5306,
+           up since 09:51:52Z, confirmed GONE.
 ```
 
-**The defect is upstream of both `atRest` and the exit path.** The agent does not
-freeze; `atRest` does not over-protect. **The exit path has not been tested — it
-has never been reached.**
+## MEANING
 
-## What moved, and it is not nothing
+**`projectVerdict` DOES return `"asleep"`.** The complaint says so in the
+daemon's own words — the detector only ever considers resources reading
+asleep-with-agent-still-running.
 
-BUTCHR-68's chain was `403 -> wake never persists -> FAIL-OPEN -> "active"
-forever -> never stopped -> pane never released`. **The first link is broken**:
-the watermark persists, and persisted across a process restart AND a 15-commit
-deploy with all five pre-existing keys byte-intact. The failure has moved to a
-later link. "FAILED" alone would hide that.
+**The agent does not exit.** It sat asleep with nothing pending until the daemon
+stopped it. That is demonstration 6's actual failure, and it is narrow: the
+project agent's own exit step, with everything around it working.
+
+**The pane WAS released — by a REAP, not an exit.** This distinction is
+load-bearing and must not be blurred: the epic's sentence, and BUTCHR-62's
+criterion, is *"wakes on an event, acts, and EXITS."* Being stopped by a safety
+net after fifteen minutes is a different sentence.
+
+**What works, established here rather than assumed:**
+
+- the verdict logic returns `"asleep"` correctly;
+- `atRest` protects the wake-then-exit race and is then bounded;
+- **`checkFrozenAsleep` FIRES.** This page previously listed that as open,
+  separating "exists" from "fires". It fires.
+
+## The pane exposure is much smaller than this page first said
+
+An earlier version said a project that cannot sleep "holds its pane" from a pool
+that is the binding constraint. **Corrected: the pane is held ~15 minutes per
+wake, then reclaimed by the safety net.** Panes do come back. That materially
+changes the fleet-capacity argument in the tier's favour.
+
+## A watermark REGRESSION, observed
+
+```
+wake.comment at 17:04:02Z : 17760259
+wake.comment at 19:53:51Z : 16777415   (the frozen complaint's own id)
+```
+
+**The watermark ran BACKWARD by 982,844.** Under max-id ordering a lower-id write
+moves the floor DOWN, so comments between the two — including 17760259, already
+consumed — become pending again. That is not only a missed wake; it is a
+regression producing spurious re-wakes. Belongs to the comment-ordering defect
+(BUTCHR-195); not fixed here.
+
+## The ordering defect, caught biting live
+
+Three root-doc comments created AFTER the watermarked one, all with lower ids,
+all `version.number == 1` so `createdAt` is creation time:
+
+```
+16580758  17:21:45Z  the deploy announcement — the project tier had no mechanism
+                     by which it could learn its own daemon had been replaced
+16842944  19:24:36Z  an assistant report on daemon defects
+18153493  19:51:09Z  the assistant's own note that 16842944 was silently missed
+```
+
+**Wording correction carried from this:** where this page said *"newest footer
+comment id == wake.comment → caught up"*, the accurate form is **"the daemon's
+own observable is caught up"**. The daemon computes newest by max id, so from its
+point of view nothing is pending — the inference holds *because* the daemon
+computes it the defective way, not because nothing new was said.
 
 ## What this does NOT establish
 
-- One subject, one window, immediately after a restart. It says nothing about
-  the other allowlisted projects and licenses no fleet-wide claim.
-- It does **not** settle whether a released pane would mean the agent exited or
-  the daemon reaped it. That distinction splits the row-goes-absent branch; the
-  row never went absent, so the question is untouched — not answered.
-- `checkFrozenAsleep` remains **untested**: it cannot fire for a resource that
-  never reads asleep. "Exists" and "fires" stay separate claims.
+- One subject, one window. No fleet-wide claim.
+- Whether the reap-then-respawn cycle repeats. The complaint comment is itself a
+  wake trigger, and a new agent appeared five minutes later — but the fleet was
+  becalmed 17:29Z–19:40Z, so a sustained loop is **not** established.
+- Why the agent fails to exit. That is the remaining question.
 
-## Two corrections to this story's own pre-registered criterion
+## Corrections to this story's own pre-registered criterion
 
-Recorded rather than smoothed over, because quietly moving a threshold after
-seeing data is the exact failure pre-registration exists to prevent. Both were
-disclosed before the data landed under them, and both made the more publishable
-FAILED verdict *harder* to reach.
+Three, all recorded rather than smoothed over, and the first two disclosed before
+the data landed under them:
 
-1. The original threshold — row present three polls after the advance — sat
-   **inside** the 10-minute `atRest` window, where a correctly-sleeping project
-   is protected from being stopped. It could not distinguish "never sleeps" from
-   "slept and is guarded", and would have produced a **false FAILED**.
-2. The corrected threshold was **still wrong**: the bound runs from
-   `firstObservedAt` — the first poll reading asleep-and-running — not from the
-   watermark advance, and is evaluated only on 5-minute project polls.
+1. The original FAILED threshold sat inside the `atRest` window — a false FAILED.
+2. Its replacement mistook where the bound's clock starts (`firstObservedAt` on
+   5-minute polls, not the watermark advance).
+3. **The mechanism claim built on the complaint-absence was wrong**, because a
+   daemon restart inside the window reset the very clock the negative depended
+   on. Caught by the epic, not by this story.
 
-The superseded thresholds are deliberately not restated as results: a number in
-the record that looks like a verdict but is not one is worse than no number.
+The superseded thresholds are deliberately not restated as results.
 
-## Method worth reusing: a duty to announce is an instrument
+## Method, restated with its own limit
 
-Correction 2 turned a purely absence-shaped demonstration into one with a
-**positive** signal. When a module documents an obligation to announce before it
-acts — "speak first, act second" — that obligation is a probe: its silence
-carries information about internal state that is otherwise unobservable. Here it
-is what separates "the agent froze past the bound" from "the verdict never said
-asleep", a distinction previously recorded as undecidable from outside.
-
-Generalisable wherever such a rule is written down; `[butchr:frozen]` is only
-this story's instance of it.
-
-## What these instruments could not see
-
-- **60s polling.** Anything appearing and disappearing inside one interval is
-  invisible to every claim here.
-- **Pane release IS visible** — proved by an unplanned positive control
-  (`butchr-butchr-164` vanished and released `wBC:p1`), not assumed. So an
-  absent row would have been detected had one occurred.
-- **The complaint-absence is a two-channel negative** (Confluence footer
-  comments AND the journal), and the daemon does emit `[frozen]` from that
-  module, so it is meaningful rather than vacuous. It excludes a complaint
-  *posted*; it cannot exclude a detector that never ran — which is why the
-  conclusion is stated as "not in `restingRunning`", not "the detector is
-  broken".
-- **A momentary `"inactive"` verdict between two polls remains unexcluded.**
-  Nothing here turns on it, since the row never went absent.
-- **Verdict internals are not logged at this level** (emitted tags post-deploy:
-  `[tools]`, `[labels]`, `[notify]`, `[pr]`, `[prompts]`, `[health]`,
-  `[reconcile]`). The complaint, not the log, is what carries the signal.
-
-## The next measurement, named rather than left as a shrug
-
-**Why does `projectVerdict` not return `"asleep"` for BUTCHR when all three wake
-rules are caught up?** That is now the whole remaining question for this
-demonstration, and it is a code-reading question rather than an observation one.
-Verdict-level logging — the value returned for a project on a given poll, or the
-contents of `desired`/`atRest`/`plan.stop` — would settle it directly.
+**When a module documents a duty to announce before acting, that duty is a
+probe.** That still holds and it is what finally settled the mechanism. **But a
+probe has a clock**, and this story read it before it could have fired. The
+lesson is not "the method failed" — the complaint is exactly what produced the
+right answer eleven minutes later — it is that *a duty-to-announce probe is only
+as good as the timing argument attached to it, and a restart can reset that clock
+silently.*
 
 ## Scope kept
 
-`atRest` was **observed and reported, never changed**. One correction for the
-record: the premise that its window is "unbounded, and nothing enforces it" is
-not merely stale — `checkFrozenAsleep` and `atRestMinutes` defaulting to 10 are
-**BUTCHR-123's shipped deliverable** (BUTCHR-95, BUTCHR-116 and BUTCHR-123 are
-all Done). The ticket text describing that defect as open has outlived the work.
+`atRest` observed, never changed — and it is now shown working end to end, bound
+included. `checkFrozenAsleep` and `atRestMinutes` are BUTCHR-123's shipped
+deliverable (BUTCHR-95, BUTCHR-116, BUTCHR-123 all Done), so ticket text
+describing that defect as open has outlived the work.
+`finish_without_a_boss` untouched (BUTCHR-101). `/health` red window not decided.
+Pane contention not investigated (BUTCHR-111). Comment ordering filed, not fixed.
 
-`finish_without_a_boss` untouched (BUTCHR-101, standing hold). The `/health`
-five-minute post-restart red window observed again (`projectNotify` state
-`"starting"`) and deliberately not decided. Pane contention not investigated
-(BUTCHR-111). The herdr restart and the deploy not investigated.
+## The next measurement
 
-## One consequence worth stating plainly
-
-The project tier is enabled fleet-wide — the running daemon's allowlist names
-nine projects. BUTCHR-68 projected "-1 pane permanently today, and -6 if the tier
-were fully enabled with the 403 unfixed". **With demonstration 6 FAILED, that
-exposure is unretired**: a project that cannot sleep holds its pane, from a pool
-that is already the binding constraint under burst. The measured subject is
-BUTCHR alone; the other projects are not measured and are not claimed.
+**Why does the project agent not exit once its verdict reads `"asleep"`?** That
+is the whole remaining question for demonstration 6, and it is now a narrow one:
+the exit step alone, with the verdict, the guard and the bound all confirmed
+working around it.
