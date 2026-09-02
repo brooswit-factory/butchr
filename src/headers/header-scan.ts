@@ -11,16 +11,32 @@ import { listTsFiles } from "../labels/label-scan.js";
  * header block built entirely outside `DescriptionHeaderKind`.
  *
  * WHY A PATTERN, NOT TODAY'S LITERAL TEXT — THE TRAP THIS TICKET WAS
- * SPECIFICALLY BUILT TO NOT REPEAT: a detector that greps for the literal
- * string `"[ORPHAN]"` catches today's one header and is BLIND to the next
- * one — structurally the identical trap `label-scan.ts`'s own header
- * documents for `agent:*`/`pr:*` (a family built by concatenation, whose
- * literal namespace prefix is not the whole value). A NEW description
- * header will have its OWN, DIFFERENT bracketed tag — this scanner matches
- * the SHAPE (`/^\[[A-Z][A-Z0-9_]*\]/` — a bracketed, all-caps tag opening a
- * string literal), extracts the tag, and checks THAT against
- * `HEADER_REGISTRY`'s declared tags, so a future header with a different
- * tag is still caught even though this file was never touched to add it.
+ * SPECIFICALLY BUILT TO NOT REPEAT, AND THEN NEARLY REPEATED ANYWAY (see
+ * below): a detector that greps for the literal string `"[ORPHAN]"` catches
+ * one header and is BLIND to the next one — structurally the identical trap
+ * `label-scan.ts`'s own header documents for `agent:*`/`pr:*` (a family
+ * built by concatenation, whose literal namespace prefix is not the whole
+ * value). A NEW description header will have its OWN, DIFFERENT bracketed
+ * tag — this scanner matches the SHAPE (`/^\[[A-Z][A-Z0-9_]*\]/` — a
+ * bracketed, all-caps tag opening a string literal), extracts the tag, and
+ * checks THAT against `HEADER_REGISTRY`'s declared tags, so a future header
+ * with a different tag is still caught even though this file was never
+ * touched to add it.
+ *
+ * PROVEN AGAINST A REAL SECOND HEADER, NOT JUST ARGUED (BUTCHR-157, review
+ * fix, 2026-09-02): this ticket's OWN fix originally shipped a second
+ * header — `retireOrphanHeader`'s `[ADOPTED]` successor line — built as a
+ * template literal WITH substitutions. `ts.isStringLiteralLike` matches
+ * `StringLiteral` and `NoSubstitutionTemplateLiteral` but NOT a
+ * `TemplateExpression` (a template containing `${...}`), so that first
+ * version was invisible to this exact scanner, caught only in human review.
+ * Fixed by hoisting the tag-bearing prefix into its own whole-literal
+ * constant (`ADOPTED_HEADER_OPEN_LINE`, `src/tools/relationship.ts`) — the
+ * same shape `ORPHAN_HEADER_OPEN_LINE` already used, which is WHY that one
+ * was caught automatically and this one, before the fix, was not. Recorded
+ * here because it is the single most concrete demonstration in this
+ * codebase of the blind spot named below — found on the first ticket that
+ * could have hit it.
  *
  * WHAT THIS SCANS: every `.ts` file under `src/` (never `test/` or
  * `scripts/` — same reasoning as `label-scan.ts`: `test/` fixtures use
@@ -42,11 +58,12 @@ import { listTsFiles } from "../labels/label-scan.js";
  *     string literal — e.g. built entirely by runtime concatenation or
  *     interpolation with no literal anywhere containing the full
  *     `[TAG] ...` prefix (`` `[${tagVar}] rest` `` where `tagVar` is not a
- *     literal). Today's one real header (`orphanHeader` in
- *     `src/tools/relationship.ts`) does NOT fall into this hole — its open
- *     line, `ORPHAN_HEADER_OPEN_LINE`, is a single whole string literal —
- *     but a future header built more dynamically could. This is the same
- *     species of blind spot `label-scan.ts` names for `agent:*`/`pr:*`
+ *     literal). Neither of today's two real headers (`ORPHAN_HEADER_OPEN_LINE`,
+ *     `ADOPTED_HEADER_OPEN_LINE`, both in `src/tools/relationship.ts`) falls
+ *     into this hole — both opening lines are single whole string literals,
+ *     the second one BECAUSE this exact hole caught it in review first (see
+ *     above) — but a future header built more dynamically still could. This
+ *     is the same species of blind spot `label-scan.ts` names for `agent:*`/`pr:*`
  *     (label built by prefix + suffix concatenation, no literal for the
  *     whole value); the type-level door (`DescriptionHeaderKind`) is what a
  *     header shaped that way must still pass through to compile, exactly as
@@ -57,9 +74,10 @@ import { listTsFiles } from "../labels/label-scan.js";
  *     description-header opening line (a log-line prefix, an error-code
  *     tag, anything else that happens to match the shape). None exist in
  *     this repo's `src/` today (verified: `grep -rnoE '"\[[A-Z][A-Z0-9_
- *     -]*\]' src/` finds exactly one match, `"[ORPHAN]` — the string this
- *     scanner is meant to find). A genuine future false positive is handled
- *     the same way `label-scan.ts` handles its own — an explicit,
+ *     -]*\]' src/` finds exactly two matches, `"[ORPHAN]` and `"[ADOPTED]` —
+ *     both real description-header opening lines, both registered). A
+ *     genuine future false positive is handled the same way `label-scan.ts`
+ *     handles its own — an explicit,
  *     named entry in `KNOWN_NON_HEADER_LITERALS` below, never by weakening
  *     the pattern or skipping a whole file, and never to make a real
  *     finding disappear.

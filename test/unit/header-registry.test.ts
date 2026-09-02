@@ -35,10 +35,16 @@ describe("HEADER_REGISTRY shape (every entry declares a real withdrawal owner)",
 describe("HEADER_REGISTRY contents (verified against the code that writes/withdraws each header, not copied from any ticket)", () => {
   test("the [ORPHAN] header is registered", () => {
     expect(HEADER_REGISTRY.orphan).toBeDefined();
+    expect(HEADER_REGISTRY.orphan.withdrawnBy).not.toBeNull();
   });
-  test("exactly one registered header kind today — a change here means a header was added or removed; update deliberately, not by reflex", () => {
-    expect(REGISTERED_HEADER_TAGS.size).toBe(1);
+  test("the [ADOPTED] successor header is registered — added in review (BUTCHR-157) after it shipped undeclared and invisible to this scanner", () => {
+    expect(HEADER_REGISTRY.adopted).toBeDefined();
+    expect(HEADER_REGISTRY.adopted.withdrawnBy).toBeNull();
+  });
+  test("exactly two registered header kinds today — a change here means a header was added or removed; update deliberately, not by reflex", () => {
+    expect(REGISTERED_HEADER_TAGS.size).toBe(2);
     expect(REGISTERED_HEADER_TAGS.has(HEADER_TAGS.orphan)).toBe(true);
+    expect(REGISTERED_HEADER_TAGS.has(HEADER_TAGS.adopted)).toBe(true);
   });
 });
 
@@ -64,6 +70,25 @@ describe("findHeaderTagLiterals — the parser-based scan", () => {
   test("reports the correct 1-indexed line for a hit past the first line", () => {
     const src = ["// header", "// more header", 'export const X = "[ORPHAN] foo";'].join("\n");
     expect(findHeaderTagLiterals("src/x.ts", src)).toEqual([{ file: "src/x.ts", line: 3, tag: "ORPHAN", text: "[ORPHAN] foo" }]);
+  });
+
+  // REGRESSION, BUTCHR-157 REVIEW: this ticket's OWN first draft shipped a
+  // header (`[ADOPTED]`) built as a template literal WITH substitutions —
+  // `ts.isStringLiteralLike` matches StringLiteral and
+  // NoSubstitutionTemplateLiteral, but NOT a TemplateExpression — and it
+  // went undetected by this exact scanner until human review. This pins
+  // BOTH halves of that lesson so it can never silently regress: the
+  // dangerous case really is invisible, and the fix (hoisting the tag into
+  // its own whole-literal constant) really is what makes it visible again.
+  test("a template literal WITH substitutions is INVISIBLE to this scanner — the exact shape that shipped undeclared in this ticket's first draft, caught in review", () => {
+    const withSubstitution = 'const x = `[ADOPTED] This ticket has a boss (${callerKey}).`;';
+    expect(findHeaderTagLiterals("src/example.ts", withSubstitution)).toEqual([]);
+  });
+
+  test("hoisting the tag-bearing prefix into its own whole-literal constant makes it visible again — the actual fix", () => {
+    const hoisted = ['const ADOPTED_HEADER_OPEN_LINE = "[ADOPTED] This ticket was adopted.";', "const x = `${ADOPTED_HEADER_OPEN_LINE}\\nAdopted by: ${callerKey}.`;"].join("\n");
+    const hits = findHeaderTagLiterals("src/example.ts", hoisted);
+    expect(hits.map((h) => h.tag)).toEqual(["ADOPTED"]);
   });
 });
 
@@ -120,8 +145,9 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     expect(unregistered).toEqual([]);
   });
 
-  test("finds the real [ORPHAN] header literal in src/tools/relationship.ts", () => {
+  test("finds both real header literals in src/tools/relationship.ts", () => {
     expect(hits.some((h) => h.tag === "ORPHAN" && h.file === "src/tools/relationship.ts")).toBe(true);
+    expect(hits.some((h) => h.tag === "ADOPTED" && h.file === "src/tools/relationship.ts")).toBe(true);
   });
 
   // A stale exclusion would hide silently — this fails loudly instead of
@@ -171,6 +197,6 @@ describe("HeaderRegistryEntry — type-level shape (compile-time, verified by `b
   });
 
   test("extending DescriptionHeaderKind without a matching HEADER_REGISTRY entry does not compile — proven structurally, not re-asserted: HEADER_REGISTRY's own declared type is Record<DescriptionHeaderKind, HeaderRegistryEntry>, so this file's very first import (HEADER_REGISTRY typechecking against that Record type today) already IS the compile-time proof that every current member has an entry; a future member with none would fail that same assignment, not a new check.", () => {
-    expect(Object.keys(HEADER_REGISTRY)).toEqual(["orphan"]);
+    expect(Object.keys(HEADER_REGISTRY).sort()).toEqual(["adopted", "orphan"]);
   });
 });

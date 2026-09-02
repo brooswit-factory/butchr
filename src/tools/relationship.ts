@@ -808,7 +808,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   // result, never allowed to abort or corrupt the adoption already in
   // progress (the ordering/partial-state discipline this function's own doc
   // comment and the `resolveCollisionSide` guard above already hold to).
-  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, callerKey, disposition.kind);
+  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, callerKey);
 
   // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
   // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
@@ -952,7 +952,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   // Epic carrying an [ORPHAN] header) cannot arrive through this codebase's
   // own write path today. Costs nothing extra to add — reuses the `issue`
   // already fetched for this path's own idempotence check.
-  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, projectKey, disposition.kind);
+  const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, projectKey);
 
   // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
   // on a "start" disposition whenever it's present, not gated on
@@ -1751,9 +1751,19 @@ export function classifyDestination(raw: string): OrphanDestination {
  * `HEADER_REGISTRY` is typed `Record<DescriptionHeaderKind, ...>`, so adding
  * a member here without a matching registry entry fails to compile — same
  * mechanism, same reason: a declaration that can be extended silently is the
- * bug this whole family exists to catch. There is exactly one member today.
+ * bug this whole family exists to catch.
+ *
+ * `"adopted"` (review fix, BUTCHR-157, 2026-09-02): `retireOrphanHeader`'s
+ * OWN successor text is itself a description header baked into a ticket —
+ * caught in review, the exact class of defect this ticket exists to close,
+ * shipping inside the fix for it. Registered here (see
+ * `src/headers/registry.ts`'s `adopted` entry) rather than left to compile
+ * by accident; see `ADOPTED_HEADER_OPEN_LINE` below for why its opening line
+ * is a whole literal, and `retireOrphanHeader` for why its wording is
+ * deliberately time-invariant (never goes stale, so `withdrawnBy: null` is
+ * an honest declaration, not a dodge).
  */
-export type DescriptionHeaderKind = "orphan";
+export type DescriptionHeaderKind = "orphan" | "adopted";
 
 /**
  * The bracketed marker tag for each `DescriptionHeaderKind`, single-sourced
@@ -1762,7 +1772,7 @@ export type DescriptionHeaderKind = "orphan";
  * comment states: a marker duplicated as a literal in two places eventually
  * drifts into two different literals.
  */
-export const HEADER_TAGS: Readonly<Record<DescriptionHeaderKind, string>> = { orphan: "ORPHAN" };
+export const HEADER_TAGS: Readonly<Record<DescriptionHeaderKind, string>> = { orphan: "ORPHAN", adopted: "ADOPTED" };
 
 /**
  * The header's first and last lines — STATIC regardless of `destination`/
@@ -1773,6 +1783,22 @@ export const HEADER_TAGS: Readonly<Record<DescriptionHeaderKind, string>> = { or
  */
 export const ORPHAN_HEADER_OPEN_LINE = "[ORPHAN] This ticket has no boss. It was filed here on purpose, outside its filer's own scope.";
 export const ORPHAN_HEADER_CLOSE_LINE = "It is not linked to anything yet — a boss makes it theirs by calling adopt_worker. Until then, nobody owns it.";
+
+/**
+ * `retireOrphanHeader`'s successor header's OPENING line — a WHOLE string
+ * literal with no substitution, on purpose (review fix, BUTCHR-157,
+ * 2026-09-02): the source-scanning door (`src/headers/header-scan.ts`)
+ * only matches `ts.isStringLiteralLike` nodes, which a template literal
+ * WITH substitutions (`` `[ADOPTED] ... ${x}` ``) is not — that was
+ * reachable-in-review, caught before merge, precisely because the first
+ * version of this text was built as one interpolated template with the
+ * tag baked into it, invisible to the very scanner this ticket ships. This
+ * constant is a whole literal, containing NOTHING that varies per ticket,
+ * so it is always caught by that scanner regardless of how the surrounding
+ * function assembles the rest of the block — the same shape
+ * `ORPHAN_HEADER_OPEN_LINE` already uses, for the same reason.
+ */
+export const ADOPTED_HEADER_OPEN_LINE = "[ADOPTED] This ticket's [ORPHAN] header was retired because the ticket gained a boss.";
 
 /** The header block baked into the created ticket's OWN description — see fileWhereItBelongs's doc comment for why this, not a comment, is where the destination is recorded. */
 function orphanHeader(destination: OrphanDestination, filerKey: string): string {
@@ -1794,6 +1820,17 @@ function orphanHeader(destination: OrphanDestination, filerKey: string): string 
  * never allowed to abort or corrupt the adoption in progress. See the two
  * call sites for how the result is folded into `AdoptWorkerResult` without
  * ever throwing.
+ *
+ * UNGUARDED AT ITS CALL SITE, UNLIKE `resolveCollisionSide`'s read, AND WHY
+ * THAT'S FINE (noted in review, BUTCHR-157): this runs before the
+ * disposition is applied, same position `resolveCollisionSide`'s guarded
+ * read occupies. The difference is that both Jira writes IN HERE are
+ * already individually wrapped in their own try/catch, so nothing inside
+ * this function can propagate a throw up to its caller — a `resolveCollisionSide`-style
+ * wrapper would only be defending against a bug in this function's own
+ * control flow, not against a live Jira call, and would just move the same
+ * guarantee one frame out for no new coverage.
+ *
  *
  * SURGICAL BY CONSTRUCTION — never touches the ticket at all unless it can
  * find the header UNAMBIGUOUSLY:
@@ -1851,6 +1888,26 @@ function orphanHeader(destination: OrphanDestination, filerKey: string): string 
  * threaded through as a new parameter, so this function's only inputs are
  * what `adoptWorker`/`adoptProjectWorker` already have in hand.
  *
+ * THE SUCCESSOR IS ITSELF A REGISTERED HEADER (`"adopted"` in
+ * `DescriptionHeaderKind`/`HEADER_REGISTRY`) — CAUGHT IN REVIEW, NOT
+ * DESIGNED IN FROM THE START (BUTCHR-157, 2026-09-02): the first version of
+ * this text asserted PRESENT-TENSE, LIVE facts — "This ticket HAS a boss
+ * (X)" and "(disposition: Y)" — which are exactly the shape of cached
+ * assertion this whole ticket exists to stop shipping: "has a boss" can be
+ * falsified by a later `jira_link_issues` re-parent, and "(disposition: Y)"
+ * goes stale the moment a `"shelve"`-adopted ticket is later sent through
+ * `start_worker` (which transitions and clears `EXEMPT_LABEL` but never
+ * touches the description). Worse, that version's opening line was a
+ * template literal WITH substitutions, which `ts.isStringLiteralLike` does
+ * not match — so it was invisible to this PR's own scanner, on day one, in
+ * the change that introduces the detector. Both defects are fixed together:
+ * the wording below asserts ONLY HISTORICAL, TIME-INVARIANT facts — an
+ * adoption EVENT that happened at a timestamp, never a claim about who owns
+ * the ticket NOW — so it can never go stale and `HEADER_REGISTRY["adopted"]`
+ * declares `withdrawnBy: null` honestly; and its opening line
+ * (`ADOPTED_HEADER_OPEN_LINE`) is hoisted into its own whole-literal
+ * constant, so the scanner catches it the same way it catches `[ORPHAN]`'s.
+ *
  * WHAT "BYTE FOR BYTE" MEANS HERE, REASONED EXPLICITLY (Requirement 5): Jira
  * descriptions are ADF, not plain text. This reads via `adfToText` (the same
  * flattening `correctWorker` already uses) and writes via `ops.correctText`,
@@ -1879,7 +1936,6 @@ async function retireOrphanHeader(
   issue: unknown,
   workerKey: string,
   callerKey: string,
-  dispositionKind: Disposition["kind"],
 ): Promise<{ retired: boolean; message: string } | undefined> {
   const text = adfToText(descriptionOf(issue) as Parameters<typeof adfToText>[0]);
   if (!text.startsWith(ORPHAN_HEADER_OPEN_LINE)) return undefined;
@@ -1906,9 +1962,15 @@ async function retireOrphanHeader(
   const afterHeader = text.slice(headerBlock.length);
   const rest = afterHeader.startsWith("\n\n---\n\n") ? afterHeader.slice("\n\n---\n\n".length) : afterHeader.replace(/^\n+/, "");
 
+  // HISTORICAL, TIME-INVARIANT WORDING ONLY — see this function's own doc
+  // comment ("THE SUCCESSOR IS ITSELF A REGISTERED HEADER") for why: this
+  // records that an adoption EVENT happened, at a timestamp, never a
+  // present-tense claim about who owns the ticket now — so it never goes
+  // stale and needs no withdrawal path of its own.
   const successor = [
-    `[ADOPTED] This ticket has a boss (${callerKey}) and is linked via Implements — adopted ${new Date().toISOString()} by adopt_worker (disposition: ${dispositionKind}).`,
-    `It was filed as an orphan by ${filerKey}; the retired [ORPHAN] header (its full text, including the destination it named) is preserved in the ${HEADER_WITHDRAWN_MARKER} comment on this ticket, not repeated here.`,
+    ADOPTED_HEADER_OPEN_LINE,
+    `Adopted by: ${callerKey} on ${new Date().toISOString()}.`,
+    `Originally filed by: ${filerKey}; the retired [ORPHAN] header (its full text, including the destination it named) is preserved in the ${HEADER_WITHDRAWN_MARKER} comment on this ticket, not repeated here.`,
   ].join("\n");
   const newText = rest ? `${successor}\n\n---\n\n${rest}` : successor;
 

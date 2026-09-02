@@ -647,9 +647,18 @@ describe("adopt_worker: BUTCHR-151/BUTCHR-157 — retiring a stale [ORPHAN] desc
     const newDescription = w.description as string;
     expect(newDescription.startsWith("[ORPHAN]")).toBe(false); // no longer the stale header
     expect(newDescription.startsWith("[ADOPTED]")).toBe(true); // a truthful successor, not a blank
-    expect(newDescription).toContain("BUTCHR-1"); // names the new boss
+    expect(newDescription).toContain("BUTCHR-1"); // names the adopter
     expect(newDescription).toContain("BUTCHR-5"); // names the original filer, parsed back out of the retired header
     expect(newDescription).toContain("Do the actual task body here."); // preserved, byte for byte
+    // REVIEW FIX (BUTCHR-157): the successor must assert only a HISTORICAL,
+    // time-invariant fact, never present-tense current state — the first
+    // draft's "This ticket HAS a boss" / "(disposition: X)" wording was
+    // reachably false (a later re-parent, or a "shelve"→"start" transition
+    // start_worker never touches the description for) and was itself an
+    // undeclared, scanner-invisible header. Pin both absences so neither can
+    // silently come back.
+    expect(newDescription).not.toContain("has a boss");
+    expect(newDescription).not.toContain("disposition:");
     expect(result.orphanHeaderWithdrawn).toBeDefined();
     expect(result.orphanHeaderNotWithdrawn).toBeUndefined();
   });

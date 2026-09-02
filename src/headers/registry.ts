@@ -10,8 +10,9 @@ import { HEADER_TAGS, type DescriptionHeaderKind } from "../tools/relationship.j
  * repeat that reasoning at the same length here.
  *
  * THE RULE, RESTATED FOR THIS MEDIUM: not "every header must be withdrawn"
- * — some legitimately never are (there are none of those here today, but
- * the type keeps the option open the same way `LabelRegistryEntry` does).
+ * — some legitimately never are (`"adopted"` below is exactly that case,
+ * `withdrawnBy: null` with a written `neverWithdrawnReason` — added in
+ * review, not designed in from the start; see that entry's own comment).
  * It is that the withdrawal owner must be WRITTEN DOWN, and "nobody,
  * deliberately, because X" is a valid declaration only when a human wrote
  * the X. A declaration made silently, or by default, is the bug this whole
@@ -94,7 +95,31 @@ export const HEADER_REGISTRY: Readonly<Record<DescriptionHeaderKind, HeaderRegis
     notes:
       "Four lines: a static open line, `Filed by: <filerKey>`, `Destination: <where>` (can itself span multiple lines — a filer's reason prose is not newline-restricted), and a static close line. The open/close lines are exported as ORPHAN_HEADER_OPEN_LINE/ORPHAN_HEADER_CLOSE_LINE so retireOrphanHeader can locate the block by content, never by counting lines.",
     withdrawnBy:
-      "retireOrphanHeader (src/tools/relationship.ts), called from BOTH adoptWorker (issue-caller) and adoptProjectWorker (project-caller — defence-in-depth: fileWhereItBelongs can only ever create a Story or a Task, so an orphan Epic cannot arrive through this codebase's own write path today, same status as that path's ORPHAN_LABEL clear), for BOTH dispositions ('start' and 'shelve'), NOT gated on adopt_worker's own alreadyAdopted idempotence check — the header must not outlive the same call that withdraws ORPHAN_LABEL, mirroring that label's own withdrawnBy exactly. Retires the header by rewriting the description with a truthful [ADOPTED] successor line, after archiving the retired text under HEADER_WITHDRAWN_MARKER; never throws — a failure here is reported (AdoptWorkerResult.orphanHeaderNotWithdrawn) and never aborts or corrupts the adoption already in progress. See retireOrphanHeader's own doc comment for the absent/hand-edited/duplicate cases it refuses to guess at, and src/tools/relationship.ts's 'THE RETROACTIVE QUESTION' comment for what this does NOT reach (tickets adopted before this fix shipped).",
+      "retireOrphanHeader (src/tools/relationship.ts), called from BOTH adoptWorker (issue-caller) and adoptProjectWorker (project-caller — defence-in-depth: fileWhereItBelongs can only ever create a Story or a Task, so an orphan Epic cannot arrive through this codebase's own write path today, same status as that path's ORPHAN_LABEL clear), for BOTH dispositions ('start' and 'shelve'), NOT gated on adopt_worker's own alreadyAdopted idempotence check — the header must not outlive the same call that withdraws ORPHAN_LABEL, mirroring that label's own withdrawnBy exactly. Retires the header by rewriting the description with a truthful [ADOPTED] successor line (see the 'adopted' entry below), after archiving the retired text under HEADER_WITHDRAWN_MARKER; never throws — a failure here is reported (AdoptWorkerResult.orphanHeaderNotWithdrawn) and never aborts or corrupts the adoption already in progress. See retireOrphanHeader's own doc comment for the absent/hand-edited/duplicate cases it refuses to guess at, and src/tools/relationship.ts's 'THE RETROACTIVE QUESTION' comment for what this does NOT reach (tickets adopted before this fix shipped).",
+  },
+  /**
+   * ADDED IN REVIEW (BUTCHR-157, 2026-09-02), NOT DESIGNED IN FROM THE
+   * START: the `[ADOPTED]` successor line `retireOrphanHeader` writes in
+   * place of a retired `[ORPHAN]` header is ITSELF a description header
+   * baked into a ticket — the reviewer caught it shipping undeclared and
+   * invisible to this very PR's own scanner (its first version was a
+   * template literal WITH substitutions, which `ts.isStringLiteralLike`
+   * does not match). Fixed on two axes together, not just one: the wording
+   * was rewritten to assert ONLY historical, time-invariant facts (see
+   * below for why that makes `withdrawnBy: null` an honest declaration
+   * rather than a dodge), and its opening line was hoisted into
+   * `ADOPTED_HEADER_OPEN_LINE`, a whole string literal with no
+   * substitution, so the scanner catches it the same way it catches
+   * `[ORPHAN]`'s.
+   */
+  adopted: {
+    appliedBy:
+      "retireOrphanHeader (src/tools/relationship.ts) — writes this in place of a retired [ORPHAN] header, inside adoptWorker/adoptProjectWorker, the same call that retires 'orphan' above. Never written any other way; there is no verb that adds this header to a ticket that never carried an [ORPHAN] header to begin with.",
+    notes:
+      "Three lines: the static ADOPTED_HEADER_OPEN_LINE, `Adopted by: <callerKey> on <ISO timestamp>.`, and `Originally filed by: <filerKey>; ...`. DELIBERATELY WORDED TO ASSERT ONLY A PAST EVENT, NEVER CURRENT STATE: earlier drafts read 'This ticket HAS a boss (X)' and '(disposition: Y)' — live, present-tense claims reachably falsified by a later jira_link_issues re-parent (the boss claim) or by start_worker following a 'shelve' adoption (start_worker transitions and clears EXEMPT_LABEL but never touches the description, so a stale 'disposition: shelve' would survive a later start). 'Adopted by: X on <date>' asserts only that the EVENT happened, which stays true forever regardless of what happens to the ticket afterward — the same distinction a git commit message or this registry's OWN appliedBy/withdrawnBy fields already rely on (a record of who did what, when, not a live claim about current ownership).",
+    withdrawnBy: null,
+    neverWithdrawnReason:
+      "Nothing to withdraw: every clause is historical and time-invariant by construction (see notes above) — there is no future state in which 'X adopted this ticket at time T' becomes false, unlike '[ORPHAN] ... nobody owns it', which adoption itself falsifies. A withdrawal path exists for an assertion that can go stale; this one is designed, deliberately, not to.",
   },
 };
 
