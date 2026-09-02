@@ -80,7 +80,22 @@ every ticket you write.
    checks passed — **and against its own
    doc**: staleness is the failure mode, because a stale page reads exactly
    like an authoritative one, so check that the story's doc actually reflects
-   what shipped and reject if it doesn't. **Submit a FORMAL GitHub
+   what shipped and reject if it doesn't.
+   **If the diff touches test files and you want to confirm no assertion was
+   weakened or removed, do not compare the suite's own reported
+   `expect() calls` tally between runs — measured non-deterministic
+   (`docs/expect-tally-non-determinism.md`): real-timer-driven polling tests
+   in this suite assert once per captured tick within a fixed wall-clock
+   window, so the tally is a function of OS scheduler jitter, not of what
+   the diff changed.** Read the diff instead:
+   `git diff <base>...<head> -- test/ | grep '^-.*expect(' || true` — the
+   `|| true` is required, not optional: plain `grep` exits 1 on the PASSING
+   case (nothing removed), which silently kills a `set -e` script at exactly
+   the moment the news is good. Every line it prints is a candidate to read
+   by eye, not a verdict — it also matches the word `assert` inside a
+   rewritten comment and a test's own pinned count being deliberately
+   updated, neither of which is a real removal.
+   **Submit a FORMAL GitHub
    review** on the story's PR — Request changes when it isn't right, Approve
    when it is; your GitHub account differs from the story author's, so this
    always works, and the formal review state records the exact commit you

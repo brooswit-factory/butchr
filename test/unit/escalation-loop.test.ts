@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createEscalator, UNRESPONSIVE_MARKER, FOLLOWUP_STAGE, type CommentRow } from "../../src/agents/escalation-loop.js";
+import type { CoverageRecorder } from "../../src/daemon/coverage.js";
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src/agents/escalate.js";
@@ -65,7 +66,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -101,6 +102,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     now: () => clock,
     log: (line) => logs.push(line),
     ...(opts.captures ? { captures: opts.captures } : {}),
+    ...(opts.coverage ? { coverage: opts.coverage } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -1377,6 +1379,76 @@ describe("createEscalator — sustained blocked-and-unparseable alarm (BUTCHR-12
       ]);
       expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(1);
     });
+  });
+});
+
+function fakeCoverage() {
+  const calls: Array<{ op: "checked" | "declined"; name: string }> = [];
+  return { calls, recordChecked: (name: string) => calls.push({ op: "checked", name }), recordDeclined: (name: string) => calls.push({ op: "declined", name }) };
+}
+
+// BUTCHR-179: this module is the second of two modules the mechanism is
+// wired into (deliberately narrow scope — see BUTCHR-179's own report for
+// why the other declining sites, in this module and five others, are named
+// but not yet instrumented). `escalateUnresponsive`'s `ownChannelComments`
+// read is the producer; these tests are its consumer half — proving a
+// resolved read reports "checked" and a rejected one reports "declined",
+// never collapsed the way a naive `if (result)` would.
+describe("createEscalator — coverage recording for the unresponsive alarm (BUTCHR-179)", () => {
+  test("a successful read (adopts nothing, posts fresh) records checked, never declined", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // fires: one successful ownChannelComments() read
+    expect(coverage.calls).toEqual([{ op: "checked", name: "escalation:unresponsive" }]);
+  });
+
+  test("a rejected read records declined, never checked — the naive-collapse trap this criterion exists to catch", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage, ownChannelCommentsFail: true });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // threshold reached, but the read rejects
+    expect(coverage.calls).toEqual([{ op: "declined", name: "escalation:unresponsive" }]);
+    expect(h.posted).toEqual([]); // and, unchanged: nothing was written on a declined poll
+  });
+
+  test("declined-then-recovered: a later successful poll for the SAME still-unlatched episode records checked, not a second declined", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage, ownChannelCommentsFail: true });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // declines
+    h.setOwnChannelCommentsFail(false);
+    h.setClock(6 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // recovers: retries the same unlatched episode
+    expect(coverage.calls).toEqual([
+      { op: "declined", name: "escalation:unresponsive" },
+      { op: "checked", name: "escalation:unresponsive" },
+    ]);
+  });
+
+  test("below the sustained threshold, escalateUnresponsive is never called at all — no coverage event either way", async () => {
+    const coverage = fakeCoverage();
+    const h = harness({ unresponsiveMinutes: 5, coverage });
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(4 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled"); // still short of 5m
+    expect(coverage.calls).toEqual([]);
+  });
+
+  test("omitting coverage entirely (existing callers/fixtures) does not throw — fully backward compatible", async () => {
+    const h = harness({ unresponsiveMinutes: 5 }); // no coverage option
+    h.setClock(0);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    h.setClock(5 * 60_000);
+    await h.noPrompt("p1", "KAN-1", "garbled");
+    expect(h.posted.length).toBe(1);
   });
 });
 

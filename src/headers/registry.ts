@@ -23,6 +23,14 @@ import { HEADER_TAGS, type DescriptionHeaderKind } from "../tools/relationship.j
  * to it, because nothing declared that the header needed a withdrawal path
  * at all. This file is what "declared" now means for this medium.
  *
+ * BUTCHR-172/BUTCHR-154: `../media/registry.ts` is the INDEX of all four
+ * media (this one included) and the grading of how strongly each one's
+ * records are made safe — NOT a shared abstraction over this file,
+ * `src/labels/registry.ts`, and `src/workspace/registry.ts`; unifying the
+ * three was considered there and declined (about fifteen shared lines
+ * bought at the cost of each file's own medium-specific documentation and
+ * an import edge between three deliberately leaf-only modules).
+ *
  * TWO DOORS, SAME SHAPE AS `src/labels/registry.ts`'s, NEITHER PROVING WHAT
  * IT LOOKS LIKE IT PROVES:
  *   1. THE TYPE-LEVEL DOOR (this file). `HEADER_REGISTRY` is typed
