@@ -434,6 +434,17 @@ non-admin-gated check; do not treat a component's absence from it as final
 without also checking, where possible, an independent behavioural signal
 (as A, B and D above each do).
 
+**The transferable method, stated once rather than left as two isolated
+anecdotes:** this document hit the identical shape twice — `/branches/{b}/protection`
+404s for a non-admin while `/branches/{b}` exposes a protection summary to
+one (above), and this document's own §1C first recorded "does any account
+hold admin" as unknowable from a non-admin vantage before discovering that
+`/collaborators` is readable by a non-admin token with `push` and settles
+it directly. Two instances is a pattern: **on this API, check what a
+non-admin token can actually read before recording something as requiring
+admin** — the reduced-but-real endpoint is often one call away, not a
+wall.
+
 ---
 
 ## 2. The cost analysis
