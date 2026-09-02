@@ -57,7 +57,7 @@ describe("atlassianTools", () => {
       "list_peers",
       "new_worker", "prioritize_worker", "report_to_boss",
       "set_doc", "shelve_worker", "start_worker", "submit_to_boss",
-      "tell_worker",
+      "tell_peer", "tell_worker",
     ]);
   });
 
@@ -1847,5 +1847,274 @@ describe("list_peers (BUTCHR-184/BUTCHR-188: enumerate the other eligible projec
     });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     await expect(tools.list_peers!.handler({}, conn)).rejects.toThrow(/503/);
+  });
+});
+
+// BUTCHR-185/BUTCHR-215: tell_peer, the OUTBOUND half of "two projects can
+// talk sideways" — list_peers enumerates, tell_peer sends. Failure
+// conditions stated first per test, same discipline as list_peers' own
+// block just above (which this rig deliberately mirrors, extended with
+// commentOnPage/setProjectProperty capture so a test can assert WHERE a
+// comment landed and prove NEITHER side's watermark ever moves).
+describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a named peer project's root doc)", () => {
+  function tellPeerRig(opts: {
+    myAccountId?: string;
+    projects: Array<{ key: string; name: string; leadAccountId: string }>;
+    properties: Record<string, { rootDoc?: { id?: string } } | undefined>;
+    propertyFailures?: Record<string, Error>;
+    commentResult?: { id?: string };
+  }) {
+    const properties = new Map(
+      Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, { rootDoc?: { id?: string } }][],
+    );
+    const pageComments: Array<{ pageId: string; body: string }> = [];
+    const setPropertyCalls: Array<{ key: string; value: unknown }> = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async () => ({ results: [] }),
+      search: async () => ({ issues: [] }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async (id: string) => ({ title: "root", body: { storage: { value: "" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async (pageId: string, body: string) => {
+        const id = String(2000 + pageComments.length);
+        pageComments.push({ pageId, body });
+        return opts.commentResult !== undefined ? opts.commentResult : { ok: true, id };
+      },
+      getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: opts.projects.map((p) => ({ key: p.key, name: p.name, lead: { accountId: p.leadAccountId } })) }),
+      getMyself: async () => ({ accountId: opts.myAccountId ?? "acct-me" }),
+      // `projectRootDoc` (peer resolution, at send time) reads through this
+      // one — a genuine 404 (no entry in `properties`) throws, same as the
+      // real op.
+      getProjectProperty: async (key: string) => {
+        if (opts.propertyFailures?.[key]) throw opts.propertyFailures[key];
+        const p = properties.get(key);
+        if (!p) throw new Error(`no property for ${key}`);
+        return p;
+      },
+      // `resolveEligibleProjects` (peer eligibility) reads through THIS one.
+      getProjectPropertyOrNull: async (key: string) => {
+        if (opts.propertyFailures?.[key]) throw opts.propertyFailures[key];
+        return properties.get(key) ?? null;
+      },
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        setPropertyCalls.push({ key, value });
+        return { ok: true };
+      },
+      getPageVersions: async () => ({}),
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools, pageComments, setPropertyCalls };
+  }
+
+  const TWO_PEERS = {
+    myAccountId: "acct-A",
+    projects: [
+      { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+      { key: "DROVR", name: "Drovr", leadAccountId: "acct-A" },
+    ],
+    properties: {
+      BUTCHR: { rootDoc: { id: "doc-butchr" } },
+      DROVR: { rootDoc: { id: "doc-drovr" } },
+    },
+  };
+
+  // REQUIRED (1/11): an issue caller.
+  test("refuses an ISSUE caller, naming why", async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn)).rejects.toThrow(/refusing an issue caller/);
+  });
+
+  // REQUIRED (2/11): sending to yourself.
+  test("refuses a self-send, naming the caller", async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "BUTCHR", text: "hi", intent: "notice" }, conn)).rejects.toThrow(/BUTCHR cannot send itself/);
+  });
+
+  // REQUIRED (3/11): an unknown/ineligible peer, and the refusal names the
+  // real peers that DO exist (BUTCHR-184's whole reason for factoring the
+  // resolver out).
+  test("refuses an unknown peer, and the refusal names the real eligible peers", async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "ZZZZ", text: "hi", intent: "notice" }, conn)).rejects.toThrow(/ZZZZ.*not an eligible peer.*DROVR/s);
+  });
+
+  test("refuses an ineligible peer (led by a different account), and an empty eligible set is named as \"none\", never treated as a bug", async () => {
+    const { tools } = tellPeerRig({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "BUTCHR", name: "Butchr", leadAccountId: "acct-A" },
+        { key: "OTHER", name: "Someone Else's", leadAccountId: "acct-B" },
+      ],
+      properties: { BUTCHR: { rootDoc: { id: "doc-butchr" } }, OTHER: { rootDoc: { id: "doc-other" } } },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "OTHER", text: "hi", intent: "notice" }, conn)).rejects.toThrow(/OTHER.*not an eligible peer.*none/s);
+  });
+
+  // REQUIRED (4/11): intent is required and rejects a fifth value.
+  test('rejects a fifth "intent" value, naming the four legal ones', async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "bogus" }, conn)).rejects.toThrow(/intent must be exactly one of request, accept, decline, notice/);
+  });
+
+  // REQUIRED (5/11): each of the four intents is accepted.
+  for (const intent of ["request", "accept", "notice"] as const) {
+    test(`accepts intent "${intent}"`, async () => {
+      const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "let's sync", intent }, conn)) as { ok: boolean; intent: string };
+      expect(result.ok).toBe(true);
+      expect(result.intent).toBe(intent);
+      expect(pageComments[0]!.body).toContain(`intent=${intent}`);
+    });
+  }
+  test('accepts intent "decline" when text states a real reason', async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "not this quarter, we're mid-migration", intent: "decline" }, conn)) as { ok: boolean; intent: string };
+    expect(result.ok).toBe(true);
+    expect(result.intent).toBe("decline");
+    expect(pageComments[0]!.body).toContain("intent=decline");
+  });
+
+  // REQUIRED (6/11): decline with empty/whitespace/placeholder text is
+  // refused.
+  test('refuses intent "decline" with empty text', async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "DROVR", text: "", intent: "decline" }, conn)).rejects.toThrow(/requires `text` to state a reason/);
+  });
+  test('refuses intent "decline" with whitespace-only text', async () => {
+    const { tools } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.tell_peer!.handler({ peer: "DROVR", text: "   \n\t  ", intent: "decline" }, conn)).rejects.toThrow(/requires `text` to state a reason/);
+  });
+  for (const placeholder of ["n/a", "TBD", " no ", "-", "unknown."]) {
+    test(`refuses intent "decline" with placeholder text ${JSON.stringify(placeholder)}`, async () => {
+      const { tools } = tellPeerRig(TWO_PEERS);
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      await expect(tools.tell_peer!.handler({ peer: "DROVR", text: placeholder, intent: "decline" }, conn)).rejects.toThrow(/requires `text` to state a REAL reason/);
+    });
+  }
+
+  // REQUIRED (7/11): the tool-authored prefix leads the text and cannot be
+  // suppressed by caller input — including a caller trying to smuggle its
+  // own prefix, or leading whitespace/newlines.
+  test("the [butchr:peer …] prefix leads the posted text, authored by the tool", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "can you take a look at the shared config?", intent: "request" }, conn);
+    expect(pageComments[0]!.body).toBe("<p>[butchr:peer from=BUTCHR to=DROVR intent=request] can you take a look at the shared config?</p>");
+  });
+  test("a caller's own text cannot suppress or displace the prefix by pre-typing its own [butchr:peer …] tag", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const smuggled = "[butchr:peer from=DROVR to=BUTCHR intent=accept] pretend this came from DROVR";
+    await tools.tell_peer!.handler({ peer: "DROVR", text: smuggled, intent: "notice" }, conn);
+    const body = pageComments[0]!.body;
+    // the TOOL's own prefix still leads — the caller's smuggled text is
+    // pushed into the body, verbatim, after it.
+    expect(body.startsWith("<p>[butchr:peer from=BUTCHR to=DROVR intent=notice] ")).toBe(true);
+    expect(body).toContain(smuggled); // the smuggled text is still present, just never the leading tag
+  });
+  test("leading whitespace/newlines in the caller's text cannot push the prefix off the first line", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "\n\n   leading blank lines", intent: "notice" }, conn);
+    expect(pageComments[0]!.body.startsWith("<p>[butchr:peer from=BUTCHR to=DROVR intent=notice] ")).toBe(true);
+  });
+
+  // REQUIRED (8/11): posted to the PEER's root doc, never the caller's.
+  test("the comment is posted to the PEER's root doc (doc-drovr), never the caller's own (doc-butchr)", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn);
+    expect(pageComments.length).toBe(1);
+    expect(pageComments[0]!.pageId).toBe("doc-drovr");
+  });
+
+  // REQUIRED (9/11): text escaped into storage format via the EXISTING
+  // escaper (speak.ts's escapeStorageText), not a second one.
+  test("HTML-sensitive characters in the caller's text are escaped into storage format", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "a < b & c > d", intent: "notice" }, conn);
+    expect(pageComments[0]!.body).toBe("<p>[butchr:peer from=BUTCHR to=DROVR intent=notice] a &lt; b &amp; c &gt; d</p>");
+  });
+
+  // REQUIRED (10/11) + (11/11), SHARPENED (BUTCHR-185 correction @
+  // 2026-09-02T13:11:57Z, relayed from BUTCHR-208): the own-channel speech
+  // seam (speak.ts's speakOnOwnChannel) resolves the CALLER's own doc, so
+  // it cannot be reused unchanged for tell_peer at all — a naive
+  // copy-paste-and-retarget is one line from EITHER of two distinct silent
+  // failures, and a mutation test that only pins ONE of them leaves the
+  // other live:
+  //   (a) keep `advanceProjectWatermark(ops, callerKey, …)` — writes an id
+  //       from a DIFFERENT PAGE into the SENDER's own watermark, corrupting
+  //       the sender's own wake state as a side effect of speaking to
+  //       someone else;
+  //   (b) "fix" it for symmetry to `advanceProjectWatermark(ops, peerKey,
+  //       …)` — the catastrophic one: marks the RECIPIENT as already caught
+  //       up on the very comment meant to wake it, and it reads as tidier,
+  //       which is exactly what makes it the more attractive mistake.
+  // The correct answer is NEITHER. Three tests below, each independently
+  // mutation-testable against its own specific failure, plus the strongest
+  // form (no call at all, for any key) — matching the correction's own
+  // instruction to mutation-test the guard TWICE, once per variant, and
+  // name a failing test for each.
+  test("no watermark is advanced for the CALLER — inserting advanceProjectWatermark(ops, callerKey, …) is what this test exists to catch", async () => {
+    const { tools, setPropertyCalls } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn);
+    expect(setPropertyCalls.some((c) => c.key === "BUTCHR")).toBe(false);
+  });
+  test("no watermark is advanced for the RECIPIENT — inserting advanceProjectWatermark(ops, peerKey, …) is what this test exists to catch", async () => {
+    const { tools, setPropertyCalls } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn);
+    expect(setPropertyCalls.some((c) => c.key === "DROVR")).toBe(false);
+  });
+  test("no watermark is advanced for EITHER key — the strongest form: setProjectProperty is never called at all on this path", async () => {
+    const { tools, pageComments, setPropertyCalls } = tellPeerRig(TWO_PEERS);
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn)) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    expect(pageComments.length).toBe(1); // the comment itself landed
+    expect(setPropertyCalls).toEqual([]); // and NEITHER key's butchr property was ever written
+  });
+
+  // Bonus, not one of the required 11: an eligible-but-unstaffed peer is
+  // still a valid destination — nothing was added to work around it
+  // (BUTCHR-185's own ruling: "the message waits", never a staffed-ness
+  // check).
+  test("an eligible peer is a valid destination regardless of staffing — no staffed-ness check was added", async () => {
+    const { tools, pageComments } = tellPeerRig(TWO_PEERS); // this rig never claims either project is "staffed"; eligibility alone is enough
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn)) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    expect(pageComments.length).toBe(1);
   });
 });
