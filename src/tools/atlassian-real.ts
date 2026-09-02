@@ -290,12 +290,29 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // MEASURED live: GET /wiki/api/v2/pages/{id}/footer-comments -> 200.
     // bodyFormat "storage" requested explicitly, same convention as getPage,
     // so a caller reading `.body` never has to guess which representation
-    // came back. Reshaped to {id, body} pairs, same spirit as getChildPages'
-    // reshape — a caller wants the comment text, not confluence.js's nested
-    // {body: {storage: {value}}} shape.
+    // came back. Reshaped to {id, body, author} tuples, same spirit as
+    // getChildPages' reshape — a caller wants the comment text, not
+    // confluence.js's nested {body: {storage: {value}}} shape.
+    //
+    // AUTHOR, MEASURED live (BUTCHR-107 reviewer, 2026-09-02, this fleet's
+    // own credential, against the endpoint this op actually calls): posted a
+    // footer comment, then read GET /wiki/api/v2/pages/{id}/footer-comments
+    // — `version.authorId` IS present and populated on the DEFAULT response,
+    // no `expand` requested. Observed `version` keys: `authorId,
+    // contributorIds, createdAt, message, minorEdit, number`. Asserted on
+    // key PRESENCE, not mere truthiness, deliberately — the trap this
+    // guards against (see `project.lead` in searchProjects' doc comment
+    // above) is a key ABSENT entirely, not one that's merely falsy.
+    // UNLIKE `project.lead`, this endpoint's own request schema
+    // (GetPageFooterCommentsSchema) exposes no `expand` parameter AT ALL —
+    // there is no separate opt-in this call could be missing, which is what
+    // makes this genuinely not that trap rather than a lucky guess. The read
+    // stays `c?.version?.authorId` — defensive by CHOICE now, not by doubt:
+    // a value this codebase has already measured once is still worth
+    // reading defensively, since nothing pins Atlassian to keep returning it.
     getPageComments: (pageId) =>
       wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
-        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "" })),
+        results: (r?.results ?? []).map((c: any) => ({ id: c.id, body: c?.body?.storage?.value ?? "", author: c?.version?.authorId })),
       })),
 
     // MEASURED live (2026-09-01, re-confirmed after an initial "null" read

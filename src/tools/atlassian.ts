@@ -169,13 +169,35 @@ export interface AtlassianOps {
   /**
    * WHERE A RESOURCE SPEAKS, the read half — see `commentOnPage`. Lists a
    * page's FOOTER comments (not inline). MEASURED live: `GET
-   * /wiki/api/v2/pages/{id}/footer-comments` -> HTTP 200. Not consumed by
-   * anything in THIS ticket (report_to_boss/ask_boss only need the write
-   * half) — built for BUTCHR-67, which needs it for the "the project's root
-   * doc received a comment" wake event and will consume this rather than
-   * building a second reader.
+   * /wiki/api/v2/pages/{id}/footer-comments` -> HTTP 200. Originally built
+   * for BUTCHR-67's "the project's root doc received a comment" wake event
+   * (consumed by `check_in`); BUTCHR-109 widened the return shape to add
+   * `author` so `get_doc_comments` (defs.ts) — the inbound half of "a
+   * project is talked to by commenting on its root doc" — could reuse this
+   * SAME reader rather than building a second one ("one reader, not two",
+   * this file's `getIssueComments` doc comment states the same rule for the
+   * issue-comments axis).
+   *
+   * NEVER THE BATCH `GET /wiki/api/v2/footer-comments?id=A&id=B` SHAPED FORM:
+   * MEASURED live TWICE now (BUTCHR-107, once at this ticket's filing and
+   * again by its reviewer on 2026-09-02) — a batch-shaped call asking for 2
+   * pages holding 2 comments between them came back HTTP 200 with **16
+   * results spanning 10 distinct pageIds**, most of them unrelated pages
+   * nobody asked about; it ignores the `id` filter entirely, silently. See
+   * `getPageVersions`'s own doc comment, which names this exact trap for the
+   * version-read axis. This op is per-page ONLY; do not "optimize" it into a
+   * batch call.
+   *
+   * `author` is the commenting user's Atlassian accountId (`version.authorId`
+   * on the raw footer-comment resource), OPTIONAL/UNDEFINED when the
+   * underlying read didn't carry one — never defaulted to a placeholder
+   * string, so a caller can tell "no author on this comment" from "this
+   * accountId". MEASURED live (BUTCHR-107 reviewer, 2026-09-02): present and
+   * populated on the default response, no `expand` needed or even available
+   * on this endpoint — see atlassian-real.ts's implementation for the full
+   * measurement.
    */
-  getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string }> }>;
+  getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string; author?: string }> }>;
 
   /**
    * BUTCHR-67's DISCOVERY read: live Jira projects. NOT a second client —
