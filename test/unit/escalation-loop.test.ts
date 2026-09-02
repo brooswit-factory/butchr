@@ -65,7 +65,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -74,7 +74,6 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
   let commentRows: CommentRow[] = [];
   let nextId = 1;
   let readCalls = 0;
-  let commentsCalls = 0;
   let ownChannelCommentsCalls = 0;
   let ownChannelCommentsFail = opts.ownChannelCommentsFail ?? false;
   const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
@@ -87,19 +86,11 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
       posted.push({ issue, text });
       commentRows = [{ id: String(nextId++), body: text, created: new Date(clock).toISOString() }, ...commentRows];
     },
-    comments: async () => {
-      commentsCalls++;
-      await delay();
-      if (opts.commentsFail) throw new Error("jira unreachable");
-      return commentRows;
-    },
-    // BUTCHR-124: the sustained-unresponsive alarm's own read-back — kept
-    // separate from `comments` above (issue-only, unchanged) so a test can
-    // fail ONE without the other. Shares the same `commentRows` state so a
-    // posted [butchr:unresponsive] notice is visible to a later adoption
-    // check, matching production (both eventually read the resource's own
-    // channel). MUST REJECT on `ownChannelCommentsFail`, never resolve to []
-    // — this is exactly the fail-closed contract escalateUnresponsive relies on.
+    // BUTCHR-159: THE ONLY comment-read dep now — `escalate()`'s dedupe,
+    // `handleBlocked`'s directive/follow-up check, and the sustained-
+    // unresponsive alarm's own restart-adoption check all go through this
+    // one fake. MUST REJECT on `ownChannelCommentsFail`, never resolve to []
+    // — this is exactly the fail-closed contract every caller relies on.
     ownChannelComments: async () => {
       ownChannelCommentsCalls++;
       await delay();
@@ -124,7 +115,6 @@ function harness(opts: { commentsFail?: boolean; delayMs?: number; captures?: Re
     setClock: (ms: number) => { clock = ms; },
     setPaneText: (t: string) => { paneText = t; },
     get readCalls() { return readCalls; },
-    get commentsCalls() { return commentsCalls; },
     get ownChannelCommentsCalls() { return ownChannelCommentsCalls; },
     setOwnChannelCommentsFail: (v: boolean) => { ownChannelCommentsFail = v; },
     addHumanComment: (body: string) => {
@@ -452,16 +442,59 @@ describe("createEscalator — 15-minute follow-up", () => {
   });
 });
 
-describe("createEscalator — Jira errors never throw into the poll loop", () => {
-  test("a failing comments() fetch is caught and logged, both while escalating and while checking for a directive", async () => {
-    const h = harness({ commentsFail: true });
+// BUTCHR-159: a rejected `ownChannelComments` read must never throw into the
+// poll loop, and must never be treated as "nothing there" — it fails
+// CLOSED, at both call sites, writing nothing until the read can be
+// verified again. A suppressed write only DELAYS (retried on the next
+// qualifying poll), never LOSES.
+describe("createEscalator — a failed read fails CLOSED and never throws into the poll loop", () => {
+  test("site 1 (dedupe/escalate): a failing read posts nothing — no escalation risked on an unverified dedupe check — and escalates normally once the read recovers", async () => {
+    const h = harness({ ownChannelCommentsFail: true });
+    const prompt = parsePrompt(REAL)!;
+    const fp = fingerprint(prompt);
+    await h.poll("p1", "KAN-1", prompt); // debounce
+    await h.poll("p1", "KAN-1", prompt); // would escalate, but the dedupe read fails
+    expect(h.posted.length).toBe(0); // fails CLOSED: nothing posted while the read is unverified
+    expect(h.logs.some((l) => /WARNING: \[escalate\] could not verify existing escalation for KAN-1 pane p1/.test(l))).toBe(true);
+
+    // Still failing: the debounce already passed, so every further poll
+    // retries escalate() again — still nothing posted, never a throw.
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(0);
+
+    // The read recovers: the SAME dialog escalates on the very next poll —
+    // delayed, never lost.
+    h.setOwnChannelCommentsFail(false);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1);
+    expect(h.posted[0]!.text).toContain(`fingerprint: ${fp}`);
+  });
+
+  test("site 2 (directive/follow-up): a failing read after a successful escalation posts no follow-up, distinguishes 'could not check' from 'nobody replied', and the suppressed follow-up fires once the read recovers — delayed, never lost", async () => {
+    const h = harness();
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", "KAN-1", prompt); // debounce
-    await h.poll("p1", "KAN-1", prompt); // escalate — comments() fails, falls back to []
-    expect(h.posted.length).toBe(1); // still escalates despite the failed idempotency check
-    await h.poll("p1", "KAN-1", prompt); // directive check — comments() fails again
+    await h.poll("p1", "KAN-1", prompt); // escalates — read succeeds
     expect(h.posted.length).toBe(1);
-    expect(h.logs.filter((l) => /comments fetch failed for KAN-1: jira unreachable/.test(l)).length).toBe(2);
+
+    h.setOwnChannelCommentsFail(true);
+    h.setClock(15 * 60_000); // past FOLLOWUP_MS
+    await h.poll("p1", "KAN-1", prompt); // directive/follow-up check — read fails
+    expect(h.posted.length).toBe(1); // no follow-up posted while the read cannot be verified
+    expect(h.logs.some((l) => /WARNING: \[directive\] could not verify KAN-1's own channel for pane p1/.test(l))).toBe(true);
+
+    // Still failing well past the window: still nothing posted, and
+    // followedUpAt is never latched on a failed attempt.
+    h.setClock(20 * 60_000);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(1);
+
+    // The read recovers: the SAME suppressed follow-up fires on the next
+    // qualifying poll.
+    h.setOwnChannelCommentsFail(false);
+    await h.poll("p1", "KAN-1", prompt);
+    expect(h.posted.length).toBe(2);
+    expect(h.posted[1]!.text).toMatch(/still waiting on the decision/);
   });
 });
 
@@ -757,22 +790,22 @@ describe("createEscalator — escalated state survives a flicker (KAN-756 PR #40
     expect(h.posted.length).toBe(2);
   });
 
-  test("flickers on an already-escalated pane cost exactly one comments() fetch per blocked poll — no extra re-adoption round-trip on top", async () => {
+  test("flickers on an already-escalated pane cost exactly one ownChannelComments() fetch per blocked poll — no extra re-adoption round-trip on top", async () => {
     const h = harness();
     const prompt = parsePrompt(REAL)!;
-    await h.poll("p1", "KAN-1", prompt); // debounce — no comments() call yet
-    expect(h.commentsCalls).toBe(0);
-    await h.poll("p1", "KAN-1", prompt); // escalates — 1 comments() call (idempotency check)
-    expect(h.commentsCalls).toBe(1);
+    await h.poll("p1", "KAN-1", prompt); // debounce — no ownChannelComments() call yet
+    expect(h.ownChannelCommentsCalls).toBe(0);
+    await h.poll("p1", "KAN-1", prompt); // escalates — 1 ownChannelComments() call (idempotency check)
+    expect(h.ownChannelCommentsCalls).toBe(1);
 
     for (let i = 1; i <= 5; i++) {
-      h.notBlocked([]); // no comments() call — nothing blocked this tick
+      h.notBlocked([]); // no ownChannelComments() call — nothing blocked this tick
       await h.poll("p1", "KAN-1", prompt); // directive-check phase — exactly 1 more
-      expect(h.commentsCalls).toBe(1 + i);
+      expect(h.ownChannelCommentsCalls).toBe(1 + i);
     }
     // If escalatedAt had been lost on any flicker, that poll would instead
-    // re-enter escalate() and ALSO adopt — still one comments() call, but
-    // with an "adopted existing escalation" log line and a second entry in
+    // re-enter escalate() and ALSO adopt — still one ownChannelComments()
+    // call, but with an "adopted existing escalation" log line and a second entry in
     // the rate-cap budget. Neither happened.
     expect(h.logs.filter((l) => /adopted existing escalation/.test(l)).length).toBe(0);
     expect(h.posted.length).toBe(1); // never re-escalated
@@ -1581,7 +1614,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const before = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     clock = 0; before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "KAN-1", "garbled", 1);
     clock = 5 * 60_000; before.onNoPrompt("p1", "KAN-1", "garbled", 2);
@@ -1592,7 +1625,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
     // Simulate the restart: a fresh escalator, no in-memory state, same underlying channel.
     const after = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "KAN-1", "garbled", 1);
     clock = 10 * 60_000; after.onNoPrompt("p1", "KAN-1", "garbled", 2);
@@ -1608,7 +1641,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const before = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     before.onPoll(1, ["p1"]); before.onNoPrompt("p1", "BUTCHR", "garbled", 1);
     clock = 5 * 60_000; before.onNoPrompt("p1", "BUTCHR", "garbled", 2);
@@ -1619,11 +1652,77 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
     const after = createEscalator({
       read: async () => "garbled", send: async () => {}, addComment,
-      comments: async () => [], ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
+      ownChannelComments, unresponsiveMinutes: 5, now: () => clock, log: () => {},
     });
     after.onPoll(1, ["p1"]); after.onNoPrompt("p1", "BUTCHR", "garbled", 1);
     clock = 10 * 60_000; after.onNoPrompt("p1", "BUTCHR", "garbled", 2);
     await Bun.sleep(0);
     expect(pageComments.length).toBe(1); // adopted via the real unwrap — NOT re-posted (BUTCHR-129's defect stays fixed post-extraction)
+  });
+
+  // BUTCHR-159: extends this block to the PARSEABLE blocked/directive path —
+  // `escalate()`'s dedupe and `handleBlocked`'s directive/follow-up check —
+  // through the SAME real `createOwnChannelComments`/`speakOnOwnChannel`
+  // seam already proven above for the sustained-unresponsive alarm. Before
+  // this ticket, both of these read the issue-only `comments` dep (a 404 for
+  // a project key): `escalate()`'s dedupe read failed every call, which is
+  // the ONLY reason a blocked PROJECT agent's escalation was ever audible at
+  // all (§2's "the bug is load-bearing"); `handleBlocked`'s directive read
+  // failed every call too, so a project-keyed `ANSWER` could never be found.
+  // These two tests are the anti-inversion guard the ticket names explicitly:
+  // a naive "just fail closed" fix makes the first test below regress from
+  // POST to SILENCE, and the second proves the actual point of this ticket
+  // — a project-keyed ANSWER is now findable at all.
+  describe("the blocked/directive path (BUTCHR-159) — project tier", () => {
+    test("PROJECT key: a blocked-dialog escalation still POSTS after the fail-closed fix — the anti-inversion guard", async () => {
+      const { ops, pageComments } = makeOps();
+      const ownChannelComments = createOwnChannelComments(ops, async () => []);
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const escalator = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      const prompt = parsePrompt(REAL)!;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — dedupe read is a REAL project-tier read, not a stub
+      const escalation = pageComments.find((c) => c.body.includes(BLOCKED_MARKER));
+      expect(escalation).toBeDefined(); // NOT silently suppressed by the fail-closed fix
+      expect(escalation!.body).toContain(`fingerprint: ${fingerprint(prompt)}`);
+
+      // A daemon restart (fresh escalator, same underlying channel) must
+      // ADOPT this comment through the real reader, not re-post — proving
+      // the dedupe read genuinely reaches the resource the escalation itself
+      // was written to, not merely a stub that happens to return [].
+      const restarted = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      await restarted.onBlocked("p1", "BUTCHR", prompt, 1);
+      await restarted.onBlocked("p1", "BUTCHR", prompt, 2);
+      expect(pageComments.filter((c) => c.body.includes(BLOCKED_MARKER)).length).toBe(1); // adopted, not duplicated
+    });
+
+    test("PROJECT key: a project-keyed target's ANSWER directive is FOUND and delivered through the real reader — the whole point of this ticket", async () => {
+      const { ops } = makeOps();
+      const ownChannelComments = createOwnChannelComments(ops, async () => []);
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const sent: Array<{ pane: string; text: string }> = [];
+      const escalator = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => 0, log: () => {},
+      });
+      const prompt = parsePrompt(REAL)!;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates
+      const fp = fingerprint(prompt);
+
+      // The real write path a boss's ANSWER reply takes for a project-keyed
+      // target: speakOnOwnChannel's project branch, storage-format wrapped —
+      // NOT a hand-typed plain-text CommentRow standing in for it.
+      await speakOnOwnChannel(ops, "BUTCHR", `ANSWER 2 ${fp}`);
+
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3); // directive check — must find it through the real unwrap
+      expect(sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+    });
   });
 });

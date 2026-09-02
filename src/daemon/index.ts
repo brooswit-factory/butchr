@@ -442,6 +442,15 @@ runResourceLoop(projectResourceType, {
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for
 // issues that are currently blocked AND already escalated, never on the 15s
 // Jira loop above.
+//
+// BUTCHR-159: the escalator's OWN `comments` dep (issue-only — a 404 for a
+// project key) is gone. Every comment-read inside escalation-loop.ts —
+// dedupe/adoption, the directive/follow-up check, and the sustained-
+// unresponsive alarm's own restart-adoption check — now goes through the
+// SAME `ownChannelComments` seam below, so a project-keyed target's
+// escalation dedupe and ANSWER directive are read from the resource its
+// speech actually lives on (a Confluence footer comment on its root doc),
+// not from a Jira issue endpoint that never resolves for it.
 const escalator = createEscalator({
   read: readPane,
   send: sendPane,
@@ -455,7 +464,6 @@ const escalator = createEscalator({
   // change — and for a project key it routes to that project's root doc via
   // the same seam BUTCHR-71 already shipped for report_to_boss/ask_boss.
   addComment: async (issue, text) => { await speakOnOwnChannel(ops, issue, text); },
-  comments: (issue) => atlassian.comments(issue),
   ownChannelComments,
   unresponsiveMinutes: config.unresponsiveMinutes,
   now: () => Date.now(),
