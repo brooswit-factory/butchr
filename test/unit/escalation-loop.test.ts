@@ -1047,6 +1047,67 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
     expect(cap.files.size).toBe(50); // 49 kept + 1 new
   });
 
+  // BUTCHR-96: a PROJECT caller's resolved id is a bare project key with no
+  // `-<digits>` suffix (see src/resources/id.ts's isProjectId), so its
+  // escalation capture name is `<PROJECT>-escalation-<ts>.txt` — no issue
+  // number at all. Before this ticket ESCALATION_CAPTURE_NAME required
+  // `-\d+`, so this shape was written but never recognised as "ours": it
+  // could never be evicted and the 50-file cap never applied to it.
+  test("a PROJECT caller's bare-key capture (no issue number) is recognised and evictable", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "BUTCHR", prompt); // debounce — project-shaped issue id
+    await h.poll("p1", "BUTCHR", prompt); // escalates
+    expect(h.posted.length).toBe(1);
+    expect(cap.files.size).toBe(1);
+    const [name] = [...cap.files.keys()];
+    expect(name).toMatch(/^BUTCHR-escalation-\d{8}T\d{6}Z\.txt$/);
+  });
+
+  test("a PROJECT caller's bare-key captures are evicted at the same cap as issue captures", async () => {
+    const cap = fakeCaptureSink();
+    for (let i = 0; i < 50; i++) {
+      const ts = `202601${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`BUTCHR-escalation-${ts}.txt`, "old capture");
+    }
+    const oldestName = "BUTCHR-escalation-20260101T000000Z.txt";
+    expect(cap.files.has(oldestName)).toBe(true);
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "BUTCHR", prompt);
+    await h.poll("p1", "BUTCHR", prompt); // escalates — pushes past the cap
+    expect(h.posted.length).toBe(1);
+    expect(cap.files.has(oldestName)).toBe(false); // evicted
+    expect(cap.files.size).toBe(50); // 49 kept + 1 new
+  });
+
+  // The disjointness control the ticket demands: a check that FAILS if the
+  // widened regex ever starts matching a session-limit-watch.ts capture name
+  // (`<ISSUE>-unrecognised-<ts>.txt` / `<ISSUE>-no-reset-time-<ts>.txt`).
+  // Without this, "the two shapes are disjoint" is only a claim in a comment.
+  test("never treats a session-limit-watch capture name as its own — foreign shapes are never evicted or counted toward the cap", async () => {
+    const cap = fakeCaptureSink();
+    const foreignUnrecognised = "KAN-1-unrecognised-20260101T000000Z.txt";
+    const foreignNoResetTime = "KAN-1-no-reset-time-20260101T000000Z.txt";
+    cap.files.set(foreignUnrecognised, "foreign");
+    cap.files.set(foreignNoResetTime, "foreign");
+    // Fill to the cap with OUR OWN recognisable captures so the next escalation forces eviction.
+    for (let i = 0; i < 50; i++) {
+      const ts = `202602${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`KAN-1-escalation-${ts}.txt`, "old capture");
+    }
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates — pushes past the cap
+    expect(h.posted.length).toBe(1);
+    // The foreign, session-limit-shaped files must survive untouched — never
+    // recognised as ours, never evicted, never counted toward the cap.
+    expect(cap.files.has(foreignUnrecognised)).toBe(true);
+    expect(cap.files.has(foreignNoResetTime)).toBe(true);
+  });
+
   test("a capture failure is logged and never blocks the escalation comment from posting", async () => {
     const failingSink = {
       write: async (): Promise<string> => { throw new Error("disk full"); },
