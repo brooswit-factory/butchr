@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
@@ -819,6 +822,30 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
 // ---------------------------------------------------------------------------
 
 describe("correctWorker", () => {
+  // BUTCHR-169: correctWorker now touches the filesystem (best-effort
+  // brief.md rewrite on a summary correction, via rewriteWorkspaceBriefSummary
+  // -> workspaceRoot(), src/agents/workspace.ts). workspaceRoot() defaults to
+  // `~/butchr-workspaces` when BUTCHR_WORKSPACES is unset — a REAL,
+  // populated directory on any host that has actually run this fleet (this
+  // very worktree's own butchr-workspaces/BUTCHR-1 is a real file on disk).
+  // Every test below uses fake keys like "BUTCHR-2" that happen not to
+  // collide today, but that is an accident of which keys were picked, not a
+  // guarantee — sandboxing BUTCHR_WORKSPACES to a throwaway temp dir for
+  // this entire describe block is what actually makes it safe, the same
+  // discipline test/unit/workspace.test.ts already applies to buildWorkspace
+  // itself.
+  let workspacesRoot: string;
+  const priorEnv = process.env.BUTCHR_WORKSPACES;
+  beforeEach(() => {
+    workspacesRoot = mkdtempSync(join(tmpdir(), "correct-worker-test-"));
+    process.env.BUTCHR_WORKSPACES = workspacesRoot;
+  });
+  afterEach(() => {
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+    else process.env.BUTCHR_WORKSPACES = priorEnv;
+  });
+
   test("refuses the CALLER'S OWN key, BEFORE any Jira read (matches prioritizeWorker's own shape)", async () => {
     const { ops } = makeWorld();
     let getIssueCalls = 0;
@@ -948,6 +975,70 @@ describe("correctWorker", () => {
     const summaryToo = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "newer summary", why: "reason 2" });
     expect(summaryToo.message).toMatch(/SNAPSHOTTED/);
     expect(summaryToo.message).toMatch(/tell_worker/);
+  });
+
+  // BUTCHR-169: WORKSPACE_REGISTRY.SUMMARY's declared withdrawal mechanism.
+  describe("summary correction's best-effort brief.md rewrite (BUTCHR-169)", () => {
+    test("no on-disk workspace for the worker: reported as 'no-workspace-on-disk', not an error, no message SNAPSHOTTED-limitation text lost", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+      expect(result.summaryWorkspaceRewrite).toBe("no-workspace-on-disk");
+      expect(result.message).toContain("No on-disk workspace exists for BUTCHR-2");
+    });
+
+    test("an existing workspace's brief.md is regenerated with the new summary, using the SAME briefFor/interpolate machinery buildWorkspace uses", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      const dir = join(workspacesRoot, "BUTCHR-2");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "brief.md"), "# Task agent — BUTCHR-2: old summary\n\nstale content from a previous build\n");
+      writeFileSync(join(dir, "CLAUDE.md"), "unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+
+      expect(result.summaryWorkspaceRewrite).toBe("rewritten");
+      expect(result.message).toContain("brief.md on BUTCHR-2's on-disk workspace was regenerated");
+      const rewritten = readFileSync(join(dir, "brief.md"), "utf8");
+      expect(rewritten).toContain("new summary");
+      expect(rewritten).not.toContain("old summary");
+      expect(rewritten).toContain("BUTCHR-2");
+      // it re-derived the boss from the SAME issue fetch (bossKey: "BUTCHR-1"), not a stale/guessed value
+      expect(rewritten).toContain("BUTCHR-1");
+      // CLAUDE.md is untouched — it carries no {{SUMMARY}} placeholder (see WORKSPACE_REGISTRY.SUMMARY)
+      expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toBe("unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+    });
+
+    test("a rewrite failure is reported, never thrown — the Jira correction (which already landed) is NOT lost", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      // A DIRECTORY at the exact path brief.md would be written to — writeFileSync throws EISDIR, deterministic across platforms.
+      mkdirSync(join(workspacesRoot, "BUTCHR-2", "brief.md"), { recursive: true });
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+
+      expect(result.correctedSummary).toBe(true); // the Jira edit itself still succeeded
+      expect(result.summaryWorkspaceRewrite).toBe("failed");
+      expect(result.message).toContain("brief.md rewrite FAILED");
+      expect(result.message).toContain("already landed and is UNAFFECTED");
+    });
+
+    test("a description-only correction never touches the filesystem at all — summaryWorkspaceRewrite is absent, not a padded value", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+      const dir = join(workspacesRoot, "BUTCHR-2");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "brief.md"), "untouched\n");
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" });
+
+      expect(result.summaryWorkspaceRewrite).toBeUndefined();
+      expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe("untouched\n");
+    });
   });
 
   test("refuses an oversized `description` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {

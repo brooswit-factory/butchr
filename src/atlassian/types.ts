@@ -4,9 +4,31 @@ export interface JiraIssue {
   status: string;
   issuetype: string;
   assignee: string | null;
+  /**
+   * Jira's NATIVE `parent` field — NOT this fleet's boss/worker relationship,
+   * which is carried entirely by an `Implements` issue link instead (see
+   * `issuelinks` below, and BUTCHR-169's own registry entry,
+   * src/workspace/registry.ts's `PARENT`, for why this distinction matters:
+   * this field is empirically null for every issue in this project's
+   * hierarchy — scripts/migrate-links.ts documents the migration away from
+   * it). Kept only because `mapIssue` (src/atlassian/client.ts) has always
+   * read it and nothing else in this codebase currently needs it removed.
+   */
   parent: string | null;
   updated: string;
   labels: string[];
+  /**
+   * BUTCHR-169: this issue's links, when the caller asked `search()` for
+   * them (see that method's `fields` param) — OPTIONAL, not because a real
+   * issue can lack the field, but because most existing fixtures across this
+   * codebase's test suite predate this field and legitimately don't care
+   * about it; treat `undefined` the same as `[]` (unknown, not "definitely
+   * none"). Same flattened `{type, otherEnd, key}` shape `AtlassianClient
+   * #links` already returns for the single-issue endpoint — see that type's
+   * own doc comment for the inward/outward direction convention, which this
+   * field's values obey identically.
+   */
+  issuelinks?: readonly IssueLink[];
 }
 
 export interface IssueLink {

@@ -74,9 +74,19 @@ export class AtlassianClient {
     }
   }
 
-  /** Issues matching a JQL query, mapped to butchr's flat shape. */
+  /**
+   * Issues matching a JQL query, mapped to butchr's flat shape.
+   *
+   * BUTCHR-169: `issuelinks` was added to `fields` so `ISSUE_SPAWN_CONFIG
+   * .specFor` (src/resources/issue.ts) can derive a ticket's REAL boss (an
+   * inward `Implements` link) without a second, per-issue API call on every
+   * poll — the same reason `parent` (Jira's native field, structurally
+   * unable to carry this fleet's boss relationship — see JiraIssue's own
+   * doc comment) was already batched into this one query instead of fetched
+   * separately.
+   */
   async search(jql: string, maxResults = 100): Promise<JiraIssue[]> {
-    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated,labels" });
+    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated,labels,issuelinks" });
     const body = await this.get(`/rest/api/3/search/jql?${q}`);
     return (body.issues ?? []).map(mapIssue);
   }
@@ -110,12 +120,7 @@ export class AtlassianClient {
   /** The issue links on a ticket, as the other end's key + relationship. */
   async links(issueKey: string): Promise<IssueLink[]> {
     const body = await this.get(`/rest/api/3/issue/${issueKey}?fields=issuelinks`);
-    const out: IssueLink[] = [];
-    for (const l of body.fields?.issuelinks ?? []) {
-      if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key });
-      else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key });
-    }
-    return out;
+    return parseIssueLinks(body.fields?.issuelinks);
   }
 
   /** Recent comments on a ticket, newest-first, ADF bodies flattened to plain text. */
@@ -124,6 +129,24 @@ export class AtlassianClient {
     const body = await this.get(`/rest/api/3/issue/${issueKey}/comment?${q}`);
     return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "", authorEmail: c.author?.emailAddress ?? null }));
   }
+}
+
+/**
+ * Shared by `links()` (single-issue endpoint) and `mapIssue` (search
+ * results) — same raw Jira `issuelinks` array shape either way, so this is
+ * one place to get the inward/outward mapping right instead of two that
+ * could drift (see `IssueLink`'s own doc comment, src/atlassian/types.ts,
+ * for the direction convention this preserves). Defensive against a missing
+ * array (an issue with no links, or a caller that didn't request the
+ * field) — always returns `[]`, never throws.
+ */
+function parseIssueLinks(raw: any[] | undefined): IssueLink[] {
+  const out: IssueLink[] = [];
+  for (const l of raw ?? []) {
+    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key });
+    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key });
+  }
+  return out;
 }
 
 function mapIssue(i: any): JiraIssue {
@@ -137,5 +160,10 @@ function mapIssue(i: any): JiraIssue {
     parent: f.parent?.key ?? null,
     updated: f.updated ?? "",
     labels: f.labels ?? [],
+    // BUTCHR-169: only set when the caller's `fields` included "issuelinks"
+    // (search() does; nothing else calling mapIssue needs to) — `undefined`
+    // when absent from the response, never a fabricated `[]` standing in
+    // for "I checked and there are none" (see JiraIssue's own doc comment).
+    ...(f.issuelinks !== undefined ? { issuelinks: parseIssueLinks(f.issuelinks) } : {}),
   };
 }

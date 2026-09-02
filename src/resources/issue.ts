@@ -82,9 +82,34 @@ export const ISSUE_ACTIVATION: Activation<JiraIssue> = {
   verdictFor: (issue) => (isActive(issue.status) ? "active" : "inactive"),
 };
 
+/**
+ * BUTCHR-169: this fleet's boss/worker relationship is carried ENTIRELY by
+ * an `Implements` issue link (src/tools/relationship.ts's assertOwnWorker
+ * and friends) — NEVER by Jira's native `parent` field, which
+ * `JiraIssue.parent`'s own doc comment (src/atlassian/types.ts) documents as
+ * structurally unable to carry it in this project. `SpawnSpec.parent` (fed
+ * into `{{PARENT}}`, src/agents/workspace.ts) used to read `issue.parent`
+ * directly and was therefore EMPIRICALLY ALWAYS NULL for every ticket with a
+ * real boss — a false-at-write-time claim, not merely one that could go
+ * stale. Fixed at the source here, not by suppressing the assertion in the
+ * templates: derives the boss from `issue.issuelinks` (populated by
+ * `search()`, src/atlassian/client.ts, specifically so this needs no second
+ * per-issue API call on every poll) the SAME WAY `findBossKey`
+ * (src/tools/docs.ts) does for the raw-JSON shape `jira_get_issue` returns —
+ * an inward `Implements` link names the boss. Two different wire shapes,
+ * same convention, verified against the identical evidence `IssueLink`'s own
+ * doc comment (src/atlassian/types.ts) cites; kept as two small functions
+ * rather than one shared helper because the input shapes genuinely differ
+ * (raw Jira JSON vs. this codebase's own flattened `IssueLink[]`), not
+ * because the RULE differs.
+ */
+export function bossKeyFrom(issue: JiraIssue): string | null {
+  return issue.issuelinks?.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
+}
+
 /** SPAWN CONFIG: the SpawnSpec fields the existing shared spawn machinery reads — see this module's top comment. */
 export const ISSUE_SPAWN_CONFIG: SpawnConfig<JiraIssue> = {
-  specFor: (issue) => ({ key: issue.key, issuetype: issue.issuetype, summary: issue.summary, parent: issue.parent }),
+  specFor: (issue) => ({ key: issue.key, issuetype: issue.issuetype, summary: issue.summary, parent: bossKeyFrom(issue) }),
 };
 
 export interface IssueResourceDeps {
