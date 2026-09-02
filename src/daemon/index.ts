@@ -4,6 +4,7 @@ import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
+import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
@@ -127,6 +128,12 @@ const projectNotifyHealth = createLoopHealth({
   thresholdMs: PROJECT_POLL_STALE_MS,
   log: (line) => console.error(line),
 });
+// BUTCHR-179: per-detector "could not check" coverage, reported as a
+// /health sibling — see src/daemon/coverage.ts's own header for the full
+// rationale. Wired into two detectors so far (syncLabels's stalled check,
+// escalation-loop's unresponsive alarm) — see this ticket's own report for
+// the rest of the declining set and why it's not all wired yet.
+const coverage = createCoverageTracker();
 
 const { app, mcp } = buildApp({
   state: async () => {
@@ -143,7 +150,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity)),
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -254,6 +261,7 @@ const syncLabels = createLabelSync({
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
+  coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
@@ -475,6 +483,7 @@ const escalator = createEscalator({
   // session-limit watcher's own captures (capture-store.ts); each recognizes
   // only its own filename shape, so neither ever evicts the other's files.
   captures: createCaptureStore(config.captureDir),
+  coverage,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
