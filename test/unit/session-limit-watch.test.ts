@@ -344,6 +344,48 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     expect(files.has(foreignProject)).toBe(true);
   });
 
+  // BUTCHR-98: a PROJECT caller's resolved issue is a bare project key with
+  // no `-<digits>` suffix (see src/resources/id.ts's isProjectId), so its
+  // session-limit capture name is `<PROJECT>-<trigger>-<ts>.txt` — no issue
+  // number at all. Before this ticket CAPTURE_NAME required `-\d+`, so this
+  // shape was written but never recognised as "ours": it could never be
+  // evicted and CAPTURE_MAX_FILES never applied to it.
+  test("(h) a PROJECT caller's bare-key capture (no issue number) is recognised and evictable", async () => {
+    const { sink, files } = fakeSink();
+    const stop = watchSessionLimits({
+      list: async () => [row("BUTCHR", "idle", "butchr:p1")],
+      read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
+      close: async () => {},
+      now: () => Date.now(),
+      log: () => {},
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    expect(files.size).toBe(1);
+    const [name] = [...files.keys()];
+    expect(name).toMatch(/^BUTCHR-unrecognised-\d{8}T\d{6}Z\.txt$/);
+  });
+
+  test("(i) a PROJECT caller's bare-key captures are evicted at the same cap as issue captures", async () => {
+    const ours = Array.from({ length: 50 }, (_, i) => `BUTCHR-unrecognised-20260201T${String(i).padStart(2, "0")}0000Z.txt`);
+    const oldestName = ours[0]!;
+    const { sink, files } = fakeSink(ours);
+    expect(files.has(oldestName)).toBe(true);
+    const stop = watchSessionLimits({
+      list: async () => [row("BUTCHR", "idle", "butchr:p1")],
+      read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
+      close: async () => {},
+      now: () => Date.now(),
+      log: () => {},
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    expect(files.has(oldestName)).toBe(false); // evicted
+    expect(files.size).toBe(50); // 49 kept + 1 new
+  });
+
   test("(g) no captures dep supplied => today's behaviour exactly (no throw, no capture-shaped log)", async () => {
     const logs: string[] = [];
     const stop = watchSessionLimits({

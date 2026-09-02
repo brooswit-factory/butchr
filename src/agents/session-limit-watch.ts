@@ -64,18 +64,24 @@ function compactUtc(ms: number): string {
 }
 
 /**
- * Recognises exactly the filenames this module writes
- * (`<ISSUE>-<trigger>-<compact-UTC-timestamp>.txt`) and captures the
- * timestamp segment. Two things depend on this, both from review on
- * BUTCHR-12: eviction must sort by the TIMESTAMP, not the whole filename —
- * a plain lexicographic sort of the full name orders by issue key first, so
- * across more than one issue it evicts the newest capture and keeps
- * seven-month-old ones — and `BUTCHR_CAPTURE_DIR` is operator-settable, so
- * `list()` can return files butchr never wrote (pointed at a shared
- * directory); eviction must never delete a file it doesn't recognise as its
- * own.
+ * `<ISSUE>-<trigger>-<compact-UTC-timestamp>.txt` OR (BUTCHR-98)
+ * `<PROJECT>-<trigger>-<compact-UTC-timestamp>.txt` — recognises exactly the
+ * filenames this module writes, for BOTH an issue caller's id (`BUTCHR-68`,
+ * `-\d+` suffix) and a project caller's bare key (`BUTCHR`, no suffix — see
+ * `src/resources/id.ts`), and captures the timestamp segment. Three things
+ * depend on this, all from review on BUTCHR-12/BUTCHR-98: eviction must sort
+ * by the TIMESTAMP, not the whole filename — a plain lexicographic sort of
+ * the full name orders by issue key first, so across more than one issue it
+ * evicts the newest capture and keeps seven-month-old ones — `BUTCHR_CAPTURE_DIR`
+ * is operator-settable, so `list()` can return files butchr never wrote
+ * (pointed at a shared directory); eviction must never delete a file it
+ * doesn't recognise as its own — and disjointness from escalation-loop.ts's
+ * own captures comes from the literal `-unrecognised-` / `-no-reset-time-`
+ * segment, not from the optional `-\d+`: escalation-loop's capture names use
+ * `-escalation-` in that position instead, so the two shapes stay mutually
+ * exclusive regardless of the issue-vs-project prefix.
  */
-const CAPTURE_NAME = /^[A-Z][A-Z0-9]*-\d+-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
+const CAPTURE_NAME = /^[A-Z][A-Z0-9]*(?:-\d+)?-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
 
 /** Our own capture files present in the sink, oldest (by timestamp) first; anything we didn't write is excluded. */
 async function ourCapturesOldestFirst(sink: CaptureSink): Promise<{ name: string; ts: string }[]> {
