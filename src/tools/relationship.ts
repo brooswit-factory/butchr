@@ -790,21 +790,23 @@ export interface CorrectWorkerResult {
  * when a summary was actually corrected, and points at `tell_worker` as the
  * follow-up if a running agent needs to know.
  *
- * A KNOWN LIMITATION THIS DOES NOT COVER, BY DESIGN, NOT OVERSIGHT: an EPIC
- * has no boss, so `assertOwnWorker` can never resolve one as "one of the
- * caller's own workers" — NO AGENT can ever correct an epic's description
- * with this verb. Stated precisely, because the imprecise version would
- * itself be the failure mode this whole verb exists to fix: this is NOT
- * "nobody can correct it" — a person can still edit it directly in the Jira
- * UI, the same "the human is the fallback, not the first responder"
- * arrangement this fleet already runs on elsewhere. This is not a hole; it
- * is refusal 1 applied to the one tier where "your own boss" and "yourself"
- * would otherwise collapse to the same agent. `finish_without_a_boss` is
- * the closest precedent in this file: a narrow, deliberately
- * non-generalized exception for the bossless top tier, meant to narrow to
- * nothing as a tier above epics gets built, not to be widened into a
- * `correct_without_a_boss`. See BUTCHR-53's review comments on BUTCHR-41
- * for the full ruling.
+ * WHO MAY CORRECT AN EPIC'S DESCRIPTION, STATED AS WHAT `assertOwnWorker`
+ * ACTUALLY CHECKS, NOT AS WHICH TIERS HAPPEN TO EXIST TODAY: a PROJECT
+ * caller may correct a target that is BOTH a member of its own project AND
+ * an Epic — so a project agent CAN correct one of its own epics'
+ * descriptions with this verb. Refusal 1 above is unaffected and
+ * unconditional at every tier, project callers included: it only stops a
+ * ticket from correcting ITSELF (`workerKey === callerKey`) — nobody
+ * corrects themselves, an epic being corrected by its own project is not an
+ * exception to that. Where `assertOwnWorker` accepts no caller for a given
+ * ticket, the recourse is a person editing it directly in the Jira UI — the
+ * same "the human is the fallback, not the first responder" arrangement
+ * this fleet already runs on elsewhere, and the intended path here, not a
+ * workaround. This comment previously claimed no agent could ever correct
+ * an epic this way, on the premise that stood before BUTCHR-62 shipped the
+ * project tier; that premise no longer holds, and the claim built on it was
+ * corrected under BUTCHR-88. See BUTCHR-53's review comments on BUTCHR-41
+ * for the original ruling this refines.
  */
 export async function correctWorker(ops: AtlassianOps, callerKey: string, workerKey: string, input: CorrectWorkerInput): Promise<CorrectWorkerResult> {
   if (workerKey === callerKey) {

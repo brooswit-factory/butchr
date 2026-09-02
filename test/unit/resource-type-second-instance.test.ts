@@ -76,9 +76,17 @@ function fakeHerd(): Herd & { spawned: string[]; stopped: string[]; notified: ne
  * Builds a `ResourceType<Widget>` whose `eventRules.poll` answers "what
  * changed" from a test-supplied schedule (`changedPerPoll`), completely
  * independent of whether the Widget arrays it's handed actually differ.
- * `activation.isActive` is likewise NOT a status-string check — it's an
- * arbitrary boolean field, proving activation doesn't need issue-shaped
- * input either.
+ * `activation.verdictFor` is likewise NOT a status-string check — it's an
+ * arbitrary unconditional verdict, proving activation doesn't need
+ * issue-shaped input either.
+ *
+ * BUTCHR-66/83 mechanical note: `Activation<T>`'s member was widened from a
+ * boolean `isActive(resource)` to a three-state `verdictFor(resource):
+ * ActivationVerdict` (sleep as a third answer to the same question, not a
+ * fifth `ResourceType` member). This fixture never returns `"asleep"` — it
+ * has no notion of rest — so `() => "active"` here is the exact same
+ * unconditional verdict `() => true` was; nothing about what this test
+ * proves changed.
  */
 function widgetResourceType(polls: readonly Widget[][], changedPerPoll: readonly string[][]): ResourceType<Widget> {
   let searchCall = -1;
@@ -94,7 +102,7 @@ function widgetResourceType(polls: readonly Widget[][], changedPerPoll: readonly
     // Deliberately not a "status" string comparison — activation here is an
     // unconditional "every discovered widget is active", a different SHAPE
     // of predicate than the issue tier's `isActive(status)`.
-    activation: { isActive: () => true },
+    activation: { verdictFor: () => "active" },
     eventRules: {
       async poll(): Promise<EventPoll> {
         // The test's own schedule, NOT a diff of `prev`/`next` — this is the
@@ -184,7 +192,7 @@ describe("a second, deliberately non-issue-shaped resource type — runResourceL
     let active = true;
     const resourceType: ResourceType<Widget> = {
       discovery: { idOf: (w) => w.id, search: async () => (active ? [{ id: "W3", payload: "x" }] : []) },
-      activation: { isActive: () => true },
+      activation: { verdictFor: () => "active" },
       eventRules: { async poll() { return { changedPrimary: [], changedRelated: [], async decide() { return { deliver: false }; } }; } },
       spawnConfig: { specFor: (w) => ({ key: w.id, issuetype: "widget", summary: w.payload, parent: null }) },
     };
