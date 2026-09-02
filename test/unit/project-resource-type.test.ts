@@ -211,9 +211,15 @@ function fakeWorld(opts: {
     searchProjects: async (_status) => ({
       values: opts.projects.map((p) => ({ key: p.key, name: p.name, lead: { accountId: p.leadAccountId } })),
     }),
-    // Still throw-always, matching the real op's contract — used only by
-    // advanceProjectWatermark's read-modify-write in these tests.
+    // Still throw-always, matching the real op's contract. Also honors
+    // `propertyFailures` (BUTCHR-105): the real op throws on ANY failure,
+    // 404 or otherwise, so a non-404 failure must be simulatable here too —
+    // this is what lets a regression test targeting the OLD
+    // `advanceProjectWatermark` (which called THIS op, bare-`.catch`ed)
+    // actually exercise the failure it existed to catch, rather than
+    // silently reading a fine property back.
     getProjectProperty: async (key: string) => {
+      if (opts.propertyFailures?.[key]) throw opts.propertyFailures[key];
       const p = properties.get(key);
       if (!p) throw new Error(`fake: 404, no "butchr" property for ${key}`);
       return p;
@@ -663,9 +669,42 @@ describe("advanceProjectWatermark", () => {
     expect(w.properties.get("ACME")!.wake).toEqual({ version: 2, comment: null, epics: { "ACME-1": "10" } });
   });
 
-  test("no prior butchr property at all -> starts from an empty base rather than throwing", async () => {
+  // BUTCHR-105 negative control (acceptance criterion 2): the genuine-404
+  // case the fail-open was there to serve must still work after the fix —
+  // do not fix the hazard by breaking the case it was meant to handle.
+  // Failure condition: this rejecting, or the write not happening at all,
+  // means the fix broke genuine first-ever-checkin absence.
+  test("no prior butchr property at all (genuine 404) -> starts from an empty base rather than throwing", async () => {
     const w = fakeWorld({ myAccountId: "acct-A", projects: [], properties: { ACME: undefined } });
     await advanceProjectWatermark(w.ops, "ACME", { version: 1 });
     expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: null, epics: {} });
+  });
+
+  // BUTCHR-105 acceptance criterion 1. Failure condition, stated before this
+  // is ever run: against the UNFIXED code (`getProjectProperty(...).catch(()
+  // => undefined) ?? {}`), a non-404 read failure is indistinguishable from a
+  // genuine absence — the call would resolve successfully AND the property
+  // already on the server (rootDoc/space/repos/archiveProject/scaffolded)
+  // would be overwritten with a wake-only object, i.e. `w.properties.get(
+  // "ACME")` would come back EQUAL to `{ wake: { version: 1, ... } }`, losing
+  // everything else. This test fails against that code two ways: the
+  // rejection assertion fails (nothing is thrown), and even if it were
+  // loosened, the property-untouched assertion below would catch the
+  // overwrite. It must pass only against a fix that refuses to write when
+  // the read fails for an unknown reason.
+  test("a non-404 read failure (rate limit / timeout / permission change) must NOT become the base of the replace: the call rejects and the existing property is left completely untouched", async () => {
+    const existing = { space: { key: "S" }, rootDoc: { id: "doc-A" }, repos: ["org/repo"], archiveProject: "KAN", scaffolded: true, wake: { version: 5, comment: "100", epics: {} } };
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [],
+      properties: { ACME: existing },
+      propertyFailures: { ACME: new Error("503 Service Unavailable (simulated transient failure)") },
+    });
+    await expect(advanceProjectWatermark(w.ops, "ACME", { version: 6 })).rejects.toThrow(/503/);
+    // Not merely "rejects" — the property on the server must be BYTE-FOR-BYTE
+    // what it was before the call: `rootDoc` is not reconstructible from
+    // anything else in the system, so an overwrite here is the actual data
+    // loss this ticket exists to prevent, not just a rejected promise.
+    expect(w.properties.get("ACME")).toEqual(existing);
   });
 });
