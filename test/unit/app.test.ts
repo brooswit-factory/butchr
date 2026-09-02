@@ -1,12 +1,24 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
-import { createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
+import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
+import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
+import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const opened: string[] = [];
-const healthy = { ok: true, components: [{ name: "pollLoop", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 }] };
+// BUTCHR-57: /health now reports TWO components — pollLoop (the fetch
+// stage) and notify (the notify stage, this ticket) — so this fixture,
+// which previously hardcoded a one-element array, must reflect the real
+// current shape rather than being loosened to hide the change.
+const healthy = {
+  ok: true,
+  components: [
+    { name: "pollLoop", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 },
+    { name: "notify", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 },
+  ],
+};
 const view = {
   state: async () => [{ issue: "KAN-9", status: "working", summary: "do a thing" }],
   open: async (issue: string) => { opened.push(issue); return issue === "KAN-BAD" ? { ok: false, error: "nope" } : { ok: true }; },
@@ -145,6 +157,168 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
         stop();
         allowPoll = false;
       }
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-57: the notify stage (loop.ts's onChange — diffing, suppression,
+// deps.notify sends) had NO heartbeat of its own; a poll cycle whose fetch
+// succeeded but whose notify stage failed (or silently died) still reported
+// {"ok":true}. Driven through the same real startLoop/buildApp seam as the
+// poll-loop test above, per the ticket's DoD: this must NOT invent a second
+// test pattern.
+describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
+  test("stays green on a quiet fleet with nothing to notify, goes red+503 when the notify stage stops completing, and recovers", async () => {
+    let nowMs = 1_000_000;
+    const logs: string[] = [];
+    const pollHealth = createLoopHealth({ name: "pollLoop", thresholdMs: 200, now: () => nowMs, checkIntervalMs: 5, log: (l) => logs.push(l) });
+    const notifyHealth = createLoopHealth({ name: "notify", thresholdMs: 200, now: () => nowMs, checkIntervalMs: 5, log: (l) => logs.push(l) });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([pollHealth, notifyHealth]),
+    });
+    app.listen(0);
+    const base = `http://localhost:${app.server!.port}`;
+    try {
+      const herd: Herd = {
+        async runningIssues() { return []; },
+        async staleIssues() { return []; },
+        async spawn() {},
+        async stop() {},
+        async paneFor() { return null; },
+        async nudge() { return { delivered: true }; },
+      };
+      // "To Do" (not an ACTIVE_STATUSES member — src/reconcile/plan.ts) so
+      // reconcileNow's desired set stays empty and this test only exercises
+      // the notify stage, not spawn/stop.
+      const base_issue: JiraIssue = { key: "KAN-1", summary: "s", status: "To Do", issuetype: "Task", assignee: null, parent: null, updated: "2026-01-01T00:00:00.000Z", labels: [] };
+      let mode: "quiet" | "changing" = "quiet";
+      let tick = 0;
+      let allowNotify = true;
+      const stop = startLoop({
+        // "quiet": the exact same issue every poll (a real quiet fleet —
+        // nothing changed in Jira). "changing": `updated` moves every single
+        // call, guaranteeing changedKeys is non-empty on EVERY poll (not
+        // just the ones a racing timer happens to catch), so deps.notify is
+        // actually invoked — and can actually be made to fail — every tick.
+        search: async () => [mode === "quiet" ? base_issue : { ...base_issue, updated: new Date(2026, 0, 1, 0, 0, 0, ++tick).toISOString() }],
+        herd,
+        notify: async () => { if (!allowNotify) throw new Error("notify blocked for test"); },
+        intervalMs: 10,
+        onPollSuccess: () => pollHealth.recordSuccess(),
+        onNotifySuccess: () => notifyHealth.recordSuccess(),
+        log: (l) => logs.push(l),
+      });
+      try {
+        // Quiet fleet: nothing ever changes. The notify stage must still go
+        // (and stay) green — mechanic B. Before the `hash` override in
+        // loop.ts, onChange would never run at all here, and this component
+        // would sit "starting" then "stale" forever despite nothing being
+        // wrong.
+        await Bun.sleep(50);
+        const quiet = await fetch(`${base}/health`);
+        expect(quiet.status).toBe(200);
+        const quietBody = (await quiet.json()) as HealthStatus;
+        expect(quietBody.ok).toBe(true);
+        expect(quietBody.components.find((c) => c.name === "notify")).toMatchObject({ ok: true, state: "ok" });
+        expect(quietBody.components.find((c) => c.name === "pollLoop")).toMatchObject({ ok: true, state: "ok" });
+
+        // Now give the notify stage real work every poll, and make it fail
+        // at that work every time (mechanic A: this must become a LOGGED
+        // failure, not a silent unhandled rejection). Let a few real polls
+        // actually happen and throw before jumping the mocked clock, so the
+        // WARNING log line is genuinely produced by a real failure.
+        mode = "changing";
+        allowNotify = false;
+        await Bun.sleep(30);
+        nowMs += 10_000;
+        await Bun.sleep(20); // let the transition-watcher timer log the STALE line
+        const stale = await fetch(`${base}/health`);
+        expect(stale.status).toBe(503);
+        const staleBody = (await stale.json()) as HealthStatus;
+        expect(staleBody.ok).toBe(false);
+        expect(staleBody.components.find((c) => c.name === "notify")).toMatchObject({ ok: false, state: "stale" });
+        // The fetch stage is unaffected — only the notify stage is down.
+        expect(staleBody.components.find((c) => c.name === "pollLoop")).toMatchObject({ ok: true, state: "ok" });
+        expect(logs.some((l) => l.includes("[notify] stage threw") && l.includes("notify blocked for test"))).toBe(true);
+        expect(logs.some((l) => l.includes("notify") && l.includes("STALE"))).toBe(true);
+
+        // Recovers to ok on the next successful notify pass — no latching.
+        allowNotify = true;
+        await Bun.sleep(30);
+        const recovered = await fetch(`${base}/health`);
+        expect(recovered.status).toBe(200);
+        const recoveredBody = (await recovered.json()) as HealthStatus;
+        expect(recoveredBody.ok).toBe(true);
+        expect(recoveredBody.components.find((c) => c.name === "notify")).toMatchObject({ ok: true, state: "ok" });
+        expect(logs.some((l) => l.includes("notify") && l.includes("recovered"))).toBe(true);
+      } finally {
+        stop();
+        allowNotify = true;
+      }
+    } finally {
+      pollHealth.stop();
+      notifyHealth.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-54: /health carries this daemon's own build identity as a SIBLING
+// field, never an entry in components[] — build identity is not a liveness
+// signal, so it must never be able to flip `ok`. Driven through the real
+// production composition (combineHealth + buildApp + this process's own
+// `buildIdentity` singleton, not a hand-rolled fixture) and a real listening
+// server, per the ticket's own "assert on the actual endpoint response"
+// requirement.
+describe("/health carries build identity as a sibling of components, never inside it (BUTCHR-54)", () => {
+  test("combineHealth's optional build param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    const build = toBuildReport(buildIdentity);
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], build),
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.build).toEqual(build);
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "sha" in c || "version" in c)).toBe(false);
+      // A daemon that doesn't know its own sha is not thereby unhealthy: `ok`
+      // here reflects pollLoop's own state (starting, since recordSuccess was
+      // never called), completely independent of whether build.sha is known.
+      expect(body.ok).toBe(false);
+      expect(body.build!.pid).toBe(process.pid);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting build (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.build).toBeUndefined();
+      expect(body.ok).toBe(true);
     } finally {
       health.stop();
       await mcp.closeAll();

@@ -39,8 +39,23 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   — at both levels (story approves task PRs; epic approves the story's PR to
   main). Every formal review — Approve or Request changes — also gets one
   `[review] <verdict> <pr> @ <sha>` comment on the author's ticket (the event
-  that actually wakes them), and the author checks both `reviewDecision` and
-  `headRefOid` before merging.
+  that actually wakes them), and the author verifies the last decisive
+  review's own `reviews[].commit.oid` against the current head before
+  merging (an approval is recorded against a sha, and the branch may have
+  moved since). That check is NOT sufficient on its own: GitHub can
+  silently rewrite `reviews[].commit.oid` to a later commit after a
+  base-merge — confirmed on two PRs, including one with three reviews where
+  an OLDER review still held its original recorded sha while a LATER
+  review's recorded commit had already moved, matching the current head
+  each time it was re-read. Only a review's own written-at-submission BODY
+  text stays fixed; any structured field, `reviews[].commit.oid` included,
+  can move — and this check reads the LAST decisive review, which is
+  exactly the one most likely to have been rewritten. Strictly better than
+  the `reviewDecision`+`headRefOid` pair it replaced (which failed on every
+  push), but not proof the base hasn't moved under the reviewed diff. If
+  the base may have moved since approval, a re-review at the new head, or
+  the append-only `[review] APPROVED ... @ <sha>` ticket comment GitHub
+  cannot rewrite, are the moves that already exist.
 - **When the work is a document**: the artifact lands where the ticket says
   (e.g. Confluence); the reviewer accepts by saying so on the ticket.
 - **Review** = the boss agent — reached via the Implements link, not the
@@ -70,8 +85,13 @@ detects this itself (`src/agents/parked.ts`) after `BUTCHR_PARKED_MINUTES`
 escalates up the Implements chain if the boss still hasn't acted — arriving
 at a human-owned ticket by construction, since epics are the human's
 (above). A deliberately-shelved backlog item can be exempted with the
-`butchr:shelved` label — any actor may set it (a human today, or an
-automated shelving tool in future) — which the daemon only ever reads.
+`butchr:shelved` label — any actor may set it (a human by hand, or
+`shelve_worker`) — which the daemon's own poll/sweep machinery only ever
+reads. It means CURRENTLY shelved, a state rather than a history:
+`start_worker`/`finish_worker`/`adopt_worker(..., "start")` clear it as part
+of reversing the decision it recorded, so reactivating a worker also
+withdraws its exemption and the detector starts watching it again. A label
+set by hand, outside those verbs, is cleared by nobody but whoever set it.
 
 ## Tools: the daemon MCP is a thin proxy
 

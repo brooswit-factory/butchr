@@ -2,11 +2,14 @@ import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
+import { isProjectId } from "../resources/id.js";
+import { speakOnOwnChannel } from "./speak.js";
 
-/** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. */
+/** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
   story?: string;
   task?: string;
+  epic?: string;
 }
 
 /** `start`, or `shelve` with a reason. No default, no third option — see the glossary page's "two legitimate states of a new worker". */
@@ -21,8 +24,8 @@ function tagComment(who: string, text: string): string {
 /** Marks an `ask_boss` comment as a QUESTION AWAITING AN ANSWER — distinguishes it from a plain `report_to_boss`, and lets a boss find unanswered questions without reading every comment its workers wrote. Placed right after the identity tag. STATED HERE VERBATIM because BUTCHR-30's briefs need to quote it. */
 export const ASK_MARKER = "[ask]";
 
-function noRoleMsg(verb: string, issuetype: "Story" | "Task"): string {
-  const envVar = issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
+function noRoleMsg(verb: string, issuetype: "Story" | "Task" | "Epic"): string {
+  const envVar = issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : issuetype === "Task" ? "BUTCHR_ASSIGNEE_TASK" : "BUTCHR_ASSIGNEE_EPIC";
   return `${verb}: no assignee for a ${issuetype} — set ${envVar} (an Atlassian accountId) on this daemon, or adopt/create it with an explicit assignee via jira_assign/jira_create_issue`;
 }
 
@@ -52,12 +55,83 @@ function summaryOf(issue: unknown): string | undefined {
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
 const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
 
-async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<void> {
+/**
+ * Returns the fetched issue (not just void) so callers that need it for a
+ * follow-up decision — `startWorker`/`finishWorker` checking for a stale
+ * `EXEMPT_LABEL` — reuse this fetch instead of paying for a second one. A
+ * worker that was never shelved must cost exactly what it cost before this
+ * check existed.
+ *
+ * GROWS A PROJECT-CALLER BRANCH HERE (BUTCHR-71, Contract 3) so every verb
+ * that routes through this one check — start_worker, shelve_worker,
+ * finish_worker, prioritize_worker, tell_worker — gets project-caller
+ * support UNIFORMLY, in one place, rather than each reimplementing it.
+ *
+ * For a PROJECT caller, ownership is MEMBERSHIP, not an Implements link (a
+ * Jira PROJECT is not an issue, so none of the issue-link machinery reaches
+ * it — confirmed against this repo: `linkIssues`/`findBossKey` are never
+ * called with a project key anywhere in this file). Membership is read
+ * straight off the worker's OWN `fields.project.key` — no second Jira call,
+ * since `ops.getIssue(workerKey)` already carries it.
+ *
+ * MEMBERSHIP ALONE IS DELIBERATELY NOT ENOUGH, and this is the exact
+ * shortcut a future reader will be tempted by: a project CONTAINS every
+ * Story and Task filed under any of its Epics too (they share the same
+ * Jira `project.key`), and a project boss has no business calling
+ * `finish_worker`/`tell_worker`/etc. on one of THOSE — its own workers are
+ * its Epics, one tier down, exactly like every other boss/worker pair in
+ * this fleet. So this REQUIRES BOTH: the target is IN the caller's project,
+ * AND the target IS an Epic. Either failing refuses, and the message says
+ * WHICH — matching the sharpness of the issue-caller Implements-link check
+ * below (the failure that check exists to prevent — a boss acting on a
+ * stranger's ticket because one character of a key was wrong — has an
+ * exact project-caller analogue here: acting on a ticket that merely
+ * SHARES A PROJECT with the caller).
+ */
+async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(workerKey);
+  if (isProjectId(callerKey)) {
+    const project = projectKeyOf(issue);
+    if (project !== callerKey) {
+      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
+    }
+    const type = issuetypeOf(issue);
+    if (type !== "Epic") {
+      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
+    }
+    return issue;
+  }
   const boss = findBossKey(issue);
   if (boss !== callerKey) {
     throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
+  return issue;
+}
+
+/**
+ * The rollback `new_worker` (either shape — issue or project caller) uses
+ * when a post-create step fails: attempts `ops.deleteIssue`, and either way
+ * throws naming what happened — see `newWorker`'s own doc comment for the
+ * full reasoning (measured DELETE_ISSUES refusal, why it's attempted
+ * anyway). Factored out so the project-caller branch (`newProjectWorker`)
+ * doesn't reimplement the same three-way message.
+ */
+function makeRollback(ops: AtlassianOps, verb: string, key: string): (why: string) => Promise<never> {
+  return async (why: string): Promise<never> => {
+    let deleted = false;
+    let deleteError: string | undefined;
+    try {
+      await ops.deleteIssue(key);
+      deleted = true;
+    } catch (e) {
+      deleteError = (e as Error).message;
+    }
+    throw new Error(
+      deleted
+        ? `${verb}: ${why} — ticket ${key} has been rolled back (deleted); nothing survives.`
+        : `${verb}: ${why} — ticket ${key} COULD NOT be rolled back (${deleteError}); this daemon's credential may lack DELETE_ISSUES on this project (measured absent as of BUTCHR-35 — granting it upgrades this path to true atomicity with no code change). Ticket ${key} SURVIVES and needs manual cleanup.`,
+    );
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +146,10 @@ export interface NewWorkerInput {
 }
 export interface NewWorkerResult {
   key: string;
-  implements: string;
+  /** Present ONLY for an ISSUE caller — the Implements link target (the caller's own key). */
+  implements?: string;
+  /** Present ONLY for a PROJECT caller — the Jira PROJECT key the new Epic is a MEMBER of. There is no Implements link for a project/epic relationship (a Jira project is not an issue), so this is a DIFFERENT field, not `implements` set to the project key — reporting `implements` here would claim a link that does not exist. The field's presence/absence, not its value, is what tells an agent reading the result which relationship it's looking at. */
+  member?: string;
   doc: DocResult;
   disposition: Disposition["kind"];
 }
@@ -138,6 +215,8 @@ export interface NewWorkerResult {
  * but only (2) means something needs to be cleaned up — read the message.
  */
 export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
+  if (isProjectId(callerKey)) return newProjectWorker(ops, roles, callerKey, input);
+
   const { disposition } = input;
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
     throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
@@ -174,21 +253,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // never rolls back). Attempts the delete unconditionally — see
   // AtlassianOps.deleteIssue's doc comment for why a currently-refused
   // permission is not a reason to skip the attempt.
-  const rollback = async (why: string): Promise<never> => {
-    let deleted = false;
-    let deleteError: string | undefined;
-    try {
-      await ops.deleteIssue(key);
-      deleted = true;
-    } catch (e) {
-      deleteError = (e as Error).message;
-    }
-    throw new Error(
-      deleted
-        ? `new_worker: ${why} — ticket ${key} has been rolled back (deleted); nothing survives.`
-        : `new_worker: ${why} — ticket ${key} COULD NOT be rolled back (${deleteError}); this daemon's credential may lack DELETE_ISSUES on this project (measured absent as of BUTCHR-35 — granting it upgrades this path to true atomicity with no code change). Ticket ${key} SURVIVES and needs manual cleanup.`,
-    );
-  };
+  const rollback = makeRollback(ops, "new_worker", key);
 
   // (2) link — outward from the new child to the caller, never the reverse.
   try {
@@ -232,15 +297,139 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   return { key, implements: callerKey, doc, disposition: disposition.kind };
 }
 
-/** Worker -> In Progress. Refuses a key that is not one of the caller's own workers. The call that actually staffs an agent; also reactivates a shelved worker and sends an In Review worker back to work. */
+/**
+ * PROJECT caller -> creates an EPIC, one tier below. See `newWorker`'s own
+ * doc comment for the general shape (disposition validation, the four-step
+ * ordering) — this differs from it in exactly the ways BUTCHR-71's Contract
+ * 2 calls out, both DELIBERATE, not oversights:
+ *
+ *  1. NO IMPLEMENTS LINK, SO THE WRITE ORDER COLLAPSES FROM FOUR STEPS TO
+ *     THREE. A Jira PROJECT is not an issue, so none of the issue-link
+ *     machinery (`ops.linkIssues`) reaches it — confirmed by this file: no
+ *     call below ever links a project key to anything. The boss/worker
+ *     relationship here is MEMBERSHIP IN THE PROJECT, which is already true
+ *     the INSTANT `ops.createIssue` lands the ticket in `projectKey` — there
+ *     is no separate "link" write establishing it afterward, unlike the
+ *     issue-caller path's step 2. So the order here is: (1) create, (2)
+ *     disposition, (3) doc.
+ *  2. ROLLBACK STILL COVERS THE DISPOSITION STEP, mirroring `newWorker`'s
+ *     own reasoning even with one fewer step to protect: between create and
+ *     disposition, the ticket exists but is not yet a DECLARED worker (no
+ *     RUNNING/SHELVED state on record) — the same genuinely damaging window
+ *     `newWorker`'s rollback exists for, just without a link step ahead of
+ *     it. There is no rollback for step 3 (the doc), same reasoning as
+ *     `newWorker`'s own step 4: convergent (`ensureDoc`), nothing downstream
+ *     depends on it, so a failure there is reported, never rolled back.
+ *  3. `member`, NOT `implements`, IN THE RESULT. Reporting `implements:
+ *     projectKey` would be a LIE — no such link exists (see 1 above) — so
+ *     the result carries `member` instead (see `NewWorkerResult`'s own doc
+ *     comment); `implements` is simply omitted rather than set to a value
+ *     that would read as true and isn't.
+ *
+ * DOC NESTING — VERIFIED, NOT ASSUMED: see the comment on `ensureDoc`'s own
+ * boss-resolution step (src/tools/docs.ts) for why the new Epic's doc
+ * already nests under `projectKey`'s root doc with no second code path.
+ */
+async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
+  const { disposition } = input;
+  if (disposition.kind === "shelve" && !disposition.reason.trim()) {
+    throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+  }
+  const role = roles.epic;
+  if (!role) throw new Error(noRoleMsg("new_worker", "Epic"));
+
+  // (1) create — irreversible; the shelve label, if any, lands HERE.
+  // Membership in `projectKey` is already real the instant this returns.
+  const created = (await ops.createIssue({
+    projectKey,
+    issuetype: "Epic",
+    summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
+    assignee: role,
+    ...(input.priority ? { priority: input.priority } : {}),
+    ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
+  })) as { key?: string };
+  const key = created.key;
+  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to transition against nothing");
+
+  const rollback = makeRollback(ops, "new_worker", key);
+
+  // (2) disposition — after this, the epic is a fully declared worker
+  // (membership + a declared RUNNING/SHELVED state). See the function doc
+  // comment for why rollback still covers this step despite there being no
+  // link step ahead of it.
+  if (disposition.kind === "start") {
+    try {
+      await ops.transition(key, "In Progress");
+    } catch (e) {
+      return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
+    }
+  } else {
+    try {
+      await ops.addComment(key, tagComment(projectKey, disposition.reason));
+    } catch (e) {
+      return rollback(`the shelve reason comment failed to post (${(e as Error).message}); the exemption label was already applied at creation`);
+    }
+  }
+
+  // (3) doc — last, on purpose; see newWorker's own step-4 comment (same reasoning).
+  let doc: DocResult;
+  try {
+    doc = await ensureDoc(ops, key);
+  } catch (e) {
+    throw new Error(
+      `new_worker: epic ${key} was created in project ${projectKey} and its disposition (${disposition.kind}) applied — it is a fully declared worker (membership, not a link); no rollback was attempted or is needed. ` +
+        `Only its Confluence doc failed to create (${(e as Error).message}); it will be completed by ${key}'s own first set_doc call, whenever that agent makes one.`,
+    );
+  }
+
+  return { key, member: projectKey, doc, disposition: disposition.kind };
+}
+
+/**
+ * Worker -> In Progress. Refuses a key that is not one of the caller's own
+ * workers. The call that actually staffs an agent; also reactivates a
+ * shelved worker and sends an In Review worker back to work.
+ *
+ * CLEARS `EXEMPT_LABEL` (`butchr:shelved`) FIRST, ONLY IF PRESENT, THEN
+ * TRANSITIONS — this is the fix for BUTCHR-50: the label means CURRENTLY
+ * shelved, a state, not a history, so the verb that reverses a shelve is the
+ * verb that withdraws the declaration. Ordering (not just presence) is the
+ * design decision, by the same "order writes by how bad it is to stop
+ * halfway" principle shelveWorker's own comment and newWorker's step
+ * ordering already use: transitioning first and then failing the label
+ * removal would leave an In Progress ticket silently carrying a stale
+ * exemption — exactly the blind spot this fix exists to close. Clearing
+ * first and then failing the transition instead leaves a To Do, assigned,
+ * UNEXEMPT child under a live boss, which the parked detector reports
+ * loudly. Never leave a partial state where the detector is silently wrong;
+ * prefer the one where it is loudly right. Skipped entirely (zero extra
+ * Jira calls) when the label isn't present, reusing assertOwnWorker's fetch.
+ */
 export async function startWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+  const issue = await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
   return ops.transition(workerKey, "In Progress");
 }
 
-/** Worker -> Done. Refuses a key that is not one of the caller's own workers. A worker never finishes itself — see submit_to_boss; the review hop is the point. */
+/**
+ * Worker -> Done. Refuses a key that is not one of the caller's own workers.
+ * A worker never finishes itself — see submit_to_boss; the review hop is the
+ * point.
+ *
+ * CLEARS `EXEMPT_LABEL` FIRST, ONLY IF PRESENT, THEN TRANSITIONS — same
+ * ordering and reasoning as `startWorker` above. Done is not shelved: a
+ * finished ticket that still carries the exemption is the exact residue this
+ * ticket exists to stop producing (BUTCHR-28/-29/-30/-31, all Done and all
+ * still carrying it before this fix).
+ */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
   return ops.transition(workerKey, "Done");
 }
 
@@ -300,6 +489,11 @@ export interface AdoptWorkerResult {
  * safety net, regardless of `alreadyAdopted`. Refuses a ticket already
  * linked to a DIFFERENT boss.
  *
+ * A `disposition: "start"` ALSO CLEARS `EXEMPT_LABEL` (`butchr:shelved`)
+ * whenever the adopted ticket carries it, whether or not this call is
+ * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
+ * below for why that check is not gated on `alreadyAdopted`.
+ *
  * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
  * "shelve" disposition, the reason is posted whenever this call does ANY
  * real adoption work at all (`!alreadyAdopted`) — even if the ticket
@@ -316,6 +510,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
     throw new Error("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
+  if (isProjectId(callerKey)) return adoptProjectWorker(ops, roles, callerKey, workerKey, disposition);
 
   const issue = await ops.getIssue(workerKey);
   const existingBoss = findBossKey(issue);
@@ -330,11 +525,12 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const role = issuetype === "Story" ? roles.story : roles.task;
   if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
 
+  const labels = labelsOf(issue);
   const linkedCorrectly = existingBoss === callerKey;
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
   const currentStatus = statusOf(issue);
   const dispositionAlreadyApplied =
-    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labelsOf(issue).includes(EXEMPT_LABEL);
+    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labels.includes(EXEMPT_LABEL);
   const alreadyAdopted = linkedCorrectly && assignedCorrectly && dispositionAlreadyApplied;
 
   if (!alreadyAdopted) {
@@ -343,6 +539,21 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   }
 
   const doc = await ensureDoc(ops, workerKey);
+
+  // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
+  // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
+  // this path already reads the issue and computes labelsOf(issue), so this
+  // costs no extra Jira call). Adopting a ticket that already carries the
+  // label straight into (or already sitting in) In Progress reproduces the
+  // identical bug startWorker fixes, through a second door — even a fully
+  // idempotent re-adoption (already linked, assigned, and In Progress) must
+  // not leave a live ticket silently carrying a stale exemption, which is
+  // exactly the residue this fix exists to stop producing. Cleared BEFORE any
+  // transition below — same ordering reasoning as startWorker's own comment:
+  // never leave a partial state where the detector is silently wrong.
+  if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
 
   // NOTE: the reason comment for "shelve" is posted whenever this call is
   // doing ANY real adoption work (!alreadyAdopted) — NOT gated on
@@ -368,6 +579,73 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
         if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
       }
       await ops.addComment(workerKey, tagComment(callerKey, disposition.reason));
+    }
+  }
+
+  return { key: workerKey, alreadyAdopted, doc, disposition: disposition.kind };
+}
+
+/**
+ * PROJECT caller adopting an existing EPIC into the project (an orphan
+ * epic, or one whose boss agent has since ended). "Already adopted" here
+ * can NEVER mean "already linked" — there is no link for a project/epic
+ * relationship (see `newProjectWorker`'s doc comment) — so it means the
+ * epic is already a MEMBER of `projectKey`, already assigned by the epic
+ * role, and already sitting in the state its disposition names. Refuses an
+ * epic that is a member of a DIFFERENT project — stealing another
+ * project's epic must be an explicit act, not a side effect of a mistyped
+ * key, mirroring the issue-caller path's refusal of a different existing
+ * boss (there is no equivalent "explicit move" verb for project
+ * membership here — moving an issue between Jira projects is out of scope
+ * for this tool surface, not silently omitted).
+ */
+async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
+  const issue = await ops.getIssue(workerKey);
+  const existingProject = projectKeyOf(issue);
+  if (existingProject !== projectKey) {
+    throw new Error(`adopt_worker: ${workerKey} belongs to project ${existingProject ?? "an unreadable project"}, not ${projectKey} — stealing another project's epic must be an explicit act, not a side effect of a mistyped key`);
+  }
+
+  const issuetype = issuetypeOf(issue);
+  if (issuetype !== "Epic") {
+    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted by a project caller — only an Epic can be`);
+  }
+  const role = roles.epic;
+  if (!role) throw new Error(noRoleMsg("adopt_worker", "Epic"));
+
+  const labels = labelsOf(issue);
+  const assignedCorrectly = assigneeAccountIdOf(issue) === role;
+  const currentStatus = statusOf(issue);
+  const dispositionAlreadyApplied =
+    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labels.includes(EXEMPT_LABEL);
+  // MEMBERSHIP IS ALREADY GIVEN (checked above) — the idempotence test here
+  // mirrors the issue-caller path's OWN reasoning: membership is a
+  // structural fact of the ticket, not a declared act, so it is never part
+  // of "already adopted" either way. Only assignment + disposition state
+  // decide it.
+  const alreadyAdopted = assignedCorrectly && dispositionAlreadyApplied;
+
+  if (!alreadyAdopted && !assignedCorrectly) await ops.assign(workerKey, role);
+
+  const doc = await ensureDoc(ops, workerKey);
+
+  // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
+  // on a "start" disposition whenever it's present, not gated on
+  // `alreadyAdopted` — see adoptWorker's own comment on this for the full
+  // reasoning (reproduces the identical bug through a second door if skipped).
+  if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
+    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
+  }
+
+  if (!alreadyAdopted) {
+    if (disposition.kind === "start") {
+      if (!dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
+    } else {
+      if (!dispositionAlreadyApplied) {
+        await ops.addLabels(workerKey, [EXEMPT_LABEL]);
+        if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
+      }
+      await ops.addComment(workerKey, tagComment(projectKey, disposition.reason));
     }
   }
 
@@ -593,19 +871,29 @@ export async function tellWorker(ops: AtlassianOps, callerKey: string, workerKey
 // Worker -> boss
 // ---------------------------------------------------------------------------
 
-/** Comments on the CALLER'S OWN ticket. No key parameter, by design — see the glossary page's "known hazard, kept deliberately" note. */
+/**
+ * Speaks on the CALLER'S OWN CHANNEL — an issue caller's own ticket, a
+ * PROJECT caller's own ROOT DOC (see `speakOnOwnChannel`, the seam that
+ * decides which). No key parameter, by design — see the glossary page's
+ * "known hazard, kept deliberately" note. A PROJECT CALLER IS ALLOWED HERE
+ * (BUTCHR-71 spec correction, ruled by the epic on BUTCHR-62): a project has
+ * no boss to submit its own ticket to (see `submitToBoss`), but it is
+ * genuinely talked TO by comments on its root doc, and this is the
+ * corresponding way it talks back — including to escalate when it is
+ * blocked, which every brief in this fleet depends on being possible.
+ */
 export async function reportToBoss(ops: AtlassianOps, callerKey: string, text: string): Promise<unknown> {
-  return ops.addComment(callerKey, tagComment(callerKey, text));
+  return speakOnOwnChannel(ops, callerKey, tagComment(callerKey, text));
 }
 
 /**
  * Same channel as report_to_boss, but marked `[ask]` right after the
  * identity tag — greppable, so a boss can find its workers' unanswered
  * questions without reading every comment. Asking does NOT change the
- * asker's status.
+ * asker's status. Allowed for a PROJECT caller, same reasoning as `reportToBoss`.
  */
 export async function askBoss(ops: AtlassianOps, callerKey: string, text: string): Promise<unknown> {
-  return ops.addComment(callerKey, tagComment(callerKey, `${ASK_MARKER} ${text}`));
+  return speakOnOwnChannel(ops, callerKey, tagComment(callerKey, `${ASK_MARKER} ${text}`));
 }
 
 /** The caller's OWN ticket -> In Review. No arguments at all — the one transition an agent is always entitled to make about itself. */

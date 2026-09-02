@@ -84,6 +84,23 @@ describe("loadConfig", () => {
     expect(none).toContain("task:unset — Task creation will be refused");
   });
 
+  // BUTCHR-71 Contract 5: the epic role, same shape as story/task, never a
+  // silent fallback to either.
+  test("BUTCHR_ASSIGNEE_EPIC is parsed independently of story/task", () => {
+    const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "712020:epic" }, noRead);
+    expect(c.assignees).toEqual({ epic: "712020:epic" });
+  });
+  test("loadConfig does not throw when BUTCHR_ASSIGNEE_EPIC is absent; the role is undefined, NOT defaulted from story/task", () => {
+    const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
+    expect(c.assignees.epic).toBeUndefined();
+  });
+  test("describeConfig includes the resolved epic accountId, and names the consequence when unset, never a token", () => {
+    const set = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "712020:e160cf60-6480-44de-8554-af5b81c584e2" }, noRead));
+    expect(set).toContain("epic:712020:e160");
+    const unset = describeConfig(loadConfig(base, noRead));
+    expect(unset).toContain("epic:unset — Epic creation will be refused");
+  });
+
   test("captureDir defaults to .captures under the workspace root; BUTCHR_CAPTURE_DIR overrides it", () => {
     const c = loadConfig(base, noRead);
     expect(c.captureDir).toBe(join(workspaceRoot(), ".captures"));

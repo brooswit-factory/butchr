@@ -1,23 +1,21 @@
 import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
-import { activeKeys, changedKeys, daemonLabelsChanged, isDaemonLabelOnlyDiff, prTransition } from "../jira-watch/diff.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
-
-/** A ticket watched on behalf of active issues via the Implements chain (see src/jira-watch/routes.ts). */
-export interface RelatedIssue {
-  issue: JiraIssue;
-  /** Active issue keys whose agents should hear when this ticket changes. */
-  watchers: readonly string[];
-}
+import type { ResourceType, RelatedResource } from "../resources/types.js";
+import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
+export type { NotifyReason } from "../resources/types.js";
+import type { NotifyReason } from "../resources/types.js";
 
 /**
- * Why an agent is being nudged, when it is more than "your ticket changed" —
- * currently only a pr:* transition on the ticket's OWN agent (see
- * `prTransition`, src/jira-watch/diff.ts). Omitted/undefined for every other
- * nudge, so existing callers and tests are unaffected.
+ * A ticket watched on behalf of active issues via the Implements chain (see
+ * src/jira-watch/routes.ts). This is `RelatedResource<T>`
+ * (src/resources/types.ts) defaulted to `T = JiraIssue` — the shape every
+ * existing caller (src/agents/parked.ts, and this file's own issue-tier
+ * wiring below) already depends on; a second resource type would use
+ * `RelatedResource<ItsShape>` directly instead of this alias.
  */
-export type NotifyReason = { pr: { from: string | null; to: string } };
+export type RelatedIssue<T = JiraIssue> = RelatedResource<T>;
 
 export interface LoopDeps {
   /** Fetch the assigned issues (active + recently changed) each poll. */
@@ -81,17 +79,27 @@ export interface LoopDeps {
   /**
    * BUTCHR-24: run the parked-ticket detector (src/agents/parked.ts) over
    * this poll's already-fetched (issues, related) snapshot. Called from
-   * inside the observe function below, NEVER from `watch()`'s `onChange`
-   * callback: `@brooswit/sundry`'s `watch()` only invokes `onChange` when
-   * the polled snapshot's hash differs from the previous one — documented in
-   * the published package's `dist/watch/watcher.d.ts` ("call `onChange(next,
-   * prev)` whenever the hash of its return value changes") and confirmed
-   * against the compiled implementation in `dist/index.js`, whose internal
-   * `observe()` returns early via `if (h !== prevHash)` before ever calling
-   * `onChange` — so a detector
-   * wired into `onChange` would silently stop firing on any poll whose
-   * snapshot happens not to change — exactly the "the fix doesn't survive a
-   * quiet poll" failure mode this ticket exists to remove. Optional;
+   * inside the observe function below, NOT from `watch()`'s `onChange`
+   * callback, because this is fetch-stage work operating on the snapshot
+   * `observe()` just produced — it belongs alongside `syncLabels` above, not
+   * downstream in the diff/notify stage.
+   *
+   * BUTCHR-57 UPDATE: the reason this placement used to be load-bearing no
+   * longer applies IN THIS LOOP. `@brooswit/sundry`'s `watch()` by DEFAULT
+   * only invokes `onChange` when the polled snapshot's hash differs from the
+   * previous one — documented in the published package's
+   * `dist/watch/watcher.d.ts` ("call `onChange(next, prev)` whenever the
+   * hash of its return value changes") and confirmed against the compiled
+   * implementation in `dist/index.js`, whose internal `observe()` returns
+   * early via `if (h !== prevHash)` before ever calling `onChange`. THIS loop
+   * no longer relies on that default: the `hash` option passed to `watch()`
+   * below (see `notifyTick`) forces `observe()`'s `h !== prevHash` branch to
+   * always be taken, so `onChange` now runs on every poll tick regardless of
+   * whether anything changed. A detector wired into `onChange` here would no
+   * longer silently stop firing on a quiet poll. That does not make
+   * `checkParked` a candidate to move, though: it still belongs in the fetch
+   * stage on its own merits (it consumes the same freshly-fetched snapshot
+   * as `syncLabels`, before any diffing happens), so it stays here. Optional;
    * omitted, parked-ticket detection simply never runs. The detector itself
    * never throws (see parked.ts), but this call is awaited inside the same
    * try-implicit observe function as `syncLabels` above, so a change to that
@@ -99,6 +107,23 @@ export interface LoopDeps {
    * it.
    */
   checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
+  /**
+   * BUTCHR-57: called once per poll when the NOTIFY stage (the `onChange`
+   * callback below — changed-key diffing, suppression checks, `deps.notify`
+   * sends) concludes without throwing, including the zero-nudges case where
+   * nothing needed sending. This is the positive heartbeat the notify
+   * component of `/health` is built on — see src/daemon/health.ts and the
+   * `hash` override below for why it fires every poll rather than only when
+   * `@brooswit/sundry`'s `watch()` would naturally invoke `onChange`.
+   * Deliberately NOT derived from `onError`: `watch()` never awaits
+   * `onChange`'s returned promise (confirmed against
+   * `node_modules/@brooswit/sundry/dist/index.js`'s `observe()`, which calls
+   * `onChange(next, prev)` synchronously and never touches the promise it
+   * returns), so a rejecting notify stage would otherwise be an unhandled
+   * rejection invisible to both `onError` and any heartbeat built on it.
+   * Optional; omitted, the notify component simply never records success.
+   */
+  onNotifySuccess?: () => void;
 }
 
 /** How many polls a just-respawned issue is shielded from a further respawn. */
@@ -156,6 +181,9 @@ export interface ReconcileOptions {
  * buildWorkspace rewrites its CLAUDE.md/brief.md/mcp.json exactly as a normal
  * spawn would. A repeat respawn of the same issue within RESPAWN_SUPPRESS_POLLS
  * polls is suppressed by `opts.guard` instead — see RespawnGuard.
+ *
+ * Generic over resource id already (an opaque string key + SpawnSpec) —
+ * nothing here is issue-shaped, so this needed no change for BUTCHR-69.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
   const guard = opts.guard ?? new RespawnGuard();
@@ -188,52 +216,107 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   }
 }
 
-/** The desired active set as spawn specs, keyed by issue. */
-export const desiredFrom = (issues: readonly JiraIssue[]): Map<string, SpawnSpec> =>
-  new Map(issues.filter((i) => activeKeys([i]).length).map((i) => [i.key, { key: i.key, issuetype: i.issuetype, summary: i.summary, parent: i.parent }]));
+/**
+ * The desired active set as spawn specs, keyed by resource id — generic over
+ * `ResourceType<T>.activation`/`.spawnConfig`/`.discovery.idOf` (BUTCHR-69).
+ * The issue tier's own call site (`runResourceLoop` below, via `startLoop`'s
+ * compatibility shim) is `desiredFrom(issues, someIssueResourceType)`; a
+ * second resource type calls this with its own instance, unchanged.
+ */
+export const desiredFrom = <T>(items: readonly T[], resourceType: Pick<ResourceType<T>, "activation" | "spawnConfig" | "discovery">): Map<string, SpawnSpec> => {
+  const out = new Map<string, SpawnSpec>();
+  for (const item of items) {
+    if (!resourceType.activation.isActive(item)) continue;
+    out.set(resourceType.discovery.idOf(item), resourceType.spawnConfig.specFor(item));
+  }
+  return out;
+};
 
-interface Snapshot { issues: JiraIssue[]; related: RelatedIssue[] }
+interface Snapshot<T> {
+  issues: T[];
+  related: RelatedResource<T>[];
+}
+
+/** What `runResourceLoop` needs beyond the resource type itself — every field here is already fully generic (no `T`-shaped logic anywhere). */
+export interface GenericLoopDeps<T> {
+  herd: Herd;
+  notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
+  onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
+  checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
+  log?: (line: string) => void;
+  intervalMs: number;
+  onError?: (error: unknown) => void;
+  onPollSuccess?: () => void;
+  /**
+   * BUTCHR-57: called once per poll when the NOTIFY stage concludes without
+   * throwing, including the zero-nudges case — the positive heartbeat the
+   * notify component of `/health` is built on (see `onNotifySuccess` on
+   * `LoopDeps` above for the full reasoning; `startLoop` threads that field
+   * straight through to this one). Optional; omitted, the notify component
+   * simply never records success.
+   */
+  onNotifySuccess?: () => void;
+}
 
 /**
- * The daemon's core loop. Every poll: fetch assigned issues, reconcile the herd
- * (idempotent — this is the periodic controller, correct after a restart), and
- * fetch the work related to what's active. On any change between polls: nudge
- * each affected agent, naming the ticket that changed — unless it is
- * suppressed as an echo of a write the daemon itself made (own-write ledger,
- * `deps.suppress`) or a cross-daemon label-only echo (`isDaemonLabelOnlyDiff`
- * + `deps.comments`) — EXCEPT a pr:* transition on a ticket's own agent
- * (`prTransition`), which is delivered past both suppressions and names the
- * transition in the third `notify` argument. A DAEMON_WRITER own-write-ledger
- * hit that also changed a daemon label (`daemonLabelsChanged`) is itself not
- * final either — see `ledgerHitSuppressed` below (KAN-828).
+ * The daemon's core loop, generic over an opaque resource type `T`
+ * (BUTCHR-64/BUTCHR-69 — "the loop and reconciler are generic over resource
+ * id, not over issue keys"). Every poll: discover this poll's resources,
+ * reconcile the herd (idempotent — this is the periodic controller, correct
+ * after a restart), and discover the related set. On any change between
+ * polls — as the resource type ITSELF decides "changed" means, per the
+ * epic's opaque-snapshot ruling on BUTCHR-69 (`resourceType.eventRules.poll`
+ * is handed the plain (prev, next) snapshots and answers both "what changed"
+ * and "is it worth pushing", including any suppression) — nudge each
+ * affected agent.
+ *
+ * What stays HERE, and only here, is the type-agnostic mechanism: per-poll
+ * memoization of `eventRules.poll` itself, the `sent` dedupe, delivery, and
+ * fail-open discipline around `syncLabels`/`checkParked`. Adding a second
+ * resource type means writing its own `ResourceType<T>` and calling this
+ * function with it — nothing below changes.
+ *
+ * `startLoop` (below) is this same function, applied to `ResourceType<JiraIssue>`
+ * built from `LoopDeps`' own fields — the issue tier's own call site, kept
+ * under its historical name/shape for every existing caller and test.
  */
-export function startLoop(deps: LoopDeps): Stop {
-  // Persists ACROSS polls (unlike `sent`, reset each poll below): the last
-  // comment id observed per key — for the cross-daemon label-echo check, the
-  // DAEMON_WRITER ledger-hit check (KAN-828), and first-sighting baseline
-  // seeding (KAN-828). Absence of a key means "no baseline yet" — the
-  // fail-safe case that always delivers rather than suppresses on an unknown
-  // baseline; seeding is what keeps a ledger hit from ever meeting that case.
-  const commentCursor = new Map<string, string | null>();
-  // Also persists across polls: the respawn storm guard (see RespawnGuard).
-  // One instance for the whole loop's lifetime — NOT module-level state — so
-  // it survives across polls without leaking between independent startLoop
-  // calls (e.g. separate tests).
+export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericLoopDeps<T>): Stop {
+  // Persists across polls: the respawn storm guard (see RespawnGuard). One
+  // instance for the whole loop's lifetime — NOT module-level state — so it
+  // survives across polls without leaking between independent
+  // runResourceLoop calls (e.g. separate tests).
   const respawnGuard = new RespawnGuard();
+  // BUTCHR-57: a monotonic counter used as `watch()`'s `hash` option below,
+  // forcing `onChange` (the notify stage) to run on EVERY poll rather than
+  // only when the fetched Snapshot's content-hash differs from last time.
+  // Without this, a quiet fleet (nothing changed in Jira for hours) would
+  // never invoke `onChange` at all, and the notify component of `/health`
+  // (see `onNotifySuccess` on `LoopDeps`) would have no way to distinguish
+  // "healthy and idle" from "stuck" — this is why `checkParked`'s own doc
+  // comment above now flags that `onChange` is no longer change-gated in
+  // THIS loop. `checkParked` itself is unaffected and stays in the fetch
+  // stage regardless (see that comment) — the notify stage's own job
+  // (diffing `prev`/`next` and sending nudges) is what genuinely belongs in
+  // `onChange`, so the fix here is to make `onChange` unconditional rather
+  // than move work out of it. `prev`/`next` stay correct either way:
+  // `watch()`'s own baseline tracking (`prevValue`) is untouched by this —
+  // only the change-detection hash is forced to always differ, so
+  // `observe()`'s `h !== prevHash` branch is always taken (confirmed against
+  // `@brooswit/sundry`'s compiled `observe()`) and it still passes the REAL
+  // previous/current snapshots.
+  let notifyTick = 0;
 
-  const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
-  const relatedIssueOf = (list: readonly RelatedIssue[], key: string) => list.find((r) => r.issue.key === key)?.issue;
-
-  return watch<Snapshot>(
+  return watch<Snapshot<T>>(
     async () => {
-      const issues = await deps.search();
-      const desired = desiredFrom(issues);
+      const issues = await resourceType.discovery.search();
+      const desired = desiredFrom(issues, resourceType);
       await reconcileNow(deps.herd, desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
       });
-      const related = deps.related ? await deps.related([...desired.keys()]) : [];
+      const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
       // A detector failure must never take down the poll — caught HERE too
       // (belt and suspenders on top of parked.ts's own internal try/catch):
@@ -251,214 +334,101 @@ export function startLoop(deps: LoopDeps): Stop {
       return { issues, related };
     },
     async (next, prev) => {
-      const sent = new Set<string>();
-      const send = async (issue: string, about: string, reason?: NotifyReason) => {
-        const id = `${issue}|${about}`;
-        if (sent.has(id)) return;
-        sent.add(id);
-        await deps.notify(issue, about, reason);
-      };
+      // BUTCHR-57: the whole notify stage is wrapped so its returned promise
+      // can never reject — `watch()` does not await `onChange` (mechanic A
+      // above), so a rejection here would otherwise be a silent unhandled
+      // promise rejection, invisible to both `deps.onError` (that seam only
+      // ever sees a rejection from the FETCH stage, the first `watch()`
+      // argument) and to `/health`. A failure is instead logged loudly on
+      // the house `deps.log`/`console.error` seam, in the neighbouring
+      // `WARNING: [tag] ... threw: ...` style, and `onNotifySuccess` is
+      // simply not called — leaving the notify health component to go stale
+      // rather than reporting a false success. Per mechanic C, a failed pass
+      // here has already lost this poll's diff forever (`watch()` advances
+      // its baseline before calling `onChange`), so there is nothing left to
+      // retry — the goal here is only to make that failure loud, not silent.
+      try {
+        const sent = new Set<string>();
+        const send = async (issue: string, about: string, reason?: NotifyReason) => {
+          const id = `${issue}|${about}`;
+          if (sent.has(id)) return;
+          sent.add(id);
+          await deps.notify(issue, about, reason);
+        };
 
-      // ONE deps.comments(key) call per key, per poll — shared by baseline
-      // seeding below, the DAEMON_WRITER ledger-hit comment-cursor check, and
-      // the cross-daemon label-only echo check (KAN-828 item 4). Fails OPEN:
-      // a rejected call (a transient network error — this is a live Jira
-      // call), or `deps.comments` simply not being wired up, is never treated
-      // as "no new comment" and never advances the cursor, so a failed poll
-      // can never install a wrong baseline.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null } | { ok: false }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null } | { ok: false }> => {
-        let p = commentsCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!deps.comments) return { ok: false as const };
-            try {
-              const comments = await deps.comments(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null };
-            } catch {
-              return { ok: false as const };
-            }
-          })();
-          commentsCache.set(key, p);
+        const evPoll = await resourceType.eventRules.poll(
+          { primary: prev.issues, related: prev.related },
+          { primary: next.issues, related: next.related },
+        );
+
+        // Primary (assigned) resources: notify the resource's own agent only.
+        // Parent/membership is not an event to listen for — a boss hears
+        // change only through the related (Implements) chain below.
+        for (const key of evPoll.changedPrimary) {
+          const verdict = await evPoll.decide(key, key, "primary");
+          if (verdict.deliver) await send(key, key, verdict.reason);
         }
-        return p;
-      };
-
-      // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
-      // no recorded comment-cursor entry yet gets one seeded now, from its
-      // CURRENT newest comment id, so its first-ever ledger hit already has a
-      // baseline to compare against — without this, the "unknown baseline"
-      // fail-safe would turn every key's first daemon-label ledger hit into
-      // a one-time echo nudge, noise this ticket must not add. Fail-open: a
-      // rejected/unavailable call leaves the key unseeded, retried on a
-      // later poll, never installing a baseline it did not observe. A key
-      // that appears mid-run (a newly staffed ticket) is seeded right here,
-      // on the poll it first appears — safe, because `suppressed()` already
-      // delivers unconditionally on appear/disappear (no `before`), and a
-      // ledger hit requires both `before` and `after`, so by the time a key
-      // can ever hit the ledger it was necessarily present — and thus
-      // seeded — on the previous poll. A ledger hit therefore always has a
-      // baseline.
-      const seenKeys = new Set<string>([...next.issues.map((i) => i.key), ...next.related.map((r) => r.issue.key)]);
-      await Promise.all(
-        [...seenKeys].map(async (key) => {
-          if (commentCursor.has(key)) return;
-          const result = await fetchComments(key);
-          if (result.ok) commentCursor.set(key, result.newest);
-        }),
-      );
-
-      // Memoized per key, per poll: the label-only branch makes at most one
-      // comments() call per key, however many watchers consult it. Fails
-      // OPEN: a rejected comments() call (a transient network error — this is
-      // a live Jira call) must never suppress and must never write the
-      // comment cursor, or a failed poll would install a wrong baseline and
-      // could cause a LATER poll to wrongly suppress a real change.
-      const crossDaemonCache = new Map<string, Promise<boolean>>();
-      const crossDaemonSuppressed = (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined): Promise<boolean> => {
-        let p = crossDaemonCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
-            const result = await fetchComments(key);
-            if (!result.ok) return false; // cannot look -> do not suppress; cursor left untouched
-            const hadBaseline = commentCursor.has(key);
-            const baseline = commentCursor.get(key) ?? null;
-            commentCursor.set(key, result.newest);
-            if (!hadBaseline) return false; // unknown baseline: never suppress
-            return result.newest === baseline;
-          })();
-          crossDaemonCache.set(key, p);
+        // Related work: notify every watcher of what changed.
+        const watchersOf = (k: string) =>
+          next.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? prev.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? [];
+        for (const key of evPoll.changedRelated) {
+          for (const w of watchersOf(key)) {
+            const verdict = await evPoll.decide(key, w, "related");
+            if (verdict.deliver) await send(w, key, verdict.reason);
+          }
         }
-        return p;
-      };
-
-      // DAEMON_WRITER ledger-hit comment-cursor check (KAN-828). The own-write
-      // ledger's exact-`updated`-match discriminator (own-writes.ts, not
-      // modified here) treats a foreign write folded into our read-back the
-      // same as a pure self-write, which swallows a reviewer/boss/human
-      // comment landing in that round-trip (KAN-793/799/804). That guarantee
-      // is corrected HERE, not in own-writes.ts (out of scope): a
-      // DAEMON_WRITER hit is no longer the final verdict — it means "our
-      // write bumped `updated` — was anything else folded in?", answered by
-      // whether the ticket's newest comment id moved since the recorded
-      // baseline.
-      //
-      // `daemonLabelsChanged` decides WHICH arm to run, not what the cursor
-      // means (KAN-838 — a prior version of this comment claimed a moved
-      // newest-comment-id on the DAEMON arm meant something foreign was
-      // folded in, treating that as proof the cursor could only be checked,
-      // never advanced, on the AGENT arm; that reasoning was false). The
-      // cursor's real invariant is "the newest comment id this daemon has
-      // OBSERVED for this key", not "the newest it has DELIVERED" — every
-      // path that learns the newest id must advance it, including a
-      // suppression. The AGENT arm (an agent's own write, typically its own
-      // comment, changing no daemon label) still always suppresses — that
-      // part of KAN-828's reasoning holds — but it must ALSO resolve and
-      // record the newest comment id before returning, via the same
-      // per-poll `fetchComments` memo the DAEMON arm uses, so a stale
-      // baseline never survives past the write that actually moved it.
-      // Skipping that step is exactly what caused the regression this
-      // ticket fixes: the NEXT daemon label write (agent:working<->idle,
-      // every turn) would see the agent's own already-suppressed comment as
-      // "new" and wake the agent about it. Fail-open discipline is
-      // unchanged either way: a rejected/unwired fetch leaves the cursor
-      // untouched, never installing a baseline nothing this poll observed.
-      //
-      // Two residuals, carried forward rather than silently dropped (KAN-828
-      // documented the first; this ticket must not let the rewrite lose it):
-      //
-      // Known residual, stated rather than hidden: a ledger hit whose
-      // folded-in foreign event was a status change with NO comment is still
-      // suppressed — outside this discriminator's reach, on the DAEMON arm,
-      // unchanged since KAN-828.
-      //
-      // Second known residual (KAN-838): on the AGENT arm, a foreign comment
-      // landing in the SAME fetch window as the agent's own write is folded
-      // into the cursor advance below and is never delivered to the ticket's
-      // own agent that poll (it still reaches any WATCHER via
-      // crossDaemonSuppressed, which never consults this cursor for a pure
-      // comment diff) — the arm's job is only to keep the cursor honest for
-      // later polls, not to reconsider what it suppresses on its own poll.
-      const ledgerHitCache = new Map<string, Promise<boolean>>();
-      const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
-        let p = ledgerHitCache.get(key);
-        if (!p) {
-          p = (async () => {
-            if (!daemonLabelsChanged(before, after)) {
-              // Agent-writer arm / pure comment path: always suppressed, but
-              // the cursor must still learn the newest id it just observed
-              // (KAN-838) — see the block comment above.
-              const result = await fetchComments(key);
-              if (result.ok) commentCursor.set(key, result.newest);
-              return true;
-            }
-            const result = await fetchComments(key);
-            if (!result.ok) return false; // fail open: deliver, cursor untouched
-            const baseline = commentCursor.get(key) ?? null;
-            if (result.newest === baseline) return true; // no new comment -> suppress
-            commentCursor.set(key, result.newest);
-            return false; // newest comment moved -> deliver
-          })();
-          ledgerHitCache.set(key, p);
-        }
-        return p;
-      };
-
-      // Both suppression checks require an ACTUAL before/after pair — a key
-      // appearing or disappearing is still a real change (the old
-      // isOwnLabelBump made this explicit; crossDaemonSuppressed already
-      // requires both above). Consulting the ledger with a stale previous
-      // `updated` for a now-gone key would check a value nothing this poll
-      // actually observed, so appear/disappear always delivers, unchecked.
-      const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
-        if (!before || !after) return false;
-        if (deps.suppress?.(key, after.updated, watcher)) return ledgerHitSuppressed(key, before, after);
-        return crossDaemonSuppressed(key, before, after);
-      };
-
-      // Assigned issues: notify the issue's own agent only. Parent is membership
-      // only (not an event to listen for) — a boss hears change only through
-      // the Implements chain below, via routes.ts.
-      for (const key of changedKeys(prev.issues, next.issues)) {
-        const before = issueOf(prev.issues, key);
-        const after = issueOf(next.issues, key);
-        // A pr:* transition on the ticket's OWN agent is delivered BEFORE
-        // either suppression is consulted (KAN-691/KAN-819/KAN-823): neither
-        // the own-write ledger (writer "daemon" — a label sync write) nor
-        // isDaemonLabelOnlyDiff may swallow it, because it's the one label
-        // flip an approved/changes-requested author is actually waiting on.
-        // This deliberately SKIPS crossDaemonSuppressed too, so the per-key
-        // comment cursor does not advance this poll for this key when no
-        // watcher also touches it. That is safe: the cursor is used only as
-        // an EQUALITY check against a monotonically-growing newest-comment
-        // id (see crossDaemonSuppressed below), so leaving it one poll stale
-        // only ever biases a LATER comparison toward "not suppressed"
-        // (delivered) — it can never manufacture a match that wrongly
-        // suppresses a genuine later change. This mirrors the existing
-        // tolerance in `suppressed()` itself: an own-write-ledger hit already
-        // short-circuits before crossDaemonSuppressed ever runs.
-        const transition = before && after ? prTransition(before, after) : null;
-        if (transition) {
-          await send(key, key, { pr: transition });
-          continue;
-        }
-        if (await suppressed(key, before, after, key)) continue;
-        await send(key, key);
-      }
-      // Related work (the Implements chain): notify every watcher of what changed.
-      const watchersOf = (k: string) =>
-        next.related.find((r) => r.issue.key === k)?.watchers ?? prev.related.find((r) => r.issue.key === k)?.watchers ?? [];
-      for (const key of changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue))) {
-        const before = relatedIssueOf(prev.related, key);
-        const after = relatedIssueOf(next.related, key);
-        for (const w of watchersOf(key)) {
-          if (await suppressed(key, before, after, w)) continue;
-          await send(w, key);
-        }
+        deps.onNotifySuccess?.();
+      } catch (e) {
+        deps.log?.(`  WARNING: [notify] stage threw: ${(e as Error)?.message ?? e}`);
       }
     },
     deps.intervalMs,
-    deps.onError ? { onError: deps.onError } : {},
+    {
+      ...(deps.onError ? { onError: deps.onError } : {}),
+      hash: () => String(notifyTick++),
+    },
   );
+}
+
+/**
+ * The issue tier's own entry point — `runResourceLoop` applied to
+ * `ResourceType<JiraIssue>`, built entirely from `LoopDeps`' own
+ * already-provided functions (`search`/`related` as given — no JQL or
+ * Implements-chain fetching of its own; that lives in
+ * src/resources/issue.ts's `createIssueResourceType`, which is what
+ * src/daemon/index.ts wires up in production). Kept under this name and
+ * shape for every existing caller and test (test/unit/loop.test.ts,
+ * app.test.ts, herd.test.ts, idle-dialog.test.ts) — this is a pure adapter,
+ * not a second implementation: the actual suppression-stack logic lives once,
+ * in `createIssueEventRules` (src/resources/issue.ts), and both this
+ * function and `createIssueResourceType` call it.
+ */
+export function startLoop(deps: LoopDeps): Stop {
+  const resourceType: ResourceType<JiraIssue> = {
+    discovery: {
+      idOf: issueIdOf,
+      search: deps.search,
+      related: deps.related ?? (async () => []),
+    },
+    activation: ISSUE_ACTIVATION,
+    eventRules: createIssueEventRules({
+      ...(deps.suppress ? { suppress: deps.suppress } : {}),
+      ...(deps.comments ? { comments: deps.comments } : {}),
+    }),
+    spawnConfig: ISSUE_SPAWN_CONFIG,
+  };
+  return runResourceLoop(resourceType, {
+    herd: deps.herd,
+    notify: deps.notify,
+    ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+    ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
+    ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
+    ...(deps.log ? { log: deps.log } : {}),
+    intervalMs: deps.intervalMs,
+    ...(deps.onError ? { onError: deps.onError } : {}),
+    ...(deps.onPollSuccess ? { onPollSuccess: deps.onPollSuccess } : {}),
+    ...(deps.onNotifySuccess ? { onNotifySuccess: deps.onNotifySuccess } : {}),
+  });
 }

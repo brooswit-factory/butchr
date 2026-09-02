@@ -1,17 +1,20 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc } from "./docs.js";
+import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER, CORRECTION_MARKER,
   type Disposition,
 } from "./relationship.js";
+import { isProjectId } from "../resources/id.js";
 
-/** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). */
+/** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
   story?: string;
   task?: string;
+  epic?: string;
 }
 
 /**
@@ -35,6 +38,35 @@ function requireCaller(c: { headers: Record<string, string> }, verb: string): st
   const who = c.headers["x-issue"];
   if (!who) throw new Error(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
   return who;
+}
+
+/**
+ * THE CALLER-SHAPE GATE (BUTCHR-71): the tool-REGISTRATION layer's place to
+ * refuse a PROJECT caller for a verb that genuinely does not apply to it,
+ * with a message that says why — WITHOUT touching that verb's own
+ * implementation in relationship.ts. Three verbs use this:
+ *   - `submit_to_boss` — a project has nothing to submit to; it never
+ *     reaches a terminal state (BUTCHR-62's design).
+ *   - `finish_without_a_boss` — OUT OF SCOPE for this ticket, its
+ *     implementation must NOT be edited (see relationship.ts's own doc
+ *     comment on it). Refusing HERE, before it ever runs, is how that
+ *     constraint is honoured: `finishWithoutABoss`'s body is unaffected —
+ *     for a project caller it is simply never reached.
+ *   - `file_where_it_belongs` — its case-B notice target walks the
+ *     CALLER's own Implements chain to find a human-watched ticket to
+ *     notify; a project has no boss and no links at all, so there is no
+ *     coherent bottom case for that walk. Refusing here is simpler and
+ *     safer than teaching that function a caller shape whose semantics it
+ *     was never designed to express.
+ * `report_to_boss`/`ask_boss` do NOT use this gate (BUTCHR-71 spec
+ * correction, ruled by the epic on BUTCHR-62): a project caller is
+ * genuinely allowed there — see relationship.ts's `speakOnOwnChannel`.
+ */
+function refuseProjectCaller(c: { headers: Record<string, string> }, verb: string, why: string): void {
+  const who = c.headers["x-issue"];
+  if (who && isProjectId(who)) {
+    throw new Error(`${verb}: refusing a project caller — ${why}`);
+  }
 }
 
 const noAssigneeMsg = (issuetype: "Story" | "Task"): string => {
@@ -128,7 +160,11 @@ export function atlassianTools(
       handler: (a, c) => {
         const { from, to, type } = a as { from: string; to: string; type?: string };
         const resolvedType = type ?? "Implements";
-        audit(c, `link ${from} → ${to} (${resolvedType}) [deprecated alias; use new_worker/adopt_worker for an Implements link]`);
+        const cls = classifyLinkIssues(resolvedType);
+        const note = cls === "sanctioned"
+          ? "non-Implements link type; still the only route for it"
+          : "Implements-type call; either drift toward new_worker/adopt_worker or a deliberate boss-reassignment override — not distinguishable from arguments alone";
+        audit(c, `link ${from} → ${to} (${resolvedType}) — ${note} ${aliasTag("jira_link_issues", cls)}`);
         return ops.linkIssues(from, to, resolvedType).then((r) => {
           noted(c, [from, to]); // a link bumps `updated` on BOTH ends
           return orOk(r, { ok: true, from, to, type: resolvedType });
@@ -155,7 +191,7 @@ export function atlassianTools(
         'DEPRECATED — use the relationship verb for what you\'re actually doing: start_worker (→ In Progress on your own worker), finish_worker (→ Done on your own worker), shelve_worker (→ To Do + the exemption label + a reason, on your own worker), submit_to_boss (→ In Review on your OWN ticket, no args), or finish_without_a_boss (→ Done on your OWN ticket, no args, ONLY when you have no boss). Those refuse a stranger\'s key and never make you type the status string; this one does neither. ' +
         'Move a Jira issue to a status by name, e.g. "In Progress", "In Review", "Done".',
       input: { key: z.string(), status: z.string() },
-      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
+      handler: (a, c) => { const { key, status } = a as { key: string; status: string }; audit(c, `transition ${key} → ${status} [deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss] ${aliasTag("jira_transition", "drift")}`); return ops.transition(key, status).then((r) => { noted(c, [key]); return r; }); },
     },
     jira_create_issue: {
       description:
@@ -172,6 +208,12 @@ export function atlassianTools(
           parent?: string; labels?: string[]; assignee?: string; priority?: string; implements?: string;
         };
 
+        // Decided up front, from `issuetype`/`implements` alone, so every audit line below
+        // (including the two REFUSED ones, before `orphan`/`target` are even resolved) agrees —
+        // see classifyCreateIssue's own doc comment (src/tools/alias-audit.ts) for the rule.
+        const cls = classifyCreateIssue(p.issuetype, p.implements);
+        const clsTag = aliasTag("jira_create_issue", cls);
+
         // (1) Assign by role, regardless of parent — an explicit `assignee` always wins.
         // A refusal is still something a connection did, so it gets its own audit line
         // before the throw — otherwise the operator watching the daemon log sees nothing.
@@ -180,7 +222,7 @@ export function atlassianTools(
           assignee = p.issuetype === "Story" ? roles.story : roles.task;
           if (!assignee) {
             const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker]`);
+            audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker] ${clsTag}`);
             throw new Error(noAssigneeMsg(p.issuetype));
           }
         }
@@ -197,7 +239,7 @@ export function atlassianTools(
           } else if (p.parent) {
             target = p.parent;
           } else {
-            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker]`);
+            audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker] ${clsTag}`);
             throw new Error(noTargetMsg(p.issuetype));
           }
         }
@@ -205,12 +247,14 @@ export function atlassianTools(
         // (4) Audit line: type/parent, resolved target ("orphan by request" for the opt-out), resolved assignee.
         // An Epic, and a deliberate orphan, have no successor at all (new_worker
         // never creates an Epic — Epics are the human's — and has no orphan
-        // route by design); the deprecation note says so only for the linked
-        // Story/Task case, where new_worker genuinely does replace this.
+        // route by design) — SANCTIONED, not drift, even though the human-facing
+        // text still says "no successor" for readability. Only the linked
+        // Story/Task case, where new_worker genuinely does replace this, is DRIFT.
         let line = `create ${p.issuetype} under ${p.parent ?? "(none)"}`;
         if (p.issuetype !== "Epic") line += orphan ? " orphan by request" : ` implements ${target}`;
         if (assignee) line += ` → ${truncAccountId(assignee)}`;
         line += p.issuetype !== "Epic" && !orphan ? " [deprecated alias; use new_worker]" : " [deprecated alias; no successor for this case]";
+        line += ` ${clsTag}`;
         audit(c, line);
 
         const created = (await ops.createIssue({
@@ -252,7 +296,7 @@ export function atlassianTools(
       input: { key: z.string(), priority: z.string() },
       handler: (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
-        audit(c, `priority ${key} → ${priority} [deprecated alias; use prioritize_worker]`);
+        audit(c, `priority ${key} → ${priority} [deprecated alias; use prioritize_worker] ${aliasTag("jira_set_priority", "drift")}`);
         return ops.setPriority(key, priority).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, priority }); });
       },
     },
@@ -278,7 +322,7 @@ export function atlassianTools(
           const resolved = role === "story" ? roles.story : roles.task;
           if (!resolved) {
             const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
-            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker]`);
+            audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker] ${aliasTag("jira_assign", "ambiguous")}`);
             throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
           }
           accountId = resolved;
@@ -287,7 +331,7 @@ export function atlassianTools(
           accountId = assignee;
           label = truncAccountId(assignee);
         }
-        audit(c, `assign ${key} → ${label} [deprecated alias; use adopt_worker]`);
+        audit(c, `assign ${key} → ${label} [deprecated alias; use adopt_worker — unless this is a raw reassignment that isn't an adoption, which stays sanctioned] ${aliasTag("jira_assign", "ambiguous")}`);
         return ops.assign(key, accountId).then((r) => { noted(c, [key]); return orOk(r, { ok: true, key, assignee: accountId }); });
       },
     },
@@ -298,7 +342,7 @@ export function atlassianTools(
       input: { spaceId: z.string(), title: z.string(), body: z.string(), parentId: z.string().optional() },
       handler: (a, c) => {
         const p = a as { spaceId: string; title: string; body: string; parentId?: string };
-        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
+        audit(c, `page "${p.title}"${p.parentId ? ` under ${p.parentId}` : ""} [deprecated alias; use set_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_create_page", "ambiguous")}`);
         return ops.createPage(p);
       },
     },
@@ -309,7 +353,7 @@ export function atlassianTools(
       input: { id: z.string(), body: z.string(), title: z.string().optional() },
       handler: (a, c) => {
         const p = a as { id: string; body: string; title?: string };
-        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""} [deprecated alias; use set_doc for a ticket's own doc]`);
+        audit(c, `update page ${p.id}${p.title ? ` (retitle "${p.title}")` : ""} [deprecated alias; use set_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_update_page", "ambiguous")}`);
         return ops.updatePage(p).then((r) => orOk(r, { ok: true, id: p.id }));
       },
     },
@@ -357,7 +401,7 @@ export function atlassianTools(
         "DEPRECATED for a ticket's own doc — use get_doc, which resolves the page id for you (the caller's own by default, or another ticket's by key) instead of making you discover and hand-carry a page id. Still the general-purpose way to read a page that ISN'T reached through a ticket. " +
         "Read a Confluence page by id (storage body). The result adds `bodyRequested: true` and `bodyLength` (the storage body's character count) to the usual fields — `bodyLength: 0` means the page genuinely has an empty body, distinguishable from a body the API never returned at all.",
       input: { id: z.string() },
-      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id} [deprecated alias; use get_doc for a ticket's own doc]`); return ops.getPage(id); },
+      handler: (a, c) => { const { id } = a as { id: string }; audit(c, `read page ${id} [deprecated alias; use get_doc for a ticket's own doc — unless this page isn't a ticket's doc, which stays sanctioned] ${aliasTag("confluence_get_page", "ambiguous")}`); return ops.getPage(id); },
     },
     confluence_list_spaces: {
       description: "List Confluence spaces (to find a spaceId).",
@@ -366,7 +410,7 @@ export function atlassianTools(
     },
     get_doc: {
       description:
-        'Read a ticket\'s doc — the CALLER\'s own by default, or another ticket\'s when `key` is given (e.g. a boss reading a worker\'s doc at review time). Reads are unrestricted by ownership: reading any ticket\'s doc for context is fine. WRITES NOTHING, EVER, for self or for another ticket — a ticket with no doc yet resolves to `{ found: false }`, never an error and never a lazily-created page; use set_doc to create/write your own doc. On a hit, returns `{ found: true, id, url, title, body }`.',
+        'Read a ticket\'s doc — the CALLER\'s own by default, or another ticket\'s when `key` is given (e.g. a boss reading a worker\'s doc at review time). For a PROJECT-keyed caller or a project-keyed `key` (BUTCHR-71), this resolves to that project\'s ROOT DOC instead — a project has no per-ticket doc, only its root doc. Reads are unrestricted by ownership: reading any ticket\'s or project\'s doc for context is fine, in either direction. WRITES NOTHING, EVER, for self or for another ticket — an ISSUE with no doc yet resolves to `{ found: false }`, never an error and never a lazily-created page (a PROJECT\'s root doc always already exists, so this case never arises for one); use set_doc to create/write your own doc. On a hit, returns `{ found: true, id, url, title, body }`.',
       input: { key: z.string().optional() },
       handler: async (a, c) => {
         const { key } = a as { key?: string };
@@ -374,20 +418,24 @@ export function atlassianTools(
         if (!who) throw new Error("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         const target = key ?? who;
         audit(c, `get_doc ${target}${key ? "" : " (self)"}`);
-        return getDoc(ops, target);
+        // Dispatch is on the TARGET's own shape, never the caller's — this is
+        // what makes "an issue caller reading a project's doc" and "a project
+        // caller reading an issue's doc" both just work, unchanged, per
+        // Contract 1's "reads are unrestricted by ownership".
+        return isProjectId(target) ? getProjectDoc(ops, target) : getDoc(ops, target);
       },
     },
     set_doc: {
       description:
-        'FULL-BODY REPLACE of the CALLER\'S OWN doc. READ THIS FIRST: this is REPLACE, not APPEND — an agent that treats `set_doc` as "append" destroys its own page on the very first call. Call get_doc() first, edit the body you got back, then write the whole thing. There is NO KEY PARAMETER AT ALL: this can only ever write the caller\'s own doc, identified by `x-issue` — overwriting another ticket\'s doc is not expressible by getting an argument wrong. Ensures the doc exists first (creating it lazily, nested under the boss\'s doc, or the project root doc when there is no boss) then writes. `title` is optional ONCE the doc has a real title (omitting it keeps the current one) — but while the current title still carries the "[unwritten]" provisional marker, `title` is REQUIRED: you cannot write real content and leave the page looking unwritten.',
+        'FULL-BODY REPLACE of the CALLER\'S OWN doc. READ THIS FIRST: this is REPLACE, not APPEND — an agent that treats `set_doc` as "append" destroys its own page on the very first call. Call get_doc() first, edit the body you got back, then write the whole thing. There is NO KEY PARAMETER AT ALL: this can only ever write the caller\'s own doc, identified by `x-issue` — overwriting another ticket\'s doc is not expressible by getting an argument wrong. For an ISSUE caller: ensures the doc exists first (creating it lazily, nested under the boss\'s doc, or the project root doc when there is no boss) then writes; `title` is REQUIRED while the doc still carries the "[unwritten]" provisional marker, optional afterward. For a PROJECT caller (BUTCHR-71): this is the project\'s ROOT DOC — its living brief and catalogue — NEVER created here (a root doc always already exists; a missing one is a refusal, not a creation), and `title` is ALWAYS optional (a root doc has a real title from the start, so there is no provisional state to graduate out of). THIS IS THE MOST DESTRUCTIVE SINGLE CALL A PROJECT CALLER CAN MAKE — it replaces the product\'s entire living brief in one write; call get_doc() first, always.',
       input: { body: z.string(), title: z.string().optional() },
       handler: async (a, c) => {
         const { body, title } = a as { body: string; title?: string };
         const who = c.headers["x-issue"];
         if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
-        const result = await setDoc(ops, who, body, title);
-        noted(c, [who]); // the remote-link upsert bumps the ticket's own `updated`
+        const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title) : await setDoc(ops, who, body, title);
+        noted(c, [who]); // the remote-link upsert (issue) / page update (project) bumps the doc's own `updated`
         return result;
       },
     },
@@ -407,7 +455,8 @@ export function atlassianTools(
         "INFERRED, WITH NO ARGUMENT FOR ANY OF IT: the child's issue type (from your own type, per the rule above), the assignee (from this daemon's role map — REFUSED if that role's accountId is unset, naming the missing env var), the project (from your own), the link direction (Implements, outward from the new child to you, never the reverse), and the new doc's parent page (your own doc). " +
         "WHAT A RETURNED RESULT GUARANTEES, AND WHAT A THROWN ERROR MEANS — READ THIS BEFORE TREATING EITHER AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A NORMAL RETURN ALWAYS MEANS a ticket that has a boss (the link succeeded), a declared disposition (RUNNING or SHELVED, never undeclared) AND a doc. If ONLY the doc step failed, this THROWS rather than returning a partial result — but by then the ticket, its boss link and its disposition are ALL already real and are NOT rolled back; the error names the surviving key, and its doc is completed by that ticket's own first `set_doc` call, whenever the agent working it makes one. Nothing here retries or fixes it automatically: a ticket that never gets a `set_doc` call simply has no doc until something calls for that key — strictly better than a duplicate or an orphan, but not invisible, and not something a caller should infer from a successful-looking throw. " +
         "ON FAILURE AFTER THE TICKET IS CREATED (the link or the disposition write): this attempts to delete the ticket it just created and rethrows either way — \"rolled back, nothing survives\" if the delete succeeded, or a NAMED PARTIAL STATE (the surviving ticket key) if it didn't. This is NOT unconditional atomicity: as of BUTCHR-35 this daemon's own credential does not hold Jira's `DELETE_ISSUES` permission on this project (measured — a permission read and a live round trip both confirm it), so the delete is currently expected to fail when attempted; it is attempted anyway because the refusal is a permission, not an API limit, and this exact code becomes fully self-cleaning the day that permission is granted, on whichever deployment holds it. Never assume a failure left nothing behind — read the error, which always names what survived. " +
-        "Replaces jira_create_issue plus the confluence_create_page call and the doc-linking step a careful agent did by hand. Does NOT cover filing a deliberate orphan (`implements: \"none\"`) — that stays on jira_create_issue, which remains the only route for out-of-scope work your brief tells you to file outside your epic.",
+        "Replaces jira_create_issue plus the confluence_create_page call and the doc-linking step a careful agent did by hand. Does NOT cover filing a deliberate orphan (`implements: \"none\"`) — that stays on jira_create_issue, which remains the only route for out-of-scope work your brief tells you to file outside your epic. " +
+        "FOR A PROJECT CALLER (BUTCHR-71): creates an EPIC in your project instead of a Story — same rule, one tier below you. There is NO Implements link (a Jira project is not an issue) — the relationship is MEMBERSHIP, reported back as `member` (the project key) instead of `implements`, which is omitted rather than set to a link that doesn't exist. Everything else — the required disposition, the doc nesting under your own root doc — works the same way.",
       input: {
         summary: z.string(),
         description: z.string().optional(),
@@ -432,7 +481,7 @@ export function atlassianTools(
     },
     start_worker: {
       description:
-        "Move ONE OF THE CALLER'S OWN workers to In Progress — the call that actually staffs an agent for it (an assigned-but-To-Do ticket is not staffed, and a boss waiting on events from it waits forever). Also reactivates a shelved worker, and sends an In Review worker back to work. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot). Replaces jira_transition(key, \"In Progress\") for this case.",
+        "Move ONE OF THE CALLER'S OWN workers to In Progress — the call that actually staffs an agent for it (an assigned-but-To-Do ticket is not staffed, and a boss waiting on events from it waits forever). Also reactivates a shelved worker, and sends an In Review worker back to work. Reactivating a shelved worker WITHDRAWS the shelved-exemption label if the worker carries it — the label means CURRENTLY shelved, a state, not a history, so the verb that reverses a shelve is the verb that retires it — cleared BEFORE the transition, never after (a live ticket left silently carrying a stale exemption is the failure this ordering exists to rule out), and skipped entirely, at no extra Jira call, when the worker doesn't carry it. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot) — for a PROJECT caller (BUTCHR-71), \"one of your own workers\" means an Epic that is a MEMBER of your project (no link exists for that relationship); a Story or Task in your own project, or an Epic in a different one, is refused just as sharply. Replaces jira_transition(key, \"In Progress\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
@@ -445,7 +494,7 @@ export function atlassianTools(
     },
     shelve_worker: {
       description:
-        "Deliberately put ONE OF THE CALLER'S OWN workers down, with the intention recorded: moves it to To Do, ADDS the shelved-exemption label (additively — never drops labels the ticket already carries; the exact label is read out of the parked-ticket detector's own code, so it always matches what that detector checks for), and posts `reason` as a comment — ALL IN ONE CALL, because a two-step declaration recreates the exact multi-step failure this epic exists to kill. Refuses a `key` that is not one of the caller's own workers, and refuses an empty `reason` — a reader six weeks from now must be able to tell a shelved ticket from a forgotten one without asking an agent that no longer exists. If you already know at filing time that a new or adopted ticket should be shelved, prefer new_worker/adopt_worker's own `disposition: \"shelve\"` — the label lands in the very call that creates the ticket, so there's no second call to forget. Has no predecessor: shelving was previously only an intention in an agent's head.",
+        "Deliberately put ONE OF THE CALLER'S OWN workers down, with the intention recorded: moves it to To Do, ADDS the shelved-exemption label (additively — never drops labels the ticket already carries; the exact label is read out of the parked-ticket detector's own code, so it always matches what that detector checks for), and posts `reason` as a comment — ALL IN ONE CALL, because a two-step declaration recreates the exact multi-step failure this epic exists to kill. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker), and refuses an empty `reason` — a reader six weeks from now must be able to tell a shelved ticket from a forgotten one without asking an agent that no longer exists. If you already know at filing time that a new or adopted ticket should be shelved, prefer new_worker/adopt_worker's own `disposition: \"shelve\"` — the label lands in the very call that creates the ticket, so there's no second call to forget. Has no predecessor: shelving was previously only an intention in an agent's head.",
       input: { key: z.string(), reason: z.string() },
       handler: async (a, c) => {
         const { key, reason } = a as { key: string; reason: string };
@@ -458,7 +507,8 @@ export function atlassianTools(
     },
     adopt_worker: {
       description:
-        "Take ownership of an EXISTING ticket — an orphan, or one filed by an agent that has since ended: infers the assignee from the ADOPTED ticket's own issue type (Story or Task; anything else is refused), makes the Implements link (adopted ticket → caller), and ensures its doc, nested under the caller's own. Also takes the SAME required `disposition` as new_worker (`\"start\"`, or `\"shelve\"` with a non-empty `reason`) — an adopted ticket left in To Do with nobody's decision recorded is the same undeclared state as an unstarted new_worker child, by a different door. IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing (the assign/link/disposition writes are skipped) and is NOT an error — only the doc is still ensured, as a no-op-when-already-present safety net. REFUSES a ticket already linked to a DIFFERENT boss — stealing another boss's worker must be an explicit act (jira_link_issues), never a side effect of a mistyped key. Replaces jira_assign plus a hand-written jira_link_issues call, plus the doc creation nobody remembered.",
+        "Take ownership of an EXISTING ticket — an orphan, or one filed by an agent that has since ended: infers the assignee from the ADOPTED ticket's own issue type (Story or Task; anything else is refused), makes the Implements link (adopted ticket → caller), and ensures its doc, nested under the caller's own. Also takes the SAME required `disposition` as new_worker (`\"start\"`, or `\"shelve\"` with a non-empty `reason`) — an adopted ticket left in To Do with nobody's decision recorded is the same undeclared state as an unstarted new_worker child, by a different door. IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing (the assign/link/disposition writes are skipped) and is NOT an error — only the doc is still ensured, as a no-op-when-already-present safety net. A `\"start\"` disposition ALSO WITHDRAWS the shelved-exemption label whenever the adopted ticket carries it, and this clear is NOT gated on that idempotence check — even an otherwise fully idempotent re-adoption (already linked, already assigned, already In Progress) still clears a stale exemption, because a live ticket silently carrying one is the same residue start_worker exists to stop producing, through a second door. No extra Jira call: it reuses the labels this call already fetched to decide idempotence. A `\"shelve\"` disposition only ever adds the label — it never clears one. REFUSES a ticket already linked to a DIFFERENT boss — stealing another boss's worker must be an explicit act (jira_link_issues), never a side effect of a mistyped key. Replaces jira_assign plus a hand-written jira_link_issues call, plus the doc creation nobody remembered. " +
+        "FOR A PROJECT CALLER (BUTCHR-71): the adoptable type is an EPIC, not a Story or Task — anything else is refused. There is no link to make (membership, not a link — see new_worker); \"already adopted\" means already a member, already assigned by the epic role, and already in the disposition's state — NEVER decided from a link, since none exists. Refuses an epic that belongs to a DIFFERENT project.",
       input: {
         key: z.string(),
         disposition: z.enum(["start", "shelve"]),
@@ -476,7 +526,7 @@ export function atlassianTools(
     },
     finish_worker: {
       description:
-        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Refuses a `key` that is not one of the caller's own workers. A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry. Replaces jira_transition(key, \"Done\") for this case.",
+        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Also WITHDRAWS the shelved-exemption label first, if the worker carries it — cleared BEFORE the transition, same ordering as start_worker's — because Done is not shelved: a finished ticket still carrying the exemption is residue, not state. Skipped entirely, at no extra Jira call, when the label isn't present. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry — and for a PROJECT caller approving an EPIC, this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_transition(key, \"Done\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
@@ -489,7 +539,7 @@ export function atlassianTools(
     },
     prioritize_worker: {
       description:
-        "Revise ONE OF THE CALLER'S OWN workers' priority — a boss's judgment of what matters NOW, not only at filing. Refuses a `key` that is not one of the caller's own workers, AND — distinctively — refuses the CALLER'S OWN key: your priority is your boss's judgment, never your own, and this makes that a refusal instead of an unenforced sentence in a brief. Replaces jira_set_priority for this case.",
+        "Revise ONE OF THE CALLER'S OWN workers' priority — a boss's judgment of what matters NOW, not only at filing. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker), AND — distinctively — refuses the CALLER'S OWN key: your priority is your boss's judgment, never your own, and this makes that a refusal instead of an unenforced sentence in a brief (holds for a project caller too). Replaces jira_set_priority for this case.",
       input: { key: z.string(), priority: z.string() },
       handler: async (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
@@ -531,7 +581,7 @@ export function atlassianTools(
     },
     tell_worker: {
       description:
-        `The ONLY way to speak DOWN to a worker: comments on ONE OF THE CALLER'S OWN workers' ticket. Refuses a \`key\` that is not one of the caller's own workers, verified via the Implements link — the failure this exists to prevent is a boss commenting on a stranger's ticket because one character of a key was wrong. THE HIGHEST-CONSEQUENCE MESSAGES IN THIS FLEET TRAVEL HERE: the \`[review] APPROVED <pr-url> @ <sha>\` / \`[review] CHANGES_REQUESTED\` lines that wake a PR author, and the \`ANSWER <n> <fingerprint>\` reply that unfreezes a worker blocked on a dialog — an agent that doesn't know this reaches for jira_add_comment instead, and its worker never wakes up. Replaces jira_add_comment(key, text) for the downward case ONLY — jira_add_comment remains the deliberate SIDEWAYS channel for two bosses coordinating (which this refuses, by design) and stays permanent for that.`,
+        `The ONLY way to speak DOWN to a worker: comments on ONE OF THE CALLER'S OWN workers' ticket. Refuses a \`key\` that is not one of the caller's own workers, verified via the Implements link (or, for a PROJECT caller, MEMBERSHIP — its own workers are the Epics that are members of its project, see start_worker) — the failure this exists to prevent is a boss commenting on a stranger's ticket because one character of a key was wrong. THE HIGHEST-CONSEQUENCE MESSAGES IN THIS FLEET TRAVEL HERE: the \`[review] APPROVED <pr-url> @ <sha>\` / \`[review] CHANGES_REQUESTED\` lines that wake a PR author, and the \`ANSWER <n> <fingerprint>\` reply that unfreezes a worker blocked on a dialog — an agent that doesn't know this reaches for jira_add_comment instead, and its worker never wakes up. A PROJECT caller approving/rejecting an Epic's PR sends its \`[review]\` line here too — this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_add_comment(key, text) for the downward case ONLY — jira_add_comment remains the deliberate SIDEWAYS channel for two bosses coordinating (which this refuses, by design) and stays permanent for that.`,
       input: { key: z.string(), text: z.string() },
       handler: async (a, c) => {
         const { key, text } = a as { key: string; text: string };
@@ -544,7 +594,7 @@ export function atlassianTools(
     },
     report_to_boss: {
       description:
-        'Comment on the CALLER\'S OWN ticket — the routing a boss actually listens to. THERE IS NO KEY PARAMETER, AND THERE MUST NEVER BE ONE: a boss listens to its workers\' tickets, so a comment written onto the BOSS\'s own ticket routes one tier too high — the empty arg list settles that question faster than any name could ("report_to_boss" sounds like it writes to the boss\'s ticket; it must not). Refuses nothing else — a verb with no key has no key to get wrong. Replaces jira_add_comment(my_own_key, text).',
+        'Speaks on the CALLER\'S OWN CHANNEL — the routing a boss actually listens to. THERE IS NO KEY PARAMETER, AND THERE MUST NEVER BE ONE: a boss listens to its workers\' tickets, so a comment written onto the BOSS\'s own ticket routes one tier too high — the empty arg list settles that question faster than any name could ("report_to_boss" sounds like it writes to the boss\'s ticket; it must not). Refuses nothing else — a verb with no key has no key to get wrong. For an ISSUE caller: comments on its own ticket, replacing jira_add_comment(my_own_key, text). For a PROJECT caller (BUTCHR-71): posts on its own ROOT DOC instead (a project has no ticket) — same identity tag, and this is deliberately ALLOWED, not refused, because a project genuinely needs a way to escalate when it is blocked and no option is safe, same as every other tier.',
       input: { text: z.string() },
       handler: async (a, c) => {
         const { text } = a as { text: string };
@@ -557,7 +607,7 @@ export function atlassianTools(
     },
     ask_boss: {
       description:
-        `Same channel as report_to_boss — a comment on the CALLER'S OWN ticket, no key parameter — but marked with the literal \`${ASK_MARKER}\` right after the identity tag, so a boss can find its workers' UNANSWERED questions without reading every comment they wrote. ASKING DOES NOT CHANGE THE ASKER'S STATUS — an agent that asks and can still make progress should carry on; one that genuinely cannot proceed is a different situation (the daemon's own blocked-dialog escalation handles that). Use report_to_boss for information; use this only when there's a real outstanding answer you're waiting on.`,
+        `Same channel as report_to_boss (an ISSUE caller's own ticket; a PROJECT caller's own root doc — see report_to_boss), no key parameter — but marked with the literal \`${ASK_MARKER}\` right after the identity tag, so a boss can find its workers' UNANSWERED questions without reading every comment they wrote. ASKING DOES NOT CHANGE THE ASKER'S STATUS — an agent that asks and can still make progress should carry on; one that genuinely cannot proceed is a different situation (the daemon's own blocked-dialog escalation handles that). Use report_to_boss for information; use this only when there's a real outstanding answer you're waiting on.`,
       input: { text: z.string() },
       handler: async (a, c) => {
         const { text } = a as { text: string };
@@ -570,9 +620,10 @@ export function atlassianTools(
     },
     submit_to_boss: {
       description:
-        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS AT ALL: this is the one transition an agent is always entitled to make about itself. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review").',
+        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS AT ALL: this is the one transition an agent is always entitled to make about itself. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review"). REFUSES A PROJECT CALLER (BUTCHR-71): a project has nothing to submit to — it never reaches a terminal state and is talked to by comments on its own root doc instead (see report_to_boss/ask_boss).',
       input: {},
       handler: async (_a, c) => {
+        refuseProjectCaller(c, "submit_to_boss", "a project has nothing to submit to — it never reaches a terminal state (BUTCHR-62's design); it is talked to by comments on its own root doc instead");
         const who = requireCaller(c, "submit_to_boss");
         audit(c, `submit_to_boss`);
         const r = await submitToBoss(ops, who);
@@ -585,9 +636,11 @@ export function atlassianTools(
         "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
         "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
         "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
-        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built.",
+        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built. " +
+        "REFUSES A PROJECT CALLER (BUTCHR-71) — that tier above epics has now arrived: a project is never \"done\" (BUTCHR-62's design keeps it sleeping/waking on events indefinitely, never reaching a terminal state), refused at the tool-registration layer here, WITHOUT this verb's own implementation being touched at all.",
       input: {},
       handler: async (_a, c) => {
+        refuseProjectCaller(c, "finish_without_a_boss", "a project is never \"done\" — it has no ticket to transition at all, and BUTCHR-62's design keeps it sleeping/waking on events indefinitely rather than reaching a terminal state");
         const who = requireCaller(c, "finish_without_a_boss");
         audit(c, `finish_without_a_boss`);
         const r = await finishWithoutABoss(ops, who);
@@ -603,7 +656,8 @@ export function atlassianTools(
         "TAKES NO DISPOSITION, unlike new_worker/adopt_worker — argued, not omitted: a disposition answers \"what happens to MY worker\", and nobody can answer that for a ticket that is by definition not yours. It is filed To Do, staffed by role exactly as jira_create_issue staffs it today, and stays there — never staffed by this daemon — until some future boss calls adopt_worker on it. Never carries the shelved-exemption label: the parked-ticket detector only ever walks tickets reachable by an Implements link, and this ticket has none, so that label would mean nothing here. " +
         "WHAT IT WRITES: the created ticket's OWN description gets a destination header block baked in at creation (never only in a comment) plus the `butchr:orphan` label (a one-line JQL away from \"show me every undirected ticket\"); then a best-effort NOTICE comment — on the named epic (case A), or, when the destination is a \"needs a new epic\" reason, on the TOPMOST ticket in the CALLER's own Implements chain (case B, since there's no epic yet to comment on and this daemon has no configured human/root key). CASE B CREATES NO LINK: the notice says where the filer thinks the work belongs, it does not make it so — quietly re-parenting an orphan onto whatever it lands near would be exactly the suppression this verb exists to prevent. " +
         "ORDER AND WHAT A THROW MEANS: create (destination + label already baked in) happens first and is irreversible; the notice and the doc (ensureDoc, same as new_worker) are best-effort afterward. A THROW after creation means the ticket itself is fine and needs no cleanup — the error names exactly which of the notice/doc failed and how to complete it by hand (jira_add_comment for the notice; the ticket's own first set_doc call for the doc). " +
-        "Was named `file_for_another_boss` during design; renamed before shipping because that name asserts there IS another boss, which is false in the \"needs a new epic\" case.",
+        "Was named `file_for_another_boss` during design; renamed before shipping because that name asserts there IS another boss, which is false in the \"needs a new epic\" case. " +
+        "REFUSES A PROJECT CALLER (BUTCHR-71): case B's notice target walks the CALLER's own Implements chain to find a human-watched ticket, and a project has no boss and no links at all — there is no coherent bottom case for that walk. Use new_worker to create an Epic for in-scope work, or jira_add_comment/tell_worker for something narrower.",
       input: {
         summary: z.string(),
         description: z.string().optional(),
@@ -613,6 +667,7 @@ export function atlassianTools(
       },
       handler: async (a, c) => {
         const p = a as { summary: string; description?: string; issuetype: "Story" | "Task"; priority?: string; destination: string };
+        refuseProjectCaller(c, "file_where_it_belongs", "its case-B notice target walks the CALLER's own Implements chain to find a human-watched ticket, and a project has no boss and no links at all — there is no coherent bottom case; use new_worker to create an Epic for in-scope work, or jira_add_comment/tell_worker for something narrower");
         const who = requireCaller(c, "file_where_it_belongs");
         audit(c, `file_where_it_belongs issuetype=${p.issuetype} destination="${p.destination.slice(0, 60)}"`);
         const result = await fileWhereItBelongs(ops, roles, who, {

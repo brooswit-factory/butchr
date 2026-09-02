@@ -84,6 +84,19 @@ export interface AtlassianOps {
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 
   /**
+   * Read-modify-write: the inverse of `addLabels` — removes `labels` from the
+   * issue's CURRENT label set and writes the remainder back (there is no
+   * subtractive endpoint; `editIssue`'s `fields.labels` always takes the
+   * FULL desired array, same as `addLabels`). Removing a label the issue
+   * does not carry is a no-op, not an error. A caller that already knows the
+   * label isn't present (from a fetch it already made for another reason)
+   * should skip calling this entirely rather than pay for a no-op write —
+   * see `startWorker`/`finishWorker` in src/tools/relationship.ts, which do
+   * exactly that with `assertOwnWorker`'s own fetch.
+   */
+  removeLabels(key: string, labels: readonly string[]): Promise<unknown>;
+
+  /**
    * Delete a Jira issue outright — `new_worker`'s compensating rollback for a
    * ticket it just created a moment ago, when the Implements link or the
    * disposition write that must immediately follow it fails (src/tools/
@@ -99,4 +112,41 @@ export interface AtlassianOps {
    * caller of this op must already handle it failing.
    */
   deleteIssue(key: string): Promise<unknown>;
+
+  /**
+   * WHERE A RESOURCE SPEAKS, the write half (BUTCHR-62's naming, ruled on
+   * BUTCHR-71): a Confluence FOOTER comment on a page — NOT an inline
+   * comment (a separate Confluence concept/endpoint) and NOT a page-body
+   * edit. `body` is storage-format XHTML, same representation the other
+   * page ops already use (`createPage`/`updatePage`) — a caller passing
+   * plain text must wrap it itself (e.g. `<p>…</p>`), same convention as
+   * `confluence_create_page`.
+   *
+   * This is the PROJECT tier's counterpart to `addComment`: an issue speaks
+   * on its own ticket (`addComment`), a project speaks on its own root doc
+   * (this op) — see `src/tools/speak.ts`, the seam that dispatches between
+   * the two. First built for `report_to_boss`/`ask_boss` from a project
+   * caller (BUTCHR-71); `getPageComments` below is the read half, built
+   * alongside it for BUTCHR-67's "root doc received a comment" wake event,
+   * per the epic's explicit instruction to take both halves of one API
+   * family rather than let two stories build two disagreeing ones.
+   *
+   * MEASURED live against this fleet's credential (BUTCHR-62, 2026-09-01):
+   * `POST /wiki/api/v2/footer-comments` with `{pageId, body: {representation:
+   * "storage", value}}` -> HTTP 201. Also measured: posting a comment does
+   * NOT bump the page's own `version.number` (5 before, 5 after) — a
+   * genuinely separate write surface from `updatePage`, not a variant of it.
+   */
+  commentOnPage(pageId: string, body: string): Promise<unknown>;
+
+  /**
+   * WHERE A RESOURCE SPEAKS, the read half — see `commentOnPage`. Lists a
+   * page's FOOTER comments (not inline). MEASURED live: `GET
+   * /wiki/api/v2/pages/{id}/footer-comments` -> HTTP 200. Not consumed by
+   * anything in THIS ticket (report_to_boss/ask_boss only need the write
+   * half) — built for BUTCHR-67, which needs it for the "the project's root
+   * doc received a comment" wake event and will consume this rather than
+   * building a second reader.
+   */
+  getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string }> }>;
 }

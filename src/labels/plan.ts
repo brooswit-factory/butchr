@@ -13,15 +13,22 @@ export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX)
 
 /**
  * BUTCHR-24: `butchr:shelved` (src/agents/parked.ts's `EXEMPT_LABEL`) is NOT
- * a daemon-owned label, deliberately — it is READ-ONLY for the daemon. ANY
- * actor may SET it on a ticket to declare a parked child deliberately
- * shelved — a human today, and possibly an automated shelving tool in
- * future (BUTCHR-25) — but the daemon only ever READS it (to skip escalating
- * that child) and must never add or remove it itself. Do NOT fold it into
- * `isDaemonLabel` below: doing so would make `sweepStaleAgentLabels`
- * (src/labels/sweep.ts) treat it as daemon-owned and silently strip a
- * deliberate exemption the moment the ticket left the active statuses.
- * Pinned by a test in test/unit/labels-plan.test.ts.
+ * a daemon-owned label, deliberately — it is READ-ONLY for the DAEMON'S OWN
+ * label machinery (this file, and the poll-loop reconciler and
+ * `sweepStaleAgentLabels`, src/labels/sweep.ts, that it drives): that
+ * machinery only ever READS it (to skip escalating a parked child) and must
+ * never add or remove it itself. Do NOT fold it into `isDaemonLabel` below:
+ * doing so would make `sweepStaleAgentLabels` treat it as daemon-owned and
+ * silently strip a deliberate exemption the moment the ticket left the
+ * active statuses. Pinned by a test in test/unit/labels-plan.test.ts.
+ *
+ * This is narrower than "nobody but a human ever writes it" (BUTCHR-50): the
+ * relationship TOOLS — `shelve_worker` sets it, `start_worker`/
+ * `finish_worker`/`adopt_worker(..., "start")` clear it — own its lifecycle
+ * as an explicit, agent-invoked verb, which is a different actor from the
+ * daemon's own unattended poll/sweep machinery this file guards against. A
+ * label set by hand (never through those verbs) is cleared by nobody but
+ * whoever set it.
  */
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
 
