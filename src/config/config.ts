@@ -39,6 +39,24 @@ export interface Config {
    */
   parkedMinutes: number;
   /**
+   * BUTCHR-95/123: minutes a resource must read `"asleep"` with its agent
+   * STILL RUNNING, continuously, before `atRest` (src/reconcile/plan.ts)
+   * stops protecting it indefinitely and the frozen-asleep detector (see
+   * src/agents/frozen-asleep.ts) posts its complaint and marks it reapable.
+   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above and
+   * for the same reason: the race this bounds (a woken agent's
+   * advance-watermark-then-exit) is milliseconds to seconds, and the
+   * project tier's own poll cadence (`PROJECT_POLL_INTERVAL_MS`,
+   * src/resources/project.ts — 5 minutes, the only resource type this can
+   * ever fire for today) is far shorter than 10 minutes too — so a
+   * genuinely-exiting agent clears the resting-and-running state within one
+   * poll, nowhere near this bound, while 10 minutes still guarantees at
+   * least one full extra 5-minute poll cycle of margin before a real freeze
+   * is ever reported, rather than tripping on the very first poll to
+   * observe it.
+   */
+  atRestMinutes: number;
+  /**
    * BUTCHR-124: minutes a pane must be reported blocked, with text that does
    * not parse as a recognized dialog, CONTINUOUSLY, before the
    * sustained-blocked-and-unparseable alarm fires (see
@@ -123,6 +141,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
+  BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
@@ -155,6 +174,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
+  const atRestMinutes = env.BUTCHR_ATREST_MINUTES ? Number(env.BUTCHR_ATREST_MINUTES) : 10;
+  if (!Number.isFinite(atRestMinutes) || atRestMinutes <= 0) throw new Error(`BUTCHR_ATREST_MINUTES is not a positive number: ${env.BUTCHR_ATREST_MINUTES}`);
   const unresponsiveMinutes = env.BUTCHR_UNRESPONSIVE_MINUTES ? Number(env.BUTCHR_UNRESPONSIVE_MINUTES) : 5;
   if (!Number.isFinite(unresponsiveMinutes) || unresponsiveMinutes <= 0) throw new Error(`BUTCHR_UNRESPONSIVE_MINUTES is not a positive number: ${env.BUTCHR_UNRESPONSIVE_MINUTES}`);
 
@@ -176,6 +197,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     parkedMinutes,
+    atRestMinutes,
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
@@ -290,7 +312,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +

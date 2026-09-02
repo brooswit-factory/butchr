@@ -179,6 +179,24 @@ export interface ReconcileOptions {
    * one) is unaffected.
    */
   atRest?: Iterable<string>;
+  /**
+   * BUTCHR-95/123: bounds `atRest` in time. Given the ids that are BOTH
+   * `atRest` (above) AND currently running (computed here, since this is
+   * where both sets already are), decide which of them have been
+   * resting-and-running continuously for longer than a stated bound and are
+   * therefore no longer protected — see src/agents/frozen-asleep.ts for the
+   * speak-first-then-report contract this must honour (it only ever
+   * returns an id here after an audible complaint has been posted on that
+   * resource's own channel, or found already posted from a prior process's
+   * lifetime; never on a bare timeout). Every id this returns is removed
+   * from the `atRest` set actually handed to `planReconcile` below, so it
+   * falls into `stop` — never `respawn`, since `respawn` intersects
+   * `desired`, which an asleep resource is never in by construction (see
+   * that module's own doc comment for why this asymmetry is the fix, not
+   * half of one). Optional; omitted, `atRest` protects indefinitely — the
+   * original, unbounded behaviour every existing caller already has.
+   */
+  checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
 }
 
 /**
@@ -197,7 +215,25 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
-  const plan = planReconcile(desired.keys(), await herd.runningIssues(), staleByIssue.keys(), opts.atRest ?? []);
+  const running = await herd.runningIssues();
+  // BUTCHR-95/123: bound `atRest` in time, BEFORE it reaches `planReconcile`
+  // below — the reconciler, per the epic's ruling that the timing state must
+  // live here or in the loop, never inside `Activation.verdictFor` (which
+  // stays synchronous and pure). `running` is captured once, above, and
+  // reused for both this check and `planReconcile` itself — a resource type
+  // with no `checkFrozenAsleep` (every one before this ticket) pays for
+  // nothing extra: the branch below is skipped whenever `atRest` (or its
+  // intersection with `running`) is empty, and `atRest` defaults to empty.
+  let atRest = new Set(opts.atRest ?? []);
+  if (opts.checkFrozenAsleep && atRest.size) {
+    const runningSet = new Set(running);
+    const restingRunning = [...atRest].filter((id) => runningSet.has(id));
+    if (restingRunning.length) {
+      const frozen = await opts.checkFrozenAsleep(restingRunning);
+      if (frozen.size) atRest = new Set([...atRest].filter((id) => !frozen.has(id)));
+    }
+  }
+  const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
   // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
   // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
   // burst of N new spawns (e.g. several stories activating in one poll)
@@ -339,6 +375,8 @@ export interface GenericLoopDeps<T> {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
+  /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
+  checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -419,6 +457,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
+        ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
