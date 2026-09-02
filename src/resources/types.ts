@@ -90,13 +90,43 @@ export interface Activation<T> {
 
 /**
  * Why an agent is being nudged, when it is more than "your ticket changed".
- * Concretely issue-shaped today (a pr:* label transition) because only the
- * issue tier's event rules ever produce one — a future type's event rules
- * are free to never populate `reason` at all. Extending this union for a
- * second producer is that type's own event-rules design, out of scope here
- * (the project type's event rules are BUTCHR-67, not this ticket).
+ * Concretely issue-shaped (every member below names an issue-tier concept —
+ * a status, a daemon label, a summary, a comment) because only the issue
+ * tier's event rules produce one today; a future type's event rules are
+ * free to never populate `reason` at all, or to define their own union —
+ * this one is not shared. Extending THIS union for a second producer would
+ * be that type's own event-rules design, out of scope here (the project
+ * type's event rules are BUTCHR-67, not this ticket).
+ *
+ * BUTCHR-87 widened this from the one-member `{ pr }` union to every class
+ * `createIssueEventRules` (src/resources/issue.ts) can honestly establish
+ * from one poll's (before, after) `JiraIssue` pair without an extra Jira
+ * call — see that module's `decide()` for the precedence order among them
+ * and src/jira-watch/diff.ts's `daemonLabelTransition` for the label member.
+ * `pr` keeps its own historical shape (rather than folding into `label`)
+ * because it alone drives `prReviewStateNudge` (src/agents/pr-nudge.ts), a
+ * separately-guarded rendering (test/unit/merge-check-guard.test.ts) that
+ * this ticket does not touch — every other member is rendered by
+ * src/agents/change-nudge.ts instead. `appeared`/`disappeared` cover a key
+ * entering or leaving a poll's snapshot (no `before` or no `after` to diff
+ * at all); `comment` is populated only where the suppression stack
+ * (issue.ts) already learned the ticket's newest comment id moved while
+ * deciding whether to suppress — never from a call made just to answer this
+ * question, per the ticket's no-new-Jira-call constraint. A delivery this
+ * taxonomy cannot explain (every field identical but `updated`, or a class
+ * whose only signal came from a Jira call the poll didn't already make —
+ * e.g. a genuinely new comment nothing else touched) carries no `reason` at
+ * all; the renderer says so honestly rather than guessing (see
+ * change-nudge.ts's fallback text).
  */
-export type NotifyReason = { pr: { from: string | null; to: string } };
+export type NotifyReason =
+  | { pr: { from: string | null; to: string } }
+  | { appeared: true }
+  | { disappeared: true }
+  | { status: { from: string; to: string } }
+  | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
+  | { summary: true }
+  | { comment: true };
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };
 
