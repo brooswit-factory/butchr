@@ -92,9 +92,13 @@ every ticket you write.
    own line, so the ticket stays greppable for `[review]`:
    `[review] APPROVED <pr-url> @ <full 40-char sha> — <one line>` or
    `[review] CHANGES_REQUESTED <pr-url> @ <full 40-char sha> — <one line>`,
-   with the sha read from `gh pr view <n> --json headRefOid` at the moment of
-   review — never taken from the author's claim. This is the event that wakes
-   the author: a formal review alone is a GitHub event that Jira never sees.
+   with the sha pasted verbatim from `gh pr view <n> --json headRefOid` at
+   the moment of review — never taken from the author's claim, and never
+   retyped by hand: a hand-transcribed sha has already gone out wrong (39
+   characters, not 40, naming no real commit) in this protocol's own
+   measurement, caught only by luck, not by anything automated. This is the
+   event that wakes the author: a formal review alone is a GitHub event
+   that Jira never sees.
    **The story agent merges its own approved PR** — then `finish_worker(story)`
    once merged.
 4. Defend your scope. Work that surfaces but doesn't serve this outcome gets
