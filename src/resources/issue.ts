@@ -23,7 +23,7 @@
  */
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, prTransition } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import type {
   Activation,
@@ -140,6 +140,19 @@ function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
 }
 
 /**
+ * BUTCHR-87: a suppression arm's answer, widened from a bare `boolean` so a
+ * "not suppressed" outcome can say WHY, when the arm already knows — see
+ * crossDaemonSuppressed/ledgerHitSuppressed below, and `decide()`'s use of
+ * `becauseComment`. `becauseComment` is only ever meaningful alongside
+ * `suppressed: false`; a caller must not (and does not) read it otherwise.
+ */
+interface SuppressionVerdict {
+  suppressed: boolean;
+  /** True only when this verdict's `suppressed: false` is caused by the ticket's newest comment id having moved since the recorded baseline — the one case a suppression arm can honestly name a `comment` notify reason. */
+  becauseComment?: boolean;
+}
+
+/**
  * EVENT RULES: the issue tier's answer to "what changed, and what is worth
  * pushing". This is the suppression stack that used to live inside
  * src/daemon/loop.ts's `startLoop`/`onChange` — moved here verbatim (logic
@@ -219,19 +232,30 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // is a live Jira call) must never suppress and must never write the
       // comment cursor, or a failed poll would install a wrong baseline and
       // could cause a LATER poll to wrongly suppress a real change.
-      const crossDaemonCache = new Map<string, Promise<boolean>>();
-      const crossDaemonSuppressed = (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined): Promise<boolean> => {
+      //
+      // BUTCHR-87: return shape widened from `boolean` to `SuppressionVerdict`
+      // — control flow and every suppress/don't-suppress OUTCOME below is
+      // UNCHANGED; the only addition is `becauseComment`, set exactly when
+      // this function already learned (from the comments() call it was
+      // making anyway) that the newest comment id moved, which is also
+      // exactly the one case where "not suppressed" here is caused BY a
+      // comment rather than by a missing/unknown baseline. See `decide()`'s
+      // use of it below — that flag exists to NAME the delivery, not to
+      // change whether one happens.
+      const crossDaemonCache = new Map<string, Promise<SuppressionVerdict>>();
+      const crossDaemonSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<SuppressionVerdict> => {
         let p = crossDaemonCache.get(key);
         if (!p) {
           p = (async () => {
-            if (!before || !after || !isDaemonLabelOnlyDiff(before, after)) return false;
+            if (!isDaemonLabelOnlyDiff(before, after)) return { suppressed: false };
             const result = await fetchComments(key);
-            if (!result.ok) return false; // cannot look -> do not suppress; cursor left untouched
+            if (!result.ok) return { suppressed: false }; // cannot look -> do not suppress; cursor left untouched
             const hadBaseline = commentCursor.has(key);
             const baseline = commentCursor.get(key) ?? null;
             commentCursor.set(key, result.newest);
-            if (!hadBaseline) return false; // unknown baseline: never suppress
-            return result.newest === baseline;
+            if (!hadBaseline) return { suppressed: false }; // unknown baseline: never suppress
+            if (result.newest === baseline) return { suppressed: true };
+            return { suppressed: false, becauseComment: true };
           })();
           crossDaemonCache.set(key, p);
         }
@@ -285,8 +309,11 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // crossDaemonSuppressed, which never consults this cursor for a pure
       // comment diff) — the arm's job is only to keep the cursor honest for
       // later polls, not to reconsider what it suppresses on its own poll.
-      const ledgerHitCache = new Map<string, Promise<boolean>>();
-      const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<boolean> => {
+      // BUTCHR-87: same return-shape widening as crossDaemonSuppressed above
+      // (see its comment) — `becauseComment` is set on exactly the branch
+      // whose own comment text already said "newest comment moved -> deliver".
+      const ledgerHitCache = new Map<string, Promise<SuppressionVerdict>>();
+      const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<SuppressionVerdict> => {
         let p = ledgerHitCache.get(key);
         if (!p) {
           p = (async () => {
@@ -296,14 +323,14 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
               // (KAN-838) — see the block comment above.
               const result = await fetchComments(key);
               if (result.ok) commentCursor.set(key, result.newest);
-              return true;
+              return { suppressed: true };
             }
             const result = await fetchComments(key);
-            if (!result.ok) return false; // fail open: deliver, cursor untouched
+            if (!result.ok) return { suppressed: false }; // fail open: deliver, cursor untouched
             const baseline = commentCursor.get(key) ?? null;
-            if (result.newest === baseline) return true; // no new comment -> suppress
+            if (result.newest === baseline) return { suppressed: true }; // no new comment -> suppress
             commentCursor.set(key, result.newest);
-            return false; // newest comment moved -> deliver
+            return { suppressed: false, becauseComment: true }; // newest comment moved -> deliver
           })();
           ledgerHitCache.set(key, p);
         }
@@ -313,11 +340,13 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // Both suppression checks require an ACTUAL before/after pair — a key
       // appearing or disappearing is still a real change (the old
       // isOwnLabelBump made this explicit; crossDaemonSuppressed already
-      // requires both above). Consulting the ledger with a stale previous
-      // `updated` for a now-gone key would check a value nothing this poll
-      // actually observed, so appear/disappear always delivers, unchecked.
-      const suppressed = async (key: string, before: JiraIssue | undefined, after: JiraIssue | undefined, watcher: string): Promise<boolean> => {
-        if (!before || !after) return false;
+      // required both before this ticket too). `decide()` below now handles
+      // appear/disappear itself, BEFORE ever calling this, for the same
+      // reason: consulting the ledger with a stale previous `updated` for a
+      // now-gone key would check a value nothing this poll actually
+      // observed, so appear/disappear must always deliver, unchecked — that
+      // rule hasn't moved, only which function states it has.
+      const suppressed = async (key: string, before: JiraIssue, after: JiraIssue, watcher: string): Promise<SuppressionVerdict> => {
         if (deps.suppress?.(key, after.updated, watcher)) return ledgerHitSuppressed(key, before, after);
         return crossDaemonSuppressed(key, before, after);
       };
@@ -346,11 +375,55 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // suppresses a genuine later change. This mirrors the existing
           // tolerance in `suppressed()` itself: an own-write-ledger hit
           // already short-circuits before crossDaemonSuppressed ever runs.
+          // BUTCHR-87: this is also why the pr:* reason keeps its own
+          // NotifyReason member instead of folding into the general `label`
+          // one below — `daemonLabelTransition` is a PURE function of
+          // (before, after) with no notion of "self path" or "is this a
+          // transition vs. a removal", so routing pr:* through it here
+          // would silently change WHICH pr:* diffs this exemption covers
+          // (prTransition deliberately excludes a pure pr:x -> no-pr:*
+          // removal; daemonLabelTransition deliberately does not).
           if (space === "primary" && watcher === key) {
             const transition = before && after ? prTransition(before, after) : null;
             if (transition) return { deliver: true, reason: { pr: transition } };
           }
-          if (await suppressed(key, before, after, watcher)) return { deliver: false };
+          // Appear/disappear (no `before` or no `after` to diff at all) is
+          // still a real change and is still always delivered, unchecked —
+          // unchanged from before this ticket (see `suppressed`'s own
+          // comment above) — now also NAMED, since the poll can establish it
+          // outright: there is nothing to look up, only a key's presence on
+          // either side of the snapshot pair.
+          if (!before) return { deliver: true, reason: { appeared: true } };
+          if (!after) return { deliver: true, reason: { disappeared: true } };
+          const verdict = await suppressed(key, before, after, watcher);
+          if (verdict.suppressed) return { deliver: false };
+          // BUTCHR-87: a delivery that escaped suppression BECAUSE the
+          // suppression stack's own comment-cursor check observed the
+          // newest comment id move (see crossDaemonSuppressed/
+          // ledgerHitSuppressed above) is named as a comment — that is the
+          // literal, established reason THIS delivery is happening: absent
+          // the comment, the label-only diff underneath it would have been
+          // swallowed. Checked before the structural classifier below on
+          // purpose, so the label change that would otherwise have been
+          // suppressed never shadows the actual cause of delivery.
+          if (verdict.becauseComment) return { deliver: true, reason: { comment: true } };
+          // The general classifier: every remaining diff the poll can name
+          // from the (before, after) `JiraIssue` pair alone, no I/O. Order
+          // is a deliberate, documented precedence (more than one can be
+          // true of a single diff) — status first (the single highest-value
+          // fact a boss can learn about a ticket), daemon label second (the
+          // most COMMON class in the fleet, named zero times before this
+          // ticket — see daemonLabelTransition for the pr:*-over-agent:*
+          // tie-break when both changed), summary third. A diff naming none
+          // of these (every visible field identical but `updated` itself —
+          // a comment this poll never learned about, a link, or a field
+          // JiraIssue does not carry at all) falls through to the honest
+          // "looked, could not tell" fallback: no `reason` at all, exactly
+          // as it explained the "why".
+          if (before.status !== after.status) return { deliver: true, reason: { status: { from: before.status, to: after.status } } };
+          const labelTransition = daemonLabelTransition(before, after);
+          if (labelTransition) return { deliver: true, reason: { label: labelTransition } };
+          if (before.summary !== after.summary) return { deliver: true, reason: { summary: true } };
           return { deliver: true };
         },
       };

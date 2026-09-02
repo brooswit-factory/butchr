@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { activeKeys, changedKeys, daemonLabelsChanged, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
+import { activeKeys, changedKeys, daemonLabelsChanged, daemonLabelTransition, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status = "In Progress", summary = "s", updated = "t", labels: string[] = []): JiraIssue =>
@@ -90,6 +90,50 @@ describe("daemonLabelsChanged", () => {
     const before = iss("A", "In Progress", "s", "t1", []);
     const after = iss("A", "In Progress", "s", "t2", ["pr:open"]);
     expect(daemonLabelsChanged(before, after)).toBe(true);
+  });
+});
+
+describe("daemonLabelTransition (BUTCHR-87)", () => {
+  test("agent:* value changing is named, with the namespace and both values", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:idle"]);
+    expect(daemonLabelTransition(before, after)).toEqual({ prefix: "agent", from: "working", to: "idle" });
+  });
+
+  test("pr:* value changing is named too, not just agent:*", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["pr:open"]);
+    const after = iss("A", "In Progress", "s", "t2", ["pr:approved"]);
+    expect(daemonLabelTransition(before, after)).toEqual({ prefix: "pr", from: "open", to: "approved" });
+  });
+
+  test("a pr:* label appearing from nothing names from: null", () => {
+    const before = iss("A", "In Progress", "s", "t1", []);
+    const after = iss("A", "In Progress", "s", "t2", ["pr:open"]);
+    expect(daemonLabelTransition(before, after)).toEqual({ prefix: "pr", from: null, to: "open" });
+  });
+
+  test("a pr:* label REMOVED entirely (to: null) is named — unlike prTransition, this function is naming what changed, not vetting a review-outstanding transition", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["pr:approved"]);
+    const after = iss("A", "In Progress", "s", "t2", []);
+    expect(daemonLabelTransition(before, after)).toEqual({ prefix: "pr", from: "approved", to: null });
+  });
+
+  test("both namespaces changed in the same diff -> pr:* wins, agent:* is not reported (deterministic precedence)", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working", "pr:open"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:idle", "pr:approved"]);
+    expect(daemonLabelTransition(before, after)).toEqual({ prefix: "pr", from: "open", to: "approved" });
+  });
+
+  test("no daemon label of either kind on either side, and neither namespace's value differs -> null", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["urgent"]);
+    const after = iss("A", "In Progress", "s", "t2", ["urgent", "another-human-label"]);
+    expect(daemonLabelTransition(before, after)).toBeNull();
+  });
+
+  test("neither namespace's value differs even though the label ARRAY differs (agent:working present both sides, pr:open present both sides) -> null", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working", "pr:open"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:working", "pr:open"]);
+    expect(daemonLabelTransition(before, after)).toBeNull();
   });
 });
 
