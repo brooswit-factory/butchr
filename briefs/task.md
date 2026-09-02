@@ -58,27 +58,52 @@ task-implements-story link is what carries your events upward.
    — the LAST decisive review, never just any APPROVED one: a naive
    `select(.state=="APPROVED")` still matches a stale approval sitting
    earlier in the list, and `reviews[].commit.oid` is the field this check
-   anchors on instead of `headRefOid`. It is NOT sufficient on its own:
-   GitHub can silently rewrite `reviews[].commit.oid` to a later commit
-   after a base-merge — confirmed on two PRs, including one with three
-   reviews where an OLDER review still held its original recorded sha while
-   a LATER review's recorded commit had already moved, matching the current
-   head each time it was re-read. Only a review's own written-at-submission
-   BODY text stays fixed; any structured field, `reviews[].commit.oid`
-   included, can move — and this check reads the LAST decisive review,
-   which is exactly the one most likely to have been rewritten. It still
-   only catches what `reviewDecision`+`headRefOid` never could (a plain
-   push past a stale approval). If the base may have moved since approval,
-   ask for a re-review at the new head, or point at the append-only
-   `[review] APPROVED ... @ <sha>` line already on the ticket — GitHub
-   cannot rewrite that one. A
-   `REFUSE: STALE` result, or a `[review] APPROVED @ <sha>` for a sha you've
-   since pushed past, means ask for a re-review, not merge; a
+   anchors on instead of `headRefOid`. On a healthy PR an OLDER review's own
+   recorded commit is routinely behind HEAD — that's expected, not a sign
+   this check is broken, which is exactly why it reads the LAST decisive
+   review and nothing else: a check that flags every superseded review as
+   "stale" cries wolf on the ordinary review-revise-review cycle and trains
+   you to ignore it.
+   What a result means: `REFUSE: STALE` means the branch's own contribution
+   changed since that review — a real signal, don't merge. `MERGE OK` means
+   it did not — that narrower claim, not a guarantee that nothing unreviewed
+   is in what merges (see below). It is NOT sufficient on its own, in ways
+   worth naming separately:
+   - **Propagation race.** After a base-merge, `reviews[].commit.oid` was
+     observed to take on the order of 30–56 seconds to catch up with the
+     new head (`docs/review-commit-immutability.md` has the measurement) —
+     an OBSERVED window, not a guaranteed bound. A read taken right after
+     your own base-merge may just be racing that update, not proof the
+     commit stayed behind. Wait at least a minute after a base-merge before
+     trusting a fresh read, or lean on the `[review]` line below instead,
+     which has no race.
+   - **A clean base-merge is a different claim from "nothing unreviewed
+     landed."** A clean merge brings `main`'s own content into your branch —
+     content this PR's reviewer never personally read. That's usually fine,
+     because `main`'s content was reviewed on its own PR before it reached
+     `main`, but don't read a `MERGE OK` here as covering it.
+   - **Untested, so not to be treated as covered:** a squash-merge, a
+     rebase, or a force-push (any could break the "the reviewed sha stays a
+     reachable ancestor of HEAD" property a content-based fallback like
+     `git diff --stat <reviewed-sha>...HEAD` depends on), whether a merge's
+     SECOND parent can also advance the record (only the first parent was
+     observed to), and a genuine multi-way conflict resolution (only a
+     hand-appended line on an otherwise clean merge was observed).
+   If the base may have moved since approval, ask for a re-review at the
+   new head, or point at the append-only `[review] APPROVED ... @ <sha>`
+   line already on the ticket. GitHub cannot rewrite that line, but it IS
+   hand-transcribed, which is a different property from immutable: trust it
+   only when the sha was pasted verbatim from `gh pr view --json
+   headRefOid` (never retyped by hand), and check it yourself before
+   acting on it — exactly 40 hex characters. A 39-character sha naming no
+   real commit has already gone out once in this protocol's own
+   measurement, caught only because the reader happened to check the API
+   instead of trusting the request; nothing automated caught it.
+   A `REFUSE: STALE` result, or a `[review] APPROVED @ <sha>` for a sha
+   you've since pushed past, means ask for a re-review, not merge; a
    `REFUSE: … CHANGES_REQUESTED` result, or a `[review] CHANGES_REQUESTED`,
-   means read the review, fix, push, and comment that a re-review is needed.
-   Before merging, also confirm you have not taken a base-merge since the
-   approval — if you have, ask for a re-review rather than trusting
-   `MERGE OK`. Then merge your own PR.
+   means read the review, fix, push, and comment that a re-review is
+   needed. Then merge your own PR.
 
 ## Filing work that isn't yours
 Something surfaces mid-task that's real but doesn't serve {{KEY}} — a bug in
