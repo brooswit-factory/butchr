@@ -220,6 +220,82 @@ const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 // because a task has no worker below it to review.
 const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:brief.md", "brief:Story:brief.md"];
 
+// ---------------------------------------------------------------------
+// BUTCHR-225: TOTAL COVERAGE OF THE DERIVED brief FAMILY, BY CONSTRUCTION
+// ---------------------------------------------------------------------
+// MERGE_INSTRUCTING_BRIEFS and REVIEW_LINE_INSTRUCTING_BRIEFS above are
+// hand-written, and until this ticket were tied to nothing: adding a new
+// entry to workspace.ts's BRIEF_BY_TYPE table (see knownBriefTypes()) ships
+// a brand-new agent-facing brief that neither list ever mentions, and
+// nothing here failed. This section makes that state impossible: every
+// member of the DERIVED family (knownBriefTypes()) must be accounted for
+// in exactly one of — "asserted" (present in the UNION of the two positive
+// lists above; a type naming two DIFFERENT instructional claims in both
+// lists, e.g. "story", is still just "asserted" once, not a conflict), or
+// "excluded" (a written, non-empty reason in TYPE_EXCLUSIONS below). Never
+// both, never neither.
+//
+// Deliberately NOT shared with assertion-check-guard.test.ts's own,
+// near-identical copy of this section — see this repo's own precedent for
+// keeping label-scan.ts/header-scan.ts/workspace-scan.ts as separate,
+// cross-referenced files rather than one shared abstraction (their own
+// headers say so). Each guard's accounting is a property of THAT guard's
+// own hand-written lists; a shared helper would blur which file's list
+// actually went stale. See assertion-check-guard.test.ts's matching
+// section for the sibling.
+//
+// briefs/CLAUDE.md and briefs/default.md are deliberately OUT OF SCOPE for
+// this accounting: both are shipped, agent-facing files, but neither is a
+// member of knownBriefTypes() (CLAUDE.md ships alongside every type;
+// DEFAULT is the "nothing more specific applies" fallback —
+// knownBriefTypes()'s own doc comment says so explicitly). An exclusion
+// entry naming "default" here would itself be flagged STALE by the test
+// below, which is the discipline working as intended, not a bug: don't add
+// one. (briefChannels() above separately builds a literal "Bug" channel as
+// a stand-in for "any unmapped type" — that's a DEFAULT-fallback probe for
+// the existing merge-check/review-line assertions, not a member of the
+// derived family this section accounts for.)
+
+interface TypeExclusion { readonly type: string; readonly reason: string }
+
+// Empty today: every member of the derived family is already covered by
+// the UNION of MERGE_INSTRUCTING_BRIEFS (task, story) and
+// REVIEW_LINE_INSTRUCTING_BRIEFS (project, epic, story) above — together,
+// epic/story/task/project, i.e. all four of knownBriefTypes(). Left as an
+// explicit, typed, empty list — same precedent
+// test/unit/family-scan.test.ts's own KNOWN_FAMILY_COLLISION_EXCLUSIONS
+// sets for an empty-but-checked list — rather than omitted, so the
+// "every exclusion still matches a real family member" test below has
+// something to iterate that isn't vacuously true by omission.
+const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [];
+
+const labelToType = (label: string): string => {
+  const m = /^brief:([A-Za-z]+):brief\.md$/.exec(label);
+  if (!m) throw new Error(`not a brief:<Type>:brief.md label: ${label}`);
+  return m[1]!.toLowerCase();
+};
+
+const ASSERTED_TYPES: ReadonlySet<string> = new Set([...MERGE_INSTRUCTING_BRIEFS, ...REVIEW_LINE_INSTRUCTING_BRIEFS].map(labelToType));
+
+/**
+ * The members of `family` accounted for in neither, or in BOTH, of
+ * `asserted`/`exclusions` — what the coverage test below actually fails
+ * on. Pure. See assertion-check-guard.test.ts's near-identical copy for
+ * the cross-reference this file deliberately does not import.
+ */
+function findUnaccountedBriefTypes(family: readonly string[], asserted: ReadonlySet<string>, exclusions: readonly TypeExclusion[]): string[] {
+  const excludedTypes = new Set(exclusions.map((e) => e.type));
+  return family.filter((t) => asserted.has(t) === excludedTypes.has(t));
+}
+
+function formatUnaccountedBriefTypeError(types: readonly string[]): string {
+  return [
+    `${types.length} brief type(s) from knownBriefTypes() are not accounted for exactly once in merge-check-guard.test.ts: ${types.join(", ")}.`,
+    "Every member of the derived brief family must appear in exactly one of: a positive-assertion list (MERGE_INSTRUCTING_BRIEFS / REVIEW_LINE_INSTRUCTING_BRIEFS) above, or TYPE_EXCLUSIONS below with a written reason — never both, never neither.",
+    "TO FIX: add the type to whichever positive-assertion list actually applies (if the brief genuinely carries that instruction), OR add a { type, reason } entry to TYPE_EXCLUSIONS explaining why it doesn't.",
+  ].join("\n");
+}
+
 // The `[review]` line format itself — BOTH verdicts required as two
 // SEPARATE patterns, not one regex that only happens to match the APPROVED
 // half (BUTCHR-149 round 1: deleting the CHANGES_REQUESTED clause from
@@ -363,5 +439,34 @@ describe("merge-check instruction channels (BUTCHR-56)", () => {
       const nearReviewLine = textNear(c.text, REVIEW_LINE_APPROVED, 400);
       expect(nearReviewLine, `${c.label} should carry the sha transcription caveat NEAR its reviewer-side [review] line`).toMatch(TRANSCRIPTION_CAVEAT);
     }
+  });
+});
+
+describe("BUTCHR-225: total type coverage of the derived brief family (merge-check-guard.test.ts)", () => {
+  test("every member of knownBriefTypes() is asserted or excluded, never both, never neither", () => {
+    const unaccounted = findUnaccountedBriefTypes(knownBriefTypes(), ASSERTED_TYPES, TYPE_EXCLUSIONS);
+    if (unaccounted.length > 0) throw new Error(formatUnaccountedBriefTypeError(unaccounted));
+    expect(unaccounted).toEqual([]);
+  });
+
+  test("TYPE_EXCLUSIONS is empty today, so this is vacuously true — but it fails loudly instead of letting a stale exclusion (naming a type no longer in the derived family) accumulate silently", () => {
+    const family = new Set(knownBriefTypes());
+    for (const exclusion of TYPE_EXCLUSIONS) {
+      expect(family.has(exclusion.type), `TYPE_EXCLUSIONS names "${exclusion.type}", which is not (or no longer) in knownBriefTypes()`).toBe(true);
+      expect(exclusion.reason.trim().length, `TYPE_EXCLUSIONS entry "${exclusion.type}" has an empty/whitespace reason`).toBeGreaterThan(0);
+    }
+  });
+
+  test("non-vacuity: the accounting function flags an unaccounted member, flags a both-asserted-and-excluded member, accepts an asserted-only or excluded-only member, and the derived family used above is not empty", () => {
+    expect(knownBriefTypes().length).toBeGreaterThan(0); // rules out "passes because the family is empty"
+
+    expect(findUnaccountedBriefTypes(["ghost"], new Set(), [])).toEqual(["ghost"]);
+    expect(findUnaccountedBriefTypes(["dup"], new Set(["dup"]), [{ type: "dup", reason: "x" }])).toEqual(["dup"]);
+    expect(findUnaccountedBriefTypes(["a", "b"], new Set(["a"]), [{ type: "b", reason: "x" }])).toEqual([]);
+
+    // Rules out "passes because ASSERTED_TYPES/TYPE_EXCLUSIONS silently
+    // matches everything": feed the REAL sets a synthetic member neither
+    // one knows about, alongside the real family.
+    expect(findUnaccountedBriefTypes(["probe", ...knownBriefTypes()], ASSERTED_TYPES, TYPE_EXCLUSIONS)).toEqual(["probe"]);
   });
 });
