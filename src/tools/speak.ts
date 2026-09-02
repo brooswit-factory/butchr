@@ -67,3 +67,27 @@ export async function speakOnOwnChannel(ops: AtlassianOps, callerKey: string, ta
 function escapeStorageText(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
+/**
+ * BUTCHR-124 review (PR #180, CHANGES_REQUESTED @ 1be6208): the exact inverse
+ * of `speakOnOwnChannel`'s PROJECT branch — undoes the `<p>${escapeStorageText
+ * (text)}</p>` wrapping so a caller reading a project's own comments back
+ * (via `ops.getPageComments`, which returns raw storage-format XHTML) sees
+ * the same plain text `speakOnOwnChannel` was originally given. Exported
+ * because reading back what this seam wrote is not this ticket's alone —
+ * escalation-loop.ts's sustained-unresponsive dedupe is the first caller,
+ * but any future project-tier read-back (BUTCHR-95/BUTCHR-84 included) needs
+ * the SAME inverse, not a second one that can drift from `escapeStorageText`.
+ *
+ * Decodes in the OPPOSITE order `escapeStorageText` encodes in (`&` first,
+ * then `<`, then `>`): `&gt;` first, `&lt;`, `&amp;` last — the encoder never
+ * double-escapes, so decoding in reverse undoes it exactly. Tolerant of a
+ * body that ISN'T `<p>...</p>`-wrapped (falls through unwrapped, still
+ * unescaped) — a foreign comment on the same page need not carry this
+ * module's own write shape.
+ */
+export function unwrapStorageParagraph(body: string): string {
+  const m = /^<p>([\s\S]*)<\/p>$/.exec(body.trim());
+  const inner = m ? m[1]! : body;
+  return inner.replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+}

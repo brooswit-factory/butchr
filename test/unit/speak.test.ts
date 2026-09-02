@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { speakOnOwnChannel } from "../../src/tools/speak.js";
+import { speakOnOwnChannel, unwrapStorageParagraph } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 // BUTCHR-71 / BUTCHR-62: "where a resource speaks" — an issue on its own
@@ -123,5 +123,47 @@ describe("speakOnOwnChannel", () => {
     const { ops, pageComments } = makeOps({ setProjectProperty: async () => { throw new Error("boom"); } });
     await expect(speakOnOwnChannel(ops, "BUTCHR", "hello")).resolves.toBeDefined();
     expect(pageComments.length).toBe(1); // the comment itself still landed
+  });
+});
+
+// BUTCHR-124 review (PR #180, CHANGES_REQUESTED @ 1be6208): `unwrapStorageParagraph`
+// is the exact inverse of speakOnOwnChannel's own `<p>${escapeStorageText(text)}</p>`
+// wrapping — the round trip a project-tier read-back needs. What would REFUTE
+// each test below: any test that hand-types its OWN "storage-format-looking"
+// string instead of reading back what speakOnOwnChannel itself actually wrote
+// would prove nothing about the real defect (a fixture disagreeing with the
+// real writer is exactly how PR #180's original tests missed this) — so every
+// test here round-trips through the REAL `speakOnOwnChannel` call.
+describe("unwrapStorageParagraph", () => {
+  test("round-trips a real speakOnOwnChannel-written body back to the exact original plain text", async () => {
+    const { ops, pageComments } = makeOps();
+    const text = "[butchr:unresponsive] KAN-1's pane has been reported blocked for 5 minute(s), and its text does not parse as a recognized dialog.\n\npane: [p1]";
+    await speakOnOwnChannel(ops, "BUTCHR", text);
+    expect(unwrapStorageParagraph(pageComments[0]!.body)).toBe(text);
+  });
+
+  // The exact defect the review found, reproduced and pinned: a naive
+  // startsWith(marker) check (findMarked's own anchor) fails on the RAW
+  // wrapped body and only succeeds once unwrapped.
+  test("findMarked's startsWith(marker) anchor fails on the raw wrapped body and succeeds only after unwrapping", async () => {
+    const { ops, pageComments } = makeOps();
+    const marker = "[butchr:unresponsive]";
+    const text = `${marker} KAN-1's pane has been reported blocked for 5 minute(s)...\n\npane: [p1]`;
+    await speakOnOwnChannel(ops, "BUTCHR", text);
+    const raw = pageComments[0]!.body;
+    expect(raw.startsWith(marker)).toBe(false); // reproduces the defect
+    expect(unwrapStorageParagraph(raw).startsWith(marker)).toBe(true); // fixed
+  });
+
+  test("round-trips HTML-sensitive characters exactly — the inverse of escapeStorageText's own encode order", async () => {
+    const { ops, pageComments } = makeOps();
+    const text = "a < b & c > d, and &amp; literally typed too";
+    await speakOnOwnChannel(ops, "BUTCHR", text);
+    expect(unwrapStorageParagraph(pageComments[0]!.body)).toBe(text);
+  });
+
+  test("a body that is NOT <p>...</p>-wrapped (a foreign comment on the same page) passes through, still unescaped", () => {
+    expect(unwrapStorageParagraph("plain text, no wrapper at all")).toBe("plain text, no wrapper at all");
+    expect(unwrapStorageParagraph("a &lt; b, no paragraph tags")).toBe("a < b, no paragraph tags");
   });
 });
