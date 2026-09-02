@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
-  CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT,
+  CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -809,6 +809,161 @@ describe("correctWorker", () => {
     addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
     const atLimit = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT);
     await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: atLimit, why: "reason" })).resolves.toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// correct_worker — BUTCHR-145: chained archive when the archive comment
+// itself (not the incoming description/summary) exceeds Jira's COMMENT cap.
+// Requirements 2-5 of BUTCHR-145.
+// ---------------------------------------------------------------------------
+
+/** Strips a chained archive part's `[caller] [correction] (part i of n) ` prefix off one posted comment, asserting the prefix is exactly what Requirement 2 promises (position + total, right after the identity tag and marker). */
+function stripPartPrefix(comment: string, callerKey: string, i: number, n: number): string {
+  const prefix = `[${callerKey}] ${CORRECTION_MARKER} (part ${i} of ${n}) `;
+  expect(comment.startsWith(prefix)).toBe(true);
+  return comment.slice(prefix.length);
+}
+
+describe("correctWorker: chained archive (BUTCHR-145)", () => {
+  test("Requirement 2: an over-cap archive is chained across multiple comments, and the parts reassemble to exactly the original superseded text", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const oldDescription = Array.from({ length: 50000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");
+    addIssue("BUTCHR-2", {
+      issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1",
+      description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: oldDescription }] }] },
+    });
+    const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new description text", why: "shrinking an oversized ticket" });
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments.length).toBeGreaterThan(1); // it actually had to chain, not fit in one comment
+    for (const c of comments) expect(c).toContain(CORRECTION_MARKER); // every part stays greppable
+    for (const c of comments) expect(c.length).toBeLessThanOrEqual(JIRA_COMMENT_CHAR_LIMIT); // every part itself respects the cap
+    const n = comments.length;
+    const reassembled = comments.map((c, idx) => stripPartPrefix(c, "BUTCHR-1", idx + 1, n)).join("");
+    expect(reassembled).toContain(oldDescription); // lossless — assert the reassembly, not just the comment count
+    expect(reassembled).toContain("shrinking an oversized ticket"); // `why` survives the split too
+    expect(result.correctedDescription).toBe(true);
+    expect(issues.get("BUTCHR-2")!.description).toBe("new description text"); // the edit still landed after a COMPLETE chain
+  });
+
+  test("Requirement 3: a mid-chain failure leaves a legibly incomplete record — CORRECTION_CHAIN_INCOMPLETE_MARKER present, description NOT replaced", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const oldDescription = "z".repeat(100000); // comfortably needs several parts
+    addIssue("BUTCHR-2", {
+      issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1",
+      description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: oldDescription }] }] },
+    });
+    let addCommentCalls = 0;
+    let correctTextCalled = false;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => {
+        addCommentCalls++;
+        if (addCommentCalls === 2) throw new Error("network blip on part 2"); // part 1 succeeds, part 2 fails
+        return ops.addComment(key, text);
+      },
+      correctText: async (key, p) => { correctTextCalled = true; return ops.correctText(key, p); },
+    };
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/UNCHANGED/);
+
+    expect(correctTextCalled).toBe(false); // fail closed: the replace was never attempted
+    const comments = issues.get("BUTCHR-2")!.comments;
+    // Only part 1 (call #1) and the best-effort incomplete-marker (call #3) actually posted — part 2 (call #2) never wrote anything.
+    expect(comments.length).toBe(2);
+    expect(comments[0]).toContain(CORRECTION_MARKER);
+    expect(comments[0]).toContain("(part 1 of");
+    expect(comments[1]).toContain(CORRECTION_CHAIN_INCOMPLETE_MARKER); // Requirement 3's positive "the chain broke" signal
+    expect(comments[1]).toMatch(/INCOMPLETE/);
+    expect(comments[1]).toMatch(/UNCHANGED|NOT changed/i);
+    expect(comments[1]).toMatch(/retry/i);
+    expect(issues.get("BUTCHR-2")!.description).not.toBe("new"); // the description was never replaced
+  });
+
+  test("Requirement 2: an ordinary under-cap correction is completely unchanged — exactly one comment, no part header", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "an ordinary small correction" });
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!).not.toMatch(/\(part \d+ of \d+\)/); // no part header — same shape as before this ticket
+    expect(comments[0]!.startsWith(`[BUTCHR-1] ${CORRECTION_MARKER}`)).toBe(true);
+  });
+
+  test("Requirement 4: the near-boundary warning fires on a successful correction close to the description limit, and not well below it, worded for a world where the next correction still succeeds", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+
+    const wellBelow = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "a short new description", why: "reason" });
+    expect(wellBelow.message).not.toMatch(/WARNING/);
+
+    const nearLimit = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT - 500);
+    const near = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: nearLimit, why: "reason 2" });
+    expect(near.message).toMatch(/WARNING/);
+    expect(near.message).toMatch(/split across multiple/);
+    expect(near.message).not.toMatch(/will fail/i); // Requirement 4's trap: never word it as a failure — it will still SUCCEED
+    expect(near.message).toMatch(/succeed/i);
+  });
+
+  test("Requirement 2/AC2: a ticket whose description matches BUTCHR-139's real-world size (~31,300 chars) is no longer permanently uncorrectable — and stays correctable on a SECOND call", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const oldDescription = "y".repeat(31300); // BUTCHR-139's measured plain-text size
+    addIssue("BUTCHR-2", {
+      issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1",
+      description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: oldDescription }] }] },
+    });
+    const why = "w".repeat(2400); // BUTCHR-139's measured `why` size on the call that originally deadlocked
+    const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "shrunk", why });
+    expect(result.correctedDescription).toBe(true);
+    expect(issues.get("BUTCHR-2")!.description).toBe("shrunk");
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments.length).toBeGreaterThan(1); // this is exactly the case that used to refuse outright
+    const n = comments.length;
+    const reassembled = comments.map((c, idx) => stripPartPrefix(c, "BUTCHR-1", idx + 1, n)).join("");
+    expect(reassembled).toContain(oldDescription);
+
+    // The deadlock is broken, not just dodged once — correct it again immediately.
+    const second = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "shrunk again", why: "second correction, proving no deadlock" });
+    expect(second.correctedDescription).toBe(true);
+    expect(issues.get("BUTCHR-2")!.description).toBe("shrunk again");
+  });
+
+  test("Requirement 2: a body containing astral-plane characters splits without corrupting a UTF-16 surrogate pair", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    const emoji = "\u{1F600}"; // 😀 — a UTF-16 surrogate pair, 2 code units
+    const blocks: string[] = [];
+    for (let i = 0; i < 20000; i++) {
+      blocks.push(emoji);
+      if (i % 997 === 0) blocks.push("x"); // periodically shifts phase, so a fixed split budget can't dodge every pair regardless of the budget's own parity
+    }
+    const oldDescription = blocks.join("");
+    addIssue("BUTCHR-2", {
+      issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1",
+      description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: oldDescription }] }] },
+    });
+    const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: "shrunk", why: "surrogate-pair test" });
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments.length).toBeGreaterThan(1); // large enough to require chaining
+    const n = comments.length;
+    const reassembled = comments.map((c, idx) => stripPartPrefix(c, "BUTCHR-1", idx + 1, n)).join("");
+    expect(reassembled).toContain(oldDescription); // no surrogate pair was split or corrupted
+
+    // Strongest per-part guarantee: no comment ever contains a LONE surrogate — every low surrogate is immediately preceded by its own high surrogate, within that same comment.
+    for (const c of comments) {
+      for (let i = 0; i < c.length; i++) {
+        const code = c.charCodeAt(i);
+        if (code >= 0xdc00 && code <= 0xdfff) {
+          expect(c.charCodeAt(i - 1)).toBeGreaterThanOrEqual(0xd800);
+          expect(c.charCodeAt(i - 1)).toBeLessThanOrEqual(0xdbff);
+        }
+      }
+    }
+    expect(result.correctedDescription).toBe(true);
   });
 });
 
