@@ -50,8 +50,16 @@ export class StalledTracker {
 }
 
 export interface StalledCheck {
-  /** Resolve whether `issue` IS stalled right now (fetches comments only when the cheap preconditions already hold — usually an empty set of tickets). */
-  check: (issue: string, label: ObservedLabel) => Promise<boolean>;
+  /**
+   * Resolve whether `issue` IS stalled right now (fetches comments only when
+   * the cheap preconditions already hold — usually an empty set of
+   * tickets). `null` means "could not verify" (the comments fetch failed) —
+   * a THIRD outcome, never collapsed into `false`/`true`: the caller
+   * (src/labels/sync.ts) must not write or contribute to `agent:stalled` on
+   * a poll that returns `null`, and must not treat it as "confirmed not
+   * stalled" either.
+   */
+  check: (issue: string, label: ObservedLabel) => Promise<boolean | null>;
   forget: (issue: string) => void;
 }
 
@@ -79,11 +87,20 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
   return {
     async check(issue, label) {
       if (!tracker.observe(issue, label)) return false;
-      const rows = await deps.comments(issue).catch((e) => {
-        deps.log?.(`[stalled] ${issue} comments fetch failed: ${(e as Error)?.message ?? e}`);
-        return [] as readonly { authorEmail: string | null }[];
-      });
-      return !rows.some((c) => c.authorEmail === deps.accountEmail);
+      try {
+        const rows = await deps.comments(issue);
+        return !rows.some((c) => c.authorEmail === deps.accountEmail);
+      } catch (e) {
+        // A failed fetch is NOT "zero comments" — that would silently turn
+        // into a confident `agent:stalled` on a ticket we simply couldn't
+        // check (the defect this ticket exists to remove; see M4 in this
+        // ticket's own doc, and src/agents/parked.ts /
+        // src/agents/escalation-loop.ts for the house convention this
+        // brings stalled.ts into line with). `null` propagates "could not
+        // verify" to the caller instead.
+        deps.log?.(`WARNING: [stalled] ${issue} comments fetch failed: ${(e as Error)?.message ?? e}`);
+        return null;
+      }
     },
     forget: (issue) => tracker.forget(issue),
   };

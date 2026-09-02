@@ -332,6 +332,48 @@ describe("createLabelSync", () => {
     expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled"))).toBe(true);
   });
 
+  test("a stalled check that could not verify (null) never writes agent:stalled onto a ticket that wasn't already labelled stalled, even across two consecutive polls", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => null, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+    await sync([issue]);
+    await sync([issue]); // two consecutive polls — would be enough to confirm a real candidate
+    expect(jira.calls).toEqual([]); // never wrote agent:stalled
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("could not verify"))).toBe(true);
+  });
+
+  test("REGRESSION: a stalled check that could not verify (null) never STRIPS an already-applied agent:stalled label, even across two consecutive polls", async () => {
+    // Naively falling a `null` result through to the OBSERVED status ("idle" —
+    // `check` only fetches comments once the idle/done streak already
+    // qualifies) makes the candidate "idle" regardless of what's actually
+    // applied. For a ticket that already carries agent:stalled from earlier
+    // successful polls, that "idle" candidate goes through the SAME 2-poll
+    // stabilizer any real transition uses and gets CONFIRMED on the second
+    // consecutive null poll — silently erasing a true stalled signal on
+    // exactly the sustained-degradation case this ticket cares about. The
+    // fix must leave the applied label untouched instead of falling through
+    // to `observed`.
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => null, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    const issue = iss("KAN-1", "In Progress", ["agent:stalled"]);
+    await sync([issue]);
+    await sync([issue]); // two consecutive null polls — would be enough to confirm a flip to idle
+    expect(jira.calls).toEqual([]); // agent:stalled was never removed
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("could not verify"))).toBe(true);
+  });
+
   test("leaving the active set forgets the stalled tracker's state for that ticket", async () => {
     const jira = fakeJira();
     const forgotten: string[] = [];
