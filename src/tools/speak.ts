@@ -50,13 +50,42 @@ import { advanceProjectWatermark } from "../resources/project.js";
  * fail-open (a rejected write is caught, not thrown): the comment itself
  * already succeeded by the time this runs, and a secondary bookkeeping
  * failure must never surface as a failed `report_to_boss`/`ask_boss` call.
+ *
+ * BUTCHR-105's REQUIREMENT-2 DECISION, recorded here rather than left as an
+ * oversight: the swallow itself is KEPT — the argument just above (a
+ * comment that already succeeded must not fail the caller over bookkeeping)
+ * still holds and this ticket does not overturn it. What changes is that
+ * the failure is no longer SILENT: it is logged via `log` (the same
+ * `console.error`-by-default seam `atlassianTools` already uses for its own
+ * audit lines — journalctl-visible, this daemon's existing convention for
+ * a fail-open write, e.g. `src/daemon/index.ts`'s own-write read-back
+ * WARNING). This is "make the failure visible without making it fatal",
+ * one of the three answers the ticket names as acceptable. Why not remove
+ * the swallow instead: `check_in` already surfaces this same failure by
+ * NOT swallowing it, and doing that here too would fail every
+ * `report_to_boss`/`ask_boss` call whenever only the watermark write is
+ * down — including the exact moment a blocked agent is using one of them to
+ * escalate, which is the single worst call to fail on a bookkeeping error.
+ * MEASURED motivation for logging rather than staying silent (BUTCHR-115's
+ * own doc): while this write was failing (403 — the project-tier account
+ * lacked project-write permission), the project nudged itself every five
+ * minutes and no signal anywhere said why; a log line is what closes that
+ * gap, and there is no ticket/doc channel to report to instead that would
+ * not itself depend on this same watermark write succeeding.
  */
-export async function speakOnOwnChannel(ops: AtlassianOps, callerKey: string, taggedText: string): Promise<unknown> {
+export async function speakOnOwnChannel(
+  ops: AtlassianOps,
+  callerKey: string,
+  taggedText: string,
+  log: (line: string) => void = console.error,
+): Promise<unknown> {
   if (isProjectId(callerKey)) {
     const doc = await projectRootDoc(ops, callerKey);
     const created = (await ops.commentOnPage(doc.id, `<p>${escapeStorageText(taggedText)}</p>`)) as { id?: string } | undefined;
     if (created?.id) {
-      await advanceProjectWatermark(ops, callerKey, { comment: created.id }).catch(() => {});
+      await advanceProjectWatermark(ops, callerKey, { comment: created.id }).catch((e) =>
+        log(`  WARNING: [speakOnOwnChannel] self-wake watermark advance failed for ${callerKey} (comment ${created.id}): ${(e as Error)?.message ?? e} — comment posted; project may nudge itself on it next poll`),
+      );
     }
     return created;
   }

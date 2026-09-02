@@ -951,6 +951,84 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(writes).toEqual([[["KAN-9", "KAN-1"], "KAN-1"]]);
   });
 
+  // BUTCHR-110/S1, exercised at the FULL TOOL-WIRING LEVEL (through
+  // atlassianTools/defs.ts), not just relationship.ts directly — this is
+  // the only place the "IDENTITY COLLISION" audit line (src/tools/defs.ts)
+  // can be observed at all, since relationship.ts itself never writes to
+  // the daemon's audit log.
+  test("new_worker end-to-end: a caller whose own assignee equals the child's role produces identityCollision in the result, a comment on the new ticket, AND an IDENTITY COLLISION audit line", async () => {
+    let commented: { key: string; text: string } | undefined;
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        if (key === "KAN-1") return { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, assignee: { accountId: "acct-story" }, issuelinks: [] } };
+        return { fields: { issuetype: { name: "Story" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }] } };
+      },
+      search: async () => ({}),
+      addComment: async (key: string, text: string) => { commented = { key, text }; return { ok: true }; },
+      linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }),
+      setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), { story: "acct-story", task: "acct-task" });
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.new_worker!.handler({ summary: "s", disposition: "start" }, conn)) as { key: string; identityCollision?: string };
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_STORY");
+    // THE ACTUAL RETURNED TOOL RESULT — pasted verbatim in the PR, per this ticket's own "before you run a check" requirement.
+    console.log("new_worker identityCollision (result field):", result.identityCollision);
+    expect(commented?.key).toBe("KAN-42");
+    expect(commented?.text).toStartWith("[KAN-1]");
+    console.log("new_worker identityCollision (ticket comment):", commented?.text);
+    const auditLine = audits.find((l) => l.includes("IDENTITY COLLISION"));
+    expect(auditLine).toBeDefined();
+    expect(auditLine).toContain("new_worker KAN-42 IDENTITY COLLISION:");
+    console.log("new_worker identityCollision (audit line):", auditLine);
+  });
+
+  test("new_worker end-to-end: NO collision when the caller's own assignee differs from the child's role — no identityCollision, no comment, no audit line", async () => {
+    let commentCalls = 0;
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        if (key === "KAN-1") return { fields: { issuetype: { name: "Epic" }, project: { key: "KAN" }, status: { name: "In Progress" }, assignee: { accountId: "some-other-human" }, issuelinks: [] } };
+        return { fields: { issuetype: { name: "Story" }, project: { key: "KAN" }, status: { name: "In Progress" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-1" } }] } };
+      },
+      search: async () => ({}),
+      addComment: async () => { commentCalls++; return { ok: true }; },
+      linkIssues: async () => ({ ok: true }), transition: async () => ({ ok: true }),
+      createIssue: async () => ({ key: "KAN-42" }),
+      setPriority: async () => ({}), assign: async () => ({}),
+      createPage: async () => ({}), getPage: async () => ({}), updatePage: async () => ({}), searchPages: async () => ({}), listSpaces: async () => ({}),
+      ...fakeDocOps(),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getIssueComments: async () => ({ results: [] }),
+      getProjectPropertyOrNull: async () => null,
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), { story: "acct-story", task: "acct-task" });
+    const conn = { headers: { "x-issue": "KAN-1" } } as any;
+    const result = (await tools.new_worker!.handler({ summary: "s", disposition: "start" }, conn)) as { identityCollision?: string };
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(commentCalls).toBe(0);
+    expect(audits.some((l) => l.includes("IDENTITY COLLISION"))).toBe(false);
+  });
+
   test("new_worker's description does not claim atomicity, and states the ordering guarantee / convergent-doc / rollback shape (BUTCHR-35 review criterion: judge the description, not just the code)", () => {
     const tools = rigNoOp();
     const d = tools.new_worker!.description;

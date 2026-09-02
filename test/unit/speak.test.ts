@@ -124,6 +124,29 @@ describe("speakOnOwnChannel", () => {
     await expect(speakOnOwnChannel(ops, "BUTCHR", "hello")).resolves.toBeDefined();
     expect(pageComments.length).toBe(1); // the comment itself still landed
   });
+
+  // BUTCHR-105 requirement 2's decision: the swallow above is KEPT (the test
+  // just above still holds), but it must no longer be SILENT — a failed
+  // watermark write is logged rather than disappearing with nothing to say
+  // why a project keeps nudging itself. Failure condition: no line reaches
+  // `log`, or the caller's `speakOnOwnChannel` promise rejects instead of
+  // resolving (that would be "remove the swallow", not "log it").
+  test("BUTCHR-105: a failed watermark write is logged (not silent) while the speak call still succeeds", async () => {
+    const { ops, pageComments } = makeOps({ setProjectProperty: async () => { throw new Error("boom"); } });
+    const lines: string[] = [];
+    await expect(speakOnOwnChannel(ops, "BUTCHR", "hello", (line) => lines.push(line))).resolves.toBeDefined();
+    expect(pageComments.length).toBe(1); // the comment itself still landed
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("BUTCHR");
+    expect(lines[0]).toContain("boom");
+  });
+
+  test("BUTCHR-105: no log line at all when the watermark write succeeds", async () => {
+    const lines: string[] = [];
+    const { ops } = makeOps();
+    await speakOnOwnChannel(ops, "BUTCHR", "hello", (line) => lines.push(line));
+    expect(lines).toEqual([]);
+  });
 });
 
 // BUTCHR-124 review (PR #180, CHANGES_REQUESTED @ 1be6208): `unwrapStorageParagraph`

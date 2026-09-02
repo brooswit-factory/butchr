@@ -479,7 +479,8 @@ export function atlassianTools(
         "WHAT A RETURNED RESULT GUARANTEES, AND WHAT A THROWN ERROR MEANS — READ THIS BEFORE TREATING EITHER AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A NORMAL RETURN ALWAYS MEANS a ticket that has a boss (the link succeeded), a declared disposition (RUNNING or SHELVED, never undeclared) AND a doc. If ONLY the doc step failed, this THROWS rather than returning a partial result — but by then the ticket, its boss link and its disposition are ALL already real and are NOT rolled back; the error names the surviving key, and its doc is completed by that ticket's own first `set_doc` call, whenever the agent working it makes one. Nothing here retries or fixes it automatically: a ticket that never gets a `set_doc` call simply has no doc until something calls for that key — strictly better than a duplicate or an orphan, but not invisible, and not something a caller should infer from a successful-looking throw. " +
         "ON FAILURE AFTER THE TICKET IS CREATED (the link or the disposition write): this attempts to delete the ticket it just created and rethrows either way — \"rolled back, nothing survives\" if the delete succeeded, or a NAMED PARTIAL STATE (the surviving ticket key) if it didn't. This is NOT unconditional atomicity: as of BUTCHR-35 this daemon's own credential does not hold Jira's `DELETE_ISSUES` permission on this project (measured — a permission read and a live round trip both confirm it), so the delete is currently expected to fail when attempted; it is attempted anyway because the refusal is a permission, not an API limit, and this exact code becomes fully self-cleaning the day that permission is granted, on whichever deployment holds it. Never assume a failure left nothing behind — read the error, which always names what survived. " +
         "Replaces jira_create_issue plus the confluence_create_page call and the doc-linking step a careful agent did by hand. Does NOT cover filing a deliberate orphan (`implements: \"none\"`) — that stays on jira_create_issue, which remains the only route for out-of-scope work your brief tells you to file outside your epic. " +
-        "FOR A PROJECT CALLER (BUTCHR-71): creates an EPIC in your project instead of a Story — same rule, one tier below you. There is NO Implements link (a Jira project is not an issue) — the relationship is MEMBERSHIP, reported back as `member` (the project key) instead of `implements`, which is omitted rather than set to a link that doesn't exist. Everything else — the required disposition, the doc nesting under your own root doc — works the same way.",
+        "FOR A PROJECT CALLER (BUTCHR-71): creates an EPIC in your project instead of a Story — same rule, one tier below you. There is NO Implements link (a Jira project is not an issue) — the relationship is MEMBERSHIP, reported back as `member` (the project key) instead of `implements`, which is omitted rather than set to a link that doesn't exist. Everything else — the required disposition, the doc nesting under your own root doc — works the same way. " +
+        "IDENTITY COLLISION (BUTCHR-110): if the child's about-to-be-assigned accountId turns out to be the SAME as your own, this daemon's role map has no second identity for this hop — GitHub will refuse an approval on the child's PR from its own author. This is RECORDED, never refused: the call above still succeeds, but the result carries an `identityCollision` field naming both roles/tiers and the hop, the same warning is written to a comment on the new ticket, and to this daemon's audit log.",
       input: {
         summary: z.string(),
         description: z.string().optional(),
@@ -498,6 +499,16 @@ export function atlassianTools(
           ...(p.priority ? { priority: p.priority } : {}),
           disposition,
         });
+        // BUTCHR-110: same line-writing path the "REFUSED: no assignee" audit
+        // lines above already use — a collision is a warning, not a refusal,
+        // hence "IDENTITY COLLISION" rather than "REFUSED", but it is still
+        // something this connection's call did, so it gets its own line.
+        if (result.identityCollision) audit(c, `new_worker ${result.key} IDENTITY COLLISION: ${result.identityCollision}`);
+        // BUTCHR-110 (review fix): the collision check's own read can fail
+        // without failing the staffing call — "not checked" gets the same
+        // audit visibility as a collision found, so an operator can tell
+        // "no collision" apart from "the check itself didn't run".
+        if (result.identityUnknown) audit(c, `new_worker ${result.key} IDENTITY CHECK SKIPPED: ${result.identityUnknown}`);
         noted(c, [result.key, who]); // the new ticket's own `updated`, plus the Implements link bumping the caller's
         return result;
       },
@@ -531,7 +542,8 @@ export function atlassianTools(
     adopt_worker: {
       description:
         "Take ownership of an EXISTING ticket — an orphan, or one filed by an agent that has since ended: infers the assignee from the ADOPTED ticket's own issue type (Story or Task; anything else is refused), makes the Implements link (adopted ticket → caller), and ensures its doc, nested under the caller's own. Also takes the SAME required `disposition` as new_worker (`\"start\"`, or `\"shelve\"` with a non-empty `reason`) — an adopted ticket left in To Do with nobody's decision recorded is the same undeclared state as an unstarted new_worker child, by a different door. IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing (the assign/link/disposition writes are skipped) and is NOT an error — only the doc is still ensured, as a no-op-when-already-present safety net. A `\"start\"` disposition ALSO WITHDRAWS the shelved-exemption label whenever the adopted ticket carries it, and this clear is NOT gated on that idempotence check — even an otherwise fully idempotent re-adoption (already linked, already assigned, already In Progress) still clears a stale exemption, because a live ticket silently carrying one is the same residue start_worker exists to stop producing, through a second door. No extra Jira call: it reuses the labels this call already fetched to decide idempotence. A `\"shelve\"` disposition only ever adds the label — it never clears one. REFUSES a ticket already linked to a DIFFERENT boss — stealing another boss's worker must be an explicit act (jira_link_issues), never a side effect of a mistyped key. Replaces jira_assign plus a hand-written jira_link_issues call, plus the doc creation nobody remembered. " +
-        "FOR A PROJECT CALLER (BUTCHR-71): the adoptable type is an EPIC, not a Story or Task — anything else is refused. There is no link to make (membership, not a link — see new_worker); \"already adopted\" means already a member, already assigned by the epic role, and already in the disposition's state — NEVER decided from a link, since none exists. Refuses an epic that belongs to a DIFFERENT project.",
+        "FOR A PROJECT CALLER (BUTCHR-71): the adoptable type is an EPIC, not a Story or Task — anything else is refused. There is no link to make (membership, not a link — see new_worker); \"already adopted\" means already a member, already assigned by the epic role, and already in the disposition's state — NEVER decided from a link, since none exists. Refuses an epic that belongs to a DIFFERENT project. " +
+        "IDENTITY COLLISION (BUTCHR-110): if the adopted ticket's about-to-be-assigned accountId is the SAME as your own (read from YOUR OWN ticket, or — for a project caller — this daemon's own Atlassian credential), this hop has no second identity — GitHub will refuse an approval on its PR from its own author. RECORDED, never refused: the call still succeeds, but the result carries an `identityCollision` field, the same warning lands as a comment on the adopted ticket (skipped on a fully idempotent re-adoption that does no other write), and on this daemon's audit log.",
       input: {
         key: z.string(),
         disposition: z.enum(["start", "shelve"]),
@@ -543,6 +555,10 @@ export function atlassianTools(
         const disposition: Disposition = p.disposition === "shelve" ? { kind: "shelve", reason: p.reason ?? "" } : { kind: "start" };
         audit(c, `adopt_worker ${p.key} disposition=${p.disposition}`);
         const result = await adoptWorker(ops, roles, who, p.key, disposition);
+        // BUTCHR-110: see the matching comment on new_worker above — same
+        // line-writing path the "REFUSED: no assignee" audit lines use.
+        if (result.identityCollision) audit(c, `adopt_worker ${result.key} IDENTITY COLLISION: ${result.identityCollision}`);
+        if (result.identityUnknown) audit(c, `adopt_worker ${result.key} IDENTITY CHECK SKIPPED: ${result.identityUnknown}`);
         noted(c, [p.key, who]);
         return result;
       },

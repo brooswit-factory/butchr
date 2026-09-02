@@ -1304,3 +1304,232 @@ describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not
     expect(commentedBody).toContain(`[BUTCHR] ${ASK_MARKER} which approach?`);
   });
 });
+
+// ===========================================================================
+// BUTCHR-110/S1: tier-identity collision — RECORD, never refuse. The caller's
+// own accountId (read from the CALLER's actual ticket, or — for a PROJECT
+// caller — `ops.getMyself()`) is compared against the accountId about to be
+// assigned to the child. A collision must be LOUD in three places: the
+// returned result (`identityCollision`), the worker's own ticket (a comment),
+// and (verified separately, in src/tools/defs.ts's own wiring — not
+// exercised by these relationship-level tests) the daemon's audit log.
+// ===========================================================================
+
+describe("newWorker: tier-identity collision (BUTCHR-110/S1, issue caller)", () => {
+  test("Epic caller whose OWN assignee equals roles.story: identityCollision in the result, naming both env vars/both tiers/the hop/the accountId, plus a comment on the new child tagged with the caller's key", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.story });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_STORY");
+    expect(result.identityCollision).toContain("epic");
+    expect(result.identityCollision).toContain("story");
+    expect(result.identityCollision).toContain(ROLES.story); // short enough not to be truncated — the shared accountId, named
+    expect(result.identityCollision).toContain("GitHub refuses");
+    const child = issues.get(result.key)!;
+    expect(child.comments).toHaveLength(1);
+    expect(child.comments[0]).toStartWith("[BUTCHR-1]");
+    expect(child.comments[0]).toContain("GitHub refuses");
+  });
+
+  test("non-collision: caller's own assignee differs from the child's role — no identityCollision, no comment, nothing added to the result", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: "some-other-human" });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(issues.get(result.key)!.comments).toHaveLength(0);
+  });
+
+  test("a caller ticket with NO assignee at all is not reported as a collision (undefined never equals a role's accountId)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no assignee
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(issues.get(result.key)!.comments).toHaveLength(0);
+  });
+
+  test("FAIL-SAFE, NEVER FAIL-SILENT: a collision whose trace comment fails to post still succeeds — the returned warning says the trace was NOT written, and why", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.story });
+    const broken: AtlassianOps = { ...ops, addComment: async () => { throw new Error("comment refused"); } };
+    const result = await newWorker(broken, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result.identityCollision).toContain("COULD NOT BE WRITTEN");
+    expect(result.identityCollision).toContain("comment refused");
+    expect(result.identityCollision).toContain("GitHub refuses"); // the warning text itself still survives, not just the failure note
+  });
+});
+
+describe("newWorker: tier-identity collision (BUTCHR-110/S1, PROJECT caller)", () => {
+  test("this daemon's own credential (getMyself) equals roles.epic: identityCollision names ATLASSIAN_EMAIL/the credential, 'project', 'epic', and BUTCHR_ASSIGNEE_EPIC; comment lands on the new epic tagged with the project key", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const spied: AtlassianOps = { ...ops, getMyself: async () => ({ accountId: ROLES.epic }) };
+    const result = await newWorker(spied, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("ATLASSIAN_EMAIL");
+    expect(result.identityCollision).toContain("project");
+    expect(result.identityCollision).toContain("epic");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    const child = issues.get(result.key)!;
+    expect(child.comments).toHaveLength(1);
+    expect(child.comments[0]).toStartWith("[BUTCHR]");
+  });
+
+  test("non-collision: this daemon's credential differs from roles.epic — no identityCollision, no comment", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } }); // fake world's default getMyself() = "test-account" != ROLES.epic
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(issues.get(result.key)!.comments).toHaveLength(0);
+  });
+
+  // BUTCHR-103's review, 2026-09-02 (blocker #1): the collision check's OWN
+  // read must never turn a successful staffing call into a failure. This
+  // read runs after the disposition here, so the epic is already fully
+  // declared either way — but it must still degrade gracefully, not throw.
+  test("FAIL-SAFE: getMyself() failing does NOT fail the staffing call — the epic is still created and declared, and the result says the check could not run", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const broken: AtlassianOps = { ...ops, getMyself: async () => { throw new Error("myself endpoint down"); } };
+    const result = await newWorker(broken, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(result.identityUnknown).toContain("myself endpoint down");
+    expect(result.identityUnknown).toContain("NOT checked");
+    expect(issues.get(result.key)!.status).toBe("In Progress"); // the staffing call itself still fully succeeded
+  });
+});
+
+describe("adoptWorker: tier-identity collision (BUTCHR-110/S1, issue caller)", () => {
+  test("a fresh adoption where the caller's OWN assignee equals roles.task: identityCollision in the result, comment posted on the adopted ticket", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.task });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" }); // orphan
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_TASK");
+    expect(result.identityCollision).toContain("the epic that owns this task");
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.comments.some((c) => c.startsWith("[BUTCHR-1]") && c.includes("GitHub refuses"))).toBe(true);
+  });
+
+  test("THE IDEMPOTENT RE-ADOPTION DECISION: identityCollision is still reported in the result (a fact about current state, cheap to state on every call) but the ticket comment is NOT reposted — this call does no other write either", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.task });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress" });
+    let commentCalls = 0;
+    const spied: AtlassianOps = { ...ops, addComment: async (...a) => { commentCalls++; return ops.addComment(...a); } };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("not reposted");
+    expect(commentCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.comments).toHaveLength(0);
+  });
+
+  test("non-collision: caller's own assignee differs from the adopted ticket's role — no identityCollision, no comment", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR", assignee: "some-other-human" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(issues.get("BUTCHR-9")!.comments).toHaveLength(0);
+  });
+
+  // THE BLOCKER FROM BUTCHR-103's REVIEW, 2026-09-02: adopt_worker's extra
+  // collision-check read (the caller's own ticket) runs AFTER assign/link
+  // and BEFORE the disposition — an unguarded throw here used to leave the
+  // ticket assigned and linked but UNDECLARED, exactly the damaging partial
+  // state adoptWorker's own doc comment names as the one `adopt_worker`
+  // itself exists to REPAIR, not to create. This is the regression test.
+  test("FAIL-SAFE: the caller-ticket read failing does NOT fail the call, and does NOT leave the adopted ticket undeclared — assign/link already happened, and the disposition still gets applied", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" }); // orphan
+    let callerReads = 0;
+    const broken: AtlassianOps = {
+      ...ops,
+      // Only the FIRST getIssue(BUTCHR-1) — the collision check's own read —
+      // fails; ensureDoc's later boss-chain walk also reads BUTCHR-1 and
+      // must succeed, or this test would be exercising a doc failure, not
+      // the collision-check-read failure it's meant to isolate.
+      getIssue: async (key: string) => {
+        if (key === "BUTCHR-1" && callerReads === 0) { callerReads++; throw new Error("transient 503"); }
+        return ops.getIssue(key);
+      },
+    };
+    const result = await adoptWorker(broken, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(callerReads).toBe(1);
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(result.identityUnknown).toContain("transient 503");
+    expect(result.identityUnknown).toContain("NOT checked");
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.assignee).toBe(ROLES.task); // assign — already happened, unaffected
+    expect(w.bossKey).toBe("BUTCHR-1"); // link — already happened, unaffected
+    expect(w.status).toBe("In Progress"); // THE FIX: disposition still applied — never left undeclared
+  });
+});
+
+describe("adoptWorker: tier-identity collision (BUTCHR-110/S1, PROJECT caller)", () => {
+  test("this daemon's own credential equals roles.epic: identityCollision in the result, comment posted on the adopted epic", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" }); // orphan epic
+    const spied: AtlassianOps = { ...ops, getMyself: async () => ({ accountId: ROLES.epic }) };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("ATLASSIAN_EMAIL");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(issues.get("BUTCHR-9")!.comments.some((c) => c.startsWith("[BUTCHR]"))).toBe(true);
+  });
+
+  test("idempotent re-adoption (PROJECT caller): identityCollision still reported, comment NOT reposted", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", assignee: ROLES.epic, status: "In Progress" });
+    const spied: AtlassianOps = { ...ops, getMyself: async () => ({ accountId: ROLES.epic }) };
+    let commentCalls = 0;
+    const spied2: AtlassianOps = { ...spied, addComment: async (...a) => { commentCalls++; return spied.addComment(...a); } };
+    const result = await adoptWorker(spied2, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(result.identityCollision).toContain("not reposted");
+    expect(commentCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.comments).toHaveLength(0);
+  });
+
+  test("non-collision: this daemon's credential differs from roles.epic — no identityCollision, no comment", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" }); // default getMyself() = "test-account"
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(issues.get("BUTCHR-9")!.comments).toHaveLength(0);
+  });
+
+  // Same regression as the issue-caller path above, via getMyself() instead
+  // of getIssue(callerKey) — see that test's comment for the full scenario.
+  test("FAIL-SAFE: getMyself() failing does NOT fail the call, and does NOT leave the adopted epic undeclared — assign already happened, and the disposition still gets applied", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" }); // orphan epic
+    const broken: AtlassianOps = { ...ops, getMyself: async () => { throw new Error("myself endpoint down"); } };
+    const result = await adoptWorker(broken, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result).not.toHaveProperty("identityCollision");
+    expect(result.identityUnknown).toContain("myself endpoint down");
+    expect(result.identityUnknown).toContain("NOT checked");
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.assignee).toBe(ROLES.epic); // assign — already happened, unaffected
+    expect(w.status).toBe("In Progress"); // THE FIX: disposition still applied — never left undeclared
+  });
+});

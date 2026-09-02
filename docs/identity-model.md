@@ -538,3 +538,15 @@ premise you're relying on before citing "2" or "3" from this page.
 by `BUTCHR-99` from the merged version of this file — not from this PR
 directly (`set_doc` only ever writes the caller's own doc). This file is
 written to stand alone as that page's source.
+
+## The decision built on this measurement
+
+This file is a *measurement* record — every claim tagged MEASURED, CITED, or
+INFERRED, with its vantage. The *decision* this epic (`BUTCHR-100`) asked
+for — confirm or refute the triangle argument, recommend a mapping with its
+residue named, record the capability half per tier, and an
+operator-executable change proposal — is a different document, on purpose,
+so a measurement and a decision are never the same artefact:
+[`docs/identity-model-decision.md`](./identity-model-decision.md)
+(`BUTCHR-104`/`BUTCHR-125`, dated 2026-09-02). As with this page: a fresh
+measurement beats either page.
