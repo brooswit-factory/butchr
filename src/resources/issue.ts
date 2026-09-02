@@ -401,14 +401,32 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // as before this refactor. This deliberately SKIPS
           // crossDaemonSuppressed too, so the per-key comment cursor does
           // not advance this poll for this key when no watcher also touches
-          // it. That is safe: the cursor is used only as an EQUALITY check
-          // against a monotonically-growing newest-comment id (see
-          // crossDaemonSuppressed above), so leaving it one poll stale only
-          // ever biases a LATER comparison toward "not suppressed"
-          // (delivered) — it can never manufacture a match that wrongly
-          // suppresses a genuine later change. This mirrors the existing
-          // tolerance in `suppressed()` itself: an own-write-ledger hit
-          // already short-circuits before crossDaemonSuppressed ever runs.
+          // it. That is safe: the cursor is compared for EQUALITY (see
+          // crossDaemonSuppressed above) against `comments[0]?.id` from a
+          // reader that explicitly requests `orderBy: "-created"`
+          // (AtlassianClient.comments(), src/atlassian/client.ts — the
+          // reader that actually feeds this cursor; see
+          // AtlassianOps.getIssueComments's doc comment for the sibling
+          // reader used elsewhere with the same guarantee) — so leaving it
+          // one poll stale only ever biases a LATER comparison toward "not
+          // suppressed" (delivered) — it can never manufacture a match that
+          // wrongly suppresses a genuine later change.
+          //
+          // CORRECTED (BUTCHR-198/BUTCHR-202): this comment used to
+          // attribute that safety to the cursor tracking "a
+          // monotonically-growing newest-comment id". That misattributed
+          // it: the safety above rests on two things that actually hold —
+          // ids being DISTINCT (so a stale baseline cannot equal a newer,
+          // different id) and `comments[0]` genuinely being newest because
+          // the call explicitly REQUESTS `-created` order — not on
+          // monotonic growth, which is sufficient but was never necessary
+          // for this argument. Whether Jira issue-comment ids are in fact
+          // monotonic with creation time is UNMEASURED here (unlike
+          // Confluence footer-comment ids, measured twice independently to
+          // be NOT monotonic) — this comment no longer needs that premise
+          // and does not assume it. This mirrors the existing tolerance in
+          // `suppressed()` itself: an own-write-ledger hit already
+          // short-circuits before crossDaemonSuppressed ever runs.
           // BUTCHR-87: this is also why the pr:* reason keeps its own
           // NotifyReason member instead of folding into the general `label`
           // one below — `daemonLabelTransition` is a PURE function of

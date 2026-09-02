@@ -571,7 +571,7 @@ export function atlassianTools(
     },
     finish_worker: {
       description:
-        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Also WITHDRAWS the shelved-exemption label first, if the worker carries it — cleared BEFORE the transition, same ordering as start_worker's — because Done is not shelved: a finished ticket still carrying the exemption is residue, not state. Skipped entirely, at no extra Jira call, when the label isn't present. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry — and for a PROJECT caller approving an EPIC, this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_transition(key, \"Done\") for this case.",
+        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Also WITHDRAWS the shelved-exemption label first, if the worker carries it — cleared BEFORE the transition, same ordering as start_worker's — because Done is not shelved: a finished ticket still carrying the exemption is residue, not state. Skipped entirely, at no extra Jira call, when the label isn't present. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). ALSO REFUSES when the worker being closed still has an open worker of its own (BUTCHR-193) — naming it, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry — and for a PROJECT caller approving an EPIC, this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_transition(key, \"Done\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
@@ -689,10 +689,27 @@ export function atlassianTools(
         // this read used getIssue's embedded block, which was found at
         // review to be ASCENDING/oldest-first with an unconfirmed cap — if
         // ever truncated, it silently disagrees with discovery's own
-        // reader (which is newest-first and always correct). getIssueComments
-        // is the SAME reader discovery uses (see its own doc comment on
-        // AtlassianOps), so the two can never disagree by construction.
-        // Usually zero calls: most polls have no epic in review at all.
+        // reader, which requests newest-first order explicitly
+        // (`orderBy: "-created"`, see AtlassianOps.getIssueComments's own
+        // doc comment). getIssueComments is the SAME reader discovery uses,
+        // so the two can never disagree by construction. Usually zero
+        // calls: most polls have no epic in review at all.
+        //
+        // CORRECTED (BUTCHR-198/BUTCHR-202): the previous version of this
+        // comment called discovery's reader "always correct" for this
+        // purpose. That overstated it: the value below is
+        // `newestCommentId(...)` (src/resources/project.ts) — a NUMERIC MAX
+        // reduce over the reader's results, which discards the reader's
+        // newest-first order entirely and re-derives "newest" from id
+        // magnitude instead. This epics-in-review watermark therefore
+        // shares the IDENTICAL max-by-numeric-id mechanism as the Confluence
+        // root-doc watermark (`comment` above, same function) — by
+        // construction, not coincidence — and its correctness depends on
+        // Jira issue-comment ids being monotonic with creation time, a
+        // premise that is, as of BUTCHR-202, UNMEASURED (unlike the
+        // Confluence case, measured twice independently to be FALSE). The
+        // reader being newest-first does not protect this line: nothing
+        // downstream of it consults that order.
         const epics: Record<string, string | null> = {};
         for (const epic of epicsRaw?.issues ?? []) {
           epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
@@ -708,7 +725,7 @@ export function atlassianTools(
     },
     get_doc_comments: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns — sort by `id` numerically yourself, the way `newestCommentId` does, if you need newest-first). `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(
@@ -758,7 +775,7 @@ export function atlassianTools(
     },
     submit_to_boss: {
       description:
-        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS AT ALL: this is the one transition an agent is always entitled to make about itself. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review"). REFUSES A PROJECT CALLER (BUTCHR-71): a project has nothing to submit to — it never reaches a terminal state and is talked to by comments on its own root doc instead (see report_to_boss/ask_boss).',
+        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS: the only ticket it can ever act on is the caller\'s own, so there is nothing to get wrong — but it is NOT unconditional (BUTCHR-193): it REFUSES when the caller still has an open worker of its own, naming it, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review"). REFUSES A PROJECT CALLER (BUTCHR-71): a project has nothing to submit to — it never reaches a terminal state and is talked to by comments on its own root doc instead (see report_to_boss/ask_boss).',
       input: {},
       handler: async (_a, c) => {
         refuseProjectCaller(c, "submit_to_boss", "a project has nothing to submit to — it never reaches a terminal state (BUTCHR-62's design); it is talked to by comments on its own root doc instead");
@@ -773,6 +790,7 @@ export function atlassianTools(
       description:
         "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
         "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
+        "ALSO REFUSES when the caller still has an open worker of its own (BUTCHR-193) — additive and orthogonal to the has-a-boss refusal above, which this leaves untouched: naming the open worker, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. " +
         "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
         "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built. " +
         "REFUSES A PROJECT CALLER (BUTCHR-71) — that tier above epics has now arrived: a project is never \"done\" (BUTCHR-62's design keeps it sleeping/waking on events indefinitely, never reaching a terminal state), refused at the tool-registration layer here, WITHOUT this verb's own implementation being touched at all.",
