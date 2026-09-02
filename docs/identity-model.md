@@ -62,14 +62,17 @@ readable from this host reported an identical role map, or if there were
 provably only one daemon in the fleet. Neither holds — see below.
 
 **DO NOT STOP AT COMPARING ROLE VARIABLES — read the wrinkle below first.**
-Daemon B's own case shows a role-variable-only comparison would have MISSED
-its collision entirely: `BUTCHR_ASSIGNEE_EPIC` is unset there, so a check
-that only diffs `_EPIC` against `_TASK` finds "no epic variable, not
-comparable" and reports a clean page that is wrong. The quantity that
-actually matters is the **effective account a live ticket of that tier ends
-up assigned to**, not whether a same-named env var happens to be set. See
-"The wrinkle" under D1, and note D2 below is built on ticket assignees for
-exactly this reason, not on env-var diffs.
+`wroosbit`'s daemon (mine) has `BUTCHR_ASSIGNEE_EPIC` unset, so a
+role-variable-only check run from there finds "no epic variable, not
+comparable" and misses the collision entirely. But `booswrit`'s daemon has
+`_EPIC` **set**, visibly identical to its `_TASK` — a role-variable check
+run from *there* catches the same collision cleanly. **Same fleet, same
+instant, opposite answers, and nothing on either daemon signals which side
+of that you're on.** The quantity that actually matters is the **effective
+account a live ticket of that tier ends up assigned to**, not whether a
+same-named env var happens to be set on whichever daemon you happened to
+check. See "The wrinkle" under D1, and note D2 below is built on ticket
+assignees for exactly this reason, not on env-var diffs.
 
 ## D1 — Daemon enumeration and the per-daemon role map
 
@@ -109,30 +112,29 @@ this session):**
 
 **Two daemons found on `servyboi`:**
 
-| | Daemon A (mine) | Daemon B |
+| | `wroosbit`'s daemon (mine) | `booswrit`'s daemon |
 |---|---|---|
-| Unix user | `wroosbit` — MEASURED, `whoami`/`id` this session: `uid=1001(wroosbit)` | `booswrit` — MEASURED via `ps -eo pid,user,args`: pid 710855 owned by `booswrit`; **not** independently confirmed from its own `/proc/<pid>/environ` (see below) |
-| host | `servyboi` — MEASURED, `hostname` this session | `servyboi` — INFERRED (same host as Daemon A; booswrit's process appears in this same host's `ps` output) |
+| Unix user | `wroosbit` — MEASURED, `whoami`/`id` this session: `uid=1001(wroosbit)` | `booswrit` — MEASURED via `ps -eo pid,user,args`: pid 710855 owned by `booswrit`; independently corroborated by `BUTCHR-99` reading its own `/proc/710855/environ` successfully (below) |
+| host | `servyboi` — MEASURED, `hostname` this session | `servyboi` — INFERRED (same host as `wroosbit`'s daemon; booswrit's process appears in this same host's `ps` output) |
 | port | `7717` — MEASURED: `ss -ltnp` shows `*:7717` owned by `bun,pid=695036`, and `/proc/695036/environ` has `BUTCHR_PORT=7717` | `7718` — CITED, from `BUTCHR-99`'s own `ENVIRONMENT.md` (booswrit daemon's self-report, quoted to me in this ticket's brief). Corroborated MEASURED: my own `ss -ltnp` shows a second listener `*:7718` with **no attributable owning process** — the exact blind spot the brief predicted |
 | systemd unit | `butchr.service` (user unit) — MEASURED via my own `ENVIRONMENT.md` and `systemctl --user status` | `butchr.service` — CITED from `BUTCHR-99`'s `ENVIRONMENT.md`; not independently checkable by me (that's `booswrit`'s user-unit table, and `systemctl --user` only shows the calling user's units) |
 | live daemon pid | `695036` — MEASURED, `systemctl --user status butchr.service` → `Main PID: 695036 (bun)`, confirmed also in `ss -ltnp` and `ps aux` | `710855` — MEASURED via unprivileged `ps -eo pid,user,args`, which lists other users' command lines on this host; matches the pid `BUTCHR-99`'s own `ENVIRONMENT.md` cites (CITED, for the value; MEASURED, for the pid's live existence and owning user) |
-| `BUTCHR_ASSIGNEE_STORY` | SET = `712020:e160cf60-6480-44de-8554-af5b81c584e2` — MEASURED, `tr '\0' '\n' < /proc/695036/environ \| grep BUTCHR` | **not readable from here** — tried `tr '\0' '\n' < /proc/710855/environ`, got `Permission denied` (MEASURED, this session — process is owned by `booswrit`, I am `wroosbit`). Vantage that WOULD work: a process running as Unix user `booswrit` (e.g. any of the `booswrit`-owned agent sessions already running on this host), or root |
-| `BUTCHR_ASSIGNEE_TASK` | SET = `712020:619ec5ec-2e92-492f-8979-91ccda318230` — MEASURED, same read | not readable from here — same blind spot as above |
-| `BUTCHR_ASSIGNEE_EPIC` | **UNSET** — MEASURED: the `grep BUTCHR` on `/proc/695036/environ` returns `BUTCHR_PORT`, `BUTCHR_GITHUB_ORGS`, `BUTCHR_ASSIGNEE_STORY`, `BUTCHR_ASSIGNEE_TASK` and nothing else; no `BUTCHR_ASSIGNEE_EPIC` line at all | **CITED as SET**, to `712020:619ec5ec-2e92-492f-8979-91ccda318230` (same value as Daemon A's `BUTCHR_ASSIGNEE_TASK`) — per the project tier's own description on `BUTCHR-100`'s ticket ("...was set for the first time in the deploy that staffed me..."), itself sourced from that daemon's own process. Not independently readable by me — see blind spot above |
-| other identity vars found | `BUTCHR_GITHUB_ORGS=brooswit-factory,brooswit-minecraft`, `ATLASSIAN_TOKEN_FILE`, `GITHUB_TOKEN_FILE` (paths only; contents not read) — MEASURED | not readable from here |
+| `BUTCHR_ASSIGNEE_STORY` | SET = `712020:e160cf60-6480-44de-8554-af5b81c584e2` — MEASURED, `tr '\0' '\n' < /proc/695036/environ \| grep BUTCHR` | SET = `712020:e160cf60-6480-44de-8554-af5b81c584e2` — **MEASURED by `BUTCHR-99`** (Unix user `booswrit`, its own session, 2026-09-02: `tr '\0' '\n' < /proc/710855/environ \| grep BUTCHR_ASSIGNEE`), CITED here from that first-hand read — I cannot run this myself, see blind spot below |
+| `BUTCHR_ASSIGNEE_TASK` | SET = `712020:619ec5ec-2e92-492f-8979-91ccda318230` — MEASURED, same read | SET = `712020:619ec5ec-2e92-492f-8979-91ccda318230` — MEASURED by `BUTCHR-99`, same read, CITED here |
+| `BUTCHR_ASSIGNEE_EPIC` | **UNSET** — MEASURED: the `grep BUTCHR` on `/proc/695036/environ` returns `BUTCHR_PORT`, `BUTCHR_GITHUB_ORGS`, `BUTCHR_ASSIGNEE_STORY`, `BUTCHR_ASSIGNEE_TASK` and nothing else; no `BUTCHR_ASSIGNEE_EPIC` line at all | **SET** = `712020:619ec5ec-2e92-492f-8979-91ccda318230` (same value as this daemon's own `BUTCHR_ASSIGNEE_TASK`, visibly identical) — **MEASURED by `BUTCHR-99`**, same read, CITED here; supersedes the project tier's earlier prose claim on `BUTCHR-100`'s ticket, which is no longer load-bearing for this row |
+| other identity vars found | `BUTCHR_GITHUB_ORGS=brooswit-factory,brooswit-minecraft`, `ATLASSIAN_TOKEN_FILE`, `GITHUB_TOKEN_FILE` (paths only; contents not read) — MEASURED | not measured — `BUTCHR-99`'s read targeted `BUTCHR_ASSIGNEE_*` only |
 
-**This is the direct, live confirmation of H1**: Daemon A (mine, port 7717)
-has `BUTCHR_ASSIGNEE_EPIC` unset, MEASURED directly. The project tier's own
-ticket description asserts that the daemon which staffed it (almost
-certainly Daemon B, since the project-tier and story-tier agent sessions on
-this host run as `booswrit` — see the process table in H2 below) had
-`BUTCHR_ASSIGNEE_EPIC` **set**. Two daemons, same host, disagreeing on
-whether a role variable is even defined. `BUTCHR-100`'s own comment
-(2026-09-01, on `BUTCHR-100`) independently reports the identical
-Daemon-A-side measurement (`STORY`/`TASK` set, `EPIC` unset) from its own
-workspace, which is served by the same port-7717 daemon as this one — its
-`ENVIRONMENT.md` names pid `695036` too, once accounting for the restart
-noted above.
+**This is the direct, live confirmation of H1, now measured on BOTH sides
+rather than one** — the earlier version of this document had `booswrit`'s
+half as a citation; it no longer needs to be one. `wroosbit`'s daemon
+(mine, port 7717, pid 695036) has `BUTCHR_ASSIGNEE_EPIC` **unset**, MEASURED
+directly by me. `booswrit`'s daemon (port 7718, pid 710855) has it **set**
+to `619ec5ec` — MEASURED directly by `BUTCHR-99`, in its own session, from
+its own process, on 2026-09-02, and CITED here rather than re-run (I have
+no way to run it myself; see the blind spot below). Same host, same
+moment, opposite answers on whether a role variable is even defined, each
+half read first-hand by an agent that owns that daemon — no citation is
+load-bearing in H1 any more.
 
 **What I did not do, deliberately:** this host grants `wroosbit` passwordless
 `sudo`, which could read `/proc/710855/environ` across the Unix-user
@@ -143,52 +145,75 @@ identity boundary, not merely a Linux filesystem permission to be routed
 around with a different tool. The correct vantage point for that read is a
 process actually running as `booswrit`, several of which are already live on
 this host (see the H2 process table) — not a privilege escalation from mine.
+That vantage point was in fact used: `BUTCHR-99`, running as `booswrit`,
+read `/proc/710855/environ` directly in its own session and reported the
+result, which appears above as MEASURED-by-`BUTCHR-99`, CITED here rather
+than left as a named-but-unfilled gap.
 
-### The wrinkle: a role-variable comparison would have missed the collision
+### The wrinkle: whether a role-variable check catches the collision depends on which daemon you ask
 
-**CITED, from `BUTCHR-100` (the Epic tier), which measured this first-hand
-on its own daemon on 2026-09-02 and reported it to `BUTCHR-99`, which
-relayed it here** — I did not and could not run this myself (it needs
-`/proc/<pid>/environ` on the daemon serving the Epic tier, which is
-`booswrit`'s, per the blind spot above). Two checks:
+`BUTCHR-100` (the Epic tier, served by `wroosbit`'s daemon — same one I run
+on) reported, and I have **MEASURED myself directly** (D1 table above): on
+`wroosbit`'s daemon, `BUTCHR_ASSIGNEE_EPIC` is **unset**, yet `BUTCHR-100`
+(an Epic-tier ticket) is assigned `619ec5ec` regardless. So this daemon's
+assignment did **not** come from *this* daemon's `_EPIC` role variable —
+there isn't one to source it from. I do not need to cite `BUTCHR-100` for
+this half at all; it is the same fact I already measured directly for D1,
+and the earlier version of this document mislabelled it as a citation.
 
-- **Check B**: `BUTCHR-100` compared its own daemon's `BUTCHR_ASSIGNEE_TASK`
-  against `BUTCHR-100`'s own ticket `assignee.accountId`. Both
-  `712020:619ec5ec-2e92-492f-8979-91ccda318230`, identical. *Falsification,
-  as `BUTCHR-100` stated it before running:* had they differed, an Epic on
-  that daemon adopting a Task would land on a different account and the hop
-  would work. They did not differ.
-- **The load-bearing part**: on that same daemon, `BUTCHR_ASSIGNEE_EPIC` is
-  **unset** — yet `BUTCHR-100` (an Epic-tier ticket) is assigned
-  `619ec5ec` regardless. Its assignment therefore did **not** come from
-  that daemon's `_EPIC` role variable (there isn't one to source it from).
-  **The collision is not "the epic role variable equals the task role
-  variable" — it is "the account the Epic actually runs as equals that
-  daemon's task role", by whatever mechanism actually staffed that
-  particular Epic** (this document does not have visibility into what that
-  mechanism was — an explicit `assignee` override on the creating call is
-  one candidate, per this repo's own tool docs for `jira_create_issue`/
-  `new_worker`, but that is **INFERRED**, not confirmed here).
+- **Check B** (CITED from `BUTCHR-100`, which ran it in its own session,
+  2026-09-02): compared this same daemon's `BUTCHR_ASSIGNEE_TASK` against
+  `BUTCHR-100`'s own ticket `assignee.accountId`. Both
+  `712020:619ec5ec-2e92-492f-8979-91ccda318230`, identical — I can also
+  confirm both halves myself, since I already have this daemon's
+  `BUTCHR_ASSIGNEE_TASK` (D1 table) and `BUTCHR-100`'s assignee
+  (`jira_get_issue`, D2 table). *Falsification, as `BUTCHR-100` stated it
+  before running:* had they differed, an Epic on this daemon adopting a
+  Task would land on a different account and the hop would work. They did
+  not differ.
 
-**Consequence, stated plainly:** a check that diffs role variables against
-each other, and treats an unset variable as "not comparable", would find no
-`_EPIC` value on this daemon, report a clean page, and be wrong — this is
-the general shape of a silently-wrong answer this whole epic is about. This
-is exactly why D2 below is built on **live ticket assignees** (the
+**The puzzle this used to leave open — now resolved, not merely a wrinkle.**
+Where DID `BUTCHR-100`'s `619ec5ec` assignment come from, if not from the
+daemon serving its own agent? `BUTCHR-100` was staffed (via `new_worker`)
+by the **project tier**, which this document's H2 table places on
+`booswrit`'s daemon. `booswrit`'s daemon has just been MEASURED (by
+`BUTCHR-99`, above) to have `BUTCHR_ASSIGNEE_EPIC` **set** to exactly
+`619ec5ec` — the identical value. **The staffing-mechanism argument below
+made a prediction from source code alone, before this measurement existed,
+and the measured value on the predicted daemon matches it exactly:**
+`BUTCHR-100`'s account came from the role map of the daemon serving the
+**boss that staffed it** (`booswrit`'s, the project tier's), not from the
+role map of whichever daemon happens to serve `BUTCHR-100`'s own agent
+today (`wroosbit`'s). No unexplained mechanism remains — see "The
+mechanism" below.
+
+**Consequence for method, stated plainly, and sharper than "misses it":**
+it is not that a role-variable diff always misses this collision — on
+`booswrit`'s daemon the same kind of diff *catches* it cleanly, because
+`_EPIC` and `_TASK` are visibly identical there. **The real danger is that
+whether a role-variable check finds the collision depends entirely on
+which daemon you happen to read it from — same fleet, same instant,
+opposite answers, with no signal on either daemon telling you which side of
+that you're on.** That is a stronger and more general argument for
+anchoring on live ticket assignees than "it's a fallback for an unreadable
+daemon": a role-variable check can give you a false sense of security even
+when it runs successfully, purely by chance of vantage point.
+
+This is exactly why D2 below is built on **live ticket assignees** (the
 *effective* account a tier's work actually lands under) rather than on
-env-var diffs — the env-var table above is a useful, and here genuinely
-incomplete, corroborating layer, never the primary instrument.
+env-var diffs — the env-var table above is a useful corroborating layer,
+never the primary instrument.
 
-It is also independent evidence for H1: a role map with `_EPIC` unset, on a
-daemon whose Epic-tier ticket is nonetheless assigned, means a tier's
-*effective* identity is sometimes not recoverable from that daemon's role
-map at all — you have to read a live ticket.
+It is also independent evidence for H1: a role map that is silent on a
+tier, on a daemon whose ticket of that tier is nonetheless assigned, means
+a tier's *effective* identity is sometimes not recoverable from the daemon
+serving its own agent at all — you have to read a live ticket, or trace
+which daemon actually did the staffing.
 
-**The mechanism, now confirmed rather than left as a puzzle**: which
-daemon's role map actually staffs a given ticket is not "the daemon that
-will end up serving that ticket's own agent" — it's **the daemon serving
-whichever boss's `new_worker`/`adopt_worker` call created it.** MEASURED,
-by reading the wiring this session (`src/daemon/index.ts` line binding
+**The mechanism** — which daemon's role map actually staffs a given ticket
+is not "the daemon that will end up serving that ticket's own agent", it's
+**the daemon serving whichever boss's `new_worker`/`adopt_worker` call
+created it.** MEASURED, by reading the wiring this session (`src/daemon/index.ts` line binding
 `atlassianTools(ops, undefined, config.assignees, recordOwnWrite)`, and
 `src/tools/defs.ts`'s `new_worker`/`adopt_worker` handlers, which close over
 that same `roles` value and never re-read it per-call): each daemon reads
@@ -197,7 +222,7 @@ at boot, and every `new_worker`/`adopt_worker` call handled by that daemon
 process resolves the role from that one frozen snapshot — regardless of
 which ticket (`x-issue`) is calling. So `BUTCHR-100`'s assignment did not
 come from "the daemon that now serves `BUTCHR-100`'s own agent" (which
-happens to be Daemon A, mine, going by its `ENVIRONMENT.md`) — it came from
+happens to be `wroosbit`'s daemon, mine, going by its `ENVIRONMENT.md`) — it came from
 whichever daemon's MCP endpoint the **project tier** was actually calling
 `new_worker`/`adopt_worker` on on 2026-09-01, at the moment `BUTCHR-100`
 was created. **A ticket's identity is set once, at staffing time, by the
@@ -251,6 +276,13 @@ it first-hand as instructed.
   process observed ran as `booswrit`. This lines up exactly with which
   daemon (A or B) each of those tickets' `ENVIRONMENT.md` cites — INFERRED
   from the two measured lists together.
+- **The blind spot is symmetric, not a quirk of one user's privileges** —
+  CITED from `BUTCHR-99`, which ran the mirror-image check in its own
+  session: from `booswrit`, `ss -ltnp` attributes port 7718 to its own
+  process and shows port 7717 with no attributable owner — the exact
+  reverse of what I see from `wroosbit`. Each daemon is fully visible to
+  itself and invisible to the other; H2 is now confirmed independently
+  from both vantage points, not just observed from mine.
 
 *Falsification, stated in advance:* H2 would be refuted by exactly one
 butchr listener on the host, or by every listener being attributable to a
@@ -313,15 +345,20 @@ called out per-hop below.
 **This is the primary method for a correctness reason, not merely an
 availability one.** It needs no daemon access at all, which does mean it
 still covers a hop whose daemon is unreadable from here — but "The wrinkle"
-above shows it is more than a fallback: a role-*variable* comparison
-provably misses a real collision (Daemon B's `_EPIC` is unset, yet a live
-Epic-tier ticket there is assigned the collision account anyway), while a
-live-*ticket*-assignee comparison cannot miss it, because it reads the
-account a tier's work actually landed under rather than a variable that
-may not have been the source of that assignment at all. **The effective
-assignee of a live ticket must be one side of every hop comparison; role
-variables are corroboration, never the primary instrument** — that is the
-rule this document's own D1 findings force, not a convenience.
+above shows it is more than a fallback. A role-*variable* comparison run
+from `wroosbit`'s daemon finds no `_EPIC` value at all and misses the
+collision entirely; the same kind of comparison run from `booswrit`'s
+daemon catches it cleanly, because `_EPIC` and `_TASK` are visibly
+identical there. **Whether a role-variable check finds this collision
+depends on which daemon happens to answer it — same fleet, same instant,
+opposite results, with no signal on either daemon telling you which side
+you're on.** A live-*ticket*-assignee comparison cannot have that failure
+mode, because it reads the account a tier's work actually landed under,
+which is a single fact independent of which daemon you happen to be able
+to query. **The effective assignee of a live ticket must be one side of
+every hop comparison; role variables are corroboration, never the primary
+instrument** — that is the rule this document's own D1 findings force, not
+a convenience.
 
 For `project→epic`, there is no worker-side "assignee" (a project has no
 ticket), so the applicable reading is the epic's `creator` (who ran
