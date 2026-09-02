@@ -224,7 +224,7 @@ export interface ReconcileOptions {
    * runs (every caller before this ticket, and any caller with nothing to
    * report through).
    */
-  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[]) => Promise<void>;
+  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
 }
 
 /**
@@ -380,7 +380,30 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   }
   // BUTCHR-147: called once per poll, after every isolated spawn/stop/respawn
   // attempt above — never gates or delays anything (see ReconcileOptions.checkReconcileFailure's own doc comment).
-  if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()]);
+  // REVIEW FIX (PR #204 round 1): `running` (captured once, above, same
+  // array `planReconcile` itself used) is now passed alongside `desired` —
+  // the detector's own pruning needs BOTH to safely track a `plan.stop`
+  // failure, which is never in `desired` (see reconcile-failure.ts's
+  // `ReconcileFailureDetector.check` doc comment for the full reasoning).
+  //
+  // NOT double-wrapped in a try/catch here (PR #204 review, non-blocking):
+  // deliberately consistent with `checkCrashLoop` immediately above, not
+  // with `checkParked`'s belt-and-suspenders wrap in `runResourceLoop`
+  // below — a real disagreement between two call sites in this same file,
+  // called out explicitly by the reviewer. The choice made here: this
+  // detector's OWN "never throws" contract (`check`'s internal try/catch,
+  // src/agents/reconcile-failure.ts) is exactly as load-bearing as
+  // `checkCrashLoop`'s equivalent guarantee at the call site directly
+  // above, which has never been double-wrapped either — a second wrapper
+  // HERE would add no guarantee beyond what `check`'s own try/catch already
+  // gives, only a duplicate of it. `checkParked`'s extra wrap is not doing
+  // the same job: it exists because that hook runs several calls further
+  // into the SAME fetch-stage function, so a regression to ITS "never
+  // throws" contract would otherwise take `onPollSuccess` down with it in a
+  // way harder to trace back to the actual offender. If `check`'s own
+  // try/catch here is ever removed or narrowed, this call site becomes
+  // exactly that same hazard and should be wrapped too.
+  if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
 }
 
 /**
@@ -504,7 +527,7 @@ export interface GenericLoopDeps<T> {
   /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   /** BUTCHR-147: see `ReconcileOptions.checkReconcileFailure`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance, same reasoning as `checkCrashLoop` above. Optional; omitted, no isolated-failure detection runs. */
-  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[]) => Promise<void>;
+  checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;

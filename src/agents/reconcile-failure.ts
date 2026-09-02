@@ -118,9 +118,9 @@ interface Entry {
 export class ReconcileFailureTracker {
   private readonly entries = new Map<string, Entry>();
 
-  /** Drop tracking for every id not in `stillDesired` this poll. */
-  forgetMissing(stillDesired: ReadonlySet<string>): void {
-    for (const key of [...this.entries.keys()]) if (!stillDesired.has(key)) this.entries.delete(key);
+  /** Drop tracking for every id not in `stillInPlay` this poll. */
+  forgetMissing(stillInPlay: ReadonlySet<string>): void {
+    for (const key of [...this.entries.keys()]) if (!stillInPlay.has(key)) this.entries.delete(key);
   }
 
   /** Record a failure observed for `id` at `at`; returns the timestamps still inside the rolling `windowMs` window (oldest-first). */
@@ -175,13 +175,39 @@ export interface ReconcileFailureDetectorDeps {
 export interface ReconcileFailureDetector {
   /**
    * One poll's worth of detection, called AFTER `reconcileNow`'s isolated
-   * spawn/stop/respawn attempts for this poll (src/daemon/loop.ts) — `failures`
-   * is exactly the set that failed this poll; `desired` is `desired.keys()`
-   * from the same poll, used only for pruning (see `forgetMissing`). Never
-   * gates or delays anything and is never consulted for control flow — see
-   * the audible-only ruling in this module's own top comment. Never throws.
+   * spawn/stop/respawn attempts for this poll (src/daemon/loop.ts) —
+   * `failures` is exactly the set that failed this poll; `desired` and
+   * `running` are `desired.keys()`/`herd.runningIssues()` from the SAME
+   * poll, used only for pruning (see `forgetMissing`). Never gates or delays
+   * anything and is never consulted for control flow — see the audible-only
+   * ruling in this module's own top comment. Never throws.
+   *
+   * REVIEW FIX (BUTCHR-147, PR #204 round 1): pruning used to key on
+   * `desired` alone, copied from crash-loop.ts's own tracker. That key is
+   * safe THERE because crash-loop.ts only ever tracks `plan.spawn` ids,
+   * which are in `desired` by construction (`spawn = desired − running`).
+   * This module widened the tracked set to all three stages, and a
+   * `plan.stop` id is in `desired` NEVER (`stop = running − desired −
+   * atRest`, src/reconcile/plan.ts) — so keying only on `desired` deleted
+   * every stop-failure entry on the very next poll, before a second failure
+   * could ever be recorded: the count was pinned at 1 forever and a
+   * persistently-failing `herd.stop` could never reach `THRESHOLD_COUNT`
+   * and never spoke. Measured on PR #204's review: 10 consecutive polls of a
+   * persistently-failing stop produced zero complaints.
+   *
+   * `desired ∪ running` is safe for all three stages: `plan.spawn` ⊆
+   * `desired`, `plan.respawn` ⊆ `desired ∩ running`, and `plan.stop` ⊆
+   * `running` (all per `planReconcile`'s own definitions) — so an id that
+   * keeps failing the SAME stage every poll necessarily keeps satisfying
+   * this union every poll (a resource whose `herd.stop` keeps failing is,
+   * by definition, still running), and an entry is only ever dropped once
+   * the id genuinely leaves both sets — i.e. once it is truly no longer in
+   * play, which is exactly when forgetting it (and thus resetting its
+   * episode) is correct. This still bounds the map: an id absent from BOTH
+   * `desired` and `running` for a whole poll cannot still be failing
+   * anything this module tracks.
    */
-  check: (failures: readonly ReconcileFailure[], desired: readonly string[]) => Promise<void>;
+  check: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
 }
 
 /** Builds the detector wired into `reconcileNow`'s `ReconcileOptions.checkReconcileFailure` (src/daemon/loop.ts), called once per poll after the isolated spawn/stop/respawn attempts. */
@@ -231,9 +257,9 @@ export function createReconcileFailureDetector(deps: ReconcileFailureDetectorDep
     return postedAt;
   }
 
-  async function check(failures: readonly ReconcileFailure[], desired: readonly string[]): Promise<void> {
+  async function check(failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]): Promise<void> {
     try {
-      tracker.forgetMissing(new Set(desired));
+      tracker.forgetMissing(new Set([...desired, ...running]));
       for (const f of failures) {
         const message = (f.error as Error)?.message ?? String(f.error);
         const times = tracker.recordFailure(f.id, f.stage, message, deps.now(), WINDOW_MS);

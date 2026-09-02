@@ -255,7 +255,7 @@ describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/
     expect(respawned).toEqual([]);
   });
 
-  test("checkReconcileFailure is called ONCE per poll, after every isolated attempt, with exactly the failures this poll produced plus desired.keys()", async () => {
+  test("checkReconcileFailure is called ONCE per poll, after every isolated attempt, with exactly the failures this poll produced plus desired.keys() AND herd.runningIssues() (REVIEW FIX, PR #204 round 1)", async () => {
     const herd = fakeHerd(["OLD"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
     herd.running.add("STALE");
     herd.spawn = async (sp) => {
@@ -263,9 +263,9 @@ describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/
       if (sp.key === "STALE") throw new Error("boom-respawn-spawn");
     };
     const desired = new Map([["BAD", spec("BAD")], ["STALE", spec("STALE")]]);
-    const calls: Array<{ failures: readonly { id: string; stage: string; error: unknown }[]; desired: readonly string[] }> = [];
+    const calls: Array<{ failures: readonly { id: string; stage: string; error: unknown }[]; desired: readonly string[]; running: readonly string[] }> = [];
     await reconcileNow(herd, desired, {
-      checkReconcileFailure: async (failures, desiredKeys) => { calls.push({ failures, desired: desiredKeys }); },
+      checkReconcileFailure: async (failures, desiredKeys, running) => { calls.push({ failures, desired: desiredKeys, running }); },
     });
     expect(calls.length).toBe(1);
     const byId = Object.fromEntries(calls[0]!.failures.map((f) => [f.id, f]));
@@ -274,6 +274,12 @@ describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/
     expect(byId["STALE"]!.stage).toBe("respawn");
     expect((byId["STALE"]!.error as Error).message).toBe("boom-respawn-spawn");
     expect(calls[0]!.desired.slice().sort()).toEqual(["BAD", "STALE"]);
+    // OLD (running, not desired) is a `plan.stop` candidate — it must be
+    // visible in `running` even though it is absent from `desired`, or the
+    // detector's own fix (union `desired` with `running` for pruning) has
+    // nothing to prune against. This is the exact defect PR #204's review
+    // caught: before the fix, `running` was never passed at all.
+    expect(calls[0]!.running.slice().sort()).toEqual(["OLD", "STALE"]);
   });
 
   test("negative case: an ordinary poll with no rejection behaves EXACTLY as before — checkReconcileFailure is called with an empty failures array, same spawns/stops/respawns/onRespawn as with the hook omitted entirely", async () => {

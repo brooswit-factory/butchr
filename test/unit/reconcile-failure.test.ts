@@ -74,10 +74,10 @@ describe("createReconcileFailureDetector: the threshold itself", () => {
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("blip") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("blip") }], ["S1"], ["S1"]);
     for (let i = 1; i <= 20; i++) {
       now = i * MIN;
-      await det.check([], ["S1"]); // still desired, no further failure — recovered
+      await det.check([], ["S1"], ["S1"]); // still desired, no further failure — recovered
     }
     expect(chan.posted).toEqual([]);
   });
@@ -86,9 +86,9 @@ describe("createReconcileFailureDetector: the threshold itself", () => {
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("workspace.create failed") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("workspace.create failed") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     now = MIN;
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("workspace.create failed") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("workspace.create failed") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     expect(chan.posted.length).toBe(1);
     expect(chan.posted[0]!.target).toBe("BUTCHR-1");
     const text = chan.posted[0]!.text;
@@ -104,9 +104,9 @@ describe("createReconcileFailureDetector: the threshold itself", () => {
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     now = 20 * MIN; // well past the 15-minute window
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     expect(chan.posted).toEqual([]);
   });
 
@@ -119,14 +119,14 @@ describe("createReconcileFailureDetector: the threshold itself", () => {
       addComment: chan.addComment,
       comments: async (id) => { fetches++; return chan.comments(id); },
     });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     now = MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     expect(chan.posted.length).toBe(1);
     const fetchesAfterFirstPost = fetches;
     for (let i = 2; i <= 10; i++) {
       now = i * MIN;
-      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     }
     expect(chan.posted.length).toBe(1); // no duplicate
     expect(fetches).toBe(fetchesAfterFirstPost); // no extra I/O once latched
@@ -136,19 +136,19 @@ describe("createReconcileFailureDetector: the threshold itself", () => {
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     now = MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     expect(chan.posted.length).toBe(1);
 
     now = 2 * MIN;
-    await det.check([], []); // S1 left desired entirely — forgetMissing drops it
+    await det.check([], [], []); // S1 left desired entirely — forgetMissing drops it
 
     now = 3 * MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("y") }], ["S1"]); // fresh episode, 1st failure
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("y") }], ["S1"], ["S1"]); // fresh episode, 1st failure
     expect(chan.posted.length).toBe(1); // not yet — only one failure this episode
     now = 4 * MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("y") }], ["S1"]); // 2nd failure of the NEW episode
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("y") }], ["S1"], ["S1"]); // 2nd failure of the NEW episode
     // findMarked adopts the still-present first-episode comment rather than
     // posting a second one — same known/accepted limitation as crash-loop's
     // fingerprint-only dedupe (test/unit/crash-loop.test.ts's identical
@@ -169,15 +169,15 @@ describe("createReconcileFailureDetector: Rule 2a — 'could not check' must nev
       comments: async (id) => { if (fail) throw new Error("503"); return chan.comments(id); },
       log: (l) => logs.push(l),
     });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     now = MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     expect(chan.posted).toEqual([]);
     expect(logs.some((l) => l.includes("WARNING: [reconcile]") && l.includes("comments fetch failed"))).toBe(true);
 
     fail = false;
     now = 2 * MIN;
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]); // count already >= 2 from the failed-fetch polls above; now succeeds
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]); // count already >= 2 from the failed-fetch polls above; now succeeds
     expect(chan.posted.length).toBe(1);
   });
 
@@ -188,9 +188,9 @@ describe("createReconcileFailureDetector: Rule 2a — 'could not check' must nev
       addComment: async () => { throw new Error("boom"); },
       comments: async () => [],
     });
-    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+    await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
     now = MIN;
-    await expect(det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"])).resolves.toBeUndefined();
+    await expect(det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"])).resolves.toBeUndefined();
   });
 });
 
@@ -202,11 +202,11 @@ describe("createReconcileFailureDetector: rate cap", () => {
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: async () => [], log: (l) => logs.push(l) });
     for (let cycle = 0; cycle < 5; cycle++) {
       now = cycle * 10 * MIN;
-      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
       now = cycle * 10 * MIN + 1 * MIN;
-      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"]);
+      await det.check([{ id: "S1", stage: "spawn", error: new Error("x") }], ["S1"], ["S1"]);
       now = cycle * 10 * MIN + 2 * MIN;
-      await det.check([], []); // forget — fresh floor next cycle
+      await det.check([], [], []); // forget — fresh floor next cycle
     }
     expect(chan.posted.length).toBe(3); // capped at 3/hour even across 5 fresh episodes
     expect(logs.some((l) => l.startsWith("WARNING: [reconcile]") && l.includes("rate cap"))).toBe(true);
@@ -218,9 +218,9 @@ describe("reconcileFailureComment: not answerable, and immune to the real parseD
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     now = MIN;
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     const text = chan.posted[0]!.text;
     expect(/^\s*ANSWER /m.test(text)).toBe(false);
     expect(parseDirective(text)).toBeNull();
@@ -242,9 +242,9 @@ describe("createReconcileFailureDetector: bracket-delimited dedupe anchor — a 
     let now = 0;
     const chan = fakeChannel();
     const det = createReconcileFailureDetector({ now: () => now, addComment: chan.addComment, comments: chan.comments });
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     now = MIN;
-    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"]);
+    await det.check([{ id: "BUTCHR-1", stage: "spawn", error: new Error("x") }], ["BUTCHR-1"], ["BUTCHR-1"]);
     expect(chan.posted.length).toBe(1);
     const text = chan.posted[0]!.text;
     const rows = [{ id: "x", body: text, created: new Date().toISOString() }];
@@ -270,17 +270,17 @@ describe("createReconcileFailureDetector: works for a resource with NO ticket, v
 
     const projectId = "BUTCHR";
     const before = createReconcileFailureDetector({ now: () => now, addComment, comments });
-    await before.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId]);
+    await before.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId], [projectId]);
     now = MIN;
-    await before.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId]);
+    await before.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId], [projectId]);
     expect(pageComments.length).toBe(1); // posted for real, through the real wrap
 
     // Simulate a daemon restart: a brand-new detector, no in-memory tracking, same underlying channel.
     const after = createReconcileFailureDetector({ now: () => now, addComment, comments });
     now = 10 * MIN;
-    await after.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId]);
+    await after.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId], [projectId]);
     now = 11 * MIN;
-    await after.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId]);
+    await after.check([{ id: projectId, stage: "spawn", error: new Error("workspace.create failed") }], [projectId], [projectId]);
     expect(pageComments.length).toBe(1); // adopted via the real unwrap, not re-posted
   });
 });
@@ -330,8 +330,52 @@ describe("BUTCHR-147 §5 — the crash-loop overlap, MEASURED against the real r
   });
 });
 
+describe("BUTCHR-147 review fix (PR #204 round 1) — a persistently-failing herd.stop now reaches the threshold and speaks", () => {
+  /**
+   * MEASURED ON THE PRE-FIX CODE (the reviewer's own probe): pruning keyed
+   * on `desired` alone deleted a stop-failure's entry every poll — a
+   * `plan.stop` id is NEVER in `desired` (`stop = running − desired − atRest`,
+   * src/reconcile/plan.ts) — so the count was pinned at 1 forever and
+   * `THRESHOLD_COUNT` (2) was unreachable. Ten consecutive polls produced
+   * zero complaints. Falsifier stated before running THIS test, on the fixed
+   * code: if a persistently-failing herd.stop still does NOT post within 10
+   * polls, the fix is wrong. This drives the REAL `reconcileNow`, not
+   * `check` directly — a direct-`check` test is what hid the defect
+   * originally, because it always passed the failing id inside `desired`.
+   */
+  test("a persistently-rejecting herd.stop, driven through the REAL reconcileNow for 10 polls, posts exactly once, at poll 2", async () => {
+    let now = 0;
+    const posted: string[] = [];
+    const det = createReconcileFailureDetector({ now: () => now, addComment: async (_id, text) => { posted.push(text); }, comments: async () => [] });
+    // OLD-1: running, never desired — plan.stop every poll — and its
+    // herd.stop() always throws, so it stays running (never actually
+    // stopped) on every subsequent poll too, exactly like the reviewer's
+    // own ARM A probe.
+    const herd: Herd = {
+      async runningIssues() { return ["OLD-1"]; },
+      async staleIssues() { return []; },
+      async spawn() {},
+      async stop() { throw new Error("herdr stop refused: pane busy"); },
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const desired = new Map<string, { key: string; issuetype: string; summary: string; parent: null }>();
+    let firedAtPoll = -1;
+    for (let i = 0; i < 10; i++) {
+      now = i * 60_000;
+      await reconcileNow(herd, desired, { checkReconcileFailure: det.check });
+      if (firedAtPoll === -1 && posted.length) firedAtPoll = i;
+    }
+    expect(posted.length).toBe(1);
+    expect(firedAtPoll).toBe(1); // 0-indexed: the 2nd poll is where the 2nd failure crosses THRESHOLD_COUNT
+    expect(posted[0]).toContain("OLD-1");
+    expect(posted[0]).toContain("stop");
+    expect(posted[0]).toContain("herdr stop refused: pane busy");
+  });
+});
+
 describe("ReconcileFailureTracker", () => {
-  test("recordFailure prunes to the rolling window and forgetMissing drops ids no longer desired", () => {
+  test("recordFailure prunes to the rolling window and forgetMissing drops ids missing from the union it's given", () => {
     const tracker = new ReconcileFailureTracker();
     const t1 = tracker.recordFailure("A", "spawn", "e1", 0, 15 * MIN);
     expect(t1).toEqual([0]);
@@ -341,5 +385,17 @@ describe("ReconcileFailureTracker", () => {
     expect(tracker.isSpoken("A")).toBe(true);
     tracker.forgetMissing(new Set());
     expect(tracker.isSpoken("A")).toBe(false); // forgotten entirely
+  });
+
+  test("REVIEW FIX (PR #204 round 1): an id absent from `desired` but present in `running` (a plan.stop candidate) SURVIVES forgetMissing across polls, so its failure count can actually accumulate", () => {
+    const tracker = new ReconcileFailureTracker();
+    tracker.recordFailure("OLD-1", "stop", "e1", 0, 15 * MIN);
+    // Old (broken) call would have been forgetMissing(new Set(desired)) with
+    // desired = [] here, which deletes "OLD-1" and resets it to zero. The
+    // fixed call unions in `running`, where "OLD-1" (running, undesired) still
+    // is every poll it keeps failing to stop.
+    tracker.forgetMissing(new Set([...[], ...["OLD-1"]]));
+    const t2 = tracker.recordFailure("OLD-1", "stop", "e2", MIN, 15 * MIN);
+    expect(t2.length).toBe(2); // NOT reset to 1 — this is exactly what PR #204's review round 1 caught
   });
 });
