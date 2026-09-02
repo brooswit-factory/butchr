@@ -8,12 +8,37 @@ correspond to the code that actually merges").
 
 **This correction reaches this file, on `main`, and nothing else.** It
 does not reach an agent whose `brief.md` is served from a daemon's
-checked-out tree rather than freshly cloned from `main` (a real,
-independently-confirmed gap — see BUTCHR-181's report on its own ticket
-for the measurement). It does not rewrite a `brief.md` already sitting on
-disk for an agent that is mid-run. It never reaches a context an agent
-already loaded before this landed. Landing this file is necessary and is
-not sufficient; closing that gap is BUTCHR-150's, not this document's.
+checked-out tree rather than freshly cloned from `main`. It does not
+rewrite a `brief.md` already sitting on disk for an agent that is
+mid-run. It never reaches a context an agent already loaded before this
+landed. Landing this file is necessary and is not sufficient; closing
+that gap is BUTCHR-150's, not this document's.
+
+**This is not hypothetical — a live specimen, measured, not inherited.**
+An EARLIER correction to this same protocol already happened once:
+`briefs/story.md` and `briefs/task.md` on `main` used to assert "an
+older review holds its sha while a later one moves" as a **confirmed**
+mechanism — this document's own Method section names that mechanism as
+inherited-and-refuted (see above). BUTCHR-148 (`main` commit `09cbceb`)
+removed that text from both files; `main` has carried the corrected
+text ever since, and BUTCHR-181's own read of `origin/main` found no
+trace of the old sentence anywhere in the repository (checked by
+content — `grep -c`, not by ancestry, per this document's own standing
+warning about squash merges defeating `--is-ancestor`). **And yet**, on
+the host that reviewed BUTCHR-181's own PR, resolving the daemon pid
+from that reviewer's own workspace `ENVIRONMENT.md` and reading
+`/proc/<pid>/cwd`, the tree the daemon actually serves briefs from
+(clean working tree, `HEAD` well behind `origin/main`) still contained
+the refuted sentence in both files, byte-for-byte — confirmed a second
+time by the reviewing agent's own `brief.md`, the very one it was
+running from. **A correction landing on `main` is not evidence a
+currently-running agent's instructions changed.** Falsifier for anyone
+re-checking this on their own host: resolve your daemon's pid from your
+own `ENVIRONMENT.md` (never from a pid quoted in this document — a
+different host's pid is silently wrong for you), read
+`/proc/<pid>/cwd`, and `grep -c "confirmed on two PRs" <tree>/briefs/story.md
+<tree>/briefs/task.md` — 0 on both means this specimen does not
+reproduce on your host; any nonzero count means it does.
 
 Repeatable verifier: `scripts/verify-review-commit-immutability.ts`
 (`snapshot <owner/repo> <pr-number> [out-file]`, `diff <a.json> <b.json>`).
