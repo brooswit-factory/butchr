@@ -472,10 +472,80 @@ export interface ProjectResourceDeps {
   allowlist: ReadonlySet<string>;
 }
 
-interface EligibleCandidate {
+/** One project this codebase has decided is a peer — see `resolveEligibleProjects`'s own doc comment. `rootDocId`/`wake` are internal fields `loadProjects` needs to build a full `ProjectResource`; the `list_peers` MCP verb (src/tools/defs.ts) reads only `key`/`name` off this and must NOT surface `rootDocId` (BUTCHR-188: a page id captured in a listing can go stale between the listing and a later send — resolve it fresh at send time instead). */
+export interface EligibleProject {
   key: string;
   name: string;
-  property: { rootDoc?: { id?: string }; wake?: Partial<ProjectWatermark> };
+  rootDocId: string;
+  wake: Partial<ProjectWatermark> | undefined;
+}
+
+/** The result of `resolveEligibleProjects` — see its own doc comment. */
+export interface ProjectEligibility {
+  /** Every LIVE project led by this credential and admitted past `preFilter` (if any) — whether or not it went on to pass the property-read eligibility check. `loadProjects` uses this (not `eligible`) to still report a led-but-ineligible project as a `ProjectResource` with `eligible: false`, rather than silently dropping it from discovery. */
+  admitted: readonly { key: string; name: string }[];
+  /** The subset of `admitted` that is genuinely ELIGIBLE — see `resolveEligibleProjects`'s own doc comment for why this, and only this, is "who is a peer". */
+  eligible: readonly EligibleProject[];
+}
+
+/**
+ * THE SINGLE, REUSABLE RESOLVER for "who is a peer" / "who is eligible"
+ * (BUTCHR-184/BUTCHR-188) — Declaration 2 in this file's top comment, live +
+ * led by this credential + a readable `butchr` entity property naming a root
+ * doc. `loadProjects` below and the `list_peers` MCP verb (src/tools/defs.ts)
+ * BOTH call this and nothing else computes eligibility — there is
+ * deliberately no second implementation anywhere in this codebase to drift
+ * out of sync with this one (the same "exactly one of these" discipline as
+ * the own-channel comment reader, and the cautionary tale of the two
+ * disagreeing issue-key regexes in src/resources/id.ts). If a future call
+ * site needs "who is a peer", it imports this function; it does not
+ * recompute the lead filter or the property read inline.
+ *
+ * `preFilter`, OPTIONAL and applied to the lead-filtered set BEFORE any
+ * per-project I/O (the property read): this is what lets `loadProjects`
+ * plug in the staffing allowlist while preserving its existing cost
+ * ordering — an unlisted project costs nothing beyond one in-memory check,
+ * never reaching the property read (see `ProjectResourceDeps.allowlist`'s
+ * own doc comment for why that gate must run before per-project I/O).
+ * `list_peers` passes NO `preFilter` at all: peers are computed from
+ * ELIGIBILITY alone, never the staffing allowlist — the allowlist is a
+ * ROLLOUT GATE, not an eligibility rule (again, `ProjectResourceDeps.allowlist`'s
+ * doc comment says so explicitly). An eligible-but-not-yet-allowlisted
+ * project is therefore a valid peer even though no agent is currently
+ * staffed for it — `tell_peer`ing it would post to a root page nobody
+ * currently reads, an accepted consequence of this increment (BUTCHR-188),
+ * not a defect to engineer around here.
+ *
+ * FAILS CLOSED, exactly matching `loadProjects`' pre-existing discipline
+ * (BUTCHR-81): a genuinely missing `butchr` property (a clean 404, via
+ * `getProjectPropertyOrNull`) simply excludes that project from `eligible`
+ * (it still appears in `admitted`). ANY OTHER read failure — rate limit,
+ * timeout, permission change — is left to PROPAGATE and reject this whole
+ * call, deliberately, rather than being swallowed into a shorter-than-true
+ * result: a project this call could not classify is not a peer, and it is
+ * not silently dropped into "not a peer" either — the caller sees the error.
+ */
+export async function resolveEligibleProjects(
+  ops: AtlassianOps,
+  preFilter?: (key: string) => boolean,
+): Promise<ProjectEligibility> {
+  const me = await ops.getMyself();
+  const raw = await ops.searchProjects("live");
+  const led = raw.values.filter((p) => p.lead?.accountId === me.accountId);
+  const admitted = preFilter ? led.filter((p) => preFilter(p.key)) : led;
+
+  const properties = await Promise.all(
+    admitted.map(async (p): Promise<EligibleProject | null> => {
+      // Only a clean NOT-FOUND is ineligibility; any other rejection
+      // propagates (see this function's own doc comment above).
+      const property = (await ops.getProjectPropertyOrNull(p.key, PROPERTY_KEY)) as { rootDoc?: { id?: string }; wake?: Partial<ProjectWatermark> } | null;
+      if (!property?.rootDoc?.id) return null;
+      return { key: p.key, name: p.name, rootDocId: property.rootDoc.id, wake: property.wake };
+    }),
+  );
+  const eligible = properties.filter((p): p is EligibleProject => p !== null);
+
+  return { admitted: admitted.map((p) => ({ key: p.key, name: p.name })), eligible };
 }
 
 /**
@@ -489,7 +559,9 @@ interface EligibleCandidate {
  * fail this poll; ANY OTHER per-project read failure (rate limit, timeout,
  * permission change, …) here or anywhere else in this function is left to
  * PROPAGATE and fail the WHOLE poll, deliberately, rather than being
- * swallowed into a shorter-than-true result.
+ * swallowed into a shorter-than-true result. Both failure directions are now
+ * `resolveEligibleProjects`' own discipline, not reimplemented here — see
+ * its doc comment.
  *
  * Why fail the whole poll rather than return the rest: `desiredFrom`
  * (src/daemon/loop.ts) treats "absent from this poll's discovery result" as
@@ -498,37 +570,19 @@ interface EligibleCandidate {
  * wake. A project this poll couldn't read is a project this poll knows
  * NOTHING new about; the safe default is to change nothing (retry at the
  * next poll, `PROJECT_POLL_INTERVAL_MS` later) rather than to report it
- * gone. Only the ONE read that is EXPECTED to reject for a large, known
- * fraction of candidates (the property read, for every ineligible project)
- * gets a narrow, explicit not-found conversion; every other call in this
- * function is intentionally left uncaught.
+ * gone.
  */
 async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[]> {
-  const me = await deps.ops.getMyself();
-  const raw = await deps.ops.searchProjects("live");
-  // BUTCHR-91/BUTCHR-68: the allowlist is applied HERE, alongside the lead
-  // filter, before any per-project I/O (property/version/comment reads)
-  // happens for a candidate — an unlisted project costs nothing beyond this
-  // one in-memory check, and never reaches `eligible`/`led`-derived output
-  // at all. See `ProjectResourceDeps.allowlist`'s own doc comment for why
-  // this is the one place the filter needs to live.
-  const led = raw.values.filter((p) => p.lead?.accountId === me.accountId && deps.allowlist.has(p.key));
+  // BUTCHR-91/BUTCHR-68: the allowlist is passed as `preFilter` so it keeps
+  // running BEFORE any per-project I/O (property/version/comment reads),
+  // exactly as before extraction — see `resolveEligibleProjects`'s own doc
+  // comment and `ProjectResourceDeps.allowlist`'s.
+  const { admitted, eligible } = await resolveEligibleProjects(deps.ops, (key) => deps.allowlist.has(key));
 
-  const properties = await Promise.all(
-    led.map(async (p): Promise<EligibleCandidate | null> => {
-      // Only a clean NOT-FOUND is ineligibility; any other rejection
-      // propagates (see this function's own doc comment above).
-      const property = (await deps.ops.getProjectPropertyOrNull(p.key, PROPERTY_KEY)) as EligibleCandidate["property"] | null;
-      if (!property?.rootDoc?.id) return null;
-      return { key: p.key, name: p.name, property };
-    }),
-  );
-  const eligible = properties.filter((p): p is EligibleCandidate => p !== null);
-
-  const rootDocIds = eligible.map((p) => p.property.rootDoc!.id!);
+  const rootDocIds = eligible.map((p) => p.rootDocId);
   const versions = rootDocIds.length ? await deps.ops.getPageVersions(rootDocIds) : {};
 
-  const commentsByProject = await Promise.all(eligible.map((p) => deps.ops.getPageComments(p.property.rootDoc!.id!)));
+  const commentsByProject = await Promise.all(eligible.map((p) => deps.ops.getPageComments(p.rootDocId)));
 
   const eligibleKeys = eligible.map((p) => p.key);
   const epicsInReview = eligibleKeys.length
@@ -540,7 +594,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     (epicsByProject.get(key) ?? epicsByProject.set(key, []).get(key)!).push(epic);
   }
 
-  const ineligible: ProjectResource[] = led
+  const ineligible: ProjectResource[] = admitted
     .filter((p) => !eligible.some((e) => e.key === p.key))
     .map((p) => ({
       key: p.key,
@@ -555,7 +609,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
 
   const resolved: ProjectResource[] = await Promise.all(
     eligible.map(async (p, i): Promise<ProjectResource> => {
-      const rootDocId = p.property.rootDoc!.id!;
+      const rootDocId = p.rootDocId;
       const epics = epicsByProject.get(p.key) ?? [];
       // One getIssueComments() call per IN-REVIEW epic only (usually zero
       // epics, per this file's own call-count budget) — deliberately not
@@ -567,7 +621,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       const observedEpics: ProjectEpic[] = await Promise.all(
         epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId((await deps.ops.getIssueComments(epic.key)).results) })),
       );
-      const wake = p.property.wake;
+      const wake = p.wake;
       return {
         key: p.key,
         name: p.name,
