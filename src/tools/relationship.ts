@@ -78,23 +78,73 @@ const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 
 
 type CollisionTier = "project" | "epic" | "story" | "task";
 
-/** One side of a possible collision: the env var (or, for a PROJECT caller, the credential) that decided this side's accountId, named because a generic "identity conflict" costs a reader a debugging session. */
+/**
+ * One side of a possible collision. `describe` is a FULL CLAUSE naming
+ * provenance, not just a variable name — BUTCHR-103's review of this ticket
+ * (2026-09-02) rejected a bare `envVarFor(tier)` label on the CALLER side:
+ * the caller's accountId is read from the caller's own TICKET, which can
+ * differ from what that tier's role variable is currently set to (that is
+ * the whole reason it's read from the ticket at all), so a label that reads
+ * as "this variable produced this value" can name the WRONG variable to
+ * fix — measured concretely on the exact daemon BUTCHR-100 already measured
+ * for S2's honesty clause: `BUTCHR_ASSIGNEE_EPIC` UNSET locally, an Epic
+ * staffed by a DIFFERENT daemon collides anyway, and a naive label would
+ * tell an operator to edit a variable that governs nothing here and did not
+ * produce the value shown. `describe` is therefore built by each call site,
+ * which knows whether its own accountId truly came from a local role
+ * variable (the CHILD side always does) or was merely observed on a ticket
+ * (an ISSUE caller) or is this daemon's own credential (a PROJECT caller).
+ */
 interface CollisionSide {
   tier: CollisionTier;
-  label: string;
+  describe: string;
   accountId: string | undefined;
 }
 
+/** The CHILD side's accountId always comes straight from this daemon's own role map (it's what `ops.assign`/`ops.createIssue` was just called with) — "governs" is literally true here, unlike the caller side. */
+function childSide(tier: "Epic" | "Story" | "Task", accountId: string | undefined): CollisionSide {
+  return { tier: tier.toLowerCase() as CollisionTier, describe: `${envVarFor(tier)} (governs this daemon's ${tier.toLowerCase()} tier)`, accountId };
+}
+
 /**
- * Pure comparison — no I/O. `undefined` on either side (an unset role, or a
- * caller ticket with no assignee at all) is NOT a collision, only a genuine
- * accountId equality is. Returns the full message (naming both labels, both
- * tiers, the specific hop, and the shared accountId) or `undefined`.
+ * The ISSUE-CALLER side. The accountId is OBSERVED on `callerKey`'s own
+ * ticket, never asserted to have come FROM the local role variable for the
+ * caller's tier — those can differ, which is the entire reason this reads
+ * the ticket rather than the variable. `describe` states both facts
+ * separately: where the value was actually observed, and what the local
+ * variable for that tier is currently set to (or that it's unset here) —
+ * so a reader can tell "the caller's actual identity" from "what this
+ * daemon's config says that tier's identity normally is" and is never told
+ * to edit a variable that did not produce the collision.
+ */
+function callerIssueSide(tier: "Epic" | "Story" | "Task", callerKey: string, roles: Roles, accountId: string | undefined): CollisionSide {
+  const envVar = envVarFor(tier);
+  const local = tier === "Story" ? roles.story : tier === "Task" ? roles.task : roles.epic;
+  const localState = local ? `currently set to ${truncAccountId(local)} here` : "UNSET here";
+  return {
+    tier: tier.toLowerCase() as CollisionTier,
+    describe: `the caller (${tier.toLowerCase()} tier, accountId observed on ${callerKey}'s own assignee — normally governed by ${envVar} on this daemon, which is ${localState})`,
+    accountId,
+  };
+}
+
+/** The PROJECT-CALLER side. There is no role variable to potentially mismatch — `ops.getMyself()` IS this daemon's own credential, full stop — so this can name it directly, same as the child side. */
+function callerProjectSide(accountId: string | undefined): CollisionSide {
+  return { tier: "project", describe: "ATLASSIAN_EMAIL (this daemon's own Atlassian credential — the project tier has no role variable)", accountId };
+}
+
+/**
+ * Pure comparison — no I/O. `undefined` on either side (an unset role, a
+ * caller ticket with no assignee at all, or a collision CHECK that could
+ * not run — see `resolveCallerIdentity` below) is NOT a collision, only a
+ * genuine accountId equality is. Returns the full message (naming both
+ * sides' provenance, both tiers, the specific hop, and the shared
+ * accountId) or `undefined`.
  */
 function collisionBetween(caller: CollisionSide, child: CollisionSide): string | undefined {
   if (!caller.accountId || !child.accountId || caller.accountId !== child.accountId) return undefined;
   return (
-    `${caller.label} (governs this daemon's ${caller.tier} tier) and ${child.label} (governs its ${child.tier} tier) resolve to the SAME Atlassian accountId (${truncAccountId(caller.accountId)}) — ` +
+    `${caller.describe} and ${child.describe} resolve to the SAME Atlassian accountId (${truncAccountId(caller.accountId)}) — ` +
     `the ${caller.tier} that owns this ${child.tier} will not be able to approve its PR: GitHub refuses a pull request approval from the PR's own author. ` +
     `This hop has no second identity behind it; RECORDED here rather than refused (BUTCHR-103's decision) — the call above still succeeds.`
   );
@@ -115,6 +165,29 @@ async function traceCollision(ops: AtlassianOps, workerKey: string, who: string,
     return message;
   } catch (e) {
     return `${message} — THE DURABLE TRACE COMMENT ON ${workerKey} COULD NOT BE WRITTEN (${(e as Error).message}): this warning exists ONLY in this tool result and the daemon's audit log, not as a comment on the ticket.`;
+  }
+}
+
+/**
+ * BUTCHR-110 (review fix, 2026-09-02): the collision check's OWN reads —
+ * `adopt_worker`'s extra `ops.getIssue(callerKey)`, and `ops.getMyself()`
+ * for a PROJECT caller — must never turn a successful staffing call into a
+ * failure, the SAME standard `traceCollision` above already holds for the
+ * trace comment. Without this guard a transient read failure here throws
+ * the whole staffing call — for `adopt_worker`, AFTER `assign`/`linkIssues`
+ * already succeeded and BEFORE the disposition is applied, producing
+ * exactly the "linked and assigned but undeclared" state this file's own
+ * `adoptWorker` doc comment names as the state `adopt_worker` itself exists
+ * to REPAIR, not to create. Converts any rejection into an `unknown`
+ * message instead of throwing — "not checked" must never look like
+ * "checked and clean" — the same principle behind S2's own honesty clause
+ * (`src/config/config.ts`), applied here to S1's check itself.
+ */
+async function resolveCollisionSide<T>(read: () => Promise<T>, whatFailed: string): Promise<{ value: T; unknown?: undefined } | { value?: undefined; unknown: string }> {
+  try {
+    return { value: await read() };
+  } catch (e) {
+    return { unknown: `the tier-identity collision check could not run: ${whatFailed} (${(e as Error).message}) — this hop was NOT checked for a shared identity.` };
   }
 }
 
@@ -217,6 +290,8 @@ export interface NewWorkerResult {
   disposition: Disposition["kind"];
   /** BUTCHR-110: present ONLY when the caller's own accountId and the child's about-to-be-assigned accountId collide — see this file's own "tier-identity collision" section above. A distinct, greppable key so an agent that skims the result still catches it; absent entirely on a healthy hop (never present-but-empty). */
   identityCollision?: string;
+  /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (this daemon's identity, for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`, since a failed check has no verdict to report. "Not checked" must never look like "checked and clean". */
+  identityUnknown?: string;
 }
 
 /**
@@ -351,8 +426,8 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // whether GitHub will refuse the review. `callerType` is known to be
   // "Story" or "Epic" here (childType resolved above via CHILD_TYPE).
   const collisionMsg = collisionBetween(
-    { tier: (callerType as "Story" | "Epic").toLowerCase() as CollisionTier, label: envVarFor(callerType as "Story" | "Epic"), accountId: assigneeAccountIdOf(callerIssue) },
-    { tier: childType.toLowerCase() as CollisionTier, label: envVarFor(childType), accountId: role },
+    callerIssueSide(callerType as "Story" | "Epic", callerKey, roles, assigneeAccountIdOf(callerIssue)),
+    childSide(childType, role),
   );
   const identityCollision = collisionMsg ? await traceCollision(ops, key, callerKey, collisionMsg) : undefined;
 
@@ -457,12 +532,13 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   // BUTCHR_ASSIGNEE_* var) — `ops.getMyself()` is the same call BUTCHR-67's
   // discovery lead-filter already uses (src/resources/project.ts) to answer
   // "the account this credential runs as", reused here rather than adding a
-  // second way to ask the same question.
-  const me = await ops.getMyself();
-  const collisionMsg = collisionBetween(
-    { tier: "project", label: "ATLASSIAN_EMAIL (this daemon's own Atlassian credential — the project tier has no role variable)", accountId: me.accountId },
-    { tier: "epic", label: envVarFor("Epic"), accountId: role },
-  );
+  // second way to ask the same question. GUARDED (review fix, 2026-09-01):
+  // this read runs AFTER the disposition, so the epic is already fully
+  // declared either way — but an unguarded throw here would still hand the
+  // caller a raw transport error instead of a clean result, so it gets the
+  // same fail-safe treatment as every other collision-check read.
+  const me = await resolveCollisionSide(() => ops.getMyself(), "reading this daemon's own Atlassian identity (getMyself) failed");
+  const collisionMsg = me.value ? collisionBetween(callerProjectSide(me.value.accountId), childSide("Epic", role)) : undefined;
   const identityCollision = collisionMsg ? await traceCollision(ops, key, projectKey, collisionMsg) : undefined;
 
   // (3) doc — last, on purpose; see newWorker's own step-4 comment (same reasoning).
@@ -476,7 +552,11 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     );
   }
 
-  return { key, member: projectKey, doc, disposition: disposition.kind, ...(identityCollision ? { identityCollision } : {}) };
+  return {
+    key, member: projectKey, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(me.unknown ? { identityUnknown: me.unknown } : {}),
+  };
 }
 
 /**
@@ -554,6 +634,8 @@ export interface AdoptWorkerResult {
   disposition: Disposition["kind"];
   /** BUTCHR-110: present ONLY when the caller's own accountId and the adopted ticket's about-to-be-assigned accountId collide — see the "tier-identity collision" section near the top of this file. Computed and reported on EVERY call (including a fully idempotent re-adoption), because it states a fact about current state, not an action taken — but the underlying ticket COMMENT is only (re-)posted when this call does real adoption work (`!alreadyAdopted`); see the comment at this field's call site for why. */
   identityCollision?: string;
+  /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (the caller's own ticket, or this daemon's identity for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`. "Not checked" must never look like "checked and clean". */
+  identityUnknown?: string;
 }
 
 /**
@@ -640,14 +722,22 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   // ticket's own S1 spec. Caller's accountId comes from the caller's
   // ACTUAL ticket, never from the role variable governing the caller's
   // tier (those can differ — a hand-assigned ticket).
-  const callerIssue = await ops.getIssue(callerKey);
-  const callerType = issuetypeOf(callerIssue) as "Story" | "Task" | "Epic" | undefined;
-  const collisionMsg =
-    callerType &&
-    collisionBetween(
-      { tier: callerType.toLowerCase() as CollisionTier, label: envVarFor(callerType), accountId: assigneeAccountIdOf(callerIssue) },
-      { tier: issuetype.toLowerCase() as CollisionTier, label: envVarFor(issuetype), accountId: role },
-    );
+  //
+  // GUARDED (review fix, 2026-09-02): this read runs AFTER `assign`/
+  // `linkIssues` above and BEFORE the disposition below — an unguarded
+  // throw here would leave the ticket assigned and linked but UNDECLARED,
+  // exactly the damaging partial state this function's own doc comment
+  // names, and which `adopt_worker` itself exists to REPAIR, not to create.
+  // A read failure therefore never throws: it's reported as `identityUnknown`
+  // on the result instead, and the call proceeds exactly as if this
+  // collision check did not exist. "Not checked" must never look like
+  // "checked and clean".
+  const callerRead = await resolveCollisionSide(() => ops.getIssue(callerKey), `reading ${callerKey}'s own assignee failed`);
+  const callerType = callerRead.value ? (issuetypeOf(callerRead.value) as "Story" | "Task" | "Epic" | undefined) : undefined;
+  const callerAccountId = callerRead.value ? assigneeAccountIdOf(callerRead.value) : undefined;
+  const collisionMsg = callerType
+    ? collisionBetween(callerIssueSide(callerType, callerKey, roles, callerAccountId), childSide(issuetype, role))
+    : undefined;
   // THE COMMENT IS POSTED ONLY WHEN THIS CALL DOES REAL ADOPTION WORK
   // (`!alreadyAdopted`) — deliberately mirroring the shelve-reason comment's
   // OWN idiom just above (and its own doc comment on `adoptWorker`): a fully
@@ -662,7 +752,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   // regardless of `alreadyAdopted`.
   const identityCollision = collisionMsg
     ? alreadyAdopted
-      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written the call this hop is actually adopted, not on every subsequent no-op check)`
+      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written on the call this hop is actually adopted, not on every subsequent no-op check)`
       : await traceCollision(ops, workerKey, callerKey, collisionMsg)
     : undefined;
 
@@ -710,7 +800,11 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
     }
   }
 
-  return { key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, ...(identityCollision ? { identityCollision } : {}) };
+  return {
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
+  };
 }
 
 /**
@@ -762,14 +856,15 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   // project.ts). Comment-posting is gated on `!alreadyAdopted`, same
   // reasoning as the issue-caller path (adoptWorker, above) — see its own
   // comment at the equivalent call site for why.
-  const me = await ops.getMyself();
-  const collisionMsg = collisionBetween(
-    { tier: "project", label: "ATLASSIAN_EMAIL (this daemon's own Atlassian credential — the project tier has no role variable)", accountId: me.accountId },
-    { tier: "epic", label: envVarFor("Epic"), accountId: role },
-  );
+  //
+  // GUARDED (review fix, 2026-09-02): this read runs AFTER `assign` above
+  // and BEFORE the disposition below — same partial-state hazard as
+  // adoptWorker's own guarded read; see its comment for the full reasoning.
+  const me = await resolveCollisionSide(() => ops.getMyself(), "reading this daemon's own Atlassian identity (getMyself) failed");
+  const collisionMsg = me.value ? collisionBetween(callerProjectSide(me.value.accountId), childSide("Epic", role)) : undefined;
   const identityCollision = collisionMsg
     ? alreadyAdopted
-      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written the call this hop is actually adopted, not on every subsequent no-op check)`
+      ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written on the call this hop is actually adopted, not on every subsequent no-op check)`
       : await traceCollision(ops, workerKey, projectKey, collisionMsg)
     : undefined;
 
@@ -795,7 +890,11 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
     }
   }
 
-  return { key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, ...(identityCollision ? { identityCollision } : {}) };
+  return {
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    ...(identityCollision ? { identityCollision } : {}),
+    ...(me.unknown ? { identityUnknown: me.unknown } : {}),
+  };
 }
 
 /** Revises a worker's priority. Refuses a key that is not one of the caller's own workers, AND refuses the caller's OWN key — your priority is your boss's judgment, never your own. */

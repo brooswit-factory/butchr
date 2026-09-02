@@ -499,6 +499,11 @@ export function atlassianTools(
         // hence "IDENTITY COLLISION" rather than "REFUSED", but it is still
         // something this connection's call did, so it gets its own line.
         if (result.identityCollision) audit(c, `new_worker ${result.key} IDENTITY COLLISION: ${result.identityCollision}`);
+        // BUTCHR-110 (review fix): the collision check's own read can fail
+        // without failing the staffing call — "not checked" gets the same
+        // audit visibility as a collision found, so an operator can tell
+        // "no collision" apart from "the check itself didn't run".
+        if (result.identityUnknown) audit(c, `new_worker ${result.key} IDENTITY CHECK SKIPPED: ${result.identityUnknown}`);
         noted(c, [result.key, who]); // the new ticket's own `updated`, plus the Implements link bumping the caller's
         return result;
       },
@@ -548,6 +553,7 @@ export function atlassianTools(
         // BUTCHR-110: see the matching comment on new_worker above — same
         // line-writing path the "REFUSED: no assignee" audit lines use.
         if (result.identityCollision) audit(c, `adopt_worker ${result.key} IDENTITY COLLISION: ${result.identityCollision}`);
+        if (result.identityUnknown) audit(c, `adopt_worker ${result.key} IDENTITY CHECK SKIPPED: ${result.identityUnknown}`);
         noted(c, [p.key, who]);
         return result;
       },
