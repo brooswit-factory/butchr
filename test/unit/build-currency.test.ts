@@ -19,7 +19,8 @@ function fakeGit(overrides: Partial<CurrencyGit>): CurrencyGit {
   const base: CurrencyGit = {
     treeOf: () => ({ ok: true, tree: "tree-same" }),
     resolveRef: () => ({ ok: true, sha: "b".repeat(40) }),
-    refUpdatedAt: () => ({ ok: true, iso: "2026-09-01T00:00:00.000Z" }),
+    refChangedAt: () => ({ ok: true, iso: "2026-09-01T00:00:00.000Z" }),
+    lastFetchedAt: () => ({ ok: true, iso: "2026-09-01T00:05:00.000Z" }),
     commitsBetween: () => ({ ok: true, count: 0 }),
   };
   return { ...base, ...overrides };
@@ -90,19 +91,42 @@ describe("resolveCurrency — pure, given an injected CurrencyGit", () => {
   // return current` with no freshness gate at all — a base ref nobody has
   // fetched in a week compares byte-equal to a running build a hundred
   // commits behind and confidently reports `current`. Trees matching is
-  // necessary but NOT sufficient; the base's own freshness must also be
+  // necessary but NOT sufficient; the base's own change-time must also be
   // determinable, or the verdict must be `unknown`, never `current`.
-  test("trees identical but base freshness is undeterminable: unknown, NOT current", () => {
+  test("trees identical but the base ref's own change-time is undeterminable: unknown, NOT current", () => {
     const v = resolveCurrency(
       CLEAN,
       fakeGit({
         treeOf: () => ({ ok: true, tree: "SAME-TREE" }),
-        refUpdatedAt: () => ({ ok: false, error: "no reflog file or loose ref file found — likely packed, reflogs disabled" }),
+        refChangedAt: () => ({ ok: false, error: "no reflog file or loose ref file found — likely packed, reflogs disabled" }),
       }),
     );
     expect(v.status).toBe("unknown");
     if (v.status === "unknown") {
-      expect(v.reason).toContain("freshness");
+      expect(v.reason).toContain("change-time");
+      expect(v.reason).not.toContain("CURRENT");
+    }
+  });
+
+  // REVIEW FINDING (added after Requirement 2 first shipped): change-time
+  // alone can't distinguish "fetched five minutes ago, unchanged" from
+  // "never fetched, unchanged" — a fetch that changes nothing never touches
+  // the reflog. Naive implementation this kills: gating `current` on
+  // `refChangedAt` alone (the ORIGINAL Requirement 2 fix) and ignoring
+  // fetch-recency entirely — trees identical, change-time known, but this
+  // checkout's own last-fetch time is undeterminable must ALSO be `unknown`,
+  // not `current`.
+  test("trees identical, change-time known, but this checkout's own last-fetch time is undeterminable: unknown, NOT current", () => {
+    const v = resolveCurrency(
+      CLEAN,
+      fakeGit({
+        treeOf: () => ({ ok: true, tree: "SAME-TREE" }),
+        lastFetchedAt: () => ({ ok: false, error: "no FETCH_HEAD — this checkout has apparently never fetched from a remote" }),
+      }),
+    );
+    expect(v.status).toBe("unknown");
+    if (v.status === "unknown") {
+      expect(v.reason).toContain("last-fetch");
       expect(v.reason).not.toContain("CURRENT");
     }
   });
@@ -159,7 +183,7 @@ describe("resolveCurrency — pure, given an injected CurrencyGit", () => {
 
   test("git call that throws is still caught by the fake's contract (never lets an exception escape resolveCurrency itself)", () => {
     const g: CurrencyGit = fakeGit({
-      refUpdatedAt: (): GitOpResult<{ iso: string }> => ({ ok: false, error: "no reflog" }),
+      refChangedAt: (): GitOpResult<{ iso: string }> => ({ ok: false, error: "no reflog" }),
     });
     expect(() => resolveCurrency(CLEAN, g)).not.toThrow();
   });
@@ -169,7 +193,14 @@ describe("renderBuildCurrencyLines — the un-collapsibility guarantee", () => {
   const build = { sha: "a".repeat(40), shaProvenance: "git-at-start" as const, shaDirty: false, version: "1.0.0" };
   const currentVerdict: CurrencyVerdict = {
     status: "current",
-    base: { ref: "refs/remotes/origin/main", sha: "b".repeat(40), updatedAt: "2026-09-01T00:00:00.000Z", updatedAtUnknownReason: null },
+    base: {
+      ref: "refs/remotes/origin/main",
+      sha: "b".repeat(40),
+      changedAt: "2026-09-01T00:00:00.000Z",
+      changedAtUnknownReason: null,
+      fetchedAt: "2026-09-01T00:05:00.000Z",
+      fetchedAtUnknownReason: null,
+    },
     dirtyUndeterminable: false,
   };
   const unknownVerdict: CurrencyVerdict = { status: "unknown", reason: "no local refs/remotes/origin/main to compare against" };
@@ -195,7 +226,14 @@ describe("renderBuildCurrencyLines — the un-collapsibility guarantee", () => {
       status: "stale",
       commitsBehind: 4,
       commitsAhead: 0,
-      base: { ref: "refs/remotes/origin/main", sha: "b".repeat(40), updatedAt: null, updatedAtUnknownReason: "no reflog" },
+      base: {
+        ref: "refs/remotes/origin/main",
+        sha: "b".repeat(40),
+        changedAt: null,
+        changedAtUnknownReason: "no reflog",
+        fetchedAt: "2026-09-01T00:05:00.000Z",
+        fetchedAtUnknownReason: null,
+      },
       dirtyUndeterminable: false,
     };
     const text = renderBuildCurrencyLines(build, v).join("\n");
@@ -253,20 +291,69 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
       expect(g.resolveRef("refs/remotes/origin/main").ok).toBe(false);
       expect(g.treeOf("HEAD").ok).toBe(false);
       expect(g.commitsBetween("a", "b").ok).toBe(false);
+      expect(g.refChangedAt("refs/remotes/origin/main").ok).toBe(false);
+      expect(g.lastFetchedAt().ok).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("refUpdatedAt: real reflog file, a real ISO timestamp — not a guess", () => {
+  test("refChangedAt: real reflog file, a real ISO timestamp — not a guess", () => {
     const dir = initRepo();
     try {
       execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: dir });
-      const r = realCurrencyGit(dir).refUpdatedAt("refs/remotes/origin/main");
+      const r = realCurrencyGit(dir).refChangedAt("refs/remotes/origin/main");
       expect(r.ok).toBe(true);
       if (r.ok) expect(new Date(r.iso).toISOString()).toBe(r.iso);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("lastFetchedAt: a checkout that has never fetched — honest failure, never a guess", () => {
+    const dir = initRepo();
+    try {
+      const r = realCurrencyGit(dir).lastFetchedAt();
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain("never fetched");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // REAL `git fetch`, against a REAL second repo acting as the remote — not
+  // simulated. Proves FETCH_HEAD's mtime actually moves on a real fetch, and
+  // that `lastFetchedAt` reads it correctly.
+  //
+  // MEASURED, NOT ASSUMED: this test originally asserted `git clone` itself
+  // writes FETCH_HEAD. It doesn't — verified live: a fresh `git clone` in
+  // this environment leaves no FETCH_HEAD at all; only an actual `git fetch`
+  // (clone does not run one internally here) creates it. Good thing to have
+  // gotten wrong in a test rather than asserted in prose: it means a
+  // freshly-cloned-but-never-fetched-since checkout correctly renders
+  // `unknown` rather than a false `current` — exactly Requirement 2's intent.
+  test("lastFetchedAt: absent right after clone, present after a real `git fetch`", () => {
+    const remote = mkdtempSync(join(tmpdir(), "butchr-build-currency-remote-"));
+    const clone = mkdtempSync(join(tmpdir(), "butchr-build-currency-clone-"));
+    try {
+      const gitIn = (dir: string, ...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+      gitIn(remote, "init", "-q", "-b", "main");
+      gitIn(remote, "config", "user.email", "test@example.com");
+      gitIn(remote, "config", "user.name", "test");
+      writeFileSync(join(remote, "f.txt"), "one\n");
+      gitIn(remote, "add", "f.txt");
+      gitIn(remote, "commit", "-q", "-m", "first");
+
+      gitIn(tmpdir(), "clone", "-q", remote, clone);
+      const before = realCurrencyGit(clone).lastFetchedAt();
+      expect(before.ok).toBe(false);
+
+      gitIn(clone, "fetch", "-q", "origin"); // a real, even no-op, fetch
+      const after = realCurrencyGit(clone).lastFetchedAt();
+      expect(after.ok).toBe(true);
+    } finally {
+      rmSync(remote, { recursive: true, force: true });
+      rmSync(clone, { recursive: true, force: true });
     }
   });
 
@@ -291,13 +378,34 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
   // for at the resolveCurrency layer (the operator script,
   // scripts/verify-workspace-ground-truth.ts, is the real run at the
   // rendered-ENVIRONMENT.md layer).
-  test("end-to-end, real repo: origin/main pointing at HEAD -> current", () => {
+  test("end-to-end, real repo: origin/main pointing at HEAD, and this checkout has fetched -> current", () => {
+    const dir = initRepo();
+    try {
+      execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: dir });
+      // A real fetch marker — see the `lastFetchedAt` tests above for why a
+      // ref pointed at HEAD by hand isn't enough on its own any more: this
+      // repo needs to look like it has ALSO actually fetched.
+      writeFileSync(join(dir, ".git", "FETCH_HEAD"), "");
+      const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+      const v = resolveCurrency({ sha: head, shaDirty: false, shaUnknownReason: null }, realCurrencyGit(dir));
+      expect(v.status).toBe("current");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Real-git counterpart to the fake-git "last-fetch time is undeterminable"
+  // unit test above: a repo whose base ref was set by hand (`update-ref`,
+  // never a real fetch) has no FETCH_HEAD at all — must be `unknown`, not a
+  // false `current`, even though the trees genuinely match.
+  test("end-to-end, real repo: origin/main pointing at HEAD, but this checkout has NEVER fetched -> unknown, not current", () => {
     const dir = initRepo();
     try {
       execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: dir });
       const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
       const v = resolveCurrency({ sha: head, shaDirty: false, shaUnknownReason: null }, realCurrencyGit(dir));
-      expect(v.status).toBe("current");
+      expect(v.status).toBe("unknown");
+      if (v.status === "unknown") expect(v.reason).toContain("last-fetch");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -346,7 +454,8 @@ describe("every git call fails: the currency section still RENDERS, never vanish
   const ALWAYS_FAILS: CurrencyGit = {
     treeOf: () => ({ ok: false, error: "git not on PATH" }),
     resolveRef: () => ({ ok: false, error: "git not on PATH" }),
-    refUpdatedAt: () => ({ ok: false, error: "git not on PATH" }),
+    refChangedAt: () => ({ ok: false, error: "git not on PATH" }),
+    lastFetchedAt: () => ({ ok: false, error: "git not on PATH" }),
     commitsBetween: () => ({ ok: false, error: "git not on PATH" }),
   };
 

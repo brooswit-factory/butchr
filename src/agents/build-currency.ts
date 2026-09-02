@@ -63,8 +63,25 @@ export interface CurrencyGit {
   treeOf(ref: string): GitOpResult<{ tree: string }>;
   /** Resolve a ref (e.g. `refs/remotes/origin/main`) to the commit sha it currently points at. */
   resolveRef(ref: string): GitOpResult<{ sha: string }>;
-  /** Best-effort: when `ref` was last updated (its reflog, or the ref file's mtime) — NEVER a guessed timestamp. */
-  refUpdatedAt(ref: string): GitOpResult<{ iso: string }>;
+  /**
+   * Best-effort: when `ref`'s VALUE last CHANGED (its reflog entry, or the
+   * loose ref file's mtime) — NEVER a guessed timestamp. NOT the same
+   * question as `lastFetchedAt` below: a `git fetch` that changes nothing
+   * does not touch this signal at all (measured live — see module doc
+   * comment) — a ref that hasn't changed in a week looks identical whether
+   * this host fetched five minutes ago or never fetched at all.
+   */
+  refChangedAt(ref: string): GitOpResult<{ iso: string }>;
+  /**
+   * Best-effort: when THIS checkout last talked to the network at all
+   * (`FETCH_HEAD`'s mtime — updated on every `git fetch`, including a
+   * no-op one that changes no ref). Answers the question `refChangedAt`
+   * cannot: whether the comparison base could even in principle be newer
+   * than what's recorded. Absent in a repository that has never fetched
+   * (e.g. a ref set by `git update-ref` with no real remote) — that must
+   * render as `unknown, because X`, never an omitted signal or a guess.
+   */
+  lastFetchedAt(): GitOpResult<{ iso: string }>;
   /** Count of commits reachable from `to` but not from `from` (`git rev-list --count from..to`) — supplementary evidence only, see module doc comment. */
   commitsBetween(from: string, to: string): GitOpResult<{ count: number }>;
 }
@@ -89,6 +106,22 @@ function run(dir: string, args: string[]): GitOpResult<{ out: string }> {
  * failing, never guessing) inside an npm-installed `dist/` with no `.git`
  * anywhere above it.
  */
+/**
+ * The git-common-dir (shared across worktrees) — where `refs/remotes/...`,
+ * their reflogs, AND `FETCH_HEAD` all actually live. VERIFIED, not assumed:
+ * in a real `git worktree add` checkout (this repo's own worktree layout,
+ * per every agent's brief), `FETCH_HEAD` was measured living under
+ * `--git-common-dir`, NOT the per-worktree `--git-dir` — a `git fetch` run
+ * in one worktree updates `FETCH_HEAD` for every worktree sharing this
+ * common dir, which is exactly the semantics `lastFetchedAt` wants (it asks
+ * "did THIS CLONE fetch", not "did this specific worktree checkout fetch").
+ */
+function resolveGitCommonDir(dir: string): GitOpResult<{ path: string }> {
+  const r = run(dir, ["rev-parse", "--git-common-dir"]);
+  if (!r.ok) return r;
+  return { ok: true, path: isAbsolute(r.out) ? r.out : join(dir, r.out) };
+}
+
 export function realCurrencyGit(dir: string): CurrencyGit {
   return {
     treeOf(ref) {
@@ -99,22 +132,32 @@ export function realCurrencyGit(dir: string): CurrencyGit {
       const r = run(dir, ["rev-parse", "--verify", ref]);
       return r.ok ? { ok: true, sha: r.out } : r;
     },
-    refUpdatedAt(ref) {
-      const gitDirResult = run(dir, ["rev-parse", "--git-common-dir"]);
-      if (!gitDirResult.ok) return { ok: false, error: `could not resolve the git directory to check ${ref}'s freshness: ${gitDirResult.error}` };
-      const gitDir = isAbsolute(gitDirResult.out) ? gitDirResult.out : join(dir, gitDirResult.out);
-      // The reflog file's mtime is updated on every fetch/update of `ref`,
+    refChangedAt(ref) {
+      const gitDir = resolveGitCommonDir(dir);
+      if (!gitDir.ok) return { ok: false, error: `could not resolve the git directory to check ${ref}'s change time: ${gitDir.error}` };
+      // The reflog file's mtime updates on every CHANGE to `ref`'s value,
       // even when the ref itself is packed (no loose `refs/...` file) — try
       // it first. Fall back to the loose ref file itself if no reflog file
-      // exists (core.logAllRefUpdates off, or a bare/minimal clone).
-      for (const candidate of [join(gitDir, "logs", ref), join(gitDir, ref)]) {
+      // exists (core.logAllRefUpdates off, or a bare/minimal clone). Neither
+      // moves on a fetch that doesn't change `ref` — see `lastFetchedAt`.
+      for (const candidate of [join(gitDir.path, "logs", ref), join(gitDir.path, ref)]) {
         try {
           return { ok: true, iso: statSync(candidate).mtime.toISOString() };
         } catch {
           // try the next candidate
         }
       }
-      return { ok: false, error: `no reflog file or loose ref file found for ${ref} under ${gitDir} (likely packed, with reflogs disabled) — cannot determine its freshness without guessing` };
+      return { ok: false, error: `no reflog file or loose ref file found for ${ref} under ${gitDir.path} (likely packed, with reflogs disabled) — cannot determine when its value last changed without guessing` };
+    },
+    lastFetchedAt() {
+      const gitDir = resolveGitCommonDir(dir);
+      if (!gitDir.ok) return { ok: false, error: `could not resolve the git directory to check FETCH_HEAD: ${gitDir.error}` };
+      const fetchHead = join(gitDir.path, "FETCH_HEAD");
+      try {
+        return { ok: true, iso: statSync(fetchHead).mtime.toISOString() };
+      } catch (e) {
+        return { ok: false, error: `no FETCH_HEAD under ${gitDir.path} — this checkout has apparently never fetched from a remote: ${(e as Error).message.split("\n")[0]}` };
+      }
     },
     commitsBetween(from, to) {
       const r = run(dir, ["rev-list", "--count", `${from}..${to}`]);
@@ -135,13 +178,29 @@ export interface RunningBuild {
   shaUnknownReason: string | null;
 }
 
-/** What the comparison base resolved to, carried on both `current` and `stale` verdicts (never on `unknown` — if the base couldn't be resolved, the verdict IS `unknown`, with that failure as the reason). */
+/**
+ * What the comparison base resolved to, carried on both `current` and
+ * `stale` verdicts (never on `unknown` — if the base couldn't be resolved,
+ * the verdict IS `unknown`, with that failure as the reason).
+ *
+ * TWO DISTINCT TIMESTAMPS, ON PURPOSE — a review finding on this ticket's
+ * own PR (added after `current`'s freshness gate first shipped): a `git
+ * fetch` that changes nothing does NOT touch `ref`'s reflog or ref file, so
+ * `changedAt` alone cannot distinguish "this host hasn't fetched in a week"
+ * (verdict worthless) from "this host fetches constantly but `main` simply
+ * hasn't moved" (verdict perfect) — both render an identical `changedAt`.
+ * `fetchedAt` (from `FETCH_HEAD`, which DOES move on every fetch, no-op or
+ * not) is the signal that actually answers "how stale could this be".
+ */
 export interface ResolvedBase {
   ref: string;
   sha: string;
-  /** Best-effort ISO timestamp of when `ref` was last updated on this host — `null` (with a reason, never a guess) when undeterminable. */
-  updatedAt: string | null;
-  updatedAtUnknownReason: string | null;
+  /** Best-effort ISO timestamp of when `ref`'s VALUE last changed — `null` (with a reason, never a guess) when undeterminable. NOT "when this host last fetched" — see the interface doc comment. */
+  changedAt: string | null;
+  changedAtUnknownReason: string | null;
+  /** Best-effort ISO timestamp of when this checkout last fetched from a remote AT ALL (`FETCH_HEAD`'s mtime) — `null` (with a reason, never a guess) when undeterminable, e.g. a checkout that has never fetched. */
+  fetchedAt: string | null;
+  fetchedAtUnknownReason: string | null;
 }
 
 export type CurrencyVerdict =
@@ -180,12 +239,15 @@ export function resolveCurrency(running: RunningBuild, git: CurrencyGit): Curren
   const baseTree = git.treeOf(baseSha);
   if (!baseTree.ok) return { status: "unknown", reason: `${BASE_REF} (${baseSha}) has no readable tree: ${baseTree.error}` };
 
-  const updatedAt = git.refUpdatedAt(BASE_REF);
+  const changedAt = git.refChangedAt(BASE_REF);
+  const fetchedAt = git.lastFetchedAt();
   const base: ResolvedBase = {
     ref: BASE_REF,
     sha: baseSha,
-    updatedAt: updatedAt.ok ? updatedAt.iso : null,
-    updatedAtUnknownReason: updatedAt.ok ? null : updatedAt.error,
+    changedAt: changedAt.ok ? changedAt.iso : null,
+    changedAtUnknownReason: changedAt.ok ? null : changedAt.error,
+    fetchedAt: fetchedAt.ok ? fetchedAt.iso : null,
+    fetchedAtUnknownReason: fetchedAt.ok ? null : fetchedAt.error,
   };
   const dirtyUndeterminable = running.shaDirty === null;
 
@@ -194,13 +256,33 @@ export function resolveCurrency(running: RunningBuild, git: CurrencyGit): Curren
     // must never compare byte-equal into a false `current`. If the base's
     // own freshness couldn't be established, `current` cannot be trusted —
     // this is the guard that makes `unknown` un-collapsible to `current`;
-    // reverting this branch to always return `current` here is the mutation
-    // this ticket's own test suite must catch (a naive first draft did
-    // exactly this and shipped a false `current` for a week-stale base).
-    if (!updatedAt.ok) {
+    // reverting either branch below to always fall through to `current` is
+    // the mutation this ticket's own test suite must catch (a naive first
+    // draft did exactly the `changedAt`-only version and shipped a false
+    // `current` for a week-stale base).
+    //
+    // GATED ON BOTH SIGNALS, DELIBERATELY (review finding on this PR): a
+    // `current` verdict's entire value is "you can trust this daemon's code
+    // matches the base" — but `changedAt` alone cannot bound how stale the
+    // LOCAL COPY of the base ref itself might be (a fetch that changes
+    // nothing never touches it, so it cannot distinguish "fetched five
+    // minutes ago, unchanged" from "never fetched, unchanged"). Requiring
+    // `fetchedAt` too closes that exact ambiguity for the one verdict whose
+    // whole purpose is trustworthiness; `stale`/`diverged` below are NOT
+    // gated on it, because a "this daemon is stale/diverged" verdict is
+    // already the honest, actionable answer even if the fetch-recency of
+    // the comparison base is itself unknown — it isn't a trust claim in the
+    // way `current` is.
+    if (!changedAt.ok) {
       return {
         status: "unknown",
-        reason: `this daemon's build matches ${BASE_REF} content-for-content, but that base's own freshness could not be established, so a current verdict cannot be trusted here: ${updatedAt.error}`,
+        reason: `this daemon's build matches ${BASE_REF} content-for-content, but that base's own change-time could not be established, so a current verdict cannot be trusted here: ${changedAt.error}`,
+      };
+    }
+    if (!fetchedAt.ok) {
+      return {
+        status: "unknown",
+        reason: `this daemon's build matches ${BASE_REF} content-for-content, and that ref's own change-time is known, but this checkout's own last-fetch time could not be established — without it there's no way to bound how stale the local copy of ${BASE_REF} itself might be, so a current verdict cannot be trusted here: ${fetchedAt.error}`,
       };
     }
     return { status: "current", base, dirtyUndeterminable };
@@ -282,9 +364,16 @@ export function renderBuildCurrencyLines(build: BuildSummary, currency: Currency
     lines.push(`- currency: STALE relative to ${baseTag} — content differs; ahead/behind commit counts unavailable${dirtyQualifier}`);
   }
 
-  const freshness = currency.base.updatedAt ? `last updated ${currency.base.updatedAt}` : `freshness unknown (${currency.base.updatedAtUnknownReason})`;
+  // Two DISTINCT signals, worded so neither can be misread as the other —
+  // see ResolvedBase's own doc comment for why a fetch that changes nothing
+  // never moves `changedAt`, so `changedAt` alone cannot tell a reader
+  // whether this checkout is actually keeping up.
+  const changedText = currency.base.changedAt ? `its value last changed ${currency.base.changedAt}` : `its value's last-change time is unknown (${currency.base.changedAtUnknownReason})`;
+  const fetchedText = currency.base.fetchedAt
+    ? `this checkout last fetched from a remote at all ${currency.base.fetchedAt}`
+    : `this checkout's last-fetch time is unknown (${currency.base.fetchedAtUnknownReason})`;
   lines.push(
-    `- comparison base: ${currency.base.ref}, ${freshness}, read from THIS DAEMON's own local checkout — never fetched over the network for this check, and never a claim about any other daemon that may also be running on this host. The verdict above reflects only what this daemon's checkout of main already had, not main right now.`,
+    `- comparison base: ${currency.base.ref} — ${changedText}; ${fetchedText}. Both read from THIS DAEMON's own local checkout, never fetched over the network for this check, and never a claim about any other daemon that may also be running on this host. The verdict above reflects only what this daemon's checkout of main already had, not main right now.`,
   );
   return lines;
 }
