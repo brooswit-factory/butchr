@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createEscalator, UNRESPONSIVE_MARKER, type CommentRow } from "../../src/agents/escalation-loop.js";
+import { createEscalator, UNRESPONSIVE_MARKER, FOLLOWUP_STAGE, type CommentRow } from "../../src/agents/escalation-loop.js";
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
 import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src/agents/escalate.js";
@@ -1558,9 +1558,15 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
 // `speakOnOwnChannel` write path, real project-tier storage-format
 // unwrapping — nothing hand-reproduced.
 describe("createEscalator wired to the REAL extracted createOwnChannelComments (BUTCHR-141/§2.6) — adoption did not become silence", () => {
-  function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string }> } {
+  // `now`, BUTCHR-171: defaults to a fixed clock matching every pre-existing
+  // caller of this fixture (all use `now: () => 0` on the escalator they
+  // build from these `ops`) — pass the SAME clock the escalator uses when a
+  // test needs its posted comments' `created` to track real elapsed time,
+  // so the recency filter this fixture's rows now feed (Consequence 1's fix)
+  // never disagrees with the clock the test itself believes it's running on.
+  function makeOps(overrides: Partial<AtlassianOps> = {}, now: () => number = () => 0): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string; created: string }> } {
     const jiraComments: Array<{ key: string; text: string }> = [];
-    const pageComments: Array<{ id: string; body: string }> = [];
+    const pageComments: Array<{ id: string; body: string; created: string }> = [];
     const ops: AtlassianOps = {
       getIssue: async () => ({}),
       search: async () => ({}),
@@ -1590,10 +1596,16 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
       deleteIssue: async () => ({ ok: true }),
       commentOnPage: async (_pageId: string, body: string) => {
         const id = String(1000 + pageComments.length);
-        pageComments.push({ id, body });
+        pageComments.push({ id, body, created: new Date(now()).toISOString() });
         return { ok: true, id };
       },
-      getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
+      // BUTCHR-171 correction: this reversal is fixture convenience ONLY
+      // (pageComments is pushed oldest-first) — getPageComments requests no
+      // `sort` and is NOT newest-first the way AtlassianClient.comments()
+      // is; the false claim previously here pinned exactly that confusion.
+      // Callers must not (and, since BUTCHR-171, do not — see
+      // createOwnChannelComments' own numeric-id sort) trust this raw order.
+      getPageComments: async () => ({ results: [...pageComments].reverse() }),
       searchProjects: async () => ({ values: [] }),
       getMyself: async () => ({ accountId: "test-account" }),
       setProjectProperty: async () => ({ ok: true }),
@@ -1723,6 +1735,251 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
 
       await escalator.onBlocked("p1", "BUTCHR", prompt, 3); // directive check — must find it through the real unwrap
       expect(sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+    });
+  });
+
+  // BUTCHR-171: real `created` timestamps + defined ordering on the project
+  // tier (root-causing Consequences 1 and 3), and the follow-up nudge's own
+  // durable dedupe (Consequence 2) — all exercised through the SAME real
+  // `createOwnChannelComments`/`speakOnOwnChannel` seam the block above
+  // proves reaches the real resource, not a stand-in. A dedicated ops fake
+  // is needed here (not the block's own `makeOps` used bare) because these
+  // tests must control EACH comment's own `created` timestamp independently
+  // — the shared fake never modelled timestamps at all (that omission was
+  // the bug), and page comments are stored in raw INSERTION order, never
+  // reversed, so ordering correctness comes only from
+  // `createOwnChannelComments`'s own post-condition sort, never the fake.
+  describe("BUTCHR-171: project-tier created/ordering + follow-up durable dedupe", () => {
+    // BUTCHR-127's own documented trap, re-verified here rather than
+    // trusted secondhand: `escalate()`'s adoption does
+    // `Date.parse(existing.created) || deps.now()`, and `Date.parse` of
+    // epoch zero ("1970-01-01T00:00:00.000Z") IS `0` — a legitimate,
+    // correctly-parsed value that is nonetheless FALSY, so `|| deps.now()`
+    // silently discards it and substitutes the restart's own clock instead.
+    // A `clock.now` (or a hand-set `created`) starting at literal `0` would
+    // trigger exactly that fallback and corrupt every test below in a way
+    // that happens to still look plausible (a defined `escalatedAt`, just
+    // the WRONG one) — every clock in this block is offset from a non-zero
+    // BASE for that reason, never from epoch zero.
+    const BASE = 1_700_000_000_000;
+
+    function makeTimedProjectOps(clock: { now: number }): { ops: AtlassianOps; rows: Array<{ id: string; body: string; created: string }> } {
+      const rows: Array<{ id: string; body: string; created: string }> = [];
+      let nextId = 1;
+      const { ops } = makeOps({
+        commentOnPage: async (_pageId: string, body: string) => {
+          const id = String(nextId++);
+          rows.push({ id, body, created: new Date(clock.now).toISOString() });
+          return { ok: true, id };
+        },
+        getPageComments: async () => ({ results: rows.map((r) => ({ ...r })) }),
+      });
+      return { ops, rows };
+    }
+
+    const isEscalationBody = (body: string) => body.includes("is waiting on a decision:");
+    const isFollowupBody = (body: string) => body.includes(FOLLOWUP_STAGE);
+
+    test("Consequence 1, REPRODUCED THEN FIXED: a stale pre-escalation ANSWER (same fingerprint) is skipped by the recency filter, never delivered — even after a simulated restart adopts the escalation by a REAL timestamp", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+      const fp = fingerprint(prompt);
+
+      // A STALE answer for THIS SAME fingerprint, already on the channel
+      // BEFORE any escalation exists for this episode — the scenario
+      // Consequence 1 describes (an old ANSWER becoming eligible again).
+      // Injected directly (bypassing commentOnPage) so its `created` can be
+      // set independently of `clock`, the way a genuinely old comment would
+      // already have an old timestamp regardless of when this test runs.
+      rows.push({ id: "1", body: `<p>ANSWER 1 ${fp}</p>`, created: new Date(BASE - 60 * 60_000).toISOString() });
+
+      // Escalate for real, 1 hour after the stale row — comfortably outside
+      // CLOCK_SKEW_GRACE_MS (2 minutes), so a working filter has an
+      // unambiguous case to get right.
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — posts a REAL escalation comment with a REAL `created`
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1);
+
+      // Simulate a restart 1 minute after the escalation (well under the
+      // 15-minute follow-up window, so the follow-up path stays inert and
+      // this test isolates Consequence 1 only). A fresh escalator has no
+      // in-memory `s.escalatedAt` — it must ADOPT the existing escalation
+      // via its real `created`, not the restart's own clock.
+      clock.now += 60_000;
+      const sent: Array<{ pane: string; text: string }> = [];
+      const after = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adopts the existing escalation by its REAL created time
+      await after.onBlocked("p1", "BUTCHR", prompt, 3); // directive/follow-up check, now that escalatedAt is set
+
+      // THE FIX, PROVEN: the stale same-fingerprint ANSWER from an hour
+      // before this episode's escalation is never delivered as a directive.
+      expect(sent).toEqual([]);
+
+      // And the filter is not simply over-broad: a FRESH answer posted
+      // after the (adopted) escalation time IS still found and delivered —
+      // recency-skipping the stale row is not accidentally skipping every
+      // row.
+      await speakOnOwnChannel(ops, "BUTCHR", `ANSWER 2 ${fp}`);
+      await after.onBlocked("p1", "BUTCHR", prompt, 4);
+      expect(sent).toEqual([{ pane: "p1", text: keysToSelect(prompt.current, 2) }]);
+
+      // MUTATION-TESTED (manually, not committed as a step here): with
+      // speak.ts's project-tier mapping reverted to the pre-fix
+      // `created: ""`, this test's `expect(sent).toEqual([])` assertion
+      // fails — `sent` contains the stale `ANSWER 1` delivery instead,
+      // because `Date.parse("")` is `NaN` and `NaN < x` is always `false`,
+      // so the recency filter never skips the row. Reported on BUTCHR-171
+      // with the exact revert diff and the failing assertion.
+    });
+
+    // BUTCHR-171 review, Finding 1: `created: r.created ?? ""` alone does
+    // NOT close Consequence 1 for a row whose underlying read genuinely
+    // carried no timestamp — `Date.parse("")` is `NaN`, and an unguarded
+    // `NaN < x` is always `false`, so such a row was previously treated as
+    // indistinguishable from "definitely current". escalation-loop.ts's
+    // recency filter now checks `Number.isNaN(...)` explicitly and skips
+    // it. This row shape is injected directly (not via commentOnPage,
+    // which always stamps a real clock-derived `created`) because it
+    // models a read that genuinely returned no `version`/`createdAt` at
+    // all — the same shape `atlassian-real.test.ts`'s "a row with no
+    // version... maps `created` to undefined" test proves is reachable.
+    test("Finding 1 fix: a directive row with NO retrievable created (recency unknown) is treated as suspect and skipped, never delivered", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+      const fp = fingerprint(prompt);
+
+      const sent: Array<{ pane: string; text: string }> = [];
+      const escalator = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates
+
+      // A matching ANSWER whose row carries no retrievable `created` at
+      // all — recency-UNKNOWN, not recency-zero.
+      rows.push({ id: String(rows.length + 1), body: `<p>ANSWER 2 ${fp}</p>`, created: "" });
+
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3);
+      expect(sent).toEqual([]); // unverifiable recency is treated as suspect, never as current
+
+      // MUTATION-TESTED (manually, not committed as a step here): with the
+      // `Number.isNaN(createdMs) ||` guard removed from escalation-loop.ts's
+      // recency filter, this assertion fails — `sent` contains the
+      // delivery instead, reproducing exactly what the review's own probe
+      // (`PROBE_VERDICT=DELIVERED`) found on the pre-fix code.
+    });
+
+    test("BUTCHR-127's shape, FIXED: restarts 30 minutes apart (> the 15-minute follow-up window) now yield escalations=1 followups=1, not followups=2", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalates at t=BASE
+
+      clock.now = BASE + 15 * 60_000 + 1; // just past the follow-up window, same (non-restarted) escalator
+      await before.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up posted at t=BASE+900001
+
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1);
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1);
+
+      // Restart 30 minutes after the ORIGINAL escalation (BUTCHR-127's own
+      // shape) — a fresh escalator, no in-memory state at all.
+      clock.now = BASE + 30 * 60_000;
+      const after = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adopts the existing escalation
+      await after.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up check: must ADOPT the existing follow-up, not re-post
+
+      expect(rows.filter((r) => isEscalationBody(r.body)).length).toBe(1); // escalations=1 — already true pre-fix, unchanged
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1); // followups=1 — THE FIX: was 2 pre-fix (this exact scenario is why)
+    });
+
+    test("collision direction 1: an escalation comment is never adopted as an already-posted follow-up (the SILENCE bug this ticket forbids)", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const escalator = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates — ONLY an escalation comment exists, no follow-up yet
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(0);
+
+      clock.now = BASE + 15 * 60_000 + 1;
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up check
+
+      // If the escalation comment were ever mistaken for an existing
+      // follow-up (both start with MARKER), the follow-up would be
+      // silently skipped here — zero posted. It must actually post.
+      expect(rows.filter((r) => isFollowupBody(r.body)).length).toBe(1);
+    });
+
+    test("collision direction 2: a follow-up comment is never adopted as the escalation on restart, even though it is NEWER and sorts first", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+
+      const before = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await before.onBlocked("p1", "BUTCHR", prompt, 1);
+      await before.onBlocked("p1", "BUTCHR", prompt, 2); // escalation posted at t=BASE, id="1"
+
+      clock.now = BASE + 15 * 60_000 + 1;
+      await before.onBlocked("p1", "BUTCHR", prompt, 3); // follow-up posted at t=BASE+900001, id="2" — NEWER than the escalation, sorts first
+
+      const escalationRow = rows.find((r) => isEscalationBody(r.body))!;
+      const followupRow = rows.find((r) => isFollowupBody(r.body))!;
+      expect(Number(followupRow.id)).toBeGreaterThan(Number(escalationRow.id)); // confirms the follow-up genuinely sorts first newest-first
+
+      clock.now = BASE + 30 * 60_000;
+      const logs: string[] = [];
+      const after = createEscalator({
+        read: async () => REAL, send: async () => {}, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: (line) => logs.push(line),
+      });
+      await after.onBlocked("p1", "BUTCHR", prompt, 1);
+      await after.onBlocked("p1", "BUTCHR", prompt, 2); // adoption check runs here
+
+      // The adoption log line names WHICH comment id was adopted as "the
+      // escalation" — it must be the escalation row's id, never the
+      // (newer, first-in-scan-order) follow-up row's id.
+      const adoptLine = logs.find((l) => l.includes("adopted existing escalation")); // escalation-loop.ts's internal log() prepends "[prompts] "
+      expect(adoptLine).toBeDefined();
+      expect(adoptLine).toContain(`from comment ${escalationRow.id}`);
+      expect(adoptLine).not.toContain(`from comment ${followupRow.id}`);
     });
   });
 });
