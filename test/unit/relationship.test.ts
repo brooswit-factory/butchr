@@ -2035,6 +2035,29 @@ describe("BUTCHR-193: submit_to_boss refuses a caller with open workers of its o
     await submitToBoss(spied, "BUTCHR-1"); // must NOT throw — the fresh fetch shows Done even though the stub was stale
     expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
   });
+
+  test("REVIEW NIT FIX (missing-stub variant, requested explicitly by BUTCHR-191's epic): a worker whose link-stub status is entirely ABSENT but whose real status is Done does NOT block", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    const spied: AtlassianOps = {
+      ...ops,
+      getIssue: async (key: string) => {
+        const result: any = await ops.getIssue(key);
+        if (key === "BUTCHR-1") {
+          // Strip the outward stub's status field entirely — simulating a
+          // stub Jira never hydrates, distinct from the race test above
+          // (which has a stub present but stale).
+          for (const link of result.fields.issuelinks) {
+            if (link.outwardIssue?.key === "BUTCHR-2") delete link.outwardIssue.fields.status;
+          }
+        }
+        return result;
+      },
+    };
+    await submitToBoss(spied, "BUTCHR-1"); // must NOT throw — the fresh per-worker fetch shows Done despite the missing stub status
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
 });
 
 describe("BUTCHR-193: finish_without_a_boss refuses a caller with open workers of its own — ADDITIVE to, and does not disturb, the existing has-a-boss refusal (BUTCHR-92 orthogonality)", () => {
