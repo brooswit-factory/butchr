@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
+  CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -522,6 +523,94 @@ describe("start_worker / finish_worker / adopt_worker: BUTCHR-58 — butchr:shel
   });
 });
 
+describe("adopt_worker: BUTCHR-108/BUTCHR-137 — butchr:orphan means UNDIRECTED, so adoption withdraws it for EITHER disposition", () => {
+  test("disposition \"start\" on a fresh orphan clears butchr:orphan BEFORE transitioning, and ends up visible to the parked detector like any normal directed ticket (AC5)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL, "team:infra"] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      transition: async (...a) => { calls.push("transition"); return ops.transition(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(calls).toEqual(["removeLabels", "transition"]); // order pinned, not just presence
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("In Progress");
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).not.toContain(EXEMPT_LABEL); // AC5: a "start" adoption never cargo-cults the exemption in either
+    expect(w.labels).toContain("team:infra"); // only the orphan label is removed, nothing else
+  });
+
+  test("disposition \"shelve\" on a fresh orphan clears butchr:orphan and adds butchr:shelved in the same call — the two labels never end up coexisting, and the ticket ends up correctly exempt from the parked detector (AC5)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do", labels: [ORPHAN_LABEL] });
+    const calls: string[] = [];
+    const spied: AtlassianOps = {
+      ...ops,
+      removeLabels: async (...a) => { calls.push("removeLabels"); return ops.removeLabels(...a); },
+      addLabels: async (...a) => { calls.push("addLabels"); return ops.addLabels(...a); },
+    };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    expect(calls).toEqual(["removeLabels", "addLabels"]); // the orphan clear happens before the exemption is added
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.status).toBe("To Do");
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).toContain(EXEMPT_LABEL);
+  });
+
+  test("a ticket that never carried butchr:orphan makes no removeLabels call for it — zero extra cost", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(removeCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress");
+  });
+
+  test("re-adoption of an already-adopted ticket (the alreadyAdopted no-op path, disposition \"start\") still clears a stale butchr:orphan", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // Already fully adopted by every OTHER measure (linked, assigned, In Progress) —
+    // a naive "skip everything when alreadyAdopted" implementation would leave this
+    // stale label behind, exactly the residue this fix exists to stop producing.
+    addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.task, status: "In Progress", labels: [ORPHAN_LABEL] });
+    let assignCalls = 0, linkCalls = 0, transitionCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      assign: async (...a) => { assignCalls++; return ops.assign(...a); },
+      linkIssues: async (...a) => { linkCalls++; return ops.linkIssues(...a); },
+      transition: async (...a) => { transitionCalls++; return ops.transition(...a); },
+    };
+    const result = await adoptWorker(spied, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(assignCalls).toBe(0);
+    expect(linkCalls).toBe(0);
+    expect(transitionCalls).toBe(0);
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL); // but the stale orphan label is still cleared
+  });
+
+  test("re-adoption of an already-adopted ticket (the alreadyAdopted no-op path, disposition \"shelve\") still clears a stale butchr:orphan, keeping butchr:shelved", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.story, status: "To Do", labels: [EXEMPT_LABEL, ORPHAN_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "still not ready" });
+    expect(result.alreadyAdopted).toBe(true);
+    const w = issues.get("BUTCHR-9")!;
+    expect(w.labels).not.toContain(ORPHAN_LABEL);
+    expect(w.labels).toContain(EXEMPT_LABEL); // "shelve" never clears its own exemption label, only the orphan one
+  });
+});
+
 describe("start_worker / finish_worker / prioritize_worker / tell_worker: ownership refusal (continued)", () => {
   test("prioritize_worker refuses a stranger's key AND the caller's OWN key, distinctly", async () => {
     const { ops, addIssue, issues } = makeWorld();
@@ -614,15 +703,41 @@ describe("correctWorker", () => {
     expect(issues.get("BUTCHR-2")!.description).toBe("old"); // UNCHANGED
   });
 
-  test("edit failing AFTER a successful archive: one harmless extra comment, description UNCHANGED, error says safe to retry", async () => {
+  test("edit failing AFTER a successful archive: a REJECTED annotation follows it each time, description UNCHANGED, error says safe to retry", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
     addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
     const failingOps: AtlassianOps = { ...ops, correctText: async () => { throw new Error("edit API down"); } };
     await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/UNCHANGED/);
     await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/retry/i);
-    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(2); // the archive lands each time (safe to retry)
+    const comments = issues.get("BUTCHR-2")!.comments;
+    expect(comments).toHaveLength(4); // archive + REJECTED annotation, twice (safe to retry)
+    expect(comments[0]).toContain(CORRECTION_MARKER);
+    expect(comments[1]).toContain(CORRECTION_REJECTED_MARKER);
+    expect(comments[1]).toMatch(/REJECTED/);
+    expect(comments[2]).toContain(CORRECTION_MARKER);
+    expect(comments[3]).toContain(CORRECTION_REJECTED_MARKER);
     expect(issues.get("BUTCHR-2")!.description).toBe("old"); // the edit never took
+  });
+
+  test("edit fails and the REJECTED annotation itself also fails: the ORIGINAL edit error still surfaces, unmasked", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    let addCommentCalls = 0;
+    const failingOps: AtlassianOps = {
+      ...ops,
+      correctText: async () => { throw new Error("edit API down"); },
+      addComment: async (key: string, text: string) => {
+        addCommentCalls++;
+        if (addCommentCalls === 1) return ops.addComment(key, text); // the archive itself still succeeds
+        throw new Error("comment API down too"); // the follow-up annotation attempt fails
+      },
+    };
+    await expect(correctWorker(failingOps, "BUTCHR-1", "BUTCHR-2", { description: "new", why: "reason" })).rejects.toThrow(/edit API down/);
+    // a catch that rethrew the annotation's own error, or swallowed the original, would fail the assertion above.
+    expect(issues.get("BUTCHR-2")!.comments).toHaveLength(1); // only the archive landed; the failed annotation attempt wrote nothing
+    expect(issues.get("BUTCHR-2")!.description).toBe("old");
   });
 
   test("a description-only call writes ONLY description — summary is untouched", async () => {
@@ -652,6 +767,48 @@ describe("correctWorker", () => {
     const summaryToo = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "newer summary", why: "reason 2" });
     expect(summaryToo.message).toMatch(/SNAPSHOTTED/);
     expect(summaryToo.message).toMatch(/tell_worker/);
+  });
+
+  test("refuses an oversized `description` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    let addCommentCalls = 0, correctTextCalls = 0;
+    const countingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { addCommentCalls++; return ops.addComment(key, text); },
+      correctText: async (key: string, p) => { correctTextCalls++; return ops.correctText(key, p); },
+    };
+    const oversized = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT + 1);
+    await expect(correctWorker(countingOps, "BUTCHR-1", "BUTCHR-2", { description: oversized, why: "reason" })).rejects.toThrow(new RegExp(String(JIRA_DESCRIPTION_CHAR_LIMIT)));
+    expect(addCommentCalls).toBe(0); // no archive was posted
+    expect(correctTextCalls).toBe(0); // no edit was attempted
+    expect(issues.get("BUTCHR-2")!.description).toBe("old"); // byte-for-byte untouched
+  });
+
+  test("refuses an oversized `summary` BEFORE any write — zero addComment, zero correctText calls, ticket untouched", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+    let addCommentCalls = 0, correctTextCalls = 0;
+    const countingOps: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { addCommentCalls++; return ops.addComment(key, text); },
+      correctText: async (key: string, p) => { correctTextCalls++; return ops.correctText(key, p); },
+    };
+    const oversized = "x".repeat(JIRA_SUMMARY_CHAR_LIMIT + 1);
+    await expect(correctWorker(countingOps, "BUTCHR-1", "BUTCHR-2", { summary: oversized, why: "reason" })).rejects.toThrow(new RegExp(String(JIRA_SUMMARY_CHAR_LIMIT)));
+    expect(addCommentCalls).toBe(0);
+    expect(correctTextCalls).toBe(0);
+    expect(issues.get("BUTCHR-2")!.summary).toBe("old summary");
+  });
+
+  test("does NOT refuse a description exactly AT the limit — the check is `>`, not `>=`", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", description: "old" });
+    const atLimit = "x".repeat(JIRA_DESCRIPTION_CHAR_LIMIT);
+    await expect(correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { description: atLimit, why: "reason" })).resolves.toBeDefined();
   });
 });
 
@@ -1218,6 +1375,25 @@ describe("adoptWorker: PROJECT caller adopts an existing EPIC (BUTCHR-71 Contrac
     const result = await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
     expect(result.alreadyAdopted).toBe(true);
     expect(assignCalls).toBe(0);
+  });
+
+  test("BUTCHR-108/BUTCHR-137: clears a stale butchr:orphan on an adopted epic too — symmetry / defence-in-depth, since file_where_it_belongs can never create an orphan Epic through this codebase's own write path", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", labels: [ORPHAN_LABEL] });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(issues.get("BUTCHR-9")!.labels).not.toContain(ORPHAN_LABEL);
+  });
+
+  test("BUTCHR-108/BUTCHR-137: no removeLabels call at all when the adopted epic never carried butchr:orphan — zero extra cost", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR" });
+    let removeCalls = 0;
+    const spied: AtlassianOps = { ...ops, removeLabels: async (...a) => { removeCalls++; return ops.removeLabels(...a); } };
+    await adoptWorker(spied, ROLES, "BUTCHR", "BUTCHR-9", { kind: "start" });
+    expect(removeCalls).toBe(0);
   });
 });
 
