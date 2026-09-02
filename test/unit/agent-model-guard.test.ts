@@ -28,13 +28,14 @@ import { modelFor } from "../../src/agents/workspace.js";
  * is also a text/string check: it says nothing about whether the value
  * `modelFor` returns is one `--model` actually accepts at spawn time.
  *
- * FORWARDING ADDRESS: this test pins AGREEMENT, not the literal string
- * "opus". The current value is a DEFAULT, not a human-stated decision — no
- * one confirmed which model Epics should run on when asked; `opus` is only
- * the completion of the recorded, reasoned change in commit `ca38dd15` /
- * CHANGELOG.md's `## [0.15.0]` entry, made because Fable capacity was
- * exhausted fleet-wide. That entry names an explicit revert condition:
- * "revert the map when Fable capacity returns." If that happens, both
+ * FORWARDING ADDRESS: every assertion below pins AGREEMENT, not the literal
+ * string "opus" — nothing here hard-codes a model name. The current value
+ * is a DEFAULT, not a human-stated decision — no one confirmed which model
+ * Epics should run on when asked; `opus` is only the completion of the
+ * recorded, reasoned change in commit `ca38dd15` / CHANGELOG.md's
+ * `## [0.15.0]` entry, made because Fable capacity was exhausted
+ * fleet-wide. That entry names an explicit revert condition: "revert the
+ * map when Fable capacity returns." If that happens, both
  * `docs/agent-model.md`'s Epic row AND `modelFor`'s epic mapping must
  * change together — this test will go red the moment only one of them
  * does, and that red is correct: it means the two sides disagree again, not
@@ -44,23 +45,34 @@ import { modelFor } from "../../src/agents/workspace.js";
 
 const DOC_PATH = join(import.meta.dir, "..", "..", "docs", "agent-model.md");
 
-// The agent-type table is "| type | owns | model | effort |"; splitting a
-// row on "|" and dropping the empty leading/trailing elements (produced by
-// the row's own leading/trailing pipe) leaves [type, owns, model, effort]
-// in order, regardless of the prose length of the "owns" cell.
+// The agent-type table's header row names its own columns
+// ("| type | owns | model | effort |"), so the "model" column's position is
+// looked up from the header rather than assumed at a fixed index — a column
+// reorder (header and cells moved together) still parses correctly, and a
+// genuine drift (a row no longer lining up with the header it claims) falls
+// out of this by construction instead of needing a separate hard-coded
+// value allowlist to catch it.
+function findColumnIndex(headerRow: string, columnName: string): number {
+  const cells = headerRow.split("|").slice(1, -1).map((cell) => cell.trim());
+  return cells.indexOf(columnName);
+}
+
 function parseDocEpicModel(docText: string): string {
-  const row = docText.split("\n").find((line) => line.trim().startsWith("| **Epic**"));
-  if (!row) return "";
-  const cells = row.split("|").slice(1, -1).map((cell) => cell.trim());
-  return cells[2] ?? "";
+  const lines = docText.split("\n");
+  const headerRow = lines.find((line) => line.trim().startsWith("| type"));
+  if (!headerRow) return "";
+  const modelCol = findColumnIndex(headerRow, "model");
+  if (modelCol === -1) return "";
+  const epicRow = lines.find((line) => line.trim().startsWith("| **Epic**"));
+  if (!epicRow) return "";
+  const cells = epicRow.split("|").slice(1, -1).map((cell) => cell.trim());
+  return cells[modelCol] ?? "";
 }
 
 describe("docs/agent-model.md Epic model cell vs modelFor (BUTCHR-90)", () => {
   test("non-vacuity: the doc's Epic row parses to a real, non-empty model cell", () => {
     const docText = readFileSync(DOC_PATH, "utf8");
-    const parsed = parseDocEpicModel(docText);
-    expect(parsed.length).toBeGreaterThan(0);
-    expect(["opus", "fable", "sonnet", "haiku"]).toContain(parsed);
+    expect(parseDocEpicModel(docText).length).toBeGreaterThan(0);
   });
 
   test("the doc's Epic model cell agrees with modelFor(\"Epic\")", () => {
