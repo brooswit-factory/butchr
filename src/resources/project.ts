@@ -181,33 +181,54 @@ export interface ProjectWatermark {
   /** Last root-doc footer-comment id this project has been acted on through, or `null` if never recorded. */
   comment: string | null;
   /**
-   * Per in-review epic key -> the epic's OWN `updated` timestamp (ISO-8601,
-   * Jira's own field) at the moment it was last acted on. A key ABSENT from
-   * this map means "never acted on this epic being in review at all".
+   * Per in-review epic key -> the newest comment id on that epic, as of the
+   * last time this project checked in on it. A key ABSENT from this map
+   * means "not currently known to be in review, as of the last check-in" —
+   * see the two-part note below on why absence, not a stale value, is what
+   * makes re-entry into review observable.
    *
-   * DELIBERATELY `updated`, NOT a comment id (BUTCHR-81 defect, caught at
-   * review before merge): a per-epic `newestCommentId` watermark cannot
-   * detect an epic RE-ENTERING review with no new comment (`submit_to_boss`
-   * transitions status; it does not necessarily comment) — a stale,
-   * never-pruned map entry from the epic's PRIOR review episode would still
-   * equal the freshly observed value and the project would wrongly stay
-   * `asleep`. Jira's `updated` field bumps on EVERY field change to an
-   * issue, status transitions included (MEASURED live, BUTCHR-81
-   * 2026-09-01: posting a comment alone moved `updated` forward) — so
-   * leaving review and re-entering it is, by itself, at least one
-   * transition that necessarily advances `updated` past whatever was
-   * watermarked during the previous review episode. No pruning is needed:
-   * the compared VALUE, not the map's membership, is what makes re-entry
-   * observable.
+   * TWO DEFECTS, FOUND AT REVIEW BEFORE MERGE, BOTH SETTLED HERE:
+   *
+   * (1) A comment id is REQUIRED, not `updated` (BUTCHR-81, first attempted
+   * fix rejected): `updated` looked attractive because it also bumps on a
+   * status transition, appearing to catch "entered review" for free. MEASURED
+   * live, twice — a plain comment add, AND a plain LABEL add with no comment
+   * at all, both moved `updated`. And this daemon's own `agent:*`/`pr:*`
+   * label sync writes to every issue in its active set CONSTANTLY (MEASURED
+   * live on a real In-Review ticket: 8 label changes in 17 minutes, `updated`
+   * exactly matching the last one) — `ISSUE_JQL` has no issuetype filter, so
+   * an in-review EPIC is label-synced identically. At this story's own
+   * 5-minute poll interval against ~1-3 minute label churn, an
+   * `updated`-keyed watermark is behind on EVERY poll for as long as any
+   * epic sits in review — active permanently, not occasionally noisy. A
+   * comment id is immune to this: nothing but an actual comment moves it.
+   *
+   * (2) Re-entry is caught by PRUNING, not by the compared value: this
+   * module NEVER prunes an entry out of this map on its own (see
+   * `advanceProjectWatermark` below) — the project agent's own `check_in`
+   * (src/tools/defs.ts) REPLACES this whole map with exactly the
+   * currently-in-review set every time it checks in, rather than merging
+   * one key into it. An epic that leaves review is therefore absent from
+   * the NEXT check-in's replacement map; when it re-enters, it is absent
+   * from `wm.epics` again and is treated as never-acted-on — the same
+   * "absence = active" comparison already used for a first-ever entry,
+   * doing double duty rather than needing a second mechanism. This keeps
+   * the load-bearing rule intact: only the AGENT, as its own last act,
+   * ever advances (or prunes) this map — never the daemon, never at spawn.
+   *
+   * A `pr:*` label transition on an in-review ticket (also part of the
+   * measured churn) is neither "entered review" nor "commented on while in
+   * review" — it must not wake the project, and a comment-id watermark
+   * cannot confuse the two, since a label write is not a comment.
    */
-  epics: Readonly<Record<string, string>>;
+  epics: Readonly<Record<string, string | null>>;
 }
 
 /** One epic currently `In Review` in a project, as `loadProject` observed it this poll. */
 export interface ProjectEpic {
   key: string;
-  /** This epic's own Jira `updated` field — see `ProjectWatermark.epics`'s doc comment for why this, not a comment id. */
-  updated: string;
+  /** This epic's newest comment id, or `null` if it has none — see `ProjectWatermark.epics`'s doc comment for why a comment id, not `updated`. */
+  newestCommentId: string | null;
 }
 
 /**
@@ -255,13 +276,13 @@ export function projectVerdict(p: ProjectResource): ActivationVerdict {
   const wm = p.watermark;
   const versionBehind = p.observedVersion !== null && p.observedVersion !== wm.version;
   const commentBehind = p.observedCommentId !== null && p.observedCommentId !== wm.comment;
-  // A single comparison covers BOTH "entered review" and "commented while in
-  // review": absence from `wm.epics` (never acted on) and a stale `updated`
-  // (acted on, but review re-entered or commented on since) are both simply
-  // "the current updated does not equal the watermarked one" — see
-  // `ProjectWatermark.epics`'s doc comment for why `updated` rather than a
-  // comment id makes this a single check instead of two.
-  const epicsBehind = p.observedEpics.some((e) => e.updated !== wm.epics[e.key]);
+  // Absence from `wm.epics` (never acted on THIS review episode — including
+  // a re-entry, since `check_in` REPLACES rather than merges this map, see
+  // its own doc comment) and a stale comment id (acted on, but commented on
+  // again since) are both simply "not equal to the watermarked value" —
+  // `wm.epics[e.key]` is `undefined` for an absent key, which a real
+  // `newestCommentId` (string) or even `null` both compare unequal to.
+  const epicsBehind = p.observedEpics.some((e) => e.newestCommentId !== wm.epics[e.key]);
   return versionBehind || commentBehind || epicsBehind ? "active" : "asleep";
 }
 
@@ -330,7 +351,7 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
-  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string>> },
+  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>> },
 ): Promise<void> {
   // Fail open on an unreadable property (e.g. genuinely absent — 404) rather
   // than throwing: this write path is reachable from speakOnOwnChannel only
@@ -342,11 +363,17 @@ export async function advanceProjectWatermark(
   // own eligibility check already treats as ineligible.
   const current = await ops.getProjectProperty(projectKey, PROPERTY_KEY).catch(() => undefined) as Record<string, unknown> | undefined ?? {};
   const wake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
-  // `epics` merges (never replaces) so watermarking one or a few epics in
-  // one call never drops another epic's already-recorded entry — the same
-  // additive discipline `addLabels`/`removeLabels` (atlassian-real.ts) use
-  // for read-modify-write over a shared collection.
-  const epics = { ...(wake.epics ?? {}), ...(patch.epics ?? {}) };
+  // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
+  // merge. This is the actual fix for rule 3's re-entry defect (see
+  // `ProjectWatermark.epics`'s doc comment, point 2): the only caller that
+  // ever passes `epics` is the project agent's own `check_in`
+  // (src/tools/defs.ts), which always computes the FULL currently-in-review
+  // set for the whole project in one JQL call — so "replace" here means
+  // "this is now the complete truth", and an epic that has left review
+  // since the last check-in is correctly dropped rather than lingering.
+  // Omitting `epics` entirely (e.g. a version-only or comment-only advance)
+  // leaves the existing map untouched.
+  const epics = patch.epics !== undefined ? patch.epics : (wake.epics ?? {});
   const nextWake: ProjectWatermark = {
     version: patch.version ?? wake.version ?? null,
     comment: patch.comment ?? wake.comment ?? null,
@@ -355,8 +382,15 @@ export async function advanceProjectWatermark(
   await ops.setProjectProperty(projectKey, PROPERTY_KEY, { ...current, wake: nextWake });
 }
 
-/** Largest comment id by NUMERIC value (Confluence footer-comment ids are monotonically increasing platform-wide, confirmed live) — never by API return order, since `getPageComments` requests no `sort` and this module does not depend on one. */
-function newestCommentId(comments: readonly { id: string }[]): string | null {
+/**
+ * Largest comment id by NUMERIC value (Confluence footer-comment ids are
+ * monotonically increasing platform-wide, confirmed live) — never by API
+ * return order, since `getPageComments` requests no `sort` and this module
+ * does not depend on one. Exported: the project tool surface's `check_in`
+ * verb (src/tools/defs.ts) reuses this exact function rather than a second
+ * "find the newest comment" implementation.
+ */
+export function newestCommentId(comments: readonly { id: string }[]): string | null {
   if (!comments.length) return null;
   return comments.reduce((max, c) => (Number(c.id) > Number(max) ? c.id : max), comments[0]!.id);
 }
@@ -367,15 +401,19 @@ const projectKeyOfIssue = (key: string): string => key.split("-", 1)[0]!;
 export interface ProjectResourceDeps {
   ops: AtlassianOps;
   /**
-   * Jira-shaped read (rule 3: epics in review) — the SAME shape
-   * `src/resources/issue.ts`'s `IssueResourceDeps.search` already takes,
+   * Jira-shaped reads (rule 3: epics in review, and their comments) — the
+   * SAME shape `src/resources/issue.ts`'s `IssueResourceDeps` already takes,
    * wired from the daemon's existing `atlassian` client, per the ticket's
    * instruction not to add Confluence-shaped work to that client or a third
-   * one. No per-epic `comments()` dependency: rule 3's epic axis watermarks
-   * the epic's own `updated` field (already returned by this same search),
-   * not a comment id — see `ProjectWatermark.epics`'s doc comment.
+   * one. `comments` is REQUIRED, not optional: rule 3's epic axis watermarks
+   * each epic's newest comment id, deliberately NOT its `updated` field —
+   * see `ProjectWatermark.epics`'s doc comment for the measured reason
+   * (label-sync churn on an in-review ticket bumps `updated` every 1-3
+   * minutes, faster than this story's own poll interval, which would leave
+   * an `updated`-keyed watermark permanently behind).
    */
   search: (jql: string) => Promise<JiraIssue[]>;
+  comments: (key: string) => Promise<readonly JiraComment[]>;
 }
 
 interface EligibleCandidate {
@@ -457,9 +495,14 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     eligible.map(async (p, i): Promise<ProjectResource> => {
       const rootDocId = p.property.rootDoc!.id!;
       const epics = epicsByProject.get(p.key) ?? [];
-      // No extra call per epic: `updated` is already on every issue the
-      // rule-3 JQL search returned.
-      const observedEpics: ProjectEpic[] = epics.map((epic): ProjectEpic => ({ key: epic.key, updated: epic.updated }));
+      // One comments() call per IN-REVIEW epic only (usually zero epics,
+      // per this file's own call-count budget) — deliberately not batched
+      // (there is no bulk comments read), and deliberately not `updated`
+      // (see ProjectWatermark.epics's doc comment for the measured
+      // label-churn reason).
+      const observedEpics: ProjectEpic[] = await Promise.all(
+        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId(await deps.comments(epic.key)) })),
+      );
       const wake = p.property.wake;
       return {
         key: p.key,
@@ -491,8 +534,8 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
   if (prev.observedVersion !== next.observedVersion) return true;
   if (prev.observedCommentId !== next.observedCommentId) return true;
   if (prev.observedEpics.length !== next.observedEpics.length) return true;
-  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.updated]));
-  return next.observedEpics.some((e) => prevEpics.get(e.key) !== e.updated || !prevEpics.has(e.key));
+  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.newestCommentId]));
+  return next.observedEpics.some((e) => prevEpics.get(e.key) !== e.newestCommentId || !prevEpics.has(e.key));
 }
 
 /**

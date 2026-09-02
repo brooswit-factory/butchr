@@ -52,55 +52,71 @@ describe("projectVerdict — the pure activation/nudge predicate", () => {
   });
 
   test("an epic never before seen in review -> active (absent from watermark.epics == never acted on)", () => {
-    expect(projectVerdict(project({ observedEpics: [{ key: "ACME-1", updated: "2026-01-01T00:00:00.000Z" }] }))).toBe("active");
+    expect(projectVerdict(project({ observedEpics: [{ key: "ACME-1", newestCommentId: null }] }))).toBe("active");
   });
 
-  test("an epic already watermarked at its current updated timestamp -> asleep", () => {
+  test("an epic already watermarked, no new comment since -> asleep", () => {
     expect(
       projectVerdict(
         project({
-          observedEpics: [{ key: "ACME-1", updated: "2026-01-01T00:00:00.000Z" }],
-          watermark: { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } },
+          observedEpics: [{ key: "ACME-1", newestCommentId: "50" }],
+          watermark: { version: 5, comment: "100", epics: { "ACME-1": "50" } },
         }),
       ),
     ).toBe("asleep");
   });
 
-  test("an epic's updated timestamp moved past its watermark -> active", () => {
+  test("an epic's newest comment moved past its watermark -> active", () => {
     expect(
       projectVerdict(
         project({
-          observedEpics: [{ key: "ACME-1", updated: "2026-01-02T00:00:00.000Z" }],
-          watermark: { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } },
+          observedEpics: [{ key: "ACME-1", newestCommentId: "51" }],
+          watermark: { version: 5, comment: "100", epics: { "ACME-1": "50" } },
         }),
       ),
     ).toBe("active");
   });
 
-  // BUTCHR-81 DEFECT, FOUND AT REVIEW: a per-epic watermark keyed by comment
-  // id alone cannot detect an epic RE-ENTERING review with no new comment
-  // (submit_to_boss transitions status; it does not necessarily comment).
-  // Failure condition, written first: an epic that enters review, is acted
-  // on (watermarked), LEAVES review, and RE-ENTERS with NO new comment must
-  // still produce "active" — because re-entry is itself a Jira `updated`
-  // transition, strictly newer than whatever was watermarked during the
-  // prior review episode. This is the test that would have failed against
-  // the old newestCommentId-keyed design (where re-entry with no comment
-  // left the watermark's stale comment id equal to the still-unchanged
-  // "newest comment id", wrongly staying asleep).
-  test("BUTCHR-81 regression: an epic that leaves review and RE-ENTERS with no new comment still wakes the project", () => {
-    // Episode 1: watermarked while first in review, at updated=T2 (after the
-    // project's own review comment bumped it past its entry time T1).
-    const watermarkFromFirstEpisode = { version: 5, comment: "100", epics: { "ACME-1": "2026-01-01T00:00:00.000Z" /* T2 */ } };
-    // Episode 2: epic left review (a transition, bumps updated to T3), then
-    // re-entered review (another transition, bumps updated to T4) with NO
-    // new comment posted in between. T4 > T2 unconditionally, since at least
-    // two transitions happened after T2.
+  // BUTCHR-81 DEFECT #1a (found at review): a per-epic watermark keyed by
+  // comment id alone, MERGED (never pruned), cannot detect an epic
+  // RE-ENTERING review with no new comment (submit_to_boss transitions
+  // status; it does not necessarily comment) — a stale map entry from the
+  // epic's PRIOR review episode compares equal to the still-unchanged
+  // "newest comment id" and the project wrongly stays asleep.
+  //
+  // DEFECT #1b (found at review, one level deeper): the first fix attempted
+  // — watermarking `updated` instead of a comment id — was itself wrong,
+  // because this daemon's OWN `agent:*`/`pr:*` label sync bumps `updated`
+  // on every label write (MEASURED live, BUTCHR-81 2026-09-01: a plain
+  // label add with no comment moved `updated`; a real in-review ticket's
+  // label-change history showed 8 changes in 17 minutes, `updated` matching
+  // the last one exactly) — faster than this story's 5-minute poll
+  // interval, so an `updated`-keyed watermark is behind on EVERY poll for
+  // as long as anything sits in review. Comment-id is immune to this.
+  //
+  // THE ACTUAL FIX: comment-id stays the compared VALUE (immune to label
+  // churn), and re-entry is caught by PRUNING on the WRITE side —
+  // `advanceProjectWatermark`'s `epics` patch REPLACES the whole map
+  // (see its own doc comment) rather than merging, so an epic that has
+  // left review is absent from the next replacement and re-entry is
+  // detected by absence again. This test proves that replace-based prune,
+  // not `projectVerdict` alone (which cannot see "did this get pruned" —
+  // that is the WRITE side's job): failure condition, written first — the
+  // full sequence (enter -> act/watermark -> leave -> re-enter with no new
+  // comment) must end with `projectVerdict` returning `active`.
+  test("BUTCHR-81 regression: an epic that leaves review and RE-ENTERS with no new comment still wakes the project, via prune-on-checkin", async () => {
+    const w = fakeWorld({ myAccountId: "acct-A", projects: [], properties: { ACME: { ...PROPERTY_A, wake: { version: 5, comment: "100", epics: { "ACME-1": "50" } } } } });
+    // Episode 1 already watermarked at comment "50" (above). The epic then
+    // LEFT review — a real check_in-shaped call observes zero epics in
+    // review right now and REPLACES the map with {} (pruning ACME-1).
+    await advanceProjectWatermark(w.ops, "ACME", { epics: {} });
+    expect(w.properties.get("ACME")!.wake).toEqual({ version: 5, comment: "100", epics: {} });
+    // Episode 2: the epic RE-ENTERS review with NO new comment (still "50").
     const reenteredWithNoComment = project({
-      observedEpics: [{ key: "ACME-1", updated: "2026-01-03T00:00:00.000Z" /* T4, strictly after T2 */ }],
-      watermark: watermarkFromFirstEpisode,
+      watermark: (w.properties.get("ACME")!.wake as any),
+      observedEpics: [{ key: "ACME-1", newestCommentId: "50" }],
     });
-    expect(projectVerdict(reenteredWithNoComment)).toBe("active");
+    expect(projectVerdict(reenteredWithNoComment)).toBe("active"); // absent from the pruned map -> behind
   });
 
   test("a never-recorded (null) watermark with something observed -> active (fail-open, matches the issue tier's baseline philosophy)", () => {
@@ -149,6 +165,7 @@ function fakeWorld(opts: {
   pageVersions?: Record<string, number>;
   pageComments?: Record<string, Array<{ id: string; body: string }>>;
   epicsInReview?: JiraIssue[];
+  epicComments?: Record<string, Array<{ id: string }>>;
 }): FakeWorld {
   const properties = new Map(Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, Record<string, unknown>][]);
   const calls = { getPageVersions: [] as string[][], getPageComments: [] as string[], search: [] as string[], getProjectPropertyOrNull: [] as string[] };
@@ -222,6 +239,7 @@ function fakeWorld(opts: {
       calls.search.push(jql);
       return opts.epicsInReview ?? [];
     },
+    comments: async (key: string) => (opts.epicComments?.[key] ?? []) as never,
   };
 
   return { ops, deps, properties, calls };
@@ -395,22 +413,23 @@ describe("discovery — call-count budget (batching)", () => {
   });
 });
 
-describe("discovery — rule 3 grouping", () => {
-  test("epics-in-review are grouped back to their own project by key prefix, carrying the epic's own `updated` field with no extra call", async () => {
+describe("discovery — rule 3 grouping and per-epic comment reads", () => {
+  test("epics-in-review are grouped back to their own project by key prefix, and only in-review epics get a comments() call", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [{ key: "ACME", name: "Acme", leadAccountId: "acct-A" }],
       properties: { ACME: PROPERTY_A },
       pageVersions: { "doc-A": 1 },
       epicsInReview: [
-        { key: "ACME-10", summary: "Epic 10", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "2026-01-01T00:00:00.000Z", labels: [] },
+        { key: "ACME-10", summary: "Epic 10", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] },
       ],
+      epicComments: { "ACME-10": [{ id: "c1" }] },
     });
     const [acme] = await createProjectResourceType(w.deps).discovery.search();
-    expect(acme!.observedEpics).toEqual([{ key: "ACME-10", updated: "2026-01-01T00:00:00.000Z" }]);
+    expect(acme!.observedEpics).toEqual([{ key: "ACME-10", newestCommentId: "c1" }]);
   });
 
-  test("no epics in review -> observedEpics is empty", async () => {
+  test("no epics in review -> observedEpics is empty and no comments() call happens for any epic", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [{ key: "ACME", name: "Acme", leadAccountId: "acct-A" }],
@@ -539,28 +558,43 @@ describe("advanceProjectWatermark", () => {
     expect(w.properties.get("ACME")!.wake).toEqual({ version: 7, comment: "200", epics: {} });
   });
 
-  test("advancing epic watermarks merges into the epics map rather than replacing it, and can batch multiple epics in one call", async () => {
+  // BUTCHR-81 (found at review): `epics`, when provided, REPLACES the whole
+  // map rather than merging — this is the actual fix for rule 3's re-entry
+  // defect (see this file's own regression test above and
+  // ProjectWatermark.epics's doc comment). An epic NOT included in a given
+  // `epics` patch is therefore DROPPED, not preserved.
+  test("advancing epic watermarks REPLACES the whole epics map — an epic omitted from the patch is dropped, not preserved", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [],
-      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } } } },
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "10" } } } },
     });
-    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-2": "2026-01-02T00:00:00.000Z", "ACME-3": "2026-01-03T00:00:00.000Z" } });
+    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-2": "20", "ACME-3": "30" } });
     expect(w.properties.get("ACME")!.wake).toEqual({
       version: 1,
       comment: null,
-      epics: { "ACME-1": "2026-01-01T00:00:00.000Z", "ACME-2": "2026-01-02T00:00:00.000Z", "ACME-3": "2026-01-03T00:00:00.000Z" },
+      epics: { "ACME-2": "20", "ACME-3": "30" }, // ACME-1 dropped — it was not in this check-in's observed set
     });
   });
 
-  test("re-watermarking an epic already in the map OVERWRITES its entry (this is exactly how re-entry stays detectable next time)", async () => {
+  test("an EMPTY epics patch ({}) clears every previously-recorded epic — exactly what a check-in with nothing currently in review must do", async () => {
     const w = fakeWorld({
       myAccountId: "acct-A",
       projects: [],
-      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "2026-01-01T00:00:00.000Z" } } } },
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "10", "ACME-2": "20" } } } },
     });
-    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-1": "2026-01-05T00:00:00.000Z" } });
-    expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: null, epics: { "ACME-1": "2026-01-05T00:00:00.000Z" } });
+    await advanceProjectWatermark(w.ops, "ACME", { epics: {} });
+    expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: null, epics: {} });
+  });
+
+  test("omitting `epics` entirely (a version- or comment-only advance) leaves the existing map untouched", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [],
+      properties: { ACME: { ...PROPERTY_A, wake: { version: 1, comment: null, epics: { "ACME-1": "10" } } } },
+    });
+    await advanceProjectWatermark(w.ops, "ACME", { version: 2 });
+    expect(w.properties.get("ACME")!.wake).toEqual({ version: 2, comment: null, epics: { "ACME-1": "10" } });
   });
 
   test("no prior butchr property at all -> starts from an empty base rather than throwing", async () => {

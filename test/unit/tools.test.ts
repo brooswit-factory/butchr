@@ -46,6 +46,7 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
+      "check_in",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
@@ -1317,5 +1318,118 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
   test("file_where_it_belongs REFUSES a project caller, naming why (no coherent case-B bottom)", async () => {
     const { tools, conn } = projectRig();
     await expect(tools.file_where_it_belongs!.handler({ summary: "s", issuetype: "Task", destination: "BUTCHR-9" }, conn)).rejects.toThrow(/refusing a project caller/);
+  });
+});
+
+// BUTCHR-81's own scope addition: check_in, the project agent's last act
+// before exiting (watermark checkpoint). Failure conditions stated first,
+// per test.
+describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark checkpoint)", () => {
+  function checkInRig(opts: {
+    epicsInReview?: Array<{ key: string }>;
+    epicComments?: Record<string, Array<{ id: string }>>;
+    rootDocComments?: Array<{ id: string; body: string }>;
+    rootDocVersion?: number;
+  } = {}) {
+    const properties = new Map<string, unknown>([["BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" } }]]);
+    const setPropertyCalls: unknown[] = [];
+    const searchCalls: string[] = [];
+    const getIssueCalls: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async (key: string) => {
+        getIssueCalls.push(key);
+        return { fields: { comment: { comments: opts.epicComments?.[key] ?? [] } } };
+      },
+      search: async (jql: string) => {
+        searchCalls.push(jql);
+        return { issues: (opts.epicsInReview ?? []).map((e) => ({ key: e.key })) };
+      },
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async () => ({ ok: true }),
+      updatePage: async () => ({ ok: true }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: opts.rootDocComments ?? [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async (key: string) => {
+        const p = properties.get(key);
+        if (!p) throw new Error(`no property for ${key}`);
+        return p;
+      },
+      getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        setPropertyCalls.push(value);
+        properties.set(key, value);
+        return { ok: true };
+      },
+      getPageVersions: async () => ({ "1": opts.rootDocVersion ?? 3 }),
+    };
+    const tools = atlassianTools(ops, () => {});
+    return { tools, properties, setPropertyCalls, searchCalls, getIssueCalls };
+  }
+
+  test("refuses an ISSUE caller — an issue never sleeps and has no watermark to advance", async () => {
+    const { tools } = checkInRig();
+    const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+    await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
+  });
+
+  test("refuses a connection with no x-issue", async () => {
+    const { tools } = checkInRig();
+    const conn = { headers: {} } as any;
+    await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing/);
+  });
+
+  test("with nothing in review: watermarks version and comment, and REPLACES epics with {} (pruning any stale entries)", async () => {
+    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }] });
+    // Seed a stale epic entry, as if watermarked during a PRIOR review episode.
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: null, epics: { "BUTCHR-9": "50" } } });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = await tools.check_in!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, comment: "99", epics: {} });
+    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, comment: "99", epics: {} }); // BUTCHR-9 pruned
+  });
+
+  test("with an epic in review: fetches ITS comments via getIssue (not the batched search), and watermarks it", async () => {
+    const { tools, properties, getIssueCalls } = checkInRig({
+      epicsInReview: [{ key: "BUTCHR-9" }],
+      epicComments: { "BUTCHR-9": [{ id: "101" }, { id: "202" }] },
+    });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string> };
+    expect(result.epics).toEqual({ "BUTCHR-9": "202" }); // newest by numeric value
+    expect(getIssueCalls).toEqual(["BUTCHR-9"]);
+    expect((properties.get("BUTCHR") as any).wake.epics).toEqual({ "BUTCHR-9": "202" });
+  });
+
+  test("no epics in review at all -> zero getIssue calls (the usual case)", async () => {
+    const { tools, getIssueCalls } = checkInRig({ epicsInReview: [] });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.check_in!.handler({}, conn);
+    expect(getIssueCalls).toEqual([]);
+  });
+
+  test("no root-doc comments yet -> comment watermark stays unadvanced (null), not clobbered to null over a real prior value", async () => {
+    const { tools, properties } = checkInRig({ rootDocComments: [] });
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: "42", epics: {} } });
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await tools.check_in!.handler({}, conn);
+    expect((properties.get("BUTCHR") as any).wake.comment).toBe("42"); // untouched — omitted from the patch, not overwritten with null
   });
 });

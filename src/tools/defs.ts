@@ -1,7 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc, getProjectDoc, setProjectDoc } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
@@ -9,6 +9,7 @@ import {
   type Disposition,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
+import { advanceProjectWatermark, newestCommentId } from "../resources/project.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -67,6 +68,23 @@ function refuseProjectCaller(c: { headers: Record<string, string> }, verb: strin
   if (who && isProjectId(who)) {
     throw new Error(`${verb}: refusing a project caller — ${why}`);
   }
+}
+
+/**
+ * The inverse gate, for `check_in` (BUTCHR-67/BUTCHR-81): a verb that ONLY
+ * makes sense for a project caller, because it is answering "has this
+ * resource acted on what it has seen" — a question `ISSUE_ACTIVATION` never
+ * asks (an issue never sleeps; `verdictFor` returns only `active`/`inactive`
+ * for it, never `asleep` — see src/resources/types.ts). Refusing an issue
+ * caller here, in words, is cheaper than that caller discovering the verb
+ * silently does nothing for it.
+ */
+function requireProjectCaller(c: { headers: Record<string, string> }, verb: string): string {
+  const who = requireCaller(c, verb);
+  if (!isProjectId(who)) {
+    throw new Error(`${verb}: refusing an issue caller — this verb only exists for a PROJECT (an issue never sleeps, so it has no watermark to advance)`);
+  }
+  return who;
 }
 
 const noAssigneeMsg = (issuetype: "Story" | "Task"): string => {
@@ -616,6 +634,47 @@ export function atlassianTools(
         const r = await askBoss(ops, who, text);
         noted(c, [who]);
         return r;
+      },
+    },
+    check_in: {
+      description:
+        'PROJECT CALLER ONLY (refuses an issue caller). Your LAST ACT before exiting: records "I have acted on everything I can currently see" so this project goes back to sleep rather than waking again on the same, already-handled state. TAKES NO ARGUMENTS: it re-reads your OWN current root-doc version, newest root-doc comment, and every epic you currently have In Review directly from Jira/Confluence — it never trusts a value you hand it, the same way nothing else in this system trusts a caller-supplied fact where a server read is available. Call this ONLY after you have actually finished acting on what woke you — calling it early against a rule or a suppression you are not designing yourself is exactly how you would go back to sleep with something unhandled. Idempotent: calling it again with nothing new to report simply re-records the same current state. Never call this on behalf of another project — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireProjectCaller(c, "check_in");
+        const doc = await projectRootDoc(ops, who);
+        const [versions, comments, epicsRaw] = await Promise.all([
+          ops.getPageVersions([doc.id]),
+          ops.getPageComments(doc.id),
+          ops.search(`project = ${who} AND issuetype = Epic AND status = "In Review"`, 200) as Promise<{ issues?: Array<{ key: string }> }>,
+        ]);
+        const version = versions[doc.id];
+        const comment = newestCommentId(comments.results);
+        // `epics` is a REPLACE, not a merge (advanceProjectWatermark's own
+        // doc comment) — this is what prunes an epic that has left review
+        // since the last check-in, so re-entry is detectable by absence
+        // again. It is therefore built and passed EVERY call, even when
+        // empty ({} correctly clears every previously-recorded entry for a
+        // project with nothing in review right now).
+        //
+        // getIssue (not the batched search) per in-review epic, deliberately:
+        // a plain getIssue already returns `fields.comment.comments` with no
+        // extra `fields` param (MEASURED live, BUTCHR-81 2026-09-01) — this
+        // reuses that rather than widening `ops.search`'s fields for every
+        // caller of the shared jira_search tool. Usually zero calls: most
+        // polls have no epic in review at all.
+        const epics: Record<string, string | null> = {};
+        for (const epic of epicsRaw?.issues ?? []) {
+          const full = (await ops.getIssue(epic.key)) as { fields?: { comment?: { comments?: Array<{ id: string }> } } };
+          epics[epic.key] = newestCommentId(full.fields?.comment?.comments ?? []);
+        }
+        audit(c, `check_in (version=${version ?? "?"}, comment=${comment ?? "none"}, epics in review=${Object.keys(epics).length})`);
+        await advanceProjectWatermark(ops, who, {
+          ...(version !== undefined ? { version } : {}),
+          ...(comment !== null ? { comment } : {}),
+          epics,
+        });
+        return { ok: true, key: who, version: version ?? null, comment, epics };
       },
     },
     submit_to_boss: {

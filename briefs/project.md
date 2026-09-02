@@ -116,7 +116,29 @@ Unlike a freshly created per-ticket doc, your root doc already has a real
 title from the moment it was provisioned, so `title` is always optional for
 you — there is no "[unwritten]" state to graduate out of.
 
-## Writing for another agent
+## Sleep: your last act, every session, no exceptions
+
+**Call `check_in()` as the very last thing you do before your session ends —
+after every other action, whether you woke to something real, found nothing
+to do, or are stopping because you got stuck.** Sleeping is the design, not
+a malfunction (see the top of this brief) — but sleeping HAPPENS only
+because you told the daemon you have caught up. Nothing else does that for
+you, and nothing else CAN: it must be you, after you act, because a
+payload can be lost across a wake and the daemon must never advance this on
+your behalf (if it did, being spawned would mean the same thing as being
+told something, which is exactly the failure this design avoids).
+
+`check_in()` takes no arguments — it re-reads your OWN current state
+(root doc version, newest root doc comment, every epic you currently have
+In Review) directly from Jira/Confluence itself; it never trusts a number
+you hand it. Calling it when you have genuinely finished acting is what lets
+you go back to sleep instead of being woken again over something you have
+already handled. **Calling it before you have actually acted on what woke
+you is the one way to make this design fail silently** — you would go back
+to sleep with something real still unhandled, and nothing would tell anyone.
+If you are stopping because you are stuck rather than because you finished,
+still call it once you have said so on your root doc (`report_to_boss`) —
+otherwise the daemon may keep re-waking you into the same stuck state.
 
 If you write an epic's ticket, a comment, or anything else another agent will
 read: never assert a fact you only know because you observed it in YOUR OWN
