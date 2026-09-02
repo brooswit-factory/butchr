@@ -42,6 +42,17 @@ import { ORPHAN_LABEL } from "../tools/relationship.js";
  * file states the boundary instead of leaving it to be discovered the way
  * `butchr:orphan` was.
  *
+ * BUTCHR-172/BUTCHR-154: `../media/registry.ts` is the INDEX of all four
+ * media (this one included) and the grading of how strongly each one's
+ * records are made safe — it is NOT a shared abstraction over this file,
+ * `../headers/registry.ts`, and `../workspace/registry.ts` (unifying the
+ * three was considered and declined there, on grounds directly continuing
+ * this file's own "declined widening" paragraph above). `../media/
+ * family-scan.ts` is the machine check for one source-visible shape of
+ * "a withdrawal path exists but its selection does not reach every member
+ * of its family" — see that file's own header, and its cross-reference in
+ * `./label-scan.ts`, for what it does and does not prove.
+ *
  * TWO DOORS, BECAUSE THEY FAIL ON DIFFERENT MISTAKES — AND NEITHER PROVES
  * WHAT IT LOOKS LIKE IT PROVES (AC-9; read this before trusting either):
  *   1. THE TYPE-LEVEL DOOR (this file). `RegisteredLabel` below is a CLOSED
