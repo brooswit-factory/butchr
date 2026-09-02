@@ -12,6 +12,8 @@ import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 
 export interface SpawnSpec { key: string; issuetype: string; summary: string; parent: string | null }
 
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, project: PROJECT };
+
 /**
  * Selected by `issuetype` — the SAME lookup an issue resource and a PROJECT
  * resource both go through (BUTCHR-71): an issue names its Jira issue type
@@ -21,8 +23,18 @@ export interface SpawnSpec { key: string; issuetype: string; summary: string; pa
  * spawn-config work before assuming the caller shape reaching this function
  * hasn't moved — this file only adds the `project` entry additively.
  */
-export const briefFor = (issuetype: string): string =>
-  ({ epic: EPIC, story: STORY, task: TASK, project: PROJECT } as Record<string, string>)[issuetype.toLowerCase()] ?? DEFAULT;
+export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.toLowerCase()] ?? DEFAULT;
+
+/**
+ * The issue-type keys `briefFor` maps explicitly (lowercase). Every other
+ * `issuetype` falls back to `DEFAULT`, which this deliberately excludes —
+ * `DEFAULT` isn't a tracked brief, it's what "nothing more specific applies"
+ * looks like. Exposed so a caller (BUTCHR-149: test/unit/merge-check-guard.test.ts)
+ * can derive "every brief this fleet actually ships" from this table instead
+ * of hand-copying a parallel list here that goes stale the moment a type is
+ * added above — which is exactly how `briefs/project.md` went uncovered.
+ */
+export const knownBriefTypes = (): string[] => Object.keys(BRIEF_BY_TYPE);
 
 /** `groundTruth` fills `{{GROUND_TRUTH}}` (only CLAUDE.md carries that placeholder); omit it for templates that don't need it. */
 export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: string): string =>
