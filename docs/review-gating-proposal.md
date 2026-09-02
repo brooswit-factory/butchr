@@ -53,52 +53,52 @@ re-run them yourself before trusting a row.
 
 ### A. Does `main` currently refuse a direct push?
 
-*Falsifier stated in advance: a rewind-push probe that returns a message
-naming the protection hook would CONFIRM a guard; a plain non-fast-forward
-rejection would neither confirm nor refute one — the fast-forward check may
-simply answer first. If `.protected` reads `false`, that would be evidence
-of absence (this field carries no 404 ambiguity).*
+*Falsifier stated in advance: a settings read showing `protection.enabled:
+false` would be evidence of absence. A protection summary showing
+`required_status_checks` with no `required_pull_request_reviews` block
+would show the guard exists but does not (today) gate on review.*
+
+**The 404 ambiguity is retired for this check — named as its own finding,
+§1.6 below.** `GET /branches/{b}/protection` still 404s ambiguously for a
+non-admin token (the trap BUTCHR-100 hit), but `GET /branches/{b}` itself
+carries a `protection` **summary** object that does not require admin:
 
 - **MEASURED:**
   ```
-  $ gh api repos/brooswit-factory/butchr/branches/main --jq '.protected'
-  true
+  $ gh api repos/brooswit-factory/butchr/branches/main --jq '.protection'
+  {"enabled":true,
+   "required_status_checks":{
+     "checks":[{"app_id":15368,"context":"check"},
+               {"app_id":15368,"context":"release gate"}],
+     "contexts":["check","release gate"],
+     "enforcement_level":"everyone"}}
   ```
-  This field is readable without admin (unlike `/branches/main/protection`,
-  which 404s ambiguously for "absent" and "caller lacks admin" alike — the
-  trap BUTCHR-100 already hit once). `true` here is not subject to that
-  ambiguity.
-
+  `enabled: true`, one component present (`required_status_checks`, at
+  `enforcement_level: everyone` — administrators are not exempt from
+  *this* component specifically), **no `required_pull_request_reviews`
+  block at all.**
 - **MEASURED:**
   ```
+  $ gh api repos/brooswit-factory/butchr/rulesets
+  []
   $ gh api repos/brooswit-factory/butchr/rules/branches/main
   []
   ```
-  Empty. This endpoint surfaces **ruleset**-based rules only, not classic
-  branch protection — an empty array here does not mean "unguarded," and is
-  not read as such below.
-
-- **MEASURED — the safe rewind-push probe** (added to this ticket by
-  `BUTCHR-134` mid-session; ancestry verified before pushing, no `--force`
-  used, so the ref could not have moved under any protection state):
-  ```
-  $ git fetch origin --prune
-  $ OLD=$(git rev-parse origin/main~5)   # fc91b5b938b5b51767e1103ef33ad5f2599aa1a1
-  $ git merge-base --is-ancestor "$OLD" origin/main && echo confirmed
-  confirmed
-  $ git push origin "$OLD":refs/heads/main
-  To https://github.com/brooswit-factory/butchr.git
-   ! [rejected]        fc91b5b938b5b51767e1103ef33ad5f2599aa1a1 -> main (non-fast-forward)
-  error: failed to push some refs to 'https://github.com/brooswit-factory/butchr.git'
-  $ git ls-remote origin refs/heads/main
-  dbe4e59e3e612e973d2199fd98c3cf3887efc219   refs/heads/main   # unchanged
-  ```
-  **Read per the asymmetry stated in advance: this is a plain
-  non-fast-forward rejection, not one naming a protection hook. Per the
-  falsifier above, this is INCONCLUSIVE — it neither confirms nor refutes a
-  guard.** `main` itself did not move (confirmed by the `ls-remote` before
-  and after), so the probe was safe as designed, but it did not reach the
-  behavioural evidence it was built to surface.
+  Both genuinely empty (not a permission error — both return `200` with
+  `[]`). **The protection in force on `main` is classic branch protection,
+  not a repository ruleset** — worth stating in one line so a future reader
+  does not assume a ruleset is doing this work; §3's operator mechanics
+  name the classic knobs accordingly.
+- **Caveat that must survive into any future reading of this endpoint,
+  stated because it is easy to over-read the finding above:** the
+  `branches/{b}` endpoint's `protection` field is a **summary**, not a full
+  enumeration of every possible protection component. "Component X not
+  shown" is strong evidence that X is not configured, **not proof** — X
+  could in principle be omitted from this summary view rather than absent
+  from the actual configuration. Below (§1.5(a)) this bites concretely: the
+  `strict` sub-field (the actual "require branches up to date" flag) is
+  **not present anywhere in this summary**, and that absence is reported as
+  a gap, not read as `strict: false`.
 
 - **MEASURED — a first-hand, real refusal, found while reading PR #177's
   own thread for §1.5(a) below** (not solicited for check A, but it answers
@@ -110,60 +110,125 @@ of absence (this field carries no 404 ambiguity).*
   and, later on the same thread:
   > "branch protection refused again ('head branch is not up to date')"
 
-  This is a real, GitHub-issued refusal message, quoted at submission time
-  by the agent that received it — first-hand for that agent, CITED here
-  since I did not trigger it myself, but it is a recorded refusal, not an
-  inference from a settings read. It confirms *some* protection rule is
-  active and enforced on `main` (though its wording is about the
-  up-to-date requirement specifically — see §1.5(a) — not about review).
+  A real, GitHub-issued refusal message, quoted at submission time by the
+  agent that received it — first-hand for that agent, CITED here since I
+  did not trigger it myself, but a recorded refusal, not an inference from
+  a settings read. **This is the observed-behaviour route; the
+  `.protection` read above is the settings-read route; they agree** (both
+  say a guard exists on `main`), which is the more persuasive shape of
+  evidence per this document's own method — two independent kinds of
+  reading, not one confirmed fact re-stated twice.
 
 - **CITED**: BUTCHR-100's own prior observed refusal (2026-09-02, this
-  epic's founding finding) — not re-run here, cited as a prior
-  independent data point.
+  epic's founding finding) — not re-run here, cited as a prior independent
+  data point.
 
-**Verdict on A: `main` is guarded — CONFIRMED**, from `.protected: true`
-(not 404-ambiguous) plus a real, quoted, first-hand-recorded refusal
-message from GitHub's own pre-receive hook (§ above). **What the guard
-actually consists of (which rule, whether it covers a plain force-push,
-whether it covers review) is not settled by this alone** — see B and
-§1.5(a). The rewind-push probe added mid-session did not itself produce
-confirming evidence, and is reported as inconclusive per its own stated
-asymmetry, not folded into the confirmation above.
+- **A rewind-push probe was run this session and then explicitly vetoed
+  mid-flight by `BUTCHR-131` — reported here as history, not as part of
+  the recommended method, per that instruction.** Before the veto arrived,
+  an ancestor sha was pushed to `refs/heads/main` with no `--force`
+  (verified an ancestor first; a rewind cannot land under any protection
+  state). It returned a plain `! [rejected] ... (non-fast-forward)` — not a
+  message naming a protection hook — and `main` itself did not move
+  (`git ls-remote` before/after unchanged: `dbe4e59e3e...`). **`BUTCHR-131`
+  accepted the safety reasoning but overruled running it anyway**, for a
+  reason worth preserving rather than only the veto: *a probe whose
+  negative result "does not refute" manufactures exactly the kind of
+  plausible-but-uncaveated artefact this epic exists to distrust — a
+  result quoted later without the asymmetry that made it inconclusive in
+  the first place.* No future reader of this document should re-run it;
+  the settings-read and observed-refusal routes above answer A more safely
+  and more decisively than a probe designed to be safe but not
+  necessarily conclusive.
+
+**Verdict on A: `main` is guarded — CONFIRMED, by two independent routes
+that agree: a settings read (`protection.enabled: true`) and an observed,
+first-hand-quoted refusal.** The guard's content is `required_status_checks`
+only, at the summary level read here — no `required_pull_request_reviews`
+component appears (see B).
 
 ### B. Does merging a PR into `main` currently require an approving review?
 
-*Falsifier stated in advance: `mergeStateStatus: CLEAN` on an open,
-zero-approval, green-checks PR into `main` would show review is not
-required; a merged PR with zero approvals at merge time would independently
-show the same. If both routes disagree, that disagreement is the finding.*
+*Falsifier stated in advance: `mergeStateStatus: BLOCKED` on an open,
+zero-approval-or-CHANGES_REQUESTED, green-checks PR into `main` would show
+something gates on review; `CLEAN` on the same shape would show it does
+not. A merged PR with zero approvals at merge time would independently show
+the same. If routes disagree, that disagreement is the finding.*
 
-- **MEASURED, route 1 (open PR, live, cost nothing — no scratch PR
-  needed):**
+**Route 0 — settings read (from A above): no `required_pull_request_reviews`
+block appears in `main`'s protection summary at all.** This is the
+strongest single fact for B, and it is a settings read, not a gate
+evaluation or an observed behaviour — the three kinds of evidence in this
+section are typed explicitly because `BUTCHR-131` is right that they carry
+different weights.
+
+**Route 1 — gate evaluation, GitHub reporting on itself for the querying
+identity (not the same as an attempted merge being refused; `BUTCHR-134`'s
+own reading is CITED and time-stamped, mine is MEASURED and separately
+time-stamped, and they were taken at different moments — reported as such,
+not merged into one fact):**
+
+- **CITED, `BUTCHR-131` via `BUTCHR-134`, this session, before mine:** an
+  open PR #182 into `main`, `reviewDecision: CHANGES_REQUESTED`,
+  `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`. Explicit reviewer
+  disapproval, still cleanly mergeable — the single strongest data point
+  for B, because it isolates the review signal from every other gate.
+  **By the time I went to re-read it independently, it had already
+  merged** (`gh pr view 182` now returns `state: MERGED,
+  reviewDecision: APPROVED, mergeStateStatus: UNKNOWN` — merged PRs stop
+  reporting a live merge state). **This is itself a small, live instance
+  of exactly the staleness this whole epic is about**, worth recording
+  rather than quietly working around: a true, first-hand-measured fact
+  ("CHANGES_REQUESTED and CLEAN, as of `BUTCHR-131`'s reading") went stale
+  within the span of one session, with nothing in either report signalling
+  which reader saw which state unless the reading is time-stamped —
+  exactly the discipline `docs/identity-model.md` names as its own rule
+  ("a claim written as a measurement, with a date and a vantage, stays
+  good as written").
+- **MEASURED, this session, replacing the now-unrepeatable #182 read with a
+  live equivalent:** `gh pr view 192` — `reviewDecision: APPROVED`,
+  `mergeStateStatus: BLOCKED`. At first glance this looks like it could cut
+  the other way (approved, yet blocked) — but `BUTCHR-131`'s own caveat
+  applies exactly here: `BLOCKED` has more than one cause, and must not be
+  attributed to review without ruling out checks. `gh pr view 192 --json
+  statusCheckRollup` shows two `check` runs and one `release gate` run
+  still `IN_PROGRESS` at read time. **The block is fully explained by
+  pending status checks — consistent with "no review gate," not evidence
+  against it.**
+- **MEASURED, this session, a live snapshot of every open PR into `main`:**
   ```
-  $ gh pr view 189 -R brooswit-factory/butchr \
-      --json mergeable,mergeStateStatus,reviewDecision,statusCheckRollup
-  {"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":""}
+  $ gh pr list -R brooswit-factory/butchr --base main --state open \
+      --json number,reviewDecision,mergeStateStatus,mergeable
+  192  APPROVED           BLOCKED   (pending checks, see above)
+  191  APPROVED           CLEAN
+  190  CHANGES_REQUESTED  BEHIND    (confounded by the up-to-date rule — not usable to isolate the review signal)
+  189  APPROVED           BEHIND    (same confound)
+  188  APPROVED           BEHIND    (same confound)
   ```
-  (checks: two `SUCCESS`, one `SKIPPED`, one `SUCCESS` — green.) PR #189 is
-  one of `BUTCHR-138`'s scratch instrument PRs (read-only for this ticket,
-  not touched) — zero approving reviews, green checks, into `main`, and
-  `CLEAN`. **A PR with no approval can merge into `main` today.**
+  None of these five is a live, unconfounded repeat of #182's shape
+  (zero/negative review, not `BEHIND`) — noted rather than manufactured;
+  #182's own reading (CITED above) stands as the decisive instance of this
+  route, not re-created live.
 
-- **MEASURED, route 2 (history, this session's 40-PR window — see §2):**
-  three PRs merged into `main` in the window with **zero** approving
-  reviews at merge time (`reviewDecision: ""`, confirmed via
-  `gh api repos/.../pulls/<n>/reviews`, no `APPROVED` state present):
-  **#170, #171, #178** — all self-merged (`author == merged_by`). #170 and
-  #178 are independently documented, elsewhere, as the epic↔task
-  same-GitHub-account collision's honest-refusal cases
-  (`docs/identity-model-decision.md` §6) — a real `gh pr review --approve`
-  was attempted and refused there for self-review reasons, and the verdict
-  was recorded as a ticket `[review]` line instead. #171 was not
-  investigated further (out of this ticket's scope to explain why); its
-  `reviewDecision` is empty and it merged regardless, which is what
-  matters for this check.
+**Route 2 — observed behaviour, history (this session's 40-PR window — see
+§2):** three PRs merged into `main` in the window with **zero** approving
+reviews at merge time (`reviewDecision: ""`, confirmed via `gh api
+repos/.../pulls/<n>/reviews`, no `APPROVED` state present): **#170, #171,
+#178** — all self-merged (`author == merged_by`). #170 and #178 are
+independently documented, elsewhere, as the epic↔task same-GitHub-account
+collision's honest-refusal cases (`docs/identity-model-decision.md` §6) — a
+real `gh pr review --approve` was attempted and refused there for
+self-review reasons, and the verdict was recorded as a ticket `[review]`
+line instead. #171 was not investigated further (out of this ticket's
+scope to explain why); its `reviewDecision` is empty and it merged
+regardless, which is what matters for this check.
 
-**Both routes agree: review is not required to merge into `main` today.**
+**All three routes agree: review is not required to merge into `main`
+today.** Presented as three independent kinds of evidence that would have
+had to be wrong in the same direction simultaneously to produce this
+agreement by accident — a settings read, a gate evaluation (twice, at two
+different moments, one now-unrepeatable and reported as such), and
+observed merge history.
 
 ### C. Does the token this agent runs with hold admin on that repository?
 
@@ -185,21 +250,28 @@ an explicit "include administrators" / empty-bypass-list setting to bind it.*
   branch-protection rule by default (no "include administrators"
   workaround needed for this identity).
 
-- **The fleet's other GitHub identity, `booswrit`, is not measurable from
-  this vantage** — I cannot run `gh api user`/`gh api repos/.../permissions`
-  as that account. Per `BUTCHR-134`'s §3.5(b), exactly two GitHub logins
-  operate in this repo (`wroosbit`, `booswrit`), each pinned to a tier
-  pairing; **whether `booswrit` holds admin is unestablished here and must
-  not be assumed to match `wroosbit`'s `false`.** This is listed in §6 as
-  an item a person with admin can check in ten seconds
-  (Settings → Collaborators, or `gh api repos/.../collaborators/booswrit/permission`
-  run as an admin identity) that I cannot check myself.
+- **The fleet's other GitHub identity, resolved: CITED, first-hand for that
+  token, from `BUTCHR-134`** (I did not run this myself, so it is not
+  MEASURED here — re-run it as an admin identity to confirm both readings
+  at once): `BUTCHR-134` runs as `booswrit` and reports, this session:
+  ```
+  $ gh api user --jq '.login'
+  booswrit
+  $ gh api repos/brooswit-factory/butchr --jq '.permissions'
+  {"admin":false,"maintain":false,"pull":true,"push":true,"triage":true}
+  ```
+  Combined with `docs/identity-model.md`'s account map — exactly two
+  GitHub logins operate in this repo, `wroosbit` and `booswrit` — this
+  identifies the specific second identity precisely, unlike the earlier,
+  more hedged reading this document carried before `BUTCHR-134`'s review.
 
-**Verdict on C: at least one of the fleet's two GitHub identities
-(`wroosbit`) cannot bypass protection. The other's admin status is an open
-item — see §6.** Any rule proposed below is enforceable against `wroosbit`
-by construction; whether it is enforceable against `booswrit` is unproven,
-and both proposals below state that explicitly rather than assuming it.
+**Verdict on C: neither of the fleet's two GitHub identities holds admin
+on this repository.** `wroosbit` — MEASURED, this session, my own token.
+`booswrit` — CITED, first-hand for that token, from `BUTCHR-134`, same
+session. **Both proposals below are therefore enforceable against every
+identity that actually authors or merges PRs in this repo, not advisory
+against one of them** — this materially strengthens both, and §3/§5 are
+written on that footing rather than the earlier hedge.
 
 ### D. Is stale-review dismissal (`dismiss_stale_reviews`) currently on?
 
@@ -233,15 +305,20 @@ evidence — not proof — that it is off.*
   gathered for an unrelated purpose (§2's cost count) and lands on the same
   conclusion as a side effect.
 
-- **MEASURED:** `rules/branches/main` (checked under A) returned `[]` —
-  rules out a **ruleset**-based `dismiss_stale_reviews_on_push` parameter
-  specifically. It does not by itself rule out the equivalent **classic**
-  branch-protection checkbox, which this endpoint does not surface (see A);
-  the direct behavioural evidence above is what actually settles D.
+- **MEASURED — and this sharpens D beyond "off," per the settings read in
+  A:** `dismiss_stale_reviews` is a field **inside** the
+  `required_pull_request_reviews` block. `main`'s protection summary (§A)
+  has no such block at all. **Dismissal is not merely disabled — there is
+  no container for it to be configured in today.** `rules/branches/main`
+  and `rulesets` (checked under A) both returned `[]`, ruling out a
+  ruleset-based equivalent too.
 
-**Verdict on D: stale-review dismissal is off — CONFIRMED**, by direct,
-repeated, first-hand behavioural observation across 13 push-after-approval
-events on 11 different PRs in this session's own sample, none dismissed.
+**Verdict on D: stale-review dismissal is off, and more specifically not
+currently configurable at all (no `required_pull_request_reviews` block
+exists to hold it) — CONFIRMED** by a settings read that agrees with
+direct, repeated, first-hand behavioural observation across 13
+push-after-approval events on 11 different PRs in this session's own
+sample, none dismissed.
 
 ### §1.5 — the §3.5(a) question: is "branch must be up to date with base" mandatory on *every* merge into `main`?
 
@@ -253,21 +330,32 @@ what forces every single merge to invalidate its approval — something else
 (reviewing promptly, or updating before requesting review) is already
 absorbing part of the cost.*
 
-- **MEASURED — the rule is real**, from two independent, first-hand
-  observations:
+- **Settings read attempted, and reported as a gap rather than assumed:**
+  the actual flag for this requirement, in classic branch protection, is
+  `required_status_checks.strict`. **It does not appear anywhere in `main`'s
+  protection summary** (§A's full `.protection` output, quoted there in
+  full — `checks`, `contexts`, `enforcement_level`, no `strict` key). Per
+  the summary caveat already named in §A: this is **not** read as
+  `strict: false` — the summary may simply not surface that sub-field —
+  and it is **not** read as confirming `strict: true` either. **Genuinely
+  unresolved from this endpoint**, listed in §6.
+- **MEASURED — the rule is nonetheless real, from behavioural evidence
+  independent of the unresolved settings field, from two first-hand
+  observations:**
   1. The quoted GitHub refusal text on PR #177's own thread (§A above):
      *"the head branch is not up to date with the base branch"* — GitHub's
      own words, read directly from the live comment.
-  2. **Live, right now**, two of `BUTCHR-138`'s open scratch PRs (#188,
-     #190) — zero reviews, green checks, `mergeable: MERGEABLE` — report
-     `mergeStateStatus: BEHIND` rather than `CLEAN`, because their base has
-     moved since they were opened:
+  2. **Live, right now**, three of `BUTCHR-138`'s open scratch PRs (#188,
+     #189, #190) — zero-or-negative reviews, green checks, `mergeable:
+     MERGEABLE` — report `mergeStateStatus: BEHIND` rather than `CLEAN`,
+     because their base has moved since they were opened:
      ```
      $ gh pr view 188 -R brooswit-factory/butchr --json mergeStateStatus,reviewDecision
      {"mergeStateStatus":"BEHIND","reviewDecision":""}
      ```
      `BEHIND` is exactly the signature this ticket names for the
-     up-to-date requirement, observed independent of anything I triggered.
+     up-to-date requirement, observed independent of anything I triggered
+     and independent of the unresolved `strict` field above.
 
 - **MEASURED — but the rule is NOT structurally universal in practice,
   contrary to the feared framing.** Of the 18 PRs in this session's window
@@ -298,6 +386,35 @@ on every merge (61%, not 100%). §2 and §4 use the measured 61% figure, not
 the feared "all of them," and this section is the place that resolves that
 question rather than leaving it open**, per the ticket's own instruction
 that §3/§4 must state which regime they describe.
+
+### §1.6 — a reusable finding: the 404 ambiguity is retired, with a caveat of its own
+
+**Named here as a durable finding, not just used inline above, per this
+ticket's own added deliverable.** BUTCHR-100 corrected an earlier, looser
+claim after discovering that `GET /repos/{o}/{r}/branches/{b}/protection`
+404s ambiguously — identically for "no protection configured" and for "the
+caller lacks admin and cannot see it." That ambiguity is why this whole
+document re-verified rather than inherited.
+
+**What retires it:** `GET /repos/{o}/{r}/branches/{b}` (the branch
+resource itself, not its `/protection` sub-resource) carries a `protection`
+field that **is** readable without admin, and returns a real summary
+(§A above) rather than a 404. A future agent hitting the same ambiguity on
+`/protection` should read `/branches/{b}` instead of concluding "cannot be
+determined without admin."
+
+**The caveat that keeps this from becoming the next over-read signal,
+stated with the same weight as the finding:** `/branches/{b}`'s
+`protection` field is a **summary**, not a full enumeration. This document
+hit that caveat concretely once already (§1.5(a) — the `strict` sub-field
+is simply absent from the summary, neither confirmed nor denied) and it
+should be expected to bite again on other sub-fields not yet needed here.
+**"Not shown in this summary" is evidence of absence, not proof of it** —
+weaker than the sub-resource read would be, if that read were available
+without admin, which it is not. Use the summary as the first, cheap,
+non-admin-gated check; do not treat a component's absence from it as final
+without also checking, where possible, an independent behavioural signal
+(as A, B and D above each do).
 
 ---
 
@@ -392,9 +509,12 @@ wasn't sought** (`gh api issues/151/comments` — empty). Its review record,
 re-read live this session, still shows `commit_id: 6774436...` — the
 originally-approved commit, not the merged head — which is itself
 inconsistent with the "APPROVED reviews always track the current head"
-pattern BUTCHR-114/BUTCHR-131 observed on #176/#177/#172 (worth flagging
-to route to BUTCHR-114 as a fifth data point, not resolved or built upon
-here — see §5's filing note). **Stated at its limit: this document does
+pattern BUTCHR-114/BUTCHR-131 observed on #176/#177/#172. **This is routed
+to `BUTCHR-114` through `report_to_boss` at submission time, not built
+upon here** — per this ticket's own §6, coordination with BUTCHR-114 goes
+through `BUTCHR-134`, not directly, and this document does not treat the
+observation as resolving or contradicting BUTCHR-114's own mechanism work.
+**Stated at its limit: this document does
 not claim #151 merged bad code** — the reviewer may have verified by
 content, exactly as BUTCHR-114's own evidence base documents was done on
 #176/#177. What is measured, plainly: a real authored change landed after
@@ -452,10 +572,16 @@ window's own ~9-hour span) — which is itself informative (short-lived
 stalls are recoverable in this fleet's actual cadence) but **does not
 answer the longer-horizon question the ticket asks**, and no number is
 manufactured for it here. `BUTCHR-134`'s §3.5(b) context — exactly two
-GitHub identities serve the fleet's tiers, so there is no third account to
-absorb a re-review if the pinned boss account's *agent process* (not the
-account itself) has exited — is the structural reason this matters, cited
-from that ticket rather than re-derived here.
+GitHub identities serve the fleet's tiers, so there is no third *agent*
+account to absorb a re-review if the pinned boss account's *agent process*
+(not the account itself) has exited — is the structural reason this
+matters, cited from that ticket rather than re-derived here.
+`docs/identity-model-decision.md` §1 records the fleet as holding three
+Atlassian accounts in total, not two — the third is the human's own
+identity, not assigned to any agent tier. That third account is exactly
+the "until a human intervenes" fallback this document already names below,
+not a fourth, undiscovered agent identity — scoped here so this claim does
+not read as contradicting that document sitting next to this one.
 
 ---
 
@@ -464,21 +590,24 @@ from that ticket rather than re-derived here.
 ### Proposal 1 — a review-gating rule on `main`
 
 **What an operator does, concretely:** `main` already has classic branch
-protection (`protected: true`, §1A). Adding a review requirement to an
-**existing** classic protection config is
-`PUT /repos/brooswit-factory/butchr/branches/main/protection` with
-`required_pull_request_reviews: { required_approving_review_count: 1 }`
-merged into whatever the current body already holds (a `PUT` to this
-endpoint replaces the whole protection config — **read the current
-config first**, e.g. via the UI, since a non-admin token cannot safely
-introspect it here — see §1C). Equivalently, if the operator prefers a
-**repository ruleset** instead of classic protection (`rules/branches/main`
-reads `[]` today, confirming no ruleset currently applies to `main`):
-`POST /repos/brooswit-factory/butchr/rulesets` with a branch ruleset
-targeting `main`, a `pull_request` rule type, `required_approving_review_count: 1`.
-Either is a single settings action; this document does not recommend one
-over the other, only names both since the ticket asks for the concrete
-call.
+protection with one component configured, `required_status_checks` (§1A's
+full read). Adding a review requirement means adding the
+`required_pull_request_reviews` **container** to the same config —
+`PUT /repos/brooswit-factory/butchr/branches/main/protection` with a body
+that **includes both** the existing `required_status_checks` block
+unchanged (a `PUT` to this endpoint replaces the whole protection config,
+not just the block named — omitting `required_status_checks` from the body
+would silently drop today's check requirement) **and** a new
+`required_pull_request_reviews: { "required_approving_review_count": 1,
+"dismiss_stale_reviews": false }` block. Equivalently, as a **repository
+ruleset** instead (`rulesets` and `rules/branches/main` both read `[]`
+today, §1A — no ruleset currently applies to `main`, so this would be a new
+one, not an edit): `POST /repos/brooswit-factory/butchr/rulesets` with a
+branch ruleset targeting `main`, a `pull_request` rule type,
+`required_approving_review_count: 1`. This document does not recommend one
+mechanism over the other; §1A already shows classic protection is what
+`main` uses today, so extending it is the lower-friction path, but a
+ruleset is equally capable of expressing Proposal 1 on its own.
 
 **What it buys:** GitHub will refuse to merge (via UI or API) any PR into
 `main` with fewer than the configured number of approvals — closing check
@@ -501,23 +630,41 @@ the collapsed-hop case that fleet already has an honest-refusal fallback
 for** — worth naming since it is a real, live population (3 of 40 in this
 window, 7.5%), not hypothetical.
 
-**Admin-bypass question (§2C):** `wroosbit` cannot bypass (not admin).
-`booswrit`'s admin status is unmeasured from this vantage (§1C) — **if
-`booswrit` holds admin, Proposal 1 is advisory against that identity
-unless the operator also enables "include administrators" / an empty
-bypass list**, which this document cannot confirm is or isn't already the
-case. Flagged for the operator to check directly (§6).
+**Admin-bypass question (§2C):** neither `wroosbit` nor `booswrit` holds
+admin (§1C — one measured directly, one CITED first-hand from
+`BUTCHR-134`). **Proposal 1 would be enforced against both identities that
+actually author and merge PRs in this repo, not advisory against either.**
+An admin identity (if any exists on this repo at all — unconfirmed, §6)
+would still need an explicit "include administrators" setting to bind, but
+that no longer matters for either of the two accounts actually doing the
+work.
 
 ### Proposal 2 — stale-review dismissal
 
-**What an operator does, concretely:** classic protection —
-`PUT /repos/brooswit-factory/butchr/branches/main/protection` with
-`required_pull_request_reviews: { dismiss_stale_reviews: true }` (requires
-`required_pull_request_reviews` to already be configured — i.e. this
-setting has no effect unless Proposal 1's gate, or an equivalent, is also
-in place, which is why §4 treats the two as an interacting pair rather
-than independent line items). Ruleset equivalent: a `pull_request` rule
-with `dismiss_stale_reviews_on_push: true`.
+**What an operator does, concretely, and the nesting that makes this not
+independent of Proposal 1:** `dismiss_stale_reviews` is a field *inside*
+the same `required_pull_request_reviews` container Proposal 1 creates
+(§1D) — there is no separate top-level toggle for it. `PUT
+/repos/brooswit-factory/butchr/branches/main/protection` with
+`required_pull_request_reviews: { "required_approving_review_count": N,
+"dismiss_stale_reviews": true }`, again alongside the existing
+`required_status_checks` block in the same request body.
+
+**Settled from GitHub's documented API contract (read, not attempted, per
+this ticket's explicit instruction) — is a container with
+`required_approving_review_count: 0` and `dismiss_stale_reviews: true`
+valid, i.e. is "Proposal 2 with no merge-blocking gate" reachable on its
+own?** GitHub's REST reference for this endpoint states
+`required_approving_review_count`: *"Specify the number of reviewers
+required to approve pull requests. Use a number between 1 and 6 or 0 to
+not require reviewers"* — `0` is an explicitly documented valid value —
+and states `dismiss_stale_reviews` as an independent boolean with no
+documented constraint tying it to a nonzero review count. **So yes: `count:
+0` with `dismiss_stale_reviews: true` is a reachable configuration** —
+dismissal fires on every push (any voluntary approval given is withdrawn),
+but nothing blocks a merge with zero current approvals, so the gate stays
+advisory and a worker is never stuck. This is the shape §4 calls
+"Proposal 2 alone," and it is real, not merely theoretical.
 
 **What it buys:** the strongest available remedy for BUTCHR-114's finding,
 framed **mechanism-free** per `BUTCHR-134`'s §3.5(c) — regardless of
@@ -544,7 +691,10 @@ merge at all until one arrived.
 **What breaks:** the liveness cost `BUTCHR-134`'s §3.5(b) names as
 structural, restated in its own terms: with exactly two GitHub identities
 serving the fleet's tiers and each tier pinned to one, **there is no third
-account anywhere to absorb a re-review.** A worker whose approval is
+*agent* account anywhere to absorb a re-review** (the fleet's third
+Atlassian account, per `docs/identity-model-decision.md` §1, is the
+human's own identity — the fallback this section already names, not a
+spare agent). A worker whose approval is
 dismissed cannot repair it (GitHub refuses self-approval, confirmed
 elsewhere in this fleet — `docs/identity-model-decision.md` §0) and must
 wait on the one specific boss agent process that reviewed it. If that
@@ -552,26 +702,46 @@ process has exited, the PR is stuck until a human intervenes — not a
 "some friction" cost, a structural one, independent of anything measured
 in this window.
 
-**Admin-bypass question (§2C):** identical framing to Proposal 1 — `wroosbit`
-cannot bypass; `booswrit`'s status is unmeasured and must be checked by the
-operator before trusting the guarantee applies to both identities that
-actually merge PRs in this repo.
+**Admin-bypass question (§2C):** identical footing to Proposal 1 — neither
+identity holds admin, so wherever this proposal's gate does bind (i.e. the
+`count ≥ 1` combination, "both" in §4), it binds against both real
+identities, not one.
 
 ---
 
-## 4. The interaction, all four combinations, and the mitigation
+## 4. The interaction, all four reachable states, and the mitigation
 
-**With BOTH proposals on:** a worker whose approval is dismissed by a
-routine base-merge (12 of 13 events in this window) cannot merge and
-cannot un-stick itself — the gate (Proposal 1) now enforces exactly what
-dismissal (Proposal 2) just removed. If its boss process has ended, the PR
-is stuck for a human. **Under Proposal 1 alone**, the same base-merge is
-survivable — the stale approval still counts, satisfying the gate, which
-is also why Proposal 1 alone does not close BUTCHR-114's finding (§3).
-**Under Proposal 2 alone**, the worker is unblocked (no gate requires the
-approval to still be standing) but the guarantee is advisory — nothing
-stops an unreviewed-at-merge-time PR like #170/#171/#178 from merging
-anyway, dismissal or not.
+**Not four independent toggles — one container with two sub-fields, per
+§3's nesting.** `dismiss_stale_reviews` lives inside
+`required_pull_request_reviews`; there is no way to configure dismissal
+without that container existing. But §3 already settled, from GitHub's own
+documented schema rather than by attempting the call, that
+`required_approving_review_count: 0` alongside `dismiss_stale_reviews:
+true` is valid — so all four states below are genuinely reachable, just
+not as four independent switches. Presented as what an operator actually
+configures, not as an abstract matrix:
+
+- **neither** — today's state: no `required_pull_request_reviews` block.
+- **Proposal 1 alone** — the block exists, `required_approving_review_count
+  ≥ 1`, `dismiss_stale_reviews: false` (or omitted, same default).
+- **Proposal 2 alone** — the block exists, `required_approving_review_count:
+  0`, `dismiss_stale_reviews: true`. Dismissal fires on every push; nothing
+  blocks a merge with zero current approvals.
+- **both** — the block exists, `required_approving_review_count ≥ 1`,
+  `dismiss_stale_reviews: true`.
+
+**With BOTH on:** a worker whose approval is dismissed by a routine
+base-merge (12 of 13 events in this window) cannot merge and cannot
+un-stick itself — the gate (`count ≥ 1`) now enforces exactly what
+dismissal just removed. If its boss process has ended, the PR is stuck for
+a human. **Under Proposal 1 alone**, the same base-merge is survivable —
+the stale approval still counts, satisfying the gate, which is also why
+Proposal 1 alone does not close BUTCHR-114's finding (§3). **Under
+Proposal 2 alone** (`count: 0` + dismissal), the worker is unblocked (no
+gate requires an approval, dismissed or not, to be standing) but the
+guarantee is fully advisory — nothing stops an unreviewed-at-merge-time PR
+like #170/#171/#178 from merging anyway, dismissal or not, exactly as
+today.
 
 | combination | integrity (does an unreviewed-diff merge get caught) | autonomy (worker merges its own approved PR without a human) | liveness (does a boss's exit strand a PR) |
 |---|---|---|---|
@@ -628,8 +798,12 @@ update habit becomes.
   design a bot identity).
 - **Treat the `[review] APPROVED <pr-url> @ <sha>` Jira line as the
   authoritative record instead of a settings change at all:** this is
-  the fleet's existing convention (`BUTCHR-73`, cited via `BUTCHR-134`'s
-  evidence base) and is already, today, doing real work — it is exactly
+  the fleet's existing convention — `docs/identity-model-decision.md` §6
+  names its origin as `BUTCHR-73`, a citation I have not independently
+  traced beyond that document (not `BUTCHR-134`'s own ticket text, which
+  does not mention `BUTCHR-73` — corrected here after `BUTCHR-134` flagged
+  the earlier, wrong attribution) — and is already, today, doing real work
+  in this repo. It is exactly
   what let #170 and #178 merge honestly despite a collapsed review hop
   (`docs/identity-model-decision.md` §6). **It is a real alternative to
   both proposals, not merely a fallback**: it is append-only, cannot
@@ -684,6 +858,25 @@ pair.** This is not a null recommendation:
   doing it, in exchange for not stranding 61% of this window's approved
   main-based merges on a boss agent's continued liveness.
 
+**This recommendation is, explicitly, the "change nothing — strengthen the
+existing convention instead" outcome named by `BUTCHR-131` as a passing
+result for this story, not a consolation one.** The ticket asked for a
+costed recommendation, not a predetermined one; the numbers in §2 and the
+nesting in §3/§4 are what produced this answer, not a starting preference
+being confirmed.
+
+**One data point for that recommendation, from this ticket's own write
+path while this story ran, filed as `BUTCHR-140`:** `correct_worker`
+failed on this ticket's own description with `CONTENT_LIMIT_EXCEEDED`
+mid-session, leaving `BUTCHR-139` with three records of its own
+requirements — the Jira description, the on-disk `brief.md`, and a
+comment — of which the two that read as authoritative on their face (the
+description, the brief) are the two that went stale first. Same failure
+family this document is about, arriving from this fleet's own tooling
+rather than from GitHub: a field that reads as the record and is not one.
+It strengthens, rather than merely illustrates, the case above for a
+stated protocol over a trusted field.
+
 **If the operator judges the liveness risk acceptable** — for instance,
 because a human is reliably available to unstick a PR whose boss agent has
 exited — **Proposal 2 with Proposal 1 is the combination that actually
@@ -700,9 +893,9 @@ away.
 
 | item | why it could not be settled from this vantage | check a person with admin could run |
 |---|---|---|
-| `booswrit`'s admin/bypass status on this repo (§1C, §3 both proposals) | Only measurable for the token this agent runs as (`wroosbit`) | `gh api repos/brooswit-factory/butchr/collaborators/booswrit/permission` (as an admin identity), or Settings → Collaborators and teams |
-| The precise content of `main`'s classic branch-protection config (which checks, which review count if any, `enforce_admins`, existing `dismiss_stale_reviews` value) | `GET .../branches/main/protection` 404s from a non-admin token — ambiguous between absent and forbidden (§1A) | Settings → Branches → edit the rule for `main`, or `gh api repos/brooswit-factory/butchr/branches/main/protection` as an admin identity |
-| Whether the rewind-push probe's non-fast-forward rejection would, on a force-capable probe, resolve to a named protection hook or to nothing (§1A) | This ticket forbids any push that could actually move `main`, and a force-push is exactly that class of action | An admin can read the protection rule directly (above) rather than needing to provoke a refusal at all |
+| Whether **any** account holds admin on this repo at all (§1C) | Both measured identities (`wroosbit` MEASURED, `booswrit` CITED first-hand from `BUTCHR-134`) read `admin: false`. Neither of us can enumerate collaborators to see whether some third, non-agent account holds it | `gh api repos/brooswit-factory/butchr --jq '.permissions'` as any other collaborator, or Settings → Collaborators and teams — confirms both readings above at once and closes this residual |
+| `required_status_checks.strict` — the actual "require branches up to date before merging" flag (§1.5(a)) | Absent from `GET /branches/main`'s `protection` summary, which is documented here as a *summary*, not a full enumeration — its absence is reported as a gap, not read as `false` | `gh api repos/brooswit-factory/butchr/branches/main/protection --jq '.required_status_checks.strict'` as an admin identity, or Settings → Branches → edit the rule |
+| `enforce_admins` / whether an admin token can bypass `main`'s protection entirely, beyond what `enforcement_level: everyone` on `required_status_checks` already implies for that one component | Not present in the non-admin summary; the summary shows *one* component's own enforcement level, not a repo-wide bypass-admins flag | `gh api repos/brooswit-factory/butchr/branches/main/protection --jq '.enforce_admins'` as an admin identity |
 | Whether a boss agent's continued *process* liveness (not account existence) would hold for a re-review requested outside this window's 9.3-hour span (§2.4) | No case of a multi-hour-or-longer stall occurred in the sampled window to observe | Not a settings check — an operational/staffing question about how long a boss agent process is kept alive relative to its worker's PR lifecycle |
 
 ---
