@@ -589,26 +589,50 @@ this table, not an afterthought.**
 
 ## 6. What a collapsed hop leaves behind, so a later reader can tell
 
-**What is verified, not merely repository-settings-shaped:** nothing on
-`main` requires an approving review before merge — confirmed by content, not
-by absence of a setting: PR #178 merged with `reviewDecision: ""`, and PR
-#170 before it did the same. That is the actual gap §6 exists to cover, and
-it holds regardless of what other protections the repo has.
+**The precise shape of the gap, verified by behaviour rather than by
+reading a setting: `main` IS guarded, and the guard does not gate on
+review.** Two separate facts, each independently evidenced, and neither
+inferred from the other:
 
-**A narrower, unverified claim is deliberately NOT made here, on review
-(BUTCHR-104, 2026-09-02).** An earlier draft of this section asserted "there
-is no branch protection on `main`" outright. Checked this session:
-`gh api repos/brooswit-factory/butchr/rules/branches/main` → `[]` (rules
-out *rulesets* only) and `gh api repos/brooswit-factory/butchr/branches/main/protection`
-→ `404`. **That 404 is ambiguous by GitHub's own documented behaviour** — it
-is returned both when no classic protection exists and when the caller
-lacks admin on the repo — so it is not evidence of absence, and this ticket
-cannot resolve it from its own vantage. `BUTCHR-100` reports that a
-different rule *does* exist (head must be up to date with base — the reason
-PR #176 needed a re-review after its own base-merge), and that what is
-*not* required is an approving review, consistent with what #178/#170
-actually did. Recorded as CITED, not measured, and named rather than
-asserted around: a future reader with admin access can settle it outright.
+1. **A rule requiring the head to be up to date with base exists on
+   `main`.** Not inferred from an API read — `gh api
+   repos/brooswit-factory/butchr/rules/branches/main` → `[]` (rules out
+   *rulesets* only) and `gh api
+   repos/brooswit-factory/butchr/branches/main/protection` → `404`, which
+   is genuinely ambiguous by GitHub's own documented behaviour (returned
+   both for "no protection" and for "caller lacks admin") — an earlier
+   draft of this section stopped there and treated the ambiguity as
+   unresolved. **It is resolved, by observed behaviour instead of a
+   settings read**, on review (`BUTCHR-104`, 2026-09-02): PR #177's own
+   comment thread records, first-hand, at the moment it happened
+   (verified this session by re-reading that thread directly, not
+   relaying the quote) — *"Branch protection refused the merge ('the head
+   branch is not up to date with the base branch'), so a base-merge was
+   forced"* — and the merge commit that refusal produced,
+   `055a30b Merge main into BUTCHR-103 (branch protection requires head up
+   to date with base)`, exists in this repo's history and is independently
+   re-checkable (`git log -1 055a30b`). **GitHub refusing a merge with that
+   specific message is positive evidence of a rule** — a repo with no
+   protection at all does not refuse for that reason, and a second
+   independent instance is on the same thread (`2ce987e0`, refused
+   identically after `#178` landed). CITED with a durable, named artefact,
+   not MEASURED by me directly — the firmer of the two vantages available,
+   and firmer than an unresolved API ambiguity.
+2. **That rule does not require an approving review** — MEASURED directly:
+   PR #178 merged with `reviewDecision: ""`, and PR #170 before it did the
+   same.
+
+So: the `404` above is not evidence of absence and is not left as an open
+question either — it is a **permissions artefact**, explained by (1)
+holding true from a non-admin vantage. Keeping it in the record matters: it
+stops a later reader from re-running the same check and concluding "no
+protection" the way an earlier draft of this section did. **The gap §6
+exists to cover is therefore sharper than "nothing guards `main`": `main`
+is guarded, and the guard does not gate on review** — which is a more
+precise, and more damning, statement of why a collapsed-hop merge is
+indistinguishable from an unreviewed one, and it points any future-change
+candidate at the actual hole (a review-gating rule) rather than at
+switching on protection that already exists.
 
 A PR on a collapsed hop therefore reports `MERGEABLE` and merges with
 `reviewDecision: ""` — **identical, after the fact, to a PR nobody thought
