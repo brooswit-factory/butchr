@@ -196,8 +196,33 @@ export interface AtlassianOps {
    * populated on the default response, no `expand` needed or even available
    * on this endpoint — see atlassian-real.ts's implementation for the full
    * measurement.
+   *
+   * `created` (BUTCHR-171) is the comment's `version.createdAt`, ISO-8601,
+   * OPTIONAL/UNDEFINED when the underlying row didn't carry one — never
+   * synthesised (a caller that needs "unavailable" to read as unavailable,
+   * not as "just now", must see `undefined`, never a fabricated `deps.now()`
+   * string). MEASURED via confluence.js's own schema + runtime (not live
+   * Confluence): `FooterCommentSchema`/`PageFooterCommentsSchema` (v3.2.0)
+   * declare `version.createdAt` as `z.ZodCoercedDate`, and `createClient.js`
+   * runs every schema-declared response through `schema.safeParse` and
+   * returns the PARSED (coerced) data on success — so at runtime this is a
+   * real `Date` object, not a string; the mapping in atlassian-real.ts must
+   * call `.toISOString()` on it, never pass it through as-is.
+   *
+   * DELIBERATE CHOICE, made here rather than left implicit: a Confluence
+   * comment's `version` is that comment's LATEST version — `createdAt` is
+   * that version's creation time, i.e. this is a LAST-EDITED time, not a
+   * distinct "originally created" time. For a comment this daemon itself
+   * posts (the only kind any current caller dedupes/orders by), the comment
+   * is never edited after posting, so last-edited and created coincide in
+   * practice — accepted as the recency-filter timestamp on that basis, not
+   * because the two are the same thing in general. A FOREIGN comment edited
+   * after posting would read as newer than it was; no current caller reads
+   * one closely enough for that gap to matter (see escalation-loop.ts's
+   * CLOCK_SKEW_GRACE_MS, which already tolerates seconds-scale slack, not
+   * edit-latency scale).
    */
-  getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string; author?: string }> }>;
+  getPageComments(pageId: string): Promise<{ results: Array<{ id: string; body: string; author?: string; created?: string }> }>;
 
   /**
    * BUTCHR-67's DISCOVERY read: live Jira projects. NOT a second client —

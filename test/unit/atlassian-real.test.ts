@@ -125,6 +125,61 @@ describe("realAtlassian confluence_search_pages", () => {
   });
 });
 
+describe("realAtlassian getPageComments (BUTCHR-171: `created`)", () => {
+  test("maps `created` from version.createdAt via .toISOString() — confluence.js's own schema coerces this field to a real Date, never a string, at parse time", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        // Standing in for confluence.js's OWN schema.safeParse behaviour
+        // (MEASURED separately against the real PageFooterCommentsSchema,
+        // not re-derived here): `version.createdAt` arrives as a real
+        // `Date` object, not an ISO string, because confluence.js declares
+        // it `z.ZodCoercedDate` and returns the PARSED response.
+        comment: {
+          getPageFooterComments: () =>
+            Promise.resolve({
+              results: [
+                { id: "1", body: { storage: { value: "<p>hi</p>" } }, version: { authorId: "acct-1", createdAt: new Date("2026-01-01T00:00:00.000Z") } },
+              ],
+            }),
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getPageComments("42");
+    expect(got).toEqual({ results: [{ id: "1", body: "<p>hi</p>", author: "acct-1", created: "2026-01-01T00:00:00.000Z" }] });
+  });
+
+  test("a row with no version (or a version whose createdAt isn't a Date) maps `created` to undefined — never synthesised, never passed through raw", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          getPageFooterComments: () =>
+            Promise.resolve({
+              results: [
+                { id: "1", body: { storage: { value: "<p>no version at all</p>" } } },
+                { id: "2", body: { storage: { value: "<p>createdAt missing</p>" } }, version: { authorId: "acct-2" } },
+              ],
+            }),
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getPageComments("42");
+    expect(got).toEqual({
+      results: [
+        { id: "1", body: "<p>no version at all</p>" },
+        { id: "2", body: "<p>createdAt missing</p>", author: "acct-2" },
+      ],
+    });
+  });
+});
+
 describe("realAtlassian correctText (BUTCHR-60)", () => {
   function rigJira() {
     const editIssueCalls: unknown[] = [];
