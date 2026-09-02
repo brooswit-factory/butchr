@@ -22,7 +22,7 @@ system's main skill, and the briefs teach it.
 
 | type | owns | model | effort |
 |---|---|---|---|
-| **Epic** | One **outcome** — a large, finite initiative. Shapes it into stories, adjusts the plan as finished work teaches, guards its scope, reviews each story's result, verifies the outcome end-to-end, writes the closing summary, and **ends**. It does not own territory; if the outcome involves repos or systems, the epic is told about them in its description. | fable | high |
+| **Epic** | One **outcome** — a large, finite initiative. Shapes it into stories, adjusts the plan as finished work teaches, guards its scope, reviews each story's result, verifies the outcome end-to-end, writes the closing summary, and **ends**. It does not own territory; if the outcome involves repos or systems, the epic is told about them in its description. | opus | high |
 | **Story** | One **increment of value** — observably true when done, per its acceptance criteria. Decomposes into tasks when the work divides (each task ticket carrying its own definition of done and the context to meet it); does directly what doesn't warrant a ticket. Reviews each task's result; verifies the whole increment; then In Review for the epic. | opus | high |
 | **Task** | One **unit of work** with a concrete definition of done stated on its ticket — code, research, writing, investigation, anything. Produces exactly the named artifact, comments what and where, then In Review for the story. | sonnet | high |
 
