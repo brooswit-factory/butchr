@@ -689,10 +689,27 @@ export function atlassianTools(
         // this read used getIssue's embedded block, which was found at
         // review to be ASCENDING/oldest-first with an unconfirmed cap — if
         // ever truncated, it silently disagrees with discovery's own
-        // reader (which is newest-first and always correct). getIssueComments
-        // is the SAME reader discovery uses (see its own doc comment on
-        // AtlassianOps), so the two can never disagree by construction.
-        // Usually zero calls: most polls have no epic in review at all.
+        // reader, which requests newest-first order explicitly
+        // (`orderBy: "-created"`, see AtlassianOps.getIssueComments's own
+        // doc comment). getIssueComments is the SAME reader discovery uses,
+        // so the two can never disagree by construction. Usually zero
+        // calls: most polls have no epic in review at all.
+        //
+        // CORRECTED (BUTCHR-198/BUTCHR-202): the previous version of this
+        // comment called discovery's reader "always correct" for this
+        // purpose. That overstated it: the value below is
+        // `newestCommentId(...)` (src/resources/project.ts) — a NUMERIC MAX
+        // reduce over the reader's results, which discards the reader's
+        // newest-first order entirely and re-derives "newest" from id
+        // magnitude instead. This epics-in-review watermark therefore
+        // shares the IDENTICAL max-by-numeric-id mechanism as the Confluence
+        // root-doc watermark (`comment` above, same function) — by
+        // construction, not coincidence — and its correctness depends on
+        // Jira issue-comment ids being monotonic with creation time, a
+        // premise that is, as of BUTCHR-202, UNMEASURED (unlike the
+        // Confluence case, measured twice independently to be FALSE). The
+        // reader being newest-first does not protect this line: nothing
+        // downstream of it consults that order.
         const epics: Record<string, string | null> = {};
         for (const epic of epicsRaw?.issues ?? []) {
           epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
@@ -708,7 +725,7 @@ export function atlassianTools(
     },
     get_doc_comments: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns — sort by `id` numerically yourself, the way `newestCommentId` does, if you need newest-first). `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(
