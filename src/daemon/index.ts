@@ -33,6 +33,7 @@ import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
+import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 
 let config;
 try {
@@ -220,6 +221,26 @@ const projectCrashLoopDetector = createCrashLoopDetector({
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
+// see src/agents/reconcile-failure.ts for the full mechanism, and that
+// module's own top comment for why this is independent of (not a
+// replacement for) crashLoopDetector above. TWO SEPARATE INSTANCES, same
+// reasoning as issueCrashLoopDetector/projectCrashLoopDetector: an isolated
+// failure has no `atRest`-style single-tier restriction. Both reuse the SAME
+// `speakOnOwnChannel`/`ownChannelComments` seams — no second Atlassian
+// writer or reader.
+const issueReconcileFailureDetector = createReconcileFailureDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
+const projectReconcileFailureDetector = createReconcileFailureDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: async () => {
@@ -331,6 +352,8 @@ runResourceLoop(issueResourceType, {
   // BUTCHR-141: the issue tier is the fast, high-volume loop (15s) — the one
   // most likely to actually observe a crash loop reach its threshold quickly.
   checkCrashLoop: issueCrashLoopDetector.check,
+  // BUTCHR-147: see src/agents/reconcile-failure.ts.
+  checkReconcileFailure: issueReconcileFailureDetector.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -398,6 +421,8 @@ runResourceLoop(projectResourceType, {
   // real crash loop still needs to reach the threshold well inside the
   // configured window (see crashLoopCount's own doc comment, config.ts).
   checkCrashLoop: projectCrashLoopDetector.check,
+  // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
+  checkReconcileFailure: projectReconcileFailureDetector.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
@@ -408,9 +433,10 @@ runResourceLoop(projectResourceType, {
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
 // speakOnOwnChannel routing above) is built once, earlier in this file, from
 // the extracted `createOwnChannelComments` (src/tools/speak.ts, BUTCHR-141/
-// §2.6) — and shared with `frozenAsleepDetector`, `issueCrashLoopDetector`
-// and `projectCrashLoopDetector` above, and `escalator` below, rather than
-// redefined per caller (BUTCHR-129/BUTCHR-141).
+// §2.6) — and shared with `frozenAsleepDetector`, `issueCrashLoopDetector`,
+// `projectCrashLoopDetector`, `issueReconcileFailureDetector` and
+// `projectReconcileFailureDetector` above, and `escalator` below, rather
+// than redefined per caller (BUTCHR-129/BUTCHR-141/BUTCHR-147).
 
 // Escalates dialogs chooseStartupAnswer declines onto the blocked agent's own
 // ticket (see src/agents/escalation-loop.ts) — comments are only fetched for
