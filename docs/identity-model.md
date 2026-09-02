@@ -3,9 +3,10 @@
 **Measured 2026-09-02 06:58–07:15 UTC** (`date -u` in the measuring session,
 Task tier, workspace `BUTCHR-106`, host `servyboi`). Every claim below is
 tagged **MEASURED** (a command run in that session, output reported),
-**CITED** (a claim from a ticket/comment/agent, not re-run — attributed and
-dated), or **INFERRED** (a conclusion reasoned from the other two, with its
-premises named).
+**CITED** (a claim from a ticket/comment/agent, not re-run — attributed,
+dated, and noting whether the source itself measured it first-hand or is
+also relaying a citation), or **INFERRED** (a conclusion reasoned from the
+other two, with its premises named).
 
 ## Read this before trusting this page
 
@@ -44,6 +45,16 @@ to stop.
 *Falsification, stated in advance:* H1 would be refuted if every daemon
 readable from this host reported an identical role map, or if there were
 provably only one daemon in the fleet. Neither holds — see below.
+
+**DO NOT STOP AT COMPARING ROLE VARIABLES — read the wrinkle below first.**
+Daemon B's own case shows a role-variable-only comparison would have MISSED
+its collision entirely: `BUTCHR_ASSIGNEE_EPIC` is unset there, so a check
+that only diffs `_EPIC` against `_TASK` finds "no epic variable, not
+comparable" and reports a clean page that is wrong. The quantity that
+actually matters is the **effective account a live ticket of that tier ends
+up assigned to**, not whether a same-named env var happens to be set. See
+"The wrinkle" under D1, and note D2 below is built on ticket assignees for
+exactly this reason, not on env-var diffs.
 
 ## D1 — Daemon enumeration and the per-daemon role map
 
@@ -118,12 +129,58 @@ around with a different tool. The correct vantage point for that read is a
 process actually running as `booswrit`, several of which are already live on
 this host (see the H2 process table) — not a privilege escalation from mine.
 
+### The wrinkle: a role-variable comparison would have missed the collision
+
+**CITED, from `BUTCHR-100` (the Epic tier), which measured this first-hand
+on its own daemon on 2026-09-02 and reported it to `BUTCHR-99`, which
+relayed it here** — I did not and could not run this myself (it needs
+`/proc/<pid>/environ` on the daemon serving the Epic tier, which is
+`booswrit`'s, per the blind spot above). Two checks:
+
+- **Check B**: `BUTCHR-100` compared its own daemon's `BUTCHR_ASSIGNEE_TASK`
+  against `BUTCHR-100`'s own ticket `assignee.accountId`. Both
+  `712020:619ec5ec-2e92-492f-8979-91ccda318230`, identical. *Falsification,
+  as `BUTCHR-100` stated it before running:* had they differed, an Epic on
+  that daemon adopting a Task would land on a different account and the hop
+  would work. They did not differ.
+- **The load-bearing part**: on that same daemon, `BUTCHR_ASSIGNEE_EPIC` is
+  **unset** — yet `BUTCHR-100` (an Epic-tier ticket) is assigned
+  `619ec5ec` regardless. Its assignment therefore did **not** come from
+  that daemon's `_EPIC` role variable (there isn't one to source it from).
+  **The collision is not "the epic role variable equals the task role
+  variable" — it is "the account the Epic actually runs as equals that
+  daemon's task role", by whatever mechanism actually staffed that
+  particular Epic** (this document does not have visibility into what that
+  mechanism was — an explicit `assignee` override on the creating call is
+  one candidate, per this repo's own tool docs for `jira_create_issue`/
+  `new_worker`, but that is **INFERRED**, not confirmed here).
+
+**Consequence, stated plainly:** a check that diffs role variables against
+each other, and treats an unset variable as "not comparable", would find no
+`_EPIC` value on this daemon, report a clean page, and be wrong — this is
+the general shape of a silently-wrong answer this whole epic is about. This
+is exactly why D2 below is built on **live ticket assignees** (the
+*effective* account a tier's work actually lands under) rather than on
+env-var diffs — the env-var table above is a useful, and here genuinely
+incomplete, corroborating layer, never the primary instrument.
+
+It is also independent evidence for H1: a role map with `_EPIC` unset, on a
+daemon whose Epic-tier ticket is nonetheless assigned, means a tier's
+*effective* identity is sometimes not recoverable from that daemon's role
+map at all — you have to read a live ticket.
+
 ### Atlassian accountId → display name → GitHub login
+
+**No single tier can produce this whole table alone** — each row needs
+either the Task tier's own co-location (which only a Task can do for
+itself) or another tier doing the equivalent for its own account and
+reporting it. This table is therefore necessarily a collaboration across
+tiers, assembled here from three separate first-hand measurements, not one:
 
 | accountId | Atlassian display name | how established | GitHub login | how established |
 |---|---|---|---|---|
-| `712020:619ec5ec-2e92-492f-8979-91ccda318230` | "Wroos Bit" | MEASURED — `jira_get_issue("BUTCHR-106")` (this ticket), `assignee.displayName` | `wroosbit` | MEASURED by **co-location**: this session IS that account (I am the assignee of `BUTCHR-106`) and, in this same session, `gh api user -q .login` → `wroosbit`. This is the strongest correspondence method available anywhere in this fleet — first-hand, same session, both sides read directly |
-| `712020:e160cf60-6480-44de-8554-af5b81c584e2` | "boos writ" | MEASURED — `jira_get_issue("BUTCHR-99")`, `assignee.displayName` | `booswrit` | **INFERRED**, from two independent artefacts, not co-location (I cannot run `gh api user` as this account): (a) CITED — this ticket's brief quotes `BUTCHR-99`'s own workspace measuring `whoami`/`id` → `booswrit` and `gh api user -q .login` → `booswrit` in its own session (2026-09-02); (b) MEASURED corroboration — `gh pr view 167 --json author,reviews` this session shows PR #167 authored by Jira-Story-tier work (`wroosbit`/Task) reviewed and `APPROVED` by GitHub login `booswrit`, consistent with the Story-tier account approving Task-tier work |
+| `712020:619ec5ec-2e92-492f-8979-91ccda318230` | "Wroos Bit" | MEASURED — `jira_get_issue("BUTCHR-106")` (this ticket), `assignee.displayName` | `wroosbit` | MEASURED by **co-location, this session**: I run as this account (I am the assignee of `BUTCHR-106`) and, in this same session, `gh api user -q .login` → `wroosbit`. This is the strongest correspondence method available anywhere in this fleet — first-hand, same session, both sides read directly. **Independently corroborated**: `BUTCHR-100` (the Epic tier, which also resolves to this same account) ran the identical co-location check in its own session on 2026-09-02 ("Check A" in its report) — `gh api user -q .login` → `wroosbit` there too — and cross-checked it against PR #170's live `author` field, also `wroosbit`. CITED here, but the source measured it first-hand, at the source, not inferred from artefacts the way an outside tier would have to |
+| `712020:e160cf60-6480-44de-8554-af5b81c584e2` | "boos writ" | MEASURED — `jira_get_issue("BUTCHR-99")`, `assignee.displayName` | `booswrit` | **CITED from `BUTCHR-99`, which measured this first-hand by co-location in its own session** (`whoami`/`id` → `booswrit`, `gh api user -q .login` → `booswrit`, 2026-09-02) — not inferred by me, and not something I can run myself (I cannot execute `gh api user` as this account). Corroborated by an artefact I did measure this session: `gh pr view 167 --json author,reviews` shows PR #167 (author `wroosbit`/Task) `APPROVED` by GitHub login `booswrit`, consistent with the Story-tier account reviewing Task-tier work |
 
 ## H2 — more than one daemon, different Unix users, one partly invisible
 
@@ -220,13 +277,26 @@ ticket), so the applicable reading is the epic's `creator` (who ran
 `assignee` — the same method `BUTCHR-62` used on `BUTCHR-100`, re-measured
 here rather than copied.
 
+**Check 1** (`gh pr view <n> --json author -q .author.login` on a
+Task-authored PR, vs the Epic tier's own `gh api user -q .login` — tests
+whether the Epic/Task GitHub-login collision is real, independent of the
+Jira-account comparison): the Task side is MEASURED by me, this session,
+by co-location (see the accountId table above). The Epic side is CITED
+from `BUTCHR-100`'s own "Check A", which measured it first-hand at the
+source (its own `gh api user -q .login`, cross-checked against PR #170's
+live author) rather than inferring it from artefacts — the original ticket
+told me this could only be inferred; that is superseded. Both sides read
+`wroosbit`. *Falsification, stated in advance:* had the two logins
+differed, the collision claim would be wrong and reportable as REFUTED.
+They did not differ.
+
 | hop | reviewer tier's account | author tier's account | measurement | verdict | falsification (stated in advance) |
 |---|---|---|---|---|---|
 | project → epic | `e160cf60` ("boos writ") — `BUTCHR-100.creator.accountId`, MEASURED via `jira_get_issue("BUTCHR-100")` this session | `619ec5ec` ("Wroos Bit") — `BUTCHR-100.assignee.accountId`, same call | live ticket read, this session | **cross-account** | equal accountIds on a re-read would flip this to same-account |
 | epic → story | `619ec5ec` — `BUTCHR-100.assignee.accountId` | `e160cf60` — `BUTCHR-99.assignee.accountId`, MEASURED via `jira_get_issue("BUTCHR-99")` this session | live ticket read, this session | **cross-account** | equal accountIds on a re-read would flip this |
 | story → task | `e160cf60` — `BUTCHR-99.assignee.accountId` | `619ec5ec` — `BUTCHR-106.assignee.accountId`, MEASURED via `jira_get_issue("BUTCHR-106")` this session (this is my own ticket) | live ticket read, this session, **plus** a live GitHub artefact: PR #167 (author `wroosbit`/Task) was `APPROVED` by `booswrit`/Story — MEASURED, `gh pr view 167 --json author,reviews` this session | **cross-account** (structural). **GitHub-layer live confirmation for THIS PR is outstanding** — `BUTCHR-99` reviews this ticket's own PR with `gh pr review --approve` after this document is published; the outcome was not yet known when this was written, and is not pre-written here. Check the `[review]` line on `BUTCHR-106` for the live result. | equal accountIds, or `BUTCHR-99`'s own review of this PR being refused with "cannot approve your own pull request", would flip this |
 | epic → task (the `adopt_worker` shortcut) | `619ec5ec` — `BUTCHR-100.assignee.accountId` | `619ec5ec` — `BUTCHR-106.assignee.accountId` | live ticket read, this session — **EQUAL** | **same-account — guarantee ABSENT** | unequal accountIds on a re-read would refute the central collision this whole epic is about |
-| epic → task, live GitHub confirmation (Check 2) | — | — | **NOT EXECUTABLE FROM THE TASK TIER.** I am a Task; I cannot call `adopt_worker` and am not an Epic. Recorded instead: (a) the structural measurement immediately above; (b) HISTORICAL live confirmation — MEASURED this session (not merely cited): `gh pr view 170 --json author,reviews` → PR #170, author `wroosbit`, its only review is `{"author":"wroosbit","state":"COMMENTED"}` — i.e. the same account as the author left a COMMENT, never an APPROVAL, which is the recorded fallback for a refused self-approval (`BUTCHR-99`/`BUTCHR-62` cite the underlying GraphQL refusal text; I did not re-attempt the approval myself, since re-running a historical refusal isn't mine to force and isn't this ticket's scope); (c) **outstanding**: a live re-run needs an Epic-tier agent to adopt a Task, let it PR, and attempt `gh pr review --approve` today. Named who could run it: any Epic-tier agent (e.g. `BUTCHR-62`, `BUTCHR-100`) — `BUTCHR-99` has said it will pass along the result if `BUTCHR-100` runs this before I merge | — | if the live re-run SUCCEEDS, this row is wrong and must be reported to `BUTCHR-99` immediately, not folded in quietly |
+| epic → task, Check 2 | — | — | **NOT EXECUTABLE FROM THE TASK TIER** (I cannot call `adopt_worker` and am not an Epic) — **and its substance is nonetheless settled, CITED from `BUTCHR-100`, which measured Check B first-hand on 2026-09-02 (see "The wrinkle" under D1): an Epic on its own daemon adopting a Task still resolves to the Epic's own account (`619ec5ec` = `619ec5ec`), so staffing is not fixed.** The *literal* live form (adopt a Task, PR, attempt `gh pr review --approve` today) was deliberately **not** re-run, for two stated reasons, not silently skipped: (1) factual — PR #170 is merged and `gh pr list --state open` on this repo returns none authored by the Task account, so there is currently no open PR to attempt an approval against; (2) principled — even given an open PR, a *successful* approval is the one outcome the check exists to catch, and running it live would leave a real GitHub approval on someone else's unreviewed work, damaging the exact guarantee under test, for a result (GitHub's own documented "cannot approve your own PR" rule) that isn't in doubt and says nothing about butchr's own staffing. Re-runnable, in its literal live form, by any Epic-tier agent at a moment an open Task-authored PR exists | — | if a live re-run of the literal form ever SUCCEEDS, or if a future Check B on any daemon finds the Epic and Task accounts DIFFER, report it to `BUTCHR-99` as REFUTED immediately, not folded in quietly |
 | story → story (adopt_worker on a peer Story) | n/a | n/a | **not measured on a real ticket** — reasoned from source, see below | **same-account by construction — not-currently-reachable in observed practice** | reachable, and would need re-verifying against real tickets, the day a Story orphan gets adopted by another Story |
 | task → task (adopt_worker on a peer Task) | n/a | n/a | **not measured on a real ticket** — reasoned from source, see below | **same-account by construction — not-currently-reachable in observed practice** | same as above |
 
