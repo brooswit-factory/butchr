@@ -7,6 +7,7 @@ import {
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
 import { speakOnOwnChannel } from "../../src/tools/speak.js";
+import { setProjectDoc } from "../../src/tools/docs.js";
 import { desiredFrom } from "../../src/daemon/loop.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
@@ -45,11 +46,14 @@ function world(opts: {
   nextCommentIds?: string[];
   /** When true, the write half of `advanceProjectWatermark` (setProjectProperty) rejects — simulates F7, the swallowed-`.catch` path. */
   failWatermarkWrite?: boolean;
+  /** The root doc's starting Confluence page version (`version.number`) — `updatePage` (the REAL write `set_doc`/`setProjectDoc` makes) bumps it by 1 per call, exactly like Confluence does, so `getPageVersions` reflects a genuine body edit rather than a hand-set number. */
+  initialPageVersion?: number;
 }): World {
   const pageComments = [...(opts.initialComments ?? [])];
   const idQueue = [...(opts.nextCommentIds ?? [])];
   let nextAutoId = 9000;
   let setProjectPropertyCalls = 0;
+  let pageVersion = opts.initialPageVersion ?? 1;
   const properties = new Map<string, Record<string, unknown>>([
     [
       opts.projectKey,
@@ -76,7 +80,13 @@ function world(opts: {
     assign: unimplemented("assign"),
     createPage: unimplemented("createPage"),
     getPage: async (id: string) => ({ title: "root doc", body: { storage: { value: "<p>hi</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
-    updatePage: unimplemented("updatePage"),
+    // REAL Confluence behavior: every `updatePage` (a body edit — the
+    // write `setProjectDoc`/`set_doc` makes) bumps `version.number` by 1,
+    // whether or not anything else ever reads it back to a watermark.
+    updatePage: async (_p: unknown) => {
+      pageVersion++;
+      return { ok: true };
+    },
     searchPages: unimplemented("searchPages"),
     listSpaces: unimplemented("listSpaces"),
     getRemoteLink: unimplemented("getRemoteLink"),
@@ -106,7 +116,11 @@ function world(opts: {
       properties.set(key, value as Record<string, unknown>);
       return { ok: true };
     },
-    getPageVersions: async () => ({}),
+    getPageVersions: async (ids: readonly string[]) => {
+      const out: Record<string, number> = {};
+      for (const id of ids) if (id === opts.rootDocId) out[id] = pageVersion;
+      return out;
+    },
     // REAL shape: storage-format XHTML, exactly what speakOnOwnChannel writes
     // and getPageComments returns — never a plain-text shortcut (BUTCHR-129's
     // own lesson, cited in this module's leads).
@@ -149,6 +163,57 @@ describe("end-to-end (real speakOnOwnChannel write, real loadProjects read): the
     await speakOnOwnChannel(w.ops, "ACME", "[ACME] status update");
     const { verdict } = await verdictOf(w.deps, "ACME");
     expect(verdict).toBe("asleep");
+  });
+});
+
+describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS: a project's own root-doc BODY EDIT — no comment involved at all — self-wakes it deterministically, because nothing but check_in ever advances the version watermark", () => {
+  // Failure condition: this whole block is wrong if the project reads
+  // "asleep" after a body edit with the comment/epics axes untouched and
+  // caught up — that would mean something DOES suppress the version axis,
+  // contradicting the writer inventory below. It does NOT come back
+  // "asleep": confirmed by re-deriving the writer inventory directly
+  // (`grep -rn "advanceProjectWatermark(" src/` at this PR's own commit
+  // finds EXACTLY TWO non-definition call sites — src/tools/defs.ts's
+  // check_in, which passes `{version, comment, epics}` every time, and
+  // src/tools/speak.ts's speakOnOwnChannel, which passes `{comment}` ONLY,
+  // never `version` — so there is no third writer and nothing advances the
+  // version axis outside check_in). `setProjectDoc` (src/tools/docs.ts),
+  // the function `set_doc` actually calls for a project caller, calls
+  // ONLY `ops.updatePage` and never `advanceProjectWatermark` — confirmed
+  // by reading its full body, not by absence-of-a-grep-hit alone.
+  //
+  // UNLIKE the comment-axis regression (F5/F6, above), this is not
+  // probabilistic — it does not depend on a non-monotonic id landing below
+  // a watermark. Every body edit bumps Confluence's own `version.number`
+  // by exactly 1 (this fake's `updatePage`/`getPageVersions` mirror that
+  // real behavior); there is no scenario where it does NOT diverge from a
+  // watermark nothing ever touches.
+  test("a project's own set_doc call (a REAL setProjectDoc write, not a hand-set version number) leaves the version watermark behind and reads active on the next poll — comment and epics axes stay fully caught up", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialPageVersion: 5,
+      initialComments: [{ id: "100", body: "<p>seed</p>" }],
+      initialWake: { version: 5, comment: "100", epics: {} }, // caught up on every axis, exactly as if check_in just ran
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the edit
+
+    // The REAL write `set_doc` makes for a project caller — no comment
+    // posted, no speakOnOwnChannel call, nothing that could touch the
+    // comment axis at all.
+    await setProjectDoc(w.ops, "ACME", "<p>updated brief</p>");
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.observedVersion).toBe(6); // Confluence bumped it
+    expect(resource.watermark.version).toBe(5); // never advanced — only check_in could
+    expect(resource.observedCommentId).toBe(resource.watermark.comment); // comment axis: still caught up, untouched by this edit
+    expect(verdict).toBe("active"); // wakes on the version axis alone
+
+    // Traced through to an actual spawn decision, same as the comment-axis
+    // test above — this is not merely a predicate curiosity.
+    const resourceType = createProjectResourceType(w.deps);
+    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
+    expect(desired.has("ACME")).toBe(true);
   });
 });
 
