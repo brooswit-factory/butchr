@@ -1,15 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HEADER_REGISTRY, REGISTERED_HEADER_TAGS, type HeaderRegistryEntry } from "../../src/headers/registry.js";
 import {
   findHeaderTagLiterals,
   findUnregisteredHeaderTagLiterals,
   formatUnregisteredHeaderTagError,
+  HEADER_BLIND_SPOTS,
   KNOWN_NON_HEADER_LITERALS,
   scanDirForHeaderTagLiterals,
   type HeaderTagLiteralHit,
 } from "../../src/headers/header-scan.js";
 import { HEADER_TAGS } from "../../src/tools/relationship.js";
+import { assertBlindSpotCoverage, withTempFixture, witnessBlindSpot } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -162,6 +165,85 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     const injected: HeaderTagLiteralHit = { file: "src/example-injected.ts", line: 1, tag: "ROGUE", text: "[ROGUE] not declared anywhere" };
     const unregistered = findUnregisteredHeaderTagLiterals([...hits, injected], REGISTERED_HEADER_TAGS);
     expect(unregistered).toEqual([injected]);
+  });
+});
+
+/**
+ * BUTCHR-224 — HEADER_BLIND_SPOTS, EXECUTABLE WITNESSES WITH PAIRED POSITIVE
+ * CONTROLS. Each `test()` below calls `witnessBlindSpot` with the exact id
+ * `src/headers/header-scan.ts`'s `HEADER_BLIND_SPOTS` declares for that
+ * entry — a typo here or there would leave the entry's declared witness
+ * unrecorded, which `assertBlindSpotCoverage` at the end of this file turns
+ * into a failing test, not a silent gap. See `src/media/blind-spot.ts` for
+ * why the pairing itself (silence + positiveControl) is structural rather
+ * than a convention to remember.
+ */
+describe("HEADER_BLIND_SPOTS witnesses (BUTCHR-224)", () => {
+  test("templateLiteralOpeningLine — a template literal WITH substitutions is invisible; hoisting the tag into its own whole-literal constant makes it visible again (BUTCHR-157's own regression, restated as a formal witness)", () => {
+    witnessBlindSpot("header:template-literal-opening-line", {
+      silence: () => {
+        const withSubstitution = 'const x = `[ADOPTED] This ticket has a boss (${callerKey}).`;';
+        expect(findHeaderTagLiterals("src/example.ts", withSubstitution)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hoisted = ['const ADOPTED_HEADER_OPEN_LINE = "[ADOPTED] This ticket was adopted.";', "const x = `${ADOPTED_HEADER_OPEN_LINE}\\nAdopted by: ${callerKey}.`;"].join("\n");
+        const hits = findHeaderTagLiterals("src/example.ts", hoisted);
+        expect(hits.map((h) => h.tag)).toEqual(["ADOPTED"]);
+      },
+    });
+  });
+
+  test("unscannedDirectories — an identical header-tag literal under test/ is invisible to scanDirForHeaderTagLiterals when it is only pointed at src/; the same literal under src/ IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      mkdirSync(join(root, "test"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "[ROGUE] not declared anywhere";');
+      writeFileSync(join(root, "test", "example.ts"), 'export const X = "[ROGUE] not declared anywhere";');
+      const scanHits = scanDirForHeaderTagLiterals(join(root, "src"), root);
+      witnessBlindSpot("header:unscanned-directories", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "test/example.ts")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.tag === "ROGUE" && h.file === "src/example.ts")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("nonHeaderLookalike — a header-tag-shaped literal that is NOT a real header is silenced ONLY by an explicit KNOWN_NON_HEADER_LITERALS-shaped exclusion; the identical shape in a DIFFERENT, unexcluded file is still flagged", () => {
+    const exclusions = [{ file: "src/tools/lookalike.ts", text: "[NOTAHEADER] a hypothetical log-line tag", reason: "test witness — not a real description-header opening line" }];
+    witnessBlindSpot("header:non-header-lookalike", {
+      silence: () => {
+        const hits: HeaderTagLiteralHit[] = [{ file: "src/tools/lookalike.ts", line: 1, tag: "NOTAHEADER", text: "[NOTAHEADER] a hypothetical log-line tag" }];
+        expect(findUnregisteredHeaderTagLiterals(hits, new Set(), exclusions)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits: HeaderTagLiteralHit[] = [{ file: "src/tools/elsewhere.ts", line: 1, tag: "NOTAHEADER", text: "[NOTAHEADER] a hypothetical log-line tag" }];
+        expect(findUnregisteredHeaderTagLiterals(hits, new Set(), exclusions)).toEqual(hits);
+      },
+    });
+  });
+
+  test("nonTsFiles — an identical header-tag literal in a non-.ts file under src/ is invisible to scanDirForHeaderTagLiterals; the same literal in a .ts file IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "[ROGUE] not declared anywhere";');
+      writeFileSync(join(root, "src", "example.md"), '`export const X = "[ROGUE] not declared anywhere";`');
+      const scanHits = scanDirForHeaderTagLiterals(join(root, "src"), root);
+      witnessBlindSpot("header:non-ts-files", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "src/example.md")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.tag === "ROGUE" && h.file === "src/example.ts")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("COVERAGE (must run after every witness above in this same file — see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every HEADER_BLIND_SPOTS entry's declared witness id was actually executed, or it declares a written noWitnessReason instead", () => {
+    assertBlindSpotCoverage("HEADER_BLIND_SPOTS", HEADER_BLIND_SPOTS);
   });
 });
 

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LABEL_REGISTRY, REGISTERED_LABELS, type LabelRegistryEntry } from "../../src/labels/registry.js";
 import {
@@ -6,9 +7,11 @@ import {
   findUnregisteredLabelLiterals,
   formatUnregisteredLabelError,
   KNOWN_NON_LABEL_LITERALS,
+  LABEL_BLIND_SPOTS,
   scanDirForLabelLiterals,
   type LabelLiteralHit,
 } from "../../src/labels/label-scan.js";
+import { assertBlindSpotCoverage, withTempFixture, witnessBlindSpot } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -173,6 +176,81 @@ describe("the actual automatic check — this IS the falsifier (AC-2), run for r
       const found = hits.some((h) => h.file === exclusion.file && h.text === exclusion.text);
       expect(found).toBe(true);
     }
+  });
+});
+
+/**
+ * BUTCHR-224 — LABEL_BLIND_SPOTS, EXECUTABLE WITNESSES WITH PAIRED POSITIVE
+ * CONTROLS. Each `test()` below calls `witnessBlindSpot` with the exact id
+ * `src/labels/label-scan.ts`'s `LABEL_BLIND_SPOTS` declares for that entry.
+ * See `src/media/blind-spot.ts` for why the pairing itself (silence +
+ * positiveControl) is structural rather than a convention to remember.
+ */
+describe("LABEL_BLIND_SPOTS witnesses (BUTCHR-224)", () => {
+  test("concatenationAndInterpolation — a label built by AGENT_PREFIX-style concatenation, or by template interpolation, is invisible; the identical value as a single whole literal IS found", () => {
+    witnessBlindSpot("label:concatenation-and-interpolation", {
+      silence: () => {
+        expect(findLabelLiterals("src/example.ts", 'const AGENT_PREFIX = "agent:"; const x = AGENT_PREFIX + "working";')).toEqual([]);
+        expect(findLabelLiterals("src/example.ts", "const PR_PREFIX = `pr:`; const state = `open`; const x = `${PR_PREFIX}${state}`;")).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits = findLabelLiterals("src/example.ts", 'const x = "agent:working";');
+        expect(hits.map((h) => h.text)).toEqual(["agent:working"]);
+      },
+    });
+  });
+
+  test("unscannedDirectories — an identical label literal under test/ is invisible to scanDirForLabelLiterals when it is only pointed at src/; the same literal under src/ IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      mkdirSync(join(root, "test"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "butchr:rogue";');
+      writeFileSync(join(root, "test", "example.ts"), 'export const X = "butchr:rogue";');
+      const scanHits = scanDirForLabelLiterals(join(root, "src"), root);
+      witnessBlindSpot("label:unscanned-directories", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "test/example.ts")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.text === "butchr:rogue" && h.file === "src/example.ts")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("nonLabelLookalike — a label-shaped literal that is NOT a real Jira label is silenced ONLY by an explicit KNOWN_NON_LABEL_LITERALS-shaped exclusion; the identical shape in a DIFFERENT, unexcluded file is still flagged", () => {
+    const exclusions = [{ file: "src/tools/lookalike.ts", text: "butchr:not-a-real-label", reason: "test witness — a hypothetical id/marker, not a Jira label" }];
+    witnessBlindSpot("label:non-label-lookalike", {
+      silence: () => {
+        const hits: LabelLiteralHit[] = [{ file: "src/tools/lookalike.ts", line: 1, text: "butchr:not-a-real-label" }];
+        expect(findUnregisteredLabelLiterals(hits, new Set(), exclusions)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits: LabelLiteralHit[] = [{ file: "src/tools/elsewhere.ts", line: 1, text: "butchr:not-a-real-label" }];
+        expect(findUnregisteredLabelLiterals(hits, new Set(), exclusions)).toEqual(hits);
+      },
+    });
+  });
+
+  test("nonTsFiles — an identical label literal in a non-.ts file under src/ is invisible to scanDirForLabelLiterals; the same literal in a .ts file IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "butchr:rogue";');
+      writeFileSync(join(root, "src", "example.md"), '`export const X = "butchr:rogue";`');
+      const scanHits = scanDirForLabelLiterals(join(root, "src"), root);
+      witnessBlindSpot("label:non-ts-files", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "src/example.md")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.text === "butchr:rogue" && h.file === "src/example.ts")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("COVERAGE (must run after every witness above in this same file — see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every LABEL_BLIND_SPOTS entry's declared witness id was actually executed, or it declares a written noWitnessReason instead", () => {
+    assertBlindSpotCoverage("LABEL_BLIND_SPOTS", LABEL_BLIND_SPOTS);
   });
 });
 
