@@ -29,6 +29,16 @@ export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX)
  * daemon's own unattended poll/sweep machinery this file guards against. A
  * label set by hand (never through those verbs) is cleared by nobody but
  * whoever set it.
+ *
+ * `butchr:orphan` (src/tools/relationship.ts's `ORPHAN_LABEL`) is likewise
+ * NOT daemon-owned, for the same reason and by the same test — not folded
+ * into `isDaemonLabel` below, so the sweep never touches it either
+ * (BUTCHR-108/BUTCHR-137). `file_where_it_belongs` applies it once, at
+ * creation; `adopt_worker` (both the issue-caller and PROJECT-caller paths,
+ * both dispositions) is now its withdrawal site — the first one this label
+ * has ever had. Same category as `butchr:shelved`: an explicit,
+ * agent-invoked relationship verb owns the lifecycle, never this file's own
+ * unattended machinery.
  */
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
 
