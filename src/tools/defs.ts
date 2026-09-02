@@ -689,10 +689,27 @@ export function atlassianTools(
         // this read used getIssue's embedded block, which was found at
         // review to be ASCENDING/oldest-first with an unconfirmed cap — if
         // ever truncated, it silently disagrees with discovery's own
-        // reader (which is newest-first and always correct). getIssueComments
-        // is the SAME reader discovery uses (see its own doc comment on
-        // AtlassianOps), so the two can never disagree by construction.
-        // Usually zero calls: most polls have no epic in review at all.
+        // reader, which requests newest-first order explicitly
+        // (`orderBy: "-created"`, see AtlassianOps.getIssueComments's own
+        // doc comment). getIssueComments is the SAME reader discovery uses,
+        // so the two can never disagree by construction. Usually zero
+        // calls: most polls have no epic in review at all.
+        //
+        // CORRECTED (BUTCHR-198/BUTCHR-202): the previous version of this
+        // comment called discovery's reader "always correct" for this
+        // purpose. That overstated it: the value below is
+        // `newestCommentId(...)` (src/resources/project.ts) — a NUMERIC MAX
+        // reduce over the reader's results, which discards the reader's
+        // newest-first order entirely and re-derives "newest" from id
+        // magnitude instead. This epics-in-review watermark therefore
+        // shares the IDENTICAL max-by-numeric-id mechanism as the Confluence
+        // root-doc watermark (`comment` above, same function) — by
+        // construction, not coincidence — and its correctness depends on
+        // Jira issue-comment ids being monotonic with creation time, a
+        // premise that is, as of BUTCHR-202, UNMEASURED (unlike the
+        // Confluence case, measured twice independently to be FALSE). The
+        // reader being newest-first does not protect this line: nothing
+        // downstream of it consults that order.
         const epics: Record<string, string | null> = {};
         for (const epic of epicsRaw?.issues ?? []) {
           epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
