@@ -1043,6 +1043,11 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps(),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
     };
     return { ops, tools: atlassianTools(ops, () => {}, roles) };
   }
@@ -1078,6 +1083,11 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps({ correctText: async () => { calls.push("correctText"); return { ok: true }; } }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
     };
     const tools = atlassianTools(ops, (l) => audits.push(l), {}, (keys: readonly string[], writer: string) => writes.push([[...keys], writer]));
     const conn = { headers: { "x-issue": "KAN-1" } } as any;
@@ -1109,6 +1119,11 @@ describe("correct_worker (BUTCHR-60): wiring — x-issue, schema shape, audit, o
       ...fakeDocOps({ correctText: async (key, p) => { calls.push([key, p]); return { ok: true }; } }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: 'test-account' }),
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+      getProjectPropertyOrNull: async () => null,
     };
     const audits: string[] = [];
     const tools = atlassianTools(ops, (l) => audits.push(l), {});
@@ -1363,6 +1378,7 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: opts.rootDocComments ?? [] }),
       searchProjects: async () => ({ values: [] }),

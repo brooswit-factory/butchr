@@ -196,6 +196,7 @@ function fakeWorld(opts: {
     addLabels: unimplemented("addLabels"),
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
+    correctText: unimplemented("correctText"),
     commentOnPage: unimplemented("commentOnPage"),
 
     getMyself: async () => ({ accountId: opts.myAccountId }),
