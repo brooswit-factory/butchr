@@ -58,7 +58,7 @@ import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-help
  * footer comment on its root doc, not a Jira comment), so the caller's
  * `comments` reader must go through the symmetric page-comment path for a
  * project id, never the issue one (see src/daemon/index.ts's
- * `commentsOnOwnChannel` wiring). Getting either half wrong the naive way
+ * `ownChannelComments` wiring). Getting either half wrong the naive way
  * — failing open on the fetch, or reading the wrong resource even when the
  * fetch "succeeds" — is bounded but repeatedly wrong across every daemon
  * restart, not merely "every poll forever" (the in-memory rate cap does not
@@ -67,8 +67,24 @@ import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-help
  * `postComplaint` below fails CLOSED on a fetch failure (posts nothing,
  * retries next poll) — the caller supplies a `comments` reader already
  * symmetric with wherever `addComment` actually posts (see
- * src/daemon/index.ts's wiring), so this module itself never has to know
- * which channel shape it's talking to.
+ * src/daemon/index.ts's `ownChannelComments` wiring), so this module itself
+ * never has to know which channel shape it's talking to.
+ *
+ * RULE 2b'S THIRD FORM, LEARNED HERE (BUTCHR-129): even a `comments` reader
+ * that hits the right resource with the right call can still hand back the
+ * WRONG REPRESENTATION. The project branch of `ownChannelComments` reads
+ * through `ops.getPageComments`, which returns raw Confluence
+ * storage-format XHTML — a body genuinely present and genuinely the right
+ * resource, just wrapped as `<p>...</p>` — so `findMarked`'s
+ * `startsWith(marker)` anchor silently never matched on the project tier
+ * until BUTCHR-129 made the reader unwrap it first
+ * (`unwrapStorageParagraph`, src/tools/speak.ts). Nothing in THIS module
+ * could have caught that on its own: `postComplaint` only ever sees
+ * whatever `deps.comments` hands it, by design (the paragraph above), so a
+ * caller-side representation bug is invisible from here — the next
+ * detector that reads a resource's own channel back (BUTCHR-84 included)
+ * will hit the same trap unless its own `comments` reader goes through the
+ * same unwrap.
  *
  * RESTART BEHAVIOUR, stated rather than left implicit: all tracking here is
  * in-memory only. A daemon restart loses every `firstObservedAt` floor and

@@ -1,9 +1,61 @@
 import { describe, expect, test } from "bun:test";
 import { createFrozenAsleepDetector, MARKER } from "../../src/agents/frozen-asleep.js";
+import { findMarked } from "../../src/agents/escalation-helper.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
+import { speakOnOwnChannel, unwrapStorageParagraph } from "../../src/tools/speak.js";
+import { projectRootDoc } from "../../src/tools/docs.js";
+import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import type { Herd } from "../../src/agents/herd.js";
 
 const MIN = 60_000;
+
+/**
+ * A minimal, FULL `AtlassianOps` fake (kept local — no cross-file test
+ * fixture coupling, same convention this file's own `fakeChannel` follows)
+ * so `speakOnOwnChannel`/`projectRootDoc` can run for real against a project
+ * key, the same real write/resolve path production uses. Only
+ * `commentOnPage`/`getPageComments` are ever overridden by the tests below;
+ * everything else is a harmless stub.
+ */
+function makeOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
+  return {
+    getIssue: async () => ({}),
+    search: async () => ({}),
+    addComment: async () => ({ ok: true }),
+    linkIssues: async () => ({}),
+    transition: async () => ({}),
+    createIssue: async () => ({}),
+    setPriority: async () => ({}),
+    assign: async () => ({}),
+    correctText: async () => ({}),
+    createPage: async () => ({}),
+    getPage: async (id: string) => ({ title: "root doc", body: { storage: { value: "<p>hi</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
+    updatePage: async () => ({ ok: true }),
+    searchPages: async () => ({ results: [] }),
+    listSpaces: async () => ({}),
+    getProjectProperty: async (projectKey: string) => {
+      if (projectKey !== "BUTCHR") throw new Error(`fake: no "butchr" property for ${projectKey}`);
+      return { space: { key: "BUTCHR" }, rootDoc: { id: "42" } };
+    },
+    getRemoteLink: async () => null,
+    upsertRemoteLink: async () => ({}),
+    getChildPages: async () => ({ results: [] }),
+    getPageLabels: async () => [],
+    createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+    addLabels: async () => ({ ok: true }),
+    removeLabels: async () => ({ ok: true }),
+    deleteIssue: async () => ({ ok: true }),
+    commentOnPage: async () => ({ ok: true, id: "1000" }),
+    getPageComments: async () => ({ results: [] }),
+    searchProjects: async () => ({ values: [] }),
+    getMyself: async () => ({ accountId: "test-account" }),
+    setProjectProperty: async () => ({ ok: true }),
+    getPageVersions: async () => ({}),
+    getIssueComments: async () => ({ results: [] }),
+    getProjectPropertyOrNull: async () => null,
+    ...overrides,
+  };
+}
 
 /** A fake "own channel" comment store: addComment writes land here, newest-first — same shape test/unit/parked.test.ts's fakeJira uses. */
 function fakeChannel() {
@@ -249,6 +301,142 @@ describe("createFrozenAsleepDetector: rate cap (BUTCHR-95/123 DoD 6)", () => {
     }
     expect(chan.posted.length).toBe(3); // capped at 3/hour even across 5 re-freeze cycles
     expect(logs.some((l) => l.startsWith("WARNING: [frozen]") && l.includes("rate cap"))).toBe(true);
+  });
+});
+
+// BUTCHR-129: BUTCHR-123 shipped `commentsOnOwnChannel` (src/daemon/index.ts)
+// wired into `comments` above, mapping a project-tier row's body RAW
+// (`body: r.body`) — but `ops.getPageComments` returns Confluence
+// storage-format XHTML, the SAME `<p>${escapeStorageText(text)}</p>` shape
+// `speakOnOwnChannel` writes, not the plain text `postComplaint` posted. A
+// wrapped body never `startsWith(MARKER)`, so restart-adoption silently
+// never matched on the project tier — the ONLY tier `atRest` (and so this
+// detector) can ever apply to. Fixed by adopting `ownChannelComments`
+// (BUTCHR-124's reader, already correct), which maps
+// `body: unwrapStorageParagraph(r.body)` instead. THE FIXTURE TRAP this
+// ticket exists to close: a fake `comments()` that hands back plain text for
+// both tiers (like `fakeChannel` above, or `AtlassianOps.getPageComments`'s
+// own default empty stub) is faithful to `CommentRow`'s TYPE and still
+// disagrees with what the REAL project-tier reader produces — that
+// agreement gap is exactly what let this defect through two reviews, so
+// every test below round-trips through the REAL `speakOnOwnChannel` write
+// path rather than hand-typing a "storage-format-looking" string.
+//
+// `commentsOnOwnChannel` itself is deleted (not merely patched) as of this
+// ticket — see src/daemon/index.ts's `ownChannelComments` doc comment and
+// DoD 4 (exactly one project-aware reader survives, grep-verified). It
+// cannot be imported here to prove "before/after" directly: it lived as an
+// unexported local in src/daemon/index.ts, a file that bootstraps a real
+// Atlassian/herdr daemon (and `process.exit`s on missing config) at module
+// load, entirely unsuited to a unit test (confirmed booting separately —
+// see this ticket's PR description). Both mapping shapes it and
+// `ownChannelComments` used are one line of glue around `CommentRow`,
+// reproduced verbatim below (`body: r.body` vs
+// `body: unwrapStorageParagraph(r.body)`) around REAL, imported production
+// code (`speakOnOwnChannel`, `projectRootDoc`, `unwrapStorageParagraph`,
+// `findMarked`) — the only two lines that could plausibly diverge from
+// daemon/index.ts's own, and grepped there to confirm they match.
+describe("createFrozenAsleepDetector: the project-tier reader must read back what speakOnOwnChannel actually wrote (BUTCHR-129)", () => {
+  test("BEFORE: the RAW mapping (`body: r.body`, the deleted commentsOnOwnChannel's shape) reproduces the defect — findMarked never matches a real project-tier write", async () => {
+    const pageComments: Array<{ pageId: string; body: string }> = [];
+    const ops = makeOps({
+      commentOnPage: async (pageId: string, body: string) => {
+        const id = String(1000 + pageComments.length);
+        pageComments.push({ pageId, body });
+        return { ok: true, id };
+      },
+    });
+    const fingerprint = "fingerprint: BUTCHR";
+    const text = [`${MARKER} BUTCHR has read "asleep" with its agent still running...`, "", fingerprint].join("\n");
+    await speakOnOwnChannel(ops, "BUTCHR", text); // the REAL write path — same call frozen-asleep's postComplaint makes via `addComment`
+
+    const written = pageComments[0]!.body;
+    expect(written.startsWith(MARKER)).toBe(false); // real write path wraps it — not the plain text that was posted
+
+    const rawRows = [{ id: "c1", body: written, created: "" }]; // commentsOnOwnChannel's exact (deleted) mapping
+    expect(findMarked(rawRows, MARKER, [fingerprint])).toBeNull(); // REPRODUCES THE DEFECT: restart-adoption would silently re-post
+  });
+
+  test("AFTER: the UNWRAPPED mapping (`body: unwrapStorageParagraph(r.body)`, ownChannelComments's shape) fixes it — findMarked matches", async () => {
+    const pageComments: Array<{ pageId: string; body: string }> = [];
+    const ops = makeOps({
+      commentOnPage: async (pageId: string, body: string) => {
+        const id = String(1000 + pageComments.length);
+        pageComments.push({ pageId, body });
+        return { ok: true, id };
+      },
+    });
+    const fingerprint = "fingerprint: BUTCHR";
+    const text = [`${MARKER} BUTCHR has read "asleep" with its agent still running...`, "", fingerprint].join("\n");
+    await speakOnOwnChannel(ops, "BUTCHR", text);
+
+    const written = pageComments[0]!.body;
+    const unwrappedRows = [{ id: "c1", body: unwrapStorageParagraph(written), created: "" }]; // ownChannelComments's exact mapping
+    const found = findMarked(unwrappedRows, MARKER, [fingerprint]);
+    expect(found?.id).toBe("c1"); // FIXED: restart-adoption finds its own prior complaint
+  });
+
+  test("END TO END: createFrozenAsleepDetector itself, wired with a `comments` reader shaped exactly like ownChannelComments's project branch, adopts a REAL project-tier write across a simulated daemon restart instead of re-posting", async () => {
+    let now = 0;
+    const pageComments: Array<{ id: string; body: string }> = [];
+    const ops = makeOps({
+      commentOnPage: async (_pageId: string, body: string) => {
+        const id = String(1000 + pageComments.length);
+        pageComments.push({ id, body });
+        return { ok: true, id };
+      },
+      getPageComments: async () => ({ results: [...pageComments].reverse() }), // newest-first, same as AtlassianClient.comments()
+    });
+    // Exactly `ownChannelComments`'s project branch (src/daemon/index.ts) —
+    // reproduced here because that function is unexported and its file
+    // cannot be imported into a unit test (see this describe block's own
+    // top comment).
+    const comments = async (key: string) => {
+      const doc = await projectRootDoc(ops, key);
+      const { results } = await ops.getPageComments(doc.id);
+      return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
+    };
+    const addComment = async (id: string, text: string) => { await speakOnOwnChannel(ops, id, text); };
+
+    const projectId = "BUTCHR";
+    const before = createFrozenAsleepDetector({ now: () => now, minutes: 10, addComment, comments });
+    await before.check([projectId]);
+    now = 10 * MIN;
+    await before.check([projectId]);
+    expect(pageComments.length).toBe(1); // spoke once, for real, through the real wrap
+
+    // Simulate the restart: a brand new detector, no in-memory tracking at
+    // all, reading back through the SAME real reader shape. Its own floor
+    // starts fresh at the moment it first observes the id (12min) — the
+    // first check below is too soon to re-attempt (mirrors this file's own
+    // "dedupe survives a simulated daemon restart" test above), so adoption
+    // only shows up once `after`'s OWN 10-minute bound is crossed.
+    now = 12 * MIN;
+    const after = createFrozenAsleepDetector({ now: () => now, minutes: 10, addComment, comments });
+    const early = await after.check([projectId]);
+    expect(early.size).toBe(0); // not yet — `after`'s own floor just started
+    expect(pageComments.length).toBe(1);
+
+    now = 22 * MIN; // 10 minutes past `after`'s own fresh floor
+    const out = await after.check([projectId]);
+    expect(out.has(projectId)).toBe(true); // adopted — reported frozen without a fresh post
+    expect(pageComments.length).toBe(1); // NOT re-posted — this is the exact restart behaviour BUTCHR-129 fixes
+  });
+
+  // DoD 3: the unwrap must not regress the tier that was already correct.
+  // The issue branch of `ownChannelComments` never calls
+  // `unwrapStorageParagraph` at all (`atlassian.comments(key)`, unchanged) —
+  // asserted two ways: the branch predicate itself, and that
+  // `unwrapStorageParagraph` is a harmless no-op on an ordinary (unwrapped)
+  // Jira comment body even if it were ever applied to one.
+  test("issue tier is unaffected: a plain (already-unwrapped) Jira-shaped body still matches findMarked directly, with or without passing through unwrapStorageParagraph", () => {
+    const fingerprint = "fingerprint: BUTCHR-71";
+    const plainBody = [`${MARKER} BUTCHR-71 has read "asleep"...`, "", fingerprint].join("\n");
+    const rows = [{ id: "c1", body: plainBody, created: "" }];
+    expect(findMarked(rows, MARKER, [fingerprint])?.id).toBe("c1"); // unchanged, as before this ticket
+
+    const stillRows = [{ id: "c1", body: unwrapStorageParagraph(plainBody), created: "" }];
+    expect(findMarked(stillRows, MARKER, [fingerprint])?.id).toBe("c1"); // idempotent no-op on a non-wrapped body
   });
 });
 
