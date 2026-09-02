@@ -213,7 +213,7 @@ describe("createCrashLoopDetector: THE PRUNING TRAP (§2.3) — prune on 'left d
 });
 
 describe("createCrashLoopDetector: THE INVERTED CONFIDENT-ZERO HAZARD (§6) — a fleet-wide 'nothing running' poll is not a fleet-wide crash loop", () => {
-  test("when ALL of a multi-resource desired set is in plan.spawn on the same poll, none of it is counted toward any id's window — no comment, ever, across many such polls", async () => {
+  test("when ALL of a multi-resource desired set is in plan.spawn on the same poll, none of it is counted toward any id's window — no comment, ever, across many such polls, and the WARNING is logged ONCE (not once per poll) while the condition is sustained", async () => {
     let now = 0;
     const chan = fakeChannel();
     const logs: string[] = [];
@@ -224,7 +224,50 @@ describe("createCrashLoopDetector: THE INVERTED CONFIDENT-ZERO HAZARD (§6) — 
       await det.check(desired, desired); // herdr reporting nothing running — ALL of desired lands in spawn
     }
     expect(chan.posted).toEqual([]);
-    expect(logs.some((l) => l.startsWith("WARNING: [crashloop]") && l.includes("not counted"))).toBe(true);
+    const fleetWideLines = logs.filter((l) => l.startsWith("WARNING: [crashloop]") && l.includes("not counted"));
+    expect(fleetWideLines.length).toBe(1); // review round 1, non-blocking: once-until-cleared, not once per poll
+    expect(fleetWideLines[0]).toContain("the entire desired set");
+  });
+
+  // Review round 1 (PR #195, CHANGES_REQUESTED): the guard's own module
+  // comment previously claimed this "can only ever delay detection", which
+  // is false for exactly this shape — measured by the reviewer at 240
+  // issue-tier polls (a full simulated hour) producing zero complaints for a
+  // 2-resource fleet crash-looping the whole time. Reproduced here at a
+  // smaller scale (well past the 60-minute window) as a pinned regression:
+  // a SUSTAINED, persistent fleet-wide condition suppresses the alarm
+  // INDEFINITELY, not merely delays it — a deliberate, now-disclosed
+  // trade-off (see the module's own top comment), not a bug, but the
+  // module's claims about itself must describe it accurately.
+  test("DISCLOSED LIMITATION: a PERSISTENT fleet-wide crash loop (the whole desired set crash-looping simultaneously, every poll, for longer than the window) suppresses the alarm INDEFINITELY — this is not merely a delay", async () => {
+    let now = 0;
+    const chan = fakeChannel();
+    const det = createCrashLoopDetector({ now: () => now, count: 5, windowMinutes: 60, addComment: chan.addComment, comments: chan.comments });
+    const desired = ["A", "B"];
+    // Every poll, both resources are spawning — the guard's own condition
+    // holds continuously, well past the 60-minute window this threshold is
+    // measured over.
+    for (let i = 0; i < 300; i++) {
+      now = i * MIN;
+      await det.check(desired, desired);
+    }
+    expect(chan.posted).toEqual([]); // suppressed for the full 300 minutes, not merely delayed past the 60-minute window
+  });
+
+  test("the fleet-wide WARNING logs again on a LATER recurrence, after the condition cleared in between", async () => {
+    let now = 0;
+    const chan = fakeChannel();
+    const logs: string[] = [];
+    const det = createCrashLoopDetector({ now: () => now, count: 3, windowMinutes: 60, addComment: chan.addComment, comments: chan.comments, log: (l) => logs.push(l) });
+    const desired = ["A", "B"];
+    now = 0;
+    await det.check(desired, desired); // fleet-wide episode 1
+    now = MIN;
+    await det.check(["A"], desired); // condition clears (B is running this poll) — resets the "logged" latch
+    now = 2 * MIN;
+    await det.check(desired, desired); // fleet-wide episode 2
+    const fleetWideLines = logs.filter((l) => l.startsWith("WARNING: [crashloop]") && l.includes("not counted"));
+    expect(fleetWideLines.length).toBe(2); // one per episode, not one total
   });
 
   test("once the fleet-wide signal clears (not everything is spawning), per-id counting resumes normally and can still reach the threshold", async () => {

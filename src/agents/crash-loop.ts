@@ -42,13 +42,31 @@ import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-help
  * detector post on every active ticket simultaneously the moment each
  * crossed its threshold — a fleet-wide false crash-loop alarm, exactly the
  * "spam destroys a channel's credibility" outcome this epic ranks worse than
- * silence. `check` treats a poll where `plan.spawn` is essentially the whole
- * `desired` set as evidence about herdr, not about any individual resource:
- * it logs and counts NONE of that poll's spawns toward any id's window,
- * rather than trusting them. This can only ever DELAY detection for a real
- * per-resource crash loop caught mid-outage (the same "delay, never
- * fabricate" guarantee this codebase's other floors already rely on for a
- * daemon restart) — never fabricate one.
+ * silence. `check` treats a poll where `plan.spawn` is EXACTLY EQUAL to the
+ * ENTIRE `desired` set (see the guard's own precise condition below — not
+ * merely "most of it") as evidence about herdr, not about any individual
+ * resource: it logs and counts NONE of that poll's spawns toward any id's
+ * window, rather than trusting them.
+ *
+ * DISCLOSED LIMITATION (review round 1, PR #195): for a TRANSIENT herdr blip
+ * this can only ever DELAY detection — the same "delay, never fabricate"
+ * guarantee this codebase's other floors already rely on for a daemon
+ * restart. It is NOT merely a delay for a PERSISTENT condition: if the whole
+ * (more-than-one-member) `desired` set stays crash-looping simultaneously —
+ * the COMMON-CAUSE shape (an expired credential, a bad global config, a
+ * herdr misconfiguration) is arguably the likeliest way more than one
+ * resource ever crash-loops at once — this guard's own condition holds on
+ * EVERY poll for as long as that persists, so it suppresses the alarm
+ * INDEFINITELY, not merely delays it (measured: a 2-resource fleet, both
+ * crash-looping, over 240 issue-tier polls — a full hour — posts zero
+ * complaints). This is a DELIBERATE trade-off, not an oversight: fanning a
+ * complaint out to every ticket in a crash-looping fleet at once is judged
+ * worse than staying silent on the sustained common-cause case, for the same
+ * "spam destroys credibility" reason the guard exists at all. If this
+ * trade-off is ever revisited, the natural fix is a SEPARATE, non-fanned-out
+ * signal for the sustained-fleet-wide case specifically — not weakening or
+ * removing this guard, which stays correct for the far more common transient
+ * blip.
  *
  * THE THRESHOLD: a rolling COUNT over a rolling TIME WINDOW, not consecutive
  * polls — the issue tier (15s) and the project tier (5min,
@@ -213,6 +231,16 @@ export function createCrashLoopDetector(deps: CrashLoopDetectorDeps): CrashLoopD
   // other detector's `cappedLogged`, same reasoning: without this a
   // permanently-capped id would log once per poll forever.
   const cappedLogged = new Set<string>();
+  // One "fleet-wide, not counted" WARNING per SUSTAINED occurrence, not one
+  // per poll — mirrors `cappedLogged` just above (and `parked.ts`/
+  // `labels/pr.ts`'s named "a PERMANENT throttle logs once instead of once
+  // per poll" convention): without this, the persistent-condition case this
+  // module's own top comment now discloses (a whole small fleet
+  // crash-looping simultaneously) would log an identical line on every
+  // single poll for as long as it lasts — hours of `WARNING` noise for one
+  // fact. Cleared the moment the condition stops holding, so a LATER
+  // recurrence logs again rather than staying silently suppressed forever.
+  let fleetWideLogged = false;
   const windowMs = deps.windowMinutes * 60_000;
   const log = (line: string) => deps.log?.(line);
 
@@ -257,20 +285,32 @@ export function createCrashLoopDetector(deps: CrashLoopDetectorDeps): CrashLoopD
     try {
       tracker.forgetMissing(new Set(desired));
       // THE INVERTED CONFIDENT-ZERO HAZARD (epic criterion 9, this module's
-      // own top comment): a poll where essentially the WHOLE desired set is
-      // in `plan.spawn` is evidence herdr reported nothing running, not
-      // evidence every one of those resources is individually
-      // crash-looping. Requiring more than one desired resource keeps a
-      // genuinely single-resource fleet's own real crash loop detectable
-      // (there is no way to distinguish the two cases with only one
-      // candidate, and the alternative — never detecting a solo crash loop
-      // — is strictly worse); this poll's spawns are not recorded toward any
-      // id's window at all when it fires, only delaying detection, never
-      // fabricating a false one, exactly like a daemon restart already does.
-      if (desired.length > 1 && spawning.length === desired.length) {
-        log(`WARNING: [crashloop] all ${spawning.length}/${desired.length} of the desired set is in plan.spawn this poll — treating as herdr reporting nothing running rather than a fleet-wide crash loop; this poll's spawns are not counted`);
+      // own top comment): a poll where `plan.spawn` is EXACTLY the ENTIRE
+      // desired set is evidence herdr reported nothing running, not evidence
+      // every one of those resources is individually crash-looping.
+      // Requiring more than one desired resource keeps a genuinely
+      // single-resource fleet's own real crash loop detectable (there is no
+      // way to distinguish the two cases with only one candidate, and the
+      // alternative — never detecting a solo crash loop — is strictly
+      // worse); this poll's spawns are not recorded toward any id's window
+      // at all when it fires.
+      //
+      // DISCLOSED LIMITATION, NOT MERELY A DELAY (see this module's own top
+      // comment): for a TRANSIENT herdr blip this only delays detection,
+      // same as a daemon restart. For a PERSISTENT common-cause fleet-wide
+      // crash loop (this guard's own condition holding on every poll for as
+      // long as the whole fleet stays down) it suppresses the alarm
+      // INDEFINITELY — a deliberate trade-off against fanning a complaint
+      // out to every ticket at once, not an oversight.
+      const fleetWide = desired.length > 1 && spawning.length === desired.length;
+      if (fleetWide) {
+        if (!fleetWideLogged) {
+          fleetWideLogged = true;
+          log(`WARNING: [crashloop] the entire desired set (${spawning.length}/${desired.length}) is in plan.spawn this poll — treating as herdr reporting nothing running rather than a fleet-wide crash loop; this poll's spawns are not counted (logged once until this clears — see this module's own top comment: a SUSTAINED occurrence of this is a disclosed, indefinite suppression, not merely a delay)`);
+        }
         return;
       }
+      fleetWideLogged = false; // condition cleared this poll — a later recurrence logs again
       for (const id of spawning) {
         const times = tracker.recordSpawn(id, deps.now(), windowMs);
         if (tracker.isSpoken(id)) continue;
