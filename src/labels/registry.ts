@@ -66,22 +66,29 @@ import { ORPHAN_LABEL } from "../tools/relationship.js";
  *      literal never routed through this file at all. See that file's own
  *      header for the parsing mechanics and false-positive traps.
  *
- * AC-9(a) — THE SCANNER SEES DECLARED LITERALS, AND ALMOST NOTHING IN THE
- * agent:/pr: FAMILIES IS ONE. Measured directly against this repo's `src/`:
- * `agent:stalled` is never a string literal anywhere in it — it is
- * `AGENT_PREFIX` concatenated with a suffix at the point of emission
- * (`./sync.ts`) — and there is not a single `pr:*` string literal in `src`
- * either; the whole family is `PR_PREFIX + prState`, a direct concat. The
- * only four `agent:*` literals that exist in `src` at all sit on one line,
- * inside `./sweep.ts`'s `SWEEP_JQL` string, which the scanner correctly reads
- * as one JQL string rather than four label literals (see ./label-scan.ts) —
- * filtering JQL correctly is the very act that blinds the scan to them; a
- * literal scanner run over this codebase today finds ZERO of the nine
- * daemon-owned label values and only the two verb-owned `butchr:*`
- * constants (two of eleven).
+ * AC-9(a) — THE SCANNER SEES THE agent:/pr: FAMILIES ONLY CIRCULARLY: AS
+ * THIS REGISTRY'S OWN KEYS, NEVER AT AN EMISSION SITE. Every one of the nine
+ * daemon-owned values below (`agent:working` through `agent:none`, `pr:open`
+ * through `pr:merged`) IS literal text in `src` today — right here, as a
+ * string key of `LABEL_REGISTRY`. But that is the registry agreeing with
+ * itself. The place each value is actually EMITTED is `AGENT_PREFIX`
+ * concatenated with a suffix in `./sync.ts` for `agent:*`, and
+ * `PR_PREFIX + prState` for `pr:*` — a direct concatenation at both sites,
+ * which a literal scanner cannot parse as a label and never claims to. Before
+ * BUTCHR-155, the only four `agent:*` literals that existed anywhere else in
+ * `src` sat on one line, inside `./sweep.ts`'s hand-written `SWEEP_JQL`
+ * string, which the scanner correctly read as one JQL string rather than
+ * four label literals (see ./label-scan.ts) — filtering JQL correctly was
+ * the very act that blinded the scan to them there. BUTCHR-155 replaced that
+ * hand-written string with one built from `./plan.ts`'s
+ * `ALL_AGENT_LABEL_KEYS` (itself `AGENT_PREFIX` concatenated with each
+ * `AgentLabel` member), removing even that incidental sighting — it changed
+ * nothing about where the family's real emission sites are, and they remain
+ * exactly as invisible to the scanner as before.
  *
- * THAT SENTENCE MUST NEVER BE READ AS "THE RULE COVERS 2 OF 11" — IT DOES
- * NOT, AND THE TWO CLAIMS ARE NOT THE SAME ONE:
+ * SO A CLEAN OR COMPLETE-LOOKING SCAN OF THESE NINE VALUES PROVES NOTHING
+ * ABOUT COVERAGE — READ THE MECHANISM, NOT A COUNT, AND THE TWO DOORS BELOW
+ * ARE NOT THE SAME CLAIM:
  *   - THE REGISTRY (this file) IS THE PRIMARY MECHANISM. Its coverage is
  *     every label declared in `LABEL_REGISTRY` — all eleven, because all
  *     eleven are declared, enforced by door 1 (the type-level union), never
@@ -92,26 +99,35 @@ import { ORPHAN_LABEL } from "../tools/relationship.js";
  *     literal anywhere.
  *   - THE SCANNER (`./label-scan.ts`) IS A SECONDARY NET against one
  *     specific bypass — a bare literal declared outside this registry
- *     entirely. Its literal VISIBILITY is two of eleven; that number
- *     describes what the scanner can independently confirm, not what the
- *     rule enforces. Keep the scanner regardless: a new label is written as
- *     a literal far more often than as a concatenation, which is exactly the
- *     shape `butchr:orphan` slipped through before BUTCHR-108 — the scanner
- *     just must never be described as a coverage proof for the prefix
- *     families.
+ *     entirely. For the two verb-owned `butchr:*` constants (`EXEMPT_LABEL`,
+ *     `ORPHAN_LABEL`), that check is real: the scanner finds them at their
+ *     own genuine declaration sites, in `../agents/parked.ts` and
+ *     `../tools/relationship.ts` respectively, independent of this file. For
+ *     the nine agent:/pr: values it is not: the only place the scanner finds
+ *     them is the keys just below, which is this file confirming itself, not
+ *     an independent sighting anywhere near an emission site. Keep the
+ *     scanner regardless: a new label is written as a literal far more often
+ *     than as a concatenation, which is exactly the shape `butchr:orphan`
+ *     slipped through before BUTCHR-108 — the scanner just must never be
+ *     described as a coverage proof for the prefix families, clean run or
+ *     not.
  *
  * AC-9(b) — A REGISTRY ENTRY RECORDS THAT A WITHDRAWAL PATH EXISTS, NOT THAT
- * IT REACHES EVERY MEMBER OF ITS FAMILY. `agent:*`'s entries below correctly
- * record the reconcile-loop diff (`./sync.ts`) as the withdrawal path — and
- * that record is accurate — yet BUTCHR-144 (filed outside this epic, not this
- * ticket's to fix) is a real hole INSIDE that path: `agent:stalled` is
- * missing from `SWEEP_JQL`'s `labels IN (...)` list in `./sweep.ts`, so a
- * ticket carrying `agent:stalled` when it goes inactive is not picked up by
- * that particular startup sweep. The registry cannot see this and does not
- * claim to: it answers "is there a withdrawal path", never "does it actually
- * reach every case". Both AC-9 blind spots are the same species of
- * overclaim — say what a check found, not what it would be nice for it to
- * have found.
+ * IT REACHES EVERY MEMBER OF ITS FAMILY, AND CANNOT ITSELF PROVE REACH.
+ * `agent:*`'s entries below correctly record the reconcile-loop diff
+ * (`./sync.ts`) as the withdrawal path — and that record is accurate.
+ * BUTCHR-144 found a real hole INSIDE that path (`agent:stalled` missing from
+ * `SWEEP_JQL`'s `labels IN (...)` list in `./sweep.ts`, so a ticket carrying
+ * it when it goes inactive was never picked up by that startup sweep); this
+ * registry could not see that hole and never claimed to — it answers "is
+ * there a withdrawal path", never "does it actually reach every case". That
+ * specific hole was closed by BUTCHR-155, which derived the sweep's selection
+ * from the `AgentLabel` union itself (`./plan.ts`'s `ALL_AGENT_LABEL_KEYS`),
+ * rather than adding one more string to the hand-written list — see that
+ * file's header. The general point stands regardless of that one fix: a
+ * registry entry is still never a reach proof for whatever it names, and both
+ * AC-9 blind spots are the same species of overclaim — say what a check
+ * found, not what it would be nice for it to have found.
  *
  * `withdrawnBy` IS STRUCTURALLY REQUIRED, AND "NEVER" REQUIRES A REASON:
  * `LabelRegistryEntry` is a discriminated union on `withdrawnBy` itself —
@@ -169,7 +185,7 @@ type VerbLabelKey = typeof EXEMPT_LABEL | typeof ORPHAN_LABEL;
 export type RegisteredLabel = AgentLabelKey | PrLabelKey | VerbLabelKey;
 
 const AGENT_LABEL_LIFECYCLE_NOTES =
-  "One of exactly five mutually exclusive agent:* values (mapAgentStatus / desiredLabels in ./plan.ts) computed fresh every ~15s poll for a ticket whose status isActive(). Flapping is damped by AgentLabelStabilizer in ./sync.ts (a candidate value must be observed on two consecutive polls before it's written), but that only delays which value gets applied — it never changes who applies or withdraws it. Known hole, live example for AC-9(b) (filed as BUTCHR-144, outside this epic, NOT this ticket's to fix — AC-7 forbids the lifecycle change): SWEEP_JQL in ./sweep.ts's startup sweep omits agent:stalled from its `labels IN (...)` list, so a ticket carrying agent:stalled when it goes inactive is not picked up by that particular sweep. This entry's withdrawnBy is still correct — the poll-loop diff below IS a real withdrawal path — but a registry entry only records that a path exists, not that every caller on it is hole-free; see this file's header, AC-9(b).";
+  "One of exactly five mutually exclusive agent:* values (mapAgentStatus / desiredLabels in ./plan.ts) computed fresh every ~15s poll for a ticket whose status isActive(). Flapping is damped by AgentLabelStabilizer in ./sync.ts (a candidate value must be observed on two consecutive polls before it's written), but that only delays which value gets applied — it never changes who applies or withdraws it. Former hole, live example for AC-9(b) (BUTCHR-144, outside this epic — AC-7 forbade fixing it here): SWEEP_JQL in ./sweep.ts's startup sweep once omitted agent:stalled from its hand-written `labels IN (...)` list, so a ticket carrying agent:stalled when it went inactive was not picked up by that particular sweep. BUTCHR-155 closed it by deriving SWEEP_JQL from AgentLabel itself (./plan.ts's ALL_AGENT_LABEL_KEYS) rather than adding one more string to the list. This entry's withdrawnBy was, and remains, correct throughout — the poll-loop diff below IS a real withdrawal path — the AC-9(b) point this instance illustrates is that a registry entry only ever records that a path exists, never that every caller on it is hole-free; see this file's header, AC-9(b).";
 
 const AGENT_LABEL_WITHDRAWN_BY =
   "src/labels/sync.ts's syncLabels, via diffLabels in ./plan.ts — every poll, diffLabels removes any agent:* label the ticket currently carries that is not this poll's desired value; desiredLabels emits NO agent:* label once isActive(status) is false, so leaving the active status set removes it. syncLabels ALSO runs an explicit disappearance-cleanup pass (the `for (const key of [...lastLabels.keys()])` loop) for the poll where a ticket stops being returned by search() entirely, so the removal fires even without one more poll that still sees the ticket.";
