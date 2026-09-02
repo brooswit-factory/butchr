@@ -1,13 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+  appendSinceWindow,
   buildIdentityReport,
   computeVerdict,
   decideBuildIdentity,
+  decideJournalWindow,
   decideReadability,
   describeSkippedUnit,
   formatBuildLine,
   formatReport,
   formatUptime,
+  formatWindowLine,
   journalInvocationFor,
   looksLikeButchrUnit,
   parseSsListeners,
@@ -15,7 +18,13 @@ import {
   type BuildOutcome,
   type IdentityReport,
   type SsListener,
+  type WindowDecision,
 } from "../../scripts/audit-alias-calls.js";
+
+// Shorthand for tests that don't care about the window axis — the default,
+// unrequested, whole-journal decision every identity gets when
+// `--since-start` wasn't passed.
+const NO_WINDOW: WindowDecision = decideJournalWindow(false, { known: false, reason: "not probed by this test" });
 
 // A REAL `ss -ltne` transcript, captured live on the host this ticket was
 // built against (servyboi): a mix of root-owned system sockets with no
@@ -145,6 +154,40 @@ describe("journalInvocationFor", () => {
     expect(inv.command).toBe("");
     expect(inv.note).toContain("no journal to read");
   });
+
+  test("no window argument at all: identical to the pre-BUTCHR-86 command, unchanged", () => {
+    expect(journalInvocationFor(userUnit, 1001, 1001).command).toBe("journalctl --user -u butchr.service");
+  });
+
+  test("a `since` window appends `--since @<epoch>` to the own-identity command", () => {
+    const inv = journalInvocationFor(userUnit, 1001, 1001, { kind: "since", sinceEpochSeconds: 1735689600, sinceIso: "2025-01-01T00:00:00.000Z" });
+    expect(inv.command).toBe("journalctl --user -u butchr.service --since @1735689600");
+  });
+
+  test("a `since` window appends `--since @<epoch>` to the foreign-identity command too", () => {
+    const inv = journalInvocationFor(systemUnit, 1002, 1001, { kind: "since", sinceEpochSeconds: 1735689600, sinceIso: "2025-01-01T00:00:00.000Z" });
+    expect(inv.command).toBe("journalctl -u butchr.service _UID=1002 --since @1735689600");
+  });
+});
+
+describe("appendSinceWindow — DoD 6: never a raw operator/health string reaching the shell, only a validated integer", () => {
+  test("`{ kind: \"none\" }` leaves the command untouched", () => {
+    expect(appendSinceWindow("journalctl -u foo", { kind: "none" })).toBe("journalctl -u foo");
+  });
+
+  test("`{ kind: \"since\" }` appends a pure-digit epoch clause", () => {
+    expect(appendSinceWindow("journalctl -u foo", { kind: "since", sinceEpochSeconds: 42, sinceIso: "x" })).toBe("journalctl -u foo --since @42");
+  });
+
+  // The scenario DoD 6 names explicitly: a malformed timestamp must not be able to
+  // break the command or execute anything. Because this function only ever emits a
+  // validated integer — never the raw string — there is no space or quote for an
+  // adversarial `startedAt` to smuggle a second shell command through in the first
+  // place; this asserts that guarantee by construction, not by escaping.
+  test("a non-integer sinceEpochSeconds throws rather than ever reaching the shell string", () => {
+    expect(() => appendSinceWindow("journalctl -u foo", { kind: "since", sinceEpochSeconds: Number.NaN, sinceIso: "not a real timestamp" })).toThrow();
+    expect(() => appendSinceWindow("journalctl -u foo", { kind: "since", sinceEpochSeconds: 1.5, sinceIso: "x" })).toThrow();
+  });
 });
 
 describe("decideReadability — the null-result rule (the ticket's own harshest acceptance criterion)", () => {
@@ -158,6 +201,22 @@ describe("decideReadability — the null-result rule (the ticket's own harshest 
       targetUid: 1002,
       readerUid: 1001,
       confirmedLiveViaHealth: true,
+      windowed: false,
+    });
+    expect(outcome.readable).toBe(false);
+    if (!outcome.readable) expect(outcome.reason).toContain("uid 1002 is not this reader");
+  });
+
+  // BUTCHR-86: windowing never rescues the foreign-identity ambiguity — a cross-user
+  // empty read is exactly as indistinguishable from permission-gated under a window
+  // as over the whole journal.
+  test("a foreign identity with an empty result is UNREADABLE even when the read was windowed", () => {
+    const outcome = decideReadability({
+      probe: { exitCode: 0, stdout: "-- No entries --\n", stderr: "" },
+      targetUid: 1002,
+      readerUid: 1001,
+      confirmedLiveViaHealth: true,
+      windowed: true,
     });
     expect(outcome.readable).toBe(false);
     if (!outcome.readable) expect(outcome.reason).toContain("uid 1002 is not this reader");
@@ -169,30 +228,59 @@ describe("decideReadability — the null-result rule (the ticket's own harshest 
       targetUid: 1001,
       readerUid: 1001,
       confirmedLiveViaHealth: true,
+      windowed: false,
     });
     expect(outcome.readable).toBe(false);
     if (!outcome.readable) expect(outcome.reason).toContain("Failed to determine unit");
   });
 
-  test("our OWN unit, zero lines, but /health confirms it's live right now: UNREADABLE — a live daemon that logged nothing proves the read failed, not that it was quiet", () => {
+  test("our OWN unit, zero lines, but /health confirms it's live right now, UNWINDOWED: UNREADABLE — a live daemon that logged nothing over its WHOLE journal proves the read failed, not that it was quiet", () => {
     const outcome = decideReadability({
       probe: { exitCode: 0, stdout: "-- No entries --\n", stderr: "" },
       targetUid: 1001,
       readerUid: 1001,
       confirmedLiveViaHealth: true,
+      windowed: false,
     });
     expect(outcome.readable).toBe(false);
     if (!outcome.readable) expect(outcome.reason).toContain("proof this read is UNREADABLE");
   });
 
-  test("our OWN unit, zero lines, liveness not independently confirmed: still UNREADABLE — a null result is not evidence of a pass", () => {
+  // BUTCHR-86 DoD 4's named hazard: the SAME zero-lines-from-our-own-live-unit
+  // combination that is UNREADABLE over the whole journal is a legitimate quiet
+  // result once the read was WINDOWED — a freshly-restarted daemon can genuinely
+  // have logged nothing yet in a narrow "since it started" span. Must come back
+  // `{ readable: true, totalLines: 0 }`, never folded into the unwindowed UNREADABLE
+  // case above (that would drag `computeVerdict` to INCONCLUSIVE for a daemon that
+  // simply hasn't had time to log anything since its own restart).
+  test("our OWN unit, zero lines, /health confirms it's live right now, WINDOWED: READABLE with totalLines 0 — a narrow window can legitimately be quiet", () => {
     const outcome = decideReadability({
+      probe: { exitCode: 0, stdout: "-- No entries --\n", stderr: "" },
+      targetUid: 1001,
+      readerUid: 1001,
+      confirmedLiveViaHealth: true,
+      windowed: true,
+    });
+    expect(outcome).toEqual({ readable: true, totalLines: 0, lines: [] });
+  });
+
+  test("our OWN unit, zero lines, liveness not independently confirmed: still UNREADABLE regardless of windowing — a null result is not evidence of a pass", () => {
+    const unwindowed = decideReadability({
       probe: { exitCode: 0, stdout: "", stderr: "" },
       targetUid: 1001,
       readerUid: 1001,
       confirmedLiveViaHealth: false,
+      windowed: false,
     });
-    expect(outcome.readable).toBe(false);
+    expect(unwindowed.readable).toBe(false);
+    const windowed = decideReadability({
+      probe: { exitCode: 0, stdout: "", stderr: "" },
+      targetUid: 1001,
+      readerUid: 1001,
+      confirmedLiveViaHealth: false,
+      windowed: true,
+    });
+    expect(windowed.readable).toBe(false);
   });
 
   test("positive evidence — at least one real line — is READABLE, with an honest total line count", () => {
@@ -201,6 +289,7 @@ describe("decideReadability — the null-result rule (the ticket's own harshest 
       targetUid: 1001,
       readerUid: 1001,
       confirmedLiveViaHealth: true,
+      windowed: false,
     });
     expect(outcome).toEqual({ readable: true, totalLines: 3, lines: ["line one", "line two", "line three"] });
   });
@@ -220,6 +309,7 @@ describe("buildIdentityReport", () => {
       unit: "butchr.service",
       journalNote: "own identity",
       outcome: { readable: true, totalLines: lines.length, lines },
+      window: NO_WINDOW,
     });
     expect(report).toMatchObject({ drift: 1, sanctioned: 1, ambiguous: 1, unknown: 1 });
   });
@@ -230,20 +320,33 @@ describe("buildIdentityReport", () => {
       unit: "butchr.service",
       journalNote: "foreign identity",
       outcome: { readable: false, reason: "unreadable" },
+      window: NO_WINDOW,
     });
     expect(report).toMatchObject({ drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0 });
     expect(report.outcome.readable).toBe(false);
+  });
+
+  test("the window decision passed in is carried through untouched, independent of readability", () => {
+    const windowed: WindowDecision = { window: { kind: "since", sinceEpochSeconds: 1735689600, sinceIso: "2025-01-01T00:00:00.000Z" }, note: "since ..." };
+    const report = buildIdentityReport({
+      uid: 1001,
+      unit: "butchr.service",
+      journalNote: "own identity",
+      outcome: { readable: false, reason: "unreadable" },
+      window: windowed,
+    });
+    expect(report.window).toEqual(windowed);
   });
 });
 
 describe("computeVerdict — structurally incapable of a pass while anything is unreadable", () => {
   const readable = (over: Partial<IdentityReport> = {}): IdentityReport => ({
     uid: 1001, unit: "butchr.service", journalNote: "", outcome: { readable: true, totalLines: 1, lines: [] },
-    drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0, ...over,
+    drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0, window: NO_WINDOW, ...over,
   });
   const unreadable = (over: Partial<IdentityReport> = {}): IdentityReport => ({
     uid: 1002, unit: "butchr.service", journalNote: "", outcome: { readable: false, reason: "nope" },
-    drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0, ...over,
+    drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0, window: NO_WINDOW, ...over,
   });
 
   // REQUIRED (acceptance criterion): even with zero drift everywhere ELSE readable,
@@ -276,17 +379,101 @@ describe("computeVerdict — structurally incapable of a pass while anything is 
   });
 });
 
+describe("decideJournalWindow — DoD 1/2/3: the window decision itself, and the degraded-identity call", () => {
+  test("--since-start NOT requested: whole journal, and the note says so explicitly (DoD 2 applies even to the default case)", () => {
+    const decision = decideJournalWindow(false, { known: false, reason: "irrelevant when not requested" });
+    expect(decision.window).toEqual({ kind: "none" });
+    expect(decision.note).toContain("whole journal");
+    expect(decision.note).toContain("--since-start");
+  });
+
+  test("--since-start requested, identity reports a valid startedAt: scoped, epoch computed correctly", () => {
+    const decision = decideJournalWindow(true, {
+      known: true,
+      info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: null, version: null, startedAt: "2025-01-01T00:00:00.000Z", pid: null },
+    });
+    expect(decision.window).toEqual({ kind: "since", sinceEpochSeconds: 1735689600, sinceIso: "2025-01-01T00:00:00.000Z" });
+    expect(decision.note).toContain("2025-01-01T00:00:00.000Z");
+  });
+
+  // THE DEGRADED CASE, DoD 3: --since-start was requested but this identity's build
+  // identity is unknown — the ONLY path exercisable end-to-end against this fleet
+  // today (deploy-on-merge is off; see the ticket). Must widen to the whole journal
+  // rather than refuse the identity outright, and must say so loudly — never a
+  // silent narrowing AND never a silent widening.
+  test("--since-start requested, build identity UNKNOWN (the live, exercisable-today case): widened to whole journal, loudly", () => {
+    const decision = decideJournalWindow(true, { known: false, reason: "this daemon does not report a build identity; it predates the field, or is running an older build" });
+    expect(decision.window).toEqual({ kind: "none" });
+    expect(decision.note).toContain("--since-start was requested");
+    expect(decision.note.toLowerCase()).toContain("widened");
+    expect(decision.note).toContain("this daemon does not report a build identity");
+  });
+
+  test("--since-start requested, build identity known but startedAt is null: widened to whole journal, loudly", () => {
+    const decision = decideJournalWindow(true, {
+      known: true,
+      info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: null, version: null, startedAt: null, pid: null },
+    });
+    expect(decision.window).toEqual({ kind: "none" });
+    expect(decision.note.toLowerCase()).toContain("widened");
+  });
+
+  test("--since-start requested, startedAt present but unparseable: widened to whole journal, loudly, names the bad value", () => {
+    const decision = decideJournalWindow(true, {
+      known: true,
+      info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: null, version: null, startedAt: "not a real timestamp", pid: null },
+    });
+    expect(decision.window).toEqual({ kind: "none" });
+    expect(decision.note.toLowerCase()).toContain("widened");
+    expect(decision.note).toContain("not a real timestamp");
+  });
+});
+
+describe("formatWindowLine", () => {
+  test("renders the decision's note under a grep-able `window:` prefix", () => {
+    expect(formatWindowLine({ window: { kind: "none" }, note: "whole journal (test)" })).toBe("window: whole journal (test)");
+  });
+});
+
 describe("formatReport", () => {
   test("names every identity, the totals, and a verdict line a human can grep for", () => {
     const id: IdentityReport = {
       uid: 1002, unit: "butchr.service", journalNote: "foreign identity",
       outcome: { readable: false, reason: "cross-user" }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      window: NO_WINDOW,
     };
     const result = computeVerdict([id]);
     const text = formatReport([id], result, Date.parse("2026-01-01T00:00:00.000Z"));
     expect(text).toContain("uid=1002");
     expect(text).toContain("UNREADABLE");
     expect(text).toContain("VERDICT: INCONCLUSIVE");
+  });
+
+  // DoD 2's headline falsifier, asserted directly: the window in force must be
+  // visible even in the default, un-requested, whole-journal case — never inferred,
+  // never omitted, never blank.
+  test("the window in force is stated even in the default no-window case", () => {
+    const id: IdentityReport = {
+      uid: 1001, unit: "butchr.service", journalNote: "own identity",
+      outcome: { readable: true, totalLines: 5, lines: [] }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      window: NO_WINDOW,
+    };
+    const result = computeVerdict([id]);
+    const text = formatReport([id], result, Date.now());
+    expect(text).toContain("window: whole journal");
+    expect(text).toContain("--since-start");
+  });
+
+  test("the window in force is stated for a since-start-scoped identity", () => {
+    const decision = decideJournalWindow(true, { known: true, info: { sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: null, version: null, startedAt: "2026-01-01T00:00:00.000Z", pid: null } });
+    const id: IdentityReport = {
+      uid: 1001, unit: "butchr.service", journalNote: "own identity",
+      outcome: { readable: true, totalLines: 0, lines: [] }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      window: decision,
+    };
+    const result = computeVerdict([id]);
+    const text = formatReport([id], result, Date.now());
+    expect(text).toContain("window: since this identity's process started at 2026-01-01T00:00:00.000Z");
   });
 });
 
@@ -391,6 +578,7 @@ describe("formatReport carries the build line for every identity, alongside — 
       outcome: { readable: false, reason: "zero lines, unconfirmed" },
       drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
       build: { known: true, info: { sha: "c".repeat(40), shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1 } },
+      window: NO_WINDOW,
     };
     const text = formatReport([id], computeVerdict([id]), Date.parse("2026-01-01T00:00:00.000Z"));
     expect(text).toContain("UNREADABLE");
@@ -407,6 +595,7 @@ describe("formatReport carries the build line for every identity, alongside — 
       outcome: { readable: true, totalLines: 2, lines: [] },
       drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
       build: decideBuildIdentity({ ok: true, components: [] }),
+      window: NO_WINDOW,
     };
     const text = formatReport([id], computeVerdict([id]), Date.parse("2026-01-01T00:00:00.000Z"));
     expect(text).toContain("READABLE");
@@ -417,6 +606,7 @@ describe("formatReport carries the build line for every identity, alongside — 
     const id: IdentityReport = {
       uid: 1002, unit: "butchr.service", journalNote: "foreign identity",
       outcome: { readable: false, reason: "cross-user" }, drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0,
+      window: NO_WINDOW,
     };
     const text = formatReport([id], computeVerdict([id]), Date.now());
     expect(text).toContain("build: unknown — build identity was not probed");
