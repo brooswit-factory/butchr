@@ -106,6 +106,9 @@ const DISPOSITIONS: Record<string, Disposition> = {
   // peers are a relationship between projects, an issue has no sideways
   // channel at all.
   list_peers: "project-only",
+  // BUTCHR-185/BUTCHR-215: same gate, same reasoning — sending a peer
+  // message is a relationship only the project tier has.
+  tell_peer: "project-only",
 
   // Works for a project caller, with caller-shape-specific behaviour
   // documented in each verb's own description (checked below).
@@ -306,14 +309,14 @@ describe('project-caller disposition enumeration (BUTCHR-82) — "refuses" and "
   // nothing and this file would look green while checking less than it
   // claims to. Pinned to the counts this ticket found: 3 "refuses" verbs
   // (submit_to_boss, finish_without_a_boss, file_where_it_belongs) and, as of
-  // BUTCHR-184/BUTCHR-188, 3 "project-only" verbs (check_in, get_doc_comments,
-  // list_peers). If a FUTURE verb is legitimately added to either bucket,
-  // this assertion SHOULD go red — that is correct, not a bug: update the
-  // expected count here to match the new, deliberate total. Do not delete
+  // BUTCHR-185/BUTCHR-215, 4 "project-only" verbs (check_in, get_doc_comments,
+  // list_peers, tell_peer). If a FUTURE verb is legitimately added to either
+  // bucket, this assertion SHOULD go red — that is correct, not a bug: update
+  // the expected count here to match the new, deliberate total. Do not delete
   // this assertion to get green; update the number.
   test("both buckets are non-empty (guards the loops below against silently checking nothing)", () => {
     expect(refusesVerbs.length).toBe(3);
-    expect(projectOnlyVerbs.length).toBe(3);
+    expect(projectOnlyVerbs.length).toBe(4);
   });
 
   for (const verb of refusesVerbs) {
