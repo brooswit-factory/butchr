@@ -30,7 +30,7 @@ import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
-import { speakOnOwnChannel } from "../tools/speak.js";
+import { speakOnOwnChannel, unwrapStorageParagraph } from "../tools/speak.js";
 import { projectRootDoc } from "../tools/docs.js";
 
 let config;
@@ -358,11 +358,28 @@ runResourceLoop(projectResourceType, {
 // result. `getPageComments` has no `created` timestamp on its rows — mapped
 // to `""`, which `Date.parse` turns into `NaN`, which the caller already
 // falls back to `deps.now()` for.
+//
+// REVIEW FINDING (PR #180, CHANGES_REQUESTED @ 1be6208): `getPageComments`
+// requests `bodyFormat: "storage"` and returns raw storage-format XHTML — the
+// SAME wrapped-and-escaped shape `speakOnOwnChannel` writes
+// (`<p>${escapeStorageText(text)}</p>`, src/tools/speak.ts), not the plain
+// text a caller posted. Read literally, a row's body starts with
+// `<p>[butchr:unresponsive]`, not `[butchr:unresponsive]` — the exact
+// string `findMarked` (escalation-helper.ts) anchors on with
+// `startsWith(marker)`, so restart-adoption silently never matched on the
+// project tier, the one this whole ticket was chosen to cover. Fixed by
+// `unwrapStorageParagraph` — speak.ts's own exported inverse of the wrapping
+// it writes, kept there so this can never drift from `escapeStorageText` and
+// so a later project-tier read-back reuses the SAME inverse. See that
+// function's doc comment for the decode-order reasoning and
+// test/unit/speak.test.ts for the round-trip proof against a REAL
+// `<p>${escapeStorageText(unresponsiveComment(...))}</p>` input, not a
+// hand-simplified stand-in.
 async function ownChannelComments(key: string): Promise<CommentRow[]> {
   if (isProjectId(key)) {
     const doc = await projectRootDoc(ops, key);
     const { results } = await ops.getPageComments(doc.id);
-    return results.map((r) => ({ id: r.id, body: r.body, created: "" }));
+    return results.map((r) => ({ id: r.id, body: unwrapStorageParagraph(r.body), created: "" }));
   }
   return atlassian.comments(key);
 }

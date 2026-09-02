@@ -1182,6 +1182,36 @@ describe("createEscalator — sustained blocked-and-unparseable alarm (BUTCHR-12
       expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(1);
       expect(h.logs.filter((l) => /adopted existing notice/.test(l)).length).toBe(5); // episodes 2-6 all adopt episode 1's comment
     });
+
+    // BUTCHR-124 review (PR #180, non-blocking finding, fixed): a capped
+    // episode must be DELAYED, not DROPPED — parked.ts's own precedent
+    // (`postStage` returns `null` on its cap branch too) is what this
+    // matches. What would refute the fix: a 4th pane's episode staying
+    // capped forever even after the rolling-hour window frees up, because
+    // `escalatedAt` had latched on the capped attempt and nothing ever
+    // retried it.
+    test("a capped episode is DELAYED, not dropped: once the rolling-hour window frees up, a later poll for the SAME still-stuck pane retries and posts", async () => {
+      const h = harness({ unresponsiveMinutes: 5 });
+      async function earnEpisode(paneId: string, startMs: number) {
+        h.setClock(startMs);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+        h.setClock(startMs + 5 * 60_000);
+        await h.noPrompt(paneId, "KAN-1", `garbled on ${paneId}`);
+      }
+      await earnEpisode("p0", 0);
+      await earnEpisode("p1", 10 * 60_000);
+      await earnEpisode("p2", 20 * 60_000);
+      await earnEpisode("p3", 30 * 60_000); // capped — NOT latched
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(3);
+
+      // p3's own episode is STILL sustained (never gapped) — a later poll,
+      // once the window has slid past episode p0's hour, must retry it
+      // rather than treat it as already handled.
+      h.setClock(70 * 60_000); // > 60 min after p0's episode (clock 0)
+      await h.noPrompt("p3", "KAN-1", "garbled on p3");
+      expect(h.posted.filter((c) => c.text.startsWith(UNRESPONSIVE_MARKER)).length).toBe(4);
+      expect(h.posted[3]!.issue).toBe("KAN-1");
+    });
   });
 
   describe("D5 — restart-adoption: a prior [butchr:unresponsive] notice is adopted, not re-posted", () => {
@@ -1267,6 +1297,21 @@ describe("createEscalator — sustained blocked-and-unparseable alarm (BUTCHR-12
     });
   });
 
+  // BUTCHR-124 review (PR #180): this harness's `ownChannelComments` mock
+  // returns plain text for BOTH issue and project keys — deliberately, since
+  // that IS the `EscalatorDeps.ownChannelComments` CONTRACT this module
+  // consumes (see that dep's own doc comment: "the read-back... a PROJECT
+  // key's Confluence... comments"). The daemon wiring that FULFILLS this
+  // contract for a project key (src/daemon/index.ts's `ownChannelComments`)
+  // must additionally unwrap Confluence's storage-format XHTML — that
+  // wrap/unwrap round trip is real production behaviour this module has no
+  // visibility into and must not re-implement, so it is tested where it
+  // actually lives: `unwrapStorageParagraph` in test/unit/speak.test.ts,
+  // against a REAL `speakOnOwnChannel`-written body, not a hand-typed
+  // stand-in. That is the fix for the defect this review found (restart-
+  // adoption never matching on the project tier because `findMarked`'s
+  // `startsWith(marker)` failed on the raw `<p>`-wrapped body) — this test
+  // only proves the PANE-ID-to-issue-key plumbing, which was never broken.
   describe("routing: the same deps.addComment seam a PROJECT-keyed target already gets for free (speakOnOwnChannel)", () => {
     test("a project-shaped key (BUTCHR-96 style: no issue-number suffix) is passed straight through to addComment, exactly like the parseable path already proves", async () => {
       const h = harness({ unresponsiveMinutes: 5 });

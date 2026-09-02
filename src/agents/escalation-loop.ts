@@ -333,6 +333,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   const unresponsive = new Map<string, UnresponsiveEntry>();
   const unresponsiveInFlight = new Set<string>();
   const unresponsiveCap = new RateCap(UNRESPONSIVE_MAX_PER_HOUR, HOUR_MS);
+  // BUTCHR-124 review (PR #180, non-blocking finding): mirrors parked.ts's
+  // own `cappedLogged` — one WARNING per target while capped, not one per
+  // poll, since (unlike a fresh episode) a capped episode is NOT latched
+  // (see escalateUnresponsive's `null` return below) and therefore keeps
+  // re-attempting, and re-checking the cap, on every qualifying poll until
+  // the window frees up.
+  const unresponsiveCappedLogged = new Set<string>();
 
   /**
    * Post (or adopt) the sustained-unresponsive notice for one episode.
@@ -357,6 +364,14 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * NEXT qualifying poll retries, exactly like parked.ts's own
    * comments-fetch-failure branch (`rows === null` -> `return null` ->
    * nothing posted, nothing latched).
+   *
+   * A RATE-CAPPED attempt returns `null` for the SAME reason (review finding
+   * on this ticket, matching parked.ts's own `postStage`, which returns
+   * `null` for BOTH its failed-fetch AND its rate-cap branches): capped
+   * means "not written this poll", not "handled" — the episode must stay
+   * unlatched so it retries once the target's rolling-hour budget frees up,
+   * rather than permanently dropping that pane's notice the moment a THIRD
+   * pane's notice happened to land first.
    */
   async function escalateUnresponsive(paneId: string, issue: string, elapsedMinutes: number): Promise<number | null> {
     let rows: CommentRow[];
@@ -372,9 +387,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       return Date.parse(existing.created) || deps.now();
     }
     if (!unresponsiveCap.allow(issue, deps.now())) {
-      log(`WARNING: [unresponsive] rate cap reached (${UNRESPONSIVE_MAX_PER_HOUR}/hour) for ${issue} — pane ${paneId}'s notice is being logged only, not posted`);
-      return deps.now();
+      if (!unresponsiveCappedLogged.has(issue)) {
+        unresponsiveCappedLogged.add(issue);
+        log(`WARNING: [unresponsive] rate cap reached (${UNRESPONSIVE_MAX_PER_HOUR}/hour) for ${issue} — pane ${paneId}'s notice is being logged only until the cap frees up (further cap hits for ${issue} are logged only once until it does)`);
+      }
+      return null; // not written — retry once the target's budget frees up, not dropped
     }
+    unresponsiveCappedLogged.delete(issue);
     await deps.addComment(issue, unresponsiveComment(issue, paneId, elapsedMinutes));
     unresponsiveCap.record(issue, deps.now());
     log(`[unresponsive] escalated ${issue} pane ${paneId} (${elapsedMinutes}m sustained blocked+unparseable)`);
