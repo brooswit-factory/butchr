@@ -116,15 +116,46 @@ export type ObservedAgentLabel = Exclude<AgentLabel, "stalled">;
  * below) — never a silent omission, and never expressible by just leaving a
  * key out, which this type does not allow.
  *
- * WHAT THIS ANCHOR CANNOT SEE: it forces every AgentLabel member to be
- * present as a KEY here — completeness, not correctness of what a caller
- * does with the result. It cannot force a consumer to actually read
- * `ALL_AGENT_LABEL_KEYS` below rather than hand-rolling a list that happens
- * to agree with it today; that a real consumer (SWEEP_JQL in ./sweep.ts) is
- * genuinely DERIVED from this array, and not just coincidentally consistent
- * with it, is a separate claim this Record alone cannot prove — it is
- * checked at runtime in test/unit/labels-sweep.test.ts instead, because a
- * bare type/Record cannot compel a caller to use it.
+ * WHAT THIS ANCHOR CANNOT SEE, STATED AS BUTCHR-144 POSED IT: what could
+ * someone add to this codebase tomorrow that emits an agent:* label the
+ * sweep never selects, while this Record stays green (compiles) and
+ * test/unit/labels-sweep.test.ts stays green? Answer: A NEW WRITE SITE,
+ * OUTSIDE desiredLabels/mapAgentStatus ABOVE, THAT WRITES AN agent:*-PREFIXED
+ * LABEL WITHOUT EVER ROUTING THROUGH THE AgentLabel TYPE — e.g. a future
+ * module calling the Jira label-update op directly with `AGENT_PREFIX +
+ * "paused"` (or the bare literal `"agent:paused"`), never adding `"paused"`
+ * to `AgentLabel` at all. This Record enforces completeness of AgentLabel's
+ * OWN declared members; it has no way to know about, and cannot require
+ * completeness against, a real write site that never touches the type in the
+ * first place. `agent:paused` would then be written by that new site,
+ * omitted from `ALL_AGENT_LABEL_KEYS` and therefore from SWEEP_JQL, and stay
+ * unreached by the sweep forever — while this Record's shape (still five
+ * keys, still compiling) and the sweep-derivation test (still checking that
+ * SWEEP_JQL matches those five) both report nothing wrong, because neither
+ * one is watching for a NEW write site; both watch only whether AgentLabel's
+ * EXISTING members are all reached. THIS IS THE SAME SPECIES OF BLIND SPOT
+ * ./registry.ts's own header describes for its type-level door (a bare
+ * literal or concatenation, declared anywhere, never routed through the
+ * governing type, is invisible to a check built only on that type) — applied
+ * here to a second, independent anchor for a different consumer. Today,
+ * every real agent:* write site in this codebase (this file's
+ * `desiredLabels`, the only one) DOES route through `AgentLabel`; nothing
+ * automated in this repository — not this Record, not
+ * test/unit/labels-sweep.test.ts, and not ./registry.ts's LABEL_REGISTRY,
+ * which the exact same concatenation trick already defeats for `agent:*`/
+ * `pr:*` per that file's own AC-9(a) — forces a FUTURE write site to keep
+ * that discipline. That is left to code review, same as it always was for
+ * `butchr:orphan` before BUTCHR-108/BUTCHR-137, per ./registry.ts's header.
+ *
+ * A second, narrower thing this anchor cannot see: it forces every
+ * AgentLabel member to be present as a KEY here — completeness, not
+ * correctness of what a caller does with the result. It cannot force a
+ * consumer to actually read `ALL_AGENT_LABEL_KEYS` below rather than
+ * hand-rolling a list that happens to agree with it today; that SWEEP_JQL in
+ * ./sweep.ts is genuinely DERIVED from this array, and not just
+ * coincidentally consistent with it, is a separate claim this Record alone
+ * cannot prove — it is checked at runtime in test/unit/labels-sweep.test.ts
+ * instead, because a bare type/Record cannot compel a caller to use it.
  */
 const ALL_AGENT_LABELS: Record<AgentLabel, true> = {
   working: true,
