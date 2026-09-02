@@ -170,10 +170,17 @@ export interface CommentRow { id: string; body: string; created: string }
  * getPageComments`'s doc comment for what that timestamp actually measures
  * and the last-edited-vs-created distinction it accepts). Falls back to
  * `""` ONLY for the row-level case where the underlying read genuinely
- * carried no timestamp — never to `Date.now()`/`deps.now()`: a caller that
- * cannot tell "unavailable" from "just now" would treat a stale row as
- * fresh, exactly backwards from what the recency filter this feeds
- * (escalation-loop.ts's `CLOCK_SKEW_GRACE_MS` check) exists to do.
+ * carried no timestamp — never to `Date.now()`/`deps.now()`, which would
+ * make an unverifiable row look definitively CURRENT instead of merely
+ * UNKNOWN. `""` is not self-enforcing on its own (`Date.parse("")` is
+ * `NaN`, and an unguarded `NaN < x` is always `false` — a caller that
+ * compares it directly gets the SAME pass-through `now()` would have
+ * given, a defect this ticket's review caught and closed at the one
+ * consumer, escalation-loop.ts's recency filter, which now checks
+ * `Number.isNaN(...)` explicitly rather than relying on that comparison by
+ * accident). This mapping's job is only to make "unavailable" and "just
+ * now" DISTINGUISHABLE values; a consumer still has to choose to tell them
+ * apart.
  *
  * ORDERING (BUTCHR-171): `getPageComments` requests no `sort` (see its own
  * doc comment) and this function no longer trusts its return order —

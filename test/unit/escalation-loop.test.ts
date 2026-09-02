@@ -1558,9 +1558,15 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
 // `speakOnOwnChannel` write path, real project-tier storage-format
 // unwrapping — nothing hand-reproduced.
 describe("createEscalator wired to the REAL extracted createOwnChannelComments (BUTCHR-141/§2.6) — adoption did not become silence", () => {
-  function makeOps(overrides: Partial<AtlassianOps> = {}): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string }> } {
+  // `now`, BUTCHR-171: defaults to a fixed clock matching every pre-existing
+  // caller of this fixture (all use `now: () => 0` on the escalator they
+  // build from these `ops`) — pass the SAME clock the escalator uses when a
+  // test needs its posted comments' `created` to track real elapsed time,
+  // so the recency filter this fixture's rows now feed (Consequence 1's fix)
+  // never disagrees with the clock the test itself believes it's running on.
+  function makeOps(overrides: Partial<AtlassianOps> = {}, now: () => number = () => 0): { ops: AtlassianOps; jiraComments: Array<{ key: string; text: string }>; pageComments: Array<{ id: string; body: string; created: string }> } {
     const jiraComments: Array<{ key: string; text: string }> = [];
-    const pageComments: Array<{ id: string; body: string }> = [];
+    const pageComments: Array<{ id: string; body: string; created: string }> = [];
     const ops: AtlassianOps = {
       getIssue: async () => ({}),
       search: async () => ({}),
@@ -1590,7 +1596,7 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
       deleteIssue: async () => ({ ok: true }),
       commentOnPage: async (_pageId: string, body: string) => {
         const id = String(1000 + pageComments.length);
-        pageComments.push({ id, body });
+        pageComments.push({ id, body, created: new Date(now()).toISOString() });
         return { ok: true, id };
       },
       // BUTCHR-171 correction: this reversal is fixture convenience ONLY
@@ -1835,6 +1841,47 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
       // because `Date.parse("")` is `NaN` and `NaN < x` is always `false`,
       // so the recency filter never skips the row. Reported on BUTCHR-171
       // with the exact revert diff and the failing assertion.
+    });
+
+    // BUTCHR-171 review, Finding 1: `created: r.created ?? ""` alone does
+    // NOT close Consequence 1 for a row whose underlying read genuinely
+    // carried no timestamp — `Date.parse("")` is `NaN`, and an unguarded
+    // `NaN < x` is always `false`, so such a row was previously treated as
+    // indistinguishable from "definitely current". escalation-loop.ts's
+    // recency filter now checks `Number.isNaN(...)` explicitly and skips
+    // it. This row shape is injected directly (not via commentOnPage,
+    // which always stamps a real clock-derived `created`) because it
+    // models a read that genuinely returned no `version`/`createdAt` at
+    // all — the same shape `atlassian-real.test.ts`'s "a row with no
+    // version... maps `created` to undefined" test proves is reachable.
+    test("Finding 1 fix: a directive row with NO retrievable created (recency unknown) is treated as suspect and skipped, never delivered", async () => {
+      const clock = { now: BASE };
+      const { ops, rows } = makeTimedProjectOps(clock);
+      const ownChannelComments = createOwnChannelComments(ops, async () => { throw new Error("must not be called for a project key"); });
+      const addComment = async (issue: string, text: string) => { await speakOnOwnChannel(ops, issue, text); };
+      const prompt = parsePrompt(REAL)!;
+      const fp = fingerprint(prompt);
+
+      const sent: Array<{ pane: string; text: string }> = [];
+      const escalator = createEscalator({
+        read: async () => REAL, send: async (pane, text) => { sent.push({ pane, text }); }, addComment,
+        ownChannelComments, unresponsiveMinutes: 5, now: () => clock.now, log: () => {},
+      });
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 1); // debounce
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 2); // escalates
+
+      // A matching ANSWER whose row carries no retrievable `created` at
+      // all — recency-UNKNOWN, not recency-zero.
+      rows.push({ id: String(rows.length + 1), body: `<p>ANSWER 2 ${fp}</p>`, created: "" });
+
+      await escalator.onBlocked("p1", "BUTCHR", prompt, 3);
+      expect(sent).toEqual([]); // unverifiable recency is treated as suspect, never as current
+
+      // MUTATION-TESTED (manually, not committed as a step here): with the
+      // `Number.isNaN(createdMs) ||` guard removed from escalation-loop.ts's
+      // recency filter, this assertion fails — `sent` contains the
+      // delivery instead, reproducing exactly what the review's own probe
+      // (`PROBE_VERDICT=DELIVERED`) found on the pre-fix code.
     });
 
     test("BUTCHR-127's shape, FIXED: restarts 30 minutes apart (> the 15-minute follow-up window) now yield escalations=1 followups=1, not followups=2", async () => {

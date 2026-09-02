@@ -626,7 +626,26 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     let directive: Directive | null = null;
     let directiveCommentId: string | null = null;
     for (const r of rows) {
-      if (Date.parse(r.created) < escalatedAtMs - CLOCK_SKEW_GRACE_MS) continue;
+      // BUTCHR-171 review fix (Finding 1): `Date.parse(r.created)` on an
+      // empty/unparseable `created` is `NaN`, and `NaN < x` is ALWAYS
+      // `false` — an unguarded comparison here treats "recency unknown"
+      // identically to "definitely current", reopening this ticket's own
+      // replay hazard for exactly the row shape (no retrievable timestamp)
+      // it exists to close. Explicit and deliberate, matching this file's
+      // own EscalatorDeps doc comment on `ownChannelComments` ("MUST FAIL
+      // BY REJECTING... never resolve to empty to represent 'could not
+      // check'"): a row whose recency cannot be verified is treated as
+      // suspect and skipped, the same conservative default this file
+      // already applies when the whole channel read fails, not treated as
+      // safe-by-default. The tradeoff this accepts is the opposite
+      // direction: a genuine ANSWER on a row with NO retrievable timestamp
+      // (measured live as essentially unreachable — `version.createdAt` is
+      // populated on the default response, see AtlassianOps.getPageComments)
+      // would never be found. Given the choice, replaying a stale decision
+      // into a live pane is the worse failure of the two — an action taken
+      // on unverifiable grounds, not merely a missed reminder.
+      const createdMs = Date.parse(r.created);
+      if (Number.isNaN(createdMs) || createdMs < escalatedAtMs - CLOCK_SKEW_GRACE_MS) continue;
       if (consumed.has(r.id)) continue; // an answer is consumed exactly once, across fingerprint resets
       const d = parseDirective(r.body);
       if (d) { directive = d; directiveCommentId = r.id; break; } // newest-first comments(); first match wins
