@@ -87,8 +87,19 @@ function hashText(s: string): string {
 /** Global cap on escalation capture files kept at once — same discipline as session-limit-watch's CAPTURE_MAX_FILES, kept separate because it recognizes a different filename shape and must never evict a session-limit capture (or vice versa). */
 const ESCALATION_CAPTURE_MAX_FILES = 50;
 
-/** `<ISSUE>-escalation-<compact-UTC-timestamp>.txt` — recognizes exactly the filenames this module writes, so eviction (and a shared BUTCHR_CAPTURE_DIR holding other files) never touches anything else's captures. */
-const ESCALATION_CAPTURE_NAME = /^[A-Z][A-Z0-9]*-\d+-escalation-(\d{8}T\d{6}Z)\.txt$/;
+/**
+ * `<ISSUE>-escalation-<compact-UTC-timestamp>.txt` OR (BUTCHR-96)
+ * `<PROJECT>-escalation-<compact-UTC-timestamp>.txt` — recognizes exactly the
+ * filenames this module writes, for BOTH an issue caller's id (`BUTCHR-68`,
+ * `-\d+` suffix) and a project caller's bare key (`BUTCHR`, no suffix — see
+ * `src/resources/id.ts`), so eviction (and a shared BUTCHR_CAPTURE_DIR
+ * holding other files) never touches anything else's captures. The disjoint
+ * half of that guarantee comes from the literal `-escalation-` segment, not
+ * from the optional `-\d+`: session-limit-watch's own capture names use
+ * `-unrecognised-` / `-no-reset-time-` in that position instead, so the two
+ * shapes stay mutually exclusive regardless of the issue-vs-project prefix.
+ */
+const ESCALATION_CAPTURE_NAME = /^[A-Z][A-Z0-9]*(?:-\d+)?-escalation-(\d{8}T\d{6}Z)\.txt$/;
 
 function compactUtc(ms: number): string {
   return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d\d\dZ$/, "Z");

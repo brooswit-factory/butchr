@@ -318,6 +318,32 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     expect([...files.keys()].some((n) => n.startsWith("KAN-1-unrecognised-"))).toBe(true);
   });
 
+  // BUTCHR-96's disjointness control, from this side: a check that FAILS if
+  // this module's own CAPTURE_NAME ever starts matching an escalation-loop.ts
+  // capture name (`<ISSUE-or-PROJECT>-escalation-<ts>.txt`). Without this,
+  // "the two shapes never cross-evict" is only a claim in a comment.
+  test("(f2) never treats an escalation-loop capture name as its own — foreign shapes are never evicted or counted toward the cap", async () => {
+    const foreignIssue = "KAN-1-escalation-20260101T000000Z.txt";
+    const foreignProject = "BUTCHR-escalation-20260101T000000Z.txt"; // bare project key, no issue number
+    const ours = Array.from({ length: 50 }, (_, i) => `KAN-1-unrecognised-20260201T${String(i).padStart(2, "0")}0000Z.txt`);
+    const { sink, files } = fakeSink([foreignIssue, foreignProject, ...ours]);
+    expect(files.size).toBe(52);
+    const stop = watchSessionLimits({
+      list: async () => [row("KAN-1", "idle")],
+      read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
+      close: async () => {},
+      now: () => Date.now(),
+      log: () => {},
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    // The foreign, escalation-shaped files must survive untouched — never
+    // recognised as ours, never evicted, never counted toward the cap.
+    expect(files.has(foreignIssue)).toBe(true);
+    expect(files.has(foreignProject)).toBe(true);
+  });
+
   test("(g) no captures dep supplied => today's behaviour exactly (no throw, no capture-shaped log)", async () => {
     const logs: string[] = [];
     const stop = watchSessionLimits({
