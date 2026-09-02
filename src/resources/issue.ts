@@ -68,9 +68,18 @@ export const issueIdOf = (issue: JiraIssue): string => issue.key;
 /**
  * ACTIVATION: delegates to the SHARED `isActive` (src/reconcile/plan.ts) —
  * see this module's top comment for why that predicate is not forked here.
+ *
+ * BUTCHR-66/83: issues do not sleep — this is acceptance criterion 3
+ * expressed as the RANGE of this function rather than a flag anybody could
+ * flip by accident. `isActive(issue.status)` is a boolean; mapping `true` to
+ * `"active"` and `false` to `"inactive"` means `"asleep"` is not merely
+ * unused here, it is UNREACHABLE — nothing this function can be handed ever
+ * produces it. See test/unit/sleep.test.ts for the structural proof (every
+ * `ACTIVE_STATUSES` member and a representative sample of non-active
+ * statuses, asserting the literal return value is never `"asleep"`).
  */
 export const ISSUE_ACTIVATION: Activation<JiraIssue> = {
-  isActive: (issue) => isActive(issue.status),
+  verdictFor: (issue) => (isActive(issue.status) ? "active" : "inactive"),
 };
 
 /** SPAWN CONFIG: the SpawnSpec fields the existing shared spawn machinery reads — see this module's top comment. */
