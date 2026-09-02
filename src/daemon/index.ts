@@ -5,8 +5,8 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
-import { startLoop, type RelatedIssue } from "./loop.js";
-import { watchedKeys } from "../jira-watch/routes.js";
+import { runResourceLoop } from "./loop.js";
+import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -25,6 +25,7 @@ import { createStalledCheck } from "../agents/stalled.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
+import { prReviewStateNudge } from "../agents/pr-nudge.js";
 
 let config;
 try {
@@ -192,55 +193,28 @@ void sweepStaleAgentLabels({
   log: (line) => console.error(`  ${line}`),
 }).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
-const JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
-const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
-
-// Related work for the active set: the Implements chain (a boss watches what
-// implements it — a story hears its tasks, an epic hears its stories).
-// Watched regardless of assignee — the assigned-issues query above is
-// per-credential, but a boss must hear about its implementer's progress even
-// when another account (another machine's daemon) staffs it. A thin I/O
-// adapter over routes.ts: this function fetches links and hydrates issues;
-// routes.ts decides which links are routed.
-const related = async (active: readonly string[]): Promise<RelatedIssue[]> => {
-  const keys = active.filter((k) => KEY_RE.test(k));
-  if (!keys.length) return [];
-  const out = new Map<string, { issue: import("../atlassian/types.js").JiraIssue; watchers: Set<string> }>();
-  const add = (issue: import("../atlassian/types.js").JiraIssue, watcher: string) => {
-    const e = out.get(issue.key) ?? { issue, watchers: new Set<string>() };
-    e.issue = issue;
-    e.watchers.add(watcher);
-    out.set(issue.key, e);
-  };
-  const linkWatchers = new Map<string, Set<string>>();
-  for (const k of keys)
-    for (const other of watchedKeys(await atlassian.links(k))) {
-      // Active ends are NOT skipped: a boss and its implementer can both be
-      // staffed by this same daemon (same assignee credential), and the boss
-      // must still hear its implementer's changes through this link. The
-      // loop's `sent` dedupe (`${issue}|${about}`) already prevents the
-      // implementer's own agent being notified twice about itself.
-      if (!KEY_RE.test(other)) continue;
-      (linkWatchers.get(other) ?? linkWatchers.set(other, new Set()).get(other)!).add(k);
-    }
-  const linked = [...linkWatchers.keys()];
-  if (linked.length)
-    for (const i of await atlassian.search(`key IN (${linked.join(",")})`))
-      for (const w of linkWatchers.get(i.key) ?? []) add(i, w);
-  return [...out.values()].map((e) => ({ issue: e.issue, watchers: [...e.watchers] }));
-};
-
-startLoop({
-  search: async () => {
-    const issues = await atlassian.search(JQL);
+// The issue tier expressed as ONE instance of ResourceType<JiraIssue>
+// (BUTCHR-64/BUTCHR-69) — discovery (the JQL + the Implements-chain
+// `related` walk), activation, event rules (the suppression stack) and
+// spawn config all live in src/resources/issue.ts now; this daemon is just
+// the wiring of that instance's I/O (the live Jira client + the own-write
+// ledger) to the generic loop below.
+const issueResourceType = createIssueResourceType({
+  search: async (jql) => {
+    const issues = await atlassian.search(jql);
     for (const i of issues) summaries.set(i.key, i.summary);
     return issues;
   },
-  related,
+  links: (key) => atlassian.links(key),
+  suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
+  comments: (key) => atlassian.comments(key),
+});
+
+runResourceLoop(issueResourceType, {
   herd,
   notify: async (issue, about, reason) => {
     const msg = reason?.pr
-      ? `[butchr] ${issue}: your PR's review state changed pr:${reason.pr.from ?? "none"} → pr:${reason.pr.to}. Verify with gh pr view <n> --json reviewDecision,headRefOid and act: approved → merge your own PR; changes-requested → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.`
+      ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
       : about === issue
         ? `[butchr] Ticket ${issue} was updated — re-read it.`
         : `[butchr] ${about} (related to your ${issue}) was updated — re-read it, then act on what changed.`;
@@ -266,8 +240,6 @@ startLoop({
   },
   syncLabels,
   checkParked: parkedDetector.check,
-  suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
-  comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -381,6 +353,6 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
-atlassian.search(JQL)
+atlassian.search(ISSUE_JQL)
   .then((issues) => console.error(`  ${issues.length} active issue(s) assigned to this credential`))
   .catch((e) => console.error(`  WARNING: Atlassian credential check failed: ${e.message}`));
