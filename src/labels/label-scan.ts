@@ -14,12 +14,19 @@ import * as ts from "typescript";
  * not a substring of a longer string — matches `agent:`, `pr:`, or `butchr:`
  * followed by one or more lowercase alphanumerics/hyphens. It uses the real
  * TypeScript parser (`ts.createSourceFile`), not a text regex, specifically
- * so a label-shaped substring embedded INSIDE a longer string — e.g.
- * SWEEP_JQL in ./sweep.ts, whose JQL text contains `"agent:working"` as
- * literal characters inside a larger single-quoted string — is correctly
- * read as part of that one bigger string, never as a standalone literal. A
+ * so a label-shaped substring embedded INSIDE a longer string is correctly
+ * read as part of that one bigger string, never as a standalone literal — a
  * naive text regex over raw source cannot make that distinction reliably;
- * asking the real parser for strings' already-unescaped `.text` can.
+ * asking the real parser for strings' already-unescaped `.text` can. Before
+ * BUTCHR-155, `SWEEP_JQL` in `./sweep.ts` was exactly this case: a hand-written
+ * JQL string whose text contained `"agent:working"` etc. as literal characters
+ * inside a larger single-quoted string, which this scanner correctly read as
+ * part of that one bigger string rather than as four standalone literals.
+ * BUTCHR-155 replaced that hand-written string with one built from
+ * `./plan.ts`'s `ALL_AGENT_LABEL_KEYS`, so those literal characters no longer
+ * exist in `./sweep.ts` at all — the example is gone, not the rationale for
+ * using a real parser instead of a regex, which still holds for any future
+ * JQL (or other) string that embeds a label-shaped substring.
  *
  * WHAT THIS CANNOT SEE (write this down; a scanner with a silent bypass is
  * the exact failure this whole rule exists to catch):
