@@ -413,8 +413,7 @@ case is that this merge commit's tree is **not** what auto-merging its
 two parents alone would produce — it carries the hand-added line on top.
 
 **Combined working rule that fits every case measured in this
-document (6 data points: 3 clean-merge MOVED cases at 5 total merge
-events, 1 chain-broken evil merge, 1 chain-intact evil merge):** the
+document** (enumerated immediately above and below): the
 recorded commit advances onto a new merge commit only when **both** (a)
 the currently-recorded commit is parent[0] of that merge, **and** (b)
 the merge's tree is a clean auto-merge of its two parents — no content
