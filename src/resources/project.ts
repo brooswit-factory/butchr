@@ -353,15 +353,25 @@ export async function advanceProjectWatermark(
   projectKey: string,
   patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>> },
 ): Promise<void> {
-  // Fail open on an unreadable property (e.g. genuinely absent — 404) rather
-  // than throwing: this write path is reachable from speakOnOwnChannel only
-  // AFTER projectRootDoc has already succeeded for the same project this
-  // same call (so the property exists in practice), but a helper this
-  // general should not assume its own callers rather than defend against
-  // the case, and starting from an empty base can only ever produce a
-  // `wake`-only property (never one missing `rootDoc`), which discovery's
-  // own eligibility check already treats as ineligible.
-  const current = await ops.getProjectProperty(projectKey, PROPERTY_KEY).catch(() => undefined) as Record<string, unknown> | undefined ?? {};
+  // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
+  // `getProjectProperty().catch(() => undefined)` this used to call. That
+  // former version could not tell "genuinely absent (404)" apart from "the
+  // read failed for some other reason (rate limit / timeout / permission
+  // change)" — both collapsed to an empty base, and `setProjectProperty` is
+  // a FULL-VALUE REPLACE (no partial-update variant), so a transient read
+  // failure with a successful write would silently destroy the rest of the
+  // property (`rootDoc`, `space`, `repos`, `archiveProject`, `scaffolded`) —
+  // and `rootDoc` is not reconstructible from anything else in the system.
+  // `getProjectPropertyOrNull` draws exactly the needed distinction (see its
+  // own doc comment on `AtlassianOps`): a genuine 404 resolves `null`, which
+  // is a real empty base and safe to build on; any OTHER rejection still
+  // rejects, and this function does NOT catch it — the write below is never
+  // reached, so an unreadable-for-unknown-reasons property can never become
+  // the base of a replace. Fail-open is right for a read used to DECIDE
+  // (e.g. discovery's eligibility check); this read is the BASE OF A
+  // REPLACE, where the same fail-open shape means "assume the record was
+  // empty" and silently deletes whatever was actually there.
+  const current = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as Record<string, unknown> | null ?? {};
   const wake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
   // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
   // merge. This is the actual fix for rule 3's re-entry defect (see
