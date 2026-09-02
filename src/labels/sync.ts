@@ -135,7 +135,18 @@ export function createLabelSync(deps: SyncDeps) {
         // Always observed (even when not idle), so the tracker's "since
         // spawn, continuously idle" streak sees every poll, not just the
         // ones where the result might matter.
-        const stalledNow = deps.stalled ? await deps.stalled.check(issue.key, observed) : false;
+        const stalledResult = deps.stalled ? await deps.stalled.check(issue.key, observed) : false;
+        // `null` means the comments fetch failed — "could not verify", a
+        // THIRD outcome that must never be treated as "confirmed stalled"
+        // (the defect this ticket removes) NOR as "confirmed not stalled"
+        // (that would silently clear a real streak's candidacy). Skip
+        // writing `agent:stalled` THIS poll and say so distinctly; the
+        // streak itself isn't lost — `StalledTracker.observe` already ran
+        // inside `deps.stalled.check` before the fetch was attempted, so
+        // `firstObservedAt`/`streakBroken` are untouched and the next poll
+        // re-examines the ticket. This only delays the label, never loses it.
+        if (stalledResult === null) deps.log?.(`WARNING: [labels] ${issue.key} stalled check could not verify (comments fetch failed) — not writing agent:stalled this poll`);
+        const stalledNow = stalledResult === true;
         // Logged unconditionally, every poll it holds — unlike the LABEL
         // below, which is deliberately delayed by the stabilizer so a single
         // flickering poll never writes Jira. An operator watching the log

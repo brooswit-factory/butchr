@@ -332,6 +332,22 @@ describe("createLabelSync", () => {
     expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled"))).toBe(true);
   });
 
+  test("a stalled check that could not verify (null) never writes agent:stalled, even across two consecutive polls (the stabilizer can't confirm what was never a candidate)", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => null, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+    await sync([issue]);
+    await sync([issue]); // two consecutive polls — would be enough to confirm a real candidate
+    expect(jira.calls).toEqual([]); // never wrote agent:stalled
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("could not verify"))).toBe(true);
+  });
+
   test("leaving the active set forgets the stalled tracker's state for that ticket", async () => {
     const jira = fakeJira();
     const forgotten: string[] = [];
