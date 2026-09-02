@@ -668,10 +668,14 @@ window, 7.5%), not hypothetical.
 admin (§1C — one measured directly, one CITED first-hand from
 `BUTCHR-134`). **Proposal 1 would be enforced against both identities that
 actually author and merge PRs in this repo, not advisory against either.**
-An admin identity (if any exists on this repo at all — unconfirmed, §6)
-would still need an explicit "include administrators" setting to bind, but
-that no longer matters for either of the two accounts actually doing the
-work.
+An admin identity **does** exist on this repository — `brooswit` (§1C,
+MEASURED), which is not one of the two accounts doing the fleet's ordinary
+work — and a rule intended to bind *it* would additionally need an explicit
+"include administrators" setting. Whether `enforce_admins` is already set
+cannot be read from a non-admin vantage, and that unknown is recorded in §6.
+Neither point weakens the sentence above: Proposal 1 binds both accounts
+that actually author and merge PRs here regardless of how the admin account
+is treated.
 
 ### Proposal 2 — stale-review dismissal
 
