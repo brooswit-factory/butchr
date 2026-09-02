@@ -25,16 +25,37 @@
  *      already fixture-tested — turns each confirmed daemon's cgroup path
  *      into a systemd unit + the journalctl invocation for it. Reused
  *      as-is, per the ticket's own instruction not to write a second parser.
- *   3. For each identity, runs the journal read this file computes as
- *      appropriate for it (see `journalInvocationFor` below), captures the
- *      raw result (exit status + stdout + stderr), and hands that RESULT —
- *      never a live re-run — to the pure `decideReadability`.
+ *   3. For each identity, first decides the TIME WINDOW in force for it
+ *      (`decideJournalWindow`) from the CLI's `--since-start` flag plus that
+ *      identity's own `/health`-derived `build.startedAt` (see BUTCHR-54's
+ *      `decideBuildIdentity` below) — never a second, divergent probe — then
+ *      runs the journal read this file computes as appropriate for it (see
+ *      `journalInvocationFor`), captures the raw result (exit status +
+ *      stdout + stderr), and hands that RESULT — never a live re-run — to
+ *      the pure `decideReadability`. The window in force is carried on every
+ *      `IdentityReport` and printed for every identity, every run — see
+ *      `WindowDecision` below.
  *   4. Scans a readable identity's captured lines with
  *      `src/tools/alias-audit.ts`'s `parseAliasAuditLine`, tallying
  *      drift / sanctioned / ambiguous / unknown(old-format) per identity.
  *   5. `computeVerdict` folds every identity into ONE overall verdict that
  *      cannot report the removal condition met while any identity was
  *      unreadable — see its own doc comment.
+ *
+ * CLI FLAGS:
+ *   --since-start   Scope each identity's journal read to "since that
+ *                    identity's own currently-running process started"
+ *                    (its `/health`'s `build.startedAt`, frozen at process
+ *                    start — BUTCHR-54). Default (flag absent): no window,
+ *                    the whole journal — unchanged from before this flag
+ *                    existed, so existing scripted callers are not silently
+ *                    re-scoped. An identity whose build identity is unknown
+ *                    (still the common case today — deploy-on-merge means
+ *                    most daemons on this fleet predate the `build` field
+ *                    entirely) cannot be scoped to its process start under
+ *                    `--since-start`; see `decideJournalWindow`'s doc
+ *                    comment for what happens to it instead (widened, never
+ *                    silently).
  *
  * Exit code carries the verdict for anything that scripts this later:
  *   0 = CONDITION_MET (every identity read, zero drift, zero unknown)
@@ -99,6 +120,38 @@ export interface JournalInvocation {
 }
 
 /**
+ * The time window a journal read is actually scoped to, ALREADY RESOLVED —
+ * never a raw operator string. `{ kind: "none" }` is the whole journal (the
+ * default, and also what a `--since-start` request degrades to for an
+ * identity `decideJournalWindow` could not scope — see its doc comment).
+ * `{ kind: "since", ... }` carries a validated Unix-epoch-seconds integer,
+ * never a string, so `appendSinceWindow` never has to quote anything: DoD 6
+ * (shell-quoting) is satisfied by never putting an arbitrary string in the
+ * command at all, not by escaping one.
+ */
+export type JournalWindow = { kind: "none" } | { kind: "since"; sinceEpochSeconds: number; sinceIso: string };
+
+/**
+ * Append a `--since @<epoch>` clause to a journalctl command string, or
+ * return it unchanged for `{ kind: "none" }`. `runJournalctl` below runs its
+ * whole command string through a shell (`spawnSync(..., { shell: true })`),
+ * so anything appended here is shell-parsed — journalctl's `@<seconds>`
+ * epoch form is pure digits (after this function's own integer check), so
+ * there is no space, quote, or shell metacharacter for a malformed
+ * `startedAt` to smuggle in. This is why `JournalWindow.sinceEpochSeconds`
+ * is a `number`, not the raw ISO string `/health` reported: the conversion
+ * to a validated integer is what makes quoting unnecessary, not a quoting
+ * scheme layered on top of a string.
+ */
+export function appendSinceWindow(command: string, window: JournalWindow): string {
+  if (window.kind === "none") return command;
+  if (!Number.isInteger(window.sinceEpochSeconds)) {
+    throw new Error(`invalid journal window: sinceEpochSeconds must be an integer, got ${JSON.stringify(window.sinceEpochSeconds)}`);
+  }
+  return `${command} --since @${window.sinceEpochSeconds}`;
+}
+
+/**
  * `parseCgroup`'s own `journalctl` field is only correct for READING YOUR
  * OWN unit: `journalctl --user -u <unit>` targets the CALLING user's own
  * user-manager session — it does not take a uid, and cannot be pointed at
@@ -122,15 +175,27 @@ export interface JournalInvocation {
  * always added (so multiple uids running a same-named unit don't conflate)
  * — the one vantage that could ever see a foreign user's persisted
  * journal, and the one that needs `adm`/`systemd-journal` to actually do so.
+ *
+ * `window` (BUTCHR-86) defaults to `{ kind: "none" }` — the whole journal,
+ * unchanged from every call site written before this parameter existed —
+ * and is applied via `appendSinceWindow` to whichever base command this
+ * function already decided on, own-identity or foreign. Which window a
+ * given identity actually gets is `decideJournalWindow`'s decision, made
+ * once per identity before this function is called — never this function's.
  */
-export function journalInvocationFor(systemd: SystemdInfo, targetUid: number, readerUid: number): JournalInvocation {
+export function journalInvocationFor(
+  systemd: SystemdInfo,
+  targetUid: number,
+  readerUid: number,
+  window: JournalWindow = { kind: "none" },
+): JournalInvocation {
   if (systemd.kind === "none") return { command: "", note: "not running under a systemd unit — no journal to read" };
   if (targetUid === readerUid) {
-    return { command: systemd.journalctl, note: "own identity — using this unit's own recommended invocation" };
+    return { command: appendSinceWindow(systemd.journalctl, window), note: "own identity — using this unit's own recommended invocation" };
   }
   const unitMatch = systemd.kind === "user" ? `_SYSTEMD_USER_UNIT=${systemd.unit}` : `-u ${systemd.unit}`;
   return {
-    command: `journalctl ${unitMatch} _UID=${targetUid}`,
+    command: appendSinceWindow(`journalctl ${unitMatch} _UID=${targetUid}`, window),
     note:
       systemd.kind === "user"
         ? "foreign identity, user unit — `--user`/`-u` cannot cross users or match a user unit's own field, so this matches `_SYSTEMD_USER_UNIT` at the system level (needs adm/systemd-journal to see anything for a uid that isn't ours)"
@@ -156,13 +221,34 @@ export type ReadOutcome = { readable: true; totalLines: number; lines: string[] 
  * identity's journal at all" must produce DIFFERENT, VISIBLE output, never
  * a shared zero. This never looks at alias-call content to decide — only
  * at whether the read itself produced ANY line of output at all, combined
- * with identity facts (self vs. foreign, confirmed live via `/health`).
+ * with identity facts (self vs. foreign, confirmed live via `/health`, and
+ * — BUTCHR-86 — whether the read was scoped to a window at all).
  *
  * Before writing this, the failing case it must catch: a foreign, non-self
  * identity whose journal returns zero lines (because we structurally
  * cannot read it) must come back `readable: false` — never
  * `{ readable: true, totalLines: 0 }`, which would be indistinguishable
  * from "we read it and it was quiet."
+ *
+ * BUTCHR-86's `windowed` deliberately does NOT touch that foreign-identity
+ * branch, or the "liveness not independently confirmed" branch below it: a
+ * cross-user empty read is exactly as ambiguous under a window as over the
+ * whole journal (permission-gated vs. quiet still can't be told apart), and
+ * an unconfirmed-live self read has no independent evidence to begin with,
+ * windowed or not. It touches exactly ONE branch: our OWN identity, zero
+ * lines, `/health` confirms it's live right now. Over the WHOLE journal
+ * that combination is proof the read failed (a live daemon that logged
+ * nothing at all, ever, is not credible). Under a WINDOW it is not proof of
+ * anything — a daemon can legitimately be quiet for the short span since it
+ * started. So: windowed + self + live + zero lines is `readable: true` with
+ * `totalLines: 0`, never `readable: false`. This is the interaction DoD 4
+ * names as the sharpest hazard in this ticket, decided deliberately rather
+ * than discovered by accident; see the PR description for the argument.
+ * (In practice `windowed: true` can only happen when `confirmedLiveViaHealth`
+ * is also true — a window is only ever built from THIS round's own `/health`
+ * response, per `decideJournalWindow` — but the nesting below is written to
+ * make that dependency explicit rather than relying on a caller to uphold
+ * an invariant this function can't see.)
  */
 export function decideReadability(opts: {
   probe: JournalProbeResult;
@@ -170,8 +256,10 @@ export function decideReadability(opts: {
   readerUid: number;
   /** From an independent `/health` probe — a live daemon is a logging daemon. */
   confirmedLiveViaHealth: boolean;
+  /** Was this read scoped by `--since-start` (i.e. `JournalWindow.kind !== "none"`)? See this function's doc comment. */
+  windowed: boolean;
 }): ReadOutcome {
-  const { probe, targetUid, readerUid, confirmedLiveViaHealth } = opts;
+  const { probe, targetUid, readerUid, confirmedLiveViaHealth, windowed } = opts;
   const isSelf = targetUid === readerUid;
 
   if (probe.exitCode !== 0) {
@@ -189,6 +277,9 @@ export function decideReadability(opts: {
       };
     }
     if (confirmedLiveViaHealth) {
+      if (windowed) {
+        return { readable: true, totalLines: 0, lines: [] };
+      }
       return {
         readable: false,
         reason: "zero lines from our own unit, but /health confirms it is live right now — a live daemon that logged nothing is proof this read is UNREADABLE, not proof it is quiet",
@@ -290,6 +381,93 @@ export function formatBuildLine(outcome: BuildOutcome, nowMs: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// PURE: BUTCHR-86 — deciding, per identity, the time window a journal read
+// is actually scoped to, and stating that decision in words a human can
+// read. A completely separate concern from `journalInvocationFor`: this
+// decides WHAT window to use (from the CLI's `--since-start` flag plus that
+// identity's own `BuildOutcome`); `journalInvocationFor` only turns an
+// already-decided `JournalWindow` into a command string.
+// ---------------------------------------------------------------------------
+
+export interface WindowDecision {
+  window: JournalWindow;
+  /** Human-readable, always non-empty, always printed for this identity — see DoD 2: "stated in the output for every identity, every single time." */
+  note: string;
+}
+
+const NO_WINDOW_NOTE = "whole journal (no --since-start requested; default — existing scripted callers are not silently re-scoped)";
+
+/**
+ * DoD 1 + DoD 2 + DoD 3, all in one place. Two inputs: did the operator ASK
+ * for a since-start window at all, and does THIS identity's own build
+ * identity (BUTCHR-54, via `decideBuildIdentity`) actually carry a
+ * `startedAt` it can be scoped to.
+ *
+ * `sinceStartRequested: false` — the default — always returns `{ kind:
+ * "none" }`, and the note says so explicitly even though nothing narrowed:
+ * DoD 2 is explicit that the default whole-journal case must still state
+ * its window, never leave it implicit because "there's nothing to say."
+ *
+ * `sinceStartRequested: true` with a build identity that DOES carry a valid
+ * `startedAt`: scoped, and the note names the exact timestamp it's scoped
+ * to and where that timestamp came from.
+ *
+ * `sinceStartRequested: true` with a build identity that does NOT carry one
+ * — `known: false` (the ticket that requested this feature said this was
+ * the ONLY path exercisable end-to-end against this fleet at ticket-write
+ * time, since deploy-on-merge was off and every daemon then visible
+ * predated the `build` field; verify this against your OWN environment's
+ * `/health` rather than trusting that as still true — a daemon on THIS
+ * fleet already reports one live while this file was being written, so the
+ * degraded path may or may not still be the only one you can exercise), or
+ * `known: true` with a null/unparseable `startedAt` — is DoD 3's degraded
+ * case. This function's answer: WIDEN, never refuse the identity outright.
+ * Refusing would mark the identity `readable: false` and drag the whole run
+ * to INCONCLUSIVE for every identity on a fleet with no build-identity
+ * daemons yet, which is strictly less useful than reading it — and DoD 3
+ * only requires the degraded case be VISIBLE, not that it be excluded. So: this identity's
+ * read stays a whole-journal read, `window.kind` stays `"none"`, and the
+ * note says so LOUDLY — naming that `--since-start` was requested, that
+ * this identity could not honor it, and why — so a human comparing two
+ * identities' counts side by side sees immediately that they are not
+ * scoped the same way, per DoD 3's "incomparable without saying so."
+ */
+export function decideJournalWindow(sinceStartRequested: boolean, build: BuildOutcome): WindowDecision {
+  if (!sinceStartRequested) return { window: { kind: "none" }, note: NO_WINDOW_NOTE };
+
+  if (!build.known) {
+    return {
+      window: { kind: "none" },
+      note: `whole journal — --since-start was requested but this identity's build identity is unknown (${build.reason}); WIDENED to the whole journal rather than silently narrowed, so this identity is still read, but its counts are NOT scoped like an identity that DID resolve a window — compare with care`,
+    };
+  }
+  const startedAt = build.info.startedAt;
+  if (!startedAt) {
+    return {
+      window: { kind: "none" },
+      note: "whole journal — --since-start was requested but this identity's build identity carries no startedAt; WIDENED to the whole journal rather than silently narrowed — compare with care",
+    };
+  }
+  const startMs = Date.parse(startedAt);
+  if (Number.isNaN(startMs)) {
+    return {
+      window: { kind: "none" },
+      note: `whole journal — --since-start was requested but this identity's build.startedAt ("${startedAt}") is not a parseable timestamp; WIDENED to the whole journal rather than silently narrowed — compare with care`,
+    };
+  }
+  const sinceEpochSeconds = Math.floor(startMs / 1000);
+  return {
+    window: { kind: "since", sinceEpochSeconds, sinceIso: startedAt },
+    note: `since this identity's process started at ${startedAt} (its own /health build.startedAt, per --since-start)`,
+  };
+}
+
+/** `window: <note>` — trivial, but a dedicated exported formatter so DoD 2 ("stated ... every single time") is one grep-able, directly-tested line rather than an inline template repeated at every `formatReport` call site. */
+export function formatWindowLine(decision: WindowDecision): string {
+  return `window: ${decision.note}`;
+}
+
+// ---------------------------------------------------------------------------
 // PURE: per-identity classification tally, and the one overall verdict.
 // ---------------------------------------------------------------------------
 
@@ -310,10 +488,12 @@ export interface IdentityReport {
    * it's absent, never a blank line.
    */
   build?: BuildOutcome;
+  /** BUTCHR-86. Required, unlike `build` above: every `IdentityReport` from this point forward is built through `buildIdentityReport`, which always takes one — there is no pre-BUTCHR-86 literal anywhere to keep compiling, so there is no need for an optional-plus-sentinel fallback here the way `build` has one. */
+  window: WindowDecision;
 }
 
-/** Fold a readable identity's raw lines into per-classification counts; an unreadable identity carries all-zero counts (its `outcome` is what actually matters). `build` is a second, independent axis (see `BuildOutcome`'s doc comment) — passed through untouched, never derived from `outcome`. */
-export function buildIdentityReport(opts: { uid: number; unit: string; journalNote: string; outcome: ReadOutcome; build?: BuildOutcome }): IdentityReport {
+/** Fold a readable identity's raw lines into per-classification counts; an unreadable identity carries all-zero counts (its `outcome` is what actually matters). `build` is a second, independent axis (see `BuildOutcome`'s doc comment) — passed through untouched, never derived from `outcome`. `window` (BUTCHR-86) is a THIRD, independent axis — see `WindowDecision`'s doc comment — likewise passed through untouched. */
+export function buildIdentityReport(opts: { uid: number; unit: string; journalNote: string; outcome: ReadOutcome; build?: BuildOutcome; window: WindowDecision }): IdentityReport {
   const counts: Record<AliasClass | "unknown", number> = { drift: 0, sanctioned: 0, ambiguous: 0, unknown: 0 };
   if (opts.outcome.readable) {
     for (const line of opts.outcome.lines) {
@@ -321,7 +501,7 @@ export function buildIdentityReport(opts: { uid: number; unit: string; journalNo
       if (parsed) counts[parsed.classification]++;
     }
   }
-  return { uid: opts.uid, unit: opts.unit, journalNote: opts.journalNote, outcome: opts.outcome, ...counts, ...(opts.build ? { build: opts.build } : {}) };
+  return { uid: opts.uid, unit: opts.unit, journalNote: opts.journalNote, outcome: opts.outcome, window: opts.window, ...counts, ...(opts.build ? { build: opts.build } : {}) };
 }
 
 export type Verdict = "CONDITION_MET" | "CONDITION_NOT_MET" | "INCONCLUSIVE";
@@ -365,7 +545,11 @@ const BUILD_NOT_PROBED: BuildOutcome = { known: false, reason: "build identity w
  * value — uptime — this renders), prints nothing itself. Build identity
  * (BUTCHR-54) is printed for EVERY identity regardless of journal
  * readability, and vice versa — the two axes never mask each other (see
- * `BuildOutcome`'s doc comment).
+ * `BuildOutcome`'s doc comment). The window in force (BUTCHR-86) is a THIRD
+ * independent axis, printed for EVERY identity for the same reason — this
+ * is DoD 2's headline falsifier: a window that narrows what's counted
+ * without a human being able to see that from this report is exactly the
+ * failure this ticket exists to prevent.
  */
 export function formatReport(identities: IdentityReport[], result: VerdictResult, nowMs: number): string {
   const lines: string[] = [];
@@ -379,6 +563,7 @@ export function formatReport(identities: IdentityReport[], result: VerdictResult
       lines.push(`identity uid=${id.uid} unit=${id.unit} — UNREADABLE: ${id.outcome.reason} (${id.journalNote})`);
     }
     lines.push(`  ${formatBuildLine(id.build ?? BUILD_NOT_PROBED, nowMs)}`);
+    lines.push(`  ${formatWindowLine(id.window)}`);
   }
   lines.push("");
   lines.push(
@@ -467,10 +652,16 @@ async function isButchrHealth(port: number): Promise<boolean> {
 // thousands of lines; node's spawnSync default maxBuffer (1MB) silently
 // truncates and reports `status: null` well before that, which this file's
 // `?? 1` fallback would misreport as "journalctl exited 1" — a fabricated
-// exit code standing in for a buffer overflow, not a real failure. Sized
-// generously rather than time-scoping the query (e.g. `--since` the unit's
-// last start): that is a real, separate improvement this script leaves for
-// later rather than folding into this ticket's scope silently.
+// exit code standing in for a buffer overflow, not a real failure. BUTCHR-86
+// added a per-identity `--since-start` time-scoping option (see
+// `decideJournalWindow`), but this buffer stays sized for the WHOLE journal
+// regardless: `--since-start` is opt-in and per-identity (a degraded
+// identity widens right back to the whole journal, see DoD 3), and even a
+// requested window only bounds how far BACK a read can reach, never how
+// long a daemon has been running since — a single long-lived process with
+// no restart can still produce a huge windowed read. Sizing this to the
+// windowed case and truncating the un-windowed default would just move the
+// silent-truncation failure this comment was written to describe.
 const JOURNALCTL_MAX_BUFFER = 256 * 1024 * 1024;
 
 function runJournalctl(command: string): JournalProbeResult {
@@ -481,6 +672,7 @@ function runJournalctl(command: string): JournalProbeResult {
 
 async function main(): Promise<void> {
   const readerUid = process.getuid?.() ?? -1;
+  const sinceStartRequested = process.argv.slice(2).includes("--since-start");
 
   const ssOutput = execFileSync("ss", ["-ltne"], { encoding: "utf8" });
   const listeners = parseSsListeners(ssOutput);
@@ -526,6 +718,12 @@ async function main(): Promise<void> {
     const bodies = await Promise.all(identity.ports.map(fetchHealthBody));
     const liveNow = bodies.some((b) => b !== null);
     const build = decideBuildIdentity(bodies.find((b) => b !== null) ?? null);
+    // Decided ONCE per identity from this same round's build outcome, then
+    // threaded through every branch below — including the two that never
+    // reach a real journalctl invocation — so the window is stated for
+    // EVERY identity, not just the ones that make it to a journal read
+    // (DoD 2).
+    const window = decideJournalWindow(sinceStartRequested, build);
 
     if (identity.uid === null || identity.cgroup === null) {
       reports.push(
@@ -535,22 +733,23 @@ async function main(): Promise<void> {
           journalNote: "ss -ltne reported no uid/cgroup for this confirmed daemon socket",
           outcome: { readable: false, reason: "ss -ltne did not expose uid/cgroup for this socket — this host disagrees with the verified-unprivileged route this script assumes; investigate before trusting anything else here" },
           build,
+          window,
         }),
       );
       continue;
     }
     const systemd = parseCgroup(identity.cgroup);
     const unit = systemd.kind === "none" ? "(none)" : systemd.unit;
-    const invocation = journalInvocationFor(systemd, identity.uid, readerUid);
+    const invocation = journalInvocationFor(systemd, identity.uid, readerUid, window.window);
 
     if (!invocation.command) {
-      reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome: { readable: false, reason: invocation.note }, build }));
+      reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome: { readable: false, reason: invocation.note }, build, window }));
       continue;
     }
 
     const probe = runJournalctl(invocation.command);
-    const outcome = decideReadability({ probe, targetUid: identity.uid, readerUid, confirmedLiveViaHealth: liveNow });
-    reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome, build }));
+    const outcome = decideReadability({ probe, targetUid: identity.uid, readerUid, confirmedLiveViaHealth: liveNow, windowed: window.window.kind !== "none" });
+    reports.push(buildIdentityReport({ uid: identity.uid, unit, journalNote: invocation.note, outcome, build, window }));
   }
 
   const result = computeVerdict(reports);
