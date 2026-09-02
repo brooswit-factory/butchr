@@ -39,6 +39,24 @@ export interface Config {
    */
   parkedMinutes: number;
   /**
+   * BUTCHR-95/123: minutes a resource must read `"asleep"` with its agent
+   * STILL RUNNING, continuously, before `atRest` (src/reconcile/plan.ts)
+   * stops protecting it indefinitely and the frozen-asleep detector (see
+   * src/agents/frozen-asleep.ts) posts its complaint and marks it reapable.
+   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above and
+   * for the same reason: the race this bounds (a woken agent's
+   * advance-watermark-then-exit) is milliseconds to seconds, and the
+   * project tier's own poll cadence (`PROJECT_POLL_INTERVAL_MS`,
+   * src/resources/project.ts — 5 minutes, the only resource type this can
+   * ever fire for today) is far shorter than 10 minutes too — so a
+   * genuinely-exiting agent clears the resting-and-running state within one
+   * poll, nowhere near this bound, while 10 minutes still guarantees at
+   * least one full extra 5-minute poll cycle of margin before a real freeze
+   * is ever reported, rather than tripping on the very first poll to
+   * observe it.
+   */
+  atRestMinutes: number;
+  /**
    * BUTCHR-5/16: minutes a pane's herdr status must read idle/done,
    * CONTINUOUSLY, before its text is even read to check for an end-of-pane
    * dialog herdr's own classification missed (the second, herdr-independent
@@ -111,6 +129,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
+  BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
@@ -142,6 +161,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
+  const atRestMinutes = env.BUTCHR_ATREST_MINUTES ? Number(env.BUTCHR_ATREST_MINUTES) : 10;
+  if (!Number.isFinite(atRestMinutes) || atRestMinutes <= 0) throw new Error(`BUTCHR_ATREST_MINUTES is not a positive number: ${env.BUTCHR_ATREST_MINUTES}`);
+
   const idleDialogMinutes = env.BUTCHR_IDLE_DIALOG_MINUTES ? Number(env.BUTCHR_IDLE_DIALOG_MINUTES) : 2;
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
@@ -160,6 +182,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     parkedMinutes,
+    atRestMinutes,
     idleDialogMinutes,
     pollStaleMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
@@ -191,7 +214,7 @@ const describeRole = (role: "Story" | "Task" | "Epic", id: string | undefined): 
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `captureDir=${c.captureDir} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"}`;

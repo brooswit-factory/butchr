@@ -31,6 +31,9 @@ import { createParkedDetector } from "../agents/parked.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel } from "../tools/speak.js";
+import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
+import { projectRootDoc } from "../tools/docs.js";
+import type { CommentRow } from "../agents/escalation-helper.js";
 
 let config;
 try {
@@ -170,6 +173,48 @@ const parkedDetector = createParkedDetector({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   links: (issue) => atlassian.links(issue),
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-95/123: reads a resource's own channel, symmetric with WHERE
+// `frozenAsleepDetector` below posts (`speakOnOwnChannel`, src/tools/speak.ts)
+// — an issue's ticket, or (a project has none) its Confluence root doc. NOT
+// `ops.getIssueComments`: that op deliberately returns `{id}` only (see its
+// own doc comment on AtlassianOps) and this detector's dedupe needs `body` to
+// find its own marker, so an issue id reads through the same `atlassian`
+// client `stalled`/`parkedDetector` above already use. A project id has no
+// ticket at all (measured: `GET /rest/api/3/issue/BUTCHR` -> 404) — and even
+// setting that failure aside, an ISSUE-shaped read would still be the WRONG
+// RESOURCE for a project (its speech is a Confluence footer comment on its
+// root doc, not a Jira comment) — so it resolves its root doc the same way
+// `speakOnOwnChannel` does and reads footer comments via `ops.getPageComments`,
+// called with exactly ONE id (`doc.id`, resolved fresh from THIS project's own
+// property read) — never the batch `?id=A&id=B` form (that op's own doc
+// comment: MEASURED to return HTTP 200 while silently ignoring the id filter,
+// two pages holding two comments coming back with 16 results spanning 10
+// unrelated pageIds). A 2xx here is evidence about the transport, not proof
+// of reading the right resource — the single-id, path-scoped call is what
+// makes that true anyway, not a post-hoc check on the response. `created` has
+// no equivalent on a footer comment (`getPageComments`'s return shape carries
+// no timestamp) — left `""`, which only ever affects the adopted-at
+// bookkeeping (Date.parse("") is NaN, falling back to `now()`), never the
+// dedupe decision itself, which reads `id`/`body` only.
+const commentsOnOwnChannel = async (id: string): Promise<readonly CommentRow[]> => {
+  if (isProjectId(id)) {
+    const doc = await projectRootDoc(ops, id);
+    const page = await ops.getPageComments(doc.id);
+    return page.results.map((r) => ({ id: r.id, body: r.body, created: "" }));
+  }
+  return atlassian.comments(id);
+};
+// BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
+// src/agents/frozen-asleep.ts for the full mechanism. `addComment` reuses the
+// SAME `speakOnOwnChannel` seam the blocked-dialog escalator already wires
+// below, so this adds no second Atlassian writer either.
+const frozenAsleepDetector = createFrozenAsleepDetector({
+  now: () => Date.now(),
+  minutes: config.atRestMinutes,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: commentsOnOwnChannel,
   log: (line) => console.error(`  ${line}`),
 });
 const syncLabels = createLabelSync({
@@ -338,6 +383,10 @@ runResourceLoop(projectResourceType, {
       : outcome.delivered ? "delivered" : "refused/absent";
     console.error(`  [notify] ${project} ← ${about}: channel pushed, prompt ${promptState}`);
   },
+  // BUTCHR-95/123: only the project tier can ever produce a non-empty
+  // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
+  // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
+  checkFrozenAsleep: frozenAsleepDetector.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
