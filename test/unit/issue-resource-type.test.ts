@@ -76,4 +76,20 @@ describe("createTodoWorkersFetch", () => {
     expect(TODO_WORKER_JQL).toContain('status = "To Do"');
     expect(TODO_WORKER_JQL).toContain("assignee = currentUser()");
   });
+
+  // BUTCHR-251: `search()` (src/atlassian/client.ts) caps at maxResults = 100
+  // and never paginates, so an ORDER BY-less query has no ordering contract
+  // at all — which rows survive the cap is decided by a property Jira never
+  // promised. Pins the clause to the exact immutable-key ordering rather
+  // than a bare `toContain("ORDER BY")`, which any garbage clause would
+  // satisfy: this fails BY NAME if the clause is dropped (no match) and
+  // fails BY NAME if the key is swapped for a mutable one such as `updated`
+  // (ISSUE_JQL's own `ORDER BY updated DESC`, deliberately NOT copied here
+  // — see TODO_WORKER_JQL's doc comment for why that would reintroduce a
+  // differently-unstable set rather than a stable one). Mutation-tested by
+  // hand against both failures before this landed.
+  test("TODO_WORKER_JQL orders by the immutable (created ASC, key ASC), not the mutable `updated`", () => {
+    const match = TODO_WORKER_JQL.match(/ ORDER BY (.+)$/);
+    expect(match?.[1]).toBe("created ASC, key ASC");
+  });
 });
