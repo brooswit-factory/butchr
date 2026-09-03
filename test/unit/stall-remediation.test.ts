@@ -60,11 +60,17 @@ describe("createStallRemediator", () => {
     expect(jira.posted).toEqual([]);
   });
 
-  // Hard constraint: the three-state result must never collapse. A null poll
-  // must be distinguishable from BOTH "not-a-candidate" (false) and
-  // "stabilizing" (true), and must never post.
-  describe("the could-not-verify (null) poll is never collapsed", () => {
-    test("null is its own distinct suppressed reason — never conflated with not-a-candidate or stabilizing", async () => {
+  // Hard constraint (AC6), PRECISELY: a null poll never GATES the
+  // act/suppress decision, is never collapsed into "not stalled" or
+  // "confirmed stalled", and never causes a post ON ITS OWN — the APPLIED
+  // label does. A prior version of this suite (and the PR/doc prose) said
+  // the narrower, ambiguous "a null poll never posts" — true only when
+  // `labelApplied` is false, and caught in review as untested for the
+  // `labelApplied: true` combination, where the module actually DOES act.
+  // See StallOutcome's own doc comment in stall-remediation.ts for why that
+  // is deliberate, not a gap.
+  describe("the could-not-verify (null) poll never gates the decision, and is never collapsed", () => {
+    test("null is its own distinct suppressed reason when the label is NOT applied — never conflated with not-a-candidate or stabilizing", async () => {
       const jira = fakeJira();
       const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
       const nullOutcome = await rem.check("KAN-1", false, null);
@@ -79,7 +85,7 @@ describe("createStallRemediator", () => {
       expect(jira.posted).toEqual([]);
     });
 
-    test("a null poll never posts and never corrupts state for a later real poll", async () => {
+    test("while NOT applied, a null poll never posts and never corrupts state for a later real poll", async () => {
       let now = 0;
       const jira = fakeJira();
       const rem = createStallRemediator({ now: () => now, addComment: jira.addComment, comments: jira.comments });
@@ -88,6 +94,30 @@ describe("createStallRemediator", () => {
       now = 5 * MIN;
       const outcome = await rem.check("KAN-1", true, true); // a later poll: label now genuinely applied
       expect(outcome.kind).toBe("acted");
+      expect(jira.posted.length).toBe(1);
+    });
+
+    // PINS THE REVIEW FINDING: once the label is already APPLIED, a null
+    // stalledPollResult this poll does NOT block remediation — the module
+    // proceeds exactly as it would for `true`. DELIBERATE (see
+    // StallOutcome's own doc comment): gating the wake on a fresh non-null
+    // verification EVERY poll would let a persistently failing comments()
+    // endpoint silently disable the deadlock-breaker during exactly the
+    // degraded conditions where a becalming is most likely.
+    test("once the label IS applied, a null stalledPollResult this poll still acts — the applied label gates, not the raw per-poll fetch", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, null);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted.length).toBe(1);
+    });
+
+    test("once the label IS applied, a null stalledPollResult still respects debounce (adoption/rate-cap), same as any other value", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      await rem.check("KAN-1", true, null); // acts once
+      const again = await rem.check("KAN-1", true, null); // steady state
+      expect(again.kind).toBe("suppressed");
       expect(jira.posted.length).toBe(1);
     });
   });

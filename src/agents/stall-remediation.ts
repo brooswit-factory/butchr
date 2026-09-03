@@ -163,13 +163,28 @@ const fingerprintNeedle = (issue: string): string => `fingerprint: ${issue}\n`;
 /**
  * The four mutually-exclusive per-poll outcomes this ticket's legibility
  * requirement names: acted / suppressed (always with a reason) /
- * attempted-and-failed (always with the error) / not-a-candidate. A `null`
- * poll (stalled.check() could not verify) is its own SUPPRESSED reason, never
- * folded into "not-a-candidate" (which would assert "confirmed not
- * stalled") or into "acted" (which would assert "confirmed stalled") — see
- * this module's own gating: it never even reaches that branch, since
- * `labelApplied` is computed from Jira's last-known-good label, independent
- * of this poll's verification outcome.
+ * attempted-and-failed (always with the error) / not-a-candidate.
+ *
+ * THE PRECISE, CORRECTED CLAIM ABOUT `null` (a prior version of this comment
+ * overstated it, caught in review): a `null` poll (`stalled.check()` could
+ * not verify) never GATES the act/suppress decision, is never collapsed
+ * into "not stalled" or "confirmed stalled", and never causes a post ON ITS
+ * OWN — the APPLIED label does. That is narrower than "a null poll never
+ * posts". When `labelApplied` is false, a `null` `stalledPollResult` is its
+ * own distinct SUPPRESSED reason (see `check`'s own doc comment) — it is
+ * never folded into "not-a-candidate" (confirmed not stalled) or treated as
+ * if it were `true`. But when `labelApplied` is ALREADY true, this module
+ * proceeds to adopt/rate-cap/post EXACTLY as it would for a `true` or even
+ * an omitted `stalledPollResult` — `stalledPollResult` is not consulted at
+ * all on that path. THIS IS DELIBERATE, not an oversight: once the label
+ * is durably applied (read back from Jira, not merely this poll's own
+ * candidate), gating the wake on ALSO getting a fresh non-null verification
+ * THIS poll would mean a persistently failing comments() endpoint silently
+ * disables the deadlock-breaker during exactly the degraded conditions
+ * where a becalming is most likely — fail-into-silence, this story's own
+ * failure mode, traded for a different failure mode than the one AC6 names.
+ * Pinned by test/unit/stall-remediation.test.ts's
+ * "labelApplied=true with a null stalledPollResult still acts" test.
  */
 export type StallOutcome =
   | { kind: "acted"; issue: string }
