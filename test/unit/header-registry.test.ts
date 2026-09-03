@@ -229,7 +229,7 @@ describe("HEADER_BLIND_SPOTS witnesses (BUTCHR-224)", () => {
     withTempFixture((root) => {
       mkdirSync(join(root, "src"));
       writeFileSync(join(root, "src", "example.ts"), 'export const X = "[ROGUE] not declared anywhere";');
-      writeFileSync(join(root, "src", "example.md"), '`export const X = "[ROGUE] not declared anywhere";`');
+      writeFileSync(join(root, "src", "example.md"), 'export const X = "[ROGUE] not declared anywhere";');
       const scanHits = scanDirForHeaderTagLiterals(join(root, "src"), root);
       witnessBlindSpot("header:non-ts-files", {
         silence: () => {

@@ -236,7 +236,7 @@ describe("LABEL_BLIND_SPOTS witnesses (BUTCHR-224)", () => {
     withTempFixture((root) => {
       mkdirSync(join(root, "src"));
       writeFileSync(join(root, "src", "example.ts"), 'export const X = "butchr:rogue";');
-      writeFileSync(join(root, "src", "example.md"), '`export const X = "butchr:rogue";`');
+      writeFileSync(join(root, "src", "example.md"), 'export const X = "butchr:rogue";');
       const scanHits = scanDirForLabelLiterals(join(root, "src"), root);
       witnessBlindSpot("label:non-ts-files", {
         silence: () => {
