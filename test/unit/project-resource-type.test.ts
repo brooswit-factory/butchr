@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach } from "bun:test";
 import {
   advanceProjectWatermark,
   createProjectEventRules,
   createProjectResourceType,
   projectIdOf,
   projectVerdict,
+  resetPendingWatermarkFallbackForTests,
   PROJECT_ACTIVATION,
   PROJECT_SPAWN_CONFIG,
   type ProjectResource,
@@ -16,6 +17,14 @@ import type { JiraIssue } from "../../src/atlassian/types.js";
 // BUTCHR-67/BUTCHR-81. Failure conditions are stated in each describe/test's
 // own comment, per this ticket's evidence-discipline requirement — a check
 // whose failure isn't stated first doesn't count as evidence.
+
+// BUTCHR-214/226: `pendingWatermarkFallback` (src/resources/project.ts) is
+// process-lifetime state shared across every test in this process, and this
+// file reuses project key "ACME" across many describe blocks — reset it
+// before each test so one test's failed-write fallback can never leak into
+// another's assertions (in particular the pre-existing "no wake watermark
+// recorded yet" test below, which asserts a clean null watermark for ACME).
+beforeEach(() => resetPendingWatermarkFallbackForTests());
 
 function project(overrides: Partial<ProjectResource> = {}): ProjectResource {
   return {
@@ -125,6 +134,146 @@ describe("projectVerdict — the pure activation/nudge predicate", () => {
 
   test("nothing observed yet (nulls) and no watermark -> asleep, not active on absence alone", () => {
     expect(projectVerdict(project({ observedVersion: null, observedCommentId: null, watermark: { version: null, comment: null, epics: {} } }))).toBe("asleep");
+  });
+});
+
+/** Every AtlassianOps member `advanceProjectWatermark` never calls, throwing loudly if it ever does — a call reaching one here is a test bug, not a passing behaviour. Local to this describe block: `fakeWorld` below already has its own, differently-shaped `unimplemented`, and this block needs direct control over `setProjectProperty`'s success/failure that `fakeWorld` doesn't expose. */
+function unimplementedProjectOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
+  const unimplemented = (name: string) => async (..._a: unknown[]) => {
+    throw new Error(`fake ops: ${name} not used by this test`);
+  };
+  return {
+    getIssue: unimplemented("getIssue"), search: unimplemented("search"), addComment: unimplemented("addComment"),
+    linkIssues: unimplemented("linkIssues"), transition: unimplemented("transition"), createIssue: unimplemented("createIssue"),
+    setPriority: unimplemented("setPriority"), assign: unimplemented("assign"), correctText: unimplemented("correctText"),
+    createPage: unimplemented("createPage"), getPage: unimplemented("getPage"), updatePage: unimplemented("updatePage") as unknown as AtlassianOps["updatePage"],
+    searchPages: unimplemented("searchPages"), listSpaces: unimplemented("listSpaces"),
+    getProjectProperty: unimplemented("getProjectProperty"), getProjectPropertyOrNull: unimplemented("getProjectPropertyOrNull"),
+    getRemoteLink: unimplemented("getRemoteLink"), upsertRemoteLink: unimplemented("upsertRemoteLink"),
+    getChildPages: unimplemented("getChildPages") as unknown as AtlassianOps["getChildPages"],
+    getPageLabels: unimplemented("getPageLabels") as unknown as AtlassianOps["getPageLabels"],
+    createPageWithLabel: unimplemented("createPageWithLabel") as unknown as AtlassianOps["createPageWithLabel"],
+    addLabels: unimplemented("addLabels"), removeLabels: unimplemented("removeLabels"), deleteIssue: unimplemented("deleteIssue"),
+    commentOnPage: unimplemented("commentOnPage"), getPageComments: unimplemented("getPageComments") as unknown as AtlassianOps["getPageComments"],
+    searchProjects: unimplemented("searchProjects") as unknown as AtlassianOps["searchProjects"],
+    getMyself: unimplemented("getMyself") as unknown as AtlassianOps["getMyself"],
+    setProjectProperty: unimplemented("setProjectProperty"),
+    getPageVersions: unimplemented("getPageVersions") as unknown as AtlassianOps["getPageVersions"],
+    getIssueComments: unimplemented("getIssueComments") as unknown as AtlassianOps["getIssueComments"],
+    ...overrides,
+  };
+}
+
+/** A minimal, directly-controllable `properties` store for `advanceProjectWatermark` — `getProjectPropertyOrNull` reads it, `setProjectProperty` (optionally rejecting, per `opts.failWrite`) writes it. Separate from `fakeWorld` below because that helper doesn't expose a way to make `setProjectProperty` itself fail — only property READS. */
+function watermarkWorld(initialWake?: Partial<{ version: number | null; comment: string | null; epics: Record<string, string | null> }>, opts: { failWrite?: boolean } = {}) {
+  const properties = new Map<string, Record<string, unknown>>();
+  if (initialWake) properties.set("ACME", { space: { key: "ACME" }, rootDoc: { id: "doc-A" }, wake: initialWake });
+  const persistedWrites: unknown[] = [];
+  const ops = unimplementedProjectOps({
+    getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+    setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+      if (opts.failWrite) throw new Error("simulated: setProjectProperty transiently unavailable");
+      properties.set(key, value as Record<string, unknown>);
+      persistedWrites.push(value);
+      return { ok: true };
+    },
+  });
+  return { ops, properties, persistedWrites };
+}
+
+describe("advanceProjectWatermark — the monotonic guard (BUTCHR-214/226, defect 1) and its in-process pending fallback (defect 1b)", () => {
+  // Failure condition, this whole block: any test here that finds the
+  // stored `comment`/`version` LOWER than an incoming value it should have
+  // accepted (over-freezing) or HIGHER than the true numeric max after a
+  // regressing incoming value (the guard removed) is this guard failing in
+  // one direction or the other.
+
+  test("a lower incoming comment id does not lower the stored watermark (fails if the guard is removed)", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "300" });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("500");
+  });
+
+  test("a higher incoming comment id still advances it (fails if the guard is over-applied into a freeze)", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "900" });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("900");
+  });
+
+  test("version axis: a lower incoming version does not lower the stored watermark; a higher one still advances", async () => {
+    const w = watermarkWorld({ version: 10, comment: null, epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { version: 3 });
+    expect((w.properties.get("ACME")!.wake as any).version).toBe(10);
+    await advanceProjectWatermark(w.ops, "ACME", { version: 42 });
+    expect((w.properties.get("ACME")!.wake as any).version).toBe(42);
+  });
+
+  test("a never-before-set watermark is still settable (absent means never-checked-in, not caught-up, so the FIRST write must not be refused)", async () => {
+    const w = watermarkWorld(); // no property at all — genuine 404 base
+    await advanceProjectWatermark(w.ops, "ACME", { version: 1, comment: "100" });
+    expect(w.properties.get("ACME")!.wake).toEqual({ version: 1, comment: "100", epics: {} });
+  });
+
+  test("a corrupted (non-numeric) stored value does not become NaN and swallow a real write — treated as absent, not as smaller-than-everything", async () => {
+    const w = watermarkWorld({ version: "not-a-number" as unknown as number, comment: "also-not-numeric" as unknown as string, epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { version: 5, comment: "500" });
+    // Neither NaN (which would make every future comparison false and
+    // permanently swallow real writes) nor a silent no-op (which would do
+    // the same thing by a different route) — the incoming, trustworthy
+    // value is accepted outright.
+    expect((w.properties.get("ACME")!.wake as any).version).toBe(5);
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("500");
+  });
+
+  test("the regression-to-wake chain, driven through the REAL predicate (not just the storage function): a would-be-regressing write does not make the project active on a stale comment", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} });
+    // The exact shape a daemon complaint's own suppression write takes
+    // (speakOnOwnChannel: `{ comment: <id the complaint itself just got> }`)
+    // — here, a non-monotonic id lower than the true page max.
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "300" });
+    const wake = w.properties.get("ACME")!.wake as { version: number | null; comment: string | null; epics: Record<string, string | null> };
+    // The true numeric max on the page is still "500" — the complaint's own
+    // lower id never became the newest observed comment.
+    const resource = project({ watermark: wake, observedCommentId: "500", observedVersion: 1 });
+    expect(projectVerdict(resource)).toBe("asleep"); // NOT active on the stale "500" it already handled
+  });
+
+  test("DEFECT 1b: a rejected persisted write is logged distinctly (not silent) and genuinely never lands", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} }, { failWrite: true });
+    const lines: string[] = [];
+    await expect(advanceProjectWatermark(w.ops, "ACME", { comment: "501" }, (l) => lines.push(l))).rejects.toThrow(/transiently unavailable/);
+    expect(lines.some((l) => l.includes("DEFECT 1b"))).toBe(true);
+    expect(w.persistedWrites.length).toBe(0); // the Jira/Confluence write genuinely never landed
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("500"); // persisted value unchanged
+    // The full end-to-end proof that the project does NOT read "active" on
+    // this very failure — via the REAL discovery/predicate path, not a
+    // reimplementation of the merge here — lives in
+    // test/unit/project-self-wake-loop.test.ts's "F7" describe block.
+  });
+
+  test("DEFECT 1b: a LATER successful write (from any caller, e.g. check_in) absorbs what an earlier failed write could not persist", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} }, { failWrite: true });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "501" }).catch(() => {}); // fails, held in-process only; persisted value stays "500"
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("500");
+
+    // A later write against the SAME project key succeeds this time (e.g.
+    // the account's write permission was restored, or a retry succeeded) —
+    // even though THIS write's own patch only knows about "500" (comment
+    // "501" was never durably recorded, so a fresh check_in-style scan of
+    // the page may not reflect it either), the still-pending in-process
+    // fallback from the earlier failed attempt is merged in first. Reuses
+    // `w`'s own `properties` map (this is one project's persisted state,
+    // not two) with a write path that simply doesn't reject.
+    const okOps = unimplementedProjectOps({
+      getProjectPropertyOrNull: async (key: string) => w.properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        w.properties.set(key, value as Record<string, unknown>);
+        w.persistedWrites.push(value);
+        return { ok: true };
+      },
+    });
+    await advanceProjectWatermark(okOps, "ACME", { comment: "500" });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("501"); // absorbed — not overwritten back down to "500"
   });
 });
 

@@ -106,13 +106,28 @@ real, watched channel for you (your root doc), so this is a genuine escalation
 path, not a dead end. State plainly what you're blocked on and why nothing
 looked safe.
 
-**One hazard to know about, not to solve:** your own `report_to_boss`/
-`ask_boss` calls post a COMMENT on your root doc, and "the root doc received
-a comment" is one of the events that can wake a project agent. If you find
-yourself waking repeatedly right after speaking, that loop is a known,
-tracked issue in how this tier's wake events work — it is not something you
-caused and not something you should try to work around by changing how or
-whether you speak.
+**Your own writes no longer wake you (BUTCHR-214/226).** Both of your
+self-wake surfaces are closed: `report_to_boss`/`ask_boss` post a COMMENT on
+your root doc, and `set_doc` bumps its page VERSION — either one used to be
+enough to wake you on nothing but your own act. Each now records, at the
+moment of the write, exactly what it produced, so the very next poll sees
+itself already caught up on that write and does not treat it as a pending
+trigger. This is not a rule that inspects who wrote something or what it
+says — a genuinely foreign comment, or a body edit you didn't make, still
+wakes you exactly as before; only a write your own `report_to_boss`/
+`ask_boss`/`set_doc` call itself just made is ever suppressed.
+
+**What can still, rarely, wake you on your own writing, so you are not
+surprised by it:** the bookkeeping that suppresses your own writes talks to
+Jira/Confluence over the network and can itself fail (a permission error, a
+timeout). When that happens the failure is logged rather than silent, and
+this process remembers what it was trying to record so a later write from
+either side still closes the gap — but that memory does not survive a daemon
+restart. If the daemon restarts while that bookkeeping is still failing, you
+may see yourself woken once on a comment or edit you already made. That is a
+known, narrow residual case, not something you caused and not something to
+work around by changing how or whether you speak or write your doc — report
+it if you see it, so the underlying write failure can be fixed at its source.
 
 ## Keep your doc current
 

@@ -136,9 +136,16 @@ describe("speakOnOwnChannel", () => {
     const lines: string[] = [];
     await expect(speakOnOwnChannel(ops, "BUTCHR", "hello", (line) => lines.push(line))).resolves.toBeDefined();
     expect(pageComments.length).toBe(1); // the comment itself still landed
-    expect(lines.length).toBe(1);
-    expect(lines[0]).toContain("BUTCHR");
-    expect(lines[0]).toContain("boom");
+    // BUTCHR-226 (defect 1b): TWO distinct lines now, not one — the generic
+    // `advanceProjectWatermark` line (which also records the failed write
+    // into its in-process fallback) and speakOnOwnChannel's own
+    // caller-specific line, deliberately different shapes so a reader can
+    // tell which mechanism produced a given incident (see project.ts's own
+    // doc comment on `pendingWatermarkFallback`).
+    expect(lines.length).toBe(2);
+    expect(lines.every((l) => l.includes("BUTCHR") && l.includes("boom"))).toBe(true);
+    expect(lines.some((l) => l.includes("[advanceProjectWatermark]") && l.includes("DEFECT 1b"))).toBe(true);
+    expect(lines.some((l) => l.includes("[speakOnOwnChannel]"))).toBe(true);
   });
 
   test("BUTCHR-105: no log line at all when the watermark write succeeds", async () => {

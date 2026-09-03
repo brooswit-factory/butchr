@@ -1881,7 +1881,7 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
       assign: async () => ({ ok: true }),
       createPage: async () => ({ ok: true }),
       getPage: async (id: string) => ({ title: "root", body: { storage: { value: "" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
-      updatePage: async () => ({ ok: true }),
+      updatePage: async () => ({ ok: true, version: 1 }),
       searchPages: async () => ({ results: [] }),
       listSpaces: async () => ({ ok: true }),
       getRemoteLink: async () => null,
