@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { abandonedCandidates, createAbandonedDetector, MARKER } from "../../src/agents/abandoned.js";
+import { parkedCandidates } from "../../src/agents/parked.js";
 import type { JiraIssue, IssueLink } from "../../src/atlassian/types.js";
+import type { RelatedIssue } from "../../src/daemon/loop.js";
 
 const MIN = 60_000;
 
@@ -89,6 +91,62 @@ describe("abandonedCandidates (pure predicate)", () => {
     const w1 = iss("WORK-1", "In Progress", { issuelinks: [bossLink("BOSS-1", "Done")] });
     const w2 = iss("WORK-2", "In Review", { issuelinks: [bossLink("BOSS-2", "In Progress")] });
     expect(abandonedCandidates([w1, w2])).toEqual([{ worker: w1, boss: "BOSS-1" }]);
+  });
+
+  // BUTCHR-240: this predicate needed no widening to cover a To Do worker —
+  // see abandonedCandidates's own "FORMER KNOWN LIMITATION" doc comment.
+  // The only status it ever excludes is "Done" (skip), so a "To Do" worker
+  // was always eligible; this test is the falsifier the ticket asked for,
+  // kept permanently as the regression that proves it.
+  test("BUTCHR-240: the state fires for a TO DO worker whose inward Implements boss is Done (the archetype case — the worker never started at all)", () => {
+    const worker = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "Done")] });
+    expect(abandonedCandidates([worker])).toEqual([{ worker, boss: "BOSS-1" }]);
+  });
+
+  // Mirrors the existing "does NOT fire: open worker under a LIVE boss" test
+  // one status down: a To Do worker under a LIVE boss is parked.ts's case,
+  // not this module's — see the cross-detector proof below for the same
+  // claim verified against BOTH predicates on one shared fixture.
+  test("BUTCHR-240: does NOT fire: a TO DO worker under a LIVE (In Progress) boss — that is parked.ts's case, not this one", () => {
+    const worker = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "In Progress")] });
+    expect(abandonedCandidates([worker])).toEqual([]);
+  });
+
+  // BUTCHR-240 hard requirement 3: fetching To Do workers makes the
+  // no-shelved-exemption decision load-bearing for the first time —
+  // `shelve_worker` moves a worker to To Do by contract, so this is the
+  // exact shape a real shelved-and-stranded worker takes once fetched.
+  test("BUTCHR-240: does NOT exempt butchr:shelved on a TO DO worker either — a shelved worker under a Done boss can never be reactivated by anyone and is MORE abandoned, not less (see abandoned.ts's own doc comment)", () => {
+    const worker = iss("WORK-1", "To Do", { labels: ["butchr:shelved"], issuelinks: [bossLink("BOSS-1", "Done")] });
+    expect(abandonedCandidates([worker])).toEqual([{ worker, boss: "BOSS-1" }]);
+  });
+});
+
+/**
+ * BUTCHR-240: proves — rather than merely asserting — that `parkedCandidates`
+ * and `abandonedCandidates` stay mutually exclusive on boss status after this
+ * ticket's change, on ONE SHARED fixture pattern rather than two independent
+ * ones that could each pass while the real invariant silently broke. The
+ * fixture is a To Do child/worker exactly as `abandonedCandidates` now
+ * receives one (via `todoWorkers`) and exactly as `parkedCandidates` already
+ * receives one (via `related`) — the two detectors' own candidate shapes,
+ * not a third one invented for this test.
+ */
+describe("BUTCHR-240: parkedCandidates and abandonedCandidates are mutually exclusive on boss status", () => {
+  const rel = (child: JiraIssue, watchers: string[]): RelatedIssue => ({ issue: child, watchers });
+
+  test("boss LIVE (In Progress): parked fires, abandoned does not", () => {
+    const child = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "In Progress")] });
+    const activeIssues = [iss("BOSS-1", "In Progress")]; // parked's own active-set resolution
+    expect(parkedCandidates(activeIssues, [rel(child, ["BOSS-1"])])).toEqual([{ child, boss: "BOSS-1" }]);
+    expect(abandonedCandidates([child])).toEqual([]);
+  });
+
+  test("boss DONE: abandoned fires, parked does not (a Done boss is never in ISSUE_JQL's active set, so bossStatus.get(boss) is undefined, not \"In Progress\")", () => {
+    const child = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "Done")] });
+    const activeIssues: JiraIssue[] = []; // a Done boss is never in the active `issues` set
+    expect(parkedCandidates(activeIssues, [rel(child, ["BOSS-1"])])).toEqual([]);
+    expect(abandonedCandidates([child])).toEqual([{ worker: child, boss: "BOSS-1" }]);
   });
 });
 
@@ -455,6 +513,115 @@ describe("createAbandonedDetector: escalation path (through addComment, per the 
     now = 54 * MIN; await det.check([worker]); // 29min after the fresh floor — still short
     expect(jira.posted).toEqual([]);
     now = 55 * MIN; await det.check([worker]); // 30min after the fresh floor
+    expect(jira.posted.length).toBe(1);
+  });
+});
+
+/**
+ * BUTCHR-240: the `todoWorkers` fetch seam — tested at the seam the real
+ * caller (`createAbandonedDetector`'s own `check`) actually uses, not just
+ * at the pure predicate, since the whole point of this ticket is getting a
+ * To Do worker INTO the array the predicate receives. Every test omitting
+ * `todoWorkers` above already proves the seam is optional/backward
+ * compatible (none of them wire it and all still pass).
+ */
+describe("createAbandonedDetector: the todoWorkers fetch seam (BUTCHR-240)", () => {
+  test("a To Do worker returned ONLY by todoWorkers (never in the poll's own `issues`) still escalates on its own ticket", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    const todoWorker = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "Done")] });
+    const det = createAbandonedDetector({
+      now: () => now,
+      minutes: 30,
+      addComment: jira.addComment,
+      comments: jira.comments,
+      links: jira.links,
+      todoWorkers: async () => [todoWorker],
+    });
+
+    now = 0; await det.check([]); // the real poll's `issues` never contains a To Do worker
+    now = 30 * MIN; await det.check([]);
+    expect(jira.posted.length).toBe(1);
+    expect(jira.posted[0]!.target).toBe("WORK-1");
+    expect(jira.posted[0]!.text).toContain("boss: BOSS-1");
+    expect(jira.posted[0]!.text).toContain("stage: 1");
+  });
+
+  test("todoWorkers results are concatenated with `issues`, not a replacement: a live In Progress worker (from `issues`) and a To Do worker (from todoWorkers) both escalate independently", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    const liveWorker = iss("WORK-LIVE", "In Progress", { issuelinks: [bossLink("BOSS-A", "Done")] });
+    const todoWorker = iss("WORK-TODO", "To Do", { issuelinks: [bossLink("BOSS-B", "Done")] });
+    const det = createAbandonedDetector({
+      now: () => now,
+      minutes: 30,
+      addComment: jira.addComment,
+      comments: jira.comments,
+      links: jira.links,
+      todoWorkers: async () => [todoWorker],
+    });
+
+    now = 0; await det.check([liveWorker]);
+    now = 30 * MIN; await det.check([liveWorker]);
+    const targets = jira.posted.map((p) => p.target).sort();
+    expect(targets).toEqual(["WORK-LIVE", "WORK-TODO"]);
+  });
+
+  // Fail OPEN on the query itself (this test) is the deliberate OPPOSITE
+  // direction from the detector's existing fail-CLOSED rule for an unknown
+  // link-stub status (see the "Unknown-status fails closed" predicate test
+  // above) — different subjects (an unreachable query vs. an unconfirmed
+  // status), both intentional. See abandoned.ts's own comment on `check`
+  // for why this is caught inside `check` itself, not left to the module's
+  // outer try/catch.
+  test("todoWorkers() throwing fails OPEN: the existing In Progress/In Review coverage over `issues` still runs and posts, and a WARNING is logged", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const liveWorker = iss("WORK-LIVE", "In Progress", { issuelinks: [bossLink("BOSS-A", "Done")] });
+    const det = createAbandonedDetector({
+      now: () => now,
+      minutes: 30,
+      addComment: jira.addComment,
+      comments: jira.comments,
+      links: jira.links,
+      todoWorkers: async () => { throw new Error("Jira 503"); },
+      log: (l) => logs.push(l),
+    });
+
+    now = 0; await det.check([liveWorker]);
+    now = 30 * MIN; await det.check([liveWorker]);
+    expect(jira.posted.length).toBe(1);
+    expect(jira.posted[0]!.target).toBe("WORK-LIVE"); // existing coverage unaffected by the failing extra query
+    expect(logs.some((l) => l.startsWith("WARNING: [abandoned]") && l.includes("todoWorkers fetch failed"))).toBe(true);
+  });
+
+  test("a To Do worker that stops appearing in todoWorkers' results has its tracking forgotten, same as any other candidate leaving the set", async () => {
+    let now = 0;
+    const jira = fakeJira();
+    let returnWorker = true;
+    const todoWorker = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "Done")] });
+    const det = createAbandonedDetector({
+      now: () => now,
+      minutes: 30,
+      addComment: jira.addComment,
+      comments: jira.comments,
+      links: jira.links,
+      todoWorkers: async () => (returnWorker ? [todoWorker] : []),
+    });
+
+    now = 0; await det.check([]); // floor starts at 0
+    now = 20 * MIN; await det.check([]); // still short of 30min
+
+    returnWorker = false;
+    now = 25 * MIN; await det.check([]); // worker disappears (e.g. re-homed/closed) -> tracking forgotten
+    expect(jira.posted).toEqual([]);
+
+    returnWorker = true;
+    now = 25 * MIN; await det.check([]); // reappears -> a FRESH floor starts at 25min
+    now = 54 * MIN; await det.check([]); // 29min after the fresh floor — still short
+    expect(jira.posted).toEqual([]);
+    now = 55 * MIN; await det.check([]); // 30min after the fresh floor
     expect(jira.posted.length).toBe(1);
   });
 });
