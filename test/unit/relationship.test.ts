@@ -48,7 +48,7 @@ function makeWorld() {
       summary?: string;
     }
   >();
-  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
+  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
   const projectProperties = new Map<string, unknown>();
 
   function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: unknown; summary?: string }) {
@@ -154,7 +154,8 @@ function makeWorld() {
       if (!page) throw new Error(`fake world: no such page ${p.id}`);
       page.body = p.body;
       if (p.title) page.title = p.title;
-      return { ok: true };
+      page.version++;
+      return { ok: true, version: page.version };
     },
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
@@ -181,7 +182,7 @@ function makeWorld() {
       const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
       if (titleTaken) throw new Error("title collision");
       const id = String(nextPageId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label] });
+      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
       return { id, title: p.title, url: pageUrl(id) };
     },
     addLabels: async (key: string, labels: readonly string[]) => {
@@ -2383,7 +2384,7 @@ describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not
   test("reportToBoss posts a Confluence footer comment on the project's root doc, identity-tagged, never ops.addComment", async () => {
     const { ops, issues, pages, addIssue, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [] });
+    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [], version: 1 });
     let commentedPageId: string | undefined;
     let commentedBody: string | undefined;
     const spied: AtlassianOps = {
@@ -2400,7 +2401,7 @@ describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not
   test("askBoss carries the SAME [ask] marker convention onto the project's root doc", async () => {
     const { ops, pages, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [] });
+    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [], version: 1 });
     let commentedBody: string | undefined;
     const spied: AtlassianOps = { ...ops, commentOnPage: async (_id: string, body: string) => { commentedBody = body; return { ok: true }; } };
     await askBoss(spied, "BUTCHR", "which approach?");

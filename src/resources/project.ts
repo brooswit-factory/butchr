@@ -348,10 +348,122 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  * (e.g. a second daemon-side writer of this same property), this function
  * needs real optimistic locking, not just this comment.
  */
+/**
+ * DEFECT 1 (BUTCHR-214/226): the numerically-larger of a stored value and an
+ * incoming one, under TODAY's read order — `newestCommentId`'s max-by-
+ * numeric-id reduce, the same order `projectVerdict`/`check_in` already
+ * compare against. `incoming === undefined` means this patch never touched
+ * this axis at all — the stored value passes through completely unchanged
+ * (this is what makes a comment-only advance leave `version` alone, and vice
+ * versa; see the call site below). BUTCHR-195/199 own updating this
+ * expression of order if/when their migration changes what "newest" means
+ * for this field — this function is deliberately written against today's
+ * scalar, not the seen-set 195 favours, per this ticket's own boundary.
+ *
+ * A stored value that is not a finite number is treated as ABSENT, not as
+ * "smaller than everything": a `null`/never-set watermark is the normal
+ * first-write case (see `ProjectWatermark`'s own doc comments, "absent means
+ * never checked in"), and a stored value that is some OTHER non-numeric
+ * garbage (outside this guard's control — e.g. hand-edited via the raw
+ * Jira API) must not silently coerce to `NaN` and then compare false against
+ * everything, which would silently swallow every future real write forever.
+ * Both resolve the same way: accept the incoming value outright rather than
+ * comparing against something that cannot be trusted as an order.
+ *
+ * An incoming value that is not a finite number (a caller bug, since every
+ * real caller only ever passes a value it read off Jira/Confluence) is
+ * treated as the ABSENT case in the other direction: kept out, so a bad
+ * write can never lower a genuinely numeric stored value — "no writer may
+ * lower it" holds even when the writer itself is confused.
+ */
+function monotonicMax(stored: number | null | undefined, incoming: number | undefined): number | null {
+  if (incoming === undefined) return stored ?? null;
+  if (!Number.isFinite(incoming)) return stored ?? null;
+  if (stored === null || stored === undefined || !Number.isFinite(stored)) return incoming;
+  return Math.max(stored, incoming);
+}
+
+/**
+ * `monotonicMax`'s counterpart for `comment`, which is stored as a numeric
+ * STRING (a Confluence comment id) rather than a `number` — compared
+ * numerically (same order as `newestCommentId`) but the WINNING side's
+ * original string is what gets stored, never a re-stringified number, so an
+ * id is never reformatted by round-tripping through this guard.
+ */
+function monotonicMaxId(stored: string | null | undefined, incoming: string | undefined): string | null {
+  if (incoming === undefined) return stored ?? null;
+  const incomingNum = Number(incoming);
+  if (!Number.isFinite(incomingNum)) return stored ?? null;
+  if (stored === null || stored === undefined) return incoming;
+  const storedNum = Number(stored);
+  if (!Number.isFinite(storedNum)) return incoming;
+  return incomingNum >= storedNum ? incoming : stored;
+}
+
+/**
+ * DEFECT 1b (BUTCHR-214/226) — the swallowed watermark-write failure is a
+ * SECOND, INDEPENDENT mechanism that produces the identical "wakes on its
+ * own write" symptom as defect 1, by staleness rather than regression: the
+ * write below is deliberately fail-open (BUTCHR-105 — a bookkeeping failure
+ * must never fail the caller's `report_to_boss`/`ask_boss`/`set_doc`), so a
+ * persistent rejection (MEASURED live, BUTCHR-115: a 403 from a project-tier
+ * account lacking write permission) left the true stored watermark forever
+ * behind the page's real max, waking the project on its own already-posted
+ * complaint every poll, indefinitely.
+ *
+ * THE CHOSEN MECHANISM, AND WHY, AGAINST THE ALTERNATIVES THIS TICKET NAMED:
+ * a bounded in-PROCESS (never persisted) fallback — the version/comment this
+ * process most recently tried and failed to persist for a project, merged
+ * into BOTH the next read (`loadProjects`, via `mergePendingFallback` below)
+ * and the next write attempt (this function, so a LATER successful write —
+ * from ANY caller, not necessarily the one that failed — durably absorbs
+ * what an earlier one could not persist). Rejected alternatives:
+ *   - A bare RETRY inside this function fixes only a TRANSIENT failure
+ *     (timeout, rate limit). It does nothing for the measured case — a
+ *     permission error is not fixed by retrying it — so retry alone would
+ *     leave defect 1b's actual production incident unfixed. (A retry is
+ *     still cheap insurance and composes fine with this fallback, but this
+ *     ticket's time is better spent on the mechanism that actually closes
+ *     the measured gap; not added here to keep one mechanism, not two.)
+ *   - A DURABLE side-channel (a second Jira/Confluence write, or changing
+ *     what the `wake` property itself stores) would need BUTCHR-195/199's
+ *     sign-off (they own the stored field's meaning) and is exactly the
+ *     "stop and ask" tripwire this ticket names — not needed here, because
+ *     this fallback changes nothing about what is PERSISTED or what it
+ *     means; it only changes what this process additionally consults before
+ *     deciding, entirely in memory.
+ * ACCEPTED COST, STATED RATHER THAN HIDDEN: this resets on daemon restart,
+ * same as the issue tier's own per-issue in-memory cursor (a DIFFERENT
+ * mechanism on a DIFFERENT surface — not modified, not reused — but the same
+ * accepted shape: in-memory resilience is not required to survive a
+ * restart to be worth having). A persistent-failure incident that survives
+ * a restart before its write ever succeeds will resume waking the project
+ * until then — a real gap, and the reason the WARNING log line below stays
+ * loud rather than being treated as fully closed.
+ */
+const pendingWatermarkFallback = new Map<string, { version: number | null; comment: string | null }>();
+
+/** Test-only: `pendingWatermarkFallback` is process-lifetime state shared across every caller in this module, so a test suite that reuses a project key across tests (as this file's own fixtures do) must reset it between tests to avoid one test's failed write leaking into another's assertions. */
+export function resetPendingWatermarkFallbackForTests(): void {
+  pendingWatermarkFallback.clear();
+}
+
+/** `loadProjects`' own merge of a persisted watermark with any still-pending in-memory fallback for the same project — see `pendingWatermarkFallback`'s doc comment. Never touches `epics` (out of this fallback's scope; see that doc comment). */
+function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): ProjectWatermark {
+  const pending = pendingWatermarkFallback.get(projectKey);
+  if (!pending) return persisted;
+  return {
+    version: monotonicMax(persisted.version, pending.version ?? undefined),
+    comment: monotonicMaxId(persisted.comment, pending.comment ?? undefined),
+    epics: persisted.epics,
+  };
+}
+
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
   patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>> },
+  log: (line: string) => void = console.error,
 ): Promise<void> {
   // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
   // `getProjectProperty().catch(() => undefined)` this used to call. That
@@ -372,7 +484,19 @@ export async function advanceProjectWatermark(
   // REPLACE, where the same fail-open shape means "assume the record was
   // empty" and silently deletes whatever was actually there.
   const current = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as Record<string, unknown> | null ?? {};
-  const wake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
+  // DEFECT 1b: an earlier caller's write to THIS axis may have failed to
+  // persist — merge its intent in before applying THIS patch, so whichever
+  // write next succeeds is the one that finally makes it durable (see
+  // `pendingWatermarkFallback`'s doc comment).
+  const persistedWake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
+  const pending = pendingWatermarkFallback.get(projectKey);
+  const wake: Partial<ProjectWatermark> = pending
+    ? {
+        version: monotonicMax(persistedWake.version, pending.version ?? undefined),
+        comment: monotonicMaxId(persistedWake.comment, pending.comment ?? undefined),
+        ...(persistedWake.epics !== undefined ? { epics: persistedWake.epics } : {}),
+      }
+    : persistedWake;
   // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
   // merge. This is the actual fix for rule 3's re-entry defect (see
   // `ProjectWatermark.epics`'s doc comment, point 2): the only caller that
@@ -382,14 +506,26 @@ export async function advanceProjectWatermark(
   // "this is now the complete truth", and an epic that has left review
   // since the last check-in is correctly dropped rather than lingering.
   // Omitting `epics` entirely (e.g. a version-only or comment-only advance)
-  // leaves the existing map untouched.
+  // leaves the existing map untouched. DELIBERATELY NOT monotonic (unlike
+  // version/comment below): a smaller map after a check-in is exactly how
+  // an epic leaving review gets pruned — "smaller" is not "behind" here.
   const epics = patch.epics !== undefined ? patch.epics : (wake.epics ?? {});
   const nextWake: ProjectWatermark = {
-    version: patch.version ?? wake.version ?? null,
-    comment: patch.comment ?? wake.comment ?? null,
+    version: monotonicMax(wake.version, patch.version),
+    comment: monotonicMaxId(wake.comment, patch.comment),
     epics,
   };
-  await ops.setProjectProperty(projectKey, PROPERTY_KEY, { ...current, wake: nextWake });
+  try {
+    await ops.setProjectProperty(projectKey, PROPERTY_KEY, { ...current, wake: nextWake });
+    // The durable write just absorbed whatever this process was holding
+    // in-memory for this project (it was merged into `nextWake` above) —
+    // safe to drop now, not before, so a failure never loses it.
+    if (pending) pendingWatermarkFallback.delete(projectKey);
+  } catch (e) {
+    pendingWatermarkFallback.set(projectKey, { version: nextWake.version, comment: nextWake.comment });
+    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, comment=${nextWake.comment ?? "null"}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
+    throw e;
+  }
 }
 
 /**
@@ -639,6 +775,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
         epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId((await deps.ops.getIssueComments(epic.key)).results) })),
       );
       const wake = p.wake;
+      const persistedWatermark: ProjectWatermark = { version: wake?.version ?? null, comment: wake?.comment ?? null, epics: wake?.epics ?? {} };
       return {
         key: p.key,
         name: p.name,
@@ -647,7 +784,11 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
         observedVersion: versions[rootDocId] ?? null,
         observedCommentId: newestCommentId(commentsByProject[i]!.results),
         observedEpics,
-        watermark: { version: wake?.version ?? null, comment: wake?.comment ?? null, epics: wake?.epics ?? {} },
+        // DEFECT 1b: merge in this process's own in-memory fallback (see
+        // `pendingWatermarkFallback`'s doc comment) so a watermark write
+        // that failed to persist still suppresses a poll's own re-read of
+        // the very thing it just tried and failed to record.
+        watermark: mergePendingFallback(p.key, persistedWatermark),
       };
     }),
   );

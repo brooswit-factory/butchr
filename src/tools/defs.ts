@@ -457,7 +457,7 @@ export function atlassianTools(
         const who = c.headers["x-issue"];
         if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
-        const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title) : await setDoc(ops, who, body, title);
+        const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title, log) : await setDoc(ops, who, body, title);
         noted(c, [who]); // the remote-link upsert (issue) / page update (project) bumps the doc's own `updated`
         return result;
       },
