@@ -1,11 +1,12 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, ensureDoc, JIRA_KEY_RE, type DocResult } from "./docs.js";
+import { findBossKey, findWorkers, ensureDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
-import { speakOnOwnChannel } from "./speak.js";
+import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
+import { resolveEligibleProjects } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
@@ -310,6 +311,75 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
     throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
   return issue;
+}
+
+/**
+ * BUTCHR-193 — the shared "open worker" check behind all three closing
+ * doors (finish_worker, finish_without_a_boss, submit_to_boss). ONE
+ * DEFINITION, justified here, so a future reader who disagrees has exactly
+ * one place to argue with: a worker is OPEN unless its status is Done, or
+ * it carries `EXEMPT_LABEL` (`butchr:shelved`) — a recorded, reasoned
+ * deferral (`shelve_worker`), not silent abandonment. To Do, In Progress and
+ * In Review are ALL open: an In Review worker still has a live review hop
+ * ahead of it (its own boss's `finish_worker`), and closing the boss out
+ * from under that hop is exactly the shape of the BUTCHR-127/BUTCHR-159
+ * defect this exists to catch — reaching a terminal state does not mean the
+ * worker's own doorway has closed, only Done means that.
+ *
+ * COST, PER §2/§2b of this ticket's own spec (MEASURED, not assumed — see
+ * `findWorkers`'s own doc comment in docs.ts): `issue`'s own payload already
+ * carries every worker's key AND status via `findWorkers`, no extra Jira
+ * call — so the common case (no workers, or every worker already Done)
+ * costs EXACTLY ZERO extra reads, preserving whatever cost profile the
+ * caller already had before this guard existed. The label read this
+ * function needs to tell "genuinely open" from "deliberately shelved" is
+ * NOT on that payload (MEASURED: the outward stub's hydrated field set
+ * never includes `labels`) — so it is paid with one extra `getIssue` PER
+ * NON-DONE WORKER, and only then: exactly the path where this is already
+ * about to refuse, never the healthy common case.
+ *
+ * RE-CHECKS DONE against that same fresh fetch (review nit, BUTCHR-193):
+ * the per-worker `getIssue` this function pays for the label read is also
+ * a fresher, authoritative status than the stub's — free to use once paid
+ * for. Without this, a worker whose stub status is stale or absent (a
+ * status change landing between the boss's fetch and this one, or a stub
+ * Jira genuinely never hydrates) would be reported open on stale data even
+ * though the fresh read already shows Done — a false refusal, the same
+ * inversion failure the anti-inversion tests guard against elsewhere.
+ */
+async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef[]> {
+  const nonDone = findWorkers(issue).filter((w) => w.status !== "Done");
+  if (nonDone.length === 0) return [];
+  const open: WorkerRef[] = [];
+  for (const w of nonDone) {
+    const full = await ops.getIssue(w.key);
+    const status = statusOf(full) ?? w.status;
+    if (status !== "Done" && !labelsOf(full).includes(EXEMPT_LABEL)) {
+      open.push({ key: w.key, status });
+    }
+  }
+  return open;
+}
+
+/**
+ * The refusal message shared by all three closing doors — deliberately
+ * matching the teaching voice `finishWithoutABoss`'s own has-a-boss refusal
+ * already uses (see that function): names every offending worker WITH its
+ * status, and BOTH discharge verbs by name, so an agent that hits this can
+ * act without reading any ticket, this one included. No exemption, no
+ * grandfather clause — BUTCHR-92's own rejected carve-out (see this ticket's
+ * PR body) is exactly the shape this message refuses to offer: the only
+ * ways through are finishing the worker for real, or recording a deliberate
+ * deferral with `shelve_worker`.
+ */
+function openWorkersRefusal(verb: string, key: string, open: WorkerRef[]): string {
+  const plural = open.length > 1;
+  const list = open.map((w) => `${w.key} (${w.status ?? "unknown status"})`).join(", ");
+  return (
+    `${verb}: ${key} still has open worker${plural ? "s" : ""} it undertook to close: ${list} — refusing. ` +
+    `For each: finish_worker it if the work is actually done, or shelve_worker(worker, reason) to record a deliberate deferral with a stated activation condition, not a silent one. ` +
+    `A boss reaching Done or In Review while a worker it undertook to close is still open is the exact failure BUTCHR-193 exists to stop — it happened once already (BUTCHR-127/BUTCHR-159) and was only caught because a human remembered.`
+  );
 }
 
 /**
@@ -664,6 +734,15 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
  * A worker never finishes itself — see submit_to_boss; the review hop is the
  * point.
  *
+ * BUTCHR-193: ALSO REFUSES WHEN THE WORKER BEING CLOSED STILL HAS OPEN
+ * WORKERS OF ITS OWN — the guard looks at the WORKER's own children (the
+ * caller's grandchildren), not the caller's, since it is the worker's own
+ * undertaking to close ITS workers that this call is about to make
+ * unreachable. Reuses the fetch `assertOwnWorker` already made — see
+ * `openWorkers`'s own doc comment for the exact cost. The message names
+ * every offending worker with its status and both discharge paths
+ * (`finish_worker`, `shelve_worker`) by name.
+ *
  * CLEARS `EXEMPT_LABEL` FIRST, ONLY IF PRESENT, THEN TRANSITIONS — same
  * ordering and reasoning as `startWorker` above. Done is not shelved: a
  * finished ticket that still carries the exemption is the exact residue this
@@ -672,6 +751,8 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
  */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("finish_worker", workerKey, open));
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
@@ -1734,8 +1815,196 @@ export async function askBoss(ops: AtlassianOps, callerKey: string, text: string
   return speakOnOwnChannel(ops, callerKey, tagComment(callerKey, `${ASK_MARKER} ${text}`));
 }
 
-/** The caller's OWN ticket -> In Review. No arguments at all — the one transition an agent is always entitled to make about itself. */
+// ---------------------------------------------------------------------------
+// Peer -> peer (BUTCHR-183/BUTCHR-184/BUTCHR-185/BUTCHR-215): the ONE
+// sideways channel a project has. See `tellPeer` below for the full design
+// note; this section exists only because reportToBoss/askBoss (up) and
+// tellWorker (down) sit right above/below it in this file and `tellPeer` is
+// the third, sideways, leg of the same "where a resource speaks" family.
+// ---------------------------------------------------------------------------
+
+/** One enum, one verb — `tellPeer`'s `intent` argument. No default, no fifth value, no free-text passthrough (BUTCHR-185's own ruling: a directive from a boss is obeyed, a request from a peer is negotiated, and `"decline"` is what makes a recorded "no" possible instead of silent non-compliance). */
+export type PeerIntent = "request" | "accept" | "decline" | "notice";
+
+const PEER_INTENTS: readonly PeerIntent[] = ["request", "accept", "decline", "notice"];
+
+/**
+ * Same idea as `PLACEHOLDER_DESTINATIONS`/`file_where_it_belongs` above —
+ * text an agent types when it hasn't actually stated a reason — but its OWN
+ * set: `"no"` and `"nope"` belong here (a bare "no" is exactly the
+ * placeholder `intent: "decline"` exists to refuse) but would be a false
+ * refusal on `file_where_it_belongs`'s destination field, so the two sets
+ * are kept deliberately separate rather than shared. Normalized the same
+ * way (trimmed, lowercased, trailing `.`/`!` stripped) before comparison.
+ */
+const PEER_DECLINE_PLACEHOLDERS = new Set([
+  "n/a", "na", "tbd", "no", "nope", "none", "-", "--", "?", "??", "idk", "dunno", "todo", "later", "null", "undefined", "unknown",
+]);
+
+function normalizePeerDeclineText(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[.!]+$/, "");
+}
+
+/** `tell_peer`'s own doc-comment note, kept beside the code it describes rather than only in defs.ts's tool description (which BUTCHR-185 requires to state the SAME thing, in caller-facing words, for the overclaim review). */
+export interface TellPeerResult {
+  ok: true;
+  /** The peer project this comment was posted to. */
+  to: string;
+  intent: PeerIntent;
+  /** The Confluence footer-comment id `commentOnPage` returned, when present. Absent, never a placeholder, mirrors `get_doc_comments`' own `author` field — see `speakOnOwnChannel`'s doc comment for why this codebase treats "unavailable" as absent rather than synthesised. */
+  commentId?: string;
+}
+
+/**
+ * THE ONE SIDEWAYS CHANNEL (BUTCHR-183/184/185/215): posts a single footer
+ * comment on `peer`'s root doc, PROJECT CALLER ONLY (gated one layer up, in
+ * defs.ts, via `requireProjectCaller` — same shape as `list_peers`/
+ * `check_in`/`get_doc_comments`). Deliberately NOT built on
+ * `speakOnOwnChannel`: that seam resolves and posts on the CALLER's OWN
+ * doc (`projectRootDoc(ops, callerKey)`), so it cannot be reused UNCHANGED
+ * here at all — routed through as-is, a peer message would land on the
+ * SENDER's own root page, never the peer's. The real hazard this function
+ * exists to avoid is therefore COPY-PASTE-AND-RETARGET (BUTCHR-185
+ * correction @ 2026-09-02, relayed sideways from BUTCHR-208), which is
+ * exactly what a careful implementer naturally reaches for, and it is one
+ * line from TWO distinct silent failures once the doc resolution has been
+ * retargeted to `peer`:
+ *   - keeping `advanceProjectWatermark(ops, callerKey, …)` writes an id
+ *     from a DIFFERENT PAGE into the SENDER's own watermark — meaningless,
+ *     and it corrupts the sender's own wake state as a side effect of
+ *     speaking to someone else;
+ *   - "fixing" it for symmetry to `advanceProjectWatermark(ops, peer, …)`
+ *     is the CATASTROPHIC one, and the more attractive mistake because it
+ *     reads as tidier: it marks the RECIPIENT as already caught up on the
+ *     very comment meant to wake it. Waking the recipient IS the delivery.
+ * The correct answer is NEITHER: this function never calls
+ * `advanceProjectWatermark` at all, for any key — see
+ * test/unit/tools.test.ts's three dedicated tests (caller-key, peer-key,
+ * and the strongest "no call at all" form), each independently
+ * mutation-tested against its own specific failure so a guard that only
+ * pins one variant can never leave the other live.
+ *
+ * THE PREFIX IS NEVER LOAD-BEARING FOR ANY WAKE DECISION (BUTCHR-185
+ * correction @ 2026-09-02): nothing in this function, or anywhere else,
+ * may inspect the `[butchr:peer …]` marker to decide whether a comment
+ * should or should not wake its reader. Self-suppression keys on the
+ * IDENTITY OF THE WRITE PATH (the watermark hazard above), never on the
+ * author or on any content marker — and the daemon and the project agent
+ * share one Atlassian account, so no content marker could carry a wake
+ * decision even in principle. The prefix below is purely reader-facing.
+ *
+ * THE MESSAGE SHAPE ON THE PAGE (fixed, not a suggestion): the posted text
+ * is always `[butchr:peer from=<callerKey> to=<peer> intent=<intent>] ` —
+ * authored by THIS FUNCTION, unconditionally prepended — followed by the
+ * caller's own `text`, verbatim. Unlike `tagComment` (which SKIPS
+ * prepending when the text already starts with the tag, so a boss/worker
+ * comment is never double-tagged), this prefix is prepended with NO such
+ * check: a caller cannot suppress it by pre-typing it, by leading
+ * whitespace, or by leading newlines, because there is no code path here
+ * that ever looks at what `text` starts with before prepending. The whole
+ * thing is escaped with the SAME `escapeStorageText`/`unwrapStorageParagraph`
+ * pair `speakOnOwnChannel` uses (imported from speak.ts, never
+ * reimplemented) and wrapped as a single storage-format `<p>...</p>`
+ * paragraph, so the prefix leads the text on the FIRST (and only) line —
+ * never a separate line above it.
+ *
+ * ELIGIBILITY, NOT THE STAFFING ALLOWLIST: `peer` is validated against
+ * `resolveEligibleProjects` (src/resources/project.ts), called with NO
+ * `preFilter`, EXACTLY as `list_peers` calls it — never a second
+ * eligibility rule, never a hardcoded project key. A `peer` this resolver
+ * does not return as eligible (unknown key, not live, not led by this
+ * credential, or missing a readable `butchr` property) is refused by name,
+ * and the refusal lists the peers that DO exist so a caller can immediately
+ * see what changed one key would need to be. An EMPTY peer set is a
+ * legitimate answer under some credentials (BUTCHR-184's own measurement)
+ * and is refused the same way, naming zero peers rather than treating that
+ * as a special case.
+ *
+ * THE PEER'S ROOT DOC IS RESOLVED FRESH, HERE, via `projectRootDoc` — never
+ * the `rootDocId` a listing might have cached (BUTCHR-188: a page id
+ * captured in a listing can go stale between the listing and a later send).
+ *
+ * WHAT THIS FUNCTION DOES NOT AND MUST NOT CLAIM: it posts a durable
+ * Confluence footer comment on `peer`'s root doc. That is what it does and
+ * all it may say. It does NOT know, and cannot promise, that `peer` will
+ * WAKE on this comment — Confluence footer-comment ids are not monotonic
+ * with creation time, and the project wake path's own MAX-id watermark
+ * comparison (`newestCommentId`, src/resources/project.ts) can silently
+ * fail to notice a comment whose id lands below the recipient's current
+ * max (BUTCHR-195, not this ticket's to fix). The comment is never lost —
+ * it sits on a durable page and is read whenever `peer` next reads its own
+ * comments — but the WAKE is best-effort, and its failure mode, while
+ * BUTCHR-195 is open, is silence: no error, on either side, distinguishable
+ * from the peer simply not having answered yet.
+ */
+export async function tellPeer(
+  ops: AtlassianOps,
+  callerKey: string,
+  peer: string,
+  text: string,
+  intent: PeerIntent,
+): Promise<TellPeerResult> {
+  if (!PEER_INTENTS.includes(intent)) {
+    throw new Error(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
+  }
+  if (peer === callerKey) {
+    throw new Error(
+      `tell_peer: ${callerKey} cannot send itself a peer message — a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer, which is a channel to OTHER projects only`,
+    );
+  }
+  if (intent === "decline") {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
+    }
+    if (PEER_DECLINE_PLACEHOLDERS.has(normalizePeerDeclineText(trimmed))) {
+      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
+    }
+  }
+
+  // Eligibility, never the allowlist gate — see this function's own doc
+  // comment. NO preFilter, same as list_peers.
+  const { eligible } = await resolveEligibleProjects(ops);
+  const peers = eligible.filter((p) => p.key !== callerKey);
+  const target = peers.find((p) => p.key === peer);
+  if (!target) {
+    const names = peers.length ? peers.map((p) => `${p.key} (${p.name})`).join(", ") : "none";
+    throw new Error(
+      `tell_peer: "${peer}" is not an eligible peer of ${callerKey} — unknown key, not live, not led by this credential, or missing a readable "butchr" entity property. Eligible peers: ${names}`,
+    );
+  }
+
+  // Resolved FRESH — never `target`'s own rootDocId from the listing above
+  // (BUTCHR-188).
+  const doc = await projectRootDoc(ops, peer);
+  const prefix = `[butchr:peer from=${callerKey} to=${peer} intent=${intent}] `;
+  const body = `<p>${escapeStorageText(prefix + text)}</p>`;
+  const created = (await ops.commentOnPage(doc.id, body)) as { id?: string } | undefined;
+
+  // Deliberately NO advanceProjectWatermark call, for EITHER key — see this
+  // function's own doc comment for why that would silently break delivery.
+  return { ok: true, to: peer, intent, ...(created?.id ? { commentId: created.id } : {}) };
+}
+
+/**
+ * The caller's OWN ticket -> In Review. No arguments at all — the only
+ * ticket it can ever act on is the caller's own, so there is nothing to get
+ * wrong — but NOT unconditional (see below).
+ *
+ * BUTCHR-193: REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS OWN —
+ * the one added `getIssue` this verb pays that it didn't before (see
+ * `openWorkers`'s own doc comment for the full cost accounting). Deliberately
+ * the EARLIEST of the three closing-door guards an agent can hit: it tells
+ * the agent that can actually fix the problem, at the moment it becomes that
+ * agent's problem, rather than surfacing later as a refusal its BOSS hits
+ * about somebody else's children. `finish_worker`'s own guard alone would
+ * already catch the same defect one hop later — this one is earlier, better-
+ * placed feedback, not the load-bearing catch.
+ */
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
+  const issue = await ops.getIssue(callerKey);
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("submit_to_boss", callerKey, open));
   return ops.transition(callerKey, "In Review");
 }
 
@@ -1787,6 +2056,17 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  * question belongs to whoever decides if and when the project tier above
  * epics gets built — a human call, not an agent's to make by building or
  * not building this.
+ *
+ * BUTCHR-193: ALSO REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS
+ * OWN — ADDITIVE AND ORTHOGONAL to the has-a-boss refusal above, which this
+ * leaves byte-identical (condition, message, and position): that refusal
+ * narrows the UPWARD precondition (BUTCHR-92's still-shelved narrowing,
+ * refuse a caller that HAS a boss); this adds a DOWNWARD one (refuse a
+ * caller that HAS OPEN WORKERS). They compose without touching each other.
+ * See `openWorkers` for what "open" means and its cost, and this ticket's
+ * PR body for why this does not reproduce BUTCHR-92's circle: that circle
+ * had no exit for ANY caller; this refusal always has one — finish_worker
+ * the worker for real, or shelve_worker it with a reason.
  */
 export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
@@ -1796,6 +2076,8 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
       `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
+  const open = await openWorkers(ops, issue);
+  if (open.length > 0) throw new Error(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");
 }
 

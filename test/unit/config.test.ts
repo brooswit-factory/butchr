@@ -56,6 +56,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("abandonedMinutes defaults to 30, honours BUTCHR_ABANDONED_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).abandonedMinutes).toBe(30);
+    expect(loadConfig({ ...base, BUTCHR_ABANDONED_MINUTES: "45" }, noRead).abandonedMinutes).toBe(45);
+    expect(() => loadConfig({ ...base, BUTCHR_ABANDONED_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_ABANDONED_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_ABANDONED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_ABANDONED_MINUTES/);
+  });
+
   test("crashLoopCount defaults to 5, honours BUTCHR_CRASHLOOP_COUNT, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).crashLoopCount).toBe(5);
     expect(loadConfig({ ...base, BUTCHR_CRASHLOOP_COUNT: "3" }, noRead).crashLoopCount).toBe(3);
