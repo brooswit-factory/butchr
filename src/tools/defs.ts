@@ -5,8 +5,8 @@ import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc } from "./
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
-  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER, CORRECTION_MARKER,
-  type Disposition,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, tellPeer, ASK_MARKER, CORRECTION_MARKER,
+  type Disposition, type PeerIntent,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
@@ -571,7 +571,7 @@ export function atlassianTools(
     },
     finish_worker: {
       description:
-        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Also WITHDRAWS the shelved-exemption label first, if the worker carries it — cleared BEFORE the transition, same ordering as start_worker's — because Done is not shelved: a finished ticket still carrying the exemption is residue, not state. Skipped entirely, at no extra Jira call, when the label isn't present. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry — and for a PROJECT caller approving an EPIC, this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_transition(key, \"Done\") for this case.",
+        "Close ONE OF THE CALLER'S OWN workers: moves it to Done. This is the boss's closing act, AFTER reviewing what it actually delivered (including that its doc reflects what actually shipped — staleness that reads as authoritative is the failure mode). Also WITHDRAWS the shelved-exemption label first, if the worker carries it — cleared BEFORE the transition, same ordering as start_worker's — because Done is not shelved: a finished ticket still carrying the exemption is residue, not state. Skipped entirely, at no extra Jira call, when the label isn't present. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). ALSO REFUSES when the worker being closed still has an open worker of its own (BUTCHR-193) — naming it, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. A worker never finishes itself — see submit_to_boss; the review hop is the entire point of the asymmetry — and for a PROJECT caller approving an EPIC, this IS the cross-account review hop the whole project-tier identity design exists for. Replaces jira_transition(key, \"Done\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
@@ -755,9 +755,27 @@ export function atlassianTools(
         return { results };
       },
     },
+    tell_peer: {
+      description:
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments), but the WAKE this comment can trigger is BEST EFFORT: Confluence footer-comment ids are not monotonic with creation time, and the project wake path\'s MAX-id watermark comparison can silently fail to notice a comment whose id lands below the recipient\'s current max — no error on either side, indistinguishable from the peer simply not having answered yet. That defect is BUTCHR-195, not this verb\'s to fix. ' +
+        'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
+        'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
+      input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },
+      handler: async (a, c) => {
+        const who = requireProjectCaller(
+          c,
+          "tell_peer",
+          "peers are a relationship between projects — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has",
+        );
+        const { peer, text, intent } = a as { peer: string; text: string; intent: PeerIntent };
+        const result = await tellPeer(ops, who, peer, text, intent);
+        audit(c, `tell_peer → ${peer} (intent=${intent})`);
+        return result;
+      },
+    },
     submit_to_boss: {
       description:
-        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS AT ALL: this is the one transition an agent is always entitled to make about itself. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review"). REFUSES A PROJECT CALLER (BUTCHR-71): a project has nothing to submit to — it never reaches a terminal state and is talked to by comments on its own root doc instead (see report_to_boss/ask_boss).',
+        'Move the CALLER\'S OWN ticket to In Review — the event that wakes the caller\'s boss. TAKES NO ARGUMENTS: the only ticket it can ever act on is the caller\'s own, so there is nothing to get wrong — but it is NOT unconditional (BUTCHR-193): it REFUSES when the caller still has an open worker of its own, naming it, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. A worker never moves itself to Done — reaching Done needs a second identity to have looked, which is the review hop finish_worker exists for. Replaces jira_transition(my_own_key, "In Review"). REFUSES A PROJECT CALLER (BUTCHR-71): a project has nothing to submit to — it never reaches a terminal state and is talked to by comments on its own root doc instead (see report_to_boss/ask_boss).',
       input: {},
       handler: async (_a, c) => {
         refuseProjectCaller(c, "submit_to_boss", "a project has nothing to submit to — it never reaches a terminal state (BUTCHR-62's design); it is talked to by comments on its own root doc instead");
@@ -772,6 +790,7 @@ export function atlassianTools(
       description:
         "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
         "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
+        "ALSO REFUSES when the caller still has an open worker of its own (BUTCHR-193) — additive and orthogonal to the has-a-boss refusal above, which this leaves untouched: naming the open worker, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. " +
         "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
         "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built. " +
         "REFUSES A PROJECT CALLER (BUTCHR-71) — that tier above epics has now arrived: a project is never \"done\" (BUTCHR-62's design keeps it sleeping/waking on events indefinitely, never reaching a terminal state), refused at the tool-registration layer here, WITHOUT this verb's own implementation being touched at all.",

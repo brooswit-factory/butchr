@@ -110,6 +110,20 @@ export interface LoopDeps {
    */
   checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
   /**
+   * BUTCHR-200: run the abandoned-worker detector (src/agents/abandoned.ts)
+   * over this poll's already-fetched `issues` snapshot — same placement
+   * rule as `checkParked` above, and for the same reason: fetch-stage work
+   * over the snapshot `observe()` just produced, not downstream diff/notify
+   * work. Takes no `related` (unlike `checkParked`): this detector's
+   * candidates ARE `issues` themselves (each already-staffed worker's own
+   * boss status arrives pre-hydrated on its `issuelinks`), so there is
+   * nothing here for a `related` walk to add. Optional; omitted, abandoned-
+   * worker detection simply never runs. Never throws (see abandoned.ts),
+   * awaited inside the same observe function as `checkParked`, same
+   * heartbeat-safety guarantee.
+   */
+  checkAbandoned?: (issues: readonly JiraIssue[]) => Promise<void>;
+  /**
    * BUTCHR-57: called once per poll when the NOTIFY stage (the `onChange`
    * callback below — changed-key diffing, suppression checks, `deps.notify`
    * sends) concludes without throwing, including the zero-nudges case where
@@ -522,6 +536,8 @@ export interface GenericLoopDeps<T> {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
+  /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above — same placement rule as `checkParked`, no `related` needed. Optional; omitted, abandoned-worker detection simply never runs. */
+  checkAbandoned?: (issues: readonly T[]) => Promise<void>;
   /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
   /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
@@ -625,6 +641,14 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
           await deps.checkParked(issues, related);
         } catch (e) {
           deps.log?.(`WARNING: [parked] checkParked threw: ${(e as Error)?.message ?? e}`);
+        }
+      }
+      // Same belt-and-suspenders wrap as checkParked above (BUTCHR-200).
+      if (deps.checkAbandoned) {
+        try {
+          await deps.checkAbandoned(issues);
+        } catch (e) {
+          deps.log?.(`WARNING: [abandoned] checkAbandoned threw: ${(e as Error)?.message ?? e}`);
         }
       }
       deps.onPollSuccess?.();
@@ -736,6 +760,7 @@ export function startLoop(deps: LoopDeps): Stop {
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
     ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
+    ...(deps.checkAbandoned ? { checkAbandoned: deps.checkAbandoned } : {}),
     ...(deps.log ? { log: deps.log } : {}),
     intervalMs: deps.intervalMs,
     ...(deps.onError ? { onError: deps.onError } : {}),

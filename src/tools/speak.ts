@@ -92,8 +92,17 @@ export async function speakOnOwnChannel(
   return ops.addComment(callerKey, taggedText);
 }
 
-/** Minimal escaping for plain text dropped into a storage-format XHTML paragraph — the same three characters `confluence_create_page`'s own guidance warns a caller to pass raw, unescaped, in the other direction (this function is what does that escaping FOR text we didn't ask the caller to format). */
-function escapeStorageText(text: string): string {
+/**
+ * Minimal escaping for plain text dropped into a storage-format XHTML
+ * paragraph — the same three characters `confluence_create_page`'s own
+ * guidance warns a caller to pass raw, unescaped, in the other direction
+ * (this function is what does that escaping FOR text we didn't ask the
+ * caller to format). EXPORTED (BUTCHR-185/BUTCHR-215) so `tell_peer`
+ * (src/tools/relationship.ts) can reuse this exact escaper instead of
+ * writing a second one that could drift from it — `unwrapStorageParagraph`
+ * below is this escaper's exact inverse, and the two must never disagree.
+ */
+export function escapeStorageText(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 

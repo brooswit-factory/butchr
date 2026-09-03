@@ -73,6 +73,25 @@ function makeWorld() {
   const ops: AtlassianOps = {
     getIssue: async (key: string) => {
       const i = requireIssue(key);
+      // BUTCHR-193: derive the OUTWARD `Implements` links too — every OTHER
+      // issue whose own `bossKey === key` is one of THIS issue's workers,
+      // the mirror of the inward `bossKey` read just above. Hydrated with
+      // EXACTLY the field set MEASURED off real Jira (BUTCHR-156's own
+      // outward link to BUTCHR-127, 2026-09-02): issuetype, priority,
+      // status, summary — deliberately NEVER labels, even for a worker that
+      // genuinely carries one (BUTCHR-127 does, and its boss's stub still
+      // omitted it). A fake that put labels on this stub would hide the
+      // real cost `openWorkers` pays (one extra `getIssue` per non-Done
+      // worker) behind a call the real payload can never make for free.
+      const workerLinks = [...issues.entries()]
+        .filter(([, w]) => w.bossKey === key)
+        .map(([workerKey, w]) => ({
+          type: { name: "Implements" },
+          outwardIssue: {
+            key: workerKey,
+            fields: { issuetype: { name: w.issuetype }, priority: w.priority ? { name: w.priority } : undefined, status: { name: w.status }, summary: w.summary ?? `${workerKey} summary` },
+          },
+        }));
       return {
         self: `https://fake.atlassian.net/rest/api/3/issue/${key}`,
         fields: {
@@ -82,7 +101,7 @@ function makeWorld() {
           status: { name: i.status },
           labels: i.labels,
           assignee: i.assignee ? { accountId: i.assignee } : null,
-          issuelinks: i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : [],
+          issuelinks: [...(i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : []), ...workerLinks],
           description: i.description,
         },
       };
@@ -1930,6 +1949,247 @@ describe("finishWithoutABoss", () => {
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey at all
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+// ===========================================================================
+// BUTCHR-193: the three closing doors (finish_worker, finish_without_a_boss,
+// submit_to_boss) refuse when the caller (or, for finish_worker, the WORKER
+// BEING CLOSED) still has an open worker of its own — the BUTCHR-127/
+// BUTCHR-159 defect: a boss reaching Done/In Review while a worker it
+// undertook to close is still open. "Open" is defined once (relationship.ts,
+// `openWorkers`): any status other than Done, UNLESS the worker carries
+// EXEMPT_LABEL (butchr:shelved) — a recorded deferral, not silent
+// abandonment. See that function's own doc comment for the full argument;
+// these tests pin the decision, not just the mechanism.
+// ===========================================================================
+
+describe("BUTCHR-193: submit_to_boss refuses a caller with open workers of its own", () => {
+  test("THE LOAD-BEARING TEST: refuses, naming the open worker's key AND status, and both discharge verbs by name", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/BUTCHR-2/);
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/In Progress/);
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/finish_worker/);
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/shelve_worker/);
+    // and, correctly, never transitioned by the refused call.
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
+  });
+
+  test("ANTI-INVERSION: succeeds when every worker is already Done", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    await submitToBoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
+
+  test("REGRESSION: a caller with NO workers at all submits exactly as before — the common case", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
+    await submitToBoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
+
+  test("§3a DECISION — close-or-shelve: a worker carrying butchr:shelved does NOT block, because it is a recorded deferral, not silent abandonment", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do", labels: [EXEMPT_LABEL] });
+    await submitToBoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
+
+  test("COST — the common case (no workers, or all Done) costs the one added getIssue this verb now pays and NOTHING more: zero PER-WORKER reads", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    let getIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, getIssue: async (...a) => { getIssueCalls++; return ops.getIssue(...a); } };
+    await submitToBoss(spied, "BUTCHR-1");
+    expect(getIssueCalls).toBe(1); // the caller's own fetch — no per-worker read, because every worker was already Done on that same payload
+  });
+
+  test("COST — a non-Done worker costs exactly one extra getIssue (the label read) to decide shelved-or-not; a Done worker costs none", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    addIssue("BUTCHR-3", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    let getIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, getIssue: async (...a) => { getIssueCalls++; return ops.getIssue(...a); } };
+    await expect(submitToBoss(spied, "BUTCHR-1")).rejects.toThrow(/BUTCHR-3/);
+    expect(getIssueCalls).toBe(2); // one for the caller itself, one label-read for BUTCHR-3 (the only non-Done worker) — none for BUTCHR-2
+  });
+
+  test("REVIEW NIT FIX: a worker that reaches Done BETWEEN the boss's own fetch and the per-worker fetch is NOT falsely reported open — the fresh read wins over the stale stub", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" }); // stub will read "In Progress"
+    const spied: AtlassianOps = {
+      ...ops,
+      getIssue: async (key: string) => {
+        if (key === "BUTCHR-2") issues.get("BUTCHR-2")!.status = "Done"; // races to Done before the per-worker fetch resolves
+        return ops.getIssue(key);
+      },
+    };
+    await submitToBoss(spied, "BUTCHR-1"); // must NOT throw — the fresh fetch shows Done even though the stub was stale
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
+
+  test("REVIEW NIT FIX (missing-stub variant, requested explicitly by BUTCHR-191's epic): a worker whose link-stub status is entirely ABSENT but whose real status is Done does NOT block", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", status: "In Progress" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    const spied: AtlassianOps = {
+      ...ops,
+      getIssue: async (key: string) => {
+        const result: any = await ops.getIssue(key);
+        if (key === "BUTCHR-1") {
+          // Strip the outward stub's status field entirely — simulating a
+          // stub Jira never hydrates, distinct from the race test above
+          // (which has a stub present but stale).
+          for (const link of result.fields.issuelinks) {
+            if (link.outwardIssue?.key === "BUTCHR-2") delete link.outwardIssue.fields.status;
+          }
+        }
+        return result;
+      },
+    };
+    await submitToBoss(spied, "BUTCHR-1"); // must NOT throw — the fresh per-worker fetch shows Done despite the missing stub status
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+  });
+});
+
+describe("BUTCHR-193: finish_without_a_boss refuses a caller with open workers of its own — ADDITIVE to, and does not disturb, the existing has-a-boss refusal (BUTCHR-92 orthogonality)", () => {
+  test("THE LOAD-BEARING TEST: refuses a bossless caller with an open worker, naming the worker's key, status, and both discharge verbs", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/BUTCHR-2/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/In Review/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/finish_worker/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/shelve_worker/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
+  });
+
+  test("the has-a-boss refusal fires FIRST and is byte-identical to before — a caller with BOTH a boss and an open worker still gets the has-a-boss message", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-0", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-0" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/has a boss \(BUTCHR-0\)/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
+  });
+
+  test("ANTI-INVERSION: succeeds when every worker is already Done", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "Done" });
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+
+  test("REGRESSION: a bossless caller with NO workers at all closes exactly as before — the common case", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+
+  test("§3a DECISION — close-or-shelve: a worker carrying butchr:shelved does NOT block", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do", labels: [EXEMPT_LABEL] });
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+describe("BUTCHR-193: finish_worker refuses when the WORKER BEING CLOSED still has open workers of its OWN (the caller's grandchildren), not the caller's own workers", () => {
+  test("THE LOAD-BEARING TEST: refuses, naming the grandchild's key, status, and both discharge verbs", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    addIssue("BUTCHR-3", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-2", status: "In Progress" });
+    await expect(finishWorker(ops, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/BUTCHR-3/);
+    await expect(finishWorker(ops, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/In Progress/);
+    await expect(finishWorker(ops, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/finish_worker/);
+    await expect(finishWorker(ops, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/shelve_worker/);
+    // never transitioned, and the exemption-label logic never ran, by the refused call
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Review");
+  });
+
+  test("the CALLER'S OWN other workers (siblings of the one being closed) are irrelevant — only the closed worker's own children matter", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" }); // no children — closeable
+    addIssue("BUTCHR-3", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" }); // BUTCHR-1's OTHER worker, still open
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done"); // closes fine — BUTCHR-3 is BUTCHR-1's problem, not BUTCHR-2's
+  });
+
+  test("ANTI-INVERSION: succeeds when every one of the worker's own workers is already Done", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    addIssue("BUTCHR-3", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-2", status: "Done" });
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+  });
+
+  test("REGRESSION: a worker with NO workers of its own closes exactly as before — the common case", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+  });
+
+  test("§3a DECISION — close-or-shelve: a grandchild carrying butchr:shelved does NOT block finish_worker", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    addIssue("BUTCHR-3", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-2", status: "To Do", labels: [EXEMPT_LABEL] });
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+  });
+
+  test("BUTCHR-127/BUTCHR-159, reproduced then closed off: a boss cannot finish_worker a still-open worker that itself has an open worker", async () => {
+    // BUTCHR-127 (story) told BUTCHR-159 (task) "merge it, then I close you
+    // out"; BUTCHR-127 went Done while BUTCHR-159 was still open. Modelled
+    // one tier up here (an epic closing a story that still has an open
+    // task) since finish_worker's grandchild check is tier-agnostic.
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("EPIC-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("STORY-1", { issuetype: "Story", project: "BUTCHR", bossKey: "EPIC-1", status: "In Review" });
+    addIssue("TASK-1", { issuetype: "Task", project: "BUTCHR", bossKey: "STORY-1", status: "In Progress" });
+    await expect(finishWorker(ops, "EPIC-1", "STORY-1")).rejects.toThrow(/TASK-1/);
+    expect(issues.get("STORY-1")!.status).toBe("In Review"); // never silently closed out from under TASK-1
+  });
+});
+
+describe("BUTCHR-193: mutation — deleting the guard makes the refusal test fail BY NAME, not just \"a test failed\"", () => {
+  // Per this ticket's own §0/§5.5: revert the guard, confirm the named test
+  // goes red, restore. This test doesn't revert source (that's done by hand
+  // at review, see the PR body's mutation-test report) — it pins the exact
+  // assertion shape a reviewer reverts against, so "which test caught it" is
+  // never in question.
+  test("openWorkers' refusal is reachable through all three doors with the SAME worker/status pair — one guard, three call sites", async () => {
+    const worlds = {
+      submit: makeWorld(),
+      fwab: makeWorld(),
+      finish: makeWorld(),
+    };
+    worlds.submit.addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+    worlds.submit.addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    worlds.fwab.addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    worlds.fwab.addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    worlds.finish.addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    worlds.finish.addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    worlds.finish.addIssue("BUTCHR-3", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-2", status: "In Progress" });
+    await expect(submitToBoss(worlds.submit.ops, "BUTCHR-1")).rejects.toThrow(/still has open worker/);
+    await expect(finishWithoutABoss(worlds.fwab.ops, "BUTCHR-1")).rejects.toThrow(/still has open worker/);
+    await expect(finishWorker(worlds.finish.ops, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/still has open worker/);
   });
 });
 
