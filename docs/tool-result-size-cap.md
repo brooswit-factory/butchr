@@ -255,7 +255,9 @@ account above.
 
 ### The unit
 
-**MEASURED:** the quantity actually compared against the threshold is a
+**MEASURED, on the MCP path** (which is the only path this document
+measured — see the scope note below): the quantity actually compared
+against the threshold is a
 **character count**, not a byte count and not a real tokenizer's token
 count. Every error message reports "N characters," and in every case I
 checked, N exactly equals the Python `len()` (Unicode codepoint count,
@@ -294,6 +296,52 @@ would establish it: deliberately set `MAX_MCP_OUTPUT_TOKENS` to a small
 known value (e.g. 500) in the environment that launches `claude`, repeat
 BUTCHR-216's controlled growing-object experiment, and confirm the
 boundary moves proportionally.
+
+### ⚠ Scope of the unit finding: the MCP path only — another path is governed by BYTES
+
+*(Added by BUTCHR-229 at integration, from its own measurement. Everything
+above in Q2 is BUTCHR-234's work and is unchanged; this subsection exists
+because the unit claim above would otherwise read as universal, and it is
+not. No part of BUTCHR-234's measurement is retracted or amended.)*
+
+**This document measured the MCP path. It is not the only capped path, and
+the unit is not the same on all of them.** MEASURED by BUTCHR-229, on its
+own host, 2026-09-03, against plain **Bash** output — which never reaches
+butchr, the daemon, or MCP at all:
+
+| characters | bytes | shape |
+|---|---|---|
+| 9,990 | 29,970 | inline |
+| 30,000 | 30,000 | inline |
+| 30,001 | 30,001 | preview (spooled) |
+| 11,000 | 33,000 | preview (spooled) |
+
+Commands: `python3 -c "import sys; sys.stdout.write('a'*30000)"` and
+`python3 -c "import sys; sys.stdout.write('—'*11000)"`.
+
+**On that path the governing quantity is BYTES, not characters:** 30,000
+characters returned inline while 11,000 characters spooled. Only the
+multi-byte rows can discriminate — in pure ASCII the two quantities are
+identical, so no ASCII experiment can tell them apart, and every ASCII row
+above is non-discriminating by construction. *Falsifier: if 11,000
+em-dashes had returned inline, or 9,990 em-dashes (29,970 bytes) had
+spooled, the byte reading would be dead.* Neither happened.
+
+That is a **different budget** from the one measured above, which is
+consistent with Q3's finding of two separate environment variables
+(`MAX_MCP_OUTPUT_TOKENS` vs `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS`).
+
+**What this means for anyone choosing a unit for a size bound:** do not
+carry "the unit is a character count" across path boundaries. Establish
+the unit for the path you are actually bounding. In this corpus the two
+quantities diverge by a real margin — em dashes and arrows are everywhere
+— so picking the wrong one is wrong by more than a rounding error.
+
+**Not established:** whether the ~30,000-byte Bash threshold and the MCP
+threshold are the same underlying mechanism with different budgets, or two
+mechanisms. All MCP observations here sit far above 30,000 bytes, so
+nothing in this document distinguishes them. What would settle it: an MCP
+call whose result size can be tuned near 30,000 bytes.
 
 ---
 
@@ -481,6 +529,15 @@ time to rule out subtler effects inside the becalming window.
   project-tier identity I don't have on this ticket.
 - Whether any agent has been silently affected beyond the one originating
   incident I found and confirmed was *not* silent (Q5).
+- **Any capped path other than the MCP one.** This document measured the
+  MCP path only. At least one other path exists and is governed by a
+  *different unit*: plain Bash output caps at **30,000 bytes**, where the
+  governing quantity is bytes rather than characters (BUTCHR-229's
+  measurement, added at integration — see the scope subsection in Q2).
+  Whether the two are one mechanism with different budgets or two
+  mechanisms is **not established**; nothing here distinguishes them,
+  because every MCP observation in this document sits far above 30,000
+  bytes.
 
 ---
 
