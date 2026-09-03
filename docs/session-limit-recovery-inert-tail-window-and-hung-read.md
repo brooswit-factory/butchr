@@ -450,6 +450,24 @@ alone is sufficient for that, and was confirmed directly.
   content line before the composer prompt, skipping known status-line
   patterns," which would be robust to chrome count changing in future
   Claude Code versions.
+
+  **This is a constraint on that fix, not a detail to defer to
+  implementation:** `REFUSAL_LINE`'s own comment excludes "a `⎿` tool-result
+  line" by name, and `TAIL_LINES`' own comment explains why — the refusal
+  phrase sits verbatim in KAN-804 and KAN-807's own ticket text, so an
+  unanchored or over-broadly-anchored match would close a perfectly healthy
+  pane the moment an agent merely reads either ticket. A naive strip of
+  `⎿`-and-whitespace before anchoring **removes that exact protection**, so
+  the anchor fix and the false-close guard have to be solved together, not
+  sequentially, or "fixed" recovery starts killing working agents instead of
+  leaving stuck ones stuck. Sharper still: the genuine banner and a rendered
+  KAN-804/807 ticket body both render as `⎿`-prefixed tool-result lines with
+  the identical leading code points found above — **prefix-stripping cannot
+  distinguish them, because the prefix is not the discriminating signal.**
+  Whatever the fix is, it needs a signal other than the line's leading
+  characters — recency/position within the *live* pane state, or the
+  presence or absence of surrounding ticket-body context, are the kinds of
+  signal that could work; this document is not proposing which.
 - Give `HerdrClient` a real `timeoutMs` in `daemon/index.ts`, and/or wrap
   each row's `deps.read()` in `watchSessionLimits` with its own timeout,
   so one wedged pane read can no longer freeze the whole polling loop
