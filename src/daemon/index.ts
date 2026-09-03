@@ -36,6 +36,7 @@ import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
+import { createReaper } from "../agents/reap.js";
 
 let config;
 try {
@@ -268,6 +269,33 @@ const projectReconcileFailureDetector = createReconcileFailureDetector({
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-245: per-poll reclamation of a workspace whose agent exited on its
+// own — see src/agents/reap.ts for the full mechanism (the ownership join,
+// the grace period, the per-poll cap). TWO SEPARATE INSTANCES, same
+// reasoning as issueCrashLoopDetector/projectCrashLoopDetector above: each
+// `runResourceLoop` call needs its own `ReapGuard` (grace-period state),
+// same "one instance per loop" discipline `RespawnGuard` already follows.
+// Both operate on the SAME shared herd namespace (there is no per-loop
+// scoping here — reclamation is scoped to the WORKSPACE, never to an issue
+// key, so `scopedHerd`'s ownsId filtering does not apply and is not used):
+// whichever loop's poll observes a candidate clear its grace period first
+// closes it; the other loop's own tracker simply stops seeing that
+// workspace in its next `workspace.list()` snapshot and never attempts a
+// second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
+// wrapper) is used directly — `strandedCandidates`/`closeStranded` are
+// HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+const issueReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
+const projectReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: async () => {
@@ -383,6 +411,10 @@ runResourceLoop(issueResourceType, {
   checkCrashLoop: issueCrashLoopDetector.check,
   // BUTCHR-147: see src/agents/reconcile-failure.ts.
   checkReconcileFailure: issueReconcileFailureDetector.check,
+  // BUTCHR-245: the issue tier is the fast, high-volume loop (15s) — the
+  // one most likely to actually clear a stranded workspace's grace period
+  // quickly. See src/agents/reap.ts.
+  checkReap: issueReaper.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -452,6 +484,11 @@ runResourceLoop(projectResourceType, {
   checkCrashLoop: projectCrashLoopDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
+  // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
+  // single-tier restriction, and this loop's own `workspace.list()` poll
+  // (5min cadence) is still a valid independent chance to catch a candidate
+  // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
+  checkReap: projectReaper.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
