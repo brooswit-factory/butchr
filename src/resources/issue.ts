@@ -58,8 +58,29 @@ export const ISSUE_JQL = 'assignee = currentUser() AND status IN ("In Progress",
  * still audible. See `abandonedCandidates`'s own doc comment for why the
  * PREDICATE needed no change once this feeds it: it was already total over
  * a To Do worker with a Done inward Implements stub.
+ *
+ * BUTCHR-251: `ORDER BY created ASC, key ASC` is deliberate, and NOT a copy
+ * of `ISSUE_JQL`'s `ORDER BY updated DESC` above — that would be the wrong
+ * fix here. The defect this closes isn't a measured instability in Jira's
+ * default ordering; it's that an ORDER BY-less query has NO ordering
+ * contract at all, so `search()`'s `maxResults = 100` cap (src/atlassian/
+ * client.ts) silently decides which rows come back on an unpromised
+ * property (BUTCHR-195's defect class). `updated` is explicitly rejected as
+ * the key: it mutates every time a ticket is touched, so under the same cap
+ * the window's membership still shifts as tickets are edited — a
+ * differently-unstable set, not a stable one. `ISSUE_JQL` gets away with
+ * `updated` only because its population (In Progress/In Review) is bounded
+ * by what the fleet can actually staff and cannot approach the cap; the To
+ * Do backlog this query reads is bounded by nothing, so the same choice
+ * would not be safe here. `created` is immutable per issue and orders
+ * oldest-first, so under a cap the longest-stranded tickets are the ones
+ * that stay visible — the right bias for an abandonment detector, though a
+ * secondary nicety, not the justification. `key` is unique and immutable
+ * and breaks any `created` tie, making the order total: without it, equal
+ * `created` values would leave order unspecified again, the very thing
+ * being fixed, in miniature.
  */
-export const TODO_WORKER_JQL = 'assignee = currentUser() AND status = "To Do"';
+export const TODO_WORKER_JQL = 'assignee = currentUser() AND status = "To Do" ORDER BY created ASC, key ASC';
 
 /**
  * Deliberate, commented (BUTCHR-69 criterion 3): distinguishes an ISSUE key
