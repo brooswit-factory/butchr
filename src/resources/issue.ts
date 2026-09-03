@@ -45,6 +45,23 @@ import type {
 export const ISSUE_JQL = 'assignee = currentUser() AND status IN ("In Progress", "In Review") ORDER BY updated DESC';
 
 /**
+ * BUTCHR-240: a SEPARATE, narrower query, fed only to
+ * `createAbandonedDetector`'s optional `todoWorkers` dep
+ * (src/agents/abandoned.ts) — never folded into `ISSUE_JQL` above.
+ * `ISSUE_JQL` is the fleet's ACTIVE SET: spawning, stall detection, the
+ * label layer and reconcile all read the poll it drives, so adding `"To
+ * Do"` there would staff an agent for every To Do ticket in the backlog, a
+ * blast radius far past this one detector. This query exists so a To Do
+ * worker whose `Implements` boss has already reached Done — invisible to
+ * `ISSUE_JQL` and therefore to `parked.ts` and `abandoned.ts` alike, since
+ * the orphan machinery also can't see it (its boss link is intact) — is
+ * still audible. See `abandonedCandidates`'s own doc comment for why the
+ * PREDICATE needed no change once this feeds it: it was already total over
+ * a To Do worker with a Done inward Implements stub.
+ */
+export const TODO_WORKER_JQL = 'assignee = currentUser() AND status = "To Do"';
+
+/**
  * Deliberate, commented (BUTCHR-69 criterion 3): distinguishes an ISSUE key
  * ("ABC-123") from a Jira PROJECT key ("ABC") for the Implements-chain
  * `related` walk below.
@@ -143,6 +160,19 @@ export interface IssueResourceDeps {
  * I/O adapter over routes.ts: this function fetches links and hydrates
  * issues; routes.ts decides which links are routed.
  */
+/**
+ * BUTCHR-240: the `todoWorkers` fetch seam `createAbandonedDetector`
+ * (src/agents/abandoned.ts) optionally takes — a single `deps.search(...)`
+ * call, the same house pattern `createRelated` below uses for its own
+ * batched extra query. Lives here, beside `TODO_WORKER_JQL`, rather than
+ * inside `abandoned.ts` itself, so that module's dependency surface never
+ * has to import a JQL string or know how a search is actually issued — it
+ * only takes a `() => Promise<JiraIssue[]>` function.
+ */
+export function createTodoWorkersFetch(deps: Pick<IssueResourceDeps, "search">): () => Promise<JiraIssue[]> {
+  return () => deps.search(TODO_WORKER_JQL);
+}
+
 function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
   return async (active: readonly string[]): Promise<RelatedResource<JiraIssue>[]> => {
     const keys = active.filter((k) => ISSUE_KEY_RE.test(k));
