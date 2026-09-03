@@ -9,7 +9,7 @@ import {
   type Disposition, type PeerIntent,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
-import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
+import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -665,7 +665,7 @@ export function atlassianTools(
     },
     check_in: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). Your LAST ACT before exiting: records "I have acted on everything I can currently see" so this project goes back to sleep rather than waking again on the same, already-handled state. TAKES NO ARGUMENTS: it re-reads your OWN current root-doc version, newest root-doc comment, and every epic you currently have In Review directly from Jira/Confluence — it never trusts a value you hand it, the same way nothing else in this system trusts a caller-supplied fact where a server read is available. Call this ONLY after you have actually finished acting on what woke you — calling it early against a rule or a suppression you are not designing yourself is exactly how you would go back to sleep with something unhandled. Idempotent: calling it again with nothing new to report simply re-records the same current state. Never call this on behalf of another project — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). Your LAST ACT before exiting: records "I have acted on everything I can currently see" so this project goes back to sleep rather than waking again on the same, already-handled state. TAKES NO ARGUMENTS: it re-reads your OWN current root-doc version, every root-doc comment id, and every epic you currently have In Review directly from Jira/Confluence — it never trusts a value you hand it, the same way nothing else in this system trusts a caller-supplied fact where a server read is available. Call this ONLY after you have actually finished acting on what woke you — calling it early against a rule or a suppression you are not designing yourself is exactly how you would go back to sleep with something unhandled. Idempotent: calling it again with nothing new to report simply re-records the same current state (BUTCHR-227: recording is a SET UNION, so a repeat call can only ever add ids already present, never regress anything). Never call this on behalf of another project — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(c, "check_in");
@@ -676,13 +676,22 @@ export function atlassianTools(
           ops.search(`project = ${who} AND issuetype = Epic AND status = "In Review"`, 200) as Promise<{ issues?: Array<{ key: string }> }>,
         ]);
         const version = versions[doc.id];
-        const comment = newestCommentId(comments.results);
-        // `epics` is a REPLACE, not a merge (advanceProjectWatermark's own
-        // doc comment) — this is what prunes an epic that has left review
-        // since the last check-in, so re-entry is detectable by absence
-        // again. It is therefore built and passed EVERY call, even when
-        // empty ({} correctly clears every previously-recorded entry for a
-        // project with nothing in review right now).
+        // BUTCHR-227: records the FULL observed id set, not a "newest"
+        // scalar — see src/resources/project.ts's `ProjectWatermark.commentsSeen`
+        // and `advanceProjectWatermark`'s own doc comments. This is
+        // WRITER A: it can only ever ADD ids (advanceProjectWatermark
+        // unions), never regress the watermark — WRITER B, the
+        // self-suppression write in src/tools/speak.ts, is the other half.
+        const seenComments = comments.results.map((c) => c.id);
+        // `epics` is a REPLACE of the KEY SET, not a merge
+        // (advanceProjectWatermark's own doc comment) — this is what prunes
+        // an epic that has left review since the last check-in, so
+        // re-entry is detectable by absence again. It is therefore built
+        // and passed EVERY call, even when empty ({} correctly clears every
+        // previously-recorded key for a project with nothing in review
+        // right now). Per-key VALUES are unioned by advanceProjectWatermark,
+        // never replaced — see that function's own doc comment for why
+        // (getIssueComments's cap, below).
         //
         // ops.getIssueComments (NOT getIssue's embedded fields.comment
         // block) per in-review epic, deliberately: an EARLIER version of
@@ -695,37 +704,35 @@ export function atlassianTools(
         // so the two can never disagree by construction. Usually zero
         // calls: most polls have no epic in review at all.
         //
-        // CORRECTED (BUTCHR-198/BUTCHR-202): the previous version of this
-        // comment called discovery's reader "always correct" for this
-        // purpose. That overstated it: the value below is
-        // `newestCommentId(...)` (src/resources/project.ts) — a NUMERIC MAX
-        // reduce over the reader's results, which discards the reader's
-        // newest-first order entirely and re-derives "newest" from id
-        // magnitude instead. This epics-in-review watermark therefore
-        // shares the IDENTICAL max-by-numeric-id mechanism as the Confluence
-        // root-doc watermark (`comment` above, same function) — by
-        // construction, not coincidence — and its correctness depends on
-        // Jira issue-comment ids being monotonic with creation time, a
-        // premise that is, as of BUTCHR-202, UNMEASURED (unlike the
-        // Confluence case, measured twice independently to be FALSE). The
-        // reader being newest-first does not protect this line: nothing
-        // downstream of it consults that order.
-        const epics: Record<string, string | null> = {};
+        // CORRECTED (BUTCHR-198/BUTCHR-227): this comment used to say
+        // discovery's reader was "always correct", then (BUTCHR-198/202)
+        // that the watermark below was a max-by-numeric-id reduce whose
+        // correctness rested on an UNMEASURED Jira id-monotonicity
+        // premise. BUTCHR-227 removes the dependence on that premise
+        // entirely rather than measuring it: the value recorded below is
+        // the FULL observed id SET, and "seen" is set membership, not
+        // "equal to the newest id by any ordering". `getIssueComments`'s
+        // own doc comment on `AtlassianOps` states its `maxResults` cap —
+        // that cap is a still-live pagination blind spot (an id outside
+        // the window is never observed, so never seen, so never wakes
+        // anything), unchanged and unfixed by this ticket; it is not the
+        // id-monotonicity defect this ticket does fix.
+        const epics: Record<string, readonly string[]> = {};
         for (const epic of epicsRaw?.issues ?? []) {
-          epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
+          epics[epic.key] = (await ops.getIssueComments(epic.key)).results.map((c) => c.id);
         }
-        audit(c, `check_in (version=${version ?? "?"}, comment=${comment ?? "none"}, epics in review=${Object.keys(epics).length})`);
+        audit(c, `check_in (version=${version ?? "?"}, comments seen=${seenComments.length}, epics in review=${Object.keys(epics).length})`);
         await advanceProjectWatermark(ops, who, {
           ...(version !== undefined ? { version } : {}),
-          ...(comment !== null ? { comment } : {}),
+          seenComments,
           epics,
         });
-        return { ok: true, key: who, version: version ?? null, comment, epics };
+        return { ok: true, key: who, version: version ?? null, seenComments, epics };
       },
     },
     get_doc_comments: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns), and that is FINE: as of BUTCHR-227, the wake path this verb feeds no longer depends on comment ordering AT ALL. CORRECTED (BUTCHR-198/BUTCHR-227): an earlier version of this description advised sorting by `id` numerically to recover newest-first order — do not do that, Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs). BUTCHR-198 documented that finding without changing behavior; BUTCHR-227 is the behavioral fix, and it does not repair ordering — it REMOVES THE DEPENDENCE ON ORDERING. `check_in` (this project\'s own last-act verb) now records every comment id this verb can see as a SEEN SET, compared by membership, never by "newest": there is still no reliable way to recover a newest-first order from this verb\'s output, and none is needed for the wake path to work correctly. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(
@@ -757,7 +764,7 @@ export function atlassianTools(
     },
     tell_peer: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments), but the WAKE this comment can trigger is BEST EFFORT: Confluence footer-comment ids are not monotonic with creation time, and the project wake path\'s MAX-id watermark comparison can silently fail to notice a comment whose id lands below the recipient\'s current max — no error on either side, indistinguishable from the peer simply not having answered yet. That defect is BUTCHR-195, not this verb\'s to fix. ' +
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). The WAKE this comment can trigger is still BEST EFFORT, but for a DIFFERENT, honest reason: the recipient\'s reader has a page-window/pagination bound (see `getPageComments`\'s own doc comment on AtlassianOps) — a comment that never appears inside that window is never observed, therefore never wakes anything, regardless of its id. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
         'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
         'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
       input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },

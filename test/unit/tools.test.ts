@@ -1518,31 +1518,47 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing/);
   });
 
-  test("with nothing in review: watermarks version and comment, and REPLACES epics with {} (pruning any stale entries)", async () => {
-    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }] });
+  // BUTCHR-227: this assertion's SHAPE changed (from a `comment`/`epics`
+  // scalar echo to a `seenComments`/`epics` SET echo) because check_in's
+  // own return/write shape changed — the property under test (nothing in
+  // review prunes any stale epic KEY; the observed root-doc comment ends up
+  // recorded) is unchanged, not weakened.
+  // BUTCHR-227 THE LOOP-VS-BATCH FALSIFIER (BUTCHR-208, via BUTCHR-195):
+  // THREE root-doc comments, deliberately not in id order — a mutation
+  // that records only the max, only the first, or only the last would pass
+  // a single-comment fixture but must fail this one. Failure condition: any
+  // of "99"/"5"/"777" missing from `seenComments` below.
+  test("with nothing in review: watermarks version and records EVERY observed comment id as seen (not a max, not a subset), and REPLACES epicsSeen with {} (pruning any stale entries)", async () => {
+    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }, { id: "5", body: "lo" }, { id: "777", body: "mid" }] });
     // Seed a stale epic entry, as if watermarked during a PRIOR review episode.
-    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: null, epics: { "BUTCHR-9": "50" } } });
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, commentsSeen: [], epicsSeen: { "BUTCHR-9": ["50"] } } });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     const result = await tools.check_in!.handler({}, conn);
-    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, comment: "99", epics: {} });
-    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, comment: "99", epics: {} }); // BUTCHR-9 pruned
+    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, seenComments: ["99", "5", "777"], epics: {} });
+    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, commentsSeen: ["99", "5", "777"], epicsSeen: {} }); // BUTCHR-9 pruned
   });
 
   // BUTCHR-81 (found at review): check_in must read epic comments via the
   // SAME reader discovery uses (getIssueComments — newest-first, capped),
   // never getIssue's embedded fields.comment block (measured ascending/
   // oldest-first with an unconfirmed cap) — otherwise the two readers could
-  // disagree on "newest" and the watermark would never catch up.
-  test("with an epic in review: fetches ITS comments via getIssueComments (the SAME reader discovery uses, not getIssue's embedded block), and watermarks it", async () => {
+  // disagree on which ids exist at all.
+  //
+  // BUTCHR-227: this assertion's SHAPE changed (from "newest by numeric
+  // value" to "every observed id, as a set") because check_in no longer
+  // derives or stores a "newest" scalar at all — the property under test
+  // (check_in reads via getIssueComments, and its result ends up recorded)
+  // is unchanged, not weakened.
+  test("with an epic in review: fetches ITS comments via getIssueComments (the SAME reader discovery uses, not getIssue's embedded block), and records EVERY observed id as seen", async () => {
     const { tools, properties, getIssueCommentsCalls } = checkInRig({
       epicsInReview: [{ key: "BUTCHR-9" }],
       epicComments: { "BUTCHR-9": [{ id: "101" }, { id: "202" }] },
     });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
-    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string> };
-    expect(result.epics).toEqual({ "BUTCHR-9": "202" }); // newest by numeric value
+    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string[]> };
+    expect(result.epics).toEqual({ "BUTCHR-9": ["101", "202"] }); // every observed id, not just the numeric max
     expect(getIssueCommentsCalls).toEqual(["BUTCHR-9"]);
-    expect((properties.get("BUTCHR") as any).wake.epics).toEqual({ "BUTCHR-9": "202" });
+    expect((properties.get("BUTCHR") as any).wake.epicsSeen).toEqual({ "BUTCHR-9": ["101", "202"] });
   });
 
   test("no epics in review at all -> zero getIssueComments calls (the usual case)", async () => {
@@ -1552,12 +1568,25 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     expect(getIssueCommentsCalls).toEqual([]);
   });
 
-  test("no root-doc comments yet -> comment watermark stays unadvanced (null), not clobbered to null over a real prior value", async () => {
+  // BUTCHR-227: this assertion's SHAPE changed — the legacy scalar write
+  // path this test exercised (a `null`-safety guard on `advanceProjectWatermark`'s
+  // old `comment ?? wake.comment ?? null` composition) no longer exists;
+  // `seenComments` is now always a UNION, so an empty observed set simply
+  // unions nothing in. The property under test survives: a project's
+  // ALREADY-SEEN state (here, a legacy `comment` scalar) is never lost when
+  // this poll observes zero comments. This ALSO proves the migration
+  // composes correctly with the writer: the legacy scalar seeds
+  // `commentsSeen` on read, and that seeded id survives the write below —
+  // see `normalizeWake`'s own doc comment for why the union must run
+  // against the MIGRATED value, not the raw stored JSON.
+  test("no root-doc comments yet -> nothing new to union in; a legacy `comment` scalar survives untouched AND its id is migrated into commentsSeen", async () => {
     const { tools, properties } = checkInRig({ rootDocComments: [] });
     properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: "42", epics: {} } });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     await tools.check_in!.handler({}, conn);
-    expect((properties.get("BUTCHR") as any).wake.comment).toBe("42"); // untouched — omitted from the patch, not overwritten with null
+    const wake = (properties.get("BUTCHR") as any).wake;
+    expect(wake.comment).toBe("42"); // legacy scalar untouched — forensic, never deleted
+    expect(wake.commentsSeen).toEqual(["42"]); // migrated in, not lost, even though this poll observed nothing new
   });
 });
 

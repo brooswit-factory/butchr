@@ -3,7 +3,6 @@ import {
   createProjectResourceType,
   projectVerdict,
   advanceProjectWatermark,
-  newestCommentId,
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
 import { speakOnOwnChannel } from "../../src/tools/speak.js";
@@ -20,11 +19,28 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
  * auto-incrementing `commentOnPage` id, as several sibling test files' local
  * `makeOps` helpers use) cannot exercise the one dimension this file is
  * about — Confluence footer-comment ids are NOT monotonic with creation
- * order (measured live, `newestCommentId`'s own doc comment in
- * src/resources/project.ts) — so this file's fake `commentOnPage` returns
+ * order (measured live; see src/resources/project.ts's own module-level
+ * measurement notes) — so this file's fake `commentOnPage` returns
  * CALLER-CHOSEN ids, including ids lower than ids already on the page,
  * exactly the shape a type-faithful-but-behaviorally-wrong fixture would
  * never produce.
+ *
+ * BUTCHR-227 UPDATE, PER BUTCHR-199's OWN INSTRUCTION ("your PR will break
+ * some of these deliberately-pinned characterization tests, and that break
+ * IS THE SIGNAL, not your bug — update them test-by-test, never flatten
+ * green"): this file pinned TODAY'S (BROKEN) behavior at BUTCHR-217. The
+ * F5/F6 "specimen's mechanism" block below is the exact defect BUTCHR-227
+ * fixes — its assertions are INVERTED below (from "regresses and wakes" to
+ * "does not regress, stays asleep"), with the old assertions kept in a
+ * comment so a reader can see exactly what changed and why. Every other
+ * block in this file characterizes something BUTCHR-227 explicitly does
+ * NOT touch (the version axis, F7's silent-write-failure path, the
+ * author/content-blindness of the predicate) and is updated ONLY for the
+ * renamed fields (`observedCommentId` -> `observedCommentIds`,
+ * `watermark.comment` -> `watermark.commentsSeen`), never for behavior —
+ * `newestCommentId` itself no longer exists (BUTCHR-227 deleted it, having
+ * no remaining callers) so this file's one direct use of it is rewritten
+ * against `advanceProjectWatermark`'s new `seenComments` writer shape.
  *
  * Every describe block states its own failure condition first, per this
  * ticket's evidence-discipline requirement.
@@ -206,7 +222,11 @@ describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS: a project's own root-doc BODY 
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     expect(resource.observedVersion).toBe(6); // Confluence bumped it
     expect(resource.watermark.version).toBe(5); // never advanced — only check_in could
-    expect(resource.observedCommentId).toBe(resource.watermark.comment); // comment axis: still caught up, untouched by this edit
+    // BUTCHR-227 field rename only (observedCommentId -> observedCommentIds,
+    // watermark.comment -> watermark.commentsSeen): the PROPERTY under test
+    // — the comment axis stays fully caught up, untouched by this edit — is
+    // unchanged; `unseenCommentIds` is the direct expression of "caught up".
+    expect(resource.unseenCommentIds).toEqual([]); // comment axis: still caught up, untouched by this edit
     expect(verdict).toBe("active"); // wakes on the version axis alone
 
     // Traced through to an actual spawn decision, same as the comment-axis
@@ -232,19 +252,26 @@ describe("end-to-end: the OPPOSITE direction — a genuine foreign comment must 
   });
 });
 
-describe("THE SPECIMEN'S MECHANISM: non-monotonic Confluence ids turn the suppression's OWN bookkeeping into a self-wake (F5/F6)", () => {
-  // Failure condition for this whole block: if this does NOT reproduce
-  // "active" from a write that never involved a foreign comment, then F5 is
-  // FALSIFIED (the blind overwrite never fires in the regressing direction)
-  // and the epic's hypothesis-to-kill is dead — that would itself be the
-  // finding to report. It DOES reproduce below, so F5/F6 are CONFIRMED live
-  // in today's code: `advanceProjectWatermark` is a blind overwrite (no max,
-  // no monotonic guard — see its own source) and `newestCommentId` is a
-  // pure max-by-numeric-id reduce over ALL comments including ones the
-  // watermark write skipped past.
-  test("a daemon complaint (frozen-asleep's own addComment, via the REAL speakOnOwnChannel seam) posted with a LOWER id than an already-caught-up watermark regresses the watermark and WAKES the project — with zero foreign comments involved", async () => {
-    // Set up: the project already checked in once, caught up to the highest
-    // id then on the page (id "500") — an entirely ordinary, healthy state.
+describe("THE SPECIMEN'S MECHANISM, BUTCHR-227 UPDATE: F5/F6 is FIXED — this block's assertions are INVERTED from BUTCHR-217's pinned (broken) behavior, on purpose", () => {
+  // BUTCHR-217's ORIGINAL failure condition (kept for the record): "if this
+  // does NOT reproduce 'active' from a write that never involved a foreign
+  // comment, then F5 is FALSIFIED". That was correct for the CODE AT THAT
+  // TIME (a blind scalar overwrite). BUTCHR-227 changes the code, so the
+  // SAME setup must now produce the OPPOSITE verdict — a test that still
+  // asserted "active" here would be asserting that this ticket's own fix
+  // did not work.
+  //
+  // THIS BLOCK'S NEW FAILURE CONDITION, stated before looking: if this
+  // reproduces "active" from a write that never involved a foreign comment,
+  // BUTCHR-227's fix DID NOT WORK — the exact defect it exists to close is
+  // still live. It does not reproduce "active" below (proven by running the
+  // test), so the fix holds against this specimen.
+  test("BUTCHR-227 FIXED: a daemon complaint posted with a LOWER id than an already-caught-up watermark no longer regresses anything, and the project stays ASLEEP — zero foreign comments involved", async () => {
+    // Set up: identical to BUTCHR-217's original fixture — the project
+    // already checked in once, caught up to the highest id then on the page
+    // (id "500", stored as the LEGACY scalar shape check_in used to write —
+    // this ALSO exercises the migration adapter, seeding `commentsSeen` with
+    // exactly one member, "500").
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -264,33 +291,41 @@ describe("THE SPECIMEN'S MECHANISM: non-monotonic Confluence ids turn the suppre
     await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME has read \"asleep\" with its agent still running...");
 
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    // The watermark was blindly overwritten to the LOWER just-posted id...
-    expect(resource.watermark.comment).toBe("300");
-    // ...while the true numeric max on the page is still "500" (the
-    // suppression write never looked at it) — the mismatch this ticket's
-    // hypothesis predicts.
-    expect(resource.observedCommentId).toBe("500");
-    // ...and the project WAKES, purely from its own suppressed write. This
-    // is the specimen's reported shape: "wakes on a stale comment rather
-    // than on the complaint itself."
-    expect(verdict).toBe("active");
+    // BUTCHR-217 (BEFORE, now WRONG): `expect(resource.watermark.comment).toBe("300")`
+    // — the scalar watermark was blindly overwritten to the LOWER id, losing "500".
+    // BUTCHR-227 (NOW): a UNION, never a replace — both ids are seen.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "300"]));
+    // BUTCHR-217 (BEFORE, now WRONG): `expect(resource.observedCommentId).toBe("500")`
+    // — a single "newest by magnitude" scalar. BUTCHR-227 (NOW): the FULL
+    // observed set, unordered by construction.
+    expect(new Set(resource.observedCommentIds)).toEqual(new Set(["500", "300"]));
+    // THE FIX ITSELF: nothing is unseen, so the project does NOT wake purely
+    // from its own suppressed write — the specimen's reported shape
+    // ("wakes on a stale comment rather than on the complaint itself") no
+    // longer reproduces.
+    expect(resource.unseenCommentIds).toEqual([]);
+    expect(verdict).toBe("asleep");
 
-    // F6 — traced through to an ACTUAL SPAWN DECISION, not reasoned on
-    // paper: `desiredFrom` (src/daemon/loop.ts) is the real function whose
-    // output the reconciler spawns from (`spawn = desired − running`), and
-    // it includes exactly the `"active"`-verdict resources. This resource
-    // lands in it.
+    // Traced through to an ACTUAL SPAWN DECISION, not reasoned on paper:
+    // `desiredFrom` (src/daemon/loop.ts) is the real function whose output
+    // the reconciler spawns from. BUTCHR-217 asserted this resource LANDED
+    // in `desired` (the bug). BUTCHR-227: it does not.
     const resourceType = createProjectResourceType(w.deps);
     const allProjects = await resourceType.discovery.search();
     const desired = desiredFrom(allProjects, resourceType);
-    expect(desired.has("ACME")).toBe(true);
+    expect(desired.has("ACME")).toBe(false);
   });
 
-  test("contrast: check_in's OWN write pattern (max over currently-observed comments, not the just-posted id) does not regress the watermark under the identical non-monotonic scenario", async () => {
-    // Same page state as above, but this simulates `check_in`'s actual
-    // write shape (src/tools/defs.ts): it computes `comment` as the max id
-    // over what it just observed, and that's what it hands to
-    // advanceProjectWatermark — never the id of one specific write.
+  // BUTCHR-217's "contrast" test compared check_in's (safe) max-reduce
+  // writer against speakOnOwnChannel's (unsafe) blind-overwrite writer —
+  // the contrast existed because the two writers had DIFFERENT regression
+  // safety. BUTCHR-227 removes that asymmetry: BOTH writers now go through
+  // the same union, so there is no longer a meaningful "contrast" between
+  // them on this axis — this test is REPURPOSED (not deleted) to assert the
+  // now-shared property directly: a union-shaped advance, given the same
+  // non-monotonic scenario, cannot regress anything, from EITHER writer's
+  // calling shape.
+  test("BUTCHR-227: a union-shaped advance (either writer's shape) does not regress under the identical non-monotonic scenario — the old writer-asymmetry this contrast existed to show is gone", async () => {
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -298,9 +333,11 @@ describe("THE SPECIMEN'S MECHANISM: non-monotonic Confluence ids turn the suppre
       initialWake: { version: 1, comment: "500", epics: {} },
     });
     const observed = (await w.ops.getPageComments("doc-1")).results;
-    await advanceProjectWatermark(w.ops, "ACME", { comment: newestCommentId(observed)! });
+    // check_in's OWN shape (src/tools/defs.ts): the FULL observed id set,
+    // never a "newest" scalar.
+    await advanceProjectWatermark(w.ops, "ACME", { seenComments: observed.map((c) => c.id) });
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("500"); // unchanged — still the true max
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "300"])); // both preserved, not just the max
     expect(verdict).toBe("asleep");
   });
 });
@@ -325,8 +362,13 @@ describe("F7: the swallowed watermark-write failure reproduces the SAME symptom,
     await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME ...", (l) => lines.push(l));
     expect(lines.some((l) => l.includes("WARNING") && l.includes("watermark advance failed"))).toBe(true);
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("500"); // never advanced
-    expect(resource.observedCommentId).toBe("501"); // the new comment IS on the page
+    // BUTCHR-227: field renames only — F7 (the silent-write-failure path)
+    // is explicitly NOT this ticket's to fix (see src/tools/speak.ts's own
+    // doc comment distinguishing "wrote a wrong value" from "failed
+    // silently"), so this test's PROPERTY is unchanged: a failed write
+    // still leaves the seen set exactly where it was.
+    expect(resource.watermark.commentsSeen).toEqual(["500"]); // never advanced
+    expect(resource.unseenCommentIds).toEqual(["501"]); // the new comment IS on the page, and is unseen
     expect(verdict).toBe("active");
   });
 });
