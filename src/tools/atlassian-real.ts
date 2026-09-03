@@ -154,10 +154,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // the string we pass here is harmless: the core client only validates the
     // RESPONSE against a schema (core/createClient.js), never the outgoing
     // parameters — `id` is only ever interpolated into the URL, never parsed.
+    // BUTCHR-214/226, defect 2: `nextVersion` is normalized onto the
+    // resolved value as a top-level `version` — the number THIS call's own
+    // PUT just sent, not a value read back afterward (see AtlassianOps.
+    // updatePage's own doc comment for why identity-of-write, not a
+    // read-back, is the point). The real response is still spread in ahead
+    // of it so nothing that read the old raw shape loses information; only
+    // callers that need the produced version rely on the added field.
     updatePage: async (p) => {
       const current: any = await wiki.page.getPageById({ id: p.id, bodyFormat: "storage" });
       const nextVersion = (current?.version?.number ?? 0) + 1;
-      return wiki.page.updatePage({
+      const updated: any = await wiki.page.updatePage({
         id: p.id,
         body: {
           id: p.id,
@@ -167,6 +174,7 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           version: { number: nextVersion, message: "butchr: confluence_update_page" },
         },
       });
+      return { ...(updated ?? {}), version: nextVersion };
     },
     // searchByCQL reads every parameter by name off the top level as GET
     // searchParams (node_modules/confluence.js/dist/v1/api/search.js) — no
