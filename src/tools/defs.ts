@@ -5,8 +5,8 @@ import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc } from "./
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
-  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, ASK_MARKER, CORRECTION_MARKER,
-  type Disposition,
+  reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, tellPeer, ASK_MARKER, CORRECTION_MARKER,
+  type Disposition, type PeerIntent,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
@@ -753,6 +753,24 @@ export function atlassianTools(
         const results = eligible.filter((p) => p.key !== who).map((p) => ({ key: p.key, name: p.name }));
         audit(c, `list_peers (${results.length} peer${results.length === 1 ? "" : "s"})`);
         return { results };
+      },
+    },
+    tell_peer: {
+      description:
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments), but the WAKE this comment can trigger is BEST EFFORT: Confluence footer-comment ids are not monotonic with creation time, and the project wake path\'s MAX-id watermark comparison can silently fail to notice a comment whose id lands below the recipient\'s current max — no error on either side, indistinguishable from the peer simply not having answered yet. That defect is BUTCHR-195, not this verb\'s to fix. ' +
+        'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
+        'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
+      input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },
+      handler: async (a, c) => {
+        const who = requireProjectCaller(
+          c,
+          "tell_peer",
+          "peers are a relationship between projects — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has",
+        );
+        const { peer, text, intent } = a as { peer: string; text: string; intent: PeerIntent };
+        const result = await tellPeer(ops, who, peer, text, intent);
+        audit(c, `tell_peer → ${peer} (intent=${intent})`);
+        return result;
       },
     },
     submit_to_boss: {

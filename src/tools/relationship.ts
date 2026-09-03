@@ -1,11 +1,12 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, findWorkers, ensureDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
+import { findBossKey, findWorkers, ensureDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
-import { speakOnOwnChannel } from "./speak.js";
+import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
+import { resolveEligibleProjects } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
@@ -1812,6 +1813,177 @@ export async function reportToBoss(ops: AtlassianOps, callerKey: string, text: s
  */
 export async function askBoss(ops: AtlassianOps, callerKey: string, text: string): Promise<unknown> {
   return speakOnOwnChannel(ops, callerKey, tagComment(callerKey, `${ASK_MARKER} ${text}`));
+}
+
+// ---------------------------------------------------------------------------
+// Peer -> peer (BUTCHR-183/BUTCHR-184/BUTCHR-185/BUTCHR-215): the ONE
+// sideways channel a project has. See `tellPeer` below for the full design
+// note; this section exists only because reportToBoss/askBoss (up) and
+// tellWorker (down) sit right above/below it in this file and `tellPeer` is
+// the third, sideways, leg of the same "where a resource speaks" family.
+// ---------------------------------------------------------------------------
+
+/** One enum, one verb — `tellPeer`'s `intent` argument. No default, no fifth value, no free-text passthrough (BUTCHR-185's own ruling: a directive from a boss is obeyed, a request from a peer is negotiated, and `"decline"` is what makes a recorded "no" possible instead of silent non-compliance). */
+export type PeerIntent = "request" | "accept" | "decline" | "notice";
+
+const PEER_INTENTS: readonly PeerIntent[] = ["request", "accept", "decline", "notice"];
+
+/**
+ * Same idea as `PLACEHOLDER_DESTINATIONS`/`file_where_it_belongs` above —
+ * text an agent types when it hasn't actually stated a reason — but its OWN
+ * set: `"no"` and `"nope"` belong here (a bare "no" is exactly the
+ * placeholder `intent: "decline"` exists to refuse) but would be a false
+ * refusal on `file_where_it_belongs`'s destination field, so the two sets
+ * are kept deliberately separate rather than shared. Normalized the same
+ * way (trimmed, lowercased, trailing `.`/`!` stripped) before comparison.
+ */
+const PEER_DECLINE_PLACEHOLDERS = new Set([
+  "n/a", "na", "tbd", "no", "nope", "none", "-", "--", "?", "??", "idk", "dunno", "todo", "later", "null", "undefined", "unknown",
+]);
+
+function normalizePeerDeclineText(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[.!]+$/, "");
+}
+
+/** `tell_peer`'s own doc-comment note, kept beside the code it describes rather than only in defs.ts's tool description (which BUTCHR-185 requires to state the SAME thing, in caller-facing words, for the overclaim review). */
+export interface TellPeerResult {
+  ok: true;
+  /** The peer project this comment was posted to. */
+  to: string;
+  intent: PeerIntent;
+  /** The Confluence footer-comment id `commentOnPage` returned, when present. Absent, never a placeholder, mirrors `get_doc_comments`' own `author` field — see `speakOnOwnChannel`'s doc comment for why this codebase treats "unavailable" as absent rather than synthesised. */
+  commentId?: string;
+}
+
+/**
+ * THE ONE SIDEWAYS CHANNEL (BUTCHR-183/184/185/215): posts a single footer
+ * comment on `peer`'s root doc, PROJECT CALLER ONLY (gated one layer up, in
+ * defs.ts, via `requireProjectCaller` — same shape as `list_peers`/
+ * `check_in`/`get_doc_comments`). Deliberately NOT built on
+ * `speakOnOwnChannel`: that seam resolves and posts on the CALLER's OWN
+ * doc (`projectRootDoc(ops, callerKey)`), so it cannot be reused UNCHANGED
+ * here at all — routed through as-is, a peer message would land on the
+ * SENDER's own root page, never the peer's. The real hazard this function
+ * exists to avoid is therefore COPY-PASTE-AND-RETARGET (BUTCHR-185
+ * correction @ 2026-09-02, relayed sideways from BUTCHR-208), which is
+ * exactly what a careful implementer naturally reaches for, and it is one
+ * line from TWO distinct silent failures once the doc resolution has been
+ * retargeted to `peer`:
+ *   - keeping `advanceProjectWatermark(ops, callerKey, …)` writes an id
+ *     from a DIFFERENT PAGE into the SENDER's own watermark — meaningless,
+ *     and it corrupts the sender's own wake state as a side effect of
+ *     speaking to someone else;
+ *   - "fixing" it for symmetry to `advanceProjectWatermark(ops, peer, …)`
+ *     is the CATASTROPHIC one, and the more attractive mistake because it
+ *     reads as tidier: it marks the RECIPIENT as already caught up on the
+ *     very comment meant to wake it. Waking the recipient IS the delivery.
+ * The correct answer is NEITHER: this function never calls
+ * `advanceProjectWatermark` at all, for any key — see
+ * test/unit/tools.test.ts's three dedicated tests (caller-key, peer-key,
+ * and the strongest "no call at all" form), each independently
+ * mutation-tested against its own specific failure so a guard that only
+ * pins one variant can never leave the other live.
+ *
+ * THE PREFIX IS NEVER LOAD-BEARING FOR ANY WAKE DECISION (BUTCHR-185
+ * correction @ 2026-09-02): nothing in this function, or anywhere else,
+ * may inspect the `[butchr:peer …]` marker to decide whether a comment
+ * should or should not wake its reader. Self-suppression keys on the
+ * IDENTITY OF THE WRITE PATH (the watermark hazard above), never on the
+ * author or on any content marker — and the daemon and the project agent
+ * share one Atlassian account, so no content marker could carry a wake
+ * decision even in principle. The prefix below is purely reader-facing.
+ *
+ * THE MESSAGE SHAPE ON THE PAGE (fixed, not a suggestion): the posted text
+ * is always `[butchr:peer from=<callerKey> to=<peer> intent=<intent>] ` —
+ * authored by THIS FUNCTION, unconditionally prepended — followed by the
+ * caller's own `text`, verbatim. Unlike `tagComment` (which SKIPS
+ * prepending when the text already starts with the tag, so a boss/worker
+ * comment is never double-tagged), this prefix is prepended with NO such
+ * check: a caller cannot suppress it by pre-typing it, by leading
+ * whitespace, or by leading newlines, because there is no code path here
+ * that ever looks at what `text` starts with before prepending. The whole
+ * thing is escaped with the SAME `escapeStorageText`/`unwrapStorageParagraph`
+ * pair `speakOnOwnChannel` uses (imported from speak.ts, never
+ * reimplemented) and wrapped as a single storage-format `<p>...</p>`
+ * paragraph, so the prefix leads the text on the FIRST (and only) line —
+ * never a separate line above it.
+ *
+ * ELIGIBILITY, NOT THE STAFFING ALLOWLIST: `peer` is validated against
+ * `resolveEligibleProjects` (src/resources/project.ts), called with NO
+ * `preFilter`, EXACTLY as `list_peers` calls it — never a second
+ * eligibility rule, never a hardcoded project key. A `peer` this resolver
+ * does not return as eligible (unknown key, not live, not led by this
+ * credential, or missing a readable `butchr` property) is refused by name,
+ * and the refusal lists the peers that DO exist so a caller can immediately
+ * see what changed one key would need to be. An EMPTY peer set is a
+ * legitimate answer under some credentials (BUTCHR-184's own measurement)
+ * and is refused the same way, naming zero peers rather than treating that
+ * as a special case.
+ *
+ * THE PEER'S ROOT DOC IS RESOLVED FRESH, HERE, via `projectRootDoc` — never
+ * the `rootDocId` a listing might have cached (BUTCHR-188: a page id
+ * captured in a listing can go stale between the listing and a later send).
+ *
+ * WHAT THIS FUNCTION DOES NOT AND MUST NOT CLAIM: it posts a durable
+ * Confluence footer comment on `peer`'s root doc. That is what it does and
+ * all it may say. It does NOT know, and cannot promise, that `peer` will
+ * WAKE on this comment — Confluence footer-comment ids are not monotonic
+ * with creation time, and the project wake path's own MAX-id watermark
+ * comparison (`newestCommentId`, src/resources/project.ts) can silently
+ * fail to notice a comment whose id lands below the recipient's current
+ * max (BUTCHR-195, not this ticket's to fix). The comment is never lost —
+ * it sits on a durable page and is read whenever `peer` next reads its own
+ * comments — but the WAKE is best-effort, and its failure mode, while
+ * BUTCHR-195 is open, is silence: no error, on either side, distinguishable
+ * from the peer simply not having answered yet.
+ */
+export async function tellPeer(
+  ops: AtlassianOps,
+  callerKey: string,
+  peer: string,
+  text: string,
+  intent: PeerIntent,
+): Promise<TellPeerResult> {
+  if (!PEER_INTENTS.includes(intent)) {
+    throw new Error(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
+  }
+  if (peer === callerKey) {
+    throw new Error(
+      `tell_peer: ${callerKey} cannot send itself a peer message — a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer, which is a channel to OTHER projects only`,
+    );
+  }
+  if (intent === "decline") {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
+    }
+    if (PEER_DECLINE_PLACEHOLDERS.has(normalizePeerDeclineText(trimmed))) {
+      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
+    }
+  }
+
+  // Eligibility, never the allowlist gate — see this function's own doc
+  // comment. NO preFilter, same as list_peers.
+  const { eligible } = await resolveEligibleProjects(ops);
+  const peers = eligible.filter((p) => p.key !== callerKey);
+  const target = peers.find((p) => p.key === peer);
+  if (!target) {
+    const names = peers.length ? peers.map((p) => `${p.key} (${p.name})`).join(", ") : "none";
+    throw new Error(
+      `tell_peer: "${peer}" is not an eligible peer of ${callerKey} — unknown key, not live, not led by this credential, or missing a readable "butchr" entity property. Eligible peers: ${names}`,
+    );
+  }
+
+  // Resolved FRESH — never `target`'s own rootDocId from the listing above
+  // (BUTCHR-188).
+  const doc = await projectRootDoc(ops, peer);
+  const prefix = `[butchr:peer from=${callerKey} to=${peer} intent=${intent}] `;
+  const body = `<p>${escapeStorageText(prefix + text)}</p>`;
+  const created = (await ops.commentOnPage(doc.id, body)) as { id?: string } | undefined;
+
+  // Deliberately NO advanceProjectWatermark call, for EITHER key — see this
+  // function's own doc comment for why that would silently break delivery.
+  return { ok: true, to: peer, intent, ...(created?.id ? { commentId: created.id } : {}) };
 }
 
 /**
