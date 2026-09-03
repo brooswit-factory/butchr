@@ -198,6 +198,23 @@ export interface StallRemediationDeps {
   addComment: (issue: string, text: string) => Promise<void>;
   /** Recent comments on the ticket, newest-first is fine — used for the dedupe/adoption check (see findMarked). */
   comments: (issue: string) => Promise<readonly CommentRow[]>;
+  /**
+   * BUTCHR-221 criterion 10 (2026-09-02's first-phase becalming: panes
+   * parked at a Claude session-limit refusal). OPTIONAL — omitted disables
+   * this gate entirely, exactly as `stalled`/`stallRemediation` are already
+   * optional elsewhere, so every existing caller/fixture is unaffected.
+   * SYNCHRONOUS by design: this is called from inside a per-issue poll and
+   * must never itself do I/O. src/daemon/index.ts supplies it from
+   * src/agents/quota-gate.ts, which tees the SAME pane reads
+   * src/agents/session-limit-watch.ts already performs through the SAME
+   * src/agents/session-limit.ts recogniser — no second banner parser, no
+   * second detection path. A quota-blocked pane cannot read a wake comment,
+   * and posting into it burns the very session quota whose return ends the
+   * outage — the sharper of the two reasons this must be checked, and
+   * checked BEFORE `comments()` below so a quota-blocked ticket costs no
+   * Jira read per poll.
+   */
+  quotaBlocked?: (issue: string) => boolean;
   log?: (line: string) => void;
 }
 
@@ -246,6 +263,13 @@ export function createStallRemediator(deps: StallRemediationDeps): StallRemediat
   // `loggedFailure` map; a failure whose reason actually changes still gets
   // its own line.
   const loggedFailure = new Map<string, string>();
+  // Issues currently believed quota-blocked, per the LAST poll this module
+  // logged the transition for — same log-flood discipline as
+  // `cappedLogged`/`loggedFailure` above: a quota-blocked ticket re-enters
+  // this branch every ~15s for hours (this module's own steady-state flood
+  // guard applies here too), so log entering AND leaving the state exactly
+  // once each, never every poll in between.
+  const quotaLogged = new Set<string>();
   const log = (line: string) => deps.log?.(line);
 
   async function check(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null): Promise<StallOutcome> {
@@ -291,6 +315,25 @@ export function createStallRemediator(deps: StallRemediationDeps): StallRemediat
         // line, still in the journal, is the legible record of why.
         return { kind: "suppressed", issue, reason: `already remediated at ${new Date(e.spokenAt).toISOString()}` };
       }
+      // CRITERION 10 — checked before touching Jira at all, and before the
+      // rate cap / adoption bookkeeping below: a quota-blocked target cannot
+      // read a wake comment, and posting into it burns the very quota whose
+      // return ends the outage, so this is cheaper AND safer to check first,
+      // not merely first for cost's sake. Deliberately does NOT call
+      // tracker.markSpoken — a quota-blocked poll is not remediated, so a
+      // later poll (quota recovered, still stalled) must still be free to
+      // act, not find itself already latched as spoken-for.
+      if (deps.quotaBlocked?.(issue)) {
+        if (!quotaLogged.has(issue)) {
+          quotaLogged.add(issue);
+          log(`[stall] ${issue} quota-blocked — suppressing wake comment (target cannot read it while blocked, and posting would burn the quota whose return ends the outage)`);
+        }
+        return { kind: "suppressed", issue, reason: "quota-blocked" };
+      }
+      if (quotaLogged.delete(issue)) {
+        log(`[stall] ${issue} no longer quota-blocked — wake comment eligible again`);
+      }
+
       const ownFloorMinutes = Math.round((deps.now() - e.firstObservedAt) / 60_000);
       const elapsedMinutes = realElapsedMinutes ?? ownFloorMinutes;
 
