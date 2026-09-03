@@ -2,6 +2,7 @@ import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
+import type { StallRemediator } from "../agents/stall-remediation.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
 
 export interface LabelWriter {
@@ -25,6 +26,19 @@ export interface SyncDeps {
    * reported for this dimension, exactly as before this ticket.
    */
   coverage?: CoverageRecorder;
+  /**
+   * BUTCHR-221/BUTCHR-210: the stall deadlock-breaker's remediation half —
+   * posts one debounced wake comment per continuous stalled episode. Omitted
+   * disables remediation entirely, exactly as `stalled` above disables
+   * agent:stalled detection entirely; every existing caller/fixture that
+   * doesn't supply it is unaffected. See src/agents/stall-remediation.ts's
+   * own top comment for why it is gated on `applied` (the label as already
+   * read from Jira this poll), never on this poll's own just-stabilized
+   * candidate — that gating is what keeps a wake comment from ever landing
+   * on the same poll as the label write it follows, which is the own-write
+   * ledger hazard that module documents in full.
+   */
+  stallRemediation?: StallRemediator;
   /**
    * Called once per poll with the keys this poll wrote daemon-owned labels
    * for (only when non-empty), so the caller can feed the own-write ledger
@@ -139,6 +153,7 @@ export function createLabelSync(deps: SyncDeps) {
       if (!isActive(issue.status)) {
         stabilizer.clear(issue.key);
         deps.stalled?.forget(issue.key);
+        deps.stallRemediation?.forget(issue.key);
         agentStatus = null;
       } else {
         const observed = mapAgentStatus(agents.get(issue.key) ?? null);
@@ -164,7 +179,18 @@ export function createLabelSync(deps: SyncDeps) {
         // below, which is deliberately delayed by the stabilizer so a single
         // flickering poll never writes Jira. An operator watching the log
         // should see this the instant it's true, not two polls later.
-        if (stalledNow) deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since first observed, zero comments from this account for the configured window`);
+        //
+        // BUTCHR-210 (2026-09-02 second becalming, ~7.5h): existence alone
+        // isn't enough — the elapsed count is what lets an operator tell a
+        // stall that started 4 minutes ago from one that has run all night,
+        // which is exactly the distinction a becalming that long costs
+        // without it. Included here (this line already fires every poll,
+        // unlike src/agents/stall-remediation.ts's own deliberately-silent
+        // steady state) rather than as a new periodic log source of its own.
+        if (stalledNow) {
+          const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since first observed${elapsed != null ? ` (${elapsed}m)` : ""}, zero comments from this account for the configured window`);
+        }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a
         // THIRD outcome that must never be treated as "confirmed stalled"
@@ -190,6 +216,18 @@ export function createLabelSync(deps: SyncDeps) {
         if (suppressed) deps.log?.(`[labels] ${issue.key} agent:${candidate} unconfirmed (holding agent:${applied}) — flip suppressed`);
         stalled = label === "stalled";
         agentStatus = stalled ? "idle" : rawFor(label);
+        // BUTCHR-221/BUTCHR-210: gated on `applied` (this poll's freshly-read
+        // Jira label, computed above BEFORE this poll's own write further
+        // down), never on `stalled`/`label` (this poll's just-stabilized
+        // candidate) — see src/agents/stall-remediation.ts's own top comment
+        // for why: footing parity with the label's own stabilizer delay, and
+        // the own-write ledger hazard (a same-poll comment could be folded
+        // into that poll's label-write read-back and silently swallow the
+        // wake it was meant to deliver). `stalledResult` is threaded through
+        // uncollapsed so the module can distinguish "could not verify" from
+        // "stabilizing" from "nothing going on" for its own log lines,
+        // without any of those ever gating whether it acts.
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null);
       }
       // KAN-824: epics never have a branch, so a search for one can only ever
       // miss — skip the call entirely rather than let it burn a GitHub search.
@@ -203,6 +241,7 @@ export function createLabelSync(deps: SyncDeps) {
       if (seen.has(key)) continue;
       stabilizer.clear(key);
       deps.stalled?.forget(key);
+      deps.stallRemediation?.forget(key);
       const current = lastLabels.get(key)!;
       const desired = current.filter((l) => !l.startsWith(AGENT_PREFIX));
       const ok = await write(written, key, current, desired);
