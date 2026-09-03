@@ -143,8 +143,16 @@ export class AtlassianClient {
 function parseIssueLinks(raw: any[] | undefined): IssueLink[] {
   const out: IssueLink[] = [];
   for (const l of raw ?? []) {
-    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key });
-    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key });
+    // BUTCHR-200: `status` is read off the other end's own `fields.status.name`
+    // (the same nested shape `mapIssue` reads for the top-level issue) and
+    // only added to the flattened stub when present — `undefined` means
+    // UNKNOWN, never a fabricated "not Done". MEASURED (BUTCHR-192): Jira
+    // hydrates `status` on this stub for both `inwardIssue` and
+    // `outwardIssue`; every other field on the stub's own `fields` object
+    // (e.g. `labels` — confirmed NEVER present, in either direction) is
+    // deliberately still discarded, exactly as before this change.
+    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key, ...(l.outwardIssue.fields?.status?.name !== undefined ? { status: l.outwardIssue.fields.status.name } : {}) });
+    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key, ...(l.inwardIssue.fields?.status?.name !== undefined ? { status: l.inwardIssue.fields.status.name } : {}) });
   }
   return out;
 }

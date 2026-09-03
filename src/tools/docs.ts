@@ -97,6 +97,50 @@ export function findBossKey(issue: unknown): string | null {
   return null;
 }
 
+/** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. */
+export interface WorkerRef {
+  key: string;
+  status: string | undefined;
+}
+
+/**
+ * `findBossKey`'s own mirror (BUTCHR-193): on a BOSS's own `getIssue`
+ * payload, its workers appear as `Implements` links in the OUTWARD
+ * direction — the opposite side from `findBossKey`'s inward read, and the
+ * ONLY other direction an `Implements` link stub can point. MEASURED live
+ * (BUTCHR-127's own payload, 2026-09-02): the outward stub arrives already
+ * hydrated with `fields.status.name`, at no extra Jira call beyond the
+ * `getIssue` the caller already made — so this stays PURE AND TOTAL over
+ * that payload, exactly like `findBossKey`: no I/O here, and it tolerates a
+ * missing, absent, or garbage `fields.issuelinks` the same way.
+ *
+ * WHAT THE STUB DOES NOT CARRY, AND WHY THAT IS THIS FUNCTION'S BUSINESS TO
+ * SAY, NOT ITS CALLER'S TO DISCOVER BY SURPRISE: the same measurement showed
+ * the outward stub's hydrated field set is exactly
+ * `issuetype, priority, status, summary` — `labels` is NOT there, confirmed
+ * even against a worker that genuinely carries labels (BUTCHR-127 itself
+ * carries `butchr:orphan`/`pr:merged`, and neither appears on BUTCHR-156's
+ * outward link to it). So this can answer "is this worker Done" for free,
+ * but it can NEVER answer "does this worker carry `butchr:shelved`"
+ * (`EXEMPT_LABEL`, src/agents/parked.ts) from this payload alone — a caller
+ * that needs the shelved-exemption has to pay for a SEPARATE `getIssue` per
+ * non-Done worker to find out. That cost, and where it's paid, lives in
+ * relationship.ts's own open-worker guard, not here — this function's only
+ * job is the total, I/O-free read of what the payload already contains.
+ */
+export function findWorkers(issue: unknown): WorkerRef[] {
+  const links = (issue as { fields?: { issuelinks?: unknown[] } })?.fields?.issuelinks ?? [];
+  const workers: WorkerRef[] = [];
+  for (const l of links as Array<{ type?: { name?: string }; outwardIssue?: { key?: string; fields?: { status?: { name?: string } } } }>) {
+    // On the BOSS (this ticket), a worker appears as `outwardIssue` — the
+    // mirror image of findBossKey's `inwardIssue` read above.
+    if (l?.type?.name === "Implements" && l.outwardIssue?.key) {
+      workers.push({ key: l.outwardIssue.key, status: l.outwardIssue.fields?.status?.name });
+    }
+  }
+  return workers;
+}
+
 /** Jira's issue `self` URL (`https://site/rest/api/3/issue/…`) with the API suffix stripped, for building a human browse link. */
 function siteFromSelf(self: unknown): string | null {
   const s = typeof self === "string" ? self : undefined;
