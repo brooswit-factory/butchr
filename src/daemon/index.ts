@@ -26,6 +26,7 @@ import { sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -171,6 +172,20 @@ const stalled = createStalledCheck({
   accountEmail: config.atlassian.email,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-221/BUTCHR-210: the stall deadlock-breaker's remediation half —
+// posts one debounced wake comment on a ticket once agent:stalled is
+// actually applied (never on the raw per-poll signal — see
+// src/agents/stall-remediation.ts's own top comment for the gating
+// rationale and the own-write ledger hazard it avoids by construction).
+// Always an issue key (syncLabels below is never wired into the project
+// loop further down this file), so `ops.addComment` is the right seam —
+// same one parked.ts uses, no second Atlassian writer.
+const stallRemediation = createStallRemediator({
+  now: () => Date.now(),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
 // see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
 // every other daemon-side comment write; no second Atlassian writer.
@@ -261,6 +276,7 @@ const syncLabels = createLabelSync({
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
+  stallRemediation,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
