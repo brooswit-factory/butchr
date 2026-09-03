@@ -465,8 +465,16 @@ describe("BUTCHR-225: total type coverage of the derived brief family (merge-che
     expect(findUnaccountedBriefTypes(["a", "b"], new Set(["a"]), [{ type: "b", reason: "x" }])).toEqual([]);
 
     // Rules out "passes because ASSERTED_TYPES/TYPE_EXCLUSIONS silently
-    // matches everything": feed the REAL sets a synthetic member neither
-    // one knows about, alongside the real family.
-    expect(findUnaccountedBriefTypes(["probe", ...knownBriefTypes()], ASSERTED_TYPES, TYPE_EXCLUSIONS)).toEqual(["probe"]);
+    // matches everything": feed the REAL sets a sentinel neither one knows
+    // about. Deliberately NOT mixed into knownBriefTypes() the way the
+    // sentinel above is a standalone family, unlike the mutation-1 fixture
+    // above — a sentinel that also matched a real member (e.g. this file
+    // once used the literal "probe", the same name the PR's own mandated
+    // headline mutation injects) would make this test ALSO redden whenever
+    // some other real member goes unaccounted, reporting a noisy multi-
+    // member failure instead of the one this test means to isolate. A
+    // sentinel guaranteed never to collide with a real brief type name
+    // keeps this test's failure meaning exactly one thing.
+    expect(findUnaccountedBriefTypes(["__not_a_real_brief_type__"], ASSERTED_TYPES, TYPE_EXCLUSIONS)).toEqual(["__not_a_real_brief_type__"]);
   });
 });
