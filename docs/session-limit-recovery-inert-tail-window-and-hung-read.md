@@ -160,55 +160,100 @@ exist for such a row by construction, so this population can't speak to
 it either way. No such row was independently identified in this
 investigation.
 
-### Candidate 2 (positional gate) — CONFIRMED as the proximate detection failure
+### Candidate 2 (positional gate) — REVISED after review: the anchor rejects the banner regardless of window size
 
-`detectSessionLimitRefusal` (`src/agents/session-limit.ts`) collects, from
-the end of the pane text, up to `TAIL_LINES = 4` **content** lines —
-walking backward, skipping blank and decorative (`^[─│╭╮╰╯·\s]*$`) lines
-without spending budget on them — then requires the refusal phrase to be
-one of those 4, anchored at line-start. This algorithm was replicated by
-hand against three independent captures (different tickets, different
-times, spanning both becalmings), not eyeballed with `tail -n`:
+**Correction, entered after story review on PR #265, not silently folded
+into the original text.** The first version of this section attributed the
+`null` result to the banner sitting outside the `TAIL_LINES = 4` window,
+based on three hand replications of the walk-back algorithm. That
+walk-back was accurate about *where the line sits*, but never tested
+whether `REFUSAL_LINE` would actually match that line *if* it were inside
+the window — and it does not. The story's review caught this by running
+its own independent 50-capture population (a different capture directory,
+different Unix user) through the real detector at every window size up to
+80 lines and finding 0/50 matches anywhere, then identifying the cause:
+every banner line begins with `⎿` (U+23BF), a space, and a non-breaking
+space (U+00A0) — the way Claude Code renders a `⎿` tool-result line —
+and `.trim()` strips the trailing/leading *whitespace* (which includes
+U+00A0) but not `⎿` itself, since `⎿` is not whitespace. The trimmed line
+therefore starts with `⎿`, and `/^You(?:'|’)ve hit your session
+limit\b.*$/` requires the string to start with `You` — so it can never
+match, at any window size, however wide.
 
-**BUTCHR-183, 20:45:26Z (becalming 2, quota-hit burst):**
-walking up from the pane's end: the composer help line
+**Independently reproduced against this task's own population, using the
+real production function rather than a hand simulation**, before accepting
+the correction:
+
+```ts
+import { detectSessionLimitRefusal } from "./src/agents/session-limit.js";
+// fed the verbatim post-header body of all 50 own captures, unmodified
+```
+
+```
+{ total: 50, matchInWindow: 0, anyMatchAnywhere: 0 }
+```
+
+`matchInWindow` uses the real `TAIL_LINES = 4`; `anyMatchAnywhere` runs the
+same anchor test with no window limit at all, over every content line in
+the file. **Both are 0/50.** And directly on the byte level, for every one
+of the 97 banner-line occurrences found across these 50 files:
+
+```
+"  ⎿  You've hit your session limit · resets 5:10pm (America/Los_Angeles)"
+prefix before "You": U+23bf U+20 U+a0
+```
+
+identical in every occurrence — the same `⎿ `+NBSP prefix the review
+described, confirmed by direct `codePointAt` inspection, not inferred.
+
+**This changes the attribution.** Position is not what is causing the
+`null` result in this population: even an *unlimited* window still finds
+zero matches, because the anchor itself rejects the line before position
+is ever relevant. The three hand-replications in the previous version of
+this section (BUTCHR-183 at `20:45:26Z` and `04:22:51.928Z`, CNDLX-1 at
+`19:24:22Z`) are not wrong as *position* observations — the banner genuinely
+does sit outside the 4-line window in all three, by 1 to 4+ positions, and
+that is worth keeping on record since a wider window is still one of two
+things that would need to change — but position is not *sufficient* to
+explain the failure, and on this evidence it is not *necessary* either: the
+anchor alone fully accounts for all 50 nulls, with or without a window.
+
+Two independently-sufficient barriers are therefore in play for this
+population: (1) the anchor rejects a `⎿`-prefixed rendering of the banner
+outright, regardless of position, and (2) where the banner would
+nonetheless have needed to be inside a window for some other reason, it
+also sits outside `TAIL_LINES = 4`, for the chrome-displacement reasons
+recorded below. **(1) is the one that is proven to matter here**, since it
+alone is sufficient to produce every observed `null` with no dependency on
+window size; (2) remains true as an independent observation but is not
+shown to be load-bearing once (1) already accounts for the result.
+
+For completeness, the chrome-displacement observation from the original
+replications, kept because it is still accurate as a position measurement
+and still relevant if the anchor is ever fixed: walking up from the pane's
+end on BUTCHR-183 at `20:45:26Z`, the composer help line
 (`⏵⏵ bypass permissions on …`) → content #1; a bare `❯` (not decorative
 under the module's own regex — it isn't in `[─│╭╮╰╯·\s]`) → #2; a rule
 line → skipped (decorative); a blank → skipped; the `✻ Worked for 58s ·
 done 1:45 PM` status line → #3; a blank → skipped; the banner's own
-**second, wrapped line** (`/usage-credits to finish …`) → #4 — budget
-exhausted. The actual `You've hit your session limit …` line is the
-**next** content line back — one position outside the window.
+second, wrapped line (`/usage-credits to finish …`) → #4 — budget
+exhausted, with the (anchor-rejected) banner line itself one position
+further back. By `04:22:51.928Z`, 7h37m later on the same pane, additional
+generic chrome (`✔ Update installed · Restart to update`,
+`new task? /clear to save 557.4k tokens`) pushes it to 8 positions back.
+CNDLX-1 at `19:24:22Z` (becalming 1) shows the identical shape.
 
-**BUTCHR-183, 04:22:51.928Z (becalming 2, the restart capture, same pane,
-7h37m later):** more chrome has accumulated below the banner by this
-point — a `✔ Update installed · Restart to update` notice and a
-`new task? /clear to save 557.4k tokens` hint, both generic Claude Code
-furniture, not ticket-specific content. Walking up: `/rc` → #1, `new
-task? …` → #2, `✔ Update installed …` → #3, the composer help line → #4 —
-budget exhausted before even reaching the `❯`, the "Worked for" line, or
-the banner's own second line. The banner itself is now **8** content
-lines back, not 5.
-
-**CNDLX-1, 19:24:22Z (becalming 1, inside its 19:10→19:40Z dead window):**
-same shape as the first BUTCHR-183 capture — composer line → #1, `❯` → #2,
-`✻ Churned for 0s · done 11:17 AM` → #3, the banner's wrapped second line
-→ #4 — budget exhausted one position short of the actual banner line.
-
-**All three replications land the anchor line outside the window, by
-between 1 and 4+ content-line positions, and the pattern is the same
-shape every time**: the banner's own message wraps onto two lines, and the
-second (continuation) line alone consumes one of only four slots; the
-remaining three are consumed by chrome — the composer prompt, the
-permission-mode/help line, and the per-turn "Worked for Xs · done HH:MM"
-status line — that is rendered on essentially every idle Claude Code pane,
-not specific to this refusal or this ticket. **This is a design problem,
-not a tuning problem**: `TAIL_LINES = 4` was sized without budgeting for
-the fact that the message it exists to catch is itself two lines, and that
-an idle pane routinely renders 2–4 lines of generic furniture below the
-last real message even in the healthy case. Confirmed **CANDIDATE 2** as
-the proximate cause of every `unrecognised` capture inspected, in both
-becalmings.
+**Confirmed CANDIDATE 2, revised: the anchor-rejection mechanism, not the
+tail-window mechanism, is the proximate and independently-sufficient cause
+of every `unrecognised` capture inspected, in this population, in both
+becalmings.** The reviewer's own population is recorded as an independent
+confirmation, not a discrepancy to reconcile away — obtained under a
+different Unix user from a different capture directory, and it agrees with
+this population exactly on the mechanism (0/50 or equivalent, same leading
+code points). Per the same tie-break rule already used for the 17-vs-10
+ticket-count discrepancy above, an unreconciled difference would have been
+recorded rather than silently resolved — here there was no difference to
+reconcile once both were actually measured the same way.
 
 ### Candidate 3 (loop liveness) — supported for becalming 2's long tail, with an honest gap
 
@@ -354,17 +399,20 @@ For the 50 captured rows, across both becalmings:
   `agent_status: done`, and the code path that would have to be true for
   a capture to exist at all (row read strictly after the status-gate
   `continue`) independently proves the same thing.
-- **Candidate 2 (positional gate): confirmed as the proximate cause.**
-  Detection returned `null` specifically because the anchored refusal
-  phrase sits outside `TAIL_LINES = 4` content lines — displaced by
-  generic idle-pane chrome (composer prompt, permission-mode status line,
-  per-turn "Worked for Xs · done HH:MM" line) plus the banner's own
-  two-line wrap, which alone halves the usable budget. This chrome is
-  present on essentially every idle Claude Code pane, so the gap between
-  "detects the refusal" and "detects the refusal *the way it's actually
-  rendered on a real idle pane*" is a design gap in the tail-window
-  budget, not a one-off tuning miss — confirmed identically across three
-  independent samples spanning both becalmings.
+- **Candidate 2 (positional gate, revised): confirmed as the proximate
+  cause, but the mechanism is anchor-rejection, not window position.**
+  Detection returned `null` because the banner renders as a `⎿`-prefixed
+  line (`U+23BF`, space, `U+00A0`) — the way Claude Code renders a
+  tool-result line — and `.trim()` does not strip `⎿` itself, so the
+  anchored `/^You(?:'|’)ve hit.../` can never match it, **at any window
+  size**: re-running the real detector with the window unbounded still
+  finds 0/50 matches. The banner also happens to sit outside
+  `TAIL_LINES = 4` in every sample checked, displaced by generic idle-pane
+  chrome plus its own two-line wrap, but that displacement is not what is
+  actually producing the `null` — the anchor alone is sufficient on its
+  own. Confirmed identically across this task's own 50-capture population
+  and an independent 50-capture population gathered under a different
+  Unix user during story review.
 - **Candidate 3 (loop liveness): a real, verified hazard, best-supported
   but not conclusively settled for becalming 2's long silent tail; could
   not be evaluated with confidence for becalming 1.** The watch's own
@@ -378,23 +426,30 @@ For the 50 captured rows, across both becalmings:
 
 **Bottom line:** for every quota-parked pane this investigation could
 inspect, recovery did not fire because detection itself returned a false
-negative (Candidate 2) — the refusal was present but positioned exactly
-where the module's own trailing-chrome budget doesn't reach. Whether the
-watch loop also independently stopped ticking for hours at a time during
-the longer of the two becalmings (Candidate 3) is likely but not proven
-by this evidence; if it did, it compounds the outage duration but is not
-required to explain why recovery never scheduled in the first place —
-Candidate 2 alone is sufficient for that, and was confirmed directly.
+negative (Candidate 2) — the refusal was present, but rendered as a
+`⎿`-prefixed tool-result line that the anchored match rejects outright,
+regardless of window size or position. Whether the watch loop also
+independently stopped ticking for hours at a time during the longer of
+the two becalmings (Candidate 3) is likely but not proven by this
+evidence; if it did, it compounds the outage duration but is not required
+to explain why recovery never scheduled in the first place — Candidate 2
+alone is sufficient for that, and was confirmed directly.
 
 ## Recommendations (prose only — not implemented here, per this task's scope)
 
-- Re-derive `TAIL_LINES` (or the detector's matching strategy generally)
-  against real idle-pane captures rather than hand-built fixtures, with
-  an explicit budget line for the refusal's own two-line wrap plus the
-  composer/status chrome documented above — or switch from "last N
-  content lines" to "last content line before the composer prompt,
-  skipping known status-line patterns," which would be robust to chrome
-  count changing in future Claude Code versions.
+- **Fix the anchor first — a `TAIL_LINES` change alone would repair none
+  of these 50 panes.** `REFUSAL_LINE` needs to match a banner that renders
+  as a `⎿`-prefixed tool-result line: either strip known leading render
+  chrome (`⎿` and its following whitespace, including `U+00A0`) before
+  anchoring, or anchor on the trimmed remainder after a small set of known
+  prefixes, and add a fixture built from a real `⎿`-prefixed capture (not
+  a hand-built one) so this doesn't regress silently. Only after that:
+  re-derive `TAIL_LINES` against real idle-pane captures, with an explicit
+  budget line for the refusal's own two-line wrap plus the composer/status
+  chrome documented above — or switch from "last N content lines" to "last
+  content line before the composer prompt, skipping known status-line
+  patterns," which would be robust to chrome count changing in future
+  Claude Code versions.
 - Give `HerdrClient` a real `timeoutMs` in `daemon/index.ts`, and/or wrap
   each row's `deps.read()` in `watchSessionLimits` with its own timeout,
   so one wedged pane read can no longer freeze the whole polling loop
