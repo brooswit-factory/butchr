@@ -98,17 +98,32 @@ describe("speakOnOwnChannel", () => {
   // HAZARD 1 (BUTCHR-67/BUTCHR-81): a project's own report_to_boss/ask_boss
   // (both go through speakOnOwnChannel) must not leave itself looking like a
   // pending wake trigger. Failure condition, stated before the check: if
-  // the `wake.comment` watermark is NOT advanced to the id this call's own
-  // `commentOnPage` returned, `projectVerdict` would see `observedCommentId
-  // !== watermark.comment` and (wrongly) report `active` for a project that
-  // only ever spoke to itself. A suppression that ALSO swallows a foreign
-  // comment (one this function never wrote) would fail the opposite way —
-  // both are asserted below.
-  test("HAZARD 1: a project's own comment advances its wake.comment watermark to that comment's own id", async () => {
+  // this call's own `commentOnPage` id is NOT added to the `wake.commentsSeen`
+  // SET, `projectVerdict`'s `unseenCommentIds` would still list it and
+  // (wrongly) report `active` for a project that only ever spoke to itself.
+  // A suppression that ALSO swallows a foreign comment (one this function
+  // never wrote) would fail the opposite way — both are asserted below.
+  //
+  // BUTCHR-227: this assertion CHANGED SHAPE (from `wake.comment` scalar
+  // equality to `wake.commentsSeen` set membership) because the watermark's
+  // stored shape changed — not weakened, the property under test is
+  // identical ("this call's own id ends up recorded as seen").
+  test("HAZARD 1 (BUTCHR-227): a project's own comment is added to its wake.commentsSeen set", async () => {
     const { ops, properties } = makeOps();
     await speakOnOwnChannel(ops, "BUTCHR", "[BUTCHR] status update");
-    const prop = properties.get("BUTCHR") as { wake?: { comment?: string | null } };
-    expect(prop.wake?.comment).toBe("1000"); // the id makeOps's fake commentOnPage assigned this call
+    const prop = properties.get("BUTCHR") as { wake?: { commentsSeen?: readonly string[] } };
+    expect(prop.wake?.commentsSeen).toEqual(["1000"]); // the id makeOps's fake commentOnPage assigned this call
+  });
+
+  // BUTCHR-227: writer B (this call's own watermark advance) can no longer
+  // REGRESS an existing seen set, because a union can only grow it — this
+  // asserts that directly, against a project that already has ids seen.
+  test("BUTCHR-227: writer B unions its id into an EXISTING commentsSeen set rather than replacing it — regression is unrepresentable, not just unexercised", async () => {
+    const { ops, properties } = makeOps();
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "42" }, wake: { commentsSeen: ["500", "700"] } });
+    await speakOnOwnChannel(ops, "BUTCHR", "hello");
+    const prop = properties.get("BUTCHR") as { wake?: { commentsSeen?: readonly string[] } };
+    expect(new Set(prop.wake?.commentsSeen)).toEqual(new Set(["500", "700", "1000"]));
   });
 
   test("HAZARD 1 control: the watermark advance never overwrites the rest of the butchr property (space/rootDoc untouched)", async () => {

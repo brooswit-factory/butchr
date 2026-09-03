@@ -39,17 +39,48 @@ import { advanceProjectWatermark } from "../resources/project.js";
  * (src/jira-watch/own-writes.ts) — MEASURED unusable for a project key (its
  * `search("key IN (...)")` silently returns empty for a bare project key)
  * — it is a WATERMARK: immediately after `commentOnPage` succeeds, this
- * function advances that project's `wake.comment` watermark
- * (src/resources/project.ts's `advanceProjectWatermark`) to the id
+ * function advances that project's `wake.commentsSeen` SET
+ * (src/resources/project.ts's `advanceProjectWatermark`) to INCLUDE the id
  * `commentOnPage` just returned. The very next poll's discovery read sees
- * that comment already caught up, so neither `verdictFor` nor `eventRules`
- * counts it as a pending trigger. A FOREIGN comment never calls this
- * function, so it is never watermarked here and still wakes the project —
- * the failure condition this fix must not also swallow (see
+ * that id already a member of the seen set, so neither `verdictFor` nor
+ * `eventRules` counts it as a pending trigger (both consume
+ * `unseenCommentIds`, which excludes it). A FOREIGN comment never calls
+ * this function, so it is never watermarked here and still wakes the
+ * project — the failure condition this fix must not also swallow (see
  * test/unit/project-resource-type.test.ts). The watermark write is
  * fail-open (a rejected write is caught, not thrown): the comment itself
  * already succeeded by the time this runs, and a secondary bookkeeping
  * failure must never surface as a failed `report_to_boss`/`ask_boss` call.
+ *
+ * THIS IS WRITER B (BUTCHR-227's naming; see `advanceProjectWatermark`'s
+ * own doc comment on the site for the full writer inventory). Before
+ * BUTCHR-227, this call passed `{ comment: created.id }` into a scalar
+ * OVERWRITE — the id it posted became the watermark REGARDLESS of what was
+ * already stored there, which made this the one writer that could ever
+ * REGRESS the watermark (Confluence footer-comment ids are not monotonic
+ * with creation time; see `advanceProjectWatermark`'s own module for the
+ * measured evidence). Passing `{ seenComments: [created.id] }` into a SET
+ * UNION instead does not merely avoid that outcome under today's code —
+ * there is no longer a patch shape this call (or any other) could pass
+ * here that removes an id from the stored set, so the regression is
+ * UNREPRESENTABLE, not just unexercised.
+ *
+ * BUTCHR-208'S GUARD (BUTCHR-227 §8, RULED by BUTCHR-195: 208 keeps a
+ * scalar guard on this exact write site rather than converting to
+ * "add to the set" itself — that would have had 208 implement THIS
+ * ticket's storage change, inside its own epic, ahead of this PR, which is
+ * the each-epic-invents-its-own-rule failure both epics were warned
+ * against): grepped for at this ticket's own commit — `git grep -n
+ * BUTCHR-208 -- src` — and NOT PRESENT. No scalar guard exists at this
+ * call site to convert or remove. Per §8's ruling, this ticket does not
+ * ask BUTCHR-208 to build anything differently (a scope negotiation with a
+ * peer epic is BUTCHR-195's seam, not a story's) — this is a stated
+ * finding, not an omission. If BUTCHR-208's guard lands after this PR
+ * merges, ITS OWN PR is responsible for converting it against the
+ * `commentsSeen` union shape above (the intent — "the suppression write
+ * must never make an already-seen comment look unseen" — already holds by
+ * construction under a union, so that conversion should be straightforward
+ * for whoever lands it).
  *
  * BUTCHR-105's REQUIREMENT-2 DECISION, recorded here rather than left as an
  * oversight: the swallow itself is KEPT — the argument just above (a
@@ -83,7 +114,7 @@ export async function speakOnOwnChannel(
     const doc = await projectRootDoc(ops, callerKey);
     const created = (await ops.commentOnPage(doc.id, `<p>${escapeStorageText(taggedText)}</p>`)) as { id?: string } | undefined;
     if (created?.id) {
-      await advanceProjectWatermark(ops, callerKey, { comment: created.id }).catch((e) =>
+      await advanceProjectWatermark(ops, callerKey, { seenComments: [created.id] }).catch((e) =>
         log(`  WARNING: [speakOnOwnChannel] self-wake watermark advance failed for ${callerKey} (comment ${created.id}): ${(e as Error)?.message ?? e} — comment posted; project may nudge itself on it next poll`),
       );
     }
@@ -199,20 +230,31 @@ export interface CommentRow { id: string; body: string; created: string }
  * CORRECTED (BUTCHR-198/BUTCHR-202): this doc comment used to assert that
  * Confluence footer-comment ids are "monotonically increasing
  * platform-wide", inherited without re-measurement from
- * `src/resources/project.ts`'s `newestCommentId` doc comment. That claim
- * was false there and is false here too — see `newestCommentId`'s own doc
- * comment for the measurement (two independent root docs, a later comment
- * with a lower id, replay of real data losing 6 of 10 comments against a
- * max-id rule). The sort above is therefore NOT the stable total order this
- * comment used to claim it was: sorting by numeric id can put a
- * later-created comment BEHIND an earlier one, the same failure mode as the
- * watermark comparison this same false premise motivated. This function's
- * own callers — `escalation-loop.ts`'s dedupe among them — read the result
- * as newest-first; that expectation is KNOWN-WRONG pending BUTCHR-198's
- * fix. Left uncorrected in behavior here deliberately (BUTCHR-202 documents
- * the finding, it does not fix it) — `created`, discussed below, is not a
- * usable substitute total order either (per-row `""` fallback, and a
- * last-edited rather than created time even when present).
+ * `src/resources/project.ts`'s (now-deleted, see below) `newestCommentId`
+ * doc comment. That claim was false there and is false here too — the
+ * measurement (two independent root docs, a later comment with a lower id,
+ * replay of real data losing 6 of 10 comments against a max-id rule) is
+ * recorded permanently on BUTCHR-198's Confluence doc and BUTCHR-227's
+ * Jira ticket, not re-derived inline here. The sort above is therefore NOT
+ * the stable total order this comment used to claim it was: sorting by
+ * numeric id can put a later-created comment BEHIND an earlier one, the
+ * same failure mode as the watermark comparison this same false premise
+ * motivated. This function's own callers — `escalation-loop.ts`'s dedupe
+ * among them — read the result as newest-first; that expectation is
+ * KNOWN-WRONG. THIS IS A DIFFERENT CONSUMER FROM THE WAKE PATH BUTCHR-227
+ * FIXES (the project tier's root-doc/epics comment-observation surfaces,
+ * `src/resources/project.ts`): BUTCHR-227 removes the wake path's
+ * dependence on ordering entirely, but this escalation-dedupe sort still
+ * assumes an order that does not exist — BUTCHR-205 owns that caller-side
+ * consequence, not this ticket, and this comment is corrected only to name
+ * the right owner, with no behavior change here. `newestCommentId`, this
+ * comment's original citation, no longer exists — BUTCHR-227 deleted it
+ * once BUTCHR-227's own fix left it with no remaining callers (a known-
+ * wrong helper is worse left around for someone to reach for than removed).
+ * Left uncorrected in BEHAVIOR here deliberately, same as before — `created`,
+ * discussed below, is not a usable substitute total order either (per-row
+ * `""` fallback, and a last-edited rather than created time even when
+ * present).
  *
  * UNWRAPPING (BUTCHR-129, found at PR #180 review, CHANGES_REQUESTED @
  * 1be6208): `getPageComments` requests `bodyFormat: "storage"` and returns
