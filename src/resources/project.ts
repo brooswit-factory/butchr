@@ -375,6 +375,22 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  * treated as the ABSENT case in the other direction: kept out, so a bad
  * write can never lower a genuinely numeric stored value — "no writer may
  * lower it" holds even when the writer itself is confused.
+ *
+ * ONE OPERATOR, TWO OPPOSITE IMPLICATIONS, DEPENDING ON WHICH SIDE OF IT YOU
+ * STAND (the reason this guard is easy to get half-right): `projectVerdict`
+ * compares observed-vs-watermark with EXACT inequality (`!==`), never an
+ * ordering comparison. That makes the READ sound — the comparison itself
+ * loses nothing, and any gap between "seen" and "acted on" lives upstream,
+ * in what gets OBSERVED, not in how it's compared (BUTCHR-195's own finding).
+ * But the SAME `!==` makes a WRITE that only ever raises the watermark
+ * UNSOUND, because exact inequality has NO TOLERANCE for the watermark
+ * being ahead of the observation — a watermark strictly ABOVE what's
+ * observed is exactly as "unequal", and wakes the project exactly as hard,
+ * as one strictly below. That is why a write that is only a PARTIAL fact
+ * (a suppression write — this guard) must never get ahead of a write that
+ * is a COMPLETE fact (a reconciling write — `patch.reconcile` below): once
+ * ahead, under `!==`, there is no comparison-side rescue, only a write-side
+ * one that can bring the watermark back down to what's actually true.
  */
 function monotonicMax(stored: number | null | undefined, incoming: number | undefined): number | null {
   if (incoming === undefined) return stored ?? null;

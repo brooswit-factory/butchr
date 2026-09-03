@@ -361,6 +361,21 @@ describe("BUTCHR-226 REVIEW ROUND 1 — deletion recovery: a reconciling write (
   // SUPPRESSION write (never `reconcile: true`) is able to lower the
   // watermark below what a prior reconciling write already established,
   // defect 1's own guard has regressed.
+  //
+  // WHY THIS SCENARIO EARNS ITS OWN TEST, NOT JUST A HYPOTHETICAL: root-doc
+  // comment deletion is EXPECTED TRAFFIC on this surface, not a contrived
+  // edge case. BUTCHR-185's own `tell_peer` harness once posted a stray
+  // probe comment onto a peer project's root doc and deleted it as cleanup
+  // once recognized as its own error — BUTCHR-183 verified that deletion at
+  // review and confirmed it as correct behavior. As peer messaging sees
+  // more use, such cleanups will land on OTHER projects' root docs more
+  // often, and because they are cleanups of a comment just written, they
+  // concentrate on RECENT — and so plausibly high-id — comments: the worst
+  // possible distribution for a high-water mark. (Stated precisely: this is
+  // a demonstrated CLASS of event on this exact surface, not a reproduced
+  // production instance of the loop — the stray comment's id relative to
+  // the page's max at deletion time was never recorded, so whether that
+  // specific incident would have triggered this exact defect is unknown.)
   test("the top comment is deleted; a reconciling write (check_in-shaped) lowers the watermark to the new true max and the project reads asleep, traced through desiredFrom", async () => {
     const w = world({
       projectKey: "ACME",
