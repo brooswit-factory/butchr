@@ -96,6 +96,29 @@ import { join } from "node:path";
  * if someone later closes one of those holes, the suite goes RED and tells
  * them the note is now false.
  *
+ * A SECOND, NARROWER GAP IN THIS SAME MECHANISM (review round 1, BUTCHR-224):
+ * door 2 (the runtime coverage door) is PER-LIST AND OPT-IN, not automatic —
+ * it exists only where a caller actually writes the `assertBlindSpotCoverage`
+ * call "THE ORDERING HAZARD" above describes placing. Nothing here detects
+ * that call's ABSENCE: a list whose `assertBlindSpotCoverage` call is deleted
+ * (or never added in the first place) keeps its type-level door — a bare
+ * entry with neither `witness` nor `noWitnessReason` still fails to compile —
+ * but silently loses the runtime one, and a `witness: "some-id"` naming a
+ * test nobody ever wrote goes back to compiling AND passing, with nothing
+ * turning red. Measured, not argued: deleting the COVERAGE test from
+ * `test/unit/labels-registry.test.ts` at commit `3b118dbe` left `LABEL_BLIND_
+ * SPOTS` and its four declared witness ids untouched and `bun test test/unit
+ * test/load` fully green (1767 pass, one fewer test, no failure). Deliberately
+ * NOT closed by a fourth guard that checks the coverage calls are themselves
+ * wired up — that guard could itself be deleted with nothing catching THAT,
+ * regressing infinitely; "a framework that admits a record it cannot grade is
+ * worth more than one that grades everything" applies here exactly as it does
+ * to `PARENT`/`{{GROUND_TRUTH}}` in `src/workspace/registry.ts`. Named here
+ * instead: every caller of this module must itself verify, at the point it
+ * calls `assertBlindSpotCoverage`, that this file's own test
+ * (`test/unit/blind-spot.test.ts`) still passes, and that the call has not
+ * quietly gone missing from a list's own test file.
+ *
  * NO RUNTIME BEHAVIOUR LIVES IN THE DAEMON FOR THIS — same discipline every
  * scanner/registry this file sits beside already declares for itself: this
  * module is imported only by test files and by the three detectors' own
