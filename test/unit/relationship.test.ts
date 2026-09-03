@@ -7,6 +7,7 @@ import {
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
   CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
   ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER, guardShortProse, SWALLOWED_ARGUMENT_RE,
+  checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
@@ -122,7 +123,7 @@ function makeWorld() {
     createIssue: async (p) => {
       const key = `${p.projectKey}-${nextIssueId++}`;
       issues.set(key, {
-        issuetype: p.issuetype, project: p.projectKey, status: "To Do",
+        issuetype: p.issuetype, project: p.projectKey, status: "To Do", summary: p.summary,
         labels: p.labels ? [...p.labels] : [], comments: [],
         ...(p.assignee ? { assignee: p.assignee } : {}), ...(p.priority ? { priority: p.priority } : {}),
         ...(p.description ? { description: p.description } : {}),
@@ -2242,7 +2243,7 @@ describe("newWorker: PROJECT caller creates an EPIC (BUTCHR-71 Contract 2)", () 
     const { ops, pages, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
-    expect(pages.get(result.doc.id)!.parentId).toBe(ROOT_DOC_ID);
+    expect(pages.get(result.doc!.id)!.parentId).toBe(ROOT_DOC_ID);
   });
 
   test("disposition failure rolls back (deletes) the created epic — same reasoning as the issue-caller path, minus the link step", async () => {
@@ -2634,5 +2635,264 @@ describe("adoptWorker: tier-identity collision (BUTCHR-110/S1, PROJECT caller)",
     const w = issues.get("BUTCHR-9")!;
     expect(w.assignee).toBe(ROLES.epic); // assign — already happened, unaffected
     expect(w.status).toBe("In Progress"); // THE FIX: disposition still applied — never left undeclared
+  });
+});
+
+describe("newWorker / adoptWorker / startWorker: honest staffing (BUTCHR-244)", () => {
+  test("newWorker start: staffing explicitly reports pending/unconfirmed, never running", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result.staffing).toBe(STAFFING_PENDING);
+    expect(result.staffing).not.toMatch(/is running|now running|an agent is/i);
+  });
+
+  test("newWorker shelve: staffing explicitly reports not-active (never spawned from), not merely 'pending'", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "shelve", reason: "later" } });
+    expect(result.staffing).toBe(STAFFING_NOT_ACTIVE);
+  });
+
+  test("adoptWorker start: staffing reports pending, even on a fully idempotent re-adoption", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: ROLES.story, status: "In Progress" });
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(true);
+    expect(result.staffing).toBe(STAFFING_PENDING);
+  });
+
+  test("start_worker's own defs.ts wiring is exercised via startWorker + STAFFING_PENDING directly (defs.ts wraps the transition result with `staffing`, tested at the tool layer conceptually here via the same constant)", async () => {
+    // startWorker itself never claims staffing (see its own doc comment); the
+    // staffing statement is added at the tool-wiring layer (src/tools/defs.ts).
+    // This test pins the constant it must use, so the two can't drift silently.
+    expect(STAFFING_PENDING).toMatch(/did NOT start an agent/);
+    expect(STAFFING_PENDING).toMatch(/check_worker/);
+  });
+});
+
+describe("newWorker: idempotency — a retry cannot produce a twin (BUTCHR-244)", () => {
+  test("a second new_worker with the SAME summary from the SAME caller: no createIssue call is made, and the existing key comes back with created: false", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const first = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "  Do the thing  ", disposition: { kind: "start" } });
+    expect(first.created).not.toBe(false); // the normal create path never sets `created`
+
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const before = issues.size;
+    const retry = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } }); // same summary, trimmed differently
+    expect(createIssueCalls).toBe(0); // THE ASSERTION THAT MATTERS: no Jira create call at all
+    expect(issues.size).toBe(before); // nothing new landed in the fake world either
+    expect(retry.created).toBe(false);
+    expect(retry.key).toBe(first.key);
+    expect(retry.duplicateReason).toContain(first.key);
+    expect(retry.implements).toBe("BUTCHR-1");
+  });
+
+  test("a same-summary match against a DONE worker does NOT block — a new ticket IS created (the boundary is real, not just documented)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "Do the thing", status: "Done" });
+
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const result = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(createIssueCalls).toBe(1); // a REAL create happened
+    expect(result.created).not.toBe(false);
+    expect(result.key).not.toBe("BUTCHR-2");
+    expect(issues.get(result.key)!.status).toBe("In Progress"); // a real create, disposition applied — never skipped
+  });
+
+  test("a summary that merely SHARES SUBSTRINGS, or differs after trimming, does not match — exact equality only", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "Do the thing", status: "In Progress" });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "Do the thing, differently", disposition: { kind: "start" } });
+    expect(result.created).not.toBe(false);
+    expect(issues.size).toBe(3); // BUTCHR-1, BUTCHR-2, and the new one
+  });
+
+  test("DIRECTION: matches against the caller's own CHILDREN (outward Implements links), never its BOSS (inward) — the near-miss named on this ticket's own review thread", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    // BUTCHR-0 is BUTCHR-1's BOSS (inward from BUTCHR-1's perspective) and
+    // happens to share the exact summary the caller is about to file. A
+    // direction bug (reading inwardIssue instead of outwardIssue) would
+    // "match" BUTCHR-0 and wrongly refuse to create — reading the RIGHT
+    // direction must create for real instead.
+    addIssue("BUTCHR-0", { issuetype: "Epic", project: "BUTCHR", summary: "Do the thing" });
+    addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-0" });
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const result = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(createIssueCalls).toBe(1);
+    expect(result.created).not.toBe(false);
+    expect(result.key).not.toBe("BUTCHR-0");
+  });
+
+  test("PROJECT caller does NOT get the dedup check — same summary twice both create (materially different: no free per-child read for a project)", async () => {
+    const { ops, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const first = await newWorker(spied, ROLES, "BUTCHR", { summary: "Do the thing", disposition: { kind: "start" } });
+    const second = await newWorker(spied, ROLES, "BUTCHR", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(createIssueCalls).toBe(2);
+    expect(first.key).not.toBe(second.key);
+    expect(second.created).not.toBe(false);
+  });
+});
+
+describe("checkWorker (BUTCHR-244): the three-valued staffing verdict", () => {
+  function setupCaller(addIssue: ReturnType<typeof makeWorld>["addIssue"]) {
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+  }
+
+  test("refuses a key that is not the caller's own worker", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-999" }); // someone else's worker
+    await expect(checkWorker(ops, "BUTCHR-1", "BUTCHR-9")).rejects.toThrow(/not one of BUTCHR-1's own workers/);
+  });
+
+  test("staffed: a probe (in scope) resolving true", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+    const probe = async (key: string) => { expect(key).toBe("BUTCHR-9"); return true; };
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "staffed", source: "herd" });
+  });
+
+  test("not staffed: a probe (in scope) resolving false", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+    const probe = async () => false;
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "herd" });
+  });
+
+  test("could not look: a probe (in scope) that REJECTS, and no agent:* label present — falls back honestly to \"could-not-look\", never \"not-staffed\"", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+    const probe = async (): Promise<boolean | null> => { throw new Error("herdr socket down"); };
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(result.staffing).toBe("could-not-look");
+    expect(result.source).toBe("label");
+    expect(result.observedLabel).toBeUndefined();
+    expect(result).not.toHaveProperty("probeOutOfScope"); // the probe WAS in scope — it just couldn't answer
+  });
+
+  test("a probe resolving null (in scope) behaves identically to a rejecting probe", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+    const probe = async (): Promise<boolean | null> => null;
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(result.staffing).toBe("could-not-look");
+    expect(result.source).toBe("label");
+  });
+
+  test("no probe wired at all: falls back to the agent:* label and names the label as the source", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: ["agent:working"] });
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+    expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "staffed", source: "label", observedLabel: "agent:working" });
+  });
+
+  test("no probe wired, agent:none label present: staffing is not-staffed, sourced from the label", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: ["agent:none"] });
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+    expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "label", observedLabel: "agent:none" });
+  });
+
+  test("no probe wired, and no agent:* label at all (e.g. never active): could-not-look, never a guessed not-staffed", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+    expect(result).toEqual({ key: "BUTCHR-9", status: "To Do", staffing: "could-not-look", source: "label" });
+  });
+
+  // -------------------------------------------------------------------
+  // BUTCHR-244 AC-5: a herd probe only ever covers issues staffed by ITS
+  // OWN account. A worker assigned to a DIFFERENT account is invisible to
+  // it — the probe must never be trusted for that worker, no matter what
+  // it would have returned. This is the exact near-miss that happened live
+  // on this ticket's own review thread: the wrong herd, queried, came back
+  // empty, and got reported as a confident "not staffed".
+  // -------------------------------------------------------------------
+  test("AC-5: a probe that WOULD say \"not running\" is never trusted for a worker assigned to a DIFFERENT account — falls back to could-not-look, not a guessed \"no\"", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress" });
+    let probeCalled = false;
+    const probe = async (): Promise<boolean | null> => { probeCalled = true; return false; }; // would confidently say "not staffed" if ever asked
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(probeCalled).toBe(false); // THE ASSERTION THAT MATTERS: never even consulted
+    expect(result.staffing).toBe("could-not-look"); // never "not-staffed"
+    expect(result.source).toBe("label");
+    expect(result.probeOutOfScope).toBe(true);
+  });
+
+  test("AC-5: out-of-scope probe, but the RIGHT daemon already wrote an agent:* label — the label still answers (cross-daemon-valid signal), with probeOutOfScope named", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["agent:working"] });
+    const probe = async (): Promise<boolean | null> => false;
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(result.staffing).toBe("staffed");
+    expect(result.source).toBe("label");
+    expect(result.observedLabel).toBe("agent:working");
+    expect(result.probeOutOfScope).toBe(true);
+  });
+
+  test("AC-5: an UNASSIGNED worker never lets a probe be trusted either (fails closed, not open)", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" }); // no assignee at all
+    let probeCalled = false;
+    const probe = async (): Promise<boolean | null> => { probeCalled = true; return true; };
+    const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(probeCalled).toBe(false);
+    expect(result.probeOutOfScope).toBe(true);
+  });
+
+  test("AC-5: getMyself() itself failing fails CLOSED — never treated as in-scope", async () => {
+    const { ops, addIssue } = makeWorld();
+    setupCaller(addIssue);
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+    const broken: AtlassianOps = { ...ops, getMyself: async () => { throw new Error("myself endpoint down"); } };
+    let probeCalled = false;
+    const probe = async (): Promise<boolean | null> => { probeCalled = true; return true; };
+    const result = await checkWorker(broken, "BUTCHR-1", "BUTCHR-9", probe);
+    expect(probeCalled).toBe(false);
+    expect(result.probeOutOfScope).toBe(true);
+    expect(result.staffing).toBe("could-not-look");
+  });
+
+  test("PROJECT caller: check_worker ownership follows MEMBERSHIP, same as start_worker (refuses a non-member, accepts a member epic)", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "KAN" }); // different project
+    await expect(checkWorker(ops, "BUTCHR", "BUTCHR-9")).rejects.toThrow(/not one of BUTCHR's own workers/);
+
+    addIssue("BUTCHR-8", { issuetype: "Epic", project: "BUTCHR", status: "In Progress", labels: ["agent:idle"] });
+    const result = await checkWorker(ops, "BUTCHR", "BUTCHR-8");
+    expect(result.staffing).toBe("staffed");
+    expect(result.observedLabel).toBe("agent:idle");
   });
 });
