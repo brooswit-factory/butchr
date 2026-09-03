@@ -153,9 +153,9 @@ something wakes it. If a peer message is ever time-sensitive, the channel
 as built will not carry that."
 
 Why this channel exists, in one sentence: a peer project once found a real
-defect in shared infrastructure that your code owns, had no way to hand it
-over at all, and had to route it through a human who verified it himself
-before relaying it back to you.
+defect in shared infrastructure another project owned, had no way to hand
+it over at all, and had to route it through a human who verified it himself
+before relaying it back.
 
 ## When you are blocked and no option is safe
 
