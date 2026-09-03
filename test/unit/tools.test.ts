@@ -47,7 +47,7 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
-      "check_in",
+      "check_in", "check_worker",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",

@@ -136,6 +136,29 @@ const projectNotifyHealth = createLoopHealth({
 // the rest of the declining set and why it's not all wired yet.
 const coverage = createCoverageTracker();
 
+/**
+ * BUTCHR-244: `check_worker`'s live staffing probe — the narrow seam
+ * `atlassianTools` takes rather than the whole `herd`, so `defs.ts` (and
+ * `relationship.ts`'s `checkWorker`, which actually calls this) stays pure
+ * over its dependencies. Resolves `true`/`false` from `herd.runningIssues()`
+ * (this daemon's own live agent registry); `null` when that read itself
+ * failed. Deliberately does NOT attempt to determine "is this worker even
+ * one this daemon's herd could cover" here — `checkWorker` already does
+ * that (AC-5: comparing the worker's own Jira assignee against this
+ * credential's own identity, both of which it has independently, without
+ * this probe's help) before ever calling this function, so this stays a
+ * simple, honest "what does MY herd currently say" — see relationship.ts's
+ * `probeCoversWorker` for that scope check and the incident it fixes.
+ */
+const isStaffed = async (key: string): Promise<boolean | null> => {
+  try {
+    const running = await herd.runningIssues();
+    return running.includes(key);
+  } catch {
+    return null;
+  }
+};
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -152,7 +175,7 @@ const { app, mcp } = buildApp({
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
+}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);

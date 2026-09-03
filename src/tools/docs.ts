@@ -97,10 +97,11 @@ export function findBossKey(issue: unknown): string | null {
   return null;
 }
 
-/** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. */
+/** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. `summary` (BUTCHR-244) is the same stub's hydrated `fields.summary` — present in the SAME measured field set as `status` (see `findWorkers`'s own doc comment), so reading it costs nothing beyond what `status` already costs; used by `new_worker`'s idempotency check (relationship.ts's `findDuplicateWorker`) to match a retry against the caller's own not-Done children with no extra Jira call. */
 export interface WorkerRef {
   key: string;
   status: string | undefined;
+  summary: string | undefined;
 }
 
 /**
@@ -131,11 +132,11 @@ export interface WorkerRef {
 export function findWorkers(issue: unknown): WorkerRef[] {
   const links = (issue as { fields?: { issuelinks?: unknown[] } })?.fields?.issuelinks ?? [];
   const workers: WorkerRef[] = [];
-  for (const l of links as Array<{ type?: { name?: string }; outwardIssue?: { key?: string; fields?: { status?: { name?: string } } } }>) {
+  for (const l of links as Array<{ type?: { name?: string }; outwardIssue?: { key?: string; fields?: { status?: { name?: string }; summary?: string } } }>) {
     // On the BOSS (this ticket), a worker appears as `outwardIssue` — the
     // mirror image of findBossKey's `inwardIssue` read above.
     if (l?.type?.name === "Implements" && l.outwardIssue?.key) {
-      workers.push({ key: l.outwardIssue.key, status: l.outwardIssue.fields?.status?.name });
+      workers.push({ key: l.outwardIssue.key, status: l.outwardIssue.fields?.status?.name, summary: l.outwardIssue.fields?.summary });
     }
   }
   return workers;
