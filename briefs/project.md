@@ -129,6 +129,13 @@ known, narrow residual case, not something you caused and not something to
 work around by changing how or whether you speak or write your doc — report
 it if you see it, so the underlying write failure can be fixed at its source.
 
+**A second, narrower residual:** `confluence_update_page` (the deprecated,
+general-purpose page-editor alias, not `set_doc`) still bumps a page's
+version with no watermark advance at all. If you ever reach for that alias
+to edit your OWN root doc instead of `set_doc`, that specific edit is NOT
+suppressed and can still wake you. Use `set_doc` for your own root doc, as
+its own description already tells you to; that path is fully closed.
+
 ## Keep your doc current
 
 For you, the doc **is** the root doc — there is no separate per-ticket page.

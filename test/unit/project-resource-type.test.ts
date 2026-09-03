@@ -275,6 +275,60 @@ describe("advanceProjectWatermark — the monotonic guard (BUTCHR-214/226, defec
     await advanceProjectWatermark(okOps, "ACME", { comment: "500" });
     expect((w.properties.get("ACME")!.wake as any).comment).toBe("501"); // absorbed — not overwritten back down to "500"
   });
+
+  // BUTCHR-226 REVIEW ROUND 1 — the blocking issue: `projectVerdict`
+  // compares by exact inequality, so a watermark strictly ABOVE the
+  // observation is exactly as "unequal" as one below. A monotonic guard
+  // that only ever raises the ceiling therefore turns a deleted top comment
+  // into a PERMANENT spawn loop `check_in` can never clear, since it
+  // legitimately observes a LOWER true max after the deletion and the
+  // guard refused to lower. `patch.reconcile` (check_in-only) is the fix:
+  // an explicit, complete-observation write that bypasses the guard.
+  test("`reconcile: true` (check_in's own shape) CAN lower the stored watermark — this is what lets a deletion be recovered from", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "100", reconcile: true });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("100");
+  });
+
+  test("a SUPPRESSION write (no `reconcile`) still cannot lower it, even immediately after a reconciling write established a lower value", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "100", reconcile: true });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "50" }); // no reconcile — a suppression write
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("100"); // NOT lowered to "50"
+  });
+
+  // THE INTERACTION THE REVIEW FLAGGED BY NAME: `pendingWatermarkFallback`
+  // merges pending values back in on read (defect 1b) — so if a
+  // RECONCILING write's own persist fails, its authoritative (possibly
+  // LOWER) intent must still win on the next read/write, never be
+  // monotonic-merged against the stale, still-higher persisted value (which
+  // would silently re-raise the ceiling and reproduce the exact permanent
+  // loop this round exists to fix).
+  test("DEFECT 1b + reconcile: a FAILED reconciling write's lower value is what a LATER write absorbs, never the stale persisted value it failed to replace", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} }, { failWrite: true });
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "100", reconcile: true }).catch(() => {});
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("500"); // persisted value: unchanged, write failed
+
+    // A later write (any caller) succeeds against the same project key. If
+    // its own floor were the stale persisted "500" (monotonic-merged, the
+    // way a SUPPRESSION-origin pending value is), a comment of "300" would
+    // be refused (300 < 500) and the stale ceiling would survive. If its
+    // floor is correctly the RECONCILED "100" (this test's claim), "300"
+    // advances past it. The full end-to-end proof that the daemon's own
+    // discovery read ALSO sees "100" (not "500") lives in
+    // test/unit/project-self-wake-loop.test.ts's deletion-recovery block;
+    // this test pins the narrower, write-side absorption claim.
+    const okOps = unimplementedProjectOps({
+      getProjectPropertyOrNull: async (key: string) => w.properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        w.properties.set(key, value as Record<string, unknown>);
+        w.persistedWrites.push(value);
+        return { ok: true };
+      },
+    });
+    await advanceProjectWatermark(okOps, "ACME", { comment: "300" });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("300"); // floor was "100" (reconciled), not "500" (stale persisted)
+  });
 });
 
 describe("PROJECT_ACTIVATION / PROJECT_SPAWN_CONFIG / projectIdOf", () => {

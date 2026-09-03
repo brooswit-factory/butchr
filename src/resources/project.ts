@@ -441,17 +441,38 @@ function monotonicMaxId(stored: string | null | undefined, incoming: string | un
  * until then — a real gap, and the reason the WARNING log line below stays
  * loud rather than being treated as fully closed.
  */
-const pendingWatermarkFallback = new Map<string, { version: number | null; comment: string | null }>();
+const pendingWatermarkFallback = new Map<string, { version: number | null; comment: string | null; reconcile: boolean }>();
 
 /** Test-only: `pendingWatermarkFallback` is process-lifetime state shared across every caller in this module, so a test suite that reuses a project key across tests (as this file's own fixtures do) must reset it between tests to avoid one test's failed write leaking into another's assertions. */
 export function resetPendingWatermarkFallbackForTests(): void {
   pendingWatermarkFallback.clear();
 }
 
-/** `loadProjects`' own merge of a persisted watermark with any still-pending in-memory fallback for the same project — see `pendingWatermarkFallback`'s doc comment. Never touches `epics` (out of this fallback's scope; see that doc comment). */
+/**
+ * `loadProjects`' own merge of a persisted watermark with any still-pending
+ * in-memory fallback for the same project — see `pendingWatermarkFallback`'s
+ * doc comment. Never touches `epics` (out of this fallback's scope; see that
+ * doc comment).
+ *
+ * `pending.reconcile` (BUTCHR-214/226 review round 1 — see `advanceProjectWatermark`'s
+ * own "RECONCILING VS SUPPRESSING WRITES" section) decides HOW the merge
+ * happens, not just whether: a pending value that came from a RECONCILING
+ * write (`check_in`'s complete, authoritative observation) is used DIRECTLY,
+ * never `monotonicMax`ed against the persisted value — that authoritative
+ * value may legitimately be LOWER (the previous top comment was deleted),
+ * and comparing it against a stale, still-higher persisted value would keep
+ * the higher (wrong) one, silently re-raising the ceiling `check_in` was
+ * trying to lower and reproducing the exact permanent-spawn-loop this round
+ * exists to fix. A pending value from a SUPPRESSION write is still merged
+ * via `monotonicMax`/`monotonicMaxId` — it is a partial fact, not a complete
+ * observation, so a persisted value that is already higher must still win.
+ */
 function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): ProjectWatermark {
   const pending = pendingWatermarkFallback.get(projectKey);
   if (!pending) return persisted;
+  if (pending.reconcile) {
+    return { version: pending.version, comment: pending.comment, epics: persisted.epics };
+  }
   return {
     version: monotonicMax(persisted.version, pending.version ?? undefined),
     comment: monotonicMaxId(persisted.comment, pending.comment ?? undefined),
@@ -459,10 +480,40 @@ function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): 
   };
 }
 
+/**
+ * RECONCILING VS SUPPRESSING WRITES (BUTCHR-214/226 review round 1 —
+ * corrects a premise this ticket started from: "`check_in` cannot regress
+ * the watermark by construction" is not quite true. It cannot regress it
+ * from a STALE value, but it legitimately observes a LOWER true max when
+ * the previously-newest comment is deleted, and the monotonic guard alone
+ * blocks exactly that recovery, turning a deletion into a PERMANENT spawn
+ * loop `check_in` — the designated recovery path — can never clear, since
+ * ids are drawn non-monotonically from a wide range with no guarantee a
+ * higher one ever arrives again.
+ *
+ * The fix is not to weaken the guard — it is to recognize that this
+ * module's two write shapes are not the same kind of fact:
+ *   - a SUPPRESSION write (`speakOnOwnChannel`, `setProjectDoc`) says "I
+ *     just created this id/version" — a PARTIAL fact about one write. It
+ *     must never lower the watermark; `monotonicMax`/`monotonicMaxId` above
+ *     are exactly right for it, unchanged.
+ *   - a RECONCILING write (`check_in` only) says "here is the max over
+ *     EVERYTHING currently on the page" — a COMPLETE observation. It may
+ *     set the watermark authoritatively, INCLUDING DOWNWARD, which is
+ *     exactly what it did before this guard existed and must keep doing.
+ *
+ * `patch.reconcile` makes this EXPLICIT at the call site — `check_in`
+ * (src/tools/defs.ts) is the only caller that ever passes it — rather than
+ * inferred/detected heuristically, per direct instruction: an explicit flag
+ * is the whole point. This does not touch `projectVerdict`'s comparison and
+ * does not change what the stored field MEANS (still "the comment id this
+ * project has been acted on through") — BUTCHR-195/199's boundary is
+ * untouched.
+ */
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
-  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>> },
+  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>>; reconcile?: boolean },
   log: (line: string) => void = console.error,
 ): Promise<void> {
   // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
@@ -484,46 +535,74 @@ export async function advanceProjectWatermark(
   // REPLACE, where the same fail-open shape means "assume the record was
   // empty" and silently deletes whatever was actually there.
   const current = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as Record<string, unknown> | null ?? {};
-  // DEFECT 1b: an earlier caller's write to THIS axis may have failed to
-  // persist — merge its intent in before applying THIS patch, so whichever
-  // write next succeeds is the one that finally makes it durable (see
-  // `pendingWatermarkFallback`'s doc comment).
-  const persistedWake = (current.wake as Partial<ProjectWatermark> | undefined) ?? {};
-  const pending = pendingWatermarkFallback.get(projectKey);
-  const wake: Partial<ProjectWatermark> = pending
-    ? {
-        version: monotonicMax(persistedWake.version, pending.version ?? undefined),
-        comment: monotonicMaxId(persistedWake.comment, pending.comment ?? undefined),
-        ...(persistedWake.epics !== undefined ? { epics: persistedWake.epics } : {}),
-      }
-    : persistedWake;
-  // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
-  // merge. This is the actual fix for rule 3's re-entry defect (see
-  // `ProjectWatermark.epics`'s doc comment, point 2): the only caller that
-  // ever passes `epics` is the project agent's own `check_in`
-  // (src/tools/defs.ts), which always computes the FULL currently-in-review
-  // set for the whole project in one JQL call — so "replace" here means
-  // "this is now the complete truth", and an epic that has left review
-  // since the last check-in is correctly dropped rather than lingering.
-  // Omitting `epics` entirely (e.g. a version-only or comment-only advance)
-  // leaves the existing map untouched. DELIBERATELY NOT monotonic (unlike
-  // version/comment below): a smaller map after a check-in is exactly how
-  // an epic leaving review gets pruned — "smaller" is not "behind" here.
-  const epics = patch.epics !== undefined ? patch.epics : (wake.epics ?? {});
-  const nextWake: ProjectWatermark = {
-    version: monotonicMax(wake.version, patch.version),
-    comment: monotonicMaxId(wake.comment, patch.comment),
-    epics,
+  const persistedWake: ProjectWatermark = {
+    version: (current.wake as Partial<ProjectWatermark> | undefined)?.version ?? null,
+    comment: (current.wake as Partial<ProjectWatermark> | undefined)?.comment ?? null,
+    epics: (current.wake as Partial<ProjectWatermark> | undefined)?.epics ?? {},
   };
+
+  let nextWake: ProjectWatermark;
+  if (patch.reconcile) {
+    // A complete, authoritative observation — bypasses BOTH the monotonic
+    // guard and this process's own pending fallback entirely (see
+    // `mergePendingFallback`'s doc comment for why merging either in here
+    // would silently defeat the one write meant to recover from a deletion).
+    // `epics` keeps its existing replace-only semantics, unaffected by this.
+    nextWake = {
+      version: patch.version ?? persistedWake.version,
+      comment: patch.comment ?? persistedWake.comment,
+      epics: patch.epics !== undefined ? patch.epics : persistedWake.epics,
+    };
+  } else {
+    // SUPPRESSION WRITE: its floor is the more-trustworthy of the persisted
+    // value and this process's own still-pending fallback — the SAME merge
+    // `loadProjects` applies on read (`mergePendingFallback`, reused here so
+    // read and write can never disagree about what "currently known" means),
+    // never lowered by this write.
+    const wake = mergePendingFallback(projectKey, persistedWake);
+    // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
+    // merge. This is the actual fix for rule 3's re-entry defect (see
+    // `ProjectWatermark.epics`'s doc comment, point 2): the only caller that
+    // ever passes `epics` is the project agent's own `check_in`
+    // (src/tools/defs.ts), which always computes the FULL currently-in-review
+    // set for the whole project in one JQL call — so "replace" here means
+    // "this is now the complete truth", and an epic that has left review
+    // since the last check-in is correctly dropped rather than lingering.
+    // Omitting `epics` entirely (e.g. a version-only or comment-only advance)
+    // leaves the existing map untouched. DELIBERATELY NOT monotonic (unlike
+    // version/comment below): a smaller map after a check-in is exactly how
+    // an epic leaving review gets pruned — "smaller" is not "behind" here.
+    const epics = patch.epics !== undefined ? patch.epics : wake.epics;
+    nextWake = {
+      version: monotonicMax(wake.version, patch.version),
+      comment: monotonicMaxId(wake.comment, patch.comment),
+      epics,
+    };
+  }
+
   try {
     await ops.setProjectProperty(projectKey, PROPERTY_KEY, { ...current, wake: nextWake });
-    // The durable write just absorbed whatever this process was holding
-    // in-memory for this project (it was merged into `nextWake` above) —
-    // safe to drop now, not before, so a failure never loses it.
-    if (pending) pendingWatermarkFallback.delete(projectKey);
+    // The durable write just became the new ground truth for whatever it
+    // covered — for a suppression write, `nextWake` already absorbed any
+    // pending value (see above); for a reconciling write, `nextWake` is
+    // authoritative regardless of what was pending. Either way, dropping
+    // the fallback outright here (never merging it back in) is correct.
+    pendingWatermarkFallback.delete(projectKey);
   } catch (e) {
-    pendingWatermarkFallback.set(projectKey, { version: nextWake.version, comment: nextWake.comment });
-    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, comment=${nextWake.comment ?? "null"}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
+    // A reconciling write's own failure must ALSO be recorded as
+    // authoritative (not monotonic-merged on a future read) — otherwise a
+    // failed deletion-recovery would sit in the fallback, get compared with
+    // `monotonicMax` against the still-stale-high persisted value on the
+    // next read, and lose exactly the downward correction it was trying to
+    // make. Once a pending entry has ever been authoritative, it stays that
+    // way until a write actually succeeds and clears it (or another
+    // reconciling write replaces it) — a later suppression write's own
+    // `nextWake` was already computed FROM that authoritative floor above,
+    // so preserving the flag here is what keeps read and write agreeing.
+    const priorPending = pendingWatermarkFallback.get(projectKey);
+    const reconcile = !!patch.reconcile || !!priorPending?.reconcile;
+    pendingWatermarkFallback.set(projectKey, { version: nextWake.version, comment: nextWake.comment, reconcile });
+    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, comment=${nextWake.comment ?? "null"}, reconcile=${reconcile}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
     throw e;
   }
 }

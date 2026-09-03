@@ -715,10 +715,20 @@ export function atlassianTools(
           epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
         }
         audit(c, `check_in (version=${version ?? "?"}, comment=${comment ?? "none"}, epics in review=${Object.keys(epics).length})`);
+        // `reconcile: true` (BUTCHR-214/226 review round 1): this is a
+        // COMPLETE observation over everything currently on the page, not a
+        // partial fact about one write — the only call site of this shape,
+        // and the only caller ever passing this flag. It may set
+        // version/comment authoritatively, INCLUDING DOWNWARD (e.g. the
+        // previously-newest comment was deleted) — see
+        // `advanceProjectWatermark`'s own "RECONCILING VS SUPPRESSING
+        // WRITES" doc comment (src/resources/project.ts) for why the
+        // monotonic guard must not apply to this call.
         await advanceProjectWatermark(ops, who, {
           ...(version !== undefined ? { version } : {}),
           ...(comment !== null ? { comment } : {}),
           epics,
+          reconcile: true,
         });
         return { ok: true, key: who, version: version ?? null, comment, epics };
       },

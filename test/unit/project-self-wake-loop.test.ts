@@ -338,10 +338,85 @@ describe("THE SPECIMEN'S MECHANISM — BUTCHR-226 FIXED THIS: non-monotonic Conf
       initialWake: { version: 1, comment: "500", epics: {} },
     });
     const observed = (await w.ops.getPageComments("doc-1")).results;
-    await advanceProjectWatermark(w.ops, "ACME", { comment: newestCommentId(observed)! });
+    // `reconcile: true` — this IS check_in's real shape as of the review
+    // round 1 fix (src/tools/defs.ts); harmless here since the observed max
+    // doesn't move, but kept accurate to what check_in actually sends.
+    await advanceProjectWatermark(w.ops, "ACME", { comment: newestCommentId(observed)!, reconcile: true });
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     expect(resource.watermark.comment).toBe("500"); // unchanged — still the true max
     expect(verdict).toBe("asleep");
+  });
+});
+
+describe("BUTCHR-226 REVIEW ROUND 1 — deletion recovery: a reconciling write (check_in) can lower the watermark; a suppression write still cannot", () => {
+  // THE BLOCKING ISSUE FROM ROUND 1's REVIEW, reproduced then fixed here.
+  // Failure condition, direction 1 (reconciling write must recover): if the
+  // project still reads "active" (or is still in `desiredFrom`) after
+  // check_in's own reconciling write observes the page's new true max
+  // following a deletion, the guard is still blocking the one write meant
+  // to recover from it — the exact permanent spawn loop this round exists
+  // to close, since ids are drawn non-monotonically from a wide range with
+  // no guarantee a higher one ever arrives to clear it by accident.
+  // Failure condition, direction 2 (suppression must still not lower): if a
+  // SUPPRESSION write (never `reconcile: true`) is able to lower the
+  // watermark below what a prior reconciling write already established,
+  // defect 1's own guard has regressed.
+  test("the top comment is deleted; a reconciling write (check_in-shaped) lowers the watermark to the new true max and the project reads asleep, traced through desiredFrom", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialPageVersion: 1,
+      // Two comments on the page; the project already checked in once,
+      // caught up to what was THEN the true max ("500").
+      initialComments: [{ id: "500", body: "<p>the one about to be deleted</p>" }, { id: "100", body: "<p>an older, still-present comment</p>" }],
+      initialWake: { version: 1, comment: "500", epics: {} },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the deletion
+
+    // Simulate the deletion of comment "500" directly on the fake's own
+    // comment list (`world()` exposes the live array, not a copy) — leaves
+    // "100" as the page's new true max.
+    const idx = w.pageComments.findIndex((c) => c.id === "500");
+    w.pageComments.splice(idx, 1);
+
+    const beforeReconcile = await verdictOf(w.deps, "ACME");
+    expect(beforeReconcile.resource.observedCommentId).toBe("100");
+    expect(beforeReconcile.resource.watermark.comment).toBe("500"); // still the old, now-gone max
+    expect(beforeReconcile.verdict).toBe("active"); // reproduces the review's own repro
+
+    // check_in's real shape: the max over EVERYTHING it now observes,
+    // `reconcile: true`.
+    await advanceProjectWatermark(w.ops, "ACME", { version: 1, comment: "100", epics: {}, reconcile: true });
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.watermark.comment).toBe("100"); // LOWERED — the guard did not block this write
+    expect(verdict).toBe("asleep"); // recovered — no longer a permanent spawn loop
+
+    const resourceType = createProjectResourceType(w.deps);
+    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
+    expect(desired.has("ACME")).toBe(false);
+  });
+
+  test("...and after that reconciliation, a SUPPRESSION write with an even lower id still cannot lower it further (defect 1's guard stays intact for the write that actually caused it)", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialComments: [{ id: "500", body: "<p>will be deleted</p>" }, { id: "100", body: "<p>survives</p>" }],
+      initialWake: { version: 1, comment: "500", epics: {} },
+      // The next comment posted (a daemon complaint via speakOnOwnChannel)
+      // draws a LOWER id than the just-reconciled "100" — the same
+      // non-monotonic hazard defect 1's guard exists for.
+      nextCommentIds: ["50"],
+    });
+    const idx = w.pageComments.findIndex((c) => c.id === "500");
+    w.pageComments.splice(idx, 1);
+    await advanceProjectWatermark(w.ops, "ACME", { version: 1, comment: "100", epics: {}, reconcile: true });
+    expect((await verdictOf(w.deps, "ACME")).resource.watermark.comment).toBe("100"); // sanity: reconciled
+
+    await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME ...");
+
+    const { resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.watermark.comment).toBe("100"); // NOT lowered to "50" — the guard held
   });
 });
 
