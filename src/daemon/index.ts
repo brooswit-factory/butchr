@@ -29,6 +29,7 @@ import { createStalledCheck } from "../agents/stalled.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
+import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
@@ -193,6 +194,25 @@ const parkedDetector = createParkedDetector({
 // `issueComments` is injected as `atlassian.comments`, the same client
 // `stalled`/`parkedDetector` above already use.
 const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comments(key));
+// BUTCHR-200: escalates a worker whose Implements boss reached Done while it
+// is still open — see src/agents/abandoned.ts. Unlike parkedDetector above
+// (which predates the BUTCHR-95/123/141 comment-read-path fix and still
+// uses the raw `atlassian.comments` call, deliberately not corrected here —
+// out of scope), this reads through `ownChannelComments`, the tier-aware
+// reader, per this ticket's own requirement. Posts through the same
+// `ops.addComment` seam as every other daemon-side comment write; no second
+// Atlassian writer. ON by default (see the wiring below): this detector's
+// measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
+// default cannot spam anything on day one — see this ticket's PR body for
+// why steady-state volume should NOT be assumed to stay zero.
+const abandonedDetector = createAbandonedDetector({
+  now: () => Date.now(),
+  minutes: config.abandonedMinutes,
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: ownChannelComments,
+  links: (issue) => atlassian.links(issue),
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
 // src/agents/frozen-asleep.ts for the full mechanism. `addComment` reuses the
 // SAME `speakOnOwnChannel` seam the blocked-dialog escalator already wires
@@ -357,6 +377,7 @@ runResourceLoop(issueResourceType, {
   },
   syncLabels,
   checkParked: parkedDetector.check,
+  checkAbandoned: abandonedDetector.check,
   // BUTCHR-141: the issue tier is the fast, high-volume loop (15s) — the one
   // most likely to actually observe a crash loop reach its threshold quickly.
   checkCrashLoop: issueCrashLoopDetector.check,

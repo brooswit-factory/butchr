@@ -46,6 +46,25 @@ export interface IssueLink {
    */
   otherEnd: "inward" | "outward";
   key: string;          // the OTHER issue's key
+  /**
+   * BUTCHR-200: the OTHER issue's status, when the payload carried it —
+   * OPTIONAL, `undefined` meaning UNKNOWN, never "confirmed none", the same
+   * discipline `JiraIssue.issuelinks` above already uses one level up.
+   * MEASURED (BUTCHR-192, `GET /rest/api/3/search/jql` with the exact field
+   * projection `AtlassianClient#search` uses): Jira hydrates
+   * `{issuetype, priority, status, summary}` on both `inwardIssue` and
+   * `outwardIssue` stubs — `labels` is NEVER among them, in either
+   * direction, even when the far end demonstrably carries one (two live
+   * samples, one with a non-empty `labels` on the far end) — so a consumer
+   * that needs a label off the other end of a link cannot get it from this
+   * stub and must fetch that issue directly. A caller reading a Done boss's
+   * status off its own worker's inward stub (src/agents/abandoned.ts) is the
+   * reason this field exists; every other existing consumer (`parked.ts`,
+   * `jira-watch/routes.ts`'s `watchedKeys`, `resources/issue.ts`'s boss-key
+   * lookup) reads only `type`/`otherEnd`/`key` and is unaffected by its
+   * addition.
+   */
+  status?: string;
 }
 
 export interface JiraComment {
