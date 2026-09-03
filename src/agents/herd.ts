@@ -1,8 +1,10 @@
 import type { HerdrClient, results } from "@brooswit/herdr-sdk";
-import { buildWorkspace, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceRoot, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
+import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 export type { SpawnSpec } from "./workspace.js";
+export type { StrandedCandidate } from "./reap.js";
 
 const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
 /**
@@ -212,6 +214,81 @@ export class HerdrHerd implements Herd {
 
   async paneFor(issue: string): Promise<string | null> {
     return (await this.byIssue()).get(issue)?.pane ?? null;
+  }
+
+  /**
+   * BUTCHR-245: this poll's stranded-and-owned workspace candidates — the
+   * "thin method" seam `strandedCandidates` (reap.ts) needs no herdr I/O of
+   * its own; this method supplies it, deliberately independent of
+   * `byIssue()`/`agent.list()`-keyed state elsewhere in this class (the
+   * ownership half of `strandedCandidates` never touches `agent.list()` at
+   * all — see that function's own doc comment).
+   */
+  async strandedCandidates(): Promise<StrandedCandidate[]> {
+    const [{ workspaces }, { panes }, { agents }] = await Promise.all([
+      this.herdr.workspace.list(),
+      this.herdr.pane.list(),
+      this.herdr.agent.list(),
+    ]);
+    return strandedCandidates(workspaces, panes, agents, workspaceRoot());
+  }
+
+  /**
+   * BUTCHR-245: verify ONE stranded candidate is genuinely dead — the
+   * decisive safety layer (reap.ts's own top comment names three; this is
+   * layer 2). Reap only if `pane.processInfo` SUCCEEDS for every one of the
+   * candidate's panes and NONE reports a claude process in its foreground
+   * (`isClaude`, this file). A thrown call, a missing `process_info`, or an
+   * empty `foreground_processes` are all UNKNOWN, never dead — same
+   * unknown-≠-stale discipline `staleIssues()` above already applies, for
+   * the same reason (a fresh respawn's pane, or a herdr hiccup, must never
+   * read as proof of death). Never throws: a herdr rejection on the verify
+   * OR the close resolves `false` — "not reaped this poll" — never
+   * propagates into the caller's per-poll loop (`reap.ts`'s `createReaper`
+   * additionally wraps this call too — belt and suspenders, matching this
+   * ticket's own "each close catches its own rejection" requirement).
+   */
+  async closeStranded(candidate: StrandedCandidate): Promise<boolean> {
+    try {
+      const verdict = await this.workspaceVerdict(candidate.paneIds);
+      if (verdict !== "dead") return false;
+      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<HerdrClient["workspace"]["close"]>[0]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** "dead" only if EVERY pane's own verdict is "dead" (see `paneVerdict`); a single "live" pane vetoes the whole workspace immediately, a single "unknown" pane makes the whole workspace "unknown" (never "dead") but does not short-circuit — every pane is still checked, since a LATER pane could still veto with "live". */
+  private async workspaceVerdict(paneIds: readonly string[]): Promise<"live" | "dead" | "unknown"> {
+    if (!paneIds.length) return "unknown"; // no panes reported for this workspace — nothing to verify against
+    let allDead = true;
+    for (const paneId of paneIds) {
+      const v = await this.paneVerdict(paneId);
+      if (v === "live") return "live";
+      if (v === "unknown") allDead = false;
+    }
+    return allDead ? "dead" : "unknown";
+  }
+
+  /**
+   * "dead" requires a SUCCESSFUL processInfo call reporting at least one
+   * identified foreground process, none of which is claude (e.g. the
+   * measured `fish`/`/usr/bin/fish` shape). Deliberately NOT "dead" for an
+   * empty `foreground_processes` — herdr reporting the call succeeded but
+   * found nothing there is not proof nothing is there; it's exactly as
+   * unverifiable as a thrown call or a missing `process_info`.
+   */
+  private async paneVerdict(paneId: string): Promise<"live" | "dead" | "unknown"> {
+    let info: results.PaneProcessInfo | undefined;
+    try {
+      info = (await this.herdr.pane.processInfo({ pane_id: paneId }) as { process_info?: results.PaneProcessInfo }).process_info;
+    } catch {
+      return "unknown";
+    }
+    const procs = info?.foreground_processes;
+    if (!procs || procs.length === 0) return "unknown";
+    return procs.some((p) => isClaude(p)) ? "live" : "dead";
   }
 
   private async statusOf(issue: string): Promise<string | null> {
