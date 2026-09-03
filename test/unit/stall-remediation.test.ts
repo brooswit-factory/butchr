@@ -385,4 +385,147 @@ describe("createStallRemediator", () => {
     await rem2.check("KAN-2", true, true); // floor starts at 7min for KAN-2, posts immediately (0 elapsed)
     expect(jira2.posted[0]!.text).toContain("0 minute(s)");
   });
+
+  // Acceptance criterion 10 (BUTCHR-221, added after PR #253 merged): do not
+  // fire the wake comment while the target's session quota is exhausted — a
+  // quota-parked pane cannot read it, and posting burns the quota whose
+  // return ends the outage.
+  describe("criterion 10: quotaBlocked suppresses the wake without touching Jira", () => {
+    test("a quota-blocked issue produces suppressed/quota-blocked and posts NOTHING", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        quotaBlocked: () => true,
+      });
+      const outcome = await rem.check("KAN-1", true, true);
+      expect(outcome).toEqual({ kind: "suppressed", issue: "KAN-1", reason: "quota-blocked" });
+      expect(jira.posted).toEqual([]);
+    });
+
+    // "Order it so it is cheap: this check should short-circuit before the
+    // comments() fetch" — proven directly, not inferred: comments() throws
+    // if it is ever called, so the test fails loudly if the ordering
+    // regresses instead of merely passing by coincidence.
+    test("short-circuits BEFORE the comments() fetch — a quota-blocked poll never calls comments()", async () => {
+      const posted: string[] = [];
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: async (_issue, text) => { posted.push(text); },
+        comments: async () => { throw new Error("comments() must not be called while quota-blocked"); },
+        quotaBlocked: () => true,
+      });
+      const outcome = await rem.check("KAN-1", true, true);
+      expect(outcome).toEqual({ kind: "suppressed", issue: "KAN-1", reason: "quota-blocked" });
+      expect(posted).toEqual([]);
+    });
+
+    // "the omitted-predicate case is unchanged from today's behaviour" —
+    // proven directly against a fresh instance with no quotaBlocked dep at
+    // all, not merely "still acts somewhere else in this file".
+    test("the omitted-predicate case is unchanged: no quotaBlocked dep still acts exactly as before", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted.length).toBe(1);
+    });
+
+    // A predicate that returns false for this issue is likewise a no-op —
+    // proves the gate is keyed by issue and not merely "supplied vs. not".
+    test("a quotaBlocked predicate that returns false for this issue does not suppress", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        quotaBlocked: (issue) => issue === "OTHER-1",
+      });
+      const outcome = await rem.check("KAN-1", true, true);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted.length).toBe(1);
+    });
+
+    // The steady-state quota-blocked case must not flood the log — tested
+    // the same way as the "already remediated" steady state above: many
+    // polls, exactly one log line (the entering transition), zero more.
+    test("log-flood policy: staying quota-blocked across many polls logs the transition once, not per poll", async () => {
+      let now = 0;
+      const logs: string[] = [];
+      const rem = createStallRemediator({
+        now: () => now,
+        addComment: async () => {},
+        comments: async () => [],
+        quotaBlocked: () => true,
+        log: (l) => logs.push(l),
+      });
+      await rem.check("KAN-1", true, true);
+      const afterFirst = logs.length;
+      expect(afterFirst).toBeGreaterThan(0);
+      expect(logs.some((l) => l.includes("quota-blocked"))).toBe(true);
+      for (let i = 0; i < 200; i++) {
+        now += 15_000;
+        const outcome = await rem.check("KAN-1", true, true);
+        expect(outcome).toEqual({ kind: "suppressed", issue: "KAN-1", reason: "quota-blocked" });
+      }
+      expect(logs.length).toBe(afterFirst); // zero NEW log lines across 200 steady-state polls
+    });
+
+    // Recovery: once the predicate flips back to false, the module acts on
+    // the very next poll (no memory of having been blocked persists as a
+    // latch), and the recovery is itself logged exactly once — not a post
+    // that silently resumes with no trace it had been suppressed.
+    test("recovers on the next poll once quota clears, and logs the recovery transition exactly once", async () => {
+      let blocked = true;
+      const jira = fakeJira();
+      const logs: string[] = [];
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        quotaBlocked: () => blocked,
+        log: (l) => logs.push(l),
+      });
+      const first = await rem.check("KAN-1", true, true);
+      expect(first).toEqual({ kind: "suppressed", issue: "KAN-1", reason: "quota-blocked" });
+      expect(jira.posted).toEqual([]);
+
+      blocked = false;
+      const recovered = await rem.check("KAN-1", true, true);
+      expect(recovered.kind).toBe("acted");
+      expect(jira.posted.length).toBe(1);
+      expect(logs.filter((l) => l.includes("no longer quota-blocked")).length).toBe(1);
+
+      // And normal debounce applies afterward, exactly as any other acted
+      // episode's would — quota-blocking is not a second dedupe mechanism.
+      const again = await rem.check("KAN-1", true, true);
+      expect(again.kind).toBe("suppressed");
+      expect(jira.posted.length).toBe(1);
+    });
+
+    // Once already remediated (spokenAt latched), quota status is moot —
+    // the steady-state "already remediated" branch returns before ever
+    // consulting quotaBlocked, so a quota-blocked poll after a successful
+    // post still reads as "already remediated", not "quota-blocked".
+    test("after a wake comment already posted, a later quota-blocked poll reads as 'already remediated', not 'quota-blocked'", async () => {
+      let now = 0;
+      const jira = fakeJira();
+      let blocked = false;
+      const rem = createStallRemediator({
+        now: () => now,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        quotaBlocked: () => blocked,
+      });
+      const acted = await rem.check("KAN-1", true, true);
+      expect(acted.kind).toBe("acted");
+      blocked = true;
+      now = MIN;
+      const outcome = await rem.check("KAN-1", true, true);
+      expect(outcome.kind).toBe("suppressed");
+      expect((outcome as { reason: string }).reason).toContain("already remediated");
+      expect(jira.posted.length).toBe(1);
+    });
+  });
 });
