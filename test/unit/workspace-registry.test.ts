@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { WORKSPACE_REGISTRY, type WorkspaceRegistryEntry } from "../../src/workspace/registry.js";
 import {
@@ -7,9 +8,11 @@ import {
   formatUnregisteredWorkspacePlaceholderError,
   KNOWN_NON_WORKSPACE_PLACEHOLDER_LITERALS,
   scanTemplatesForWorkspacePlaceholders,
+  WORKSPACE_BLIND_SPOTS,
   type WorkspacePlaceholderHit,
 } from "../../src/workspace/workspace-scan.js";
 import { WORKSPACE_PLACEHOLDERS } from "../../src/agents/workspace.js";
+import { assertBlindSpotCoverage, withTempFixture, witnessBlindSpot } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -160,6 +163,109 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     const injected: WorkspacePlaceholderHit = { file: "briefs/example-injected.md", line: 1, name: "ROGUE" };
     const unregistered = findUnregisteredWorkspacePlaceholders([...hits, injected], registeredNames);
     expect(unregistered).toEqual([injected]);
+  });
+});
+
+/**
+ * BUTCHR-224 — WORKSPACE_BLIND_SPOTS, EXECUTABLE WITNESSES WITH PAIRED
+ * POSITIVE CONTROLS. Each `test()` below calls `witnessBlindSpot` with the
+ * exact id `src/workspace/workspace-scan.ts`'s `WORKSPACE_BLIND_SPOTS`
+ * declares for that entry. TWO entries (`nonTemplateWriteSites`,
+ * `mergedNotDeployed`) are `witness: null` with a written `noWitnessReason`
+ * instead — see that file's own comment on WORKSPACE_BLIND_SPOTS for why
+ * they are two DIFFERENT kinds of unwitnessable, not the same gap named
+ * twice. Neither needs a test here; `assertBlindSpotCoverage` only demands
+ * execution for entries that declare a witness id.
+ */
+describe("WORKSPACE_BLIND_SPOTS witnesses (BUTCHR-224)", () => {
+  test("secondTemplatesDirectory — an identical placeholder in a sibling directory is invisible to scanTemplatesForWorkspacePlaceholders when it is only pointed at briefs/; the same placeholder under briefs/ IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "briefs"));
+      mkdirSync(join(root, "other-briefs"));
+      writeFileSync(join(root, "briefs", "registered.md"), "hello {{ROGUE}} world");
+      writeFileSync(join(root, "other-briefs", "rogue.md"), "hello {{ROGUE}} world");
+      const scanHits = scanTemplatesForWorkspacePlaceholders(join(root, "briefs"), root);
+      witnessBlindSpot("workspace:second-templates-directory", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "other-briefs/rogue.md")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.name === "ROGUE" && h.file === "briefs/registered.md")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("nonRecursiveSubdirectory — an identical placeholder in a subdirectory of briefs/ is invisible to scanTemplatesForWorkspacePlaceholders (non-recursive); the same placeholder directly under briefs/ IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "briefs"));
+      mkdirSync(join(root, "briefs", "sub"));
+      writeFileSync(join(root, "briefs", "top.md"), "hello {{ROGUE}} world");
+      writeFileSync(join(root, "briefs", "sub", "nested.md"), "hello {{ROGUE}} world");
+      const scanHits = scanTemplatesForWorkspacePlaceholders(join(root, "briefs"), root);
+      witnessBlindSpot("workspace:non-recursive-subdirectory", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "briefs/sub/nested.md")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.name === "ROGUE" && h.file === "briefs/top.md")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("nonMdFiles — an identical placeholder in a non-.md file under briefs/ is invisible to scanTemplatesForWorkspacePlaceholders; the same placeholder in a .md file IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "briefs"));
+      writeFileSync(join(root, "briefs", "real.md"), "hello {{ROGUE}} world");
+      writeFileSync(join(root, "briefs", "real.txt"), "hello {{ROGUE}} world");
+      const scanHits = scanTemplatesForWorkspacePlaceholders(join(root, "briefs"), root);
+      witnessBlindSpot("workspace:non-md-files", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "briefs/real.txt")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.name === "ROGUE" && h.file === "briefs/real.md")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("placeholderLookalike — a placeholder-shaped hit that is NOT a live interpolation target is silenced ONLY by an explicit KNOWN_NON_WORKSPACE_PLACEHOLDER_LITERALS-shaped exclusion; the identical shape in a DIFFERENT, unexcluded file is still flagged", () => {
+    const exclusions = [{ file: "briefs/example.md", name: "LIKE_THIS", reason: "test witness — a worked documentation example, not a real placeholder" }];
+    witnessBlindSpot("workspace:placeholder-lookalike", {
+      silence: () => {
+        const hits: WorkspacePlaceholderHit[] = [{ file: "briefs/example.md", line: 1, name: "LIKE_THIS" }];
+        expect(findUnregisteredWorkspacePlaceholders(hits, new Set(), exclusions)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits: WorkspacePlaceholderHit[] = [{ file: "briefs/elsewhere.md", line: 1, name: "LIKE_THIS" }];
+        expect(findUnregisteredWorkspacePlaceholders(hits, new Set(), exclusions)).toEqual(hits);
+      },
+    });
+  });
+
+  test("COVERAGE (must run after every witness above in this same file — see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every WORKSPACE_BLIND_SPOTS entry's declared witness id was actually executed, or it declares a written noWitnessReason instead", () => {
+    assertBlindSpotCoverage("WORKSPACE_BLIND_SPOTS", WORKSPACE_BLIND_SPOTS);
+  });
+
+  test("exactly two entries are witness: null today (nonTemplateWriteSites, mergedNotDeployed) — a change here means a blind spot became witnessable or a new unwitnessable one was added; update this pin deliberately, not by reflex", () => {
+    const unwitnessed = Object.entries(WORKSPACE_BLIND_SPOTS)
+      .filter(([, entry]) => entry.witness === null)
+      .map(([key]) => key)
+      .sort();
+    expect(unwitnessed).toEqual(["mergedNotDeployed", "nonTemplateWriteSites"]);
+  });
+
+  test("the two witness: null entries give DIFFERENT reasons — this is not one gap named twice", () => {
+    const nonTemplate = WORKSPACE_BLIND_SPOTS.nonTemplateWriteSites;
+    const mergedNotDeployed = WORKSPACE_BLIND_SPOTS.mergedNotDeployed;
+    expect(nonTemplate.witness).toBeNull();
+    expect(mergedNotDeployed.witness).toBeNull();
+    if (nonTemplate.witness === null && mergedNotDeployed.witness === null) {
+      expect(nonTemplate.noWitnessReason).not.toBe(mergedNotDeployed.noWitnessReason);
+      expect(mergedNotDeployed.noWitnessReason.toLowerCase()).toContain("deployed");
+    }
   });
 });
 
