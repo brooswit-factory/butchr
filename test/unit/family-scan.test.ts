@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  FAMILY_BLIND_SPOTS,
   findFamilyCollisions,
   findUnexplainedFamilyCollisions,
   formatFamilyCollisionError,
@@ -11,6 +13,7 @@ import {
 } from "../../src/media/family-scan.js";
 import { ALL_AGENT_LABEL_KEYS, isPrLabel } from "../../src/labels/plan.js";
 import { REGISTERED_LABELS } from "../../src/labels/registry.js";
+import { assertBlindSpotCoverage, withTempFixture, witnessBlindSpot } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -59,26 +62,6 @@ describe("findFamilyCollisions — the parser-based scan", () => {
 
   test("does NOT match a mention inside a /** JSDoc */ comment — comments are not string-literal AST nodes", () => {
     expect(findFamilyCollisions("src/example.ts", "/** agent:working and agent:idle both apply */\nexport const x = 1;", FAMILIES)).toEqual([]);
-  });
-
-  // THE ACTUAL LIVE SHAPE THIS SCANNER EXISTS TO CATCH: the pre-BUTCHR-155
-  // SWEEP_JQL, reconstructed here as a fixture (never against the real
-  // src/labels/sweep.ts file in this test — that reconstruction was done,
-  // run for real, and reverted manually for this ticket's PR; see this
-  // ticket's PR body for that actual output).
-  test("THE SWEEP_JQL SHAPE: a single hand-written JQL literal enumerating four of the five agent:* members is caught, naming exactly those four", () => {
-    const jql =
-      'const SWEEP_JQL = `assignee = currentUser() AND status NOT IN ("In Progress", "In Review") AND labels IN ("agent:working", "agent:idle", "agent:blocked", "agent:none")`;';
-    const hits = findFamilyCollisions("src/labels/sweep.ts", jql, FAMILIES);
-    expect(hits).toHaveLength(1);
-    expect(hits[0]!.family).toBe("agent:*");
-    expect(hits[0]!.matchedMembers).toEqual(["agent:blocked", "agent:idle", "agent:none", "agent:working"]);
-  });
-
-  test("THE DERIVED FORM OF THE SAME SWEEP_JQL — built from ALL_AGENT_LABEL_KEYS via .map()/.join(), no literal anywhere contains two members — is NOT caught, proving this scanner reads source shape, not runtime behaviour", () => {
-    const derived =
-      'const SWEEP_JQL = `assignee = currentUser() AND labels IN (${ALL_AGENT_LABEL_KEYS.map((l) => `"${l}"`).join(", ")})`;';
-    expect(findFamilyCollisions("src/labels/sweep.ts", derived, FAMILIES)).toEqual([]);
   });
 
   test("reports the correct 1-indexed line for a hit past the first line", () => {
@@ -145,5 +128,126 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     const injected: FamilyCollisionHit = { file: "src/example-injected.ts", line: 1, family: "agent:*", matchedMembers: ["agent:idle", "agent:working"], text: "agent:working agent:idle" };
     const unexplained = findUnexplainedFamilyCollisions([...hits, injected]);
     expect(unexplained).toEqual([injected]);
+  });
+});
+
+/**
+ * BUTCHR-254 — FAMILY_BLIND_SPOTS, EXECUTABLE WITNESSES WITH PAIRED POSITIVE
+ * CONTROLS. Each `test()` below calls `witnessBlindSpot` with the exact id
+ * `src/media/family-scan.ts`'s `FAMILY_BLIND_SPOTS` declares for that entry.
+ * See `src/media/blind-spot.ts` for why the pairing itself is structural
+ * rather than a convention to remember, and this file's own `FAMILY_BLIND_
+ * SPOTS` comment for why `noValueLevelAnchor` below is witnessed rather
+ * than left uncovered — it demonstrates the blindness, it does not close it.
+ */
+describe("FAMILY_BLIND_SPOTS witnesses (BUTCHR-254)", () => {
+  // PRIOR ART, FOLDED IN (BUTCHR-254's own instruction): this was previously
+  // two separate, unpaired tests — "THE SWEEP_JQL SHAPE" (a positive control
+  // with no structurally-linked silence half) and "THE DERIVED FORM" (a
+  // silence assertion with no structurally-linked positive control). Folding
+  // them into one witnessBlindSpot call is what makes the positive control
+  // load-bearing instead of adjacent-and-deletable — see this ticket's PR
+  // body for the mutation evidence proving the pairing matters.
+  test("suffixConcatenation — the real, post-BUTCHR-155 SWEEP_JQL shape (derived via ALL_AGENT_LABEL_KEYS.map()/.join(), no literal anywhere contains two members) is invisible; the pre-BUTCHR-155 hand-written form of the identical selection IS caught, naming all four members it hand-enumerated", () => {
+    witnessBlindSpot("family:suffix-concatenation", {
+      silence: () => {
+        const derived = 'const SWEEP_JQL = `assignee = currentUser() AND labels IN (${ALL_AGENT_LABEL_KEYS.map((l) => `"${l}"`).join(", ")})`;';
+        expect(findFamilyCollisions("src/labels/sweep.ts", derived, FAMILIES)).toEqual([]);
+      },
+      positiveControl: () => {
+        const jql =
+          'const SWEEP_JQL = `assignee = currentUser() AND status NOT IN ("In Progress", "In Review") AND labels IN ("agent:working", "agent:idle", "agent:blocked", "agent:none")`;';
+        const hits = findFamilyCollisions("src/labels/sweep.ts", jql, FAMILIES);
+        expect(hits).toHaveLength(1);
+        expect(hits[0]!.family).toBe("agent:*");
+        expect(hits[0]!.matchedMembers).toEqual(["agent:blocked", "agent:idle", "agent:none", "agent:working"]);
+      },
+    });
+  });
+
+  test("filteredAfterDerivation — a derivation immediately .filter()-ed down before use still contains no literal with two members, indistinguishable from an unfiltered derivation to a scanner that reads AST shape only; the hand-enumerated form of the same narrowed selection IS caught", () => {
+    witnessBlindSpot("family:filtered-after-derivation", {
+      silence: () => {
+        const filtered =
+          'const SWEEP_JQL = `labels IN (${ALL_AGENT_LABEL_KEYS.filter((l) => l !== "agent:stalled").map((l) => `"${l}"`).join(", ")})`;';
+        expect(findFamilyCollisions("src/labels/sweep.ts", filtered, FAMILIES)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits = findFamilyCollisions("src/labels/sweep.ts", 'const X = "agent:working agent:idle agent:blocked agent:none";', FAMILIES);
+        expect(hits).toHaveLength(1);
+        expect(hits[0]!.matchedMembers).toEqual(["agent:blocked", "agent:idle", "agent:none", "agent:working"]);
+      },
+    });
+  });
+
+  // THE TRAP (see this file's own header, and FAMILY_BLIND_SPOTS's own
+  // comment): this demonstrates the blindness using a throwaway Family built
+  // ONLY here, inside the test. It must never be read as this codebase
+  // inventing a real anchor for pr:*, PARENT, or {{GROUND_TRUTH}} — none of
+  // those gain one from this test existing.
+  test("noValueLevelAnchor — a hand-enumerated collision over a family with NO Family object built for it at all is invisible (nothing was ever asked to check it); the identical literal IS caught once an ad hoc Family is actually constructed for it", () => {
+    const text = 'const X = "ghost:alpha ghost:beta";';
+    witnessBlindSpot("family:no-value-level-anchor", {
+      silence: () => {
+        expect(findFamilyCollisions("src/example.ts", text, FAMILIES)).toEqual([]);
+      },
+      positiveControl: () => {
+        const ghostFamily: Family = { name: "ghost:*", members: new Set(["ghost:alpha", "ghost:beta"]) };
+        const hits = findFamilyCollisions("src/example.ts", text, [...FAMILIES, ghostFamily]);
+        expect(hits.map((h) => h.family)).toEqual(["ghost:*"]);
+      },
+    });
+  });
+
+  test("severalSeparateLiterals — two family members compared as two separate single-member literals (l === \"agent:working\" || l === \"agent:idle\") is invisible, since neither literal alone contains two members; the same two members combined into ONE literal IS caught", () => {
+    witnessBlindSpot("family:several-separate-literals", {
+      silence: () => {
+        const src = 'const ok = l === "agent:working" || l === "agent:idle";';
+        expect(findFamilyCollisions("src/example.ts", src, FAMILIES)).toEqual([]);
+      },
+      positiveControl: () => {
+        const hits = findFamilyCollisions("src/example.ts", 'const X = "agent:working agent:idle";', FAMILIES);
+        expect(hits.map((h) => h.matchedMembers)).toEqual([["agent:idle", "agent:working"]]);
+      },
+    });
+  });
+
+  test("unscannedDirectories — an identical family-collision literal under test/ is invisible to scanDirForFamilyCollisions when it is only pointed at src/; the same literal under src/ IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      mkdirSync(join(root, "test"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "agent:working agent:idle";');
+      writeFileSync(join(root, "test", "example.ts"), 'export const X = "agent:working agent:idle";');
+      const scanHits = scanDirForFamilyCollisions(join(root, "src"), root, FAMILIES);
+      witnessBlindSpot("family:unscanned-directories", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "test/example.ts")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.file === "src/example.ts" && h.family === "agent:*")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("nonTsFiles — an identical family-collision literal in a non-.ts file under src/ is invisible to scanDirForFamilyCollisions; the same literal in a .ts file IS found", () => {
+    withTempFixture((root) => {
+      mkdirSync(join(root, "src"));
+      writeFileSync(join(root, "src", "example.ts"), 'export const X = "agent:working agent:idle";');
+      writeFileSync(join(root, "src", "example.md"), 'export const X = "agent:working agent:idle";');
+      const scanHits = scanDirForFamilyCollisions(join(root, "src"), root, FAMILIES);
+      witnessBlindSpot("family:non-ts-files", {
+        silence: () => {
+          expect(scanHits.some((h) => h.file === "src/example.md")).toBe(false);
+        },
+        positiveControl: () => {
+          expect(scanHits.some((h) => h.file === "src/example.ts" && h.family === "agent:*")).toBe(true);
+        },
+      });
+    });
+  });
+
+  test("COVERAGE (must run after every witness above in this same file — see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every FAMILY_BLIND_SPOTS entry's declared witness id was actually executed", () => {
+    assertBlindSpotCoverage("FAMILY_BLIND_SPOTS", FAMILY_BLIND_SPOTS);
   });
 });
