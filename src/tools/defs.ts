@@ -10,6 +10,7 @@ import {
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
+import { unwrapStorageParagraph } from "./speak.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -725,7 +726,7 @@ export function atlassianTools(
     },
     get_doc_comments: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). `body` comes back as PLAIN TEXT (BUTCHR-239): `getPageComments` itself returns raw storage-format XHTML, but this handler undoes that with the same `unwrapStorageParagraph` the write side\'s wrapping already has as its exact inverse (src/tools/speak.ts) — no `<p>...</p>` wrapper and no entity escaping survive, so a marker like `[butchr:peer from=... to=... intent=...]` is readable with a bare `startsWith` and does not need re-decoding by the caller. CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(
@@ -734,7 +735,8 @@ export function atlassianTools(
           "your own root doc's footer comments have no per-issue equivalent to read here — an ISSUE caller's canonical read, jira_get_issue, already returns its own ticket's comments embedded in the response",
         );
         const doc = await projectRootDoc(ops, who);
-        const comments = await ops.getPageComments(doc.id);
+        const raw = await ops.getPageComments(doc.id);
+        const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
         audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
         return comments;
       },

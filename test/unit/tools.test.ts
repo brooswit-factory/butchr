@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -1676,6 +1677,79 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
     const { tools } = docCommentsRig({ "1": [{ id: "10", body: "hello from a reviewer", author: "712020:abc" }] });
     const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
     expect(result.results).toEqual([{ id: "10", body: "hello from a reviewer", author: "712020:abc" }]);
+  });
+
+  // BUTCHR-239: this defect already passed two reviews because the fixture
+  // above (`"hello from a reviewer"`) hands back PLAIN TEXT — a reader that
+  // never unwraps storage-format XHTML is indistinguishable from one that
+  // does, against that fixture. Every test below builds its body the way
+  // the REAL writer (`tell_peer`/`speakOnOwnChannel`, src/tools/relationship.ts
+  // and src/tools/speak.ts) actually produces one — `<p>${escapeStorageText
+  // (text)}</p>` — using the SAME exported `escapeStorageText`, so the
+  // fixture cannot drift from what production writes.
+  //
+  // Falsifier stated before writing these: with `unwrapStorageParagraph`
+  // removed from get_doc_comments' handler, the marker test below MUST fail
+  // — if it stays green, the fixture is still effectively plain text and
+  // this is the same mistake BUTCHR-129 already made once.
+  describe("BUTCHR-239: body comes back unwrapped and unescaped, using the real writer's shape", () => {
+    test("a tell_peer-shaped body reads back so body.startsWith('[butchr:peer ') is true and '<->' is literal, not entity-escaped", async () => {
+      const prefix = "[butchr:peer from=BUTCHR to=DROVR intent=notice] ";
+      const text = "The butchr <-> DROVR sideways channel is live.";
+      const written = `<p>${escapeStorageText(prefix + text)}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "10", body: written, author: "712020:abc" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      const body = result.results[0]!.body;
+      expect(body.startsWith("[butchr:peer ")).toBe(true);
+      expect(body).toBe(prefix + text);
+      expect(body).not.toContain("&lt;");
+      expect(body).not.toContain("&gt;");
+    });
+
+    test("round-trip identity: unwrapping what the real writer wrote returns the original text exactly", () => {
+      const original = "A & B < C > D — all three escapes in one string";
+      const written = `<p>${escapeStorageText(original)}</p>`;
+      expect(unwrapStorageParagraph(written)).toBe(original);
+    });
+
+    test("tolerant path: a body that is NOT <p>-wrapped (a human's foreign comment) comes back sensibly rather than mangled or dropped", async () => {
+      const humanBody = "just a note left by a person, no tool wrapping here";
+      const { tools } = docCommentsRig({ "1": [{ id: "11", body: humanBody, author: "712020:human" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results[0]!.body).toBe(humanBody);
+    });
+
+    test("id and author still arrive intact, and author is still absent (not a placeholder) when the source has none", async () => {
+      const prefix = "[butchr:peer from=BUTCHR to=DROVR intent=notice] ";
+      const written = `<p>${escapeStorageText(prefix + "no author on this row")}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "12", body: written }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results).toEqual([{ id: "12", body: prefix + "no author on this row" }]);
+      expect("author" in result.results[0]!).toBe(false);
+    });
+
+    // BUTCHR-239 [correction]: `unwrapStorageParagraph` must be applied to a
+    // row's body EXACTLY ONCE, in get_doc_comments' own handler — never in
+    // the shared op (getPageComments/atlassian-real.ts), because
+    // `createOwnChannelComments` (src/tools/speak.ts) already maps every row
+    // through this same inverse for its own caller, and unwrapping twice is
+    // not a harmless no-op: a sender whose PLAIN TEXT itself contains an
+    // entity-looking literal like "&gt;" would have that literal silently
+    // rewritten to ">" on the second pass, with no error on either side.
+    // This test's fixture's original text contains exactly that literal, so
+    // it can tell "unwrapped once" apart from "unwrapped twice" — a fixture
+    // without it could not.
+    test("exactly-once unwrap: a body whose ORIGINAL plain text itself contains an entity-looking literal ('&gt;') survives the round trip unchanged", async () => {
+      const original = "the arrow renders as &gt; in storage";
+      const written = `<p>${escapeStorageText(original)}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "13", body: written, author: "712020:abc" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results[0]!.body).toBe(original);
+      // Documents the failure this test exists to catch: unwrapping the
+      // ALREADY-unwrapped result a second time corrupts exactly this input.
+      expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).not.toBe(original);
+      expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).toBe("the arrow renders as > in storage");
+    });
   });
 });
 
