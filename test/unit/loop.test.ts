@@ -305,6 +305,28 @@ describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/
     expect(failureCalls).toEqual([[]]); // called once, with zero failures
   });
 
+  test("BUTCHR-245: checkReap is called exactly once per poll, BEFORE the spawn loop runs", async () => {
+    const herd = fakeHerd([]);
+    const order: string[] = [];
+    const desired = new Map([["NEW", spec("NEW")]]);
+    let calls = 0;
+    herd.spawn = async (sp) => { order.push(`spawn:${sp.key}`); herd.running.add(sp.key); };
+    await reconcileNow(herd, desired, {
+      checkReap: async () => { calls++; order.push("reap"); },
+    });
+    expect(calls).toBe(1);
+    expect(order).toEqual(["reap", "spawn:NEW"]);
+  });
+
+  test("BUTCHR-245: checkReap omitted behaves exactly as before — no call, no effect on spawn/stop/respawn", async () => {
+    const herd = fakeHerd(["OLD"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    herd.running.add("STALE");
+    const desired = new Map([["NEW", spec("NEW")], ["STALE", spec("STALE")]]);
+    await reconcileNow(herd, desired, {});
+    expect(herd.spawned.sort()).toEqual(["NEW", "STALE"]);
+    expect(herd.stopped.sort()).toEqual(["OLD", "STALE"]);
+  });
+
   test("a genuinely daemon-level failure (herd.runningIssues() rejecting) still propagates out of reconcileNow — isolation never widens to swallow this (§7)", async () => {
     const herd: Herd = {
       async runningIssues() { throw new Error("herdr down"); },

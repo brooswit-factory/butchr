@@ -1,7 +1,27 @@
+claude 'follow your CLAUDE.md' --model sonnet --effort high --permission-mode bypassPermission
+s --mcp-config /home/wroosbit/butchr-workspaces/BUTCHR-236/mcp.json --dangerously-load-develop
+ment-channels server:butchr
+Welcome to fish, the friendly interactive shell
+Type help for instructions on how to use fish
+wroosbit@servyboi ~/b/BUTCHR-236> claude 'follow your CLAUDE.md' --model sonnet --effort high
+--permission-mode bypassPermissions --mcp-config /home/wroosbit/butchr-workspaces/BUTCHR-236/m
+cp.json --dangerously-load-development-channels server:butchr
+ ▐▛███▛█   Claude Code v2.1.258
+▝▜██████▀  Sonnet 5 with high effort · Claude Max
+  ▝▝ ▝▝    ~/butchr-workspaces/BUTCHR-236
 
-● Bash(claude --model sonnet --permission-mode bypassPermissions --mcp-config mcp.json --dangerously-load-development-channels server:butchr "follow your CLAUDE.md")
-  ⎿  Running…
+▎ Channels (experimental) messages from server:butchr inject directly in this session ·
+▎ restart without --dangerously-load-development-channels to stop
+▎ server:butchr · no MCP server configured with that name
 
-───────────────────────────────────────────────────────────────────────────────────────────────
-You've hit your session limit · resets 9:50pm
-───────────────────────────────────────────────────────────────────────────────────────────────
+❯ follow your CLAUDE.md
+  ⎿  You've hit your session limit · resets 5:10pm (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+
+✻ Churned for 0s · done 1:47 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents              ● high · /effort
+                                                                                         /rc
