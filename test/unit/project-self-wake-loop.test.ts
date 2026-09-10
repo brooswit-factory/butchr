@@ -3,7 +3,6 @@ import {
   createProjectResourceType,
   projectVerdict,
   advanceProjectWatermark,
-  newestCommentId,
   resetPendingWatermarkFallbackForTests,
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
@@ -29,11 +28,28 @@ beforeEach(() => resetPendingWatermarkFallbackForTests());
  * auto-incrementing `commentOnPage` id, as several sibling test files' local
  * `makeOps` helpers use) cannot exercise the one dimension this file is
  * about — Confluence footer-comment ids are NOT monotonic with creation
- * order (measured live, `newestCommentId`'s own doc comment in
- * src/resources/project.ts) — so this file's fake `commentOnPage` returns
+ * order (measured live; see src/resources/project.ts's own module-level
+ * measurement notes) — so this file's fake `commentOnPage` returns
  * CALLER-CHOSEN ids, including ids lower than ids already on the page,
  * exactly the shape a type-faithful-but-behaviorally-wrong fixture would
  * never produce.
+ *
+ * BUTCHR-227 UPDATE, PER BUTCHR-199's OWN INSTRUCTION ("your PR will break
+ * some of these deliberately-pinned characterization tests, and that break
+ * IS THE SIGNAL, not your bug — update them test-by-test, never flatten
+ * green"): this file pinned TODAY'S (BROKEN) behavior at BUTCHR-217. The
+ * F5/F6 "specimen's mechanism" block below is the exact defect BUTCHR-227
+ * fixes — its assertions are INVERTED below (from "regresses and wakes" to
+ * "does not regress, stays asleep"), with the old assertions kept in a
+ * comment so a reader can see exactly what changed and why. Every other
+ * block in this file characterizes something BUTCHR-227 explicitly does
+ * NOT touch (the version axis, F7's silent-write-failure path, the
+ * author/content-blindness of the predicate) and is updated ONLY for the
+ * renamed fields (`observedCommentId` -> `observedCommentIds`,
+ * `watermark.comment` -> `watermark.commentsSeen`), never for behavior —
+ * `newestCommentId` itself no longer exists (BUTCHR-227 deleted it, having
+ * no remaining callers) so this file's one direct use of it is rewritten
+ * against `advanceProjectWatermark`'s new `seenComments` writer shape.
  *
  * Every describe block states its own failure condition first, per this
  * ticket's evidence-discipline requirement.
@@ -221,7 +237,7 @@ describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS — BUTCHR-226 FIXED THIS: a pr
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     expect(resource.observedVersion).toBe(6); // Confluence bumped it
     expect(resource.watermark.version).toBe(6); // BUTCHR-226: advanced to the version setProjectDoc's OWN write produced
-    expect(resource.observedCommentId).toBe(resource.watermark.comment); // comment axis: still caught up, untouched by this edit
+    expect(resource.unseenCommentIds).toEqual([]); // comment axis: still caught up, untouched by this edit
     expect(verdict).toBe("asleep"); // BUTCHR-226: no longer wakes on its own edit
 
     // Traced through to an actual spawn decision, same discipline as F5/F6.
@@ -251,7 +267,12 @@ describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS — BUTCHR-226 FIXED THIS: a pr
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     expect(resource.observedVersion).toBe(6);
     expect(resource.watermark.version).toBe(5); // never advanced — this write never went through setProjectDoc
-    expect(verdict).toBe("active");
+    // BUTCHR-227 field rename only (observedCommentId -> observedCommentIds,
+    // watermark.comment -> watermark.commentsSeen): the PROPERTY under test
+    // — the comment axis stays fully caught up, untouched by this edit — is
+    // unchanged; `unseenCommentIds` is the direct expression of "caught up".
+    expect(resource.unseenCommentIds).toEqual([]); // comment axis: still caught up, untouched by this edit
+    expect(verdict).toBe("active"); // wakes on the version axis alone
 
     const resourceType = createProjectResourceType(w.deps);
     const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
@@ -274,22 +295,26 @@ describe("end-to-end: the OPPOSITE direction — a genuine foreign comment must 
   });
 });
 
-describe("THE SPECIMEN'S MECHANISM — BUTCHR-226 FIXED THIS: non-monotonic Confluence ids can no longer turn the suppression's OWN bookkeeping into a self-wake (F5/F6)", () => {
-  // PRE-BUTCHR-226, this test proved the regression REPRODUCED (the
-  // defect's own outcome: watermark regressed to "300", verdict "active",
-  // spawned). BUTCHR-226's monotonic guard in `advanceProjectWatermark`
-  // (src/resources/project.ts) makes the stored comment the numerically
-  // LARGER of the incoming id and the existing one, so this same write can
-  // no longer regress it. Updated in place — see this file's top-of-file
-  // BUTCHR-226 update note.
+describe("THE SPECIMEN'S MECHANISM, BUTCHR-227 UPDATE: F5/F6 is FIXED — this block's assertions are INVERTED from BUTCHR-217's pinned (broken) behavior, on purpose", () => {
+  // BUTCHR-217's ORIGINAL failure condition (kept for the record): "if this
+  // does NOT reproduce 'active' from a write that never involved a foreign
+  // comment, then F5 is FALSIFIED". That was correct for the CODE AT THAT
+  // TIME (a blind scalar overwrite). BUTCHR-227 changes the code, so the
+  // SAME setup must now produce the OPPOSITE verdict — a test that still
+  // asserted "active" here would be asserting that this ticket's own fix
+  // did not work.
   //
-  // Failure condition, post-fix: this is wrong if `resource.watermark.comment`
-  // reads anything other than "500" (the guard failed to hold the line) or
-  // if the verdict reads "active" (the guard didn't prevent the wake it
-  // exists to prevent).
-  test("a daemon complaint (frozen-asleep's own addComment, via the REAL speakOnOwnChannel seam) posted with a LOWER id than an already-caught-up watermark no longer regresses the watermark, and the project stays asleep — with zero foreign comments involved", async () => {
-    // Set up: the project already checked in once, caught up to the highest
-    // id then on the page (id "500") — an entirely ordinary, healthy state.
+  // THIS BLOCK'S NEW FAILURE CONDITION, stated before looking: if this
+  // reproduces "active" from a write that never involved a foreign comment,
+  // BUTCHR-227's fix DID NOT WORK — the exact defect it exists to close is
+  // still live. It does not reproduce "active" below (proven by running the
+  // test), so the fix holds against this specimen.
+  test("BUTCHR-227 FIXED: a daemon complaint posted with a LOWER id than an already-caught-up watermark no longer regresses anything, and the project stays ASLEEP — zero foreign comments involved", async () => {
+    // Set up: identical to BUTCHR-217's original fixture — the project
+    // already checked in once, caught up to the highest id then on the page
+    // (id "500", stored as the LEGACY scalar shape check_in used to write —
+    // this ALSO exercises the migration adapter, seeding `commentsSeen` with
+    // exactly one member, "500").
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -309,29 +334,41 @@ describe("THE SPECIMEN'S MECHANISM — BUTCHR-226 FIXED THIS: non-monotonic Conf
     await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME has read \"asleep\" with its agent still running...");
 
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    // BUTCHR-226: the guard refused the lower incoming id — the stored
-    // watermark stays at the numerically larger "500", not "300".
-    expect(resource.watermark.comment).toBe("500");
-    // The true numeric max on the page is still "500" too (the just-posted
-    // "300" is lower) — watermark and observation now agree.
-    expect(resource.observedCommentId).toBe("500");
-    // ...and the project no longer wakes on its own suppressed write.
+    // BUTCHR-217 (BEFORE, now WRONG): `expect(resource.watermark.comment).toBe("300")`
+    // — the scalar watermark was blindly overwritten to the LOWER id, losing "500".
+    // BUTCHR-227 (NOW): a UNION, never a replace — both ids are seen.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "300"]));
+    // BUTCHR-217 (BEFORE, now WRONG): `expect(resource.observedCommentId).toBe("500")`
+    // — a single "newest by magnitude" scalar. BUTCHR-227 (NOW): the FULL
+    // observed set, unordered by construction.
+    expect(new Set(resource.observedCommentIds)).toEqual(new Set(["500", "300"]));
+    // THE FIX ITSELF: nothing is unseen, so the project does NOT wake purely
+    // from its own suppressed write — the specimen's reported shape
+    // ("wakes on a stale comment rather than on the complaint itself") no
+    // longer reproduces.
+    expect(resource.unseenCommentIds).toEqual([]);
     expect(verdict).toBe("asleep");
 
-    // Traced through to an actual spawn decision, not reasoned on paper:
+    // Traced through to an ACTUAL SPAWN DECISION, not reasoned on paper:
     // `desiredFrom` (src/daemon/loop.ts) is the real function whose output
-    // the reconciler spawns from. This resource no longer lands in it.
+    // the reconciler spawns from. BUTCHR-217 asserted this resource LANDED
+    // in `desired` (the bug). BUTCHR-227: it does not.
     const resourceType = createProjectResourceType(w.deps);
     const allProjects = await resourceType.discovery.search();
     const desired = desiredFrom(allProjects, resourceType);
     expect(desired.has("ACME")).toBe(false);
   });
 
-  test("contrast: check_in's OWN write pattern (max over currently-observed comments, not the just-posted id) does not regress the watermark under the identical non-monotonic scenario", async () => {
-    // Same page state as above, but this simulates `check_in`'s actual
-    // write shape (src/tools/defs.ts): it computes `comment` as the max id
-    // over what it just observed, and that's what it hands to
-    // advanceProjectWatermark — never the id of one specific write.
+  // BUTCHR-217's "contrast" test compared check_in's (safe) max-reduce
+  // writer against speakOnOwnChannel's (unsafe) blind-overwrite writer —
+  // the contrast existed because the two writers had DIFFERENT regression
+  // safety. BUTCHR-227 removes that asymmetry: BOTH writers now go through
+  // the same union, so there is no longer a meaningful "contrast" between
+  // them on this axis — this test is REPURPOSED (not deleted) to assert the
+  // now-shared property directly: a union-shaped advance, given the same
+  // non-monotonic scenario, cannot regress anything, from EITHER writer's
+  // calling shape.
+  test("BUTCHR-227: a union-shaped advance (either writer's shape) does not regress under the identical non-monotonic scenario — the old writer-asymmetry this contrast existed to show is gone", async () => {
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -339,144 +376,79 @@ describe("THE SPECIMEN'S MECHANISM — BUTCHR-226 FIXED THIS: non-monotonic Conf
       initialWake: { version: 1, comment: "500", epics: {} },
     });
     const observed = (await w.ops.getPageComments("doc-1")).results;
-    // `reconcile: true` — this IS check_in's real shape as of the review
-    // round 1 fix (src/tools/defs.ts); harmless here since the observed max
-    // doesn't move, but kept accurate to what check_in actually sends.
-    await advanceProjectWatermark(w.ops, "ACME", { comment: newestCommentId(observed)!, reconcile: true });
+    // check_in's OWN shape (src/tools/defs.ts): the FULL observed id set,
+    // never a "newest" scalar.
+    await advanceProjectWatermark(w.ops, "ACME", { seenComments: observed.map((c) => c.id) });
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("500"); // unchanged — still the true max
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "300"])); // both preserved, not just the max
     expect(verdict).toBe("asleep");
   });
 });
 
-describe("BUTCHR-226 REVIEW ROUND 1 — deletion recovery: a reconciling write (check_in) can lower the watermark; a suppression write still cannot", () => {
-  // THE BLOCKING ISSUE FROM ROUND 1's REVIEW, reproduced then fixed here.
-  // Failure condition, direction 1 (reconciling write must recover): if the
-  // project still reads "active" (or is still in `desiredFrom`) after
-  // check_in's own reconciling write observes the page's new true max
-  // following a deletion, the guard is still blocking the one write meant
-  // to recover from it — the exact permanent spawn loop this round exists
-  // to close, since ids are drawn non-monotonically from a wide range with
-  // no guarantee a higher one ever arrives to clear it by accident.
-  // Failure condition, direction 2 (suppression must still not lower): if a
-  // SUPPRESSION write (never `reconcile: true`) is able to lower the
-  // watermark below what a prior reconciling write already established,
-  // defect 1's own guard has regressed.
+describe("BUTCHR-260 — the reconcile/deletion-recovery machinery is DROPPED, not adapted: a comment deletion needs no recovery path under BUTCHR-227's seen-set", () => {
+  // WHAT USED TO LIVE HERE (BUTCHR-226 review round 1): under the
+  // pre-BUTCHR-227 scalar watermark ("newest comment id by numeric
+  // magnitude"), deleting the root doc's highest-id comment could drop the
+  // page's true max BELOW the already-stored scalar. `projectVerdict`'s
+  // exact-inequality comparison then read that stale-high watermark as
+  // "behind" forever, and the ordinary monotonic guard (raise-only) could
+  // never let `check_in` lower it back — a PERMANENT spawn loop only an
+  // explicit `patch.reconcile` escape hatch (check_in-only, bypassing the
+  // guard entirely) could clear. Three tests here proved that recovery
+  // end-to-end (two driving `advanceProjectWatermark` directly, one through
+  // the real `atlassianTools(...)` `check_in` handler).
   //
-  // WHY THIS SCENARIO EARNS ITS OWN TEST, NOT JUST A HYPOTHETICAL: root-doc
-  // comment deletion is EXPECTED TRAFFIC on this surface, not a contrived
-  // edge case. BUTCHR-185's own `tell_peer` harness once posted a stray
-  // probe comment onto a peer project's root doc and deleted it as cleanup
-  // once recognized as its own error — BUTCHR-183 verified that deletion at
-  // review and confirmed it as correct behavior. As peer messaging sees
-  // more use, such cleanups will land on OTHER projects' root docs more
-  // often, and because they are cleanups of a comment just written, they
-  // concentrate on RECENT — and so plausibly high-id — comments: the worst
-  // possible distribution for a high-water mark. (Stated precisely: this is
-  // a demonstrated CLASS of event on this exact surface, not a reproduced
-  // production instance of the loop — the stray comment's id relative to
-  // the page's max at deletion time was never recorded, so whether that
-  // specific incident would have triggered this exact defect is unknown.)
-  test("the top comment is deleted; a reconciling write (check_in-shaped) lowers the watermark to the new true max and the project reads asleep, traced through desiredFrom", async () => {
-    const w = world({
-      projectKey: "ACME",
-      rootDocId: "doc-1",
-      initialPageVersion: 1,
-      // Two comments on the page; the project already checked in once,
-      // caught up to what was THEN the true max ("500").
-      initialComments: [{ id: "500", body: "<p>the one about to be deleted</p>" }, { id: "100", body: "<p>an older, still-present comment</p>" }],
-      initialWake: { version: 1, comment: "500", epics: {} },
-    });
-    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the deletion
-
-    // Simulate the deletion of comment "500" directly on the fake's own
-    // comment list (`world()` exposes the live array, not a copy) — leaves
-    // "100" as the page's new true max.
-    const idx = w.pageComments.findIndex((c) => c.id === "500");
-    w.pageComments.splice(idx, 1);
-
-    const beforeReconcile = await verdictOf(w.deps, "ACME");
-    expect(beforeReconcile.resource.observedCommentId).toBe("100");
-    expect(beforeReconcile.resource.watermark.comment).toBe("500"); // still the old, now-gone max
-    expect(beforeReconcile.verdict).toBe("active"); // reproduces the review's own repro
-
-    // check_in's real shape: the max over EVERYTHING it now observes,
-    // `reconcile: true`.
-    await advanceProjectWatermark(w.ops, "ACME", { version: 1, comment: "100", epics: {}, reconcile: true });
-
-    const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("100"); // LOWERED — the guard did not block this write
-    expect(verdict).toBe("asleep"); // recovered — no longer a permanent spawn loop
-
-    const resourceType = createProjectResourceType(w.deps);
-    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
-    expect(desired.has("ACME")).toBe(false);
-  });
-
-  test("...and after that reconciliation, a SUPPRESSION write with an even lower id still cannot lower it further (defect 1's guard stays intact for the write that actually caused it)", async () => {
-    const w = world({
-      projectKey: "ACME",
-      rootDocId: "doc-1",
-      initialComments: [{ id: "500", body: "<p>will be deleted</p>" }, { id: "100", body: "<p>survives</p>" }],
-      initialWake: { version: 1, comment: "500", epics: {} },
-      // The next comment posted (a daemon complaint via speakOnOwnChannel)
-      // draws a LOWER id than the just-reconciled "100" — the same
-      // non-monotonic hazard defect 1's guard exists for.
-      nextCommentIds: ["50"],
-    });
-    const idx = w.pageComments.findIndex((c) => c.id === "500");
-    w.pageComments.splice(idx, 1);
-    await advanceProjectWatermark(w.ops, "ACME", { version: 1, comment: "100", epics: {}, reconcile: true });
-    expect((await verdictOf(w.deps, "ACME")).resource.watermark.comment).toBe("100"); // sanity: reconciled
-
-    await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME ...");
-
-    const { resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("100"); // NOT lowered to "50" — the guard held
-  });
-
-  // BUTCHR-226 review round 2's own finding: the two tests above drive
-  // `advanceProjectWatermark(..., { reconcile: true })` DIRECTLY — accurate
-  // to what `check_in` sends only because a human (this comment, until now)
-  // keeps it accurate, exactly the coupling a test exists to remove. They
-  // proved the deletion scenario end-to-end through the PREDICATE
-  // (`desiredFrom`/`projectVerdict`/`loadProjects`), but not through the
-  // CALLER — so a regression that stops `check_in` from passing
-  // `reconcile: true` at all would pass every other test in this file.
-  // CONFIRMED: deleting `reconcile: true` from check_in's call site
-  // (src/tools/defs.ts) and running the full suite passed all 1842
-  // pre-existing tests before this one existed.
+  // WHY THIS IS GONE (BUTCHR-260, VERIFIED rather than assumed — see
+  // `advanceProjectWatermark`'s own doc comment on `monotonicMax`,
+  // src/resources/project.ts, for the full evidence trail): BUTCHR-227
+  // replaced that scalar with `commentsSeen`, a SEEN SET compared by
+  // MEMBERSHIP, never by magnitude, unioned, never replaced, with no
+  // retention/eviction rule. There is no "newest" for a deletion to
+  // invalidate, and nothing is ever removed from the set once seen, so a
+  // deleted comment simply STAYS seen — there is no ceiling to re-lower and
+  // no recovery to perform. The two direct-`reconcile`-flag tests that used
+  // to prove the recovery are deleted outright, not adapted: the scenario
+  // they proved recoverable no longer occurs, so there is nothing left for
+  // them to characterize.
   //
-  // Failure condition: this test must fail if `check_in`'s own call site
-  // stops passing `reconcile: true` — verified by making that exact
-  // mutation and confirming this test (and only the mutation-relevant
-  // tests) fails, then reverting.
-  test("check_in, driven through the REAL tool-surface handler (atlassianTools(...), not a direct advanceProjectWatermark call), reconciles a deleted top comment and reaches asleep — traced through desiredFrom", async () => {
+  // STILL REQUIRED (BUTCHR-260 DoD): "check_in's real call-site wiring,
+  // driven through the real atlassianTools(...) handler, not a direct
+  // advanceProjectWatermark call" — kept below, repurposed to prove the NEW
+  // claim (no reconciliation needed) instead of the old one (reconciliation
+  // works).
+  test("check_in, driven through the REAL tool-surface handler (atlassianTools(...), not a direct advanceProjectWatermark call): a comment already checked in stays seen after it's deleted from the page — no reconciliation performed or needed, project stays asleep", async () => {
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
       initialPageVersion: 1,
       initialComments: [{ id: "500", body: "<p>will be deleted</p>" }, { id: "100", body: "<p>survives</p>" }],
-      initialWake: { version: 1, comment: "500", epics: {} },
+      initialWake: { version: 1, epics: {} }, // nothing checked in yet
     });
     // check_in's real handler also calls `ops.search` for epics currently
     // In Review (src/tools/defs.ts) — `world()`'s own fake leaves this
     // `unimplemented`, since no other test in this file exercises the real
     // check_in handler; none are in review here.
     w.ops.search = async () => ({ issues: [] });
-    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the deletion
-
-    const idx = w.pageComments.findIndex((c) => c.id === "500");
-    w.pageComments.splice(idx, 1);
-    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: deletion reproduces the wake
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: two comments, neither seen yet
 
     // The REAL tool surface, the same handler an agent's MCP call actually
     // reaches — not a reimplementation of check_in's shape.
     const tools = atlassianTools(w.ops, () => {});
     await tools.check_in!.handler({}, { headers: { "x-issue": "ACME" } } as any);
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: check_in caught up on both
+
+    // The specimen this block used to need a `reconcile` escape hatch for:
+    // the comment check_in just recorded as seen is now deleted from the
+    // page entirely.
+    const idx = w.pageComments.findIndex((c) => c.id === "500");
+    w.pageComments.splice(idx, 1);
 
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    expect(resource.watermark.comment).toBe("100"); // check_in's own write lowered it
+    // THE CLAIM: still asleep, with NO reconciliation performed — "500"
+    // stays a member of `commentsSeen` forever (no retention rule), and the
+    // freshly observed set ("100" only, now) is fully contained in it.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "100"]));
+    expect(resource.unseenCommentIds).toEqual([]);
     expect(verdict).toBe("asleep");
 
     const resourceType = createProjectResourceType(w.deps);
@@ -521,12 +493,13 @@ describe("F7 — BUTCHR-226 FIXED THIS (defect 1b): the swallowed watermark-writ
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     // The PERSISTED property was never written (the fake's setProjectProperty
     // always rejects here) — but `resource.watermark` is what `loadProjects`
-    // hands to the predicate, and BUTCHR-226 merges the in-process fallback
-    // into it, so the EFFECTIVE watermark the project is judged against
-    // already reflects the failed write's own intent.
-    expect(resource.watermark.comment).toBe("501");
-    expect(resource.observedCommentId).toBe("501"); // the new comment IS on the page
-    expect(verdict).toBe("asleep"); // BUTCHR-226: no longer wakes on its own already-posted (but unpersisted) complaint
+    // hands to the predicate, and BUTCHR-226/BUTCHR-260's fallback merges the
+    // in-process pending value into it (adapted to `commentsSeen`), so the
+    // EFFECTIVE watermark the project is judged against already reflects the
+    // failed write's own intent.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "501"]));
+    expect(resource.unseenCommentIds).toEqual([]); // the new comment IS on the page, but already covered by the fallback
+    expect(verdict).toBe("asleep"); // BUTCHR-226/BUTCHR-260: no longer wakes on its own already-posted (but unpersisted) complaint
   });
 });
 

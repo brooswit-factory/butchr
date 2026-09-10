@@ -120,16 +120,19 @@
  *
  * HAZARD 1 CLOSED (self-wake loop, see src/tools/speak.ts): a project's own
  * `report_to_boss`/`ask_boss` posts a footer comment via `commentOnPage`,
- * then immediately advances THIS project's `wake.comment` watermark to the
- * id `commentOnPage` just returned — synchronously with the write, before
- * any poll can observe it. The very next `loadProject` read sees
- * `observedCommentId === watermark.comment` for that write, so it is never
- * counted as a pending trigger by EITHER `verdictFor` or `eventRules`. A
- * FOREIGN comment never goes through `speakOnOwnChannel`, so it is never
- * watermarked here and still registers as a pending trigger — the failure
- * condition a suppression must not also swallow. See
- * `test/unit/project-resource-type.test.ts` for the failure-condition-first
- * proof (own comment -> asleep stays asleep; foreign comment -> wakes).
+ * then immediately advances THIS project's `wake.commentsSeen` set
+ * (BUTCHR-227: was a `wake.comment` scalar overwrite, now a pure add — see
+ * `advanceProjectWatermark`'s own doc comment) to include the id
+ * `commentOnPage` just returned — synchronously with the write, before any
+ * poll can observe it. The very next `loadProject` read sees that id
+ * already present in `watermark.commentsSeen`, so it is never counted as a
+ * pending trigger by EITHER `verdictFor` or `eventRules` (both consume
+ * `unseenCommentIds`, which excludes it). A FOREIGN comment never goes
+ * through `speakOnOwnChannel`, so it is never watermarked here and still
+ * registers as a pending trigger — the failure condition a suppression
+ * must not also swallow. See `test/unit/project-resource-type.test.ts` for
+ * the failure-condition-first proof (own comment -> asleep stays asleep;
+ * foreign comment -> wakes).
  *
  * HAZARD 2 (daemon-side escalation destination for a blocked project
  * agent) is NOT in this module — it is a one-line change at the daemon's
@@ -145,6 +148,40 @@
  * and stating (per the epic's instruction that the polling COST is this
  * story's to own, the cadence MECHANISM already being generic — see that
  * constant's own comment for the call-count budget behind the number).
+ *
+ * BUTCHR-227 — THE AXIS STATEMENT (DoD #15), stated once here because
+ * `projectVerdict` below is a three-way OR and a reader must not be able to
+ * infer that fixing "the watermark" meant all three fields: `version` OR
+ * `commentsSeen`(as `comment` was) OR `epicsSeen`(as `epics` was) being
+ * behind makes a project `"active"`. BUTCHR-227 CHANGES ONLY THE COMMENT
+ * AXIS (`commentsSeen`, surface 1) AND THE EPICS AXIS (`epicsSeen`, surface
+ * 2) — both from a scalar "newest id" to a seen SET, removing their
+ * dependence on id ordering entirely. BUTCHR-227 DOES NOT TOUCH THE VERSION
+ * AXIS: it is BUTCHR-208/BUTCHR-214's, page version numbers are genuinely
+ * monotonic by construction (a real ordering guarantee, not an assumed
+ * one), and it needs no migration from this ticket. Because the predicate
+ * is an OR, a project this ticket makes fully correct about comments and
+ * epics still wakes on the version axis if THAT axis has its own defect
+ * (BUTCHR-208/214's to fix) — this ticket does not claim otherwise.
+ *
+ * BUTCHR-227 DoD #16 — THE BOUNDED-VS-ASCENDING FALSIFIER (checked, not
+ * measured directly — no live Confluence access from this module): stated
+ * before looking, this claim would be REFUTED by evidence that Confluence
+ * footer-comment ids are drawn from a fixed, page-scoped pool rather than a
+ * space shared across an entire tenant. Structural evidence points toward
+ * ASCENDING (a moving target), not a fixed range: Confluence content ids
+ * are documented as shared across every content type (pages, blogposts,
+ * comments, attachments, …) tenant-wide, not scoped per page — a single
+ * busy tenant issues far more ids overall than any one page's comment
+ * count, so the tenant-wide maximum keeps climbing over calendar time even
+ * though any ONE page's own comments draw non-monotonically from inside
+ * that climbing range (which is the defect this ticket fixes — local
+ * non-monotonicity within a globally ascending space, not a contradiction
+ * of it). NOT independently re-measured by this ticket (get_doc_comments's
+ * project-caller-only wall, again) — reported to BUTCHR-199 as a finding,
+ * not asserted as settled. Per this ticket's own instruction, this finding
+ * changes nothing about the design: a seen set is correct under EITHER
+ * answer, which is the whole point of not choosing a threshold-shaped fix.
  */
 import type { AtlassianOps } from "../tools/atlassian.js";
 import type { JiraIssue } from "../atlassian/types.js";
@@ -161,6 +198,53 @@ import type {
 const PROPERTY_KEY = "butchr";
 
 /**
+ * BUTCHR-227 DoD #9 / §6: the space ceiling on a Jira project entity
+ * property VALUE, in bytes — see `ProjectWatermark.commentsSeen`'s own doc
+ * comment for how this number was obtained (a web search surfacing
+ * Atlassian's own stated limit; NOT a first-hand read of the rendered
+ * reference page, and NOT asserted from memory) and re-verify it there if
+ * it matters enough to confirm by hand.
+ *
+ * THIS IS DELIBERATELY NOT LEFT AS A COMMENT ALONE (BUTCHR-216's own point,
+ * adopted by BUTCHR-199): a number measured once and written in a doc
+ * comment is the self-declaring grade in its purest form — authoritative-
+ * looking forever, silently wrong the moment the platform limit, the id
+ * encoding, or the serialized shape changes, with nothing binding the
+ * comment to what the code actually does. `assertWithinPropertySizeCeiling`
+ * below is the same-call withdrawal instead: it converts "we believe N ids
+ * fit" into "we find out on the run where it first stops being true".
+ */
+const PROJECT_PROPERTY_SIZE_CEILING_BYTES = 32768;
+
+/**
+ * BUTCHR-227 §6/DoD #9's runtime assertion, called at the ONE site that
+ * serializes and writes the `butchr` project entity property
+ * (`advanceProjectWatermark`, immediately before `setProjectProperty`) —
+ * not duplicated at any other call site, so there is exactly one place
+ * this bound is checked and exactly one place it could be forgotten.
+ *
+ * FAILS LOUDLY (throws), never swallows: a space bound that silently
+ * overflows (Jira would reject the oversized write, or worse, truncate it
+ * — this module has not measured which) is worse than one that fails
+ * loudly here, before the network call, with a message naming the actual
+ * ceiling to re-derive. Writer A (`check_in`) does not catch this — it
+ * propagates to the calling agent, which is itself the "STOP and tell
+ * BUTCHR-199" trigger this ticket's retention section names, not a defect.
+ * Writer B (`speakOnOwnChannel`)'s existing fail-open `.catch` + WARNING
+ * log (BUTCHR-105) still applies here — this assertion does not add a
+ * second failure-handling policy, it feeds the existing one a real trigger
+ * instead of a silent 400-or-worse from Jira's own side.
+ */
+function assertWithinPropertySizeCeiling(projectKey: string, propertyValue: unknown): void {
+  const bytes = new TextEncoder().encode(JSON.stringify(propertyValue)).length;
+  if (bytes > PROJECT_PROPERTY_SIZE_CEILING_BYTES) {
+    throw new Error(
+      `advanceProjectWatermark(${projectKey}): the "butchr" property would serialize to ${bytes} bytes, over the stated ${PROJECT_PROPERTY_SIZE_CEILING_BYTES}-byte Jira entity-property ceiling (see PROJECT_PROPERTY_SIZE_CEILING_BYTES's own doc comment for how that number was obtained and how to re-verify it) — refusing to write rather than risk a silent truncation or rejection. This is the retention section's stop-and-escalate trigger firing for real: report this to BUTCHR-199 rather than inventing a retention rule under this call site.`,
+    );
+  }
+}
+
+/**
  * Mirrors BUTCHR-66's pinned seam (relayed verbatim on BUTCHR-81,
  * 2026-09-01T17:31): `Activation<T>.verdictFor(resource): ActivationVerdict`,
  * REPLACING `isActive` on `src/resources/types.ts`'s `Activation<T>`. That
@@ -174,20 +258,99 @@ const PROPERTY_KEY = "butchr";
  */
 export type ActivationVerdict = "active" | "asleep" | "inactive";
 
-/** A project's wake watermarks — see this module's top comment for where they live and who writes them. */
+/**
+ * A project's wake watermarks — see this module's top comment for where
+ * they live and who writes them. This is the NORMALIZED in-memory shape
+ * (BUTCHR-227) — the RAW stored JSON can also carry the pre-BUTCHR-227
+ * legacy scalar fields (`comment`/`epics`); see `StoredWake` and
+ * `normalizeWake` below for the read-time adapter that turns one into the
+ * other. Nothing outside `normalizeWake`/`advanceProjectWatermark` ever
+ * sees the legacy shape.
+ *
+ * IDS ARE STRINGS, COMPARED BY STRING EQUALITY / SET MEMBERSHIP ONLY.
+ * There is deliberately no `Number()` and no magnitude/threshold comparison
+ * anywhere on this path — see BUTCHR-227's ticket doc for why a threshold
+ * ("drop everything below id N") is the exact bug this shape replaces, not
+ * a variant of the fix.
+ */
 export interface ProjectWatermark {
-  /** Last root-doc page version this project has been acted on through, or `null` if never recorded. */
+  /** Last root-doc page version this project has been acted on through, or `null` if never recorded. Unrelated to the ordering defect (page versions ARE genuinely monotonic by construction) — untouched by BUTCHR-227, carried through as before. */
   version: number | null;
-  /** Last root-doc footer-comment id this project has been acted on through, or `null` if never recorded. */
-  comment: string | null;
   /**
-   * Per in-review epic key -> the newest comment id on that epic, as of the
-   * last time this project checked in on it. A key ABSENT from this map
-   * means "not currently known to be in review, as of the last check-in" —
-   * see the two-part note below on why absence, not a stale value, is what
-   * makes re-entry into review observable.
+   * The root-doc axis's SEEN SET (BUTCHR-227) — every footer-comment id
+   * this project has ever been recorded as having observed, unioned in by
+   * every writer, NEVER pruned, NEVER replaced wholesale. Membership only:
+   * an id not in this set is unseen, regardless of how it compares
+   * numerically to anything already in it. See this module's
+   * `normalizeWake` for how a pre-migration project's stored scalar
+   * `comment` id seeds this set, and `advanceProjectWatermark` for why
+   * "seen" and "woke" are different facts recorded here.
    *
-   * TWO DEFECTS, FOUND AT REVIEW BEFORE MERGE, BOTH SETTLED HERE:
+   * NO RETENTION RULE, DECLARED (BUTCHR-227, BUTCHR-199's decision): a
+   * member of this set asserts a timestamped PAST EVENT ("id X was
+   * observed") which, per BUTCHR-151's measured finding, cannot go stale —
+   * there is no correctness reason to ever remove an entry. What this has
+   * instead is a SPACE bound, not a correctness one, and solving a space
+   * bound with a correctness mechanism (evicting old-but-real entries) is
+   * exactly how a simple fix re-acquires the complexity of the bug it
+   * replaced — an evicted id and a never-seen id would again be
+   * indistinguishable, which is THE HARD RULE this ticket's whole design
+   * exists to avoid. So: no eviction, ever, from this module.
+   *
+   * THE STATED CEILING (verify by re-deriving, this is not asserted from
+   * memory): a Jira project entity property VALUE is capped at 32768 bytes
+   * total (`PROJECT_PROPERTY_SIZE_CEILING_BYTES`, this module), per
+   * Atlassian's own Jira Cloud "Entity properties" reference
+   * (https://developer.atlassian.com/cloud/jira/platform/jira-entity-properties/).
+   * A DIRECT FETCH of that page did not resolve on this read — it renders
+   * as a JS app and returned only navigation chrome, the same class of
+   * incomplete-fetch BUTCHR-198 hit on a different Atlassian reference
+   * page — so this number is a WEB SEARCH result surfacing that page's own
+   * stated limit, not a first-hand read of the rendered reference. Treat
+   * it the way BUTCHR-198 treated its own unconfirmed hedge: plausible,
+   * not first-hand-verified; re-fetch or measure directly (write an
+   * oversized property and observe the rejection) if this number is load-
+   * bearing enough to be worth confirming by hand.
+   *
+   * NOT LEFT AS A COMMENT ALONE (BUTCHR-216's point, adopted by BUTCHR-199):
+   * `assertWithinPropertySizeCeiling`, called from `advanceProjectWatermark`
+   * at the one site that serializes and writes this property, ASSERTS the
+   * real serialized size against this number on every write and fails
+   * loudly rather than let a silently-stale comment paper over a platform
+   * limit change, an id-encoding change, or a growing property shape. This
+   * doc comment states the REASONING; that assertion is what stays true.
+   *
+   * This ceiling is shared by the WHOLE `butchr` property, not just this
+   * array — `space`/`rootDoc`/`repos`/`archiveProject`/`scaffolded` plus
+   * the legacy `comment`/`epics` scalars all count against the same 32768
+   * bytes. Budgeting ~1000 bytes for everything else (unmeasured, a
+   * round-number placeholder — re-measure a real property blob if this
+   * gets tight) leaves ~31768 bytes for this array; a comment id is
+   * currently 8 digits, so one JSON array entry (`"18153493",`) costs
+   * ~11 bytes, for a capacity of roughly 2,800 ids.
+   *
+   * TODAY'S ACTUAL POPULATION (per BUTCHR-227's ticket doc's own replay,
+   * the only measured data available): 17 ids on the one root doc measured
+   * — roughly 0.6% of the ~2,800-id estimated capacity, so headroom is not
+   * in doubt right now. This module still cannot measure a STEADY-STATE
+   * accumulation RATE directly (`get_doc_comments` is project-caller-only
+   * and refuses an issue-tier caller, the same wall BUTCHR-198 recorded
+   * hitting), so "not in doubt now" is a snapshot, not a year-long
+   * projection — the runtime assertion above is what makes that gap safe
+   * to leave open rather than something this module must estimate under
+   * this ticket.
+   */
+  commentsSeen: readonly string[];
+  /**
+   * Per in-review epic key -> that epic's SEEN SET (BUTCHR-227). A key
+   * ABSENT from this map means "not currently known to be in review, as of
+   * the last check-in" — unchanged from the pre-BUTCHR-227 scalar design,
+   * see the two-part note below for why absence (not a stale value) is
+   * what makes re-entry into review observable. Only the per-key VALUE
+   * changed shape, from a single "newest comment id" scalar to a set.
+   *
+   * TWO DEFECTS, FOUND AT REVIEW BEFORE BUTCHR-67 MERGED, BOTH STILL
+   * SETTLED HERE THE SAME WAY:
    *
    * (1) A comment id is REQUIRED, not `updated` (BUTCHR-81, first attempted
    * fix rejected): `updated` looked attractive because it also bumps on a
@@ -203,32 +366,101 @@ export interface ProjectWatermark {
    * epic sits in review — active permanently, not occasionally noisy. A
    * comment id is immune to this: nothing but an actual comment moves it.
    *
-   * (2) Re-entry is caught by PRUNING, not by the compared value: this
-   * module NEVER prunes an entry out of this map on its own (see
+   * (2) Re-entry is caught by PRUNING THE KEY SET, not by the compared
+   * value: this module NEVER prunes a key out of this map on its own (see
    * `advanceProjectWatermark` below) — the project agent's own `check_in`
-   * (src/tools/defs.ts) REPLACES this whole map with exactly the
-   * currently-in-review set every time it checks in, rather than merging
-   * one key into it. An epic that leaves review is therefore absent from
-   * the NEXT check-in's replacement map; when it re-enters, it is absent
-   * from `wm.epics` again and is treated as never-acted-on — the same
-   * "absence = active" comparison already used for a first-ever entry,
-   * doing double duty rather than needing a second mechanism. This keeps
-   * the load-bearing rule intact: only the AGENT, as its own last act,
-   * ever advances (or prunes) this map — never the daemon, never at spawn.
+   * (src/tools/defs.ts) REPLACES the whole KEY SET with exactly the
+   * currently-in-review set every time it checks in (unioning VALUES for
+   * surviving keys, see `advanceProjectWatermark`'s own doc comment for
+   * why), rather than merging one key into it. An epic that leaves review
+   * is therefore absent from the NEXT check-in's replacement map; when it
+   * re-enters, it is absent from `wm.epicsSeen` again and is treated as
+   * never-acted-on-this-episode — the same "absence = active" comparison
+   * already used for a first-ever entry, doing double duty rather than
+   * needing a second mechanism. This keeps the load-bearing rule intact:
+   * only the AGENT, as its own last act, ever advances (or prunes) this
+   * map — never the daemon, never at spawn.
    *
    * A `pr:*` label transition on an in-review ticket (also part of the
    * measured churn) is neither "entered review" nor "commented on while in
-   * review" — it must not wake the project, and a comment-id watermark
+   * review" — it must not wake the project, and a comment-id seen-set
    * cannot confuse the two, since a label write is not a comment.
    */
-  epics: Readonly<Record<string, string | null>>;
+  epicsSeen: Readonly<Record<string, readonly string[]>>;
 }
 
-/** One epic currently `In Review` in a project, as `loadProject` observed it this poll. */
+/**
+ * The RAW shape found in the `butchr` project entity property's `wake`
+ * sub-key (BUTCHR-227) — a UNION of every shape this key has ever held,
+ * not the normalized `ProjectWatermark` the rest of this module operates
+ * on. `comment`/`epics` are the PRE-BUTCHR-227 legacy scalar fields.
+ *
+ * `comment`/`epics` ARE NEVER DELETED FROM STORAGE (see
+ * `advanceProjectWatermark`) and ARE NEVER READ AGAIN once `commentsSeen`/
+ * `epicsSeen` exist (see `normalizeWake`) — kept only as forensic evidence
+ * of the ordering regression this ticket fixes. Nothing outside
+ * `normalizeWake` and `advanceProjectWatermark`'s own read-modify-write
+ * ever sees this type.
+ */
+interface StoredWake {
+  version?: number | null;
+  /** @deprecated pre-BUTCHR-227 scalar — see this interface's own doc comment. */
+  comment?: string | null;
+  /** @deprecated pre-BUTCHR-227 scalar map — see this interface's own doc comment. */
+  epics?: Readonly<Record<string, string | null>>;
+  commentsSeen?: readonly string[];
+  epicsSeen?: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * THE MIGRATION (BUTCHR-227) — a PURE READ-TIME SHAPE ADAPTER, called
+ * everywhere the stored `wake` sub-key is deserialised: `loadProjects`'
+ * own read below, AND `advanceProjectWatermark`'s read-modify-write (its
+ * own "stored set" to union against is this function's OUTPUT, never the
+ * raw JSON — otherwise a pre-migration project's first post-migration
+ * write would union new ids onto an empty `commentsSeen` and silently
+ * DROP the one id its legacy `comment` scalar had already genuinely seen).
+ *
+ * NEVER A WRITER, AND NEVER A THRESHOLD: the legacy scalar `comment` is
+ * read ONLY as "this one id was definitely, truthfully seen" — never as
+ * "everything at or below this id was seen" (the exact assumption that
+ * regressed this project's watermark in the first place; see BUTCHR-227's
+ * ticket doc for the measured evidence a scalar high-water-mark reading
+ * would mishandle). A regressed legacy scalar therefore degrades
+ * gracefully under this adapter: it simply seeds one fewer id into the
+ * set, and every other previously-stepped-over comment still inside the
+ * reader's page window (see `getPageComments`/`getIssueComments`'s own
+ * doc comments for that window's size) re-delivers once, the next time it
+ * is observed.
+ *
+ * Once `commentsSeen` (or `epicsSeen`, per key) exists in storage — even
+ * as an empty array, which `??` treats as present, correctly — the
+ * corresponding legacy field is NEVER consulted again. A brand-new project
+ * with neither legacy nor new fields seeds `[]`, i.e. everything observed
+ * is unseen, i.e. `"active"` — the same fail-open behavior a never-seen
+ * project already had.
+ */
+function normalizeWake(wake: StoredWake | undefined): ProjectWatermark {
+  const commentsSeen = wake?.commentsSeen ?? (wake?.comment ? [wake.comment] : []);
+  const rawEpics: Readonly<Record<string, readonly string[] | string | null>> = wake?.epicsSeen ?? wake?.epics ?? {};
+  const epicsSeen: Record<string, readonly string[]> = {};
+  for (const [key, value] of Object.entries(rawEpics)) {
+    epicsSeen[key] = Array.isArray(value) ? value : value ? [value] : [];
+  }
+  return { version: wake?.version ?? null, commentsSeen, epicsSeen };
+}
+
+/**
+ * One epic currently `In Review` in a project, as `loadProject` observed
+ * it this poll — EVERY comment id currently observed on it, not a single
+ * "newest" one (BUTCHR-227: a "newest" concept requires an ordering this
+ * module no longer assumes). See `ProjectResource.unseenEpicCommentIds`
+ * for the derived subset actually novel against the stored watermark.
+ */
 export interface ProjectEpic {
   key: string;
-  /** This epic's newest comment id, or `null` if it has none — see `ProjectWatermark.epics`'s doc comment for why a comment id, not `updated`. */
-  newestCommentId: string | null;
+  /** Every comment id `getIssueComments` returned for this epic this poll — see that op's own doc comment for its cap, which bounds what this can ever contain. */
+  commentIds: readonly string[];
 }
 
 /**
@@ -244,14 +476,40 @@ export interface ProjectResource {
   eligible: boolean;
   rootDocId: string | null;
   observedVersion: number | null;
-  observedCommentId: string | null;
+  /** Every comment id `getPageComments` returned for this project's root doc this poll — BUTCHR-227: the FULL observation, never collapsed to a "newest" scalar. See `unseenCommentIds` for the derived subset novel against the watermark, and `getPageComments`'s own doc comment for this read's pagination window (this module's stated blind spot: a comment outside that window is never observed, therefore never in this array, therefore never seen or woken — a pagination limitation, not the id-monotonicity defect this ticket fixes). */
+  observedCommentIds: readonly string[];
   observedEpics: readonly ProjectEpic[];
+  /**
+   * THE CLASSIFICATION SEAM (BUTCHR-227, per the inter-epic agreement with
+   * BUTCHR-208): `observedCommentIds` minus `watermark.commentsSeen` —
+   * every id observed this poll that this project has never recorded
+   * seeing before. "Seen" and "woke" are deliberately two different facts:
+   * `check_in`/the suppression write record the FULL `observedCommentIds`
+   * as seen regardless of this field, but `projectVerdict`/the nudge path
+   * decide whether to wake/notify from THIS field. A future sender-class
+   * filter (BUTCHR-208's remedy) belongs HERE, narrowing this field before
+   * a decision is made from it — never folded back into `observedCommentIds`
+   * itself, which must keep surfacing every observed id so a
+   * classified-away comment is still recorded as seen (see this module's
+   * top comment, "ONE PREDICATE, TWO CONSUMERS", for why the write and the
+   * decision share one read).
+   */
+  unseenCommentIds: readonly string[];
+  /** The same classification seam as `unseenCommentIds`, per in-review epic key — see that field's own doc comment. */
+  unseenEpicCommentIds: Readonly<Record<string, readonly string[]>>;
   watermark: ProjectWatermark;
 }
 
 export const projectIdOf = (p: ProjectResource): string => p.key;
 
-const EMPTY_WATERMARK: ProjectWatermark = { version: null, comment: null, epics: {} };
+const EMPTY_WATERMARK: ProjectWatermark = { version: null, commentsSeen: [], epicsSeen: {} };
+
+/** Set membership only — no ordering, no magnitude, no `Number()` (BUTCHR-227's hard rule). Exported for this module's own reuse between `projectVerdict`, `loadProjects`' unseen-field computation, and their tests; not part of this module's public API surface (not re-exported from an index). */
+function unseenIds(observed: readonly string[], seen: readonly string[]): readonly string[] {
+  if (observed.length === 0) return observed;
+  const seenSet = new Set(seen);
+  return observed.filter((id) => !seenSet.has(id));
+}
 
 /**
  * The pure comparison at the center of this module — see "ONE PREDICATE,
@@ -275,14 +533,23 @@ export function projectVerdict(p: ProjectResource): ActivationVerdict {
   if (!p.eligible) return "inactive";
   const wm = p.watermark;
   const versionBehind = p.observedVersion !== null && p.observedVersion !== wm.version;
-  const commentBehind = p.observedCommentId !== null && p.observedCommentId !== wm.comment;
-  // Absence from `wm.epics` (never acted on THIS review episode — including
-  // a re-entry, since `check_in` REPLACES rather than merges this map, see
-  // its own doc comment) and a stale comment id (acted on, but commented on
-  // again since) are both simply "not equal to the watermarked value" —
-  // `wm.epics[e.key]` is `undefined` for an absent key, which a real
-  // `newestCommentId` (string) or even `null` both compare unequal to.
-  const epicsBehind = p.observedEpics.some((e) => e.newestCommentId !== wm.epics[e.key]);
+  // BUTCHR-227: SET MEMBERSHIP, not scalar equality — active iff at least
+  // one observed id is absent from the seen set. No ordering, no
+  // magnitude, no `Number()` (this ticket's hard rule). `p.unseenCommentIds`
+  // is exactly this computation, already done once by `loadProjects` (see
+  // its own doc comment on the classification seam) — reused here rather
+  // than recomputed, so the two can never disagree.
+  const commentBehind = p.unseenCommentIds.length > 0;
+  // Absence of a key from `wm.epicsSeen` (never acted on THIS review
+  // episode — including a re-entry, since `check_in` REPLACES rather than
+  // merges the KEY SET, see that map's own doc comment) means active
+  // regardless of that epic's current comment count, including zero — the
+  // same "absence = active" rule the pre-BUTCHR-227 scalar design used,
+  // unchanged in shape. A key PRESENT in `wm.epicsSeen` is active iff this
+  // poll observed an id for it that isn't in its stored set yet, which is
+  // exactly `p.unseenEpicCommentIds[e.key]` — again reused, not
+  // recomputed, from `loadProjects`.
+  const epicsBehind = p.observedEpics.some((e) => !(e.key in wm.epicsSeen) || (p.unseenEpicCommentIds[e.key]?.length ?? 0) > 0);
   return versionBehind || commentBehind || epicsBehind ? "active" : "asleep";
 }
 
@@ -347,18 +614,55 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  * own call frequency could plausibly collide with. If that ever changes
  * (e.g. a second daemon-side writer of this same property), this function
  * needs real optimistic locking, not just this comment.
+ *
+ * BUTCHR-227 — WRITER SEMANTICS CHANGED FROM OVERWRITE TO UNION:
+ *
+ * - `seenComments`, when provided, is UNIONED into the stored `commentsSeen`
+ *   set — never a replace. This is what makes the two writers below both
+ *   safe: WRITER A (`check_in`, src/tools/defs.ts) passes every id it
+ *   observed this poll; WRITER B (the self-suppression write in
+ *   `speakOnOwnChannel`, src/tools/speak.ts) passes just the one id of the
+ *   comment it posted. Under overwrite semantics writer B was the ONLY one
+ *   of the two writers that could ever REGRESS the watermark (it wrote
+ *   whatever id it was given, whatever that id compared as). Under union,
+ *   regression is not merely forbidden by this function's logic — it is
+ *   UNREPRESENTABLE: a set union can only ever grow or stay the same size,
+ *   so there is no patch shape writer B (or anything else) could pass that
+ *   removes a previously-seen id from the stored set. That is a stronger
+ *   claim than "this function refuses to shrink the set" — there is no
+ *   code path here that even attempts a removal for a caller to bypass.
+ * - `epics`, when PROVIDED, REPLACES the whole KEY SET (deliberately NOT a
+ *   merge — unchanged in shape from before BUTCHR-227, see
+ *   `ProjectWatermark.epicsSeen`'s own doc comment, point 2, for the
+ *   re-entry-detection reasoning) — but for each key PRESENT in the patch,
+ *   the VALUE is unioned against whatever this project already had stored
+ *   for that key, never replaced. Per-key union matters independently of
+ *   the key-set replace: `getIssueComments` is CAPPED (see that op's own
+ *   doc comment on `AtlassianOps` for the exact number) — a value-level
+ *   replace could drop an id a truncated read simply didn't return this
+ *   particular poll, even though an earlier poll genuinely saw it.
+ * - Both unions read against `normalizeWake`'s OUTPUT, never the raw stored
+ *   JSON directly — see that function's own doc comment for why: reading
+ *   raw JSON here would silently drop a legacy scalar's already-seen id on
+ *   this project's very first post-migration write.
+ * - THE LEGACY `comment`/`epics` SCALAR FIELDS ARE NEVER WRITTEN AND NEVER
+ *   DELETED HERE: `nextWake` spreads `...wake` (the RAW stored object)
+ *   first, so whatever legacy value was already there survives byte-for-
+ *   byte, forensic evidence of the pre-BUTCHR-227 ordering regression, and
+ *   this function never re-derives or overwrites either key.
+ * - Omitting `seenComments`/`epics` entirely (e.g. a version-only advance)
+ *   leaves the corresponding set(s) exactly as `normalizeWake` last
+ *   resolved them — not the raw stored value, per the point above.
  */
 /**
- * DEFECT 1 (BUTCHR-214/226): the numerically-larger of a stored value and an
- * incoming one, under TODAY's read order — `newestCommentId`'s max-by-
- * numeric-id reduce, the same order `projectVerdict`/`check_in` already
- * compare against. `incoming === undefined` means this patch never touched
- * this axis at all — the stored value passes through completely unchanged
- * (this is what makes a comment-only advance leave `version` alone, and vice
- * versa; see the call site below). BUTCHR-195/199 own updating this
- * expression of order if/when their migration changes what "newest" means
- * for this field — this function is deliberately written against today's
- * scalar, not the seen-set 195 favours, per this ticket's own boundary.
+ * THE VERSION AXIS'S MONOTONIC GUARD (BUTCHR-214/226 defect 1, NARROWED by
+ * BUTCHR-260 to this one axis — see this function's own closing note for
+ * why the COMMENT axis's twin, `monotonicMaxId`, and the `reconcile` escape
+ * hatch both used to need, are gone rather than carried forward). `incoming
+ * === undefined` means this patch never touched this axis at all — the
+ * stored value passes through completely unchanged (this is what makes a
+ * comment/epics-only advance leave `version` alone; see the call site
+ * below).
  *
  * A stored value that is not a finite number is treated as ABSENT, not as
  * "smaller than everything": a `null`/never-set watermark is the normal
@@ -381,16 +685,43 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  * compares observed-vs-watermark with EXACT inequality (`!==`), never an
  * ordering comparison. That makes the READ sound — the comparison itself
  * loses nothing, and any gap between "seen" and "acted on" lives upstream,
- * in what gets OBSERVED, not in how it's compared (BUTCHR-195's own finding).
- * But the SAME `!==` makes a WRITE that only ever raises the watermark
- * UNSOUND, because exact inequality has NO TOLERANCE for the watermark
- * being ahead of the observation — a watermark strictly ABOVE what's
- * observed is exactly as "unequal", and wakes the project exactly as hard,
- * as one strictly below. That is why a write that is only a PARTIAL fact
- * (a suppression write — this guard) must never get ahead of a write that
- * is a COMPLETE fact (a reconciling write — `patch.reconcile` below): once
- * ahead, under `!==`, there is no comparison-side rescue, only a write-side
- * one that can bring the watermark back down to what's actually true.
+ * in what gets OBSERVED, not in how it's compared. But the SAME `!==` makes
+ * a WRITE that only ever raises the watermark UNSOUND IF the true value
+ * could ever legitimately need to go DOWN — a watermark strictly ABOVE
+ * what's observed is exactly as "unequal", and wakes the project exactly as
+ * hard, as one strictly below.
+ *
+ * WHY NO EXCEPTION IS NEEDED HERE, UNLIKE THE NOW-DELETED COMMENT-AXIS TWIN
+ * (BUTCHR-260 — reconciling BUTCHR-214 with the seen-set BUTCHR-227 landed
+ * on `main`): BUTCHR-214/226 ALSO carried this exact guard (plus an explicit
+ * `patch.reconcile` bypass, and a sibling `monotonicMaxId` function) for the
+ * COMMENT axis, because that axis's OLD representation — a single "newest
+ * comment id by numeric magnitude" scalar — could legitimately need to go
+ * DOWN: deleting the root doc's top comment drops the page's true max below
+ * an already-stored scalar, and `check_in` (the designated recovery path)
+ * could never lower it back without the bypass, becoming a PERMANENT spawn
+ * loop. BUTCHR-227 replaced that scalar with `commentsSeen`, a SEEN SET
+ * compared by membership, unioned, never replaced — it has no analogous
+ * problem: nothing is ever evicted from it (`ProjectWatermark.commentsSeen`'s
+ * own doc comment, "NO RETENTION RULE"), so there is no "true max" for a
+ * deletion to drop it below, and nothing left for `reconcile`/
+ * `monotonicMaxId` to protect. VERIFIED, not inherited, before dropping
+ * either (both falsifiers this ticket named, checked): (1) a Confluence
+ * page version has no deletion-style analogue — this module's own top
+ * comment and `ProjectWatermark.version`'s doc comment both assert page
+ * versions are genuinely monotonic by construction, a real platform
+ * guarantee (restoring an old version creates a NEW, still-higher version
+ * number; a version number is never reused or decremented), independent of
+ * anything BUTCHR-214/226/227 touched. (2) an audit of every remaining
+ * wake-path caller (`check_in`/src/tools/defs.ts, `speakOnOwnChannel`/
+ * `setProjectDoc`) found no place that still derives a "newest" or a bound
+ * from `commentsSeen`/`epicsSeen` — the one remaining numeric sort left in
+ * this codebase (`createOwnChannelComments`, src/tools/speak.ts) is a
+ * DIFFERENT consumer (escalation-loop's dedupe), documented there as
+ * explicitly outside the wake path BUTCHR-227 fixed. Both hold, so a plain
+ * `monotonicMax`, with NO exception, is sound for `version` alone — a
+ * future report that a page version DID decrease would falsify (1) and
+ * should reopen this, not be patched around silently.
  */
 function monotonicMax(stored: number | null | undefined, incoming: number | undefined): number | null {
   if (incoming === undefined) return stored ?? null;
@@ -400,40 +731,25 @@ function monotonicMax(stored: number | null | undefined, incoming: number | unde
 }
 
 /**
- * `monotonicMax`'s counterpart for `comment`, which is stored as a numeric
- * STRING (a Confluence comment id) rather than a `number` — compared
- * numerically (same order as `newestCommentId`) but the WINNING side's
- * original string is what gets stored, never a re-stringified number, so an
- * id is never reformatted by round-tripping through this guard.
- */
-function monotonicMaxId(stored: string | null | undefined, incoming: string | undefined): string | null {
-  if (incoming === undefined) return stored ?? null;
-  const incomingNum = Number(incoming);
-  if (!Number.isFinite(incomingNum)) return stored ?? null;
-  if (stored === null || stored === undefined) return incoming;
-  const storedNum = Number(stored);
-  if (!Number.isFinite(storedNum)) return incoming;
-  return incomingNum >= storedNum ? incoming : stored;
-}
-
-/**
  * DEFECT 1b (BUTCHR-214/226) — the swallowed watermark-write failure is a
  * SECOND, INDEPENDENT mechanism that produces the identical "wakes on its
- * own write" symptom as defect 1, by staleness rather than regression: the
- * write below is deliberately fail-open (BUTCHR-105 — a bookkeeping failure
- * must never fail the caller's `report_to_boss`/`ask_boss`/`set_doc`), so a
- * persistent rejection (MEASURED live, BUTCHR-115: a 403 from a project-tier
- * account lacking write permission) left the true stored watermark forever
- * behind the page's real max, waking the project on its own already-posted
- * complaint every poll, indefinitely.
+ * own write" symptom as the old comment-axis regression used to, by
+ * staleness rather than regression: the write below is deliberately
+ * fail-open (BUTCHR-105 — a bookkeeping failure must never fail the
+ * caller's `report_to_boss`/`ask_boss`/`set_doc`), so a persistent rejection
+ * (MEASURED live, BUTCHR-115: a 403 from a project-tier account lacking
+ * write permission) left the true stored watermark forever behind the
+ * page's real max, waking the project on its own already-posted complaint
+ * every poll, indefinitely. UNCHANGED BY BUTCHR-227/BUTCHR-260 (BUTCHR-260
+ * DoD): still absent from `main`, so adapted here rather than dropped.
  *
  * THE CHOSEN MECHANISM, AND WHY, AGAINST THE ALTERNATIVES THIS TICKET NAMED:
- * a bounded in-PROCESS (never persisted) fallback — the version/comment this
- * process most recently tried and failed to persist for a project, merged
- * into BOTH the next read (`loadProjects`, via `mergePendingFallback` below)
- * and the next write attempt (this function, so a LATER successful write —
- * from ANY caller, not necessarily the one that failed — durably absorbs
- * what an earlier one could not persist). Rejected alternatives:
+ * a bounded in-PROCESS (never persisted) fallback — the version/seen-comment
+ * ids this process most recently tried and failed to persist for a project,
+ * merged into BOTH the next read (`loadProjects`, via `mergePendingFallback`
+ * below) and the next write attempt (this function, so a LATER successful
+ * write — from ANY caller, not necessarily the one that failed — durably
+ * absorbs what an earlier one could not persist). Rejected alternatives:
  *   - A bare RETRY inside this function fixes only a TRANSIENT failure
  *     (timeout, rate limit). It does nothing for the measured case — a
  *     permission error is not fixed by retrying it — so retry alone would
@@ -457,7 +773,7 @@ function monotonicMaxId(stored: string | null | undefined, incoming: string | un
  * until then — a real gap, and the reason the WARNING log line below stays
  * loud rather than being treated as fully closed.
  */
-const pendingWatermarkFallback = new Map<string, { version: number | null; comment: string | null; reconcile: boolean }>();
+const pendingWatermarkFallback = new Map<string, { version: number | null; seenComments: readonly string[] }>();
 
 /** Test-only: `pendingWatermarkFallback` is process-lifetime state shared across every caller in this module, so a test suite that reuses a project key across tests (as this file's own fixtures do) must reset it between tests to avoid one test's failed write leaking into another's assertions. */
 export function resetPendingWatermarkFallbackForTests(): void {
@@ -467,69 +783,67 @@ export function resetPendingWatermarkFallbackForTests(): void {
 /**
  * `loadProjects`' own merge of a persisted watermark with any still-pending
  * in-memory fallback for the same project — see `pendingWatermarkFallback`'s
- * doc comment. Never touches `epics` (out of this fallback's scope; see that
- * doc comment).
+ * doc comment. Never touches `epicsSeen` (out of this fallback's scope; see
+ * that doc comment).
  *
- * `pending.reconcile` (BUTCHR-214/226 review round 1 — see `advanceProjectWatermark`'s
- * own "RECONCILING VS SUPPRESSING WRITES" section) decides HOW the merge
- * happens, not just whether: a pending value that came from a RECONCILING
- * write (`check_in`'s complete, authoritative observation) is used DIRECTLY,
- * never `monotonicMax`ed against the persisted value — that authoritative
- * value may legitimately be LOWER (the previous top comment was deleted),
- * and comparing it against a stale, still-higher persisted value would keep
- * the higher (wrong) one, silently re-raising the ceiling `check_in` was
- * trying to lower and reproducing the exact permanent-spawn-loop this round
- * exists to fix. A pending value from a SUPPRESSION write is still merged
- * via `monotonicMax`/`monotonicMaxId` — it is a partial fact, not a complete
- * observation, so a persisted value that is already higher must still win.
+ * BUTCHR-260: this used to branch on a `pending.reconcile` flag (a pending
+ * value from `check_in`'s reconciling write was used DIRECTLY, bypassing
+ * `monotonicMax`, because it could legitimately be LOWER than the stale
+ * persisted value after a comment deletion — see `monotonicMax`'s own doc
+ * comment for the full history). That branch, and the flag, are gone: the
+ * comment axis this existed to protect is now `commentsSeen`, a plain
+ * union with no "stale ceiling" a reconciling write would ever need to
+ * override, so every pending value merges the same way.
  */
 function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): ProjectWatermark {
   const pending = pendingWatermarkFallback.get(projectKey);
   if (!pending) return persisted;
-  if (pending.reconcile) {
-    return { version: pending.version, comment: pending.comment, epics: persisted.epics };
-  }
   return {
     version: monotonicMax(persisted.version, pending.version ?? undefined),
-    comment: monotonicMaxId(persisted.comment, pending.comment ?? undefined),
-    epics: persisted.epics,
+    commentsSeen: Array.from(new Set([...persisted.commentsSeen, ...pending.seenComments])),
+    epicsSeen: persisted.epicsSeen,
   };
 }
 
 /**
- * RECONCILING VS SUPPRESSING WRITES (BUTCHR-214/226 review round 1 —
- * corrects a premise this ticket started from: "`check_in` cannot regress
- * the watermark by construction" is not quite true. It cannot regress it
- * from a STALE value, but it legitimately observes a LOWER true max when
- * the previously-newest comment is deleted, and the monotonic guard alone
- * blocks exactly that recovery, turning a deletion into a PERMANENT spawn
- * loop `check_in` — the designated recovery path — can never clear, since
- * ids are drawn non-monotonically from a wide range with no guarantee a
- * higher one ever arrives again.
+ * Read-modify-write of ONLY the `wake` sub-key — see this file's top comment
+ * for why the rest of the `butchr` property (owned by the external
+ * scaffolding tool) is never overwritten wholesale, and `monotonicMax`'s own
+ * doc comment for why `version` alone still needs a monotonic floor while
+ * `commentsSeen`/`epicsSeen` (BUTCHR-227's union-only shapes) do not.
  *
- * The fix is not to weaken the guard — it is to recognize that this
- * module's two write shapes are not the same kind of fact:
- *   - a SUPPRESSION write (`speakOnOwnChannel`, `setProjectDoc`) says "I
- *     just created this id/version" — a PARTIAL fact about one write. It
- *     must never lower the watermark; `monotonicMax`/`monotonicMaxId` above
- *     are exactly right for it, unchanged.
- *   - a RECONCILING write (`check_in` only) says "here is the max over
- *     EVERYTHING currently on the page" — a COMPLETE observation. It may
- *     set the watermark authoritatively, INCLUDING DOWNWARD, which is
- *     exactly what it did before this guard existed and must keep doing.
+ * BUTCHR-260 (reconciling BUTCHR-214 with `main` after BUTCHR-227 landed):
+ * this function used to take an explicit `patch.reconcile` flag — the ONLY
+ * caller that ever passed it was `check_in` (src/tools/defs.ts), saying "the
+ * following is a COMPLETE observation over everything currently on the
+ * page, not a partial fact about one write, so it may set the watermark
+ * authoritatively, INCLUDING DOWNWARD". That flag, and the branch it
+ * selected, are DROPPED HERE, not adapted — see `monotonicMax`'s own doc
+ * comment for the evidence: the axis it existed to let `check_in` correct
+ * downward (the old comment scalar) is gone, and `version` never had a
+ * legitimate downward case to begin with (a real Confluence page version
+ * never decreases). `check_in`'s own call site (src/tools/defs.ts) no
+ * longer passes `reconcile` — its `seenComments`/`epics` were already a
+ * plain union/replace regardless of the flag, so removing it changes
+ * NOTHING about `check_in`'s observable behavior, only removes a
+ * now-meaningless parameter.
  *
- * `patch.reconcile` makes this EXPLICIT at the call site — `check_in`
- * (src/tools/defs.ts) is the only caller that ever passes it — rather than
- * inferred/detected heuristically, per direct instruction: an explicit flag
- * is the whole point. This does not touch `projectVerdict`'s comparison and
- * does not change what the stored field MEANS (still "the comment id this
- * project has been acted on through") — BUTCHR-195/199's boundary is
- * untouched.
+ * STATED RISK, NOT AN IMPLIED GUARANTEE: this reads the property immediately
+ * before writing it back, but the two calls are NOT atomic — Jira's project
+ * entity property endpoint has no compare-and-swap/version field to make
+ * them so (contrast `updatePage`, which does exact this locking for
+ * Confluence pages via `version.number`). A write landing between this
+ * function's own read and write is last-writer-wins. Accepted rather than
+ * engineered around, same reasoning as before BUTCHR-260: the only other
+ * writers of the `butchr` property are humans and the external scaffolding
+ * tool that provisions a project once, up front — not a second, frequent,
+ * automated writer this function's own call frequency could plausibly
+ * collide with.
  */
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
-  patch: { version?: number; comment?: string; epics?: Readonly<Record<string, string | null>>; reconcile?: boolean },
+  patch: { version?: number; seenComments?: readonly string[]; epics?: Readonly<Record<string, readonly string[]>> },
   log: (line: string) => void = console.error,
 ): Promise<void> {
   // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
@@ -551,106 +865,47 @@ export async function advanceProjectWatermark(
   // REPLACE, where the same fail-open shape means "assume the record was
   // empty" and silently deletes whatever was actually there.
   const current = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as Record<string, unknown> | null ?? {};
-  const persistedWake: ProjectWatermark = {
-    version: (current.wake as Partial<ProjectWatermark> | undefined)?.version ?? null,
-    comment: (current.wake as Partial<ProjectWatermark> | undefined)?.comment ?? null,
-    epics: (current.wake as Partial<ProjectWatermark> | undefined)?.epics ?? {},
-  };
+  const wake = (current.wake as StoredWake | undefined) ?? {};
+  // BUTCHR-260 (defect 1b, adapted): this process's own still-pending
+  // fallback (see `pendingWatermarkFallback`'s doc comment) is merged in
+  // BEFORE this write's own union/monotonic-max, exactly as `loadProjects`
+  // merges it on read (`mergePendingFallback`, reused here so read and
+  // write can never disagree about what "currently known" means) — so a
+  // LATER write, from ANY caller, durably absorbs what an earlier one could
+  // not persist, never lowered by this write.
+  const normalized = mergePendingFallback(projectKey, normalizeWake(wake));
 
-  let nextWake: ProjectWatermark;
-  if (patch.reconcile) {
-    // A complete, authoritative observation — bypasses BOTH the monotonic
-    // guard and this process's own pending fallback entirely (see
-    // `mergePendingFallback`'s doc comment for why merging either in here
-    // would silently defeat the one write meant to recover from a deletion).
-    // `epics` keeps its existing replace-only semantics, unaffected by this.
-    nextWake = {
-      version: patch.version ?? persistedWake.version,
-      comment: patch.comment ?? persistedWake.comment,
-      epics: patch.epics !== undefined ? patch.epics : persistedWake.epics,
-    };
-  } else {
-    // SUPPRESSION WRITE: its floor is the more-trustworthy of the persisted
-    // value and this process's own still-pending fallback — the SAME merge
-    // `loadProjects` applies on read (`mergePendingFallback`, reused here so
-    // read and write can never disagree about what "currently known" means),
-    // never lowered by this write.
-    const wake = mergePendingFallback(projectKey, persistedWake);
-    // `epics`, when PROVIDED, REPLACES the whole map — deliberately NOT a
-    // merge. This is the actual fix for rule 3's re-entry defect (see
-    // `ProjectWatermark.epics`'s doc comment, point 2): the only caller that
-    // ever passes `epics` is the project agent's own `check_in`
-    // (src/tools/defs.ts), which always computes the FULL currently-in-review
-    // set for the whole project in one JQL call — so "replace" here means
-    // "this is now the complete truth", and an epic that has left review
-    // since the last check-in is correctly dropped rather than lingering.
-    // Omitting `epics` entirely (e.g. a version-only or comment-only advance)
-    // leaves the existing map untouched. DELIBERATELY NOT monotonic (unlike
-    // version/comment below): a smaller map after a check-in is exactly how
-    // an epic leaving review gets pruned — "smaller" is not "behind" here.
-    const epics = patch.epics !== undefined ? patch.epics : wake.epics;
-    nextWake = {
-      version: monotonicMax(wake.version, patch.version),
-      comment: monotonicMaxId(wake.comment, patch.comment),
-      epics,
-    };
+  const commentsSeen = patch.seenComments ? Array.from(new Set([...normalized.commentsSeen, ...patch.seenComments])) : normalized.commentsSeen;
+
+  let epicsSeen = normalized.epicsSeen;
+  if (patch.epics !== undefined) {
+    const nextEpicsSeen: Record<string, readonly string[]> = {};
+    for (const [key, ids] of Object.entries(patch.epics)) {
+      nextEpicsSeen[key] = Array.from(new Set([...(normalized.epicsSeen[key] ?? []), ...ids]));
+    }
+    epicsSeen = nextEpicsSeen;
   }
 
+  const nextWake: StoredWake = {
+    ...wake, // preserves the legacy `comment`/`epics` scalars VERBATIM — see this function's own doc comment.
+    version: monotonicMax(normalized.version, patch.version),
+    commentsSeen,
+    epicsSeen,
+  };
+  const nextProperty = { ...current, wake: nextWake };
+  assertWithinPropertySizeCeiling(projectKey, nextProperty);
   try {
-    await ops.setProjectProperty(projectKey, PROPERTY_KEY, { ...current, wake: nextWake });
+    await ops.setProjectProperty(projectKey, PROPERTY_KEY, nextProperty);
     // The durable write just became the new ground truth for whatever it
-    // covered — for a suppression write, `nextWake` already absorbed any
-    // pending value (see above); for a reconciling write, `nextWake` is
-    // authoritative regardless of what was pending. Either way, dropping
-    // the fallback outright here (never merging it back in) is correct.
+    // covered — `nextWake` already absorbed any pending value (see above) —
+    // so dropping the fallback outright here (never merging it back in) is
+    // correct.
     pendingWatermarkFallback.delete(projectKey);
   } catch (e) {
-    // A reconciling write's own failure must ALSO be recorded as
-    // authoritative (not monotonic-merged on a future read) — otherwise a
-    // failed deletion-recovery would sit in the fallback, get compared with
-    // `monotonicMax` against the still-stale-high persisted value on the
-    // next read, and lose exactly the downward correction it was trying to
-    // make. Once a pending entry has ever been authoritative, it stays that
-    // way until a write actually succeeds and clears it (or another
-    // reconciling write replaces it) — a later suppression write's own
-    // `nextWake` was already computed FROM that authoritative floor above,
-    // so preserving the flag here is what keeps read and write agreeing.
-    const priorPending = pendingWatermarkFallback.get(projectKey);
-    const reconcile = !!patch.reconcile || !!priorPending?.reconcile;
-    pendingWatermarkFallback.set(projectKey, { version: nextWake.version, comment: nextWake.comment, reconcile });
-    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, comment=${nextWake.comment ?? "null"}, reconcile=${reconcile}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
+    pendingWatermarkFallback.set(projectKey, { version: nextWake.version ?? null, seenComments: commentsSeen });
+    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, commentsSeen=${commentsSeen.length}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
     throw e;
   }
-}
-
-/**
- * Largest comment id by NUMERIC value — never by API return order, since
- * `getPageComments` requests no `sort` and this module does not depend on
- * one. Exported: the project tool surface's `check_in` verb
- * (src/tools/defs.ts) reuses this exact function rather than a second
- * "find the newest comment" implementation.
- *
- * CORRECTED (BUTCHR-198/BUTCHR-202): this doc comment used to assert that
- * Confluence footer-comment ids are "monotonically increasing
- * platform-wide, confirmed live". That was false. MEASURED, independently,
- * on two different project root docs: id order and creation-time order
- * disagree — on one doc, id `17334328` was created at `14:58:06.003Z` and
- * id `17104948` was created 24s LATER, at `14:58:30.387Z` (the later
- * comment's id is lower by 229,380). Replaying this project's own root-doc
- * footer comments in creation order against a max-id watermark, 6 of 10
- * would never have been seen. A max-by-numeric-id reduce, which is what
- * this function does, can therefore return the SAME value across a poll
- * even though a genuinely new (but lower-id) comment has arrived — the
- * comment is silently never observed, not merely mis-ordered. This
- * function, and every caller comparing its output against a watermark
- * (`projectVerdict`/`createProjectEventRules` in this file, `check_in` in
- * src/tools/defs.ts), is KNOWN-WRONG pending BUTCHR-198's fix. This ticket
- * (BUTCHR-202) documents the finding; it deliberately does not change this
- * function's behavior.
- */
-export function newestCommentId(comments: readonly { id: string }[]): string | null {
-  if (!comments.length) return null;
-  return comments.reduce((max, c) => (Number(c.id) > Number(max) ? c.id : max), comments[0]!.id);
 }
 
 /** `project = "KEY-123"` -> `"KEY"`. Project keys never contain a hyphen (`PROJECT_ID_RE`, src/resources/id.ts) so the first split segment is always the whole prefix. */
@@ -850,8 +1105,10 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       eligible: false,
       rootDocId: null,
       observedVersion: null,
-      observedCommentId: null,
+      observedCommentIds: [],
       observedEpics: [],
+      unseenCommentIds: [],
+      unseenEpicCommentIds: {},
       watermark: EMPTY_WATERMARK,
     }));
 
@@ -862,33 +1119,62 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       // One getIssueComments() call per IN-REVIEW epic only (usually zero
       // epics, per this file's own call-count budget) — deliberately not
       // batched (there is no bulk comments read), and deliberately not
-      // `updated` (see ProjectWatermark.epics's doc comment for the
+      // `updated` (see ProjectWatermark.epicsSeen's doc comment for the
       // measured label-churn reason). The SAME reader `check_in`
       // (src/tools/defs.ts) uses to watermark this same axis — see
       // `getIssueComments`'s own doc comment on AtlassianOps.
       const observedEpics: ProjectEpic[] = await Promise.all(
-        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, newestCommentId: newestCommentId((await deps.ops.getIssueComments(epic.key)).results) })),
+        epics.map(async (epic): Promise<ProjectEpic> => ({ key: epic.key, commentIds: (await deps.ops.getIssueComments(epic.key)).results.map((c) => c.id) })),
       );
-      const wake = p.wake;
-      const persistedWatermark: ProjectWatermark = { version: wake?.version ?? null, comment: wake?.comment ?? null, epics: wake?.epics ?? {} };
+      // BUTCHR-227: the migration adapter runs HERE, at the one read path
+      // this ticket's own doc comment on `normalizeWake` names — a
+      // pre-migration project's stored scalar is turned into a one-member
+      // seen set, never treated as a threshold. See that function's own
+      // doc comment for the reasoning this module must reproduce in its PR.
+      //
+      // DEFECT 1b (BUTCHR-260, adapted from BUTCHR-214/226): merge in this
+      // process's own in-memory fallback (see `pendingWatermarkFallback`'s
+      // doc comment) BEFORE computing anything derived from the watermark,
+      // so a watermark write that failed to persist still suppresses a
+      // poll's own re-read of the very thing it just tried and failed to
+      // record.
+      const watermark = mergePendingFallback(p.key, normalizeWake(p.wake));
+      const observedCommentIds = commentsByProject[i]!.results.map((c) => c.id);
+      // THE CLASSIFICATION SEAM (BUTCHR-227) — computed once, here, where
+      // both the observation and the watermark are in hand, and reused by
+      // both `projectVerdict` (the wake decision) and a future BUTCHR-208
+      // sender-class filter, rather than recomputed in each: see
+      // `ProjectResource.unseenCommentIds`'s own doc comment for why this
+      // must stay a SEPARATE field from `observedCommentIds`, never folded
+      // into it.
+      const unseenCommentIds = unseenIds(observedCommentIds, watermark.commentsSeen);
+      const unseenEpicCommentIds: Record<string, readonly string[]> = {};
+      for (const e of observedEpics) {
+        unseenEpicCommentIds[e.key] = unseenIds(e.commentIds, watermark.epicsSeen[e.key] ?? []);
+      }
       return {
         key: p.key,
         name: p.name,
         eligible: true,
         rootDocId,
         observedVersion: versions[rootDocId] ?? null,
-        observedCommentId: newestCommentId(commentsByProject[i]!.results),
+        observedCommentIds,
         observedEpics,
-        // DEFECT 1b: merge in this process's own in-memory fallback (see
-        // `pendingWatermarkFallback`'s doc comment) so a watermark write
-        // that failed to persist still suppresses a poll's own re-read of
-        // the very thing it just tried and failed to record.
-        watermark: mergePendingFallback(p.key, persistedWatermark),
+        unseenCommentIds,
+        unseenEpicCommentIds,
+        watermark,
       };
     }),
   );
 
   return [...resolved, ...ineligible];
+}
+
+/** SET equality, not array/reference equality — see `changed`'s own doc comment for why this must not degrade to comparing array identity or order. */
+function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const bSet = new Set(b);
+  return a.every((id) => bSet.has(id));
 }
 
 /**
@@ -899,14 +1185,28 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
  * genuinely `active` every poll (watermark never advanced — see this
  * file's top comment on the stated gap) is not re-nudged every single poll,
  * only when something about it actually moved since last time.
+ *
+ * BUTCHR-227: compares `observedCommentIds`/`commentIds` as SETS
+ * (`sameIdSet`), not scalars and not array equality. This is deliberate,
+ * not incidental — `getPageComments` requests no `sort` (see that op's own
+ * doc comment on `AtlassianOps`), so two polls observing the exact same
+ * underlying comments can return them in a DIFFERENT array order with
+ * nothing having actually changed. A comparison that silently degraded to
+ * array-order or reference equality here would manufacture a spurious
+ * "changed" event, and therefore a spurious nudge, on every such poll —
+ * covered by this file's own test suite with a fixture that holds the
+ * same ids in two different orders and asserts `changed` reports `false`.
  */
 function changed(prev: ProjectResource, next: ProjectResource): boolean {
   if (prev.eligible !== next.eligible) return true;
   if (prev.observedVersion !== next.observedVersion) return true;
-  if (prev.observedCommentId !== next.observedCommentId) return true;
+  if (!sameIdSet(prev.observedCommentIds, next.observedCommentIds)) return true;
   if (prev.observedEpics.length !== next.observedEpics.length) return true;
-  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.newestCommentId]));
-  return next.observedEpics.some((e) => prevEpics.get(e.key) !== e.newestCommentId || !prevEpics.has(e.key));
+  const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.commentIds]));
+  return next.observedEpics.some((e) => {
+    const before = prevEpics.get(e.key);
+    return before === undefined || !sameIdSet(before, e.commentIds);
+  });
 }
 
 /**

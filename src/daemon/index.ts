@@ -24,8 +24,10 @@ import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
+import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -36,6 +38,7 @@ import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
+import { createReaper } from "../agents/reap.js";
 
 let config;
 try {
@@ -172,6 +175,39 @@ const stalled = createStalledCheck({
   accountEmail: config.atlassian.email,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-221 criterion 10: a synchronous "is this issue quota-blocked right
+// now" predicate, built by teeing the SAME list()/read() calls handed to
+// watchSessionLimits below — through the SAME session-limit.ts recogniser —
+// rather than a second detection path. See src/agents/quota-gate.ts's own
+// top comment. Constructed here, ahead of stallRemediation, so its
+// `isBlocked` can be wired straight into StallRemediationDeps; its
+// `list`/`read` are wired into watchSessionLimits further down this file in
+// place of the underlying functions, so this taps exactly the reads that
+// watcher already performs — no extra pane I/O.
+const quotaGate = createQuotaGate(
+  async () => (await herdr.agent.list()).agents.map((a) => ({
+    pane_id: a.pane_id,
+    agent_status: a.agent_status ?? "",
+    issue: issueOfAgentName((a as { name?: string }).name),
+  })),
+  readPane,
+  () => Date.now(),
+);
+// BUTCHR-221/BUTCHR-210: the stall deadlock-breaker's remediation half —
+// posts one debounced wake comment on a ticket once agent:stalled is
+// actually applied (never on the raw per-poll signal — see
+// src/agents/stall-remediation.ts's own top comment for the gating
+// rationale and the own-write ledger hazard it avoids by construction).
+// Always an issue key (syncLabels below is never wired into the project
+// loop further down this file), so `ops.addComment` is the right seam —
+// same one parked.ts uses, no second Atlassian writer.
+const stallRemediation = createStallRemediator({
+  now: () => Date.now(),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  quotaBlocked: quotaGate.isBlocked,
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
 // see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
 // every other daemon-side comment write; no second Atlassian writer.
@@ -268,6 +304,33 @@ const projectReconcileFailureDetector = createReconcileFailureDetector({
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-245: per-poll reclamation of a workspace whose agent exited on its
+// own — see src/agents/reap.ts for the full mechanism (the ownership join,
+// the grace period, the per-poll cap). TWO SEPARATE INSTANCES, same
+// reasoning as issueCrashLoopDetector/projectCrashLoopDetector above: each
+// `runResourceLoop` call needs its own `ReapGuard` (grace-period state),
+// same "one instance per loop" discipline `RespawnGuard` already follows.
+// Both operate on the SAME shared herd namespace (there is no per-loop
+// scoping here — reclamation is scoped to the WORKSPACE, never to an issue
+// key, so `scopedHerd`'s ownsId filtering does not apply and is not used):
+// whichever loop's poll observes a candidate clear its grace period first
+// closes it; the other loop's own tracker simply stops seeing that
+// workspace in its next `workspace.list()` snapshot and never attempts a
+// second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
+// wrapper) is used directly — `strandedCandidates`/`closeStranded` are
+// HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+const issueReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
+const projectReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: async () => {
@@ -281,6 +344,7 @@ const syncLabels = createLabelSync({
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
+  stallRemediation,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
@@ -292,13 +356,13 @@ const syncLabels = createLabelSync({
 // the refusal and close it once past its printed reset time plus margin so
 // the reconciler respawns with a fresh kickoff. Nothing persisted; a restart
 // re-reads the same pane and reaches the same decision.
+// list/read wired through quotaGate (created above) rather than straight to
+// herdr.agent.list()/readPane — same rows, same pane text, same recogniser,
+// just tee'd so BUTCHR-221's quotaBlocked predicate stays current off this
+// exact poll. watchSessionLimits itself is unmodified and unaware.
 watchSessionLimits({
-  list: async () => (await herdr.agent.list()).agents.map((a) => ({
-    pane_id: a.pane_id,
-    agent_status: a.agent_status ?? "",
-    issue: issueOfAgentName((a as { name?: string }).name),
-  })),
-  read: readPane,
+  list: quotaGate.list,
+  read: quotaGate.read,
   close: (issue) => herd.stop(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
@@ -383,6 +447,10 @@ runResourceLoop(issueResourceType, {
   checkCrashLoop: issueCrashLoopDetector.check,
   // BUTCHR-147: see src/agents/reconcile-failure.ts.
   checkReconcileFailure: issueReconcileFailureDetector.check,
+  // BUTCHR-245: the issue tier is the fast, high-volume loop (15s) — the
+  // one most likely to actually clear a stranded workspace's grace period
+  // quickly. See src/agents/reap.ts.
+  checkReap: issueReaper.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -452,6 +520,11 @@ runResourceLoop(projectResourceType, {
   checkCrashLoop: projectCrashLoopDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
+  // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
+  // single-tier restriction, and this loop's own `workspace.list()` poll
+  // (5min cadence) is still a valid independent chance to catch a candidate
+  // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
+  checkReap: projectReaper.check,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

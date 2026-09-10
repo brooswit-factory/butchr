@@ -239,6 +239,21 @@ export interface ReconcileOptions {
    * report through).
    */
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
+  /**
+   * BUTCHR-245: per-poll reclamation of a workspace whose agent exited on
+   * its own — see src/agents/reap.ts for the full mechanism (the ownership
+   * join, the grace period, the per-poll cap). Unlike `checkCrashLoop`/
+   * `checkReconcileFailure` above, this takes NO arguments: reclamation is
+   * scoped to the WORKSPACE, never the issue key (a duplicate label with
+   * one live and one stranded workspace is exactly the case an issue-keyed
+   * check gets wrong — see reap.ts's own top comment), so it has nothing to
+   * do with this poll's `plan`/`desired`/`running` at all. Called BEFORE
+   * the spawn loop below (see that call site's own comment for why this
+   * ordering is safe). Never throws (see `Reaper.check`'s own contract).
+   * Optional; omitted, no reclamation runs (every caller before this
+   * ticket).
+   */
+  checkReap?: () => Promise<void>;
 }
 
 /**
@@ -314,6 +329,17 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // (not `plan.spawn`) is what the detector prunes its own tracking against —
   // the pruning trap that module's top comment names.
   if (opts.checkCrashLoop) await opts.checkCrashLoop(plan.spawn, [...desired.keys()]);
+  // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
+  // freed THIS poll is available to THIS poll's spawns rather than sitting
+  // idle an extra cycle. This ordering is not what makes an in-flight spawn
+  // safe, though — a workspace `spawn()` just created (pane up, agent not
+  // registered yet) would look exactly like a stranded slot to `checkReap`
+  // for the first several seconds either way. What actually protects it is
+  // `ReapGuard`'s own grace period (reap.ts: 2 observations AND >= 60s),
+  // which comfortably outlasts `KICKOFF_VERIFY_MS` (12s, herd.ts) — the
+  // ordering here is purely a throughput optimization, never a safety
+  // mechanism.
+  if (opts.checkReap) await opts.checkReap();
   // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
   // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
   // burst of N new spawns (e.g. several stories activating in one poll)
@@ -544,6 +570,8 @@ export interface GenericLoopDeps<T> {
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   /** BUTCHR-147: see `ReconcileOptions.checkReconcileFailure`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance, same reasoning as `checkCrashLoop` above. Optional; omitted, no isolated-failure detection runs. */
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
+  /** BUTCHR-245: see `ReconcileOptions.checkReap`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `Reaper` instance, same reasoning as `checkCrashLoop`/`checkReconcileFailure` above. Optional; omitted, no reclamation runs. */
+  checkReap?: () => Promise<void>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -627,6 +655,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
+        ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];

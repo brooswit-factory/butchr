@@ -1927,15 +1927,22 @@ export interface TellPeerResult {
  * WHAT THIS FUNCTION DOES NOT AND MUST NOT CLAIM: it posts a durable
  * Confluence footer comment on `peer`'s root doc. That is what it does and
  * all it may say. It does NOT know, and cannot promise, that `peer` will
- * WAKE on this comment — Confluence footer-comment ids are not monotonic
- * with creation time, and the project wake path's own MAX-id watermark
- * comparison (`newestCommentId`, src/resources/project.ts) can silently
- * fail to notice a comment whose id lands below the recipient's current
- * max (BUTCHR-195, not this ticket's to fix). The comment is never lost —
- * it sits on a durable page and is read whenever `peer` next reads its own
- * comments — but the WAKE is best-effort, and its failure mode, while
- * BUTCHR-195 is open, is silence: no error, on either side, distinguishable
- * from the peer simply not having answered yet.
+ * WAKE on this comment. CORRECTED (BUTCHR-227): this used to attribute
+ * that to the wake path's MAX-id watermark comparison (`newestCommentId`,
+ * a symbol BUTCHR-227 deleted) silently failing to notice a low-id
+ * comment — that comparison no longer exists; the comment axis is now a
+ * SEEN SET, compared by membership, never by magnitude (see
+ * src/resources/project.ts's `ProjectWatermark.commentsSeen`). The WAKE is
+ * still best-effort, for a DIFFERENT, honest reason: `peer`'s reader has a
+ * page-window/pagination bound (see `getPageComments`'s own doc comment on
+ * `AtlassianOps`) — a comment that never appears inside that window is
+ * never observed, therefore never wakes anything, regardless of its id.
+ * This function also does not bump `peer`'s root-doc page VERSION, so the
+ * version axis is not a second delivery path here either. The comment is
+ * never lost — it sits on a durable page and is read whenever `peer` next
+ * reads its own comments — but the wake remains best-effort, and its
+ * failure mode is silence: no error, on either side, distinguishable from
+ * the peer simply not having answered yet.
  */
 export async function tellPeer(
   ops: AtlassianOps,
