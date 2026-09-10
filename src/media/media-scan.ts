@@ -135,6 +135,31 @@ export function formatUnexpectedRegistryModulesError(found: readonly string[], e
  * `src/workspace/workspace-scan.ts`'s own two `witness: null` entries set:
  * each argues, specifically, why FABRICATING an input would be wrong, not
  * merely that one is inconvenient to build.
+ *
+ * WHAT THIS LIST BUYS THIS DETECTOR: MEASURABLY LESS THAN THE OTHERS, AND
+ * THE NUMBER IS WORTH STATING (BUTCHR-223). Every entry here is
+ * `witness: null`, so this list contains ZERO executable witnesses. The
+ * consequence, measured rather than reasoned: killing this file's
+ * detector outright — making `listRegistryModules` return `[]`
+ * unconditionally — produced 0 failures at `positiveControl` and 0 at
+ * `silence`, because there are no halves of either kind to fail. The
+ * same attack on `./family-scan.ts`'s six witnesses produced 6
+ * `positiveControl` failures and 0 `silence` failures. So for THIS
+ * detector the mechanism supplies the type-level door and a written
+ * argument, and NO non-vacuity evidence whatever. `assertBlindSpotCoverage`
+ * below still runs and still passes — but it passes TRIVIALLY here, and a
+ * green result from it is evidence about nothing except that no entry
+ * declares a witness id. That is the honest position for a claim that is
+ * genuinely unwitnessable (see the entry's own `noWitnessReason`), not a
+ * gap to be closed by fabricating a fixture — but it must not be read as
+ * this detector's blind spot having been VERIFIED. It has been argued.
+ *
+ * AND, AS EVERYWHERE ELSE UNDER THIS EPIC: this list closes "is the
+ * stated blind spot true" — here, only as far as an argument can. It does
+ * not close "is the list of stated blind spots complete." A second
+ * structurally-enforced medium that nobody noticed would be absent from
+ * this list and invisible to this check at the same time, which is the
+ * doubled blindness the entry below names.
  */
 export const MEDIA_SCAN_BLIND_SPOT_IDS = ["docTitleNotRegistryConvention"] as const;
 export type MediaScanBlindSpotId = (typeof MEDIA_SCAN_BLIND_SPOT_IDS)[number];

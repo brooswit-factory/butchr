@@ -235,6 +235,21 @@ export function scanDirForFamilyCollisions(srcDir: string, repoRoot: string, fam
  * or for `{{GROUND_TRUTH}}`'s own gaps — see this file's header, and
  * `src/media/registry.ts`'s `workspace` entry, for why those stay live,
  * reachable, and deliberately ungraded.
+ *
+ * THE LIMIT THIS LIST DOES NOT REMOVE (BUTCHR-223) — carried here rather
+ * than left only in `blind-spot.ts`'s header, because THIS is the file a
+ * reader lands on when they want to know what this scanner cannot see,
+ * and a list that looks exhaustive is exactly how the overclaim gets
+ * made. Every entry below is now EXECUTABLE: the claim is constructed,
+ * the silence is measured, and a near-miss positive control proves the
+ * check could have failed. That closes "IS THE STATED BLIND SPOT TRUE."
+ * It does not close "IS THE LIST OF STATED BLIND SPOTS COMPLETE" —
+ * nothing checks that the six entries below are all of them, and a blind
+ * spot this scanner's authors never noticed would simply be absent here,
+ * indistinguishable from one that does not exist. That residual layer
+ * stays self-declaring and no mechanism in this codebase closes it.
+ * Promoting prose bullets into a value-level list moved the claims from
+ * unverifiable to verified; it did not make the set of claims complete.
  */
 export const FAMILY_BLIND_SPOT_IDS = [
   "suffixConcatenation",

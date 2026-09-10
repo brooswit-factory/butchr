@@ -282,6 +282,25 @@ export type DetectorField =
  * `./media-scan.ts`'s own header for why that absence is itself a named
  * blind spot in THAT check, not an oversight here); `blindSpotIds: null`
  * with a written reason is the honest value for it, not an invented list.
+ *
+ * WHAT THIS FIELD DOES NOT BUY — READ THIS BEFORE CITING IT AS COVERAGE
+ * (BUTCHR-223). Tying this entry to the scanner's own array closes DRIFT
+ * BETWEEN TWO COPIES: the registry and the scanner can no longer disagree
+ * about what the list says, because there is only one list. It does NOT
+ * make that list COMPLETE, and it does not make either end of it true.
+ * The enumeration is still SELF-DECLARING — nothing checks that every
+ * prose bullet a header once carried became an entry, and nothing checks
+ * that a detector has no blind spot its author never noticed. Two
+ * independent claims, and only the first is closed here:
+ *   - "the registry and the scanner agree about the list"  <- CLOSED, by
+ *     construction, since assigning the same array makes disagreement
+ *     inexpressible rather than merely discouraged.
+ *   - "the list names every blind spot the detector actually has"  <-
+ *     NOT closed, by this field or by anything else in this codebase.
+ * `blindSpots` (below) is still unchecked prose sitting beside this
+ * field; it is narrower than it was, not verified. Anything — a header,
+ * a PR body, a doc — that reads this field as "blind spots are now
+ * verified" is making the overclaim this epic exists to catch.
  */
 export type BlindSpotIdsField =
   | { readonly blindSpotIds: readonly string[] }
