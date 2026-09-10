@@ -210,14 +210,31 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
         // Newest-first (AtlassianClient.comments' own `orderBy: -created`),
         // so `.find` surfaces the most recent disqualifying evidence first
         // when more than one qualifies — the most informative one to log.
-        const disqualifying = rows.find(
-          (c) => !c.body.startsWith(DAEMON_CHATTER_PREFIX) && Date.parse(c.created) >= streakStart,
-        );
+        //
+        // An unparseable `created` (AtlassianClient.comments defaults a
+        // missing one to `""`, and `Date.parse("")` is `NaN`) must NOT
+        // silently fall through `NaN >= streakStart` (always false) into
+        // "did not land during the streak" — that would collapse "I cannot
+        // tell when this comment arrived" into a confident "no", the exact
+        // defect this file's own `catch` block below exists to avoid for a
+        // failed fetch. Fail toward DISQUALIFYING instead (we cannot rule
+        // out that someone is attending) — the safe direction, since a
+        // false wake costs one debounced comment (see
+        // stall-remediation.ts) while a false silence costs nothing
+        // visible at all.
+        const disqualifying = rows.find((c) => {
+          if (c.body.startsWith(DAEMON_CHATTER_PREFIX)) return false;
+          const createdAt = Date.parse(c.created);
+          return Number.isNaN(createdAt) || createdAt >= streakStart;
+        });
         if (disqualifying) {
           if (declineLogged.get(issue) !== disqualifying.id) {
             declineLogged.set(issue, disqualifying.id);
+            const unparseable = Number.isNaN(Date.parse(disqualifying.created));
             deps.log?.(
-              `[stalled] ${issue} declined: comment ${disqualifying.id} (${disqualifying.created}) is not daemon chatter and landed at/after the current idle streak began (${new Date(streakStart).toISOString()}) — someone is attending`,
+              unparseable
+                ? `WARNING: [stalled] ${issue} declined: comment ${disqualifying.id} has an unparseable created field (${JSON.stringify(disqualifying.created)}) — cannot rule out it landed during the current idle streak (started ${new Date(streakStart).toISOString()}), treating as disqualifying rather than guessing`
+                : `[stalled] ${issue} declined: comment ${disqualifying.id} (${disqualifying.created}) is not daemon chatter and landed at/after the current idle streak began (${new Date(streakStart).toISOString()}) — someone is attending`,
             );
           }
           return false;

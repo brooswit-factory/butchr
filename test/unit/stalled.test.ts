@@ -277,6 +277,41 @@ describe("createStalledCheck", () => {
     expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified — "at or after", inclusive
   });
 
+  // BUTCHR-289 review finding: AtlassianClient.comments defaults a missing
+  // `created` to `""`, and `Date.parse("")` is `NaN` — every comparison
+  // against `NaN` is false, so a naive `Date.parse(c.created) >= streakStart`
+  // would silently treat an unparseable-timestamp comment as NOT disqualifying,
+  // collapsing "I cannot tell when this arrived" into a confident "it didn't
+  // land during the streak". Must fail toward DISQUALIFYING instead (the safe
+  // direction — a false wake costs one debounced comment, a false silence
+  // costs nothing visible), and log it distinctly from a normal decline.
+  test("a non-chatter comment with an unparseable `created` disqualifies rather than being silently ignored", async () => {
+    let now = 0;
+    const logs: string[] = [];
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [{ id: "c1", body: "I am actively looking at this right now.", created: "" }],
+      log: (l) => logs.push(l),
+    });
+    await check.check("KAN-1", "idle"); // floor starts at now=0
+    now = 10 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified, not silently ignored
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("[stalled]") && l.includes("KAN-1") && l.includes("c1") && l.includes("unparseable"))).toBe(true);
+  });
+
+  test("daemon chatter with an unparseable `created` still never disqualifies — the unparseable-fallback only applies to non-chatter comments", async () => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [{ id: "c1", body: "[butchr:reconcile] some daemon note with a missing timestamp.", created: "" }],
+    });
+    await check.check("KAN-1", "idle");
+    now = 10 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(true); // still stalls — chatter is checked FIRST, before the date is even parsed
+  });
+
   // BUTCHR-289 DoD 3 (recency, both directions in one scenario): mixes an
   // old (pre-streak) report, daemon chatter mid-streak, and one genuine
   // mid-streak human comment — proves the rule finds the ONE disqualifying
