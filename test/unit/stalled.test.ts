@@ -175,14 +175,13 @@ describe("StalledTracker", () => {
 });
 
 describe("createStalledCheck", () => {
-  test("fetches comments only once the cheap preconditions hold, and stalled=true when none are from the account", async () => {
+  test("fetches comments only once the cheap preconditions hold, and stalled=true when nothing disqualifies", async () => {
     let now = 0;
     const fetched: string[] = [];
     const check = createStalledCheck({
       now: () => now,
       minutes: 10,
       comments: async (issue) => { fetched.push(issue); return []; },
-      accountEmail: "daemon@example.com",
     });
     expect(await check.check("KAN-1", "idle")).toBe(false);
     expect(fetched).toEqual([]); // not yet a candidate — zero Jira cost
@@ -191,42 +190,171 @@ describe("createStalledCheck", () => {
     expect(fetched).toEqual(["KAN-1"]); // exactly one fetch, only once it mattered
   });
 
-  test("never stalled once the account has commented, even if it's the only comment on the ticket", async () => {
+  // BUTCHR-289 DoD 1: the epic's core defect. An agent finishing a turn and
+  // reporting on its own ticket — exactly what every brief asks for — used
+  // to permanently disqualify the ticket from ever stalling, because that
+  // report is authored by the SAME account the daemon itself comments
+  // through. Run against the pre-fix `authorEmail === accountEmail` gate,
+  // this scenario returns false forever (the previous
+  // "never stalled once the account has commented" test pinned exactly
+  // that). The kind×recency rule fixes it: the report predates the CURRENT
+  // idle streak (posted while still working), so it does not disqualify a
+  // LATER stall.
+  test("a progress report posted before the current idle streak began does not disqualify a later stall (BUTCHR-289: the defect this ticket fixes)", async () => {
     let now = 0;
     const check = createStalledCheck({
       now: () => now,
       minutes: 10,
-      comments: async () => [{ authorEmail: "daemon@example.com" }],
-      accountEmail: "daemon@example.com",
+      comments: async () => [
+        { id: "c1", body: "[KAN-1] finished this turn's work, reporting done. Going idle now.", created: new Date(0).toISOString() },
+      ],
     });
-    now = 10 * 60_000;
-    expect(await check.check("KAN-1", "idle")).toBe(false);
+    await check.check("KAN-1", "working"); // report was posted here, at now=0, while still working
+    now = 5 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // floor starts here (5min) — report (0min) predates it
+    now = 15 * 60_000; // 10 min of idle since the floor
+    expect(await check.check("KAN-1", "idle")).toBe(true); // stalls despite the earlier report
   });
 
-  test("a comment from someone else does not disqualify stalled — the AGENT never spoke", async () => {
+  // BUTCHR-289 DoD 2/3 (kind): a non-chatter comment landing DURING the
+  // current streak disqualifies regardless of WHO wrote it — an agent, a
+  // boss, or a human all count, because the rule keys on kind, never
+  // authorship. This is now MORE protective than the old authorship gate,
+  // which a boss's comment never disqualified at all.
+  test.each([
+    ["the agent itself", "[KAN-1] still working on this, one more sec."],
+    ["the boss", "[BUTCHR-207] holding on this, do not stall it."],
+    ["a human", "please wait, I'm reviewing this by hand."],
+  ])("a non-chatter comment from %s, landing during the current idle streak, disqualifies", async (_who, body) => {
     let now = 0;
     const check = createStalledCheck({
       now: () => now,
       minutes: 10,
-      comments: async () => [{ authorEmail: "a-human@example.com" }],
-      accountEmail: "daemon@example.com",
+      comments: async () => [{ id: "c1", body, created: new Date(7 * 60_000).toISOString() }],
     });
-    await check.check("KAN-1", "idle"); // establishes the floor at now=0
+    await check.check("KAN-1", "idle"); // floor starts at now=0
+    now = 7 * 60_000; // comment lands mid-streak
+    now = 10 * 60_000; // window elapses
+    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified — someone is attending
+  });
+
+  // BUTCHR-289 DoD 2/3 (kind): daemon chatter never disqualifies, no matter
+  // when it lands — it is the daemon narrating its own state, never
+  // evidence anyone is attending. Excluding `[butchr:stall]` specifically is
+  // load-bearing: the remediator's own wake comment must not clear the very
+  // label that triggered it (see labels-sync.test.ts's end-to-end coverage
+  // for the sticky-label consequence of that).
+  test.each([
+    "[butchr:reconcile] KAN-1's reconcile has failed 2 time(s) in the last 15 minutes.",
+    "[butchr:respawn] respawned the agent for KAN-1.",
+    "[butchr:crashloop] KAN-1's agent has crash-looped 3 time(s).",
+    "[butchr:stall] KAN-1 has read agent:stalled, continuously, for 10 minute(s)...",
+    "[butchr:blocked] KAN-1 has been blocked for 30 minutes.",
+  ])("daemon chatter (%s), even landing during the current streak, never disqualifies", async (body) => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [{ id: "c1", body, created: new Date(7 * 60_000).toISOString() }],
+    });
+    await check.check("KAN-1", "idle"); // floor starts at now=0
     now = 10 * 60_000;
-    expect(await check.check("KAN-1", "idle")).toBe(true);
+    expect(await check.check("KAN-1", "idle")).toBe(true); // not disqualified — chatter, not attention
+  });
+
+  // BUTCHR-289 DoD 3 (recency boundary): "at or after" means the boundary
+  // instant itself counts — a comment landing EXACTLY at the streak's start
+  // disqualifies, not just strictly-after ones.
+  test("a non-chatter comment landing exactly AT the streak's start instant disqualifies (boundary is inclusive)", async () => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [{ id: "c1", body: "right as it went idle.", created: new Date(0).toISOString() }],
+    });
+    expect(await check.check("KAN-1", "idle")).toBe(false); // floor starts at now=0 — same instant as the comment
+    now = 10 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified — "at or after", inclusive
+  });
+
+  // BUTCHR-289 DoD 3 (recency, both directions in one scenario): mixes an
+  // old (pre-streak) report, daemon chatter mid-streak, and one genuine
+  // mid-streak human comment — proves the rule finds the ONE disqualifying
+  // row among several red herrings, not merely "any row present".
+  test("generalisation: an old report and daemon chatter are both ignored, but a genuine mid-streak comment among them still disqualifies", async () => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [
+        { id: "c3", body: "please hold off, I'm looking at this now.", created: new Date(6 * 60_000).toISOString() }, // mid-streak, genuine — SHOULD disqualify
+        { id: "c2", body: "[butchr:reconcile] KAN-1's reconcile has failed once.", created: new Date(4 * 60_000).toISOString() }, // mid-streak but chatter — ignored
+        { id: "c1", body: "[KAN-1] done, going idle.", created: new Date(0).toISOString() }, // pre-streak — ignored
+      ],
+    });
+    await check.check("KAN-1", "idle"); // floor starts at now=0
+    now = 10 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // c3 disqualifies
+  });
+
+  // BUTCHR-289: disqualification RE-ANCHORS every time the streak breaks and
+  // re-arms — temporary, not permanent. A comment that disqualified an OLD
+  // streak has no bearing on a NEW one once the agent has worked again; this
+  // is the same structural guarantee the epic later asked to be proven
+  // end-to-end in labels-sync.test.ts (the re-stall recurrence case), tested
+  // here at the check() level directly.
+  test("a comment that disqualified an old streak does not carry over to a new streak after the agent works again", async () => {
+    let now = 0;
+    const comments = [{ id: "c1", body: "[KAN-1] still on it.", created: new Date(0).toISOString() }];
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => comments,
+    });
+    await check.check("KAN-1", "idle"); // old streak floor at now=0
+    now = 10 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified by c1 (created at 0, streak also started at 0)
+
+    now = 20 * 60_000;
+    await check.check("KAN-1", "working"); // agent works again — old streak breaks
+    now = 25 * 60_000;
+    expect(await check.check("KAN-1", "idle")).toBe(false); // NEW streak floor at 25min, not yet 10min old
+    now = 35 * 60_000; // 10 min into the NEW streak — c1 (created at 0) is long before this streak's start (25min)
+    expect(await check.check("KAN-1", "idle")).toBe(true); // c1 no longer disqualifies — it belongs to the old streak
+  });
+
+  // BUTCHR-289 DoD 6: the decline path must say which comment disqualified
+  // it, logged once per disqualifying comment rather than every ~15s poll a
+  // still-disqualified ticket re-enters this branch.
+  test("a decline logs which comment disqualified it, once per comment — not once per poll", async () => {
+    let now = 0;
+    const logs: string[] = [];
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [{ id: "c1", body: "[KAN-1] still on it.", created: new Date(5 * 60_000).toISOString() }],
+      log: (l) => logs.push(l),
+    });
+    await check.check("KAN-1", "idle"); // floor at now=0
+    now = 10 * 60_000;
+    await check.check("KAN-1", "idle"); // examined and declined — logs once
+    now = 15 * 60_000;
+    await check.check("KAN-1", "idle"); // still declined by the SAME comment — must not log again
+    const declineLines = logs.filter((l) => l.includes("[stalled]") && l.includes("KAN-1") && l.includes("declined"));
+    expect(declineLines.length).toBe(1);
+    expect(declineLines[0]).toContain("c1");
   });
 
   // BUTCHR-279 FIRES case at the createStalledCheck level (one layer above
   // the bare tracker tested above): a worked-then-idle agent, idle/done
-  // continuously for the full window with zero daemon comments, resolves
-  // stalled=true — this is the defect this ticket fixes.
+  // continuously for the full window with zero comments at all, resolves
+  // stalled=true — the shape that was never broken, kept as a baseline.
   test("a post-work stall becomes stalled=true once idle/done has held for the full window since work stopped", async () => {
     let now = 0;
     const check = createStalledCheck({
       now: () => now,
       minutes: 10,
       comments: async () => [],
-      accountEmail: "daemon@example.com",
     });
     await check.check("KAN-1", "working");
     now = 60 * 60_000; // an hour later, first idle observation: floor starts here, not yet qualified
@@ -241,7 +369,6 @@ describe("createStalledCheck", () => {
       now: () => now,
       minutes: 10,
       comments: async () => [],
-      accountEmail: "daemon@example.com",
     });
     await check.check("KAN-1", "idle");
     now = 15 * 60_000; // would already qualify if left idle
@@ -262,7 +389,6 @@ describe("createStalledCheck", () => {
       now: () => now,
       minutes: 10,
       comments: async () => [],
-      accountEmail: "daemon@example.com",
     });
     const CYCLE_MS = 20 * 60_000;
     const DIP_MS = 5 * 60_000;
@@ -283,7 +409,6 @@ describe("createStalledCheck", () => {
       now: () => now,
       minutes: 10,
       comments: async () => [],
-      accountEmail: "daemon@example.com",
     });
     await check.check("KAN-1", "working");
     now = 5 * 60_000;
@@ -299,7 +424,6 @@ describe("createStalledCheck", () => {
       now: () => now,
       minutes: 10,
       comments: async () => { throw new Error("timeout"); },
-      accountEmail: "daemon@example.com",
       log: (l) => logs.push(l),
     });
     await check.check("KAN-1", "idle"); // establishes the floor at now=0
@@ -314,7 +438,6 @@ describe("createStalledCheck", () => {
       now: () => now,
       minutes: 10,
       comments: async () => [],
-      accountEmail: "daemon@example.com",
     });
     expect(check.elapsedMinutes?.("KAN-1")).toBe(null); // never observed yet
     await check.check("KAN-1", "idle");
