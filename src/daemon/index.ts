@@ -39,6 +39,7 @@ import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
+import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 
 let config;
 try {
@@ -162,6 +163,15 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+// BUTCHR-275: the project agent's own positive "I have checked in" exit
+// signal — see src/agents/check-in-exit.ts's own top comment for the full
+// mechanism and why it is a separate registry from frozenAsleepDetector
+// below rather than folded into it. One instance, shared between the
+// `check_in` tool handler (which declares) and the project loop's
+// `checkDeclaredDone` hook (which consumes) — declared here, ahead of both,
+// same "shared, not duplicated" discipline as `ownChannelComments` below.
+const checkInExit = createCheckInExitRegistry();
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -178,7 +188,7 @@ const { app, mcp } = buildApp({
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
+}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -536,6 +546,16 @@ runResourceLoop(projectResourceType, {
   // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
   // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
   checkFrozenAsleep: frozenAsleepDetector.check,
+  // BUTCHR-275: wired here only, same reasoning as checkFrozenAsleep just
+  // above — only the project tier ever produces a candidate (the issue tier
+  // never sleeps, so `check_in` doesn't exist for it and never declares
+  // anything here). See src/agents/check-in-exit.ts.
+  checkDeclaredDone: checkInExit.check,
+  // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
+  // see ReconcileOptions.invalidateDeclaredDone's own doc comment
+  // (src/daemon/loop.ts) and src/agents/check-in-exit.ts's "PER-EPISODE
+  // INVALIDATION" for the hazard this closes.
+  invalidateDeclaredDone: checkInExit.invalidateActive,
   // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
   // single-tier restriction, and the project tier is the slower loop where a
   // real crash loop still needs to reach the threshold well inside the
