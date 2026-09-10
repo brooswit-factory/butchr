@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ApiError } from "confluence.js/core";
-import { getDoc, setDoc, ensureDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc } from "../../src/tools/docs.js";
+import { getDoc, setDoc, ensureDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
@@ -472,6 +472,119 @@ describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Con
     const result = await setProjectDoc(ops, "KAN", "<p>x</p>", "new title");
     expect(result.title).toBe("new title");
     expect(pages.get("4")!.title).toBe("new title");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-250: refuse a doc write IFF it is BOTH over DOC_BODY_CHAR_BUDGET AND
+// larger than what's currently stored. Every arm below must be able to fail:
+// dropping the second clause (the anti-bricking escape) would turn the
+// "smaller than stored" arm into a false REFUSED; dropping the first clause
+// would turn the "under budget" arm into a false-ALLOWED-forever guard that
+// never fires at all. Project keys below are deliberately NOT "BUTCHR" — the
+// guard must not be, even accidentally, project-specific.
+// ---------------------------------------------------------------------------
+describe("docs.ts: doc-write size budget (BUTCHR-250) — refuse only a write that is BOTH over budget AND growing", () => {
+  function seedProjectRootDoc(
+    pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>,
+    setProjectProperty: (projectKey: string, value: unknown) => void,
+    projectKey: string,
+    pageId: string,
+    title: string,
+    body: string,
+  ) {
+    pages.set(pageId, { parentId: "", title, body, labels: [] });
+    setProjectProperty(projectKey, { space: { key: projectKey }, rootDoc: { id: pageId } });
+  }
+
+  test("under budget: always allowed, regardless of stored size", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9001", "ACME — product brief", "<p>small stored body</p>");
+    const proposed = "a".repeat(DOC_BODY_CHAR_BUDGET - 1);
+    await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
+    expect(pages.get("9001")!.body).toBe(proposed); // the write actually landed
+  });
+
+  test("over budget AND larger than stored: REFUSED, and the message names stored size, proposed size, budget, and the remedy", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    const stored = "a".repeat(100);
+    expect(stored.length).toBeLessThan(DOC_BODY_CHAR_BUDGET); // pin the fixture's floor, or this arm proves nothing
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9002", "ACME — product brief", stored);
+    const proposed = "b".repeat(DOC_BODY_CHAR_BUDGET + 1);
+
+    let caught: Error | undefined;
+    try {
+      await setProjectDoc(ops, "ACME", proposed);
+    } catch (e) {
+      caught = e as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toContain(String(stored.length)); // current stored size
+    expect(caught!.message).toContain(String(proposed.length)); // proposed size
+    expect(caught!.message).toContain(String(DOC_BODY_CHAR_BUDGET)); // the budget
+    expect(caught!.message).toMatch(/child page/); // the remedy
+    expect(pages.get("9002")!.body).toBe(stored); // the refused write never landed
+  });
+
+  test("over budget but SMALLER than stored: allowed — the anti-bricking arm, most likely to break under a later 'simplification'", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    const stored = "a".repeat(DOC_BODY_CHAR_BUDGET + 10_000);
+    expect(stored.length).toBeGreaterThan(DOC_BODY_CHAR_BUDGET); // pin: the fixture itself must be over budget
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9003", "ACME — product brief", stored);
+    const proposed = "b".repeat(DOC_BODY_CHAR_BUDGET + 5_000); // still over budget, but smaller than what's stored
+    expect(proposed.length).toBeGreaterThan(DOC_BODY_CHAR_BUDGET);
+    expect(proposed.length).toBeLessThan(stored.length);
+    await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
+    expect(pages.get("9003")!.body).toBe(proposed); // the shrink landed
+  });
+
+  test("over budget and EXACTLY EQUAL to stored: allowed — a same-size rewrite is not growth, decided and pinned deliberately", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    const stored = "a".repeat(DOC_BODY_CHAR_BUDGET + 2_000);
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9004", "ACME — product brief", stored);
+    const proposed = "b".repeat(stored.length); // same length, different content
+    await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
+    expect(pages.get("9004")!.body).toBe(proposed);
+  });
+
+  test("the boundary itself: exactly at budget is allowed; one character over (against a small stored body) is refused", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9005", "ACME — product brief", "<p>tiny</p>");
+
+    const atBudget = "a".repeat(DOC_BODY_CHAR_BUDGET);
+    await expect(setProjectDoc(ops, "ACME", atBudget)).resolves.toBeDefined();
+    expect(pages.get("9005")!.body).toBe(atBudget);
+
+    const overByOne = "a".repeat(DOC_BODY_CHAR_BUDGET + 1);
+    await expect(setProjectDoc(ops, "ACME", overByOne)).rejects.toThrow();
+    expect(pages.get("9005")!.body).toBe(atBudget); // refused write never landed
+  });
+
+  test("NOT accidentally project-specific: the guard refuses/allows identically for project keys that are not BUTCHR", async () => {
+    for (const projectKey of ["ACME", "ZORP"]) {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      seedProjectRootDoc(pages, setProjectProperty, projectKey, "1", `${projectKey} — product brief`, "<p>small</p>");
+      await expect(setProjectDoc(ops, projectKey, "a".repeat(DOC_BODY_CHAR_BUDGET + 1))).rejects.toThrow(/refusing this write/);
+      await expect(setProjectDoc(ops, projectKey, "a".repeat(DOC_BODY_CHAR_BUDGET - 1))).resolves.toBeDefined();
+      expect(pages.get("1")!.body).toBe("a".repeat(DOC_BODY_CHAR_BUDGET - 1)); // the allowed one landed, the refused one didn't
+    }
+  });
+
+  test("setDoc (the per-ticket write path) carries the SAME guard — BUTCHR-250's own scope decision: a growing per-ticket doc is a smaller problem than the shared root doc, but not a non-problem", async () => {
+    const { ops, addIssue, issues, pages } = makeWorld();
+    addIssue("BUTCHR-90", "a task with an oversized doc already");
+    const stored = "a".repeat(DOC_BODY_CHAR_BUDGET + 1_000);
+    expect(stored.length).toBeGreaterThan(DOC_BODY_CHAR_BUDGET); // pin: fixture must genuinely be over budget
+    pages.set("900", { parentId: ROOT_DOC_ID, title: "A real title", body: stored, labels: [labelForKey("BUTCHR-90")] });
+    issues.get("BUTCHR-90")!.remoteLink = { title: "A real title", url: "https://fake.atlassian.net/wiki/pages/900" };
+
+    // growing an already-oversized ticket doc: refused
+    await expect(setDoc(ops, "BUTCHR-90", "b".repeat(stored.length + 1))).rejects.toThrow(/refusing this write/);
+    expect(pages.get("900")!.body).toBe(stored); // refused write never landed
+    // shrinking it: allowed
+    const shrunk = "b".repeat(DOC_BODY_CHAR_BUDGET - 1);
+    await expect(setDoc(ops, "BUTCHR-90", shrunk)).resolves.toBeDefined();
+    expect(pages.get("900")!.body).toBe(shrunk);
   });
 });
 

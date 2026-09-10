@@ -14,6 +14,68 @@ const MAX_TITLE_LEN = 200;
 // and any real boss chain in this fleet is a handful of hops (task -> story -> epic).
 const MAX_BOSS_DEPTH = 20;
 
+/**
+ * Character budget for a doc's full body on the WRITE path (BUTCHR-250).
+ * "Characters" here means `.length` — JS UTF-16 code units, matching the
+ * unit the MCP harness cap itself compares against (docs/tool-result-size-cap.md
+ * Q2: the harness reports "N characters" and N is a codepoint/UTF-16-unit
+ * count, not a UTF-8 byte count — the two diverge measurably in this corpus'
+ * em-dash-heavy prose, so do not swap this for `Buffer.byteLength`).
+ *
+ * METHOD, not a present-tense fact: this must sit BELOW the low end of the
+ * measured PREVIEW-to-ERROR boundary for the MCP result cap — the (56,239,
+ * 61,376] character bracket docs/tool-result-size-cap.md's Q2 cites from
+ * BUTCHR-216's controlled experiment — with margin for three things that are
+ * not constants, so re-derive them rather than trusting this comment:
+ *   (1) the cap bounds the WHOLE MCP result (JSON envelope + HTML escaping
+ *       around the body), not the body alone, and that envelope is NOT a
+ *       fixed subtraction — read back live on the BUTCHR root doc, it
+ *       measured ~289 characters on 2026-09-02 and ~303 on 2026-09-10 (the
+ *       same page), i.e. it grows with the body's own escaping;
+ *   (2) the 56,239-61,376 bracket comes from one experiment of undetermined
+ *       precision, not a spec;
+ *   (3) a body sitting exactly at the boundary is one comment away from
+ *       crossing it.
+ * 50,000 leaves >6,000 characters (>10%) of margin over all three combined.
+ * Re-measure the bracket (docs/tool-result-size-cap.md) before trusting this
+ * is still conservative enough — it is a snapshot, not a proof.
+ */
+export const DOC_BODY_CHAR_BUDGET = 50_000;
+
+/**
+ * Refuses a doc write IFF it would both exceed `budget` AND grow the page
+ * (`proposed.length > stored.length`) — BUTCHR-250's anti-bricking design.
+ * `stored` MUST be read from the page BEFORE the write being adjudicated: a
+ * post-write measurement can't do this job, because the anti-bricking clause
+ * needs "what's on the page right now", not "what this write would produce".
+ * Both `setProjectDoc` and `setDoc` already do that pre-write read (via
+ * `projectRootDoc`/`ensureDoc`) to resolve the page id, so this reuses it —
+ * no second fetch.
+ *
+ * Deliberately allows `proposed === stored` (equal size is not growth — a
+ * same-size rewrite is a correction, not an expansion) and `proposed ===
+ * budget` (the budget line itself is not "over" it). Both edge cases are
+ * pinned by the boundary test arms in test/unit/docs.test.ts, so a later
+ * edit that flips either `>` to `>=` fails loudly rather than silently.
+ *
+ * A SIZE comparison, not a content one — this never inspects what changed,
+ * only how large the two bodies are, so it is not exposed to the
+ * entity-encoding residual docs/tool-result-size-cap.md's sibling ticket
+ * (BUTCHR-235) flags for content comparisons on this surface.
+ */
+function refuseIfGrowingOverBudget(who: string, stored: string, proposed: string, budget: number): void {
+  const storedLen = stored.length;
+  const proposedLen = proposed.length;
+  if (proposedLen > budget && proposedLen > storedLen) {
+    throw new Error(
+      `${who}: refusing this write — proposed body is ${proposedLen} characters, over the ${budget}-character budget ` +
+        `and larger than what's currently stored (${storedLen} characters). This would grow an already-oversized page. ` +
+        `Move the excess into a child page linked from this doc's index, then retry with a body no larger than what's ` +
+        `stored now — an over-budget page can always be corrected or shrunk, it just cannot be grown further.`,
+    );
+  }
+}
+
 /** `[A-Z][A-Z0-9_]*-[0-9]+` — any valid Jira key. The lowercase round-trip (KEY -> label -> KEY) is lossless only for keys shaped like this. */
 export const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]*-[0-9]+$/;
 
@@ -244,6 +306,7 @@ export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Prom
  */
 export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<DocResult> {
   const doc = await projectRootDoc(ops, projectKey);
+  refuseIfGrowingOverBudget(`setProjectDoc(${projectKey})`, doc.body, body, DOC_BODY_CHAR_BUDGET);
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
   return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
 }
@@ -441,6 +504,7 @@ export async function setDoc(ops: AtlassianOps, key: string, body: string, title
   if (isProvisional(doc.title) && !title) {
     throw new Error(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
   }
+  refuseIfGrowingOverBudget(`setDoc(${key})`, doc.body, body, DOC_BODY_CHAR_BUDGET);
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
   const finalTitle = title ?? doc.title;
   if (title && title !== doc.title) {
