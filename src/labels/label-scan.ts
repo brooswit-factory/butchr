@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import * as ts from "typescript";
+import type { BlindSpotEntry } from "../media/blind-spot.js";
 
 /**
  * BUTCHR-133/BUTCHR-143 — the source-scanning door. See ./registry.ts's
@@ -37,41 +38,15 @@ import * as ts from "typescript";
  * using a real parser instead of a regex, which still holds for any future
  * JQL (or other) string that embeds a label-shaped substring.
  *
- * WHAT THIS CANNOT SEE (write this down; a scanner with a silent bypass is
- * the exact failure this whole rule exists to catch):
- *   - A label built by concatenation or interpolation whose PARTS are
- *     literals but whose WHOLE is not (e.g. `AGENT_PREFIX + label`,
- *     `` `${PR_PREFIX}${state}` ``) — this is where `agent:*` and `pr:*` are
- *     actually EMITTED (`./sync.ts`'s AGENT_PREFIX-plus-suffix and
- *     PR_PREFIX-plus-prState concatenations), and neither is a literal this
- *     scanner can parse. AC-9(a): a scan of this repo's `src/` today DOES
- *     find all nine daemon-owned label values as literal text — every one of
- *     them, as a string key of `LABEL_REGISTRY` in ./registry.ts. That is NOT
- *     this scanner confirming the emission sites above; it is the registry
- *     agreeing with itself, one file finding its own declarations. The real
- *     coverage for these nine comes ENTIRELY from ./registry.ts's TYPE-level
- *     door (`AgentLabelKey`/`PrLabelKey`, derived from `AgentLabel`/`PrState`
- *     themselves) — never from this scanner, clean run or not. Do not read a
- *     clean run of this scanner as evidence the agent:/pr: families are
- *     covered; it sees them, but only circularly, in the file that declares
- *     them, never at the sites that actually emit them.
- *   - `test/` and `scripts/`. Only `src/` is scanned. Labels are runtime
- *     state written by `src/`'s own code; `test/` fixtures use label
- *     literals freely by design (see e.g. test/unit/relationship.test.ts),
- *     and `scripts/` is operator tooling, not the write path. Scanning those
- *     directories too would either false-positive on every fixture or
- *     require a second exclusion list just as large as the trap list below.
- *   - Anything that is a real Jira-label-shaped literal STRING but is not
- *     actually used as a Jira label (an ID, a marker, a JQL fragment). Two
- *     confirmed examples are hardcoded in `KNOWN_NON_LABEL_LITERALS` below,
- *     each with why. A new one must be added there explicitly, by name, with
- *     a reason — NEVER by weakening the pattern or skipping a whole file,
- *     and never to make a real finding disappear (see ./registry.ts's
- *     header and BUTCHR-143's own ticket: using this list to launder a label
- *     whose withdrawal path someone forgot to write is the one outcome this
- *     mechanism must never produce).
- *   - Non-`.ts` files, and anything generated (this repo has none checked in
- *     under `src/` today; if that changes, re-examine this assumption).
+ * WHAT THIS CANNOT SEE: see `LABEL_BLIND_SPOTS` below — the enumerable
+ * source of truth (BUTCHR-224), each entry with either an executable witness
+ * (a test that constructs the claimed-invisible input, confirms silence,
+ * and pairs it with a near-miss variant that IS detected) or a written
+ * `noWitnessReason`. This comment stops enumerating the claims in prose, on
+ * purpose: a second, independently-driftable copy of the same list is
+ * exactly the drift BUTCHR-224 exists to remove. The substantive reasoning
+ * for each claim — including AC-9(a), the circularity warning for the
+ * agent:/pr: families — now lives in that entry's own `claim` field.
  */
 
 const LABEL_LITERAL_RE = /^(?:agent|pr|butchr):[a-z0-9][a-z0-9-]*$/;
@@ -192,3 +167,39 @@ export function scanDirForLabelLiterals(srcDir: string, repoRoot: string): Label
   }
   return hits;
 }
+
+/**
+ * BUTCHR-224. Every blind spot this scanner's own module header (above) used
+ * to enumerate in prose, now an enumerable value with a type-level door
+ * (`Record` keyed by a closed union fails to compile in both directions),
+ * the same door `WORKSPACE_PLACEHOLDERS`/`MEDIA_REGISTRY` already use for
+ * their own families. See `test/unit/labels-registry.test.ts` for the
+ * witness or the `noWitnessReason` this drives for each entry below, and
+ * `src/media/blind-spot.ts` for what those mean and the runtime link that
+ * makes a declared-but-unwritten witness fail the suite.
+ */
+export const LABEL_BLIND_SPOT_IDS = ["concatenationAndInterpolation", "unscannedDirectories", "nonLabelLookalike", "nonTsFiles"] as const;
+export type LabelBlindSpotId = (typeof LABEL_BLIND_SPOT_IDS)[number];
+
+export const LABEL_BLIND_SPOTS: Readonly<Record<LabelBlindSpotId, BlindSpotEntry>> = {
+  concatenationAndInterpolation: {
+    claim:
+      "A label built by concatenation or interpolation whose PARTS are literals but whose WHOLE is not (e.g. `AGENT_PREFIX + label`, `` `${PR_PREFIX}${state}` ``) — this is where `agent:*` and `pr:*` are actually EMITTED (`./sync.ts`'s AGENT_PREFIX-plus-suffix and PR_PREFIX-plus-prState concatenations), and neither is a literal this scanner can parse. AC-9(a), LOAD-BEARING, DO NOT MISREAD A CLEAN SCAN: a scan of this repo's `src/` today DOES find all nine daemon-owned label values as literal text — every one of them, as a string key of `LABEL_REGISTRY` in `./registry.ts`. That is NOT this scanner confirming the emission sites above; it is the registry agreeing with itself, one file finding its own declarations. The real coverage for these nine comes ENTIRELY from `./registry.ts`'s TYPE-level door (`AgentLabelKey`/`PrLabelKey`, derived from `AgentLabel`/`PrState` themselves) — never from this scanner, clean run or not.",
+    witness: "label:concatenation-and-interpolation",
+  },
+  unscannedDirectories: {
+    claim:
+      "`test/` and `scripts/` are not scanned — only `src/` is, because `scanDirForLabelLiterals` is always called with `srcDir` fixed to the repo's `src/` directory (see `test/unit/labels-registry.test.ts`'s own call). Labels are runtime state written by `src/`'s own code; `test/` fixtures use label literals freely by design (see e.g. `test/unit/relationship.test.ts`), and `scripts/` is operator tooling, not the write path. Scanning those directories too would either false-positive on every fixture or require a second exclusion list just as large as `KNOWN_NON_LABEL_LITERALS`.",
+    witness: "label:unscanned-directories",
+  },
+  nonLabelLookalike: {
+    claim:
+      "Anything that is a real Jira-label-shaped literal STRING but is not actually used as a Jira label (an ID, a marker, a JQL fragment). This scanner cannot tell such a literal apart from a real label by shape alone. Two confirmed examples are hardcoded in `KNOWN_NON_LABEL_LITERALS` above, each with why. A new one must be added there explicitly, by name, with a reason — NEVER by weakening `LABEL_LITERAL_RE` or skipping a whole file, and never to make a real finding disappear (see `./registry.ts`'s header and BUTCHR-143's own ticket: using this list to launder a label whose withdrawal path someone forgot to write is the one outcome this mechanism must never produce).",
+    witness: "label:non-label-lookalike",
+  },
+  nonTsFiles: {
+    claim:
+      "Non-`.ts` files, and anything generated (this repo has none checked in under `src/` today; if that changes, re-examine this assumption) — `listTsFiles` only collects names ending `.ts` (and excludes `.d.ts`), so an identical label-shaped literal sitting in, say, a `.md` or `.json` file under `src/` is never even read.",
+    witness: "label:non-ts-files",
+  },
+};
