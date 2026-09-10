@@ -86,15 +86,26 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
 });
 
 /**
- * BUTCHR-254 — MEDIA_SCAN_BLIND_SPOTS. Unlike the other detectors converted
- * under this epic, this one entry is `witness: null` with a written
- * `noWitnessReason` — see that entry's own reason, and this file's own
- * module header, for why. No `test()` here calls `witnessBlindSpot`;
- * `assertBlindSpotCoverage` still runs, because it must, for every list this
- * mechanism is applied to (see src/media/blind-spot.ts, "THE ORDERING
- * HAZARD") — it passes trivially here since `assertBlindSpotCoverage` only
- * ever demands execution for entries that declare a witness id, and this
- * list declares none.
+ * BUTCHR-254 — MEDIA_SCAN_BLIND_SPOTS, SPLIT INTO TWO ENTRIES UNDER
+ * BUTCHR-223 AFTER REVIEW. One entry is witnessed below; the other is
+ * `witness: null` with a written `noWitnessReason` — see each entry's own
+ * fields in `src/media/media-scan.ts`, and that file's module header, for
+ * why the split was necessary rather than cosmetic.
+ *
+ * THIS COMMENT USED TO SAY "no `test()` here calls `witnessBlindSpot`" and
+ * that `assertBlindSpotCoverage` "passes trivially here since this list
+ * declares none". Both were true when written and both are now FALSE. It is
+ * left named rather than silently rewritten because it is this epic's own
+ * defect — a cached description outliving the thing it described — occurring
+ * in this epic's own test file, and because nothing in the mechanism would
+ * ever have caught it: `assertBlindSpotCoverage` grades entries, never the
+ * prose around them.
+ *
+ * `assertBlindSpotCoverage` still runs at the bottom of this describe block,
+ * because it must, for every list this mechanism is applied to (see
+ * src/media/blind-spot.ts, "THE ORDERING HAZARD"). It is no longer vacuous:
+ * one entry declares a witness id, so deleting the witness below turns the
+ * coverage call red instead of leaving it green.
  */
 describe("MEDIA_SCAN_BLIND_SPOTS (BUTCHR-254, split under BUTCHR-223)", () => {
   /**
