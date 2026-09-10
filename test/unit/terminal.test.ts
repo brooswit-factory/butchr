@@ -63,10 +63,18 @@ describe("attachRefusalMessage (BUTCHR-267 — the browser's whole reporting sur
     expect(msg).toContain("w1:p3");
     expect(msg).toContain("not one of this daemon's own running agents");
   });
-  test("no-display names the env vars it checked", () => {
+  test("no-display names the env vars it checked, is scoped to what was actually measured, and says what fixes it", () => {
+    // BUTCHR-267 [correction]: on at least one real daemon this is not a rare
+    // branch, it is the ONLY branch that ever runs — so the wording must not
+    // over-claim ("a terminal window cannot be opened here", a flat claim
+    // about the host) beyond what two unset env vars in this process prove,
+    // and it must be actionable (name the fix) rather than leave a reader stuck.
     const msg = attachRefusalMessage({ reason: "no-display" });
     expect(msg).toContain("DISPLAY");
     expect(msg).toContain("WAYLAND_DISPLAY");
+    expect(msg).toContain("own process");
+    expect(msg).not.toMatch(/cannot be opened here/);
+    expect(msg.toLowerCase()).toContain("systemd unit");
   });
   test("no-terminal names the override an operator can set", () => {
     const msg = attachRefusalMessage({ reason: "no-terminal" });

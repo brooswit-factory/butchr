@@ -21,13 +21,18 @@ const healthy = {
     { name: "notify", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 },
   ],
 };
-// BUTCHR-267: `openPane` fixture exercises the three outcomes the pane-keyed
-// attach route (criterion 8) must be able to reach — "w1:p3" (a colon-bearing
-// pane, per criterion 1) succeeds; "KAN-NO-TERM:p1" simulates no terminal
-// emulator configured; anything else is an unknown/not-live pane.
+// BUTCHR-267: `openPane` fixture exercises the four outcomes the pane-keyed
+// attach route (criterion 8, amended) must be able to reach — "w1:p3" (a
+// colon-bearing pane, per criterion 1) succeeds; "KAN-NO-TERM:p1" simulates
+// no terminal emulator configured; "KAN-NO-DISPLAY:p1" simulates the daemon
+// having no display to reach (per the ticket's [correction]: on at least one
+// real daemon this is the ONLY branch that ever runs, not a rare edge case,
+// so it gets its own end-to-end test rather than only unit coverage on
+// `resolveAttach`); anything else is an unknown/not-live pane.
 const openPane = async (pane: string) => {
   openedPanes.push(pane);
   if (pane === "KAN-NO-TERM:p1") return { ok: false, error: "no terminal emulator found on this host (set BUTCHR_TERMINAL, e.g. \"alacritty -e\")" };
+  if (pane === "KAN-NO-DISPLAY:p1") return { ok: false, error: "this daemon's own process has neither DISPLAY nor WAYLAND_DISPLAY set, so it cannot launch a terminal window itself — if this host does have a display, set DISPLAY (or WAYLAND_DISPLAY) in the daemon's own environment (e.g. its systemd unit) and restart it" };
   if (pane !== "w1:p3") return { ok: false, error: `no such live pane: ${pane} (not one of this daemon's own running agents)` };
   return { ok: true };
 };
@@ -132,6 +137,23 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
     expect(body).toContain("no terminal emulator found");
     expect(body).toContain("BUTCHR_TERMINAL");
     expect(body).not.toContain("no such live pane");
+  });
+  // BUTCHR-267 [correction]: on at least one real daemon this is the ONLY
+  // branch that ever runs (no DISPLAY/WAYLAND_DISPLAY in the daemon's own
+  // process, while a terminal emulator IS on PATH) — not an exotic edge case,
+  // so it needs the same end-to-end coverage as the other two refusals, and
+  // its wording must be scoped to what was measured (this process's env) and
+  // actionable, not a flat unscoped claim about the host.
+  test("no display to reach is refused with ITS OWN specific, scoped, actionable reason", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("KAN-NO-DISPLAY:p1")}/attach`);
+    expect(r.status).toBe(409);
+    const body = await r.text();
+    expect(body).toContain("DISPLAY");
+    expect(body).toContain("WAYLAND_DISPLAY");
+    expect(body).toContain("own process");
+    expect(body.toLowerCase()).toContain("systemd unit");
+    expect(body).not.toContain("no such live pane");
+    expect(body).not.toContain("no terminal emulator found");
   });
 });
 

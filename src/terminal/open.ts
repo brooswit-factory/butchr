@@ -44,7 +44,7 @@ export function attachRefusalMessage(r: AttachRefusal): string {
     case "unknown-pane":
       return `no such live pane: ${r.pane} (not one of this daemon's own running agents)`;
     case "no-display":
-      return "this daemon has no display to reach (neither DISPLAY nor WAYLAND_DISPLAY is set) — a terminal window cannot be opened here";
+      return "this daemon's own process has neither DISPLAY nor WAYLAND_DISPLAY set, so it cannot launch a terminal window itself — if this host does have a display, set DISPLAY (or WAYLAND_DISPLAY) in the daemon's own environment (e.g. its systemd unit) and restart it";
     case "no-terminal":
       return "no terminal emulator found on this host (set BUTCHR_TERMINAL, e.g. \"alacritty -e\")";
   }
