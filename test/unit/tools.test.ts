@@ -1367,11 +1367,14 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
     expect(result).toEqual({ found: true, id: "1", url: expect.any(String), title: "BUTCHR — product brief", body: "<p>hi</p>" });
   });
 
-  test("set_doc() replaces the PROJECT's root doc, title optional", async () => {
+  test("set_doc() replaces the PROJECT's root doc, title optional, and returns a bounded receipt — never the body (BUTCHR-236)", async () => {
     const { tools, conn } = projectRig();
     const result = await tools.set_doc!.handler({ body: "<p>new</p>" }, conn);
     expect((result as any).id).toBe("1");
-    expect((result as any).body).toBe("<p>new</p>");
+    expect((result as any).body).toBeUndefined(); // the old echo is gone — pinning the defect this replaces
+    expect((result as any).landed).toBe("confirmed"); // this rig's getPage always resolves with a body
+    expect(typeof (result as any).wrote.chars).toBe("number");
+    expect((result as any).wrote.chars).toBe("<p>new</p>".length);
   });
 
   test("new_worker creates an EPIC, member of BUTCHR, no implements field, staffed by roles.epic", async () => {
