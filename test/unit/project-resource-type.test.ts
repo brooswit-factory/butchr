@@ -11,6 +11,7 @@ import {
   type ProjectResource,
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
+import { setProjectDoc } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
@@ -328,6 +329,116 @@ describe("advanceProjectWatermark — the monotonic guard (BUTCHR-214/226, defec
     });
     await advanceProjectWatermark(okOps, "ACME", { comment: "300" });
     expect((w.properties.get("ACME")!.wake as any).comment).toBe("300"); // floor was "100" (reconciled), not "500" (stale persisted)
+  });
+
+  // BUTCHR-214/226 review round 2, non-blocking item: the sticky flag
+  // (`!!patch.reconcile || !!priorPending?.reconcile`) is untested — the
+  // review confirmed reverting it to `!!patch.reconcile` alone fails
+  // nothing today, since it only matters after TWO CONSECUTIVE failed
+  // writes. Closed here rather than left silent.
+  //
+  // Failure condition: this test must fail if the sticky OR is narrowed
+  // back to `!!patch.reconcile` — verified by making that exact mutation.
+  test("the sticky reconcile flag: once a pending entry is authoritative, a LATER failed SUPPRESSION write does not downgrade it back to non-authoritative", async () => {
+    const w = watermarkWorld({ version: 1, comment: "500", epics: {} }, { failWrite: true });
+    // First failure: a reconciling write (check_in-shaped) — pending becomes {comment:"100", reconcile:true}.
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "100", reconcile: true }).catch(() => {});
+    // Second failure: a plain SUPPRESSION write (no `reconcile`) — if the
+    // sticky OR were narrowed to `!!patch.reconcile` alone, this write
+    // would overwrite pending with `{comment: "150", reconcile: false}`,
+    // losing the earlier authoritative (possibly-lower) truth.
+    await advanceProjectWatermark(w.ops, "ACME", { comment: "150" }).catch(() => {});
+
+    // A later write succeeds. If the pending fallback correctly stayed
+    // authoritative (sticky), its floor is "150" (monotonically raised from
+    // the authoritative "100" by the second failed write, still read back
+    // DIRECTLY rather than `monotonicMax`ed against the stale persisted
+    // "500"), and "300" advances past it. If the flag had been wrongly
+    // downgraded, the floor would instead be `monotonicMax(500, 150)` =
+    // "500" (the stale, never-reconciled persisted value), and "300"
+    // (< 500) would be refused.
+    const okOps = unimplementedProjectOps({
+      getProjectPropertyOrNull: async (key: string) => w.properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        w.properties.set(key, value as Record<string, unknown>);
+        w.persistedWrites.push(value);
+        return { ok: true };
+      },
+    });
+    await advanceProjectWatermark(okOps, "ACME", { comment: "300" });
+    expect((w.properties.get("ACME")!.wake as any).comment).toBe("300");
+  });
+});
+
+// BUTCHR-214/226 review round 3: `setProjectDoc`'s identity-of-write is also
+// unpinned — converting it to a read-back-after-write (call `ops.updatePage`,
+// then separately call `ops.getPageVersions` to fetch "the current version",
+// then watermark THAT) passes every test written before this describe block.
+// This matters in production: an operator's emergency wake mechanism IS a
+// root-doc page-version bump (used in anger on a real incident, relayed
+// third-hand — re-derive before citing elsewhere), because the comment axis
+// can silently fail to notice a real comment (non-monotonic ids). A
+// read-back implementation would, if a FOREIGN version bump races into the
+// gap between `setProjectDoc`'s own write and a separate read-back read,
+// watermark the FOREIGN version as if it were the agent's own write —
+// silently swallowing exactly that operator emergency channel.
+describe("setProjectDoc's identity-of-write (BUTCHR-214/226 review round 3): the watermarked version must be what THIS write produced, never read back afterward", () => {
+  function docWorld() {
+    let pageVersion = 5;
+    const properties = new Map<string, Record<string, unknown>>([
+      ["ACME", { space: { key: "ACME" }, rootDoc: { id: "doc-A" }, wake: { version: 5, comment: null, epics: {} } }],
+    ]);
+    let getPageVersionsCalls = 0;
+    const ops = unimplementedProjectOps({
+      getPage: async (id: string) => ({ title: "root", body: { storage: { value: "<p>x</p>" } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } }),
+      getProjectProperty: async (key: string) => properties.get(key),
+      getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        properties.set(key, value as Record<string, unknown>);
+        return { ok: true };
+      },
+      updatePage: async (_p) => {
+        const produced = pageVersion + 1;
+        pageVersion = produced;
+        // Simulates a FOREIGN write racing into the page immediately after
+        // THIS write's own PUT lands, before any separate read-back could
+        // observe it — the exact gap identity-of-write closes by never
+        // taking a separate read at all.
+        pageVersion = pageVersion + 1;
+        return { version: produced };
+      },
+      getPageVersions: async (ids: readonly string[]) => {
+        getPageVersionsCalls++;
+        const out: Record<string, number> = {};
+        for (const id of ids) out[id] = pageVersion;
+        return out;
+      },
+    });
+    return { ops, properties, getPageVersionsCallCount: () => getPageVersionsCalls, currentPageVersion: () => pageVersion };
+  }
+
+  // Failure condition: this must fail if `setProjectDoc` is changed to call
+  // `ops.getPageVersions` for its own watermark value instead of using what
+  // `ops.updatePage` returned — verified by making that exact mutation.
+  test("watermarks the version ITS OWN write produced, not the foreign bump that raced in immediately after — and never calls getPageVersions at all", async () => {
+    const w = docWorld();
+    await setProjectDoc(w.ops, "ACME", "<p>updated</p>");
+    expect((w.properties.get("ACME")!.wake as any).version).toBe(6); // what setProjectDoc's OWN write produced
+    expect(w.currentPageVersion()).toBe(7); // the foreign bump DID land
+    expect(w.getPageVersionsCallCount()).toBe(0); // identity-of-write needs no separate read at all
+
+    // Driven through the real predicate: the foreign bump must still show
+    // as unresolved — not silently swallowed by the agent's own write
+    // racing past it. Comment axis left fully caught up (null observed,
+    // matching the watermark's own null comment) so only the version axis
+    // is under test here.
+    const wake = w.properties.get("ACME")!.wake as { version: number | null; comment: string | null; epics: Record<string, string | null> };
+    const resource = project({
+      watermark: wake,
+      observedVersion: w.currentPageVersion(),
+      observedCommentId: wake.comment,
+    });
+    expect(projectVerdict(resource)).toBe("active");
   });
 });
 

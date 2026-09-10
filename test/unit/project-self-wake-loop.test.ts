@@ -10,6 +10,7 @@ import {
 import { speakOnOwnChannel } from "../../src/tools/speak.js";
 import { setProjectDoc } from "../../src/tools/docs.js";
 import { desiredFrom } from "../../src/daemon/loop.js";
+import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 // BUTCHR-226: `pendingWatermarkFallback` (src/resources/project.ts) is
@@ -432,6 +433,55 @@ describe("BUTCHR-226 REVIEW ROUND 1 — deletion recovery: a reconciling write (
 
     const { resource } = await verdictOf(w.deps, "ACME");
     expect(resource.watermark.comment).toBe("100"); // NOT lowered to "50" — the guard held
+  });
+
+  // BUTCHR-226 review round 2's own finding: the two tests above drive
+  // `advanceProjectWatermark(..., { reconcile: true })` DIRECTLY — accurate
+  // to what `check_in` sends only because a human (this comment, until now)
+  // keeps it accurate, exactly the coupling a test exists to remove. They
+  // proved the deletion scenario end-to-end through the PREDICATE
+  // (`desiredFrom`/`projectVerdict`/`loadProjects`), but not through the
+  // CALLER — so a regression that stops `check_in` from passing
+  // `reconcile: true` at all would pass every other test in this file.
+  // CONFIRMED: deleting `reconcile: true` from check_in's call site
+  // (src/tools/defs.ts) and running the full suite passed all 1842
+  // pre-existing tests before this one existed.
+  //
+  // Failure condition: this test must fail if `check_in`'s own call site
+  // stops passing `reconcile: true` — verified by making that exact
+  // mutation and confirming this test (and only the mutation-relevant
+  // tests) fails, then reverting.
+  test("check_in, driven through the REAL tool-surface handler (atlassianTools(...), not a direct advanceProjectWatermark call), reconciles a deleted top comment and reaches asleep — traced through desiredFrom", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialPageVersion: 1,
+      initialComments: [{ id: "500", body: "<p>will be deleted</p>" }, { id: "100", body: "<p>survives</p>" }],
+      initialWake: { version: 1, comment: "500", epics: {} },
+    });
+    // check_in's real handler also calls `ops.search` for epics currently
+    // In Review (src/tools/defs.ts) — `world()`'s own fake leaves this
+    // `unimplemented`, since no other test in this file exercises the real
+    // check_in handler; none are in review here.
+    w.ops.search = async () => ({ issues: [] });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the deletion
+
+    const idx = w.pageComments.findIndex((c) => c.id === "500");
+    w.pageComments.splice(idx, 1);
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: deletion reproduces the wake
+
+    // The REAL tool surface, the same handler an agent's MCP call actually
+    // reaches — not a reimplementation of check_in's shape.
+    const tools = atlassianTools(w.ops, () => {});
+    await tools.check_in!.handler({}, { headers: { "x-issue": "ACME" } } as any);
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.watermark.comment).toBe("100"); // check_in's own write lowered it
+    expect(verdict).toBe("asleep");
+
+    const resourceType = createProjectResourceType(w.deps);
+    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
+    expect(desired.has("ACME")).toBe(false);
   });
 });
 
