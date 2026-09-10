@@ -174,6 +174,18 @@ export function atlassianTools(
    * `agent:*` label (see `checkWorker`'s own doc comment in relationship.ts).
    */
   isStaffed?: (key: string) => Promise<boolean | null>,
+  /**
+   * BUTCHR-275: `check_in`'s own exit signal — called from that handler
+   * below, strictly AFTER `advanceProjectWatermark` resolves without
+   * throwing (never before, never speculatively), so the daemon-side
+   * registry (src/agents/check-in-exit.ts) can never unprotect an id whose
+   * watermark write has not already landed. Optional — every existing
+   * caller of `atlassianTools` keeps working unchanged; when omitted,
+   * `check_in` still advances the watermark exactly as before, it just
+   * declares nothing, so the project falls back to today's behaviour
+   * (reaped by `checkFrozenAsleep`, not exited promptly).
+   */
+  declareCheckInDone?: (key: string) => void,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -465,7 +477,8 @@ export function atlassianTools(
     },
     set_doc: {
       description:
-        'FULL-BODY REPLACE of the CALLER\'S OWN doc. READ THIS FIRST: this is REPLACE, not APPEND — an agent that treats `set_doc` as "append" destroys its own page on the very first call. Call get_doc() first, edit the body you got back, then write the whole thing. There is NO KEY PARAMETER AT ALL: this can only ever write the caller\'s own doc, identified by `x-issue` — overwriting another ticket\'s doc is not expressible by getting an argument wrong. For an ISSUE caller: ensures the doc exists first (creating it lazily, nested under the boss\'s doc, or the project root doc when there is no boss) then writes; `title` is REQUIRED while the doc still carries the "[unwritten]" provisional marker, optional afterward. For a PROJECT caller (BUTCHR-71): this is the project\'s ROOT DOC — its living brief and catalogue — NEVER created here (a root doc always already exists; a missing one is a refusal, not a creation), and `title` is ALWAYS optional (a root doc has a real title from the start, so there is no provisional state to graduate out of). THIS IS THE MOST DESTRUCTIVE SINGLE CALL A PROJECT CALLER CAN MAKE — it replaces the product\'s entire living brief in one write; call get_doc() first, always.',
+        'FULL-BODY REPLACE of the CALLER\'S OWN doc. READ THIS FIRST: this is REPLACE, not APPEND — an agent that treats `set_doc` as "append" destroys its own page on the very first call. Call get_doc() first, edit the body you got back, then write the whole thing. There is NO KEY PARAMETER AT ALL: this can only ever write the caller\'s own doc, identified by `x-issue` — overwriting another ticket\'s doc is not expressible by getting an argument wrong. For an ISSUE caller: ensures the doc exists first (creating it lazily, nested under the boss\'s doc, or the project root doc when there is no boss) then writes; `title` is REQUIRED while the doc still carries the "[unwritten]" provisional marker, optional afterward. For a PROJECT caller (BUTCHR-71): this is the project\'s ROOT DOC — its living brief and catalogue — NEVER created here (a root doc always already exists; a missing one is a refusal, not a creation), and `title` is ALWAYS optional (a root doc has a real title from the start, so there is no provisional state to graduate out of). THIS IS THE MOST DESTRUCTIVE SINGLE CALL A PROJECT CALLER CAN MAKE — it replaces the product\'s entire living brief in one write; call get_doc() first, always. ' +
+        'THE RESULT IS A BOUNDED RECEIPT, NEVER THE BODY YOU JUST WROTE (BUTCHR-236) — a few hundred bytes at any document size, never a body, preview, or excerpt; a caller that needs the body calls get_doc(). Shape: `{ id, url, title, version, wrote: { chars, bytes, sha256 }, stored: { chars, bytes, sha256 } | null, landed: "confirmed" | "unconfirmed", identical: boolean | null }`. `landed` is what to read: `"confirmed"` means the page was re-read after the write and returned a body — it landed. `"unconfirmed"` means the write call itself succeeded but the read-back that would confirm it did not — almost certainly landed, but NOT THE SAME AS CONFIRMED; do not treat it as failure and do not blind-retry a FULL-BODY REPLACE on it — if you need certainty, call get_doc() and look. Byte-for-byte equality is NOT achievable here (Confluence rewrites ordinary prose on write, e.g. an em dash comes back as `&mdash;`), so `identical: false` is the ORDINARY result of a healthy write, not an error — compare `wrote` and `stored` yourself instead: normalisation makes `stored` slightly larger, truncation or corruption makes it dramatically smaller. Nothing here throws except a genuinely failed write — `landed: "unconfirmed"` and `identical: false` are both resolved results, never rejections.',
       input: { body: z.string(), title: z.string().optional() },
       handler: async (a, c) => {
         const { body, title } = a as { body: string; title?: string };
@@ -759,6 +772,13 @@ export function atlassianTools(
           seenComments,
           epics,
         });
+        // BUTCHR-275: the exit signal — declared ONLY after the watermark
+        // write directly above has resolved without throwing, so "check-in
+        // lands before teardown" is structural: a caller that dies mid-call,
+        // before this line, has declared nothing, and the daemon-side
+        // registry (src/agents/check-in-exit.ts) has nothing to consume. See
+        // that module's own doc comment for the full mechanism this feeds.
+        declareCheckInDone?.(who);
         return { ok: true, key: who, version: version ?? null, seenComments, epics };
       },
     },
