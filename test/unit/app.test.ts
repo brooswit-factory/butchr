@@ -513,6 +513,9 @@ describe("/health carries the admission cap + residency as a sibling of componen
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
     app.listen(0);
@@ -539,6 +542,9 @@ describe("/health carries the admission cap + residency as a sibling of componen
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
     app.listen(0);
@@ -558,6 +564,9 @@ describe("/health carries the admission cap + residency as a sibling of componen
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
     });
     app.listen(0);
