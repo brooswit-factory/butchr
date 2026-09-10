@@ -1,5 +1,6 @@
 import { isApiError } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
+import { HTML4_NAMED_ENTITIES } from "./html4-named-entities.generated.js";
 
 /** The fixed remote-link globalId that carries the ticket -> doc binding. */
 export const DOC_LINK_GLOBAL_ID = "butchr:doc";
@@ -43,52 +44,50 @@ const MAX_BOSS_DEPTH = 20;
 export const DOC_BODY_CHAR_BUDGET = 50_000;
 
 /**
- * KNOWN-SUBSET model of Confluence's storage-layer character substitution —
- * NOT a full re-implementation of that transform. BUTCHR-235 established
- * that a literal em dash and a literal quotation mark round-trip through
- * storage as longer named XML entities, and explicitly did NOT establish
- * that this is the only thing the transform does. BUTCHR-250's own review
- * (PR #299) measured two more instances live against a real `setDoc` write —
- * a literal `—` (U+2014) coming back as `&mdash;` (+6 chars) and a literal
- * `Δ` (U+0394) coming back as `&Delta;` (+6 chars) — and this list is
- * exactly the entities observed round-tripping across every live project
- * root doc this bound protects, plus that measurement. A character outside
- * this list that Confluence also happens to re-encode is a residual this
- * function does NOT close; see docs/root-doc-write-budget.md.
+ * The MEASURED RULE (BUTCHR-250 PR #299's second review round): Confluence's
+ * storage layer re-encodes a character into a longer named XML entity IF AND
+ * ONLY IF that character has a standard HTML 4 named character reference —
+ * confirmed by a 37-character live probe with no exception either direction
+ * (every character WITH an HTML4 named entity came back encoded; every
+ * character WITHOUT one, however exotic, survived literal). That makes
+ * `HTML4_NAMED_ENTITIES` (`src/tools/html4-named-entities.generated.ts`,
+ * vendored from the W3C HTML 4.01 spec itself, not hand-typed — see
+ * `scripts/vendor/html4-entities.ts`) an EXACT model of the transform, not a
+ * known-subset approximation: every one of its 252 entries is a character
+ * this codebase now knows, with certainty, gets re-encoded, and by exactly
+ * how many characters. A character outside this table is, by the same
+ * measured rule, one Confluence's storage layer does NOT re-encode — so
+ * this is not a residual to be widened later; the measured boundary IS the
+ * table's boundary. (BUTCHR-235's own, separate, unresolved caution about
+ * attribute ordering/whitespace/self-closing-tag normalisation still stands
+ * — this closes the CHARACTER-SUBSTITUTION residual specifically, not every
+ * possible way Confluence's storage layer could change a body.)
  */
-const KNOWN_STORAGE_ENTITY_ENCODINGS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/—/g, "&mdash;"],
-  [/–/g, "&ndash;"],
-  [/…/g, "&hellip;"],
-  [/→/g, "&rarr;"],
-  [/←/g, "&larr;"],
-  [/“/g, "&ldquo;"],
-  [/”/g, "&rdquo;"],
-  [/‘/g, "&lsquo;"],
-  [/’/g, "&rsquo;"],
-  [/Δ/g, "&Delta;"],
-];
+const HTML4_ENTITY_BY_CODEPOINT: ReadonlyMap<number, string> = new Map(HTML4_NAMED_ENTITIES);
 
 /**
  * Estimates what `body` will look like once Confluence's storage layer has
- * round-tripped it, by applying `KNOWN_STORAGE_ENTITY_ENCODINGS`. Used to
- * bring a not-yet-stored `proposed` body into the SAME representation
- * `stored` is already in (whatever `get_doc`/`confluence_get_page` returned
- * is already post-transform) and that `DOC_BODY_CHAR_BUDGET` was itself
- * calibrated against (docs/tool-result-size-cap.md's cap is measured on the
- * STORED/returned body, not on what a caller sends) — comparing a raw,
- * untransformed `proposed` against either undercounts by exactly the amount
- * this corrects for. An UNDER-estimate for any character this list does not
- * cover, never an over-estimate: it only replaces literal characters with
- * their known-longer encoded form, so a real defect is never hidden by this
- * function inventing shrinkage that will not happen.
+ * round-tripped it, by replacing every character with an HTML4 named entity
+ * with that entity. Used to bring a not-yet-stored `proposed` body into the
+ * SAME representation `stored` is already in (whatever
+ * `get_doc`/`confluence_get_page` returned is already post-transform) and
+ * that `DOC_BODY_CHAR_BUDGET` was itself calibrated against
+ * (docs/tool-result-size-cap.md's cap is measured on the STORED/returned
+ * body, not on what a caller sends) — comparing a raw, untransformed
+ * `proposed` against either undercounts by exactly the amount this corrects
+ * for. Only ever LENGTHENS a body (never shrinks it), so this can never
+ * manufacture a false refusal by inventing growth that will not happen —
+ * the only direction of error this function could have is under-estimating,
+ * and per the doc comment on `HTML4_ENTITY_BY_CODEPOINT` above, measurement
+ * says there is none left to have.
  */
 function estimateStoredLength(body: string): number {
-  let estimated = body;
-  for (const [pattern, entity] of KNOWN_STORAGE_ENTITY_ENCODINGS) {
-    estimated = estimated.replace(pattern, entity);
+  let total = 0;
+  for (const ch of body) {
+    const entity = HTML4_ENTITY_BY_CODEPOINT.get(ch.codePointAt(0)!);
+    total += entity ? entity.length + 2 : ch.length; // +2 for "&" and ";"
   }
-  return estimated.length;
+  return total;
 }
 
 /**
@@ -110,17 +109,17 @@ function estimateStoredLength(body: string): number {
  * A SIZE comparison, not a content one — this never inspects WHAT changed,
  * only how large the two bodies are once both are expressed in the same
  * (estimated-stored) representation via `estimateStoredLength`. That
- * normalisation is necessary but NOT sufficient against BUTCHR-235's
- * content-transform residual: it closes the specific entities in
- * `KNOWN_STORAGE_ENTITY_ENCODINGS` (measured, live, on this surface — see
- * that constant's own comment) but is not a general decoder, and a
- * transform this list does not cover would still be invisible to this
- * comparison. Prior to BUTCHR-250's review, this compared raw
- * (un-normalised) lengths and was measurably unsound in the permissive
- * direction — a write that swapped stored entities for their literal,
- * longer-when-re-encoded characters could score as a shrink while the
- * stored page did not shrink at all. See docs/root-doc-write-budget.md for
- * the measurement and test/unit/docs.test.ts for the regression arm.
+ * normalisation closes the MEASURED character-substitution residual exactly
+ * (see `HTML4_ENTITY_BY_CODEPOINT`'s own comment) but is NOT a claim that
+ * every way Confluence's storage layer could change a body is covered —
+ * BUTCHR-235's separate, unresolved caution about attribute ordering,
+ * whitespace and self-closing-tag normalisation still stands. Prior to
+ * BUTCHR-250's review, this compared raw (un-normalised) lengths and was
+ * measurably unsound in the permissive direction — a write that swapped
+ * stored entities for their literal, longer-when-re-encoded characters
+ * could score as a shrink while the stored page did not shrink at all. See
+ * docs/root-doc-write-budget.md for the measurement and
+ * test/unit/docs.test.ts for the regression arm.
  */
 function refuseIfGrowingOverBudget(who: string, stored: string, proposed: string, budget: number): void {
   const storedLen = stored.length;
