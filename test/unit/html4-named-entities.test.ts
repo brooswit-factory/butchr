@@ -3,18 +3,29 @@ import { HTML4_NAMED_ENTITIES } from "../../src/tools/html4-named-entities.gener
 
 /**
  * Pins the vendored table (`scripts/vendor/html4-entities.ts`) against the
- * exact measured boundary BUTCHR-250's PR #299 second review round
- * established: Confluence's storage layer re-encodes a character IFF it has
- * a standard HTML4 named entity. A regeneration that silently drifted from
- * the W3C spec (wrong source, a parser bug, a truncated fetch) would fail
- * these assertions rather than passing unnoticed — this is the "pin a few
- * representative rows" arm the review asked for.
+ * exact measured boundary BUTCHR-250's PR #299 review established across
+ * three rounds: Confluence's storage layer re-encodes a NON-ASCII character
+ * IFF it has a standard HTML4 named entity — EXCLUDING `quot`/`amp`/`lt`/`gt`
+ * (34/38/60/62), which are the storage format's OWN markup syntax, not
+ * content it re-encodes (third round's finding). A regeneration that
+ * silently drifted from the W3C spec, or that stopped excluding those four,
+ * would fail these assertions rather than passing unnoticed — this is the
+ * "pin a few representative rows" arm the review asked for.
  */
 describe("html4-named-entities.generated.ts — pinned against the measured Confluence-encoding boundary", () => {
   const byCodepoint = new Map(HTML4_NAMED_ENTITIES);
 
-  test("has exactly the 252 entities HTML 4.01 defines — a wildly different count means the source/parser drifted", () => {
-    expect(HTML4_NAMED_ENTITIES.length).toBe(252);
+  test("has exactly 248 entities — the spec's 252 minus the 4 storage-syntax codepoints this surface must not encode", () => {
+    expect(HTML4_NAMED_ENTITIES.length).toBe(248);
+  });
+
+  test.each([
+    [34, "quot", '"'],
+    [38, "amp", "&"],
+    [60, "lt", "<"],
+    [62, "gt", ">"],
+  ] as const)("codepoint %i (%s, %s) is Confluence storage-format SYNTAX, not content — must NOT be in the table", (code) => {
+    expect(byCodepoint.has(code)).toBe(false);
   });
 
   test("no duplicate codepoints and no duplicate entity names", () => {

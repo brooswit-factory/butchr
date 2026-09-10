@@ -628,6 +628,32 @@ describe("docs.ts: doc-write size budget (BUTCHR-250) — refuse only a write th
     await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
     expect(pages.get("9007")!.body).toBe(proposed);
   });
+
+  // -------------------------------------------------------------------
+  // Review finding (PR #299, THIRD round): `<`, `>`, `&` and `"` are
+  // Confluence STORAGE-FORMAT SYNTAX (tag brackets, attribute quotes, an
+  // entity's own leading "&"), not content the storage layer re-encodes.
+  // The prior fix wrongly billed them as if they were, inflating any
+  // realistic storage-markup body and causing FALSE REFUSALS of genuinely
+  // under-budget writes — the opposite failure direction from the one this
+  // bound exists to prevent. Nothing above this arm uses a "<p>...</p>"
+  // shape, so nothing above it could have caught this.
+  // -------------------------------------------------------------------
+  test("REGRESSION (PR #299 review, round 3): realistic storage markup that is genuinely under budget is ALLOWED, not falsely refused for its own tag syntax", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9008", "ACME — product brief", "<p>small</p>");
+
+    // Realistic storage markup, heavy in the four syntax characters: a link
+    // with a quoted href, a paragraph, and an already-present entity — the
+    // exact shape the review measured being wrongly inflated.
+    const unit = '<p>See <a href="https://example.com/x">a link</a> &mdash; done.</p>';
+    const proposed = unit.repeat(600); // comfortably under budget in raw form
+    expect(proposed.length).toBeLessThan(DOC_BODY_CHAR_BUDGET); // pin: genuinely under budget, not a boundary trick
+    expect(proposed).toContain("<p>"); // pin: this IS the shape no earlier arm exercised
+
+    await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
+    expect(pages.get("9008")!.body).toBe(proposed); // allowed and landed — not refused for its own markup
+  });
 });
 
 describe("docs.ts: labelForKey / JIRA_KEY_RE", () => {

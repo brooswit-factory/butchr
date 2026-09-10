@@ -1,14 +1,13 @@
 // GENERATED — do not hand-edit. Regenerate with `bun run scripts/vendor/html4-entities.ts`.
 // Source: https://www.w3.org/TR/html4/sgml/entities.html (HTML 4.01 §24.2/24.3/24.4 — a closed, frozen spec).
-// 252 entries: Unicode codepoint -> the HTML4 named entity for it.
+// 248 entries (of the spec's 252; see this
+// generator's own header comment for the 4
+// storage-syntax codepoints deliberately excluded and why):
+// Unicode codepoint -> the HTML4 named entity for it.
 // Consumed by estimateStoredLength (src/tools/docs.ts) — see that function's
 // own doc comment for what this table is for and what it does not cover.
 
 export const HTML4_NAMED_ENTITIES: ReadonlyArray<readonly [number, string]> = [
-  [34, "quot"],
-  [38, "amp"],
-  [60, "lt"],
-  [62, "gt"],
   [160, "nbsp"],
   [161, "iexcl"],
   [162, "cent"],

@@ -44,18 +44,27 @@ const MAX_BOSS_DEPTH = 20;
 export const DOC_BODY_CHAR_BUDGET = 50_000;
 
 /**
- * The MEASURED RULE (BUTCHR-250 PR #299's second review round): Confluence's
- * storage layer re-encodes a character into a longer named XML entity IF AND
- * ONLY IF that character has a standard HTML 4 named character reference —
- * confirmed by a 37-character live probe with no exception either direction
- * (every character WITH an HTML4 named entity came back encoded; every
- * character WITHOUT one, however exotic, survived literal). That makes
- * `HTML4_NAMED_ENTITIES` (`src/tools/html4-named-entities.generated.ts`,
- * vendored from the W3C HTML 4.01 spec itself, not hand-typed — see
- * `scripts/vendor/html4-entities.ts`) an EXACT model of the transform, not a
- * known-subset approximation: every one of its 252 entries is a character
- * this codebase now knows, with certainty, gets re-encoded, and by exactly
- * how many characters. A character outside this table is, by the same
+ * The MEASURED RULE, corrected once already (BUTCHR-250 PR #299's third
+ * review round): Confluence's storage layer re-encodes a NON-ASCII character
+ * into a longer named XML entity IF AND ONLY IF that character has a
+ * standard HTML 4 named character reference — confirmed by a 37-character
+ * live probe with no exception either direction. The SECOND round's own
+ * probe was, by its own author's later correction, entirely non-ASCII (every
+ * character tested was above U+007F) and over-generalised the rule to ALL
+ * 252 HTML4 named entities, including 4 that are themselves Confluence's
+ * OWN STORAGE-FORMAT SYNTAX rather than content it re-encodes: `"` (quot),
+ * `&` (amp), `<` (lt), `>` (gt) — the quotes around an attribute value, the
+ * angle brackets of a tag, the leading `&` of an entity reference already
+ * present. Those four are measurably left alone (a 54,824-character real
+ * stored body containing 160 literal `&`, 953 literal `<`, 953 literal `>`
+ * and 30 literal `"` round-tripped byte-identical), so `HTML4_NAMED_ENTITIES`
+ * (`src/tools/html4-named-entities.generated.ts`, vendored from the W3C
+ * HTML 4.01 spec itself, not hand-typed — see `scripts/vendor/html4-entities.ts`,
+ * whose own header names the 4-codepoint exclusion and why) EXCLUDES those
+ * four by construction: it is the spec's 252 minus exactly those 4 = 248.
+ * The remaining 248 were checked for the same kind of storage-syntax
+ * significance and found clean (that generator's header comment has the
+ * detail). A character outside this 248-entry table is, by the same
  * measured rule, one Confluence's storage layer does NOT re-encode — so
  * this is not a residual to be widened later; the measured boundary IS the
  * table's boundary. (BUTCHR-235's own, separate, unresolved caution about
@@ -68,18 +77,26 @@ const HTML4_ENTITY_BY_CODEPOINT: ReadonlyMap<number, string> = new Map(HTML4_NAM
 /**
  * Estimates what `body` will look like once Confluence's storage layer has
  * round-tripped it, by replacing every character with an HTML4 named entity
- * with that entity. Used to bring a not-yet-stored `proposed` body into the
- * SAME representation `stored` is already in (whatever
+ * (per `HTML4_ENTITY_BY_CODEPOINT`, which deliberately excludes the 4
+ * storage-syntax codepoints — see its own doc comment) with that entity.
+ * Used to bring a not-yet-stored `proposed` body into the SAME
+ * representation `stored` is already in (whatever
  * `get_doc`/`confluence_get_page` returned is already post-transform) and
  * that `DOC_BODY_CHAR_BUDGET` was itself calibrated against
  * (docs/tool-result-size-cap.md's cap is measured on the STORED/returned
- * body, not on what a caller sends) — comparing a raw, untransformed
- * `proposed` against either undercounts by exactly the amount this corrects
- * for. Only ever LENGTHENS a body (never shrinks it), so this can never
- * manufacture a false refusal by inventing growth that will not happen —
- * the only direction of error this function could have is under-estimating,
- * and per the doc comment on `HTML4_ENTITY_BY_CODEPOINT` above, measurement
- * says there is none left to have.
+ * body, not on what a caller sends).
+ *
+ * BOTH DIRECTIONS OF ERROR ARE REAL, AND EQUALLY WORTH GUARDING AGAINST —
+ * an earlier version of this comment claimed only under-estimating was a
+ * risk, which is wrong: OVER-estimating is not "safe" here, it is the
+ * OPPOSITE failure this bound exists to avoid — a body this function scores
+ * as over budget when its real stored size is not locks the writing tier
+ * out of a page it is entitled to write (measured live: exactly this
+ * happened when this table still counted the 4 storage-syntax codepoints,
+ * inflating a genuinely under-budget real page by ~14% and scoring it
+ * over). Correctness here means neither direction of error, not merely
+ * "never shrinks" — hence excluding the 4 codepoints above rather than
+ * treating their inclusion as a harmless conservative bias.
  */
 function estimateStoredLength(body: string): number {
   let total = 0;
