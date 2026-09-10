@@ -8,6 +8,7 @@ import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { resolveEligibleProjects } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
+import { AGENT_PREFIX } from "../labels/plan.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
@@ -127,6 +128,62 @@ function summaryOf(issue: unknown): string | undefined {
 
 /** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
 const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
+
+// ---------------------------------------------------------------------------
+// BUTCHR-244: what a disposition write DOES and DOES NOT establish.
+// `newWorker`/`newProjectWorker`/`adoptWorker`/`adoptProjectWorker`'s
+// "start" disposition, and `startWorker`, are ALL just
+// `ops.transition(key, "In Progress")` — nothing here spawns an agent, and
+// nothing here CAN confirm one exists. In Progress is one of
+// `src/reconcile/plan.ts`'s ACTIVE_STATUSES: it makes the ticket a candidate
+// the daemon's OWN, LATER, INDEPENDENT poll (`reconcileNow`,
+// src/daemon/loop.ts) spawns an agent FROM, on its own cadence, and that
+// spawn can fail (see `src/agents/herd.ts`'s `spawn`, isolated per-resource
+// by BUTCHR-147) with no path back to this call. `check_worker` below is
+// the verb that actually answers "is my worker staffed?" — these two
+// constants are what every write site that moves/leaves a ticket in or out
+// of that status set says about it, verbatim, so the statement can never
+// drift into a paraphrase that quietly starts claiming more than the code
+// does (the exact defect this ticket exists to fix: two tool descriptions
+// in defs.ts used to claim a disposition or start_worker itself staffs an
+// agent — neither ever has).
+// ---------------------------------------------------------------------------
+
+export const STAFFING_PENDING =
+  "pending: this call moved (or confirmed) the ticket into In Progress, one of the ACTIVE statuses the daemon's reconcile poll spawns agents from — it did NOT start an agent and cannot confirm one exists, or ever will (the spawn itself can fail; see the ticket's agent:* label). Check with check_worker.";
+
+export const STAFFING_NOT_ACTIVE =
+  "not staffed: this call left the ticket in a non-active status (e.g. shelved, To Do) — the reconciler only spawns agents for ACTIVE statuses (In Progress/In Review), so no agent will be started for it until something moves it there (e.g. start_worker).";
+
+/** `STAFFING_PENDING` for a "start" disposition, `STAFFING_NOT_ACTIVE` for "shelve" — see both constants' own comments. */
+function staffingFor(kind: Disposition["kind"]): string {
+  return kind === "start" ? STAFFING_PENDING : STAFFING_NOT_ACTIVE;
+}
+
+/**
+ * BUTCHR-244: the match rule behind `new_worker`'s idempotency (issue-caller
+ * path only — see `newProjectWorker`'s own doc comment for why the
+ * project-caller path does NOT get this check). Reuses `findWorkers` over
+ * the SAME `ops.getIssue(callerKey)` payload `newWorker` already fetches for
+ * type/project inference — `summary` is hydrated on that same outward
+ * `Implements` stub `status` already reads (MEASURED live against a real
+ * caller-with-children payload, BUTCHR-218, 2026-09-02 — see `WorkerRef`'s
+ * own doc comment in docs.ts), so this costs NO extra Jira call and NO JQL
+ * search.
+ *
+ * MATCH RULE: exact equality after trimming, against workers that are NOT
+ * Done. A Done worker is finished history — filing new work that happens to
+ * share its summary is legitimate follow-up, not a duplicate, so a Done
+ * match never blocks a create; this is a deliberate boundary, not an
+ * oversight (BUTCHR-244's own spec). Returns only the FIRST match, in
+ * `findWorkers`' own return order — a caller with more than one live
+ * sibling sharing this exact summary already has a pre-existing ambiguity
+ * this check did not create and is not responsible for resolving.
+ */
+function findDuplicateWorker(callerIssue: unknown, summary: string): WorkerRef | undefined {
+  const trimmed = summary.trim();
+  return findWorkers(callerIssue).find((w) => w.status !== "Done" && (w.summary ?? "").trim() === trimmed);
+}
 
 // ---------------------------------------------------------------------------
 // BUTCHR-110: tier-identity collision — RECORD, never refuse (BUTCHR-103's
@@ -355,7 +412,7 @@ async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef
     const full = await ops.getIssue(w.key);
     const status = statusOf(full) ?? w.status;
     if (status !== "Done" && !labelsOf(full).includes(EXEMPT_LABEL)) {
-      open.push({ key: w.key, status });
+      open.push({ key: w.key, status, summary: summaryOf(full) ?? w.summary });
     }
   }
   return open;
@@ -424,12 +481,35 @@ export interface NewWorkerResult {
   implements?: string;
   /** Present ONLY for a PROJECT caller — the Jira PROJECT key the new Epic is a MEMBER of. There is no Implements link for a project/epic relationship (a Jira project is not an issue), so this is a DIFFERENT field, not `implements` set to the project key — reporting `implements` here would claim a link that does not exist. The field's presence/absence, not its value, is what tells an agent reading the result which relationship it's looking at. */
   member?: string;
-  doc: DocResult;
-  disposition: Disposition["kind"];
+  /** Absent ONLY when `created` is `false` (see below) — an idempotent duplicate return makes no doc write of its own and reports no fresh doc state; use `get_doc(key)` against the returned `key` if you need it. Present on every normal create. */
+  doc?: DocResult;
+  /** Absent ONLY when `created` is `false` — an idempotent duplicate return applied no disposition this call (the existing worker's own disposition, whatever it is, was already declared by whichever call actually created it). Present on every normal create. */
+  disposition?: Disposition["kind"];
+  /** BUTCHR-244: what this call's own disposition write establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Absent ONLY when `created` is `false`, for the same reason `disposition` is: no disposition was applied this call. Present on every normal create. Never present alongside `created: false`. */
+  staffing?: string;
   /** BUTCHR-110: present ONLY when the caller's own accountId and the child's about-to-be-assigned accountId collide — see this file's own "tier-identity collision" section above. A distinct, greppable key so an agent that skims the result still catches it; absent entirely on a healthy hop (never present-but-empty). */
   identityCollision?: string;
   /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (this daemon's identity, for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`, since a failed check has no verdict to report. "Not checked" must never look like "checked and clean". */
   identityUnknown?: string;
+  /**
+   * BUTCHR-244: present, and always `false`, ONLY when this call found an
+   * existing NOT-DONE worker under the caller whose summary exactly matches
+   * (after trimming) the one requested, and returned THAT worker instead of
+   * creating a second ticket — see `findDuplicateWorker`'s own doc comment
+   * for the match rule (a DONE match never blocks a create — finished work
+   * sharing a summary with new work is legitimate follow-up). Absent (never
+   * `true`) on a normal create — its absence is what "a real create
+   * happened" means here, the same present-only-when-true idiom
+   * `identityCollision` above already uses. When present, `key` is the
+   * EXISTING worker's key, never a freshly created one, and `doc`/
+   * `disposition`/`staffing` are all absent (see each field's own comment).
+   * DELIBERATE LIMITATION, stated here rather than left implied: there is no
+   * bypass in this increment — a caller that genuinely wants a second
+   * worker with an identical summary must differentiate the summary.
+   */
+  created?: false;
+  /** BUTCHR-244: present iff `created` is `false` — names the match in one sentence: which existing key it matched and why. */
+  duplicateReason?: string;
 }
 
 /**
@@ -503,6 +583,25 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
 
   const callerIssue = await ops.getIssue(callerKey);
+
+  // BUTCHR-244: idempotency, BEFORE anything else this call would do — a
+  // retry (cause unestablished; see this ticket) must be safe and quiet, not
+  // a twin. See `findDuplicateWorker`'s own doc comment for the match rule
+  // and cost. No write happens on this path — not even `ensureDoc` — so a
+  // caller that needs the existing worker's doc/status/staffing reads them
+  // separately (get_doc / check_worker) against the returned `key`.
+  const dup = findDuplicateWorker(callerIssue, input.summary);
+  if (dup) {
+    return {
+      key: dup.key,
+      implements: callerKey,
+      created: false,
+      duplicateReason:
+        `new_worker: ${callerKey} already has a not-Done worker (${dup.key}, status ${dup.status ?? "unknown"}) whose summary exactly matches (after trimming) the one requested — returning it instead of creating a twin. ` +
+        `Deliberate limitation (BUTCHR-244): there is no bypass in this increment; a caller that genuinely wants a second worker with an identical summary must differentiate the summary.`,
+    };
+  }
+
   const callerType = issuetypeOf(callerIssue);
   const childType = callerType ? CHILD_TYPE[callerType] : undefined;
   if (!childType) {
@@ -588,7 +687,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     );
   }
 
-  return { key, implements: callerKey, doc, disposition: disposition.kind, ...(identityCollision ? { identityCollision } : {}) };
+  return { key, implements: callerKey, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind), ...(identityCollision ? { identityCollision } : {}) };
 }
 
 /**
@@ -623,6 +722,23 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
  * DOC NESTING — VERIFIED, NOT ASSUMED: see the comment on `ensureDoc`'s own
  * boss-resolution step (src/tools/docs.ts) for why the new Epic's doc
  * already nests under `projectKey`'s root doc with no second code path.
+ *
+ * BUTCHR-244: DELIBERATELY DOES NOT GET THE ISSUE-CALLER PATH'S IDEMPOTENCY
+ * CHECK (`findDuplicateWorker`) — said explicitly here, not left implied,
+ * per that ticket's own instruction to state a materially-different
+ * boundary rather than half-do it. `newWorker`'s check is free because a
+ * SINGLE `ops.getIssue(callerKey)` call already embeds every child's
+ * summary on the SAME payload it fetches for type/project inference — that
+ * shortcut exists only because the caller is an ISSUE with `issuelinks`. A
+ * PROJECT is not an issue (see point 1 above): it has no `getIssue` payload
+ * and no `issuelinks` at all, so there is no equivalent free read here —
+ * finding this project's own existing Epics by summary would need a NEW
+ * JQL search (`project = X AND issuetype = Epic`), which is exactly the
+ * added Jira round trip BUTCHR-244 rules out for the issue-caller path.
+ * Adding it here anyway would be a genuinely different (costlier) feature,
+ * not a symmetric extension of the free one — so this path stays as it was,
+ * un-deduplicated, rather than silently adding a cost the ticket didn't ask
+ * for.
  */
 async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;
@@ -695,7 +811,7 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   }
 
   return {
-    key, member: projectKey, doc, disposition: disposition.kind,
+    key, member: projectKey, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
   };
@@ -703,8 +819,13 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
 
 /**
  * Worker -> In Progress. Refuses a key that is not one of the caller's own
- * workers. The call that actually staffs an agent; also reactivates a
- * shelved worker and sends an In Review worker back to work.
+ * workers. NOT the call that staffs an agent (BUTCHR-244 correction — this
+ * doc comment used to claim otherwise): it moves the ticket into In
+ * Progress, one of `src/reconcile/plan.ts`'s ACTIVE_STATUSES, which makes it
+ * a candidate the daemon's own later, independent reconcile poll spawns an
+ * agent FROM — this call neither starts one nor can confirm one exists. See
+ * `STAFFING_PENDING` and `check_worker`. Also reactivates a shelved worker
+ * and sends an In Review worker back to work.
  *
  * CLEARS `EXEMPT_LABEL` (`butchr:shelved`) FIRST, ONLY IF PRESENT, THEN
  * TRANSITIONS — this is the fix for BUTCHR-50: the label means CURRENTLY
@@ -727,6 +848,134 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
   return ops.transition(workerKey, "In Progress");
+}
+
+/** `check_worker`'s staffing verdict — three-valued, NEVER two: conflating "could not look" with "not staffed" is the specific error this codebase has already been bitten by and guards against elsewhere (see `PrLookup`, src/labels/plan.ts, and its own doc comment) — this type keeps that same illegal conflation unrepresentable here. */
+export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look";
+
+export interface CheckWorkerResult {
+  key: string;
+  /** The worker's current Jira status, straight off `assertOwnWorker`'s own fresh fetch. */
+  status: string | undefined;
+  staffing: StaffingVerdict;
+  /** Which source produced `staffing` — "herd" is the live, authoritative probe (`herd.runningIssues()`, src/agents/herd.ts), consulted ONLY when it is known to cover this worker (see `probeOutOfScope` below); "label" is the `agent:*` label already on the ticket, which can be up to a poll stale and is further damped by the stabilizer in src/labels/sync.ts (a candidate value must be observed on two consecutive polls before it's written) — but is written by WHICHEVER daemon actually staffs this ticket, so it stays a valid signal even when a probe wired into THIS call is not. A caller that cares about freshness reads THIS field, never just `staffing` — a label-derived verdict must never be mistaken for a live one. */
+  source: "herd" | "label";
+  /** Present ONLY when `source` is "label" AND the ticket actually carries an `agent:*` label — the exact value observed (e.g. "agent:none"). Absent when `source` is "label" but no `agent:*` label was found at all (e.g. the ticket's status was never active, so the label machinery never wrote one) — that absence is exactly the case where `staffing` is "could-not-look", not a guessed "not-staffed". */
+  observedLabel?: string;
+  /**
+   * BUTCHR-244 (AC-5, added after a live near-miss during THIS ticket's own
+   * review — see the comment thread on BUTCHR-244): present, and always
+   * `true`, ONLY when a `probe` was given but was NEVER CALLED because this
+   * worker's own Jira assignee does not match this credential's own
+   * Atlassian identity (or that identity could not be established) — see
+   * `checkWorker`'s own doc comment for why that comparison is the scope
+   * check. A herd only ever covers issues staffed by ITS OWN account
+   * (`assignee = currentUser()` — src/resources/issue.ts's `ISSUE_JQL`), so
+   * an empty/false read from a herd that was never even the right one to
+   * ask is not evidence of anything for THIS worker — treating it as "not
+   * staffed" is the exact mistake this field exists to make impossible to
+   * repeat silently. Falls back to the label same as an absent probe would,
+   * but for a materially different reason, named here so a reader isn't
+   * left to guess which one happened. Absent when no probe was given at
+   * all, or when the probe's scope matched (whether or not it then
+   * answered) — i.e. absent whenever the probe was actually consulted.
+   */
+  probeOutOfScope?: true;
+}
+
+/**
+ * BUTCHR-244 (AC-5): whether `probe` is even the right herd to ask about
+ * `issue` — see `CheckWorkerResult.probeOutOfScope`'s own doc comment for
+ * the full incident this guards against. A herd only ever contains issues
+ * staffed by ITS OWN Atlassian account (`ISSUE_JQL`'s `assignee =
+ * currentUser()`, src/resources/issue.ts) — so the scope check is simply
+ * "does this worker's own assignee equal the account `ops` authenticates
+ * as". The assignee is already on `issue` (no extra Jira call, reused from
+ * `assertOwnWorker`'s own fetch); `ops.getMyself()` costs one extra call,
+ * paid only when a probe is actually wired (i.e. only in real daemon use,
+ * never in the common no-probe unit-test path). Fails CLOSED on every edge:
+ * no assignee, or `getMyself` itself failing, both mean "scope could not be
+ * established" — never "assume in scope".
+ */
+async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boolean> {
+  const assignee = assigneeAccountIdOf(issue);
+  if (!assignee) return false;
+  try {
+    const me = await ops.getMyself();
+    return me.accountId === assignee;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * BUTCHR-244: the verb that can actually answer "is my worker staffed?" —
+ * `new_worker`/`start_worker`/`adopt_worker` only ever move a ticket into
+ * the status set the reconciler spawns FROM (`STAFFING_PENDING` above);
+ * none of them starts an agent or can confirm one exists. This is the read
+ * that closes that gap. Refuses a `key` that is not one of the caller's own
+ * workers, via `assertOwnWorker` — the SAME helper `start_worker`/
+ * `tell_worker`/etc. already use, not a second one.
+ *
+ * `probe`, when given, is the authoritative LIVE source — a narrow function
+ * seam over `herd.runningIssues()` (src/agents/herd.ts), injected rather
+ * than the whole herd so this module (and defs.ts, which wires it in) stays
+ * pure over its dependencies and unit-testable with no herdr fixture — the
+ * property this file's own header note already protects for `ops`. It is
+ * consulted ONLY when `probeCoversWorker` confirms it is even the right
+ * herd to ask (AC-5 — see that function's own doc comment and
+ * `CheckWorkerResult.probeOutOfScope`): a single host can run more than one
+ * butchr daemon, each with its own herd covering only its own Atlassian
+ * account's tickets, and an empty/false read from the WRONG herd is not
+ * evidence of anything for this worker — it must never harden into "not
+ * staffed". `probe` resolving `null`, or REJECTING, ALSO mean "the live
+ * probe could not answer" — NEVER "not staffed". Either way this falls back
+ * to the ticket's own `agent:*` label (src/labels/registry.ts: `agent:none`
+ * means "active ticket, no running agent"; any OTHER `agent:*` value means
+ * one IS running) — a label stays a valid signal regardless of which
+ * daemon's probe this call was given, because it is written by WHICHEVER
+ * daemon actually staffs the ticket. When NEITHER source can answer (no
+ * `probe` wired, or `probe` out of scope or unable to answer, AND no
+ * `agent:*` label is present at all) the result is "could-not-look" — never
+ * a guessed "not-staffed". `source` on the result always names which one
+ * actually answered; `probeOutOfScope` says when a probe existed but was
+ * never even asked.
+ */
+export async function checkWorker(
+  ops: AtlassianOps,
+  callerKey: string,
+  workerKey: string,
+  probe?: (key: string) => Promise<boolean | null>,
+): Promise<CheckWorkerResult> {
+  const issue = await assertOwnWorker(ops, "check_worker", callerKey, workerKey);
+  const status = statusOf(issue);
+
+  let outOfScope = false;
+  if (probe) {
+    if (await probeCoversWorker(ops, issue)) {
+      let probed: boolean | null;
+      try {
+        probed = await probe(workerKey);
+      } catch {
+        probed = null; // a rejecting probe means "could not look", never "not staffed" — falls through to the label below, same as an explicit null.
+      }
+      if (probed !== null) {
+        return { key: workerKey, status, staffing: probed ? "staffed" : "not-staffed", source: "herd" };
+      }
+    } else {
+      outOfScope = true;
+    }
+  }
+
+  const observedLabel = labelsOf(issue).find((l) => l.startsWith(AGENT_PREFIX));
+  if (observedLabel === undefined) {
+    return { key: workerKey, status, staffing: "could-not-look", source: "label", ...(outOfScope ? { probeOutOfScope: true } : {}) };
+  }
+  return {
+    key: workerKey, status, source: "label", observedLabel,
+    staffing: observedLabel === `${AGENT_PREFIX}none` ? "not-staffed" : "staffed",
+    ...(outOfScope ? { probeOutOfScope: true } : {}),
+  };
 }
 
 /**
@@ -786,6 +1035,8 @@ export interface AdoptWorkerResult {
   alreadyAdopted: boolean;
   doc: DocResult;
   disposition: Disposition["kind"];
+  /** BUTCHR-244: what THIS call's disposition establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Reported even on a fully idempotent re-adoption (`alreadyAdopted`): it states a fact about the worker's CURRENT declared state, not only about a write this call made. */
+  staffing: string;
   /** BUTCHR-110: present ONLY when the caller's own accountId and the adopted ticket's about-to-be-assigned accountId collide — see the "tier-identity collision" section near the top of this file. Computed and reported on EVERY call (including a fully idempotent re-adoption), because it states a fact about current state, not an action taken — but the underlying ticket COMMENT is only (re-)posted when this call does real adoption work (`!alreadyAdopted`); see the comment at this field's call site for why. */
   identityCollision?: string;
   /** BUTCHR-110 (review fix): present ONLY when the collision check's OWN read (the caller's own ticket, or this daemon's identity for a PROJECT caller) failed and the check could not run at all — mutually exclusive with `identityCollision`. "Not checked" must never look like "checked and clean". */
@@ -1008,7 +1259,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   }
 
   return {
-    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
@@ -1130,7 +1381,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   }
 
   return {
-    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind,
+    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
