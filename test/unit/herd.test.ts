@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { HerdrError } from "@brooswit/herdr-sdk";
 import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
@@ -143,6 +144,71 @@ describe("spawn failure", () => {
     };
     const herd = new HerdrHerd(f as any, "http://x/mcp");
     await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(closed).toEqual(["wX:p1"]);
+  });
+});
+
+describe("spawn: pane readiness retry (BUTCHR-268)", () => {
+  const busyError = () =>
+    new HerdrError("agent_pane_busy", "agent target pane wX:p1 is not an available shell", "agent.start", {
+      code: "agent_pane_busy",
+      message: "agent target pane wX:p1 is not an available shell",
+    });
+
+  /** `agent.start` rejects with `agent_pane_busy` on the first `rejectCount` calls, then succeeds (or never, if `rejectCount` is unbounded). */
+  function fakeHerdrBusyThenOk(rejectCount: number) {
+    const started: any[] = [];
+    const closed: string[] = [];
+    let calls = 0;
+    const client = {
+      agent: {
+        list: async () => ({ agents: [] }),
+        start: async (p: any) => {
+          calls++;
+          if (calls <= rejectCount) throw busyError();
+          started.push(p);
+        },
+      },
+      pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
+      workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
+    };
+    return { client: client as any, started, closed, callCount: () => calls };
+  }
+
+  test("retries agent_pane_busy and succeeds once the pane is ready, waiting once per attempt", async () => {
+    const f = fakeHerdrBusyThenOk(2);
+    const waits: number[] = [];
+    const herd = new HerdrHerd(f.client, "u", (ms) => { waits.push(ms); return Promise.resolve(); });
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.started.length).toBe(1);
+    expect(f.closed.length).toBe(0); // it eventually started — the pane it created must not be closed
+    expect(f.callCount()).toBe(3); // 2 busy rejections + the attempt that succeeded
+    // one wait before every attempt (including the first) plus verifyKickoff's
+    // own trailing wait (agents stays empty here, so it's a no-op past that)
+    expect(waits.length).toBe(4);
+    expect(new Set(waits.slice(0, 3)).size).toBe(1); // the same wait before every start attempt
+  });
+
+  test("gives up after the bounded retry budget, closes the pane it created (BUTCHR-111), and rethrows agent_pane_busy", async () => {
+    const f = fakeHerdrBusyThenOk(Number.POSITIVE_INFINITY);
+    const herd = new HerdrHerd(f.client, "u", () => Promise.resolve());
+    await expect(herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null })).rejects.toMatchObject({ code: "agent_pane_busy" });
+    expect(f.closed).toEqual(["w9:p1"]);
+    expect(f.started.length).toBe(0);
+    expect(f.callCount()).toBeGreaterThan(1); // it did retry, not fail on the first busy rejection
+  });
+
+  test("a non-busy agent.start rejection is never retried — it reaches spawn()'s own catch on the first attempt", async () => {
+    const closed: string[] = [];
+    let calls = 0;
+    const client = {
+      agent: { list: async () => ({ agents: [] }), start: async () => { calls++; throw new Error("boom"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+      pane: { close: async (p: string) => { closed.push(p); } },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", () => Promise.resolve());
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(calls).toBe(1);
     expect(closed).toEqual(["wX:p1"]);
   });
 });
