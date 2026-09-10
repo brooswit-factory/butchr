@@ -135,6 +135,37 @@ function formatFalselyTaughtError(verbs: readonly string[]): string {
   ].join("\n");
 }
 
+/**
+ * The converse of `findFalselyTaughtVerbs` (BUTCHR-257 review round 1): a
+ * `taught: false` entry's `reason` claims "no brief teaches this" — this
+ * flags any such verb a real brief NOW names (per `extracted`), so that
+ * claim is re-verified too, not left as an unchecked label. See
+ * brief-coverage.ts's own header for the honest limit this inherits from
+ * `extractVerbs`: a bare backticked mention that WARNS against a verb
+ * (`` never call `jira_transition` ``) is indistinguishable from one that
+ * TEACHES it, so this can fire on a genuine non-teaching mention — a
+ * deliberate trade-off, not an oversight; see that header for what to do
+ * when it does. A `taught: true` entry is never checked here — it already
+ * has its own corroboration test above.
+ */
+function findTaughtFalseButNamedVerbs(coverage: Readonly<Record<string, BriefCoverageEntry>>, extracted: ReadonlySet<string>): string[] {
+  return Object.entries(coverage)
+    .filter(([, entry]) => !entry.taught)
+    .map(([verb]) => verb)
+    .filter((verb) => extracted.has(verb));
+}
+
+function formatTaughtFalseButNamedError(verbs: readonly string[], coverage: Readonly<Record<string, BriefCoverageEntry>>): string {
+  const reasonFor = (v: string) => {
+    const entry = coverage[v];
+    return entry && !entry.taught ? entry.reason : "(reason unavailable)";
+  };
+  return [
+    `${verbs.length} BRIEF_COVERAGE entr${verbs.length === 1 ? "y claims" : "ies claim"} { taught: false } but a briefs/*.md file now names ${verbs.length === 1 ? "it" : "them"} (per extractVerbs): ${verbs.map((v) => `${v} (stated reason: "${reasonFor(v)}")`).join("; ")}.`,
+    "Either the stated reason is now stale — verify the verb is genuinely taught and flip the entry to { taught: true } — or this is a non-teaching mention (e.g. a deprecation warning) tripping extractVerbs's known imprecision (it cannot tell teaching from mentioning); see brief-coverage.ts's header for what to do in that case. Never delete or weaken this check to silence a real, honestly-explained false positive.",
+  ].join("\n");
+}
+
 // ---------------------------------------------------------------------
 // BUTCHR-257: TOTAL COVERAGE OF THE DERIVED REGISTRY FAMILY, BY CONSTRUCTION
 // ---------------------------------------------------------------------
@@ -184,7 +215,14 @@ describe("BUTCHR-257: total brief-coverage accounting of the derived tool regist
     expect(falselyTaught).toEqual([]);
   });
 
-  test("non-vacuity: the three accounting functions flag an uncovered verb, a stale entry, and a falsely-taught claim on synthetic fixtures; accept correct fixtures; and — fed the REAL BRIEF_COVERAGE with a sentinel neither knows about — still catch it", () => {
+  test("every BRIEF_COVERAGE taught:false entry's claim is re-verified too — no briefs/*.md file names it (BUTCHR-257 review round 1)", () => {
+    const extracted = allTaughtVerbs();
+    const taughtFalseButNamed = findTaughtFalseButNamedVerbs(BRIEF_COVERAGE, extracted);
+    if (taughtFalseButNamed.length > 0) throw new Error(formatTaughtFalseButNamedError(taughtFalseButNamed, BRIEF_COVERAGE));
+    expect(taughtFalseButNamed).toEqual([]);
+  });
+
+  test("non-vacuity: the four accounting functions flag an uncovered verb, a stale entry, a falsely-taught claim, and a stale taught:false claim on synthetic fixtures; accept correct fixtures; and — fed the REAL BRIEF_COVERAGE with a sentinel neither knows about — still catch it", () => {
     // Synthetic fixtures: prove the functions distinguish good from bad, not just "always empty".
     expect(findUncoveredVerbs(["ghost"], {})).toEqual(["ghost"]);
     expect(findUncoveredVerbs(["a"], { a: { taught: true } })).toEqual([]);
@@ -194,9 +232,15 @@ describe("BUTCHR-257: total brief-coverage accounting of the derived tool regist
 
     expect(findFalselyTaughtVerbs({ x: { taught: true } }, new Set())).toEqual(["x"]);
     expect(findFalselyTaughtVerbs({ x: { taught: true } }, new Set(["x"]))).toEqual([]);
-    // A taught:false entry is never flagged, however the extraction set looks —
-    // that's the whole point of declaring it excluded.
+    // A taught:false entry is never flagged by findFalselyTaughtVerbs, however
+    // the extraction set looks — that's findTaughtFalseButNamedVerbs's job instead.
     expect(findFalselyTaughtVerbs({ x: { taught: false, reason: "r" } }, new Set())).toEqual([]);
+
+    expect(findTaughtFalseButNamedVerbs({ x: { taught: false, reason: "r" } }, new Set(["x"]))).toEqual(["x"]);
+    expect(findTaughtFalseButNamedVerbs({ x: { taught: false, reason: "r" } }, new Set())).toEqual([]);
+    // A taught:true entry is never flagged by findTaughtFalseButNamedVerbs, however
+    // the extraction set looks — that's findFalselyTaughtVerbs's job instead.
+    expect(findTaughtFalseButNamedVerbs({ x: { taught: true } }, new Set(["x"]))).toEqual([]);
 
     // Rules out "passes because BRIEF_COVERAGE silently matches everything":
     // feed the REAL declared map a family/verb it has never heard of.
@@ -205,5 +249,11 @@ describe("BUTCHR-257: total brief-coverage accounting of the derived tool regist
     // family that doesn't contain them, proving stale-detection isn't vacuous
     // against real data either.
     expect(findStaleCoverageEntries(["__not_a_real_verb__"], BRIEF_COVERAGE).length).toBe(Object.keys(BRIEF_COVERAGE).length);
+    // And the same technique for the taught:false corroboration: feed the REAL
+    // BRIEF_COVERAGE an extracted set containing every taught:false verb by name —
+    // proves the function isn't vacuously empty against real declared data either.
+    const realTaughtFalseVerbs = Object.entries(BRIEF_COVERAGE).filter(([, e]) => !e.taught).map(([v]) => v);
+    expect(realTaughtFalseVerbs.length).toBeGreaterThan(0); // rules out "passes because there are no taught:false entries to test against"
+    expect(findTaughtFalseButNamedVerbs(BRIEF_COVERAGE, new Set(realTaughtFalseVerbs)).sort()).toEqual([...realTaughtFalseVerbs].sort());
   });
 });

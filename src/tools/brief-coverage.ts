@@ -51,6 +51,45 @@
  * static brief text. The two answer different questions and can drift apart
  * from each other without either one being wrong — this file's reasons are
  * written independently, from each verb's own `defs.ts` description.
+ *
+ * `taught: false` IS ALSO RE-VERIFIED, NOT JUST A LABEL (BUTCHR-257 review
+ * round 1): `brief-tool-surface.test.ts`'s `findTaughtFalseButNamedVerbs`
+ * checks the converse of `findFalselyTaughtVerbs` above — a `taught: false`
+ * entry whose verb a real brief NOW names fails loud, naming the verb and
+ * its stated reason, so a reason that quietly stops being true (someone
+ * starts teaching a verb this file still claims no brief teaches) cannot
+ * sit unnoticed the way the ORIGINAL forward-only guard let the whole
+ * reverse direction sit unnoticed. Measured directly at review: appending
+ * "Use `jira_transition` to move your ticket." to `briefs/task.md` — while
+ * `jira_transition`'s entry still read `taught: false` — left the suite
+ * fully green, because `findFalselyTaughtVerbs` only ever filters on
+ * `entry.taught` and never checks a `false` entry against `extracted` in
+ * either direction. That gap is what this paragraph and the converse
+ * function close.
+ *
+ * THE HONEST LIMIT OF THAT CHECK, STATED RATHER THAN HIDDEN (same discipline
+ * `src/media/blind-spot.ts` and this file's own merge-check-guard.test.ts
+ * precedent use for a known hole): `extractVerbs` cannot distinguish
+ * TEACHING a call from MENTIONING the verb for any other reason — a future
+ * brief writing "never call `jira_transition`; use start_worker instead" is
+ * indistinguishable, to a regex over backticked spans, from a brief
+ * genuinely teaching `jira_transition` as a call. That sentence would flip
+ * `findTaughtFalseButNamedVerbs` red even though nothing is actually wrong.
+ * This is a DELIBERATE trade-off, not an oversight: a check that occasionally
+ * demands a human judgment call on a rare, specific sentence shape is worth
+ * more than one that stays silent forever while a reason quietly rots — the
+ * same judgment this repo's own `BASE_MERGE_CAVEAT`
+ * (`merge-check-guard.test.ts`) makes explicit for its own known hole: "this
+ * assertion SHOULD go red... telling you the pinned text must be updated,
+ * not that the test is broken." If this check ever fires on a genuine
+ * non-teaching mention: either verify the verb really is now taught and
+ * flip its entry to `taught: true`, or rephrase the brief so the mention
+ * isn't a bare/paren-call-shaped backticked span (`extractVerbs`'s own doc
+ * comment already names this exact imprecision — "does not understand
+ * prose... beyond pulling out the verb itself" — as a pre-existing,
+ * accepted limit of the extraction rule, not something new introduced
+ * here) — never delete or weaken this check to silence a real,
+ * honestly-explained false positive.
  */
 
 export type BriefCoverageEntry =
