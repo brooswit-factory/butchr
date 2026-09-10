@@ -39,6 +39,22 @@ export interface Config {
    */
   parkedMinutes: number;
   /**
+   * BUTCHR-200: minutes a worker must sit continuously ABANDONED (its own
+   * Implements boss observed Done while it is still open) before the
+   * abandoned-worker detector's stage 1 escalation comment fires (see
+   * src/agents/abandoned.ts) — also the interval between each subsequent
+   * stage. Deliberately NOT `parked.ts`'s default (10): unlike a To-Do child
+   * under a live boss (never legitimate), a boss closing moments before it
+   * discharges its last worker is a real ordering race, not a fault — too
+   * short a threshold would fire on that race routinely. Default 30: three
+   * times `parkedMinutes`, comfortably clear of any conceivable race
+   * (seconds, not minutes, given this daemon's own 15s poll cadence) while
+   * still surfacing the state roughly 4-5x faster than the one historical
+   * instance this detector exists for (BUTCHR-127/BUTCHR-159, discharged by
+   * hand 2h15m later — considered too slow).
+   */
+  abandonedMinutes: number;
+  /**
    * BUTCHR-95/123: minutes a resource must read `"asleep"` with its agent
    * STILL RUNNING, continuously, before `atRest` (src/reconcile/plan.ts)
    * stops protecting it indefinitely and the frozen-asleep detector (see
@@ -171,6 +187,7 @@ export interface ConfigEnv {
   BUTCHR_GITHUB_ORGS?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
+  BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_CRASHLOOP_COUNT?: string | undefined;
   BUTCHR_CRASHLOOP_WINDOW_MINUTES?: string | undefined;
@@ -206,6 +223,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
+  const abandonedMinutes = env.BUTCHR_ABANDONED_MINUTES ? Number(env.BUTCHR_ABANDONED_MINUTES) : 30;
+  if (!Number.isFinite(abandonedMinutes) || abandonedMinutes <= 0) throw new Error(`BUTCHR_ABANDONED_MINUTES is not a positive number: ${env.BUTCHR_ABANDONED_MINUTES}`);
+
   const atRestMinutes = env.BUTCHR_ATREST_MINUTES ? Number(env.BUTCHR_ATREST_MINUTES) : 10;
   if (!Number.isFinite(atRestMinutes) || atRestMinutes <= 0) throw new Error(`BUTCHR_ATREST_MINUTES is not a positive number: ${env.BUTCHR_ATREST_MINUTES}`);
 
@@ -235,6 +255,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     parkedMinutes,
+    abandonedMinutes,
     atRestMinutes,
     crashLoopCount,
     crashLoopWindowMinutes,
@@ -352,7 +373,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +

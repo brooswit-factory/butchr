@@ -317,13 +317,14 @@ export interface AtlassianOps {
    * (src/tools/defs.ts) originally read an in-review epic's comments via
    * plain `getIssue`'s EMBEDDED `fields.comment` block, which is
    * ASCENDING/oldest-first (MEASURED live) with an unconfirmed cap — if
-   * that block is ever truncated, `newestCommentId` over it silently
-   * returns a STALE id, disagreeing with discovery's own reader (which is
-   * newest-first and therefore always correct regardless of any cap). Two
-   * readers of "the same fact" that can disagree is exactly the class of
-   * bug this epic has already ruled against twice (the Confluence comment
-   * capability itself, and `getPageComments`) — "one reader, not two".
-   * This op is that one reader, reused by both discovery and `check_in`.
+   * that block is ever truncated, deriving "newest" from it (BUTCHR-227:
+   * or, as of this ticket, deriving the full SEEN SET from it) silently
+   * omits comments discovery's own reader (this op) would have returned,
+   * disagreeing with discovery. Two readers of "the same fact" that can
+   * disagree is exactly the class of bug this epic has already ruled
+   * against twice (the Confluence comment capability itself, and
+   * `getPageComments`) — "one reader, not two". This op is that one
+   * reader, reused by both discovery and `check_in`.
    */
   getIssueComments(key: string): Promise<{ results: Array<{ id: string }> }>;
 }

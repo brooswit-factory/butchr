@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as ts from "typescript";
 import { listTsFiles } from "../labels/label-scan.js";
+import type { BlindSpotEntry } from "../media/blind-spot.js";
 
 /**
  * BUTCHR-151/BUTCHR-157 — the description-header medium's source-scanning
@@ -52,37 +53,14 @@ import { listTsFiles } from "../labels/label-scan.js";
  * `label-scan.ts` for the concrete SWEEP_JQL case this same class of bug
  * produces when text regexes are used instead.
  *
- * WHAT THIS CANNOT SEE (write this down; a scanner with a silent bypass is
- * the exact failure this whole rule exists to catch):
- *   - A header block whose OPENING line is not itself a single, whole
- *     string literal — e.g. built entirely by runtime concatenation or
- *     interpolation with no literal anywhere containing the full
- *     `[TAG] ...` prefix (`` `[${tagVar}] rest` `` where `tagVar` is not a
- *     literal). Neither of today's two real headers (`ORPHAN_HEADER_OPEN_LINE`,
- *     `ADOPTED_HEADER_OPEN_LINE`, both in `src/tools/relationship.ts`) falls
- *     into this hole — both opening lines are single whole string literals,
- *     the second one BECAUSE this exact hole caught it in review first (see
- *     above) — but a future header built more dynamically still could. This
- *     is the same species of blind spot `label-scan.ts` names for `agent:*`/`pr:*`
- *     (label built by prefix + suffix concatenation, no literal for the
- *     whole value); the type-level door (`DescriptionHeaderKind`) is what a
- *     header shaped that way must still pass through to compile, exactly as
- *     `RegisteredLabel`'s type door is what actually covers `agent:*`/
- *     `pr:*` today, never the literal scan.
- *   - `test/` and `scripts/`. Only `src/` is scanned — see above.
- *   - A bracketed-all-caps-tag-shaped literal that is NOT actually a
- *     description-header opening line (a log-line prefix, an error-code
- *     tag, anything else that happens to match the shape). None exist in
- *     this repo's `src/` today (verified: `grep -rnoE '"\[[A-Z][A-Z0-9_
- *     -]*\]' src/` finds exactly two matches, `"[ORPHAN]` and `"[ADOPTED]` —
- *     both real description-header opening lines, both registered). A
- *     genuine future false positive is handled the same way `label-scan.ts`
- *     handles its own — an explicit,
- *     named entry in `KNOWN_NON_HEADER_LITERALS` below, never by weakening
- *     the pattern or skipping a whole file, and never to make a real
- *     finding disappear.
- *   - Non-`.ts` files, and anything generated (none checked in under `src/`
- *     today; re-examine this assumption if that changes).
+ * WHAT THIS CANNOT SEE: see `HEADER_BLIND_SPOTS` below — the enumerable
+ * source of truth (BUTCHR-224), each entry with either an executable witness
+ * (a test that constructs the claimed-invisible input, confirms silence,
+ * and pairs it with a near-miss variant that IS detected) or a written
+ * `noWitnessReason`. This comment stops enumerating the claims in prose,
+ * on purpose: a second, independently-driftable copy of the same list is
+ * exactly the drift BUTCHR-224 exists to remove. The substantive reasoning
+ * for each claim now lives in that entry's own `claim` field, not here.
  */
 
 const HEADER_TAG_RE = /^\[([A-Z][A-Z0-9_]*)\]/;
@@ -169,3 +147,41 @@ export function scanDirForHeaderTagLiterals(srcDir: string, repoRoot: string): H
   }
   return hits;
 }
+
+/**
+ * BUTCHR-224. Every blind spot this scanner's own module header (above)
+ * used to enumerate in prose, now an enumerable value with a type-level door
+ * (`Record` keyed by a closed union fails to compile in both directions —
+ * an excess key or a missing one — the same door `WORKSPACE_PLACEHOLDERS`'s
+ * `Record<WorkspacePlaceholder, string>` and `MEDIA_REGISTRY`'s
+ * `Readonly<Record<Medium, ...>>` already hold their own families honest
+ * with). See `test/unit/header-registry.test.ts` for the witness or the
+ * `noWitnessReason` this drives for each entry below, and `src/media/
+ * blind-spot.ts` for what "witness" and "noWitnessReason" mean here and the
+ * runtime link that makes a declared-but-unwritten witness fail the suite.
+ */
+export const HEADER_BLIND_SPOT_IDS = ["templateLiteralOpeningLine", "unscannedDirectories", "nonHeaderLookalike", "nonTsFiles"] as const;
+export type HeaderBlindSpotId = (typeof HEADER_BLIND_SPOT_IDS)[number];
+
+export const HEADER_BLIND_SPOTS: Readonly<Record<HeaderBlindSpotId, BlindSpotEntry>> = {
+  templateLiteralOpeningLine: {
+    claim:
+      "A header block whose OPENING line is not itself a single, whole string literal — e.g. built entirely by runtime concatenation or interpolation with no literal anywhere containing the full `[TAG] ...` prefix (`` `[${tagVar}] rest` `` where `tagVar` is not a literal). `ts.isStringLiteralLike` matches `StringLiteral` and `NoSubstitutionTemplateLiteral` but NOT a `TemplateExpression` (a template containing `${...}`). PROVEN AGAINST A REAL SECOND HEADER, NOT JUST ARGUED (BUTCHR-157, review fix): this ticket's OWN fix originally shipped `retireOrphanHeader`'s `[ADOPTED]` successor line as a template literal WITH substitutions, invisible to this exact scanner, caught only in human review — fixed by hoisting the tag-bearing prefix into its own whole-literal constant (`ADOPTED_HEADER_OPEN_LINE`, `src/tools/relationship.ts`). Neither of today's two real headers (`ORPHAN_HEADER_OPEN_LINE`, `ADOPTED_HEADER_OPEN_LINE`) falls into this hole today — but a future header built more dynamically still could. Same species of blind spot `label-scan.ts` names for `agent:*`/`pr:*` (label built by prefix + suffix concatenation, no literal for the whole value); the type-level door (`DescriptionHeaderKind`) is what a header shaped that way must still pass through to compile, never this scanner.",
+    witness: "header:template-literal-opening-line",
+  },
+  unscannedDirectories: {
+    claim:
+      "`test/` and `scripts/` are not scanned — only `src/` is, because `scanDirForHeaderTagLiterals` is always called with `srcDir` fixed to the repo's `src/` directory (see `test/unit/header-registry.test.ts`'s own call). `test/` fixtures use header-shaped literals freely by design (e.g. this scanner's own test file), and `scripts/` is operator tooling, not the write path.",
+    witness: "header:unscanned-directories",
+  },
+  nonHeaderLookalike: {
+    claim:
+      "A bracketed-all-caps-tag-shaped literal that is NOT actually a description-header opening line (a log-line prefix, an error-code tag, anything else that happens to match the shape). None exist in this repo's `src/` today (verified: `grep -rnoE '\"\\[[A-Z][A-Z0-9_-]*\\]' src/` finds exactly two matches, `\"[ORPHAN]` and `\"[ADOPTED]`, both real, both registered). This scanner cannot tell such a literal apart from a real header by shape alone — a genuine future false positive is handled by an explicit, named entry in `KNOWN_NON_HEADER_LITERALS` above, never by weakening `HEADER_TAG_RE` or skipping a whole file, and never to make a real finding disappear.",
+    witness: "header:non-header-lookalike",
+  },
+  nonTsFiles: {
+    claim:
+      "Non-`.ts` files, and anything generated (none checked in under `src/` today; re-examine this assumption if that changes) — `listTsFiles` (`../labels/label-scan.js`) only collects names ending `.ts` (and excludes `.d.ts`), so an identical header-tag-shaped literal sitting in, say, a `.md` or `.json` file under `src/` is never even read.",
+    witness: "header:non-ts-files",
+  },
+};

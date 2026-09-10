@@ -52,6 +52,36 @@ describe("AtlassianClient", () => {
     const issues = await c.search("x");
     expect("issuelinks" in issues[0]!).toBe(false);
   });
+  // BUTCHR-200: MEASURED live against the real endpoint+fields AtlassianClient#search
+  // uses (BUTCHR-192, see src/atlassian/types.ts's IssueLink doc comment) —
+  // Jira hydrates {issuetype, priority, status, summary} on the stub. This
+  // fixture reproduces only the field the parser reads (`fields.status.name`),
+  // matching FIXTURE DISCIPLINE: shaped like the real payload's status
+  // sub-object, not a flat string a real caller could never produce.
+  test("search maps the boss's status onto the worker's own inward Implements stub, when the payload carries it", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "KAN-757", fields: { summary: "s", issuelinks: [
+        { id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759", fields: { status: { name: "Done" } } } },
+      ] } }] },
+    }));
+    const issues = await c.search("x");
+    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759", status: "Done" }]);
+  });
+  test("search leaves the stub's status UNDEFINED (never a fabricated 'not Done') when the payload's stub carries no nested fields at all", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "KAN-757", fields: { summary: "s", issuelinks: [
+        { id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } },
+      ] } }] },
+    }));
+    const issues = await c.search("x");
+    expect("status" in issues[0]!.issuelinks![0]!).toBe(false);
+  });
+  test("links maps status on an outward stub too (both directions carry it, per the measurement)", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-759": { fields: { issuelinks: [
+      { id: "10595", type: { name: "Implements" }, outwardIssue: { key: "KAN-757", fields: { status: { name: "In Progress" } } } },
+    ] } } }));
+    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757", status: "In Progress" }]);
+  });
   test("links reads both directions", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-1": { fields: { issuelinks: [
       { type: { name: "Blocks" }, outwardIssue: { key: "KAN-2" } },
