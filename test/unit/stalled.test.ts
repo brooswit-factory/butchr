@@ -47,6 +47,37 @@ describe("StalledTracker", () => {
     expect(t.observe("KAN-1", "working")).toBe(false);
   });
 
+  // BUTCHR-207 (the epic) conditioned accepting BUTCHR-279's tradeoff — that
+  // widening stalled-eligibility to worked agents extends the "idle/done for
+  // the whole window looks identical to becalmed" risk from never-worked
+  // agents to worked ones — on this exact case being exercised for a
+  // genuinely long window, with the idle-dip-between-turns shape REPEATED
+  // across the run, not proven once. Ten hours, thirty turns, a brief
+  // between-turn idle dip every turn, every dip comfortably under the
+  // 10-minute window, every single observation asserted false — not just the
+  // end state. A regression where a working observation only intermittently
+  // reset the floor, or where dips accumulated across turns instead of each
+  // one re-arming independently, would sail through a short version of this
+  // test but cannot survive this one.
+  test("a healthy long-running agent, turn-taking between working and brief idle dips for hours, never becomes a candidate at any point in the run", () => {
+    let now = 0;
+    const t = new StalledTracker(() => now, 10);
+    const CYCLE_MS = 20 * 60_000; // 20 minutes per turn
+    const DIP_MS = 5 * 60_000; // 5-minute idle dip between turns — under the 10-minute window
+    for (let turn = 0; turn < 30; turn++) {
+      const turnStart = turn * CYCLE_MS;
+      now = turnStart;
+      expect(t.observe("KAN-1", "working")).toBe(false); // working: never a candidate
+      now = turnStart + (CYCLE_MS - DIP_MS); // turn ends, brief idle dip begins
+      expect(t.observe("KAN-1", "idle")).toBe(false); // dip just started: floor re-armed here, not qualified
+      now = turnStart + CYCLE_MS - 60_000; // 4 minutes into the dip: still under the window
+      expect(t.observe("KAN-1", "idle")).toBe(false);
+      // next turn's `working` observation (top of the next loop iteration)
+      // breaks this dip's streak again before it could ever reach 10 minutes.
+    }
+    // Total simulated span: 30 * 20min = 10 hours, none of it ever qualifying.
+  });
+
   test("a dip to idle between turns, followed by working again before the window elapses, never qualifies — the floor re-arms on every break, it does not accumulate across them", () => {
     let now = 0;
     const t = new StalledTracker(() => now, 10);
@@ -217,6 +248,33 @@ describe("createStalledCheck", () => {
     expect(await check.check("KAN-1", "idle")).toBe(true);
     now = 16 * 60_000;
     expect(await check.check("KAN-1", "working")).toBe(false);
+  });
+
+  // BUTCHR-207's binding condition on this ticket's tradeoff, one layer above
+  // the bare tracker's own version of this test above: a genuinely long
+  // `working`-reported run, turn-taking with a repeated between-turn idle
+  // dip, must never resolve stalled=true at any point — not exercised once,
+  // not exercised briefly. Ten hours, thirty turns, asserted false on every
+  // single observation of the run.
+  test("a healthy long-running agent, turn-taking between working and brief idle dips for hours, is never stalled=true at any point in the run", async () => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [],
+      accountEmail: "daemon@example.com",
+    });
+    const CYCLE_MS = 20 * 60_000;
+    const DIP_MS = 5 * 60_000;
+    for (let turn = 0; turn < 30; turn++) {
+      const turnStart = turn * CYCLE_MS;
+      now = turnStart;
+      expect(await check.check("KAN-1", "working")).toBe(false);
+      now = turnStart + (CYCLE_MS - DIP_MS);
+      expect(await check.check("KAN-1", "idle")).toBe(false);
+      now = turnStart + CYCLE_MS - 60_000; // 4 minutes into the dip
+      expect(await check.check("KAN-1", "idle")).toBe(false);
+    }
   });
 
   test("an agent that worked and then disappeared entirely (sustained none) is never stalled", async () => {

@@ -800,5 +800,49 @@ describe("createLabelSync", () => {
       expect(st.current()).toEqual(["agent:none"]); // never agent:stalled
       expect(posted).toEqual([]); // remediator never invoked with labelApplied=true
     });
+
+    // BUTCHR-207's binding condition on this ticket's tradeoff, given the
+    // same end-to-end treatment as the sustained-none case above: a
+    // genuinely long `working`-reported run, turn-taking with a repeated
+    // between-turn idle dip, must never write agent:stalled or reach the
+    // remediator — asserted after EVERY poll across the run, not just at the
+    // end, so a regression that only intermittently held the guard cannot
+    // hide between assertions.
+    test("DOES NOT FIRE: a healthy long-running agent, turn-taking between working and brief idle dips for hours, never becomes agent:stalled and never reaches the remediator", async () => {
+      let now = 0;
+      let agentState = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: async () => [], accountEmail: "daemon@example.com" });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); },
+        comments: async () => [],
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", agentState]]), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      const CYCLE_MS = 20 * 60_000; // 20-minute turn
+      const DIP_MS = 5 * 60_000; // 5-minute idle dip between turns — under the 10-minute stall window
+      for (let turn = 0; turn < 30; turn++) {
+        const turnStart = turn * CYCLE_MS;
+
+        now = turnStart; agentState = "working";
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+
+        now = turnStart + (CYCLE_MS - DIP_MS); agentState = "idle";
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+
+        now = turnStart + CYCLE_MS - 60_000; // 4 minutes into the dip — still well under the window
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+      }
+
+      // Total simulated span: 30 * 20min = 10 hours, ninety polls, never once
+      // reaching agent:stalled and never once invoking the remediator.
+      expect(posted).toEqual([]);
+    });
   });
 });
