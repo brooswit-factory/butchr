@@ -258,33 +258,62 @@ a bound cannot afford:
   job (which is to make growth impossible once over budget, not merely to
   make *apparent* growth impossible).
 
-**The fix:** `estimateStoredLength()` (`src/tools/docs.ts`) puts `proposed`
-into the same representation `stored` is already in — whatever
-`get_doc`/`confluence_get_page` returns is already post-transform — by
-applying `KNOWN_STORAGE_ENTITY_ENCODINGS`, a small, explicit table of the
-characters this corpus has actually observed Confluence re-encoding (the em
-dash, en dash, ellipsis, both arrow glyphs, curly quotes, and `Δ` — the
-literal character the review's second measurement produced). Both
-`refuseIfGrowingOverBudget`'s clauses now compare against
+**First fix (this PR's first round): `estimateStoredLength()`** puts
+`proposed` into the same representation `stored` is already in — whatever
+`get_doc`/`confluence_get_page` returns is already post-transform — instead
+of comparing raw lengths. Its first version used a small, hand-picked table
+of 10 characters this corpus had actually been observed round-tripping (em
+dash, en dash, ellipsis, both arrow glyphs, curly quotes, `Δ`), framed
+honestly as a known-subset approximation, not a claim of completeness.
+
+**Second review round measured the EXACT boundary, closing the residual
+rather than merely narrowing it.** The reviewer probed 20 characters
+deliberately chosen as *not* in that first table — ordinary prose/typography
+like `× ° é • ≥ ½ ± § © µ à ü ñ ∞ ≈ † ‰ € ™ ·` — and every one came back
+re-encoded. Then a boundary probe: 7 characters with a standard HTML4 named
+entity (`Ω ∂ ℵ ♠ ⌈ ∴ ⊕`) all came back encoded; 10 characters with no
+standard named entity (`漢 😀 ʃ ŧ ǽ ᴀ ค ж א ᚠ` — CJK, emoji, IPA, other-script
+letters) all survived literal. Seventeen for seventeen, no exception either
+direction. **The measured rule: Confluence's storage layer re-encodes a
+character if and only if it has a standard HTML 4 named character
+reference.**
+
+That rule has a name and a size — HTML 4.01 defines exactly 252 of these
+(§24.2 ISO 8859-1, §24.3 symbols/math/Greek, §24.4 markup-significant and
+internationalization characters) — so the fix is to use the *complete* set,
+not a hand-picked slice of it. `src/tools/html4-named-entities.generated.ts`
+is that complete table, **vendored from the W3C HTML 4.01 spec itself**
+(`scripts/vendor/html4-entities.ts` fetches
+`https://www.w3.org/TR/html4/sgml/entities.html` and mechanically parses its
+own `<!ENTITY name CDATA "&#code;">` declarations) rather than hand-typed —
+a 252-row table transcribed from memory is exactly where a silent
+transcription error hides, which is precisely what a review of a hand-picked
+10-row table had already caught once. `estimateStoredLength()` now replaces
+every character present in that table with its named entity; every other
+character passes through unchanged, per the measured rule. Both
+`refuseIfGrowingOverBudget`'s clauses compare against
 `estimateStoredLength(proposed)`, never `proposed.length` directly.
+
 `test/unit/docs.test.ts` carries a regression arm using real non-ASCII
 characters (not `"a".repeat(...)`) that fails against the pre-fix
 raw-comparison code and passes against the fix — reverted and re-run by hand
 during this PR to confirm it is a genuine falsifier, not decoration.
+`test/unit/html4-named-entities.test.ts` separately pins the vendored
+table's exact size (252) and a set of representative rows — including every
+character either review round named — so a bad regeneration (wrong source,
+a parser bug, a truncated fetch) fails loudly instead of drifting silently.
 
-**This is still NOT a claim of completeness, and must not be read as one.**
-`KNOWN_STORAGE_ENTITY_ENCODINGS` is a known-subset model, explicitly not a
-full re-implementation of Confluence's storage transform — the same limit
-BUTCHR-235 already named (attribute ordering, whitespace, self-closing tags
-and empty-element normalisation were never tested, by either ticket). A
-character this list does not cover, that Confluence also happens to
-re-encode into a longer form, would still be invisible to this comparison,
-in the same permissive direction as before. What has changed is that the
-*specific, measured* failure mode — em dash and the one Greek letter
-actually observed live — is closed, and the mechanism for closing further
-instances (extend the table) is now in place rather than absent. Re-measure
-against realistic markup before trusting this is complete; it is a
-known-subset fix, not a proof of soundness.
+**What this closes, and what it still does not.** This closes the
+character-substitution residual EXACTLY, per the measured rule above — not
+an approximation this time, an exact model of it, confirmed against 37
+characters with zero exceptions in either direction. **It does not claim
+anything about BUTCHR-235's separate, still-unresolved caution** — attribute
+ordering, whitespace handling, self-closing tag forms and empty-element
+normalisation were never tested by either ticket, and a transform of THAT
+kind (not a character substitution) would still be invisible to this size
+comparison. This bound turns on size, not content, precisely because that
+residual is real; closing the character-substitution instance of it does
+not retire the broader caution.
 
 ## Read this next to `docs/tool-result-size-cap.md`
 
