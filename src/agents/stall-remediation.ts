@@ -64,13 +64,15 @@ const MAX_PER_HOUR = 3;
 interface Entry {
   /**
    * This module's OWN first observation of `agent:stalled` as the APPLIED
-   * label for this ticket — NOT the true idle-since-spawn floor
-   * stalled.ts's own StalledTracker keeps (that is a longer, earlier
-   * duration; already surfaced, without a number, by src/labels/sync.ts's
-   * own unconditional "[labels] <key> stalled: ..." line). Reported elapsed
-   * time is honest about what THIS module measured: how long it has
-   * continuously observed the label applied, the same relationship
-   * frozen-asleep.ts's own floor has to ITS candidate condition.
+   * label for this ticket — NOT the current-streak floor stalled.ts's own
+   * StalledTracker keeps (anchored to when the agent last stopped working,
+   * not to this module's own first sighting of the label; that is a longer,
+   * earlier duration; already surfaced, without a number, by
+   * src/labels/sync.ts's own unconditional "[labels] <key> stalled: ..."
+   * line). Reported elapsed time is honest about what THIS module measured:
+   * how long it has continuously observed the label applied, the same
+   * relationship frozen-asleep.ts's own floor has to ITS candidate
+   * condition.
    */
   firstObservedAt: number;
   /** Set once a wake comment has been posted (or adopted) for this continuous episode — from then on this ticket is reported suppressed on every call, with no further I/O, until it drops out of the candidate set. */
@@ -231,7 +233,7 @@ export interface StallRemediator {
    * verify this poll" — it never gates whether this module acts (that is
    * `labelApplied` alone). `realElapsedMinutes`, when supplied (src/labels/
    * sync.ts passes `stalled.elapsedMinutes(issue)`), is the GENUINE
-   * idle-since-spawn duration stalled.ts's own tracker measured — reported
+   * current-streak duration stalled.ts's own tracker measured — reported
    * in the wake comment in place of this module's own floor, which (since
    * this module acts on the very first poll it is eligible to, by design —
    * see the "footing parity" reasoning above) would otherwise always read
