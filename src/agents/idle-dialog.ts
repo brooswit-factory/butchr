@@ -9,11 +9,12 @@ import type { AgentStatusRow } from "./blocked.js";
  * (a real dialog sits a little longer before we notice), never fabricates
  * one.
  *
- * Unlike StalledTracker's `streakBroken` latch (permanent once the streak
- * breaks), this tracker's floor simply resets whenever the pane leaves
- * idle/done — a pane can go idle, work, then sit on a dialog again, and each
- * idle spell must be timed from ITS OWN start. There is no "has ever worked"
- * concept here; only "how long has it been idle/done RIGHT NOW".
+ * Same anchoring StalledTracker uses since BUTCHR-279: this tracker's floor
+ * resets whenever the pane leaves idle/done — a pane can go idle, work, then
+ * sit on a dialog again, and each idle spell must be timed from ITS OWN
+ * start. The two trackers are now consistent rather than deliberately
+ * different; there is no "has ever worked" concept in either — only "how
+ * long has it been idle/done RIGHT NOW".
  */
 export class IdleDialogTracker {
   private readonly since = new Map<string, number>();
