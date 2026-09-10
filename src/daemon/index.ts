@@ -39,6 +39,7 @@ import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
+import { createAdmissionController } from "../agents/admission.js";
 
 let config;
 try {
@@ -59,6 +60,21 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+// BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
+// the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
+// below, which are deliberately two SEPARATE instances) wired into BOTH
+// `runResourceLoop` calls below: the cap must bound the HOST, not each tier
+// independently (see that module's own top comment, Trap 1) — a per-tier
+// instance here would silently reintroduce exactly the bug this ticket
+// exists to close. `residency` reads the RAW `herd` above (the unscoped
+// `HerdrHerd` instance, before either loop's own `scopedHerd` wrapping),
+// which is the one seam that can see every `butchr-*` agent regardless of
+// which loop desired it.
+const admissionController = createAdmissionController({
+  cap: config.maxAgents,
+  residency: () => herd.runningIssues(),
+  log: (line) => console.error(`  ${line}`),
+});
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 const summaries = new Map<string, string>();
 
@@ -177,7 +193,7 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -474,6 +490,10 @@ runResourceLoop(issueResourceType, {
   // one most likely to actually clear a stranded workspace's grace period
   // quickly. See src/agents/reap.ts.
   checkReap: issueReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the project loop below
+  // also uses — see admissionController's own construction comment above
+  // for why this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -548,6 +568,10 @@ runResourceLoop(projectResourceType, {
   // (5min cadence) is still a valid independent chance to catch a candidate
   // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
   checkReap: projectReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the issue loop above
+  // also uses — see admissionController's own construction comment for why
+  // this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

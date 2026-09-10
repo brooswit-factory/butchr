@@ -254,6 +254,20 @@ export interface ReconcileOptions {
    * ticket).
    */
   checkReap?: () => Promise<void>;
+  /**
+   * BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts
+   * for the full mechanism (why a count cap, the two Trap-2 failure shapes,
+   * the bounded-mistrust window). Called with `(plan.spawn, plan.stop)`
+   * BEFORE `checkCrashLoop` and the spawn loop below, and its return value
+   * REPLACES `plan.spawn` for BOTH — unlike every other hook in this
+   * interface, this one is consulted for control flow, not merely observed.
+   * `plan.stop`/`plan.respawn` are never touched: only `plan.spawn` is
+   * admission-controlled (criterion 4 on the ticket — a respawn never
+   * consumes budget). Optional; omitted (every caller before this ticket,
+   * and any direct `reconcileNow` caller that doesn't opt in), `admitted`
+   * below is `plan.spawn` itself, unchanged — today's exact behaviour.
+   */
+  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
 }
 
 /**
@@ -323,12 +337,24 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     }
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
+  // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
+  // spawn loop below, and is the ONE hook in this function that actually
+  // replaces its input rather than merely observing it — see
+  // ReconcileOptions.admission's own doc comment and src/agents/admission.ts
+  // for the full mechanism. `admitted` (never `plan.spawn` directly) is what
+  // actually gets attempted below: a withheld candidate was never really
+  // spawned this poll, so it must not count toward `checkCrashLoop`'s own
+  // rolling window either — only a GENUINE attempt should. Omitted, `admitted`
+  // is `plan.spawn` itself (the same array), so every existing caller and
+  // test (including crash-loop.test.ts's own pinned "checkCrashLoop receives
+  // exactly plan.spawn" assertions) is unaffected.
+  const admitted = opts.admission ? await opts.admission(plan.spawn, plan.stop) : plan.spawn;
   // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
   // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
   // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
   // (not `plan.spawn`) is what the detector prunes its own tracking against —
   // the pruning trap that module's top comment names.
-  if (opts.checkCrashLoop) await opts.checkCrashLoop(plan.spawn, [...desired.keys()]);
+  if (opts.checkCrashLoop) await opts.checkCrashLoop(admitted, [...desired.keys()]);
   // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
   // freed THIS poll is available to THIS poll's spawns rather than sitting
   // idle an extra cycle. This ordering is not what makes an in-flight spawn
@@ -354,7 +380,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // failure is recorded into `failures` and never touches any other
   // resource's spawn this same `Promise.all`.
   const failures: ReconcileFailure[] = [];
-  await Promise.all(plan.spawn.map(async (issue) => {
+  await Promise.all(admitted.map(async (issue) => {
     try {
       await herd.spawn(desired.get(issue)!);
     } catch (e) {
@@ -572,6 +598,8 @@ export interface GenericLoopDeps<T> {
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   /** BUTCHR-245: see `ReconcileOptions.checkReap`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `Reaper` instance, same reasoning as `checkCrashLoop`/`checkReconcileFailure` above. Optional; omitted, no reclamation runs. */
   checkReap?: () => Promise<void>;
+  /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
+  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -656,6 +684,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
+        ...(deps.admission ? { admission: deps.admission } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
