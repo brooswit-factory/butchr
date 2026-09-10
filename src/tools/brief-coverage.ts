@@ -150,6 +150,11 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
   start_worker: { taught: true },
   shelve_worker: { taught: true },
   adopt_worker: { taught: true },
+  check_worker: {
+    taught: false,
+    reason:
+      "NOT a deprecated alias — unlike every other taught:false entry here, this is a live, current verb (BUTCHR-244). It is a DIAGNOSTIC reached for at the moment a specific question arises (\"is my worker actually staffed?\"), and the three verbs that raise that question — new_worker, start_worker and adopt_worker, all of which briefs do teach — each point at it from their own description's STAFFING paragraph, so an agent meets it exactly when it needs it (verified in defs.ts at this commit, not inherited: all three say \"use `check_worker` ... to actually find out\"). A brief teaching it up front would be teaching a check for a condition the agent has not hit yet. If that stops being true — if a brief starts naming it, or the sibling descriptions stop pointing at it — flip this entry rather than editing this reason to fit.",
+  },
   finish_worker: { taught: true },
   prioritize_worker: { taught: true },
   correct_worker: { taught: true },
