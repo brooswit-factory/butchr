@@ -15,7 +15,7 @@ export interface SyncDeps {
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
   prState?: (key: string) => Promise<PrLookup>;
-  /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
+  /** KAN-804/807: the "idle since it stopped working, never spoke" signal. Omitted disables agent:stalled entirely. */
   stalled?: StalledCheck;
   /**
    * BUTCHR-179: reports `stalled.check`'s three-state result on `/health`
@@ -189,7 +189,7 @@ export function createLabelSync(deps: SyncDeps) {
         // steady state) rather than as a new periodic log source of its own.
         if (stalledNow) {
           const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
-          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since first observed${elapsed != null ? ` (${elapsed}m)` : ""}, zero comments from this account for the configured window`);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}, zero comments from this account for the configured window`);
         }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a
