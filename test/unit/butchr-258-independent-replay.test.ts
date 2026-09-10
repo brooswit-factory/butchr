@@ -10,6 +10,7 @@ import {
   type ProjectResourceDeps,
   type ProjectWatermark,
 } from "../../src/resources/project.js";
+import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
@@ -663,6 +664,90 @@ describe("SECTION 6 — THE PRIMARY CHECK: seen and woke are different facts, on
     await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-1": before!.observedEpics[0]!.commentIds } });
     const stored = w.properties.get("ACME")!.wake as { epicsSeen: Record<string, string[]> };
     expect(new Set(stored.epicsSeen["ACME-1"])).toEqual(new Set(["50", "51"])); // 50 re-recorded despite waking nothing
+  });
+});
+
+// ===========================================================================
+// SECTION 6b — THE check_in SEAM, closed: Section 6 above drives
+// `advanceProjectWatermark` with a HAND-CONSTRUCTED `seenComments` array —
+// exactly the value the primary check's own falsifier doubts ("if `check_in`
+// records anything less than every observed id..."). A fixture whose
+// starting state equals the state under test can never detect a wrong
+// write (BUTCHR-156's rule) — so Section 6 alone cannot tell you whether the
+// REAL `check_in` MCP handler (src/tools/defs.ts) actually passes the full
+// observed set, only that `advanceProjectWatermark` unions whatever it is
+// given. This section drives `tools.check_in!.handler` itself, the same
+// construction the sibling suite (test/unit/tools.test.ts's own
+// `checkInRig`) already uses — verify that pattern at your own checkout
+// before trusting this one.
+//
+// THIS TEST IS GENUINELY PRE-REGISTERED BY THIS FILE'S CURRENT AUTHOR, not
+// inherited: written and run for the first time this session, falsifier
+// stated below BEFORE it was run, unedited since.
+// ===========================================================================
+describe("SECTION 6b — THE check_in SEAM: the REAL handler (src/tools/defs.ts), not a stand-in for it", () => {
+  // FALSIFIER, stated before running: if `seenComments` handed to storage
+  // after this call is anything other than the FULL observed set (both the
+  // already-seen id that wakes nothing, and the new one that does), that
+  // means `check_in`'s own handler — not `advanceProjectWatermark`, which
+  // Section 6 already covers — is the one that drops something. This is the
+  // one seam a mutation on `src/tools/defs.ts` itself (e.g. slicing
+  // `seenComments` to one id) can be caught at; Section 6 cannot reach this
+  // seam by construction, since it never calls this handler.
+  test("real check_in handler: a mixed poll (one already-seen id, one new id) writes the FULL observed set, not the waking subset", async () => {
+    const properties = new Map<string, unknown>([["ACME", { space: { key: "ACME" }, rootDoc: { id: "doc-A" }, wake: { version: 1, commentsSeen: ["100"], epicsSeen: {} } }]]);
+    const unimplemented = (name: string) => async (..._a: unknown[]) => {
+      throw new Error(`fake ops: ${name} not used by this test`);
+    };
+    const ops: AtlassianOps = {
+      getIssue: unimplemented("getIssue"),
+      search: async () => ({ issues: [] }), // no epics in review — this test's own scope is the comment axis
+      addComment: unimplemented("addComment"),
+      linkIssues: unimplemented("linkIssues"),
+      transition: unimplemented("transition"),
+      createIssue: unimplemented("createIssue"),
+      setPriority: unimplemented("setPriority"),
+      assign: unimplemented("assign"),
+      createPage: unimplemented("createPage"),
+      getPage: async () => ({ title: "Acme root doc", body: { storage: { value: "" } }, _links: { base: "", webui: "" } }),
+      updatePage: unimplemented("updatePage"),
+      searchPages: unimplemented("searchPages"),
+      listSpaces: unimplemented("listSpaces"),
+      getRemoteLink: unimplemented("getRemoteLink"),
+      upsertRemoteLink: unimplemented("upsertRemoteLink"),
+      getChildPages: unimplemented("getChildPages"),
+      getPageLabels: unimplemented("getPageLabels"),
+      createPageWithLabel: unimplemented("createPageWithLabel"),
+      addLabels: unimplemented("addLabels"),
+      removeLabels: unimplemented("removeLabels"),
+      deleteIssue: unimplemented("deleteIssue"),
+      correctText: unimplemented("correctText"),
+      commentOnPage: unimplemented("commentOnPage"),
+      getMyself: async () => ({ accountId: "acct-A" }),
+      searchProjects: async () => ({ values: [{ key: "ACME", name: "Acme", lead: { accountId: "acct-A" } }] }),
+      getProjectProperty: async (key: string) => {
+        const p = properties.get(key);
+        if (!p) throw new Error(`fake: 404, no "butchr" property for ${key}`);
+        return p;
+      },
+      getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
+      setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        properties.set(key, value as Record<string, unknown>);
+        return { ok: true };
+      },
+      getPageVersions: async (ids: readonly string[]) => Object.fromEntries(ids.map((id) => [id, 1])),
+      // 100 already seen (wakes nothing), 200 new — the SAME mixed-poll
+      // shape Section 6 uses, but observed through the real handler's own
+      // read, not handed in by the test.
+      getPageComments: async () => ({ results: [{ id: "100", body: "" }, { id: "200", body: "" }] }),
+      getIssueComments: async () => ({ results: [] }),
+    };
+    const tools = atlassianTools(ops, () => {});
+    const conn = { headers: { "x-issue": "ACME" } } as any;
+    const result = (await tools.check_in!.handler({}, conn)) as { seenComments: string[] };
+    expect(result.seenComments).toEqual(["100", "200"]); // the handler's OWN return already claims the full set
+    const stored = (properties.get("ACME") as any).wake as { commentsSeen: string[] };
+    expect(new Set(stored.commentsSeen)).toEqual(new Set(["100", "200"])); // and storage actually got both, not just the one that woke anything
   });
 });
 
