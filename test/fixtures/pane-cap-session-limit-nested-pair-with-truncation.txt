@@ -1,0 +1,11 @@
+⏺ Called butchr (ctrl+o to expand)
+
+  ⎿  ## Gate 2 — the tail window is off by one
+     Every genuine parked pane renders the same lines:
+
+     ⎿  You've hit your session limit · resets 5:10pm (America/Los_Angeles)
+     /usage-credits to finish what you're working on.
+
+     … +19 lines (ctrl+o to expand)
+
+⏺ Now let me implement the guard.
