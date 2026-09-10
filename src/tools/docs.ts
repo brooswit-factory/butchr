@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isApiError } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
 
@@ -97,10 +98,11 @@ export function findBossKey(issue: unknown): string | null {
   return null;
 }
 
-/** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. */
+/** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. `summary` (BUTCHR-244) is the same stub's hydrated `fields.summary` — present in the SAME measured field set as `status` (see `findWorkers`'s own doc comment), so reading it costs nothing beyond what `status` already costs; used by `new_worker`'s idempotency check (relationship.ts's `findDuplicateWorker`) to match a retry against the caller's own not-Done children with no extra Jira call. */
 export interface WorkerRef {
   key: string;
   status: string | undefined;
+  summary: string | undefined;
 }
 
 /**
@@ -131,11 +133,11 @@ export interface WorkerRef {
 export function findWorkers(issue: unknown): WorkerRef[] {
   const links = (issue as { fields?: { issuelinks?: unknown[] } })?.fields?.issuelinks ?? [];
   const workers: WorkerRef[] = [];
-  for (const l of links as Array<{ type?: { name?: string }; outwardIssue?: { key?: string; fields?: { status?: { name?: string } } } }>) {
+  for (const l of links as Array<{ type?: { name?: string }; outwardIssue?: { key?: string; fields?: { status?: { name?: string }; summary?: string } } }>) {
     // On the BOSS (this ticket), a worker appears as `outwardIssue` — the
     // mirror image of findBossKey's `inwardIssue` read above.
     if (l?.type?.name === "Implements" && l.outwardIssue?.key) {
-      workers.push({ key: l.outwardIssue.key, status: l.outwardIssue.fields?.status?.name });
+      workers.push({ key: l.outwardIssue.key, status: l.outwardIssue.fields?.status?.name, summary: l.outwardIssue.fields?.summary });
     }
   }
   return workers;
@@ -162,6 +164,89 @@ export interface DocResult {
 }
 
 export type GetDocResult = { found: false } | ({ found: true } & DocResult);
+
+/** `chars` is string length (UTF-16 code units, i.e. what `.length` reports); `bytes` is UTF-8 byte length — carried separately because the incident this contract exists to fix reported "characters" while naming a "token" limit, and this project has already paid once for that unit ambiguity. */
+export interface WriteDigest {
+  chars: number;
+  bytes: number;
+  sha256: string;
+}
+
+/**
+ * `set_doc`'s new write receipt (BUTCHR-236, story BUTCHR-235). Replaces the
+ * old `DocResult`-shaped echo — which returned the caller's own input `body`
+ * back at it, proving nothing about what actually landed, and which scaled
+ * with document size (an oversize doc turned a SUCCESSFUL write into an
+ * error indistinguishable from a failed one). This type is bounded — a few
+ * hundred bytes — AT EVERY ARM, for any document size: no body, no preview,
+ * no excerpt, ever.
+ *
+ * `landed` is the deliverable: `"confirmed"` means the page was re-read
+ * after the write and returned a body — the write landed. `"unconfirmed"`
+ * means the update call itself succeeded but the read-back did not; almost
+ * certainly landed, but "I could not check" is not "I checked and it
+ * differed" — keep the two apart.
+ *
+ * Byte-for-byte equality is NOT achievable on this surface (MEASURED:
+ * Confluence's storage-format normalisation rewrites ordinary prose on
+ * write — a literal em dash reads back as `&mdash;`), so `identical` is a
+ * convenience only, and MUST NOT be the only thing a caller reads:
+ * `identical: false` is the ORDINARY case on a healthy write, not an error.
+ * The numbers (`wrote` vs `stored`) are the primary, machine-readable
+ * signal — normalisation makes `stored` slightly LARGER than `wrote`, while
+ * truncation or mangling makes it dramatically SMALLER, so a caller can
+ * apply its own threshold instead of being taught how to read a boolean.
+ *
+ * `version` is the page's version number as reported on the read-back, or
+ * `null` when unavailable (e.g. `landed: "unconfirmed"`) — bounded,
+ * server-authoritative, and monotonic evidence that the write took effect.
+ *
+ * Nothing about this type can be produced by a throw except a genuinely
+ * failed write: `landed: "unconfirmed"` and `identical: false` are both
+ * ordinary, resolved results, never rejections.
+ */
+export interface SetDocResult {
+  id: string;
+  url: string;
+  title: string;
+  version: number | null;
+  wrote: WriteDigest;
+  stored: WriteDigest | null;
+  landed: "confirmed" | "unconfirmed";
+  identical: boolean | null;
+}
+
+function digest(body: string): WriteDigest {
+  const buf = Buffer.from(body, "utf8");
+  return { chars: body.length, bytes: buf.byteLength, sha256: createHash("sha256").update(buf).digest("hex") };
+}
+
+/**
+ * Builds the write receipt shared by `setDoc` and `setProjectDoc`: re-reads
+ * the page AFTER `updatePage` has already resolved, rather than trusting
+ * anything `updatePage` itself returned — a read-back is the only thing
+ * that can tell "landed" from "looked like it landed". The read-back is
+ * NEVER allowed to throw out of this function: a failed confirmation read
+ * is `landed: "unconfirmed"`, not a rejection, because a caller must be
+ * able to tell "the write failed" (a thrown error, from `updatePage`
+ * itself, above this call) apart from "the write very likely succeeded but
+ * this call couldn't confirm it" (this catch branch).
+ */
+async function buildReceipt(ops: AtlassianOps, id: string, url: string, title: string, body: string): Promise<SetDocResult> {
+  const wrote = digest(body);
+  try {
+    const page = (await ops.getPage(id)) as { version?: { number?: number }; body?: { storage?: { value?: string } } } | undefined;
+    const storedBody = page?.body?.storage?.value;
+    const version = page?.version?.number ?? null;
+    if (storedBody === undefined) {
+      return { id, url, title, version, wrote, stored: null, landed: "unconfirmed", identical: null };
+    }
+    const stored = digest(storedBody);
+    return { id, url, title, version, wrote, stored, landed: "confirmed", identical: stored.sha256 === wrote.sha256 };
+  } catch {
+    return { id, url, title, version: null, wrote, stored: null, landed: "unconfirmed", identical: null };
+  }
+}
 
 async function readLinkedPage(ops: AtlassianOps, key: string): Promise<DocResult | null> {
   const link = await ops.getRemoteLink(key, DOC_LINK_GLOBAL_ID);
@@ -241,11 +326,14 @@ export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Prom
  * concept (a freshly created per-ticket page needs a real title before it
  * can stop looking unwritten) — a root doc is provisioned ahead of time with
  * a real title already, so there is no provisional state to graduate out of.
+ *
+ * Returns a `SetDocResult` (BUTCHR-236) — a bounded receipt, never the
+ * body it just wrote — built by `buildReceipt`'s own post-write read-back.
  */
-export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<DocResult> {
+export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<SetDocResult> {
   const doc = await projectRootDoc(ops, projectKey);
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
-  return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
+  return buildReceipt(ops, doc.id, doc.url, title ?? doc.title, body);
 }
 
 /**
@@ -435,8 +523,11 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
  * Only do this when the title actually changed: a body-only write touches
  * nothing the link displays, and an unconditional upsert would bump the
  * ticket's `updated` on every doc write, waking a boss for a non-event.
+ *
+ * Returns a `SetDocResult` (BUTCHR-236) — a bounded receipt, never the body
+ * it just wrote — built by `buildReceipt`'s own post-write read-back.
  */
-export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<DocResult> {
+export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<SetDocResult> {
   const doc = await ensureDoc(ops, key);
   if (isProvisional(doc.title) && !title) {
     throw new Error(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
@@ -446,5 +537,5 @@ export async function setDoc(ops: AtlassianOps, key: string, body: string, title
   if (title && title !== doc.title) {
     await ops.upsertRemoteLink(key, DOC_LINK_GLOBAL_ID, "documented by", { title: finalTitle, url: doc.url });
   }
-  return { id: doc.id, url: doc.url, title: finalTitle, body };
+  return buildReceipt(ops, doc.id, doc.url, finalTitle, body);
 }

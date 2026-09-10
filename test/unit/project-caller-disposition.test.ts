@@ -118,6 +118,9 @@ const DISPOSITIONS: Record<string, Disposition> = {
   adopt_worker: "permitted",
   finish_worker: "permitted",
   prioritize_worker: "permitted",
+  // BUTCHR-244: same ownership gate as start_worker (assertOwnWorker's
+  // existing isProjectId branch — membership, not a link), reused as-is.
+  check_worker: "permitted",
   // BUTCHR-41/BUTCHR-60: deliberately PERMITTED — a project agent may
   // correct one of its own epics — with NO gate call at all. This is the
   // verb that proves "calls refuseProjectCaller" cannot be this guard's
