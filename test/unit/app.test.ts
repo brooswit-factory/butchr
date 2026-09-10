@@ -9,6 +9,7 @@ import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const opened: string[] = [];
+const openedPanes: string[] = [];
 // BUTCHR-57: /health now reports TWO components — pollLoop (the fetch
 // stage) and notify (the notify stage, this ticket) — so this fixture,
 // which previously hardcoded a one-element array, must reflect the real
@@ -20,9 +21,20 @@ const healthy = {
     { name: "notify", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 },
   ],
 };
+// BUTCHR-267: `openPane` fixture exercises the three outcomes the pane-keyed
+// attach route (criterion 8) must be able to reach — "w1:p3" (a colon-bearing
+// pane, per criterion 1) succeeds; "KAN-NO-TERM:p1" simulates no terminal
+// emulator configured; anything else is an unknown/not-live pane.
+const openPane = async (pane: string) => {
+  openedPanes.push(pane);
+  if (pane === "KAN-NO-TERM:p1") return { ok: false, error: "no terminal emulator found on this host (set BUTCHR_TERMINAL, e.g. \"alacritty -e\")" };
+  if (pane !== "w1:p3") return { ok: false, error: `no such live pane: ${pane} (not one of this daemon's own running agents)` };
+  return { ok: true };
+};
 const view = {
   state: async () => [{ issue: "KAN-9", status: "working", summary: "do a thing" }],
   open: async (issue: string) => { opened.push(issue); return issue === "KAN-BAD" ? { ok: false, error: "nope" } : { ok: true }; },
+  openPane,
   health: () => healthy,
 };
 const { app, mcp } = buildApp(view);
@@ -80,6 +92,49 @@ describe("butchr webapp + open action", () => {
   });
 });
 
+// BUTCHR-267: the dashboard row's pane-keyed terminal-attach link — an
+// ordinary GET a person can click (unlike the issue-keyed POST above, which
+// is `fetch()`-driven and never reachable via `<a href>`). Criterion 8 wants
+// the happy path, an unknown pane and no-emulator-configured, each asserted
+// on the specific human-readable text (criterion 5) rather than just the
+// status code.
+describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-267)", () => {
+  test("a live pane launches and reports what actually happened, in plain text", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("w1:p3")}/attach`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    // Criterion 6: never claims a window appeared — only that launching it
+    // was attempted, since the spawn is fire-and-forget.
+    expect(body).toContain("w1:p3");
+    expect(body).not.toMatch(/window (appeared|opened)/);
+    expect(openedPanes).toContain("w1:p3");
+  });
+  test("a colon-bearing pane id survives the route unmangled — criterion 1", async () => {
+    // Exercised again here, raw (unencoded) in the URL, since colon is a
+    // legal pchar and a dashboard link need not necessarily percent-encode it.
+    const r = await fetch(`${base}/agents/pane/w1:p3/attach`);
+    expect(r.status).toBe(200);
+    expect(await r.text()).toContain("w1:p3");
+  });
+  test("an unknown pane is refused with the specific reason, not a generic failure", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("nope:p9")}/attach`);
+    expect(r.status).toBe(409);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    expect(body).toContain("no such live pane");
+    expect(body).toContain("nope:p9");
+  });
+  test("no terminal emulator configured is refused with ITS OWN specific reason, distinct from unknown-pane", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("KAN-NO-TERM:p1")}/attach`);
+    expect(r.status).toBe(409);
+    const body = await r.text();
+    expect(body).toContain("no terminal emulator found");
+    expect(body).toContain("BUTCHR_TERMINAL");
+    expect(body).not.toContain("no such live pane");
+  });
+});
+
 // KAN/BUTCHR-18 (BUTCHR-6): /health must go red when the poll loop stops
 // completing cycles, and recover once it resumes — driven through the REAL
 // startLoop/buildApp composition and a real listening app, not a fake-clock
@@ -92,6 +147,7 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => health.status(),
     });
     app.listen(0);
@@ -181,6 +237,7 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([pollHealth, notifyHealth]),
     });
     app.listen(0);
@@ -285,6 +342,7 @@ describe("/health carries build identity as a sibling of components, never insid
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], build),
     });
     app.listen(0);
@@ -313,6 +371,7 @@ describe("/health carries build identity as a sibling of components, never insid
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
     });
     app.listen(0);
@@ -346,6 +405,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
     });
     app.listen(0);
@@ -379,6 +439,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
     });
     app.listen(0);
@@ -399,6 +460,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
     });
     app.listen(0);

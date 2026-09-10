@@ -27,3 +27,50 @@ export function detectTerminalPrefix(has: (cmd: string) => boolean): string[] | 
 
 /** Parse a `BUTCHR_TERMINAL` override ("alacritty -e") into a prefix. */
 export const parseTerminalEnv = (v: string): string[] => v.trim().split(/\s+/).filter(Boolean);
+
+/**
+ * The three ways a pane-keyed terminal-attach link (BUTCHR-267) can refuse,
+ * chosen to be a specific, human-readable message rather than a generic
+ * "could not open" a person clicking a link has no way to act on.
+ */
+export type AttachRefusal =
+  | { reason: "unknown-pane"; pane: string }
+  | { reason: "no-display" }
+  | { reason: "no-terminal" };
+
+/** Renders an `AttachRefusal` as the exact text a browser should show. */
+export function attachRefusalMessage(r: AttachRefusal): string {
+  switch (r.reason) {
+    case "unknown-pane":
+      return `no such live pane: ${r.pane} (not one of this daemon's own running agents)`;
+    case "no-display":
+      return "this daemon has no display to reach (neither DISPLAY nor WAYLAND_DISPLAY is set) — a terminal window cannot be opened here";
+    case "no-terminal":
+      return "no terminal emulator found on this host (set BUTCHR_TERMINAL, e.g. \"alacritty -e\")";
+  }
+}
+
+/**
+ * Pure decision for the pane-keyed attach link: given the pane the link
+ * named, the daemon's own live pane registry, its resolved terminal prefix,
+ * and whether it has a display to reach, decides whether to launch (and the
+ * exact argv, via `terminalCommand`) or which refusal applies.
+ *
+ * Order is deliberate: an unknown pane is refused first, regardless of
+ * terminal/display state — a typo'd or attacker-supplied pane should never
+ * be told "no display" as though it were otherwise a valid target (BUTCHR-267
+ * AC4). Between the two environment-level refusals, "no display" is checked
+ * first since it is the more fundamental problem — no terminal window can
+ * ever appear on this host regardless of which emulator is configured.
+ */
+export function resolveAttach(
+  pane: string,
+  livePanes: readonly string[],
+  terminalPrefix: readonly string[] | null,
+  hasDisplay: boolean,
+): { ok: true; argv: string[] } | { ok: false; refusal: AttachRefusal } {
+  if (!livePanes.includes(pane)) return { ok: false, refusal: { reason: "unknown-pane", pane } };
+  if (!hasDisplay) return { ok: false, refusal: { reason: "no-display" } };
+  if (!terminalPrefix) return { ok: false, refusal: { reason: "no-terminal" } };
+  return { ok: true, argv: terminalCommand(terminalPrefix, pane) };
+}
