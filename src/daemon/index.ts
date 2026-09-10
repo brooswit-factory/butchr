@@ -39,6 +39,8 @@ import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
+import { createAdmissionController } from "../agents/admission.js";
+import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 
 let config;
 try {
@@ -59,6 +61,21 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+// BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
+// the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
+// below, which are deliberately two SEPARATE instances) wired into BOTH
+// `runResourceLoop` calls below: the cap must bound the HOST, not each tier
+// independently (see that module's own top comment, Trap 1) — a per-tier
+// instance here would silently reintroduce exactly the bug this ticket
+// exists to close. `residency` reads the RAW `herd` above (the unscoped
+// `HerdrHerd` instance, before either loop's own `scopedHerd` wrapping),
+// which is the one seam that can see every `butchr-*` agent regardless of
+// which loop desired it.
+const admissionController = createAdmissionController({
+  cap: config.maxAgents,
+  residency: () => herd.runningIssues(),
+  log: (line) => console.error(`  ${line}`),
+});
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 const summaries = new Map<string, string>();
 
@@ -162,6 +179,15 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+// BUTCHR-275: the project agent's own positive "I have checked in" exit
+// signal — see src/agents/check-in-exit.ts's own top comment for the full
+// mechanism and why it is a separate registry from frozenAsleepDetector
+// below rather than folded into it. One instance, shared between the
+// `check_in` tool handler (which declares) and the project loop's
+// `checkDeclaredDone` hook (which consumes) — declared here, ahead of both,
+// same "shared, not duplicated" discipline as `ownChannelComments` below.
+const checkInExit = createCheckInExitRegistry();
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -177,8 +203,8 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -188,14 +214,13 @@ const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: pan
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
-// KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
+// KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
   comments: (issue) => atlassian.comments(issue),
-  accountEmail: config.atlassian.email,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-221 criterion 10: a synchronous "is this issue quota-blocked right
@@ -474,6 +499,10 @@ runResourceLoop(issueResourceType, {
   // one most likely to actually clear a stranded workspace's grace period
   // quickly. See src/agents/reap.ts.
   checkReap: issueReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the project loop below
+  // also uses — see admissionController's own construction comment above
+  // for why this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -536,6 +565,16 @@ runResourceLoop(projectResourceType, {
   // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
   // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
   checkFrozenAsleep: frozenAsleepDetector.check,
+  // BUTCHR-275: wired here only, same reasoning as checkFrozenAsleep just
+  // above — only the project tier ever produces a candidate (the issue tier
+  // never sleeps, so `check_in` doesn't exist for it and never declares
+  // anything here). See src/agents/check-in-exit.ts.
+  checkDeclaredDone: checkInExit.check,
+  // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
+  // see ReconcileOptions.invalidateDeclaredDone's own doc comment
+  // (src/daemon/loop.ts) and src/agents/check-in-exit.ts's "PER-EPISODE
+  // INVALIDATION" for the hazard this closes.
+  invalidateDeclaredDone: checkInExit.invalidateActive,
   // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
   // single-tier restriction, and the project tier is the slower loop where a
   // real crash loop still needs to reach the threshold well inside the
@@ -548,6 +587,10 @@ runResourceLoop(projectResourceType, {
   // (5min cadence) is still a valid independent chance to catch a candidate
   // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
   checkReap: projectReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the issue loop above
+  // also uses — see admissionController's own construction comment for why
+  // this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

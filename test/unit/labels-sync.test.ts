@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createLabelSync, type LabelWriter } from "../../src/labels/sync.js";
+import { createStalledCheck } from "../../src/agents/stalled.js";
+import { createStallRemediator } from "../../src/agents/stall-remediation.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status: string, labels: string[]): JiraIssue =>
@@ -688,6 +690,361 @@ describe("createLabelSync", () => {
       });
       await sync([iss("KAN-1", "Done", ["agent:idle"])]);
       expect(rem.calls).toEqual([]);
+    });
+  });
+
+  // BUTCHR-279: the whole path, real dependencies (createStalledCheck +
+  // createStallRemediator, not stubs), driven poll-by-poll through
+  // createLabelSync exactly as src/daemon/index.ts wires them. The tracker
+  // qualifying is necessary but not sufficient evidence the remediator gets
+  // its trigger — labelApplied only becomes true once the stabilizer has
+  // confirmed agent:stalled AND a later poll reads it back from Jira, so this
+  // proves the wiring, not just StalledTracker's own arithmetic (see
+  // test/unit/stalled.test.ts for that).
+  describe("BUTCHR-279: a post-work stall reaches the remediator end-to-end", () => {
+    /** Replays jira.calls' diffs onto a locally-held label array, exactly as real Jira state would accumulate across polls. */
+    function statefulIssue(key: string, status: string) {
+      let labels: string[] = [];
+      let seen = 0;
+      return {
+        current: () => labels,
+        issue: () => iss(key, status, labels),
+        absorb: (jira: { calls: Array<{ key: string; add: string[]; remove: string[] }> }) => {
+          for (const call of jira.calls.slice(seen)) {
+            if (call.key !== key) continue;
+            labels = [...labels.filter((l) => !call.remove.includes(l)), ...call.add];
+          }
+          seen = jira.calls.length;
+        },
+      };
+    }
+
+    test("FIRES: worked, then idle/done continuously for the full window, zero daemon comments — reaches the remediator with labelApplied true", async () => {
+      let now = 0;
+      let agentState: string | null = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: async () => [] });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); },
+        comments: async () => [],
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(agentState ? [["KAN-1", agentState]] : []), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      // Poll 1: agent is working.
+      await sync([st.issue()]); st.absorb(jira);
+      expect(st.current()).toEqual(["agent:working"]);
+      expect(posted).toEqual([]);
+
+      // Poll 2 (t=5m): agent stops working — herdr now reports idle. Floor starts here.
+      now = 5 * 60_000; agentState = "idle";
+      await sync([st.issue()]); st.absorb(jira);
+      expect(posted).toEqual([]); // agent:idle flip not even confirmed yet (stabilizer)
+
+      // Poll 3 (t=10m): idle confirmed twice in a row — agent:idle is written.
+      now = 10 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      expect(st.current()).toEqual(["agent:idle"]);
+      expect(posted).toEqual([]);
+
+      // Poll 4 (t=15m): 10 minutes of idle since the floor started (t=5m) — tracker
+      // qualifies, but agent:stalled needs its own 2-poll stabilizer confirmation.
+      now = 15 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      expect(st.current()).toEqual(["agent:idle"]); // not written yet — first confirmation
+      expect(posted).toEqual([]);
+
+      // Poll 5 (t=20m): agent:stalled confirmed and written — but `applied` was
+      // read at the TOP of this poll (still "idle"), so the remediator does not
+      // yet see labelApplied=true. Necessary-but-not-sufficient, demonstrated.
+      now = 20 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      expect(st.current()).toEqual(["agent:stalled"]); // label IS applied in Jira now
+      expect(posted).toEqual([]); // but the remediator has not acted yet
+
+      // Poll 6 (t=25m): THIS poll reads agent:stalled back from Jira as `applied`
+      // — only now does the remediator fire.
+      now = 25 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      expect(st.current()).toEqual(["agent:stalled"]);
+      expect(posted.length).toBe(1);
+      expect(posted[0]!.issue).toBe("KAN-1");
+      expect(posted[0]!.text).toContain("agent:stalled");
+    });
+
+    test("DOES NOT FIRE: worked, then disappeared entirely (sustained agent:none) — never labelled stalled, never reaches the remediator", async () => {
+      let now = 0;
+      let agentState: string | null = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: async () => [] });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); },
+        comments: async () => [],
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(agentState ? [["KAN-1", agentState]] : []), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      await sync([st.issue()]); st.absorb(jira); // working
+      agentState = null; // agent disappears entirely
+
+      // Many polls, sustained "none", well past the stall window in wall-clock terms.
+      for (let i = 1; i <= 6; i++) {
+        now = i * 30 * 60_000; // 30 minutes apart
+        await sync([st.issue()]); st.absorb(jira);
+      }
+
+      expect(st.current()).toEqual(["agent:none"]); // never agent:stalled
+      expect(posted).toEqual([]); // remediator never invoked with labelApplied=true
+    });
+
+    // BUTCHR-207's binding condition on this ticket's tradeoff, given the
+    // same end-to-end treatment as the sustained-none case above: a
+    // genuinely long `working`-reported run, turn-taking with a repeated
+    // between-turn idle dip, must never write agent:stalled or reach the
+    // remediator — asserted after EVERY poll across the run, not just at the
+    // end, so a regression that only intermittently held the guard cannot
+    // hide between assertions.
+    test("DOES NOT FIRE: a healthy long-running agent, turn-taking between working and brief idle dips for hours, never becomes agent:stalled and never reaches the remediator", async () => {
+      let now = 0;
+      let agentState = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: async () => [] });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); },
+        comments: async () => [],
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", agentState]]), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      const CYCLE_MS = 20 * 60_000; // 20-minute turn
+      const DIP_MS = 5 * 60_000; // 5-minute idle dip between turns — under the 10-minute stall window
+      for (let turn = 0; turn < 30; turn++) {
+        const turnStart = turn * CYCLE_MS;
+
+        now = turnStart; agentState = "working";
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+
+        now = turnStart + (CYCLE_MS - DIP_MS); agentState = "idle";
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+
+        now = turnStart + CYCLE_MS - 60_000; // 4 minutes into the dip — still well under the window
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).not.toContain("agent:stalled");
+      }
+
+      // Total simulated span: 30 * 20min = 10 hours, ninety polls, never once
+      // reaching agent:stalled and never once invoking the remediator.
+      expect(posted).toEqual([]);
+    });
+  });
+
+  // BUTCHR-289: the comments gate itself, driven end-to-end through the real
+  // modules — DoD 5's explicit instruction to extend the BUTCHR-279 harness
+  // "with a comment list containing a real agent report", not the
+  // zero-comments shape that was never broken. `fakeCommentStore` is shared
+  // between `stalled`'s and `stallRemediation`'s own `comments` deps (and
+  // `addComment` writes into the SAME store), exactly as `AtlassianClient`
+  // is one shared read/write surface in the real daemon.
+  describe("BUTCHR-289: the kind×recency comments gate, end-to-end", () => {
+    function statefulIssue(key: string, status: string) {
+      let labels: string[] = [];
+      let seen = 0;
+      return {
+        current: () => labels,
+        issue: () => iss(key, status, labels),
+        absorb: (jira: { calls: Array<{ key: string; add: string[]; remove: string[] }> }) => {
+          for (const call of jira.calls.slice(seen)) {
+            if (call.key !== key) continue;
+            labels = [...labels.filter((l) => !call.remove.includes(l)), ...call.add];
+          }
+          seen = jira.calls.length;
+        },
+      };
+    }
+
+    /** A shared, in-memory comment store — the same shape AtlassianClient.comments returns, fed to both the detector and the remediator, mutated by addComment exactly as a real Jira ticket accumulates comments. */
+    function fakeCommentStore() {
+      const rows: Array<{ id: string; body: string; created: string }> = [];
+      let n = 0;
+      return {
+        post: (body: string, at: number) => { rows.push({ id: `c${++n}`, body, created: new Date(at).toISOString() }); },
+        read: async () => [...rows].reverse(), // newest-first, like AtlassianClient.comments' own orderBy: -created
+      };
+    }
+
+    // DoD 1/5: the exact defect scenario, driven through the real modules —
+    // an agent posts its own progress report (while still working), then
+    // goes idle for the full window. Under the OLD authorEmail-based gate
+    // this comment (same account as the daemon) would have disqualified the
+    // ticket FOREVER, so the remediator would never fire. Under the new
+    // kind×recency rule the report predates the idle streak and does not
+    // disqualify — the mechanism is REACHABLE with a real report present,
+    // not just the empty-comments shape the old FIRES test proved.
+    test("FIRES even with a real agent progress report already on the ticket, posted before the idle streak began", async () => {
+      let now = 0;
+      let agentState: string | null = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const cs = fakeCommentStore();
+      cs.post("[KAN-1] Finished this turn's work: implemented the fix, tests green. Going idle now.", 0);
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: cs.read });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); },
+        comments: cs.read,
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(agentState ? [["KAN-1", agentState]] : []), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      await sync([st.issue()]); st.absorb(jira); // t=0: working
+      now = 5 * 60_000; agentState = "idle";
+      await sync([st.issue()]); st.absorb(jira); // t=5: floor starts (report at t=0 predates this)
+      now = 10 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=10: agent:idle written
+      expect(st.current()).toEqual(["agent:idle"]);
+      now = 15 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=15: tracker qualifies, stabilizer unconfirmed
+      now = 20 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=20: agent:stalled written this poll
+      now = 25 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=25: labelApplied true this poll — remediator fires
+      expect(st.current()).toEqual(["agent:stalled"]);
+      expect(posted.length).toBe(1);
+      expect(posted[0]!.issue).toBe("KAN-1");
+    });
+
+    // DoD 4 / the "one consequence you must think about" callout: the wake
+    // comment is `[butchr:stall]`-prefixed chatter, so it no longer
+    // disqualifies the comments gate the way it used to under the old
+    // authorship rule — the label is now STICKY (stays applied) rather than
+    // self-clearing. Fails if: the label ever reverts away from
+    // agent:stalled while the ticket is genuinely still idle (sticky claim),
+    // OR if `posted.length` is ever anything but 1 (no-flood claim) across
+    // many consecutive polls at the daemon's real ~15s cadence.
+    test("NO FLOOD: once stalled, the label stays applied (sticky) across many consecutive polls, but exactly ONE wake comment is ever posted", async () => {
+      let now = 0;
+      let agentState: string | null = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const cs = fakeCommentStore();
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: cs.read });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); cs.post(text, now); },
+        comments: cs.read,
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(agentState ? [["KAN-1", agentState]] : []), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      await sync([st.issue()]); st.absorb(jira);
+      now = 5 * 60_000; agentState = "idle";
+      await sync([st.issue()]); st.absorb(jira);
+      now = 10 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      now = 15 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      now = 20 * 60_000;
+      await sync([st.issue()]); st.absorb(jira);
+      now = 25 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // wake comment posted here
+      expect(posted.length).toBe(1);
+      expect(st.current()).toEqual(["agent:stalled"]);
+
+      // The ticket remains genuinely idle, with only the wake comment (daemon
+      // chatter) on it — 200 more polls at the daemon's real ~15s cadence.
+      for (let i = 1; i <= 200; i++) {
+        now = 25 * 60_000 + i * 15_000;
+        await sync([st.issue()]); st.absorb(jira);
+        expect(st.current()).toEqual(["agent:stalled"]); // sticky: never self-clears
+      }
+      expect(posted.length).toBe(1); // still exactly one wake comment
+    });
+
+    // The epic's added scenario (comment on this ticket after the original
+    // DoD was written): a wake that WORKS — the agent takes a turn, goes
+    // idle again, and genuinely re-stalls — must not produce a second wake
+    // comment. The recurrence is stopped one layer down, in the
+    // remediator's own evidence-based `findMarked` adoption (which outlives
+    // the in-memory `spokenAt` latch StallRemediationTracker.forget drops
+    // the moment `labelApplied` goes false) — not in this ticket's own
+    // comments gate, which structurally CANNOT stop it: the agent's own
+    // reply, posted while working, necessarily predates the next idle
+    // streak (`idleSince` is only ever set by the first `idle` observation,
+    // which comes after that reply), so it never disqualifies the new
+    // streak — the ticket DOES become a candidate again, by design. This
+    // test fails if `posted.length` is ever more than 1 at any point after
+    // the re-stall — that would mean the adoption dedupe was not actually
+    // reached through the real wiring, only provable in stall-remediation.ts's
+    // own module-level tests (which hand-set labelApplied directly).
+    test("re-stall after a successful wake posts at most one wake comment total (evidence-based adoption survives the episode boundary)", async () => {
+      let now = 0;
+      let agentState: string | null = "working";
+      const jira = fakeJira();
+      const posted: Array<{ issue: string; text: string }> = [];
+      const cs = fakeCommentStore();
+      const stalled = createStalledCheck({ now: () => now, minutes: 10, comments: cs.read });
+      const stallRemediation = createStallRemediator({
+        now: () => now,
+        addComment: async (issue, text) => { posted.push({ issue, text }); cs.post(text, now); },
+        comments: cs.read,
+      });
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(agentState ? [["KAN-1", agentState]] : []), stalled, stallRemediation });
+      const st = statefulIssue("KAN-1", "In Progress");
+
+      // --- Episode 1: work -> idle -> stall -> wake ---
+      await sync([st.issue()]); st.absorb(jira); // t=0: working
+      now = 5 * 60_000; agentState = "idle";
+      await sync([st.issue()]); st.absorb(jira); // t=5
+      now = 10 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=10: agent:idle written
+      now = 15 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=15: tracker qualifies, stabilizer unconfirmed
+      now = 20 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=20: agent:stalled written this poll
+      now = 25 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=25: wake posted
+      expect(posted.length).toBe(1);
+      expect(st.current()).toEqual(["agent:stalled"]);
+
+      // --- The wake works: the agent takes a turn ---
+      now = 30 * 60_000; agentState = "working";
+      await sync([st.issue()]); st.absorb(jira); // t=30: candidate "working" vs applied "stalled" — unconfirmed
+      expect(st.current()).toEqual(["agent:stalled"]);
+      now = 35 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=35: confirmed — agent:working written
+      expect(st.current()).toEqual(["agent:working"]);
+      expect(posted.length).toBe(1); // still just the original wake
+
+      // The agent posts its own reply WHILE working — this necessarily
+      // predates the next idle streak's `idleSince`.
+      cs.post("[KAN-1] Still waiting on the external process. Going idle again.", 38 * 60_000);
+
+      now = 40 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=40: applied freshly "working" — remediator's spokenAt is forgotten here
+      expect(st.current()).toEqual(["agent:working"]);
+
+      // --- The agent goes idle again: a genuinely NEW streak ---
+      now = 45 * 60_000; agentState = "idle";
+      await sync([st.issue()]); st.absorb(jira); // t=45: floor starts here — the reply (38min) predates it
+      now = 50 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=50: agent:idle confirmed & written
+      expect(st.current()).toEqual(["agent:idle"]);
+      now = 55 * 60_000; // 10 min since the NEW floor (45min) — the ticket IS a candidate again
+      await sync([st.issue()]); st.absorb(jira); // t=55: stabilizer unconfirmed (1st poll of "stalled")
+      now = 60 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=60: agent:stalled confirmed & written this poll
+      now = 65 * 60_000;
+      await sync([st.issue()]); st.absorb(jira); // t=65: labelApplied true — remediator ADOPTS the existing wake comment
+      expect(st.current()).toEqual(["agent:stalled"]);
+      expect(posted.length).toBe(1); // exactly one wake comment across the WHOLE sequence, including the re-stall
     });
   });
 });

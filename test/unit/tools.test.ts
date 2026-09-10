@@ -1376,11 +1376,14 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
     });
   });
 
-  test("set_doc() replaces the PROJECT's root doc, title optional", async () => {
+  test("set_doc() replaces the PROJECT's root doc, title optional, and returns a bounded receipt — never the body (BUTCHR-236)", async () => {
     const { tools, conn } = projectRig();
     const result = await tools.set_doc!.handler({ body: "<p>new</p>" }, conn);
     expect((result as any).id).toBe("1");
-    expect((result as any).body).toBe("<p>new</p>");
+    expect((result as any).body).toBeUndefined(); // the old echo is gone — pinning the defect this replaces
+    expect((result as any).landed).toBe("confirmed"); // this rig's getPage always resolves with a body
+    expect(typeof (result as any).wrote.chars).toBe("number");
+    expect((result as any).wrote.chars).toBe("<p>new</p>".length);
   });
 
   test("new_worker creates an EPIC, member of BUTCHR, no implements field, staffed by roles.epic", async () => {
@@ -1460,6 +1463,12 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     epicComments?: Record<string, Array<{ id: string }>>;
     rootDocComments?: Array<{ id: string; body: string }>;
     rootDocVersion?: number;
+    // BUTCHR-275: the exit-declaration seam under test below — omitted in
+    // every pre-existing test above (unaffected, same as any other optional
+    // atlassianTools dependency), threaded in only by the new block that
+    // follows this rig.
+    declareCheckInDone?: (key: string) => void;
+    failSetProjectProperty?: boolean;
   } = {}) {
     const properties = new Map<string, unknown>([["BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" } }]]);
     const setPropertyCalls: unknown[] = [];
@@ -1506,13 +1515,14 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       },
       getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
       setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        if (opts.failSetProjectProperty) throw new Error("setProjectProperty: simulated write failure");
         setPropertyCalls.push(value);
         properties.set(key, value);
         return { ok: true };
       },
       getPageVersions: async () => ({ "1": opts.rootDocVersion ?? 3 }),
     };
-    const tools = atlassianTools(ops, () => {});
+    const tools = atlassianTools(ops, () => {}, {}, undefined, undefined, opts.declareCheckInDone);
     return { tools, properties, setPropertyCalls, searchCalls, getIssueCommentsCalls };
   }
 
@@ -1597,6 +1607,43 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     const wake = (properties.get("BUTCHR") as any).wake;
     expect(wake.comment).toBe("42"); // legacy scalar untouched — forensic, never deleted
     expect(wake.commentsSeen).toEqual(["42"]); // migrated in, not lost, even though this poll observed nothing new
+  });
+
+  // BUTCHR-275: the exit signal check_in now emits, on top of the watermark
+  // write BUTCHR-67/BUTCHR-81 already covers above. Failure conditions
+  // stated first, per test, same discipline as the rest of this block.
+  describe("check_in's own exit declaration (BUTCHR-275, implementing BUTCHR-271)", () => {
+    test("a successful check_in declares its own key AFTER the watermark write — the ordering DoD requires structurally, not by convention", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key) });
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      await tools.check_in!.handler({}, conn);
+      expect(declared).toEqual(["BUTCHR"]); // declared exactly once, for the caller's own key
+    });
+
+    test("a rejecting watermark write means NOTHING is declared — a caller that dies mid-check_in must never unprotect its own atRest slot", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key), failSetProjectProperty: true });
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/simulated write failure/);
+      expect(declared).toEqual([]); // never reached — the throw happens before this line
+    });
+
+    test("omitting declareCheckInDone entirely leaves check_in's own watermark behaviour completely unaffected — every test above this block keeps passing unmodified", async () => {
+      const { tools, properties } = checkInRig({ rootDocVersion: 7 }); // no declareCheckInDone at all
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      const result = await tools.check_in!.handler({}, conn);
+      expect(result).toEqual({ ok: true, key: "BUTCHR", version: 7, seenComments: [], epics: {} });
+      expect((properties.get("BUTCHR") as any).wake.version).toBe(7);
+    });
+
+    test("an ISSUE caller's refusal happens before any declaration could occur — requireProjectCaller's throw pre-empts everything below it", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key) });
+      const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+      await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
+      expect(declared).toEqual([]);
+    });
   });
 });
 
