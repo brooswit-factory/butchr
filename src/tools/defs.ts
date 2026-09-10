@@ -174,6 +174,18 @@ export function atlassianTools(
    * `agent:*` label (see `checkWorker`'s own doc comment in relationship.ts).
    */
   isStaffed?: (key: string) => Promise<boolean | null>,
+  /**
+   * BUTCHR-275: `check_in`'s own exit signal — called from that handler
+   * below, strictly AFTER `advanceProjectWatermark` resolves without
+   * throwing (never before, never speculatively), so the daemon-side
+   * registry (src/agents/check-in-exit.ts) can never unprotect an id whose
+   * watermark write has not already landed. Optional — every existing
+   * caller of `atlassianTools` keeps working unchanged; when omitted,
+   * `check_in` still advances the watermark exactly as before, it just
+   * declares nothing, so the project falls back to today's behaviour
+   * (reaped by `checkFrozenAsleep`, not exited promptly).
+   */
+  declareCheckInDone?: (key: string) => void,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -760,6 +772,13 @@ export function atlassianTools(
           seenComments,
           epics,
         });
+        // BUTCHR-275: the exit signal — declared ONLY after the watermark
+        // write directly above has resolved without throwing, so "check-in
+        // lands before teardown" is structural: a caller that dies mid-call,
+        // before this line, has declared nothing, and the daemon-side
+        // registry (src/agents/check-in-exit.ts) has nothing to consume. See
+        // that module's own doc comment for the full mechanism this feeds.
+        declareCheckInDone?.(who);
         return { ok: true, key: who, version: version ?? null, seenComments, epics };
       },
     },
