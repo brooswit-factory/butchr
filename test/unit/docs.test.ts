@@ -15,7 +15,7 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
 function makeWorld(opts: { childPageSize?: number } = {}) {
   const childPageSize = opts.childPageSize ?? 50;
   const issues = new Map<string, { summary: string; bossKey?: string; remoteLink?: { title: string; url: string } }>();
-  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
+  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
   const projectProperties = new Map<string, unknown>();
   let nextId = 100;
   let upsertRemoteLinkCalls = 0;
@@ -61,7 +61,8 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       if (!page) throw new Error(`fake world: no such page ${p.id}`);
       page.body = p.body;
       if (p.title) page.title = p.title;
-      return { ok: true };
+      page.version++;
+      return { ok: true, version: page.version };
     },
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
@@ -100,7 +101,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
       if (titleTaken) throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
       const id = String(nextId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label] });
+      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
       return { id, title: p.title, url: pageUrl(id) };
     },
   commentOnPage: async () => ({ ok: true }),
@@ -207,7 +208,7 @@ describe("docs.ts: ensureDoc — lazy nested creation", () => {
     addIssue("BUTCHR-41", "orphaned page, no link yet");
     // Simulate the fail-at-5 partial state directly: the page exists and is
     // labelled, but nothing ever ran step 5 to link it back.
-    pages.set("500", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-41 — orphaned page, no link yet", body: "<p/>", labels: [labelForKey("BUTCHR-41")] });
+    pages.set("500", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-41 — orphaned page, no link yet", body: "<p/>", labels: [labelForKey("BUTCHR-41")], version: 1 });
     expect(issues.get("BUTCHR-41")!.remoteLink).toBeUndefined();
 
     const doc = await ensureDoc(ops, "BUTCHR-41");
@@ -220,9 +221,9 @@ describe("docs.ts: ensureDoc — lazy nested creation", () => {
     const { ops, addIssue, pages, setProjectProperty } = makeWorld({ childPageSize: 1 });
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     // Three unrelated siblings already under the root doc before the target's label...
-    pages.set("601", { parentId: ROOT_DOC_ID, title: "sibling one", body: "", labels: [] });
-    pages.set("602", { parentId: ROOT_DOC_ID, title: "sibling two", body: "", labels: [] });
-    pages.set("603", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-42 — target, three pages in", body: "", labels: [labelForKey("BUTCHR-42")] });
+    pages.set("601", { parentId: ROOT_DOC_ID, title: "sibling one", body: "", labels: [], version: 1 });
+    pages.set("602", { parentId: ROOT_DOC_ID, title: "sibling two", body: "", labels: [], version: 1 });
+    pages.set("603", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-42 — target, three pages in", body: "", labels: [labelForKey("BUTCHR-42")], version: 1 });
     addIssue("BUTCHR-42", "target, three pages in");
 
     const doc = await ensureDoc(ops, "BUTCHR-42");
@@ -245,7 +246,7 @@ describe("docs.ts: ensureDoc — lazy nested creation", () => {
       createPageWithLabel: async (p) => {
         if (!raced) {
           raced = true;
-          pages.set("700", { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label] });
+          pages.set("700", { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
         }
         throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
       },
@@ -404,11 +405,11 @@ describe("docs.ts: the provisional body's ASSIST pointer", () => {
 // fresh per-ticket page, already has a real title from provisioning).
 // ---------------------------------------------------------------------------
 describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Contract 1)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>, id: string, title: string, body: string) {
+  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
     // A project's root doc is provisioned AHEAD OF TIME (BUTCHR-62's doc: six
     // product projects + ASSIST already carry one) — seeded directly here,
     // never via ensureDoc, matching that reality.
-    pages.set(id, { parentId: "", title, body, labels: [] });
+    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
   }
 
   test("resolves the project's root doc via the EXISTING entity-property reader — same shape ensureDoc already reads, no second reader", async () => {

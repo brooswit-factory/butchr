@@ -1,5 +1,6 @@
 import { isApiError } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
+import { advanceProjectWatermark } from "../resources/project.js";
 
 /** The fixed remote-link globalId that carries the ticket -> doc binding. */
 export const DOC_LINK_GLOBAL_ID = "butchr:doc";
@@ -241,10 +242,43 @@ export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Prom
  * concept (a freshly created per-ticket page needs a real title before it
  * can stop looking unwritten) — a root doc is provisioned ahead of time with
  * a real title already, so there is no provisional state to graduate out of.
+ *
+ * DEFECT 2 CLOSED HERE (BUTCHR-214/226) — the project wake predicate's
+ * VERSION axis (src/resources/project.ts's `projectVerdict`) had NO
+ * suppression at all: every root-doc body edit bumps Confluence's own page
+ * version, and nothing but the project agent's own `check_in` ever advanced
+ * the stored `wake.version` watermark to match — so a project that keeps its
+ * doc current (every agent's explicit instruction) woke itself
+ * deterministically, on every `set_doc` call, forever. Fixed with the SAME
+ * identity-of-write shape `speakOnOwnChannel` already uses for the comment
+ * axis (src/tools/speak.ts): immediately after `ops.updatePage` succeeds,
+ * this advances THIS project's `wake.version` watermark to the version THAT
+ * CALL'S OWN write produced (`updatePage`'s now-normalized `version` field —
+ * see its own doc comment on `AtlassianOps` for why this is deliberately NOT
+ * a read-back-after-write). A FOREIGN edit — any `updatePage` call this
+ * function did not make — never runs this advance, so it is never
+ * watermarked here and still wakes the project on the next poll, the same
+ * failure condition `speakOnOwnChannel`'s own suppression must not swallow.
+ *
+ * Fail-open and logged, not fatal — copied from `speakOnOwnChannel`'s own
+ * shape and its BUTCHR-105 reasoning (see that function's header comment):
+ * the doc write already succeeded by the time this runs, and a secondary
+ * bookkeeping failure must never surface as a failed `set_doc` call. A
+ * rejected write here also feeds `advanceProjectWatermark`'s own in-process
+ * fallback (DEFECT 1b, src/resources/project.ts) exactly like the comment
+ * axis does, so a persistent failure on THIS axis gets the same protection
+ * against waking the project on the very edit that failed to persist.
+ *
+ * ONLY the project root-doc path: `setDoc` (an issue's own doc, below) is a
+ * different surface with no project watermark at all — it never calls this
+ * function and nothing here reaches it.
  */
-export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<DocResult> {
+export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string, log: (line: string) => void = console.error): Promise<DocResult> {
   const doc = await projectRootDoc(ops, projectKey);
-  await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
+  const updated = await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
+  await advanceProjectWatermark(ops, projectKey, { version: updated.version }, log).catch((e) =>
+    log(`  WARNING: [setProjectDoc] self-wake version watermark advance failed for ${projectKey} (version ${updated.version}): ${(e as Error)?.message ?? e} — doc write succeeded; project may nudge itself on its own version bump next poll`),
+  );
   return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
 }
 
