@@ -15,7 +15,7 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
 function makeWorld(opts: { childPageSize?: number } = {}) {
   const childPageSize = opts.childPageSize ?? 50;
   const issues = new Map<string, { summary: string; bossKey?: string; remoteLink?: { title: string; url: string } }>();
-  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[] }>();
+  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version?: number }>();
   const projectProperties = new Map<string, unknown>();
   let nextId = 100;
   let upsertRemoteLinkCalls = 0;
@@ -54,13 +54,14 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     getPage: async (id: string) => {
       const p = pages.get(id);
       if (!p) throw new Error(`fake world: no such page ${id}`);
-      return { title: p.title, body: { storage: { value: p.body } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
+      return { title: p.title, body: { storage: { value: p.body } }, version: { number: p.version ?? 1 }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
     },
     updatePage: async (p) => {
       const page = pages.get(p.id);
       if (!page) throw new Error(`fake world: no such page ${p.id}`);
       page.body = p.body;
       if (p.title) page.title = p.title;
+      page.version = (page.version ?? 1) + 1;
       return { ok: true };
     },
     searchPages: async () => ({ results: [] }),
@@ -113,7 +114,22 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
   getProjectPropertyOrNull: async () => null,
   };
 
-  return { ops, issues, pages, projectProperties, addIssue, setProjectProperty, upsertCalls: () => upsertRemoteLinkCalls };
+  /**
+   * Directly wires an issue's remote link to a page with an arbitrary
+   * id/title/body/version, bypassing `ensureDoc`'s creation path entirely —
+   * for `get_doc`-only tests (BUTCHR-270's range-read arms) that need
+   * control over the stored body's exact content (e.g. empty, or built for
+   * a specific character/byte length) rather than whatever `ensureDoc`
+   * would provision.
+   */
+  function seedIssueDoc(key: string, id: string, title: string, body: string, version = 1) {
+    pages.set(id, { parentId: "", title, body, labels: [], version });
+    const issue = issues.get(key);
+    if (!issue) throw new Error(`fake world: no such issue ${key} — call addIssue first`);
+    issue.remoteLink = { title, url: pageUrl(id) };
+  }
+
+  return { ops, issues, pages, projectProperties, addIssue, setProjectProperty, seedIssueDoc, upsertCalls: () => upsertRemoteLinkCalls };
 }
 
 const ROOT_DOC_ID = "1";
