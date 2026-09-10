@@ -227,7 +227,7 @@ export const LABEL_REGISTRY: Readonly<Record<RegisteredLabel, LabelRegistryEntry
     withdrawnBy: AGENT_LABEL_WITHDRAWN_BY,
   },
   "agent:stalled": {
-    appliedBy: "src/labels/sync.ts's syncLabels — an overlay on top of an \"idle\" mapping (see src/agents/stalled.ts's StalledCheck): idle/done continuously since first observed, with zero comments from the daemon's own account, for the configured stall window. Never mapAgentStatus's own direct output (see ./plan.ts's ObservedAgentLabel exclusion) — always layered on top of idle.",
+    appliedBy: "src/labels/sync.ts's syncLabels — an overlay on top of an \"idle\" mapping (see src/agents/stalled.ts's StalledCheck): idle/done continuously since the agent last stopped working, with zero comments from the daemon's own account, for the configured stall window. Never mapAgentStatus's own direct output (see ./plan.ts's ObservedAgentLabel exclusion) — always layered on top of idle.",
     notes: AGENT_LABEL_LIFECYCLE_NOTES,
     withdrawnBy: AGENT_LABEL_WITHDRAWN_BY,
   },

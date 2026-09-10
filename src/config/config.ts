@@ -25,10 +25,12 @@ export interface Config {
    */
   github?: { token: string; orgs: string[] };
   /**
-   * KAN-804/807: minutes an active ticket's agent must sit idle/done,
-   * continuously since first observed running, with zero comments from this
-   * account, before it's surfaced as `agent:stalled` — a swallowed kickoff
-   * "idle since spawn, never spoke" must never look like a finished agent.
+   * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
+   * idle/done, continuously since it last stopped working (a swallowed
+   * kickoff that never worked counts from first observed running, since it
+   * never stopped working — it never started), with zero comments from this
+   * account, before it's surfaced as `agent:stalled` — neither a swallowed
+   * kickoff nor a post-work becalming should look like a finished agent.
    */
   stalledMinutes: number;
   /**
