@@ -551,6 +551,11 @@ runResourceLoop(projectResourceType, {
   // never sleeps, so `check_in` doesn't exist for it and never declares
   // anything here). See src/agents/check-in-exit.ts.
   checkDeclaredDone: checkInExit.check,
+  // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
+  // see ReconcileOptions.invalidateDeclaredDone's own doc comment
+  // (src/daemon/loop.ts) and src/agents/check-in-exit.ts's "PER-EPISODE
+  // INVALIDATION" for the hazard this closes.
+  invalidateDeclaredDone: checkInExit.invalidateActive,
   // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
   // single-tier restriction, and the project tier is the slower loop where a
   // real crash loop still needs to reach the threshold well inside the

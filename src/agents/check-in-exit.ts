@@ -50,15 +50,23 @@
  * complaint, since nothing froze" is true by construction, not by care at
  * each call site.
  *
- * SAFE BY CONSTRUCTION, NOT BY CARE: `check` below only ever inspects ids the
- * CALLER (`reconcileNow`) already independently determined are `atRest`
- * THIS POLL, from a FRESH `discovery.search()` + `verdictFor` read
- * (`atRestFrom`, src/daemon/loop.ts) — i.e. ids the rest of the system has
- * already decided mean "eligible AND every watermark caught up" (BUTCHR-66/
- * 83's `"asleep"`), independent of anything this module tracks. This module
- * can therefore never cause a genuinely-pending resource to be stopped: the
- * worst it can do is let an ALREADY-asleep resource skip the frozen-timeout
- * grace period, which is exactly the point.
+ * SAFE BY CONSTRUCTION, NOT BY CARE — BUT ONLY WITH `invalidateActive` ALSO
+ * WIRED IN, SEE BELOW: `check` below only ever inspects ids the CALLER
+ * (`reconcileNow`) already independently determined are `atRest` THIS POLL,
+ * from a FRESH `discovery.search()` + `verdictFor` read (`atRestFrom`,
+ * src/daemon/loop.ts) — i.e. ids the rest of the system has already decided
+ * mean "eligible AND every watermark caught up" (BUTCHR-66/83's `"asleep"`),
+ * independent of anything this module tracks. That establishes `check` is
+ * safe for THIS poll's read of `"asleep"` — it does NOT, by itself,
+ * establish that a declaration `check` consumes still describes the agent
+ * currently running for that id: consumption can be deferred to a poll long
+ * after the one that declared. Closing that gap is `invalidateActive`'s
+ * entire job (see "PER-EPISODE INVALIDATION" below) — without it wired in,
+ * this module can still, in a real if narrow path, cause a genuinely-pending
+ * resource to be stopped, which code review caught. With both `check` and
+ * `invalidateActive` wired (as `src/daemon/index.ts` does), the worst this
+ * module can do is let an ALREADY-asleep resource, whose declaration has not
+ * gone stale, skip the frozen-timeout grace period — which is the point.
  *
  * NOT TIME-BOUNDED, DELIBERATELY: unlike `FrozenAsleepTracker`, this holds no
  * elapsed-time floor and no restart-adoption logic — there is nothing to
@@ -66,17 +74,44 @@
  * project waits out the ordinary frozen-asleep bound instead of exiting
  * promptly, exactly as it did before this ticket) and nothing that needs a
  * clock. `declare` is a plain one-shot flag, `check` consumes (deletes) it
- * the moment it is used to unprotect an id, so a LATER, unrelated sleep
- * episode of the same id needs its own fresh `declare()` call and never
- * silently inherits this one — the same "don't reuse a stale latch across
- * episodes" discipline `FrozenAsleepTracker.forgetMissing` exists for, here
- * achieved by consuming on use rather than by pruning every poll (a
- * declaration that is never consumed — e.g. the project goes active again
- * before the next poll observes it resting — simply waits, harmlessly: see
- * this module's own PR description for why that is not the same hazard
- * `forgetMissing` guards against). Memory cost is one string per distinct
- * project id ever declared and not yet consumed — bounded by the number of
- * live, eligible projects, never unbounded.
+ * the moment it is used to unprotect an id. Memory cost is one string per
+ * distinct project id ever declared and not yet consumed — bounded by the
+ * number of live, eligible projects, never unbounded.
+ *
+ * PER-EPISODE INVALIDATION (added in code review — the first version of
+ * this module got this wrong): a declaration that is never consumed on the
+ * very next poll (the project goes active again before that poll observes
+ * it resting) used to simply WAIT, on the theory that this was harmless —
+ * it is not. `check`'s consumption is deferred to whichever LATER poll
+ * happens to see the id resting-and-running, and there is no guarantee that
+ * is a continuation of the SAME episode that declared: a project's verdict
+ * can return to `"asleep"` with NO fresh `check_in` at all
+ * (`src/resources/project.ts`'s `projectVerdict`: `epicsBehind` is computed
+ * over epics CURRENTLY in review, so an epic simply LEAVING review takes
+ * that axis from behind to caught-up with no watermark write). Down that
+ * path, a declaration from a FINISHED episode — the agent that made it
+ * crashed, was session-limited, or was respawned as stale — would be
+ * consumed against a DIFFERENT, later agent instance for the same project,
+ * silently stopping it mid-work. That is exactly what `atRest` exists to
+ * prevent (see its own doc comment on the advance-watermark-then-exit
+ * race), and a declaration is not exempt from that requirement just because
+ * it is optimistic rather than a timeout.
+ *
+ * `invalidateActive(desired)` closes this: called on EVERY poll (never
+ * gated by `atRest`/`restingRunning`, unlike `check` — see
+ * `ReconcileOptions.invalidateDeclaredDone`'s own doc comment for why it
+ * cannot share that gate), it drops any declared-but-unconsumed id the
+ * instant that SAME id is observed ACTIVE (present in `desired`) again.
+ * Once a project goes active, whatever made it eligible before is stale by
+ * definition — new work has been observed — so the old declaration cannot
+ * be trusted to describe the agent that will eventually check the box next.
+ * A project that later returns to `"asleep"` after that point needs its own
+ * fresh `declare()`, exactly like any other new episode; until one arrives,
+ * ordinary `atRest`/`checkFrozenAsleep` protection applies, same as a
+ * project that had never declared at all. This is what makes "a stale
+ * declaration from a finished episode can never stop a different, later
+ * agent for the same project" actually true, rather than true only in the
+ * common case.
  */
 
 /** One poll's worth of ids that are BOTH `atRest` and running — the exact shape `ReconcileOptions.checkFrozenAsleep`/`checkDeclaredDone` (src/daemon/loop.ts) already share. */
@@ -95,6 +130,17 @@ export interface CheckInExitRegistry {
    * Never throws — there is no I/O here to fail.
    */
   check(restingRunning: readonly string[]): Promise<ReadonlySet<string>>;
+  /**
+   * Wired into `ReconcileOptions.invalidateDeclaredDone` (src/daemon/loop.ts)
+   * — called on EVERY poll, unlike `check` above. Drops any declared id
+   * found in `desired` (this poll's active-verdict set): see this module's
+   * own top comment, "PER-EPISODE INVALIDATION", for the hazard this closes
+   * (a declaration surviving an intervening active period and being consumed
+   * against a later, different agent instance for the same project id).
+   * Synchronous and side-effect-free beyond the in-memory prune — never
+   * throws.
+   */
+  invalidateActive(desired: readonly string[]): void;
 }
 
 export function createCheckInExitRegistry(): CheckInExitRegistry {
@@ -112,6 +158,9 @@ export function createCheckInExitRegistry(): CheckInExitRegistry {
         }
       }
       return out;
+    },
+    invalidateActive(desired: readonly string[]): void {
+      for (const id of desired) declared.delete(id);
     },
   };
 }
