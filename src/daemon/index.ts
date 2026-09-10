@@ -205,7 +205,6 @@ const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
   comments: (issue) => atlassian.comments(issue),
-  accountEmail: config.atlassian.email,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-221 criterion 10: a synchronous "is this issue quota-blocked right
