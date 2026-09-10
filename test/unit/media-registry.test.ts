@@ -67,7 +67,7 @@ describe("MEDIA_REGISTRY contents (verified against the code each medium actuall
     }
   });
 
-  test("docTitle: blindSpotIds is null, with a written reason distinct from media-scan.ts's own docTitleNotRegistryConvention noWitnessReason (BUTCHR-254) — a medium having no list of its own gaps is a different claim from a check being blind to that medium's shape", () => {
+  test("docTitle: blindSpotIds is null, with a written reason distinct from media-scan.ts's own MEDIA_SCAN_BLIND_SPOTS reasons (BUTCHR-254) — a medium having no list of its own gaps is a different claim from a check being blind to that medium's shape", () => {
     expect(MEDIA_REGISTRY.docTitle.blindSpotIds).toBeNull();
     if (MEDIA_REGISTRY.docTitle.blindSpotIds === null) {
       expect(MEDIA_REGISTRY.docTitle.noBlindSpotIdsReason.length).toBeGreaterThan(0);

@@ -119,57 +119,86 @@ export function formatUnexpectedRegistryModulesError(found: readonly string[], e
 }
 
 /**
- * BUTCHR-254 (applying BUTCHR-222/BUTCHR-224's mechanism to this detector).
- * This check's own blind spot, now an enumerable value with the same
- * type-level door `HEADER_BLIND_SPOTS`/`LABEL_BLIND_SPOTS`/
- * `WORKSPACE_BLIND_SPOTS`/`FAMILY_BLIND_SPOTS` already hold their own
- * families honest with. See `test/unit/media-scan.test.ts` for why this
- * one entry is `witness: null` rather than witnessed, and
- * `src/media/blind-spot.ts` for what those mean.
+ * BUTCHR-254 (applying BUTCHR-222/BUTCHR-224's mechanism to this detector),
+ * SPLIT INTO TWO ENTRIES UNDER BUTCHR-223 AFTER REVIEW. This check's own
+ * blind spots, as an enumerable value with the same type-level door
+ * `HEADER_BLIND_SPOTS`/`LABEL_BLIND_SPOTS`/`WORKSPACE_BLIND_SPOTS`/
+ * `FAMILY_BLIND_SPOTS` already hold their own families honest with. See
+ * `test/unit/media-scan.test.ts` for the witness the first entry drives and
+ * `src/media/blind-spot.ts` for what "witness" means here.
  *
- * SCOPE FENCE (BUTCHR-254): do not invent a discovery mechanism that
- * appears to confirm `docTitle`'s hand-declaration is complete or current —
- * it is honestly uncheckable by this file, by construction (see the entry's
- * own `claim`). A written `noWitnessReason` naming why a human has to
- * notice is the correct, honest outcome here, matching the standard
- * `src/workspace/workspace-scan.ts`'s own two `witness: null` entries set:
- * each argues, specifically, why FABRICATING an input would be wrong, not
- * merely that one is inconvenient to build.
+ * WHY TWO ENTRIES, AND THE MISTAKE THAT MADE IT ONE — worth reading before
+ * writing a `noWitnessReason` anywhere in this codebase. These were
+ * originally a SINGLE entry, `docTitleNotRegistryConvention`, carrying
+ * `witness: null` and an argument that no fixture could reach it. Review
+ * refuted that argument by BUILDING THE WITNESS IT SAID COULD NOT EXIST,
+ * in the idiom this file's siblings already use twice. The entry had
+ * conflated two claims of different kinds:
  *
- * WHAT THIS LIST BUYS THIS DETECTOR: MEASURABLY LESS THAN THE OTHERS, AND
- * THE NUMBER IS WORTH STATING (BUTCHR-223). Every entry here is
- * `witness: null`, so this list contains ZERO executable witnesses. The
- * consequence, measured rather than reasoned: killing this file's
- * detector outright — making `listRegistryModules` return `[]`
- * unconditionally — produced 0 failures at `positiveControl` and 0 at
- * `silence`, because there are no halves of either kind to fail. The
- * same attack on `./family-scan.ts`'s six witnesses produced 6
- * `positiveControl` failures and 0 `silence` failures. So for THIS
- * detector the mechanism supplies the type-level door and a written
- * argument, and NO non-vacuity evidence whatever. `assertBlindSpotCoverage`
- * below still runs and still passes — but it passes TRIVIALLY here, and a
- * green result from it is evidence about nothing except that no entry
- * declares a witness id. That is the honest position for a claim that is
- * genuinely unwitnessable (see the entry's own `noWitnessReason`), not a
- * gap to be closed by fabricating a fixture — but it must not be read as
- * this detector's blind spot having been VERIFIED. It has been argued.
+ *   - A MECHANICAL claim — a medium with no `registry.ts` inside the
+ *     scanned root is invisible to this scan by construction. Fully
+ *     witnessable, and now witnessed.
+ *   - A CURRENCY claim — that the hand-maintained set of such media in
+ *     `MEDIA_REGISTRY` is complete and current. Genuinely unwitnessable,
+ *     because the input that would falsify it is one a human never
+ *     noticed, and no fixture can construct an absence in attention.
  *
- * AND, AS EVERYWHERE ELSE UNDER THIS EPIC: this list closes "is the
- * stated blind spot true" — here, only as far as an argument can. It does
- * not close "is the list of stated blind spots complete." A second
- * structurally-enforced medium that nobody noticed would be absent from
- * this list and invisible to this check at the same time, which is the
- * doubled blindness the entry below names.
+ * Bundled, the unwitnessable half's reason excused the witnessable half,
+ * and the type door cannot see that: a `noWitnessReason` is prose, and
+ * NOTHING in this mechanism checks whether it is TRUE. That is a real,
+ * unguarded gap in the mechanism itself — the same shape as the per-list
+ * coverage residue named in `blind-spot.ts`'s header, one level up: door 1
+ * forces a reason to EXIST, door 2 forces a declared witness id to have
+ * RUN, and neither can tell a sound reason from a plausible one. Only a
+ * reader who tries to build the witness anyway can. One did.
+ *
+ * THE SCOPE FENCE STILL HOLDS, and the split is what respects it rather
+ * than breaks it: do NOT invent a discovery mechanism that appears to
+ * confirm `docTitle`'s hand-declaration is complete or current. That claim
+ * keeps `witness: null` and a written reason. What is witnessed below is
+ * the mechanical blindness, using a synthetic fixture that never asserts
+ * anything about the real `MEDIA_REGISTRY`'s completeness.
+ *
+ * WHAT THIS LIST NOW BUYS THIS DETECTOR, MEASURED (BUTCHR-223): killing
+ * this file's detector — making `listRegistryModules` return `[]`
+ * unconditionally — fails the witness below at its `positiveControl` and
+ * leaves its `silence` half green, the same 1-and-0 shape per witness that
+ * `./family-scan.ts`'s six produce. BEFORE THE SPLIT this same attack
+ * produced 0 failures at `positiveControl` and 0 at `silence`, because the
+ * list contained no witnesses at all and `assertBlindSpotCoverage` passed
+ * TRIVIALLY against a dead detector. That number is recorded here, not
+ * quietly dropped, because it is the measurement that made the split
+ * necessary and it is what a reader should expect to see return if the
+ * witness below is ever deleted.
+ *
+ * WHAT REMAINS ARGUED RATHER THAN VERIFIED: the second entry, and only it.
+ * A green `assertBlindSpotCoverage` says nothing about that entry beyond
+ * "it declares no witness id" — do not read it as coverage.
+ *
+ * AND, AS EVERYWHERE ELSE UNDER THIS EPIC: this list closes "is the stated
+ * blind spot true," never "is the list of stated blind spots complete." A
+ * second structurally-enforced medium that nobody noticed would be absent
+ * from this list and invisible to this check at the same time — the
+ * doubled blindness the second entry names, and the reason that entry
+ * cannot be witnessed.
  */
-export const MEDIA_SCAN_BLIND_SPOT_IDS = ["docTitleNotRegistryConvention"] as const;
+export const MEDIA_SCAN_BLIND_SPOT_IDS = [
+  "nonRegistryConventionMediumInvisible",
+  "docTitleHandDeclarationCurrency",
+] as const;
 export type MediaScanBlindSpotId = (typeof MEDIA_SCAN_BLIND_SPOT_IDS)[number];
 
 export const MEDIA_SCAN_BLIND_SPOTS: Readonly<Record<MediaScanBlindSpotId, BlindSpotEntry>> = {
-  docTitleNotRegistryConvention: {
+  nonRegistryConventionMediumInvisible: {
     claim:
-      "A medium whose registry is NOT a file matching the `src/<dir>/registry.ts` convention is invisible to this check by construction — it only ever lists directories one level under `srcDir` and tests each for a `registry.ts` file; a medium enforced some other way never produces a candidate path for `listRegistryModules` to find or for `findUnexplainedRegistryModules` to flag. The Confluence `[unwritten]` doc-title marker (the `docTitle` entry in `./registry.ts`'s `MEDIA_REGISTRY`) is exactly such a case TODAY, deliberately: its enforcement lives directly in `src/tools/docs.ts`'s `set_doc`/`isProvisional` logic (see that entry's own `detector: null` — `structural` needs no separate scanner at all), not in a registry module of its own, and it is declared in `MEDIA_REGISTRY` BY HAND, with nothing here confirming that declaration is complete or current. A fifth medium enforced the same way — structurally, with no registry.ts — would be equally invisible to this check, and nothing in this codebase closes that; a human has to notice, the same way a human had to notice `docTitle` needed adding here in the first place.",
+      "THE MECHANICAL CLAIM, and it is witnessable: a medium whose registry is NOT a file matching the `src/<dir>/registry.ts` convention is invisible to this check by construction. `listRegistryModules` only ever lists directories one level under `srcDir` and tests each for a `registry.ts` file, so a medium enforced some other way never produces a candidate path for it to find or for `findUnexplainedRegistryModules` to flag — EVEN WHEN THAT MEDIUM'S OWN ENFORCEMENT CODE SITS INSIDE THE SCANNED ROOT. That last clause is what makes this a claim about the CONVENTION this scanner requires within a root it is already scanning, and NOT a restatement of `family-scan.ts`'s `unscannedDirectories` (which is about which root the scanner is pointed at in the first place). `docTitle` is the live instance today: its enforcement lives directly in `src/tools/docs.ts`'s `set_doc`/`isProvisional` logic (see that entry's own `detector: null` in `./registry.ts` — `structural` needs no separate scanner at all), inside `src/`, with no registry.ts of its own — and this check cannot see it.",
+    witness: "media:non-registry-convention-medium",
+  },
+  docTitleHandDeclarationCurrency: {
+    claim:
+      "THE UNWITNESSABLE CLAIM, and it is a DIFFERENT KIND of claim from the one above — split out from it under BUTCHR-223 after review demonstrated that the two had been conflated, and that bundling them let a genuinely witnessable claim hide behind an unwitnessable one's `noWitnessReason`. `docTitle` is declared in `MEDIA_REGISTRY` BY HAND, and nothing anywhere confirms that declaration is COMPLETE or CURRENT. A fifth medium enforced the same way — structurally, with no registry.ts — would be equally invisible to this check AND equally absent from `MEDIA_REGISTRY`, and nothing in this codebase closes that: a human has to notice, the same way a human had to notice `docTitle` needed adding here in the first place.",
     witness: null,
     noWitnessReason:
-      "This is a claim about what does NOT exist on disk for a medium enforced structurally, not about a parseable input this scanner fails to read correctly — there is no fixture shape to construct that would exercise this scanner against `docTitle` specifically, because `docTitle` has no scanner module and no registry.ts of its own for `listRegistryModules` to even be pointed at. Fabricating one (e.g. writing a synthetic `src/docTitle/registry.ts` into a temp fixture and confirming it IS found) would only re-demonstrate that `listRegistryModules` finds real registry.ts files — already covered by this file's own `unscannedDirectories`-shaped tests in the other three detectors and by `test/unit/media-scan.test.ts`'s own 'the actual automatic check' describe block — never this claim's actual content, which is that a medium requiring NO registry.ts file at all (docTitle's real, deliberate shape) has nothing here to find it by. Covered instead by prose in `src/media/registry.ts`'s own `docTitle` entry (`noDetectorReason`, `blindSpots`) and by this file's own module header, verified by reading `src/tools/docs.ts`, not by this mechanism.",
+      "This is a claim about the CURRENCY AND COMPLETENESS of a hand-maintained declaration — whether the set of structurally-enforced media a human has written into `MEDIA_REGISTRY` matches the set that actually exists. No fixture can reach it, and the reason is not inconvenience: any fixture I build would contain exactly the media I put in it, so confirming that the registry lists them would confirm only that I wrote down what I just created. The thing that could falsify this claim is a structurally-enforced medium that exists in the real codebase and that NOBODY WROTE DOWN — and a test cannot construct an artifact whose defining property is that its author never noticed it. Fabricating one would answer a question nobody is asking. This is distinct from the reason the sibling scanners give for their own unwitnessed entries (one because no test can run inside a deployed process; the other because a fabricated fixture would re-demonstrate a different blind spot under another filename); this one is unwitnessable because the input's defining property is an absence in a human's attention, not an absence on disk. Verified by reading `src/tools/docs.ts` and `./registry.ts`'s `docTitle` entry, never by this mechanism. NOTE WHAT IS NOT COVERED BY THIS REASON: the mechanical half of the original combined entry — that a medium with no registry.ts inside the scanned root is invisible here — IS witnessable, is witnessed above, and was wrongly excused by an earlier version of this reason.",
   },
 };

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   findUnexplainedRegistryModules,
@@ -8,7 +9,7 @@ import {
   MEDIA_SCAN_BLIND_SPOTS,
 } from "../../src/media/media-scan.js";
 import { MEDIA_REGISTRY } from "../../src/media/registry.js";
-import { assertBlindSpotCoverage } from "../../src/media/blind-spot.js";
+import { assertBlindSpotCoverage, withTempFixture, witnessBlindSpot } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -23,7 +24,12 @@ describe("listRegistryModules", () => {
     expect(modules).toContain("src/headers/registry.ts");
     expect(modules).toContain("src/workspace/registry.ts");
     expect(modules).toContain("src/media/registry.ts");
-    expect(modules.every((m) => m.endsWith("/registry.ts"))).toBe(true);
+    // BUTCHR-223: `modules.every(...)` was VACUOUSLY TRUE on an empty array —
+    // it passed under a dead `listRegistryModules`, so it read as a silence
+    // assertion that could not fail in the direction that matters. Anchored
+    // to a non-empty result first, which is what makes the shape claim real.
+    expect(modules.length).toBeGreaterThan(0);
+    expect(modules.filter((m) => !m.endsWith("/registry.ts"))).toEqual([]);
   });
 });
 
@@ -90,16 +96,67 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
  * ever demands execution for entries that declare a witness id, and this
  * list declares none.
  */
-describe("MEDIA_SCAN_BLIND_SPOTS (BUTCHR-254)", () => {
-  test("docTitleNotRegistryConvention is witness: null with a non-empty written reason", () => {
-    expect(MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.witness).toBeNull();
-    if (MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.witness === null) {
-      expect(MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.noWitnessReason.trim().length).toBeGreaterThan(0);
+describe("MEDIA_SCAN_BLIND_SPOTS (BUTCHR-254, split under BUTCHR-223)", () => {
+  /**
+   * THE WITNESS AN EARLIER `noWitnessReason` SAID COULD NOT BE BUILT.
+   *
+   * The claim is about the CONVENTION this scanner requires WITHIN a root it
+   * is already scanning — not about which root it is pointed at (that is
+   * family-scan's `unscannedDirectories`, a different mechanism). So both
+   * halves live inside ONE scanned root, and the only difference between
+   * them is whether the medium's directory holds a `registry.ts`:
+   *
+   *   silence         — a structurally-enforced medium (enforcement code in
+   *                     the directory, no registry.ts) is NOT found;
+   *   positiveControl — a sibling medium in the SAME fixture root that does
+   *                     have registry.ts IS found.
+   *
+   * The positive control is what makes the silence half mean something: it
+   * proves the scanner was pointed somewhere it could actually see, so the
+   * silence is the convention's blindness rather than a mis-aimed scan.
+   * Nothing here asserts anything about the real MEDIA_REGISTRY's
+   * completeness — that claim is `docTitleHandDeclarationCurrency`, which
+   * keeps `witness: null` deliberately.
+   */
+  test("nonRegistryConventionMediumInvisible — a structurally-enforced medium with no registry.ts, INSIDE the scanned root, is invisible; a sibling medium in the same root that has one IS found", () => {
+    withTempFixture((root) => {
+      const src = join(root, "src");
+      mkdirSync(src);
+      // The docTitle-shaped medium: real enforcement code, no registry.ts.
+      mkdirSync(join(src, "structural-medium"));
+      writeFileSync(join(src, "structural-medium", "enforce.ts"), 'export function isProvisional(t: string): boolean {\n  return t.startsWith("[unwritten]");\n}\n');
+      // The conventional medium, same root, one level down, with registry.ts.
+      mkdirSync(join(src, "conventional-medium"));
+      writeFileSync(join(src, "conventional-medium", "registry.ts"), "export const REGISTRY = {} as const;\n");
+
+      const modules = listRegistryModules(src, root);
+      witnessBlindSpot("media:non-registry-convention-medium", {
+        silence: () => {
+          expect(modules.some((m) => m.includes("structural-medium"))).toBe(false);
+          expect(findUnexplainedRegistryModules(modules, []).some((m) => m.includes("structural-medium"))).toBe(false);
+        },
+        positiveControl: () => {
+          expect(modules).toContain("src/conventional-medium/registry.ts");
+          expect(findUnexplainedRegistryModules(modules, [])).toContain("src/conventional-medium/registry.ts");
+        },
+      });
+    });
+  });
+
+  test("docTitleHandDeclarationCurrency is witness: null with a non-empty written reason", () => {
+    expect(MEDIA_SCAN_BLIND_SPOTS.docTitleHandDeclarationCurrency.witness).toBeNull();
+    if (MEDIA_SCAN_BLIND_SPOTS.docTitleHandDeclarationCurrency.witness === null) {
+      expect(MEDIA_SCAN_BLIND_SPOTS.docTitleHandDeclarationCurrency.noWitnessReason.trim().length).toBeGreaterThan(0);
     }
   });
 
-  test("exactly one entry, unwitnessed — a change here means this claim became witnessable or a second unwitnessable one was added; update this pin deliberately, not by reflex", () => {
-    expect(Object.keys(MEDIA_SCAN_BLIND_SPOTS)).toEqual(["docTitleNotRegistryConvention"]);
+  test("the two entries are distinct claims, not one claim split for appearance — the witnessed one is witnessed, the unwitnessed one carries a reason, and their claims differ", () => {
+    expect(MEDIA_SCAN_BLIND_SPOTS.nonRegistryConventionMediumInvisible.witness).toBe("media:non-registry-convention-medium");
+    expect(MEDIA_SCAN_BLIND_SPOTS.nonRegistryConventionMediumInvisible.claim).not.toBe(MEDIA_SCAN_BLIND_SPOTS.docTitleHandDeclarationCurrency.claim);
+  });
+
+  test("exactly two entries — a change here means a claim became witnessable or a new one was added; update this pin deliberately, not by reflex", () => {
+    expect(Object.keys(MEDIA_SCAN_BLIND_SPOTS)).toEqual(["nonRegistryConventionMediumInvisible", "docTitleHandDeclarationCurrency"]);
   });
 
   test("COVERAGE (see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every MEDIA_SCAN_BLIND_SPOTS entry's declared witness id was actually executed, or it declares a written noWitnessReason instead", () => {
