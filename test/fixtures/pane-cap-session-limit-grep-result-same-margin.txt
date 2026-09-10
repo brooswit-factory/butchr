@@ -1,0 +1,3 @@
+⏺ Bash(grep -A1 "hit your session limit" ~/butchr-workspaces/.captures/BUTCHR-183-unrecognised-*.txt)
+  ⎿  You've hit your session limit · resets 5:10pm (America/Los_Angeles)
+     /usage-credits to finish what you're working on.
