@@ -15,7 +15,7 @@ export interface SyncDeps {
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;
   /** Per-ticket PR state; omitted (or always resolving null) when pr:* is disabled. */
   prState?: (key: string) => Promise<PrLookup>;
-  /** KAN-804/807: the "idle since spawn, never spoke" signal. Omitted disables agent:stalled entirely. */
+  /** KAN-804/807: the "idle since it stopped working, never spoke" signal. Omitted disables agent:stalled entirely. */
   stalled?: StalledCheck;
   /**
    * BUTCHR-179: reports `stalled.check`'s three-state result on `/health`
