@@ -47,6 +47,23 @@ export class StalledTracker {
   forget(issue: string): void {
     this.entries.delete(issue);
   }
+
+  /**
+   * Minutes since `issue`'s floor started (its first observation running,
+   * per `observe`'s own doc comment) — the genuine, measured idle-since-
+   * spawn duration, or `null` if untracked (never observed, forgotten, or a
+   * fresh instance after a restart). A pure query: never mutates, and
+   * distinct from `observe`'s own boolean — BUTCHR-221's stall remediator
+   * (src/agents/stall-remediation.ts) reports this in its wake comment
+   * instead of fabricating its own number, since its own floor only starts
+   * when IT first sees the label applied (typically the very next poll
+   * after this tracker's own streak already qualified), which would read as
+   * "0 minutes" on every first action otherwise.
+   */
+  elapsedMinutes(issue: string): number | null {
+    const e = this.entries.get(issue);
+    return e ? Math.round((this.now() - e.firstObservedAt) / 60_000) : null;
+  }
 }
 
 export interface StalledCheck {
@@ -61,6 +78,17 @@ export interface StalledCheck {
    */
   check: (issue: string, label: ObservedLabel) => Promise<boolean | null>;
   forget: (issue: string) => void;
+  /**
+   * See StalledTracker.elapsedMinutes — the genuine measured idle duration,
+   * or null if untracked. OPTIONAL, and appended after the two original
+   * members rather than folded into a breaking interface change: every
+   * existing test fixture in this repo constructs a bare `{ check, forget }`
+   * object satisfying `StalledCheck` (test/unit/labels-sync.test.ts,
+   * test/unit/stalled.test.ts), and none of them need to grow a third member
+   * just to keep compiling. A consumer that wants a real number (BUTCHR-221's
+   * stall remediator) must use optional chaining and its own fallback.
+   */
+  elapsedMinutes?: (issue: string) => number | null;
 }
 
 export interface StalledCheckDeps {
@@ -103,5 +131,6 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
       }
     },
     forget: (issue) => tracker.forget(issue),
+    elapsedMinutes: (issue) => tracker.elapsedMinutes(issue),
   };
 }

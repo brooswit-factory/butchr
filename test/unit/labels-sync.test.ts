@@ -332,6 +332,38 @@ describe("createLabelSync", () => {
     expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled"))).toBe(true);
   });
 
+  // BUTCHR-210 (2026-09-02 second becalming, ~7.5h): existence alone isn't
+  // enough on this per-poll line either — an operator must be able to tell
+  // a 4-minute stall from an all-night one at a glance.
+  test("the stalled log line includes elapsed minutes when the stalled dep exposes them", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => true, forget: () => {}, elapsedMinutes: () => 450 },
+      log: (l) => logs.push(l),
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+    expect(logs.some((l) => l.includes("KAN-1") && l.includes("stalled") && l.includes("450m"))).toBe(true);
+  });
+
+  test("the stalled log line omits elapsed minutes gracefully when the stalled dep doesn't expose them (existing fixtures unaffected)", async () => {
+    const jira = fakeJira();
+    const logs: string[] = [];
+    const sync = createLabelSync({
+      jira,
+      agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+      stalled: { check: async () => true, forget: () => {} },
+      log: (l) => logs.push(l),
+    });
+    await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+    const line = logs.find((l) => l.includes("KAN-1") && l.includes("stalled"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("undefined");
+    expect(line).not.toMatch(/\(\d+m\)/);
+  });
+
   test("a stalled check that could not verify (null) never writes agent:stalled onto a ticket that wasn't already labelled stalled, even across two consecutive polls", async () => {
     const jira = fakeJira();
     const logs: string[] = [];
@@ -509,6 +541,153 @@ describe("createLabelSync", () => {
         stalled: { check: async () => null, forget: () => {} },
       });
       await expect(sync([iss("KAN-1", "In Progress", ["agent:idle"])])).resolves.toBeInstanceOf(Set);
+    });
+  });
+
+  // BUTCHR-221/BUTCHR-210: the stall remediator is wired as an OPTIONAL dep,
+  // called with the ALREADY-APPLIED label (never this poll's just-stabilized
+  // candidate) — see src/agents/stall-remediation.ts's own top comment for
+  // why that gating specifically avoids the own-write ledger hazard.
+  describe("stallRemediation wiring (BUTCHR-221/BUTCHR-210)", () => {
+    function fakeRemediator() {
+      const calls: Array<{ issue: string; labelApplied: boolean; stalledPollResult: boolean | null; realElapsedMinutes: number | null | undefined }> = [];
+      const forgotten: string[] = [];
+      return {
+        calls,
+        forgotten,
+        check: async (issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null) => {
+          calls.push({ issue, labelApplied, stalledPollResult, realElapsedMinutes });
+          return { kind: "not-a-candidate" as const, issue };
+        },
+        forget: (issue: string) => forgotten.push(issue),
+      };
+    }
+
+    test("called with labelApplied=false on the SAME poll the label first stabilizes to stalled (never more eagerly than one poll behind the write)", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        stallRemediation: rem,
+      });
+      const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+      await sync([issue]); // 1st confirming poll: label still applied="idle"
+      await sync([issue]); // 2nd confirming poll: label WRITES to stalled this poll, but `applied` (read at the top) is still "idle"
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:stalled"], remove: ["agent:idle"] }]);
+      expect(rem.calls.every((c) => c.labelApplied === false)).toBe(true);
+    });
+
+    test("called with labelApplied=true starting the poll AFTER the write lands — never the same poll", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]); // unconfirmed
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]); // confirmed + written this poll — applied still "idle" going in
+      rem.calls.length = 0;
+      await sync([iss("KAN-1", "In Progress", ["agent:stalled"])]); // NOW applied="stalled", read fresh this poll
+      expect(rem.calls).toEqual([{ issue: "KAN-1", labelApplied: true, stalledPollResult: true, realElapsedMinutes: null }]);
+    });
+
+    test("the raw stalled.check() three-state result is threaded through UNCOLLAPSED (true/false/null all distinct)", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const results: Array<boolean | null> = [true, false, null];
+      let i = 0;
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => results[i++]!, forget: () => {} },
+        stallRemediation: rem,
+      });
+      const issue = iss("KAN-1", "In Progress", ["agent:idle"]);
+      await sync([issue]);
+      await sync([issue]);
+      await sync([issue]);
+      expect(rem.calls.map((c) => c.stalledPollResult)).toEqual([true, false, null]);
+    });
+
+    test("elapsedMinutes is passed through from the stalled dep when present", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {}, elapsedMinutes: () => 42 },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(rem.calls[0]!.realElapsedMinutes).toBe(42);
+    });
+
+    test("elapsedMinutes defaults to null when the stalled dep omits it (existing fixtures unaffected)", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(rem.calls[0]!.realElapsedMinutes).toBe(null);
+    });
+
+    test("forget is called on the inactive-status path", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => false, forget: () => {} },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "Done", ["agent:idle"])]);
+      expect(rem.forgotten).toEqual(["KAN-1"]);
+    });
+
+    test("forget is called when a ticket disappears from the feed", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => false, forget: () => {} },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      rem.forgotten.length = 0;
+      await sync([]); // KAN-1 disappears
+      expect(rem.forgotten).toEqual(["KAN-1"]);
+    });
+
+    test("omitting stallRemediation entirely (existing callers/fixtures) does not throw", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+      });
+      await expect(sync([iss("KAN-1", "In Progress", ["agent:idle"])])).resolves.toBeInstanceOf(Set);
+    });
+
+    test("stallRemediation is never invoked while the ticket is inactive", async () => {
+      const jira = fakeJira();
+      const rem = fakeRemediator();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => true, forget: () => {} },
+        stallRemediation: rem,
+      });
+      await sync([iss("KAN-1", "Done", ["agent:idle"])]);
+      expect(rem.calls).toEqual([]);
     });
   });
 });

@@ -6,10 +6,12 @@ import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, tellPeer, ASK_MARKER, CORRECTION_MARKER,
+  checkWorker, STAFFING_PENDING,
   type Disposition, type PeerIntent,
 } from "./relationship.js";
 import { isProjectId } from "../resources/id.js";
-import { advanceProjectWatermark, newestCommentId, resolveEligibleProjects } from "../resources/project.js";
+import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
+import { unwrapStorageParagraph } from "./speak.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -159,6 +161,19 @@ export function atlassianTools(
   log: (line: string) => void = console.error,
   roles: AssigneeRoles = {},
   onWrite?: (keys: readonly string[], writer: string) => void,
+  /**
+   * BUTCHR-244: `check_worker`'s live staffing source — a NARROW function
+   * seam over `herd.runningIssues()` (src/agents/herd.ts), not the whole
+   * herd, so this module stays pure over its dependencies and
+   * unit-testable with no herdr fixture (the same property this file's own
+   * header note already protects for `ops`). Resolves `true`/`false` when
+   * it can tell, `null` when it genuinely can't (never a guessed `false`).
+   * Optional — every existing caller of `atlassianTools` (this daemon's own
+   * production call site included, until it's updated) keeps working
+   * unchanged; when omitted, `check_worker` falls back to the ticket's own
+   * `agent:*` label (see `checkWorker`'s own doc comment in relationship.ts).
+   */
+  isStaffed?: (key: string) => Promise<boolean | null>,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -474,12 +489,14 @@ export function atlassianTools(
     new_worker: {
       description:
         "Create a worker one tier below the CALLER: an Epic's new_worker makes a Story, a Story's makes a Task — a Task has no worker beneath it and this REFUSES for a Task caller, explaining in words that it has reached the bottom of the hierarchy. " +
-        "YOU SUPPLY: `summary`, `description` (the full context a fresh agent needs to meet the definition of done), `priority` (optional — omitting it takes the site default), and a REQUIRED `disposition`: `\"start\"`, or `\"shelve\"` with a non-empty `reason` (the activation condition, in words — a `shelve` with no reason is REFUSED, and so is a missing disposition entirely; there is no default and no third option, because a worker this tool creates is always RUNNING or SHELVED, never undeclared). " +
+        "YOU SUPPLY: `summary`, `description` (the full context a fresh agent needs to meet the definition of done), `priority` (optional — omitting it takes the site default), and a REQUIRED `disposition`: `\"start\"`, or `\"shelve\"` with a non-empty `reason` (the activation condition, in words — a `shelve` with no reason is REFUSED, and so is a missing disposition entirely; there is no default and no third option, because a worker this tool creates always has a DECLARED disposition — In Progress or shelved (To Do + the exemption label) — never undeclared). " +
         "INFERRED, WITH NO ARGUMENT FOR ANY OF IT: the child's issue type (from your own type, per the rule above), the assignee (from this daemon's role map — REFUSED if that role's accountId is unset, naming the missing env var), the project (from your own), the link direction (Implements, outward from the new child to you, never the reverse), and the new doc's parent page (your own doc). " +
-        "WHAT A RETURNED RESULT GUARANTEES, AND WHAT A THROWN ERROR MEANS — READ THIS BEFORE TREATING EITHER AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A NORMAL RETURN ALWAYS MEANS a ticket that has a boss (the link succeeded), a declared disposition (RUNNING or SHELVED, never undeclared) AND a doc. If ONLY the doc step failed, this THROWS rather than returning a partial result — but by then the ticket, its boss link and its disposition are ALL already real and are NOT rolled back; the error names the surviving key, and its doc is completed by that ticket's own first `set_doc` call, whenever the agent working it makes one. Nothing here retries or fixes it automatically: a ticket that never gets a `set_doc` call simply has no doc until something calls for that key — strictly better than a duplicate or an orphan, but not invisible, and not something a caller should infer from a successful-looking throw. " +
+        "STAFFING (BUTCHR-244 — READ THIS BEFORE TREATING A NORMAL RETURN AS \"AN AGENT IS RUNNING\", BECAUSE IT NEVER MEANS THAT): a `\"start\"` disposition moves the ticket to In Progress, one of the ACTIVE statuses the daemon's reconcile poll spawns agents FROM, on its own later, independent cadence — this call does not start an agent and cannot confirm one exists, or ever will (the spawn itself can fail, e.g. herdr's `agent_pane_busy`, and nothing routes that failure back to this caller — it lands on the WORKER's own ticket instead, as a `[butchr:reconcile]`/`[butchr:crashloop]` comment and an `agent:*` label). The result's `staffing` field says this in words for whichever disposition you chose; use `check_worker` on the new key to actually find out. " +
+        "WHAT A RETURNED RESULT GUARANTEES, AND WHAT A THROWN ERROR MEANS — READ THIS BEFORE TREATING EITHER AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A NORMAL RETURN ALWAYS MEANS a ticket that has a boss (the link succeeded) AND a declared disposition (never undeclared) AND a doc — UNLESS `created: false` is present (see IDEMPOTENCY below), in which case none of this call's own writes happened at all. If ONLY the doc step failed, this THROWS rather than returning a partial result — but by then the ticket, its boss link and its disposition are ALL already real and are NOT rolled back; the error names the surviving key, and its doc is completed by that ticket's own first `set_doc` call, whenever the agent working it makes one. Nothing here retries or fixes it automatically: a ticket that never gets a `set_doc` call simply has no doc until something calls for that key — strictly better than a duplicate or an orphan, but not invisible, and not something a caller should infer from a successful-looking throw. " +
+        "IDEMPOTENCY (BUTCHR-244): before creating anything, this checks whether you already have a NOT-DONE worker whose summary exactly matches (after trimming) the one you're passing — a Done match does NOT count, since finished work sharing a summary with new work is legitimate follow-up, not a duplicate. If it finds one, NOTHING is created (no Jira write of any kind) and this returns THAT worker's key with `created: false` and a `duplicateReason` naming the match — never a throw, so a retry (this call's own cause is unestablished — network, a respawn, anything) is safe and quiet instead of producing a twin. DELIBERATE LIMITATION: there is no bypass in this increment — if you genuinely want a second worker with an identical summary, change the summary. This check is FREE (the same `getIssue` call already made for type/project inference) for an ISSUE caller; a PROJECT caller does NOT get it (finding a project's own existing Epics by summary has no equivalently free read — see relationship.ts's `newProjectWorker` doc comment). " +
         "ON FAILURE AFTER THE TICKET IS CREATED (the link or the disposition write): this attempts to delete the ticket it just created and rethrows either way — \"rolled back, nothing survives\" if the delete succeeded, or a NAMED PARTIAL STATE (the surviving ticket key) if it didn't. This is NOT unconditional atomicity: as of BUTCHR-35 this daemon's own credential does not hold Jira's `DELETE_ISSUES` permission on this project (measured — a permission read and a live round trip both confirm it), so the delete is currently expected to fail when attempted; it is attempted anyway because the refusal is a permission, not an API limit, and this exact code becomes fully self-cleaning the day that permission is granted, on whichever deployment holds it. Never assume a failure left nothing behind — read the error, which always names what survived. " +
         "Replaces jira_create_issue plus the confluence_create_page call and the doc-linking step a careful agent did by hand. Does NOT cover filing a deliberate orphan (`implements: \"none\"`) — that stays on jira_create_issue, which remains the only route for out-of-scope work your brief tells you to file outside your epic. " +
-        "FOR A PROJECT CALLER (BUTCHR-71): creates an EPIC in your project instead of a Story — same rule, one tier below you. There is NO Implements link (a Jira project is not an issue) — the relationship is MEMBERSHIP, reported back as `member` (the project key) instead of `implements`, which is omitted rather than set to a link that doesn't exist. Everything else — the required disposition, the doc nesting under your own root doc — works the same way. " +
+        "FOR A PROJECT CALLER (BUTCHR-71): creates an EPIC in your project instead of a Story — same rule, one tier below you. There is NO Implements link (a Jira project is not an issue) — the relationship is MEMBERSHIP, reported back as `member` (the project key) instead of `implements`, which is omitted rather than set to a link that doesn't exist. Everything else — the required disposition, the doc nesting under your own root doc — works the same way (except the idempotency check above, which this path does not get). " +
         "IDENTITY COLLISION (BUTCHR-110): if the child's about-to-be-assigned accountId turns out to be the SAME as your own, this daemon's role map has no second identity for this hop — GitHub will refuse an approval on the child's PR from its own author. This is RECORDED, never refused: the call above still succeeds, but the result carries an `identityCollision` field naming both roles/tiers and the hop, the same warning is written to a comment on the new ticket, and to this daemon's audit log.",
       input: {
         summary: z.string(),
@@ -515,7 +532,7 @@ export function atlassianTools(
     },
     start_worker: {
       description:
-        "Move ONE OF THE CALLER'S OWN workers to In Progress — the call that actually staffs an agent for it (an assigned-but-To-Do ticket is not staffed, and a boss waiting on events from it waits forever). Also reactivates a shelved worker, and sends an In Review worker back to work. Reactivating a shelved worker WITHDRAWS the shelved-exemption label if the worker carries it — the label means CURRENTLY shelved, a state, not a history, so the verb that reverses a shelve is the verb that retires it — cleared BEFORE the transition, never after (a live ticket left silently carrying a stale exemption is the failure this ordering exists to rule out), and skipped entirely, at no extra Jira call, when the worker doesn't carry it. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot) — for a PROJECT caller (BUTCHR-71), \"one of your own workers\" means an Epic that is a MEMBER of your project (no link exists for that relationship); a Story or Task in your own project, or an Epic in a different one, is refused just as sharply. Replaces jira_transition(key, \"In Progress\") for this case.",
+        "Move ONE OF THE CALLER'S OWN workers to In Progress. NOT the call that staffs an agent (BUTCHR-244 correction — this description used to claim otherwise): In Progress is one of the ACTIVE statuses the daemon's reconcile poll spawns agents FROM, on its own later, independent cadence — this call does not start an agent and cannot confirm one exists, or ever will (the spawn itself can fail, e.g. herdr's `agent_pane_busy`, with no path back to this caller). The result's `staffing` field says this in words; use `check_worker` on the key to actually find out. Also reactivates a shelved worker, and sends an In Review worker back to work. Reactivating a shelved worker WITHDRAWS the shelved-exemption label if the worker carries it — the label means CURRENTLY shelved, a state, not a history, so the verb that reverses a shelve is the verb that retires it — cleared BEFORE the transition, never after (a live ticket left silently carrying a stale exemption is the failure this ordering exists to rule out), and skipped entirely, at no extra Jira call, when the worker doesn't carry it. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot) — for a PROJECT caller (BUTCHR-71), \"one of your own workers\" means an Epic that is a MEMBER of your project (no link exists for that relationship); a Story or Task in your own project, or an Epic in a different one, is refused just as sharply. Replaces jira_transition(key, \"In Progress\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
@@ -523,7 +540,21 @@ export function atlassianTools(
         audit(c, `start_worker ${key}`);
         const r = await startWorker(ops, who, key);
         noted(c, [key]);
-        return orOk(r, { ok: true, key, status: "In Progress" });
+        return { ...orOk(r, {}), ok: true, key, status: "In Progress", staffing: STAFFING_PENDING };
+      },
+    },
+    check_worker: {
+      description:
+        "BUTCHR-244: the verb that can actually answer \"is my worker staffed?\" — new_worker/start_worker/adopt_worker only ever move a ticket into the status set the daemon's reconcile poll spawns agents FROM; none of them starts an agent or can confirm one exists (see their own `staffing` field). This is that check. Refuses a `key` that is not one of the caller's own workers, the same way start_worker/tell_worker do (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). " +
+        "RETURNS `status` (the worker's current Jira status) and `staffing`, a THREE-VALUED verdict — \"staffed\" / \"not-staffed\" / \"could-not-look\" — NEVER just two: conflating \"could not look\" with \"not staffed\" is a real, previously-shipped mistake in this fleet (a boss on this exact ticket checked the wrong daemon's herd, saw nothing, and reported a confident, wrong \"not staffed\" — read as a cautionary tale, not a hypothetical). `source` says which read answered — \"herd\" (this daemon's own live agent registry, when wired and known to cover this worker) or \"label\" (the ticket's own `agent:*` label, which can be up to a poll stale and is further damped by a two-poll stabilizer, but is written by WHICHEVER daemon actually staffs the ticket, so it stays valid even when this call's own herd probe is not the right one to ask). `observedLabel` names the exact label read, when `source` is \"label\" and one was present. " +
+        "SCOPE (why a live herd read can itself become \"could not look\"): a single host can run more than one butchr daemon, each with a herd that only ever covers ITS OWN Atlassian account's tickets. If this worker is staffed by a DIFFERENT account/daemon, this daemon's own herd is structurally blind to it — an empty read from it is not evidence of \"not staffed\", so this call never trusts it: the herd is consulted only when the worker's own assignee matches this credential's own identity, and otherwise falls back to the label instead (still a valid, cross-daemon-correct signal) with `probeOutOfScope: true` on the result naming why. " +
+        "Replaces reading the `agent:*` label off jira_get_issue by hand and hoping you inferred the right thing from it.",
+      input: { key: z.string() },
+      handler: async (a, c) => {
+        const { key } = a as { key: string };
+        const who = requireCaller(c, "check_worker");
+        audit(c, `check_worker ${key}`);
+        return checkWorker(ops, who, key, isStaffed);
       },
     },
     shelve_worker: {
@@ -544,7 +575,8 @@ export function atlassianTools(
         "Take ownership of an EXISTING ticket — an orphan, or one filed by an agent that has since ended: infers the assignee from the ADOPTED ticket's own issue type (Story or Task; anything else is refused), makes the Implements link (adopted ticket → caller), and ensures its doc, nested under the caller's own. Also takes the SAME required `disposition` as new_worker (`\"start\"`, or `\"shelve\"` with a non-empty `reason`) — an adopted ticket left in To Do with nobody's decision recorded is the same undeclared state as an unstarted new_worker child, by a different door. IDEMPOTENT: adopting a ticket already correctly adopted by the caller changes nothing (the assign/link/disposition writes are skipped) and is NOT an error — only the doc is still ensured, as a no-op-when-already-present safety net. A `\"start\"` disposition ALSO WITHDRAWS the shelved-exemption label (`butchr:shelved`) whenever the adopted ticket carries it, and this clear is NOT gated on that idempotence check — even an otherwise fully idempotent re-adoption (already linked, already assigned, already In Progress) still clears a stale exemption, because a live ticket silently carrying one is the same residue start_worker exists to stop producing, through a second door. No extra Jira call: it reuses the labels this call already fetched to decide idempotence. For `butchr:shelved` specifically, a `\"shelve\"` disposition only ever ADDS the label — it never clears it. SEPARATELY, AND REGARDLESS OF DISPOSITION, this call ALSO WITHDRAWS the orphan label (`butchr:orphan`) whenever the adopted ticket carries it — for BOTH `\"start\"` and `\"shelve\"`, unlike `butchr:shelved` above: the moment a ticket gains a boss it stops being undirected, whichever disposition names what happens to it next, so the label meaning \"nobody owns this\" comes off either way. Likewise not gated on the idempotence check, and likewise costs no extra Jira call — same reused fetch. REFUSES a ticket already linked to a DIFFERENT boss — stealing another boss's worker must be an explicit act (jira_link_issues), never a side effect of a mistyped key. Replaces jira_assign plus a hand-written jira_link_issues call, plus the doc creation nobody remembered. " +
         "FOR A PROJECT CALLER (BUTCHR-71): the adoptable type is an EPIC, not a Story or Task — anything else is refused. There is no link to make (membership, not a link — see new_worker); \"already adopted\" means already a member, already assigned by the epic role, and already in the disposition's state — NEVER decided from a link, since none exists. Refuses an epic that belongs to a DIFFERENT project. Clears a stale `butchr:orphan` here too, same rule as the issue-caller path above — reachable today only if one is set by hand (`file_where_it_belongs` can only ever create a Story or a Task), so this is symmetry / defence-in-depth, not a fix for a reachable bug. " +
         "IDENTITY COLLISION (BUTCHR-110): if the adopted ticket's about-to-be-assigned accountId is the SAME as your own (read from YOUR OWN ticket, or — for a project caller — this daemon's own Atlassian credential), this hop has no second identity — GitHub will refuse an approval on its PR from its own author. RECORDED, never refused: the call still succeeds, but the result carries an `identityCollision` field, the same warning lands as a comment on the adopted ticket (skipped on a fully idempotent re-adoption that does no other write), and on this daemon's audit log. " +
-        "DECLARED HEADER WITHDRAWAL (BUTCHR-151/BUTCHR-157): if the adopted ticket carries a stale [ORPHAN] description header (baked in by file_where_it_belongs), this call retires it in the SAME call it withdraws butchr:orphan — rewriting the description with a truthful [ADOPTED] successor line naming the new boss, after archiving the retired header text as a [header-withdrawn] comment. Runs for BOTH dispositions and is NOT gated on the alreadyAdopted idempotence check, same as the label clear. NEVER blocks or corrupts the adoption: the result carries `orphanHeaderWithdrawn` on success, or `orphanHeaderNotWithdrawn` naming why not (absent header — the common case — hand-edited, duplicated, or a write failure) when it isn't; see src/headers/registry.ts for what this withdrawal path does and does not claim to reach.",
+        "DECLARED HEADER WITHDRAWAL (BUTCHR-151/BUTCHR-157): if the adopted ticket carries a stale [ORPHAN] description header (baked in by file_where_it_belongs), this call retires it in the SAME call it withdraws butchr:orphan — rewriting the description with a truthful [ADOPTED] successor line naming the new boss, after archiving the retired header text as a [header-withdrawn] comment. Runs for BOTH dispositions and is NOT gated on the alreadyAdopted idempotence check, same as the label clear. NEVER blocks or corrupts the adoption: the result carries `orphanHeaderWithdrawn` on success, or `orphanHeaderNotWithdrawn` naming why not (absent header — the common case — hand-edited, duplicated, or a write failure) when it isn't; see src/headers/registry.ts for what this withdrawal path does and does not claim to reach. " +
+        "STAFFING (BUTCHR-244): like new_worker, a \"start\" disposition here only moves the ticket to In Progress — it does not start an agent and cannot confirm one exists; the result's `staffing` field says so (or, for \"shelve\", says the ticket is left in a non-active status the reconciler never spawns from at all). Use `check_worker` to actually find out. Reported even on a fully idempotent re-adoption.",
       input: {
         key: z.string(),
         disposition: z.enum(["start", "shelve"]),
@@ -665,7 +697,7 @@ export function atlassianTools(
     },
     check_in: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). Your LAST ACT before exiting: records "I have acted on everything I can currently see" so this project goes back to sleep rather than waking again on the same, already-handled state. TAKES NO ARGUMENTS: it re-reads your OWN current root-doc version, newest root-doc comment, and every epic you currently have In Review directly from Jira/Confluence — it never trusts a value you hand it, the same way nothing else in this system trusts a caller-supplied fact where a server read is available. Call this ONLY after you have actually finished acting on what woke you — calling it early against a rule or a suppression you are not designing yourself is exactly how you would go back to sleep with something unhandled. Idempotent: calling it again with nothing new to report simply re-records the same current state. Never call this on behalf of another project — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). Your LAST ACT before exiting: records "I have acted on everything I can currently see" so this project goes back to sleep rather than waking again on the same, already-handled state. TAKES NO ARGUMENTS: it re-reads your OWN current root-doc version, every root-doc comment id, and every epic you currently have In Review directly from Jira/Confluence — it never trusts a value you hand it, the same way nothing else in this system trusts a caller-supplied fact where a server read is available. Call this ONLY after you have actually finished acting on what woke you — calling it early against a rule or a suppression you are not designing yourself is exactly how you would go back to sleep with something unhandled. Idempotent: calling it again with nothing new to report simply re-records the same current state (BUTCHR-227: recording is a SET UNION, so a repeat call can only ever add ids already present, never regress anything). Never call this on behalf of another project — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(c, "check_in");
@@ -676,13 +708,22 @@ export function atlassianTools(
           ops.search(`project = ${who} AND issuetype = Epic AND status = "In Review"`, 200) as Promise<{ issues?: Array<{ key: string }> }>,
         ]);
         const version = versions[doc.id];
-        const comment = newestCommentId(comments.results);
-        // `epics` is a REPLACE, not a merge (advanceProjectWatermark's own
-        // doc comment) — this is what prunes an epic that has left review
-        // since the last check-in, so re-entry is detectable by absence
-        // again. It is therefore built and passed EVERY call, even when
-        // empty ({} correctly clears every previously-recorded entry for a
-        // project with nothing in review right now).
+        // BUTCHR-227: records the FULL observed id set, not a "newest"
+        // scalar — see src/resources/project.ts's `ProjectWatermark.commentsSeen`
+        // and `advanceProjectWatermark`'s own doc comments. This is
+        // WRITER A: it can only ever ADD ids (advanceProjectWatermark
+        // unions), never regress the watermark — WRITER B, the
+        // self-suppression write in src/tools/speak.ts, is the other half.
+        const seenComments = comments.results.map((c) => c.id);
+        // `epics` is a REPLACE of the KEY SET, not a merge
+        // (advanceProjectWatermark's own doc comment) — this is what prunes
+        // an epic that has left review since the last check-in, so
+        // re-entry is detectable by absence again. It is therefore built
+        // and passed EVERY call, even when empty ({} correctly clears every
+        // previously-recorded key for a project with nothing in review
+        // right now). Per-key VALUES are unioned by advanceProjectWatermark,
+        // never replaced — see that function's own doc comment for why
+        // (getIssueComments's cap, below).
         //
         // ops.getIssueComments (NOT getIssue's embedded fields.comment
         // block) per in-review epic, deliberately: an EARLIER version of
@@ -695,37 +736,35 @@ export function atlassianTools(
         // so the two can never disagree by construction. Usually zero
         // calls: most polls have no epic in review at all.
         //
-        // CORRECTED (BUTCHR-198/BUTCHR-202): the previous version of this
-        // comment called discovery's reader "always correct" for this
-        // purpose. That overstated it: the value below is
-        // `newestCommentId(...)` (src/resources/project.ts) — a NUMERIC MAX
-        // reduce over the reader's results, which discards the reader's
-        // newest-first order entirely and re-derives "newest" from id
-        // magnitude instead. This epics-in-review watermark therefore
-        // shares the IDENTICAL max-by-numeric-id mechanism as the Confluence
-        // root-doc watermark (`comment` above, same function) — by
-        // construction, not coincidence — and its correctness depends on
-        // Jira issue-comment ids being monotonic with creation time, a
-        // premise that is, as of BUTCHR-202, UNMEASURED (unlike the
-        // Confluence case, measured twice independently to be FALSE). The
-        // reader being newest-first does not protect this line: nothing
-        // downstream of it consults that order.
-        const epics: Record<string, string | null> = {};
+        // CORRECTED (BUTCHR-198/BUTCHR-227): this comment used to say
+        // discovery's reader was "always correct", then (BUTCHR-198/202)
+        // that the watermark below was a max-by-numeric-id reduce whose
+        // correctness rested on an UNMEASURED Jira id-monotonicity
+        // premise. BUTCHR-227 removes the dependence on that premise
+        // entirely rather than measuring it: the value recorded below is
+        // the FULL observed id SET, and "seen" is set membership, not
+        // "equal to the newest id by any ordering". `getIssueComments`'s
+        // own doc comment on `AtlassianOps` states its `maxResults` cap —
+        // that cap is a still-live pagination blind spot (an id outside
+        // the window is never observed, so never seen, so never wakes
+        // anything), unchanged and unfixed by this ticket; it is not the
+        // id-monotonicity defect this ticket does fix.
+        const epics: Record<string, readonly string[]> = {};
         for (const epic of epicsRaw?.issues ?? []) {
-          epics[epic.key] = newestCommentId((await ops.getIssueComments(epic.key)).results);
+          epics[epic.key] = (await ops.getIssueComments(epic.key)).results.map((c) => c.id);
         }
-        audit(c, `check_in (version=${version ?? "?"}, comment=${comment ?? "none"}, epics in review=${Object.keys(epics).length})`);
+        audit(c, `check_in (version=${version ?? "?"}, comments seen=${seenComments.length}, epics in review=${Object.keys(epics).length})`);
         await advanceProjectWatermark(ops, who, {
           ...(version !== undefined ? { version } : {}),
-          ...(comment !== null ? { comment } : {}),
+          seenComments,
           epics,
         });
-        return { ok: true, key: who, version: version ?? null, comment, epics };
+        return { ok: true, key: who, version: version ?? null, seenComments, epics };
       },
     },
     get_doc_comments: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns). CORRECTED (BUTCHR-198/BUTCHR-202): this description used to advise sorting by `id` numerically, the way `newestCommentId` does, to recover newest-first order. Do not do that — Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs; see `newestCommentId`\'s own doc comment, src/resources/project.ts), so a numeric-id sort is not a reliable newest-first order either, and is KNOWN-WRONG pending BUTCHR-198\'s fix. There is currently no reliable way to recover newest-first order from this verb\'s output. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
+        'PROJECT CALLER ONLY (refuses an issue caller). The inbound half of "a project is talked to by commenting on its root doc" (BUTCHR-62/BUTCHR-71\'s outbound half is report_to_boss/ask_boss posting there) — BUTCHR-107 found that no verb returned that root doc\'s FOOTER comments back to the project that owns it, so `get_doc()`\'s body-only read left every such comment invisible. TAKES NO ARGUMENTS: like check_in/report_to_boss/ask_boss, the only doc this can ever read is the CALLER\'S OWN root doc, resolved server-side — there is no key parameter, so which project\'s comments you get is never expressible as an argument mistake. Returns `{ results: [{ id, body, author }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the same raw order `getPageComments` returns), and that is FINE: as of BUTCHR-227, the wake path this verb feeds no longer depends on comment ordering AT ALL. `body` comes back as PLAIN TEXT (BUTCHR-239): `getPageComments` itself returns raw storage-format XHTML, but this handler undoes that with the same `unwrapStorageParagraph` the write side\'s wrapping already has as its exact inverse (src/tools/speak.ts) — no `<p>...</p>` wrapper and no entity escaping survive, so a marker like `[butchr:peer from=... to=... intent=...]` is readable with a bare `startsWith` and does not need re-decoding by the caller. CORRECTED (BUTCHR-198/BUTCHR-227): an earlier version of this description advised sorting by `id` numerically to recover newest-first order — do not do that, Confluence footer-comment ids are NOT monotonic with creation time (measured on two independent root docs). BUTCHR-198 documented that finding without changing behavior; BUTCHR-227 is the behavioral fix, and it does not repair ordering — it REMOVES THE DEPENDENCE ON ORDERING. `check_in` (this project\'s own last-act verb) now records every comment id this verb can see as a SEEN SET, compared by membership, never by "newest": there is still no reliable way to recover a newest-first order from this verb\'s output, and none is needed for the wake path to work correctly. `author` is the commenter\'s Atlassian accountId, OPTIONAL — absent (not a placeholder) on a comment whose author could not be read. Read-only: does not mark comments as seen, does not touch check_in\'s watermark, and does not let you reply — outbound stays on report_to_boss/ask_boss.',
       input: {},
       handler: async (_a, c) => {
         const who = requireProjectCaller(
@@ -734,7 +773,8 @@ export function atlassianTools(
           "your own root doc's footer comments have no per-issue equivalent to read here — an ISSUE caller's canonical read, jira_get_issue, already returns its own ticket's comments embedded in the response",
         );
         const doc = await projectRootDoc(ops, who);
-        const comments = await ops.getPageComments(doc.id);
+        const raw = await ops.getPageComments(doc.id);
+        const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
         audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
         return comments;
       },
@@ -757,7 +797,7 @@ export function atlassianTools(
     },
     tell_peer: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments), but the WAKE this comment can trigger is BEST EFFORT: Confluence footer-comment ids are not monotonic with creation time, and the project wake path\'s MAX-id watermark comparison can silently fail to notice a comment whose id lands below the recipient\'s current max — no error on either side, indistinguishable from the peer simply not having answered yet. That defect is BUTCHR-195, not this verb\'s to fix. ' +
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). The WAKE this comment can trigger is still BEST EFFORT, but for a DIFFERENT, honest reason: the recipient\'s reader has a page-window/pagination bound (see `getPageComments`\'s own doc comment on AtlassianOps) — a comment that never appears inside that window is never observed, therefore never wakes anything, regardless of its id. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
         'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
         'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
       input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },
