@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrError } from "@brooswit/herdr-sdk";
-import { HerdrHerd, agentNameFor, issueOfAgentName } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, issueOfAgentName, PANE_BUSY_MAX_RETRIES } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 
@@ -195,7 +195,7 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
     await expect(herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null })).rejects.toMatchObject({ code: "agent_pane_busy" });
     expect(f.closed).toEqual(["w9:p1"]);
     expect(f.started.length).toBe(0);
-    expect(f.callCount()).toBeGreaterThan(1); // it did retry, not fail on the first busy rejection
+    expect(f.callCount()).toBe(1 + PANE_BUSY_MAX_RETRIES); // pins the exact bound the constant's own doc comment advertises
   });
 
   test("a non-busy agent.start rejection is never retried — it reaches spawn()'s own catch on the first attempt", async () => {
