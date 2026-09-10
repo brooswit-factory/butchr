@@ -586,6 +586,48 @@ describe("docs.ts: doc-write size budget (BUTCHR-250) — refuse only a write th
     await expect(setDoc(ops, "BUTCHR-90", shrunk)).resolves.toBeDefined();
     expect(pages.get("900")!.body).toBe(shrunk);
   });
+
+  // -------------------------------------------------------------------
+  // Review finding (PR #299): Confluence's storage layer re-encodes at
+  // least some characters (a literal em dash, a literal "Δ") into LONGER
+  // named XML entities on round-trip. A comparison of RAW (un-normalised)
+  // lengths can therefore be fooled: a proposed body that swaps entities
+  // for their shorter literal form LOOKS smaller than what is stored, but
+  // is measured too early — its real post-storage size is what matters,
+  // and that can come back larger than what raw comparison suggested.
+  // These arms use REAL non-ASCII characters (not "a".repeat(...)) because
+  // that is exactly what a purely-ASCII fixture cannot ever catch.
+  // -------------------------------------------------------------------
+  test("REGRESSION (PR #299 review): a raw-looking shrink that actually grows once stored is still REFUSED", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    // stored: already over budget, no special characters.
+    const stored = "b".repeat(60_000);
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9006", "ACME — product brief", stored);
+
+    // proposed: RAW length (56,000) is smaller than stored (60,000) — a
+    // pre-fix, raw-only comparison would have scored this as a shrink and
+    // allowed it. But it carries 1,000 literal em dashes, each of which
+    // Confluence's storage layer re-encodes to the 7-character "&mdash;" —
+    // so its REAL stored size would be 55,000 + 1,000*7 = 62,000, which is
+    // BOTH over budget and larger than the 60,000 currently stored.
+    const proposed = "b".repeat(55_000) + "—".repeat(1_000);
+    expect(proposed.length).toBeLessThan(stored.length); // pin: the raw comparison this bug relied on
+
+    await expect(setProjectDoc(ops, "ACME", proposed)).rejects.toThrow(/refusing this write/);
+    expect(pages.get("9006")!.body).toBe(stored); // refused write never landed — the page did not silently grow
+  });
+
+  test("a proposed body containing known-re-encoded characters that genuinely stays under budget once estimated is still allowed", async () => {
+    const { ops, pages, setProjectProperty } = makeWorld();
+    seedProjectRootDoc(pages, setProjectProperty, "ACME", "9007", "ACME — product brief", "<p>small</p>");
+
+    // A handful of em dashes and curly quotes inflate the estimate, but not
+    // past budget: comfortably allowed, and the estimate (not the raw
+    // length) is what must clear the budget check.
+    const proposed = "b".repeat(100) + "—’“”".repeat(5);
+    await expect(setProjectDoc(ops, "ACME", proposed)).resolves.toBeDefined();
+    expect(pages.get("9007")!.body).toBe(proposed);
+  });
 });
 
 describe("docs.ts: labelForKey / JIRA_KEY_RE", () => {

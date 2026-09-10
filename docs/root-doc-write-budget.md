@@ -18,7 +18,10 @@ of the write path. Let `budget` be the named constant `DOC_BODY_CHAR_BUDGET`,
 `stored` be the character length of the body already on the page (read before
 the write, by the same pre-write read `projectRootDoc`/`ensureDoc` already
 perform to resolve the page id — no second fetch), and `proposed` be the
-character length of the body about to be written.
+**estimated post-storage** character length of the body about to be written
+— `estimateStoredLength(body)`, not a bare `body.length` (see "The residual
+limit" section below for why the estimate step exists and what it does and
+does not cover).
 
 **Refuse if and only if `proposed.length > budget` AND `proposed.length >
 stored.length`.**
@@ -212,7 +215,7 @@ This table answers BUTCHR-232's blast-radius question as "which projects are
 pinned the moment this merges," not "should the bound be widened" — that
 question is already decided at the epic level.
 
-## The residual limit on any content-based comparison on this surface
+## The residual limit on any content-based comparison on this surface — MEASURED live in review, and fixed
 
 This bound turns on a **size** comparison, never a content comparison — it
 never inspects what changed, only how large `stored` and `proposed` are. That
@@ -222,13 +225,66 @@ is the *only* transformation involved (attribute ordering, whitespace,
 self-closing tags and empty-element normalisation were explicitly not
 tested). A size comparison is far less exposed to that residual than a
 content comparison would be, since `stored`/`proposed` never need to be
-diffed or reconciled against each other — but it is not zero-exposed: if
-Confluence's storage transform changes a body's *length* (not just its
-content) between what is sent and what is later read back, `stored` on a
-later write is measuring the transformed length, not the sent length. This
-bound has not measured whether that happens; it is a residual worth a future
-reader's attention if `stored` and `proposed` for an unmodified body are ever
-observed to disagree.
+diffed or reconciled against each other.
+
+**This section originally said the length-changing residual "has not
+measured whether that happens." PR #299's review measured it, live, against
+the real `setDoc` path, and it does happen — the original code was
+measurably unsound as a result.** Two measurements, reproduced independently
+in this repo's review:
+
+- A literal em dash (`—`, U+2014) sent through `set_doc` came back from
+  Confluence storage as `&mdash;` — 6 characters longer, the only difference
+  in an otherwise-unchanged 48,730-character body.
+- Starting from a stored body containing 97 `&mdash;` entities, replacing 50
+  of them with literal `—` and sending that (**300 characters smaller** than
+  what was stored) read back **byte-identical** to the prior stored body —
+  same sha256, same length. The page did not shrink at all.
+
+**Why that broke the guard, precisely: `stored` (read back, post-transform)
+and a raw, un-normalised `proposed.length` (pre-transform, as the caller
+wrote it) were being compared as though they were in the same unit, and they
+are not.** Both clauses under-counted in the permissive direction — the one
+a bound cannot afford:
+
+- The **budget** clause under-counted a `proposed` body rich in
+  transform-inflated characters, since the raw length is smaller than what
+  it will actually occupy once stored.
+- The **growth** clause under-counted the same way, and this was the more
+  serious defect: a `proposed` body that looks smaller than `stored` in raw
+  terms can have a real post-storage size *larger* than `stored` — so a
+  genuinely growing, over-budget write could be scored as a permitted
+  shrink, repeatedly, entirely defeating the anti-bricking clause's actual
+  job (which is to make growth impossible once over budget, not merely to
+  make *apparent* growth impossible).
+
+**The fix:** `estimateStoredLength()` (`src/tools/docs.ts`) puts `proposed`
+into the same representation `stored` is already in — whatever
+`get_doc`/`confluence_get_page` returns is already post-transform — by
+applying `KNOWN_STORAGE_ENTITY_ENCODINGS`, a small, explicit table of the
+characters this corpus has actually observed Confluence re-encoding (the em
+dash, en dash, ellipsis, both arrow glyphs, curly quotes, and `Δ` — the
+literal character the review's second measurement produced). Both
+`refuseIfGrowingOverBudget`'s clauses now compare against
+`estimateStoredLength(proposed)`, never `proposed.length` directly.
+`test/unit/docs.test.ts` carries a regression arm using real non-ASCII
+characters (not `"a".repeat(...)`) that fails against the pre-fix
+raw-comparison code and passes against the fix — reverted and re-run by hand
+during this PR to confirm it is a genuine falsifier, not decoration.
+
+**This is still NOT a claim of completeness, and must not be read as one.**
+`KNOWN_STORAGE_ENTITY_ENCODINGS` is a known-subset model, explicitly not a
+full re-implementation of Confluence's storage transform — the same limit
+BUTCHR-235 already named (attribute ordering, whitespace, self-closing tags
+and empty-element normalisation were never tested, by either ticket). A
+character this list does not cover, that Confluence also happens to
+re-encode into a longer form, would still be invisible to this comparison,
+in the same permissive direction as before. What has changed is that the
+*specific, measured* failure mode — em dash and the one Greek letter
+actually observed live — is closed, and the mechanism for closing further
+instances (extend the table) is now in place rather than absent. Re-measure
+against realistic markup before trusting this is complete; it is a
+known-subset fix, not a proof of soundness.
 
 ## Read this next to `docs/tool-result-size-cap.md`
 

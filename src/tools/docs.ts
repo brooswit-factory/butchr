@@ -43,14 +43,63 @@ const MAX_BOSS_DEPTH = 20;
 export const DOC_BODY_CHAR_BUDGET = 50_000;
 
 /**
+ * KNOWN-SUBSET model of Confluence's storage-layer character substitution —
+ * NOT a full re-implementation of that transform. BUTCHR-235 established
+ * that a literal em dash and a literal quotation mark round-trip through
+ * storage as longer named XML entities, and explicitly did NOT establish
+ * that this is the only thing the transform does. BUTCHR-250's own review
+ * (PR #299) measured two more instances live against a real `setDoc` write —
+ * a literal `—` (U+2014) coming back as `&mdash;` (+6 chars) and a literal
+ * `Δ` (U+0394) coming back as `&Delta;` (+6 chars) — and this list is
+ * exactly the entities observed round-tripping across every live project
+ * root doc this bound protects, plus that measurement. A character outside
+ * this list that Confluence also happens to re-encode is a residual this
+ * function does NOT close; see docs/root-doc-write-budget.md.
+ */
+const KNOWN_STORAGE_ENTITY_ENCODINGS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/—/g, "&mdash;"],
+  [/–/g, "&ndash;"],
+  [/…/g, "&hellip;"],
+  [/→/g, "&rarr;"],
+  [/←/g, "&larr;"],
+  [/“/g, "&ldquo;"],
+  [/”/g, "&rdquo;"],
+  [/‘/g, "&lsquo;"],
+  [/’/g, "&rsquo;"],
+  [/Δ/g, "&Delta;"],
+];
+
+/**
+ * Estimates what `body` will look like once Confluence's storage layer has
+ * round-tripped it, by applying `KNOWN_STORAGE_ENTITY_ENCODINGS`. Used to
+ * bring a not-yet-stored `proposed` body into the SAME representation
+ * `stored` is already in (whatever `get_doc`/`confluence_get_page` returned
+ * is already post-transform) and that `DOC_BODY_CHAR_BUDGET` was itself
+ * calibrated against (docs/tool-result-size-cap.md's cap is measured on the
+ * STORED/returned body, not on what a caller sends) — comparing a raw,
+ * untransformed `proposed` against either undercounts by exactly the amount
+ * this corrects for. An UNDER-estimate for any character this list does not
+ * cover, never an over-estimate: it only replaces literal characters with
+ * their known-longer encoded form, so a real defect is never hidden by this
+ * function inventing shrinkage that will not happen.
+ */
+function estimateStoredLength(body: string): number {
+  let estimated = body;
+  for (const [pattern, entity] of KNOWN_STORAGE_ENTITY_ENCODINGS) {
+    estimated = estimated.replace(pattern, entity);
+  }
+  return estimated.length;
+}
+
+/**
  * Refuses a doc write IFF it would both exceed `budget` AND grow the page
- * (`proposed.length > stored.length`) — BUTCHR-250's anti-bricking design.
- * `stored` MUST be read from the page BEFORE the write being adjudicated: a
- * post-write measurement can't do this job, because the anti-bricking clause
- * needs "what's on the page right now", not "what this write would produce".
- * Both `setProjectDoc` and `setDoc` already do that pre-write read (via
- * `projectRootDoc`/`ensureDoc`) to resolve the page id, so this reuses it —
- * no second fetch.
+ * (estimated-stored `proposed` length > `stored.length`) — BUTCHR-250's
+ * anti-bricking design. `stored` MUST be read from the page BEFORE the
+ * write being adjudicated: a post-write measurement can't do this job,
+ * because the anti-bricking clause needs "what's on the page right now",
+ * not "what this write would produce". Both `setProjectDoc` and `setDoc`
+ * already do that pre-write read (via `projectRootDoc`/`ensureDoc`) to
+ * resolve the page id, so this reuses it — no second fetch.
  *
  * Deliberately allows `proposed === stored` (equal size is not growth — a
  * same-size rewrite is a correction, not an expansion) and `proposed ===
@@ -58,20 +107,31 @@ export const DOC_BODY_CHAR_BUDGET = 50_000;
  * pinned by the boundary test arms in test/unit/docs.test.ts, so a later
  * edit that flips either `>` to `>=` fails loudly rather than silently.
  *
- * A SIZE comparison, not a content one — this never inspects what changed,
- * only how large the two bodies are, so it is not exposed to the
- * entity-encoding residual docs/tool-result-size-cap.md's sibling ticket
- * (BUTCHR-235) flags for content comparisons on this surface.
+ * A SIZE comparison, not a content one — this never inspects WHAT changed,
+ * only how large the two bodies are once both are expressed in the same
+ * (estimated-stored) representation via `estimateStoredLength`. That
+ * normalisation is necessary but NOT sufficient against BUTCHR-235's
+ * content-transform residual: it closes the specific entities in
+ * `KNOWN_STORAGE_ENTITY_ENCODINGS` (measured, live, on this surface — see
+ * that constant's own comment) but is not a general decoder, and a
+ * transform this list does not cover would still be invisible to this
+ * comparison. Prior to BUTCHR-250's review, this compared raw
+ * (un-normalised) lengths and was measurably unsound in the permissive
+ * direction — a write that swapped stored entities for their literal,
+ * longer-when-re-encoded characters could score as a shrink while the
+ * stored page did not shrink at all. See docs/root-doc-write-budget.md for
+ * the measurement and test/unit/docs.test.ts for the regression arm.
  */
 function refuseIfGrowingOverBudget(who: string, stored: string, proposed: string, budget: number): void {
   const storedLen = stored.length;
-  const proposedLen = proposed.length;
+  const proposedLen = estimateStoredLength(proposed);
   if (proposedLen > budget && proposedLen > storedLen) {
     throw new Error(
-      `${who}: refusing this write — proposed body is ${proposedLen} characters, over the ${budget}-character budget ` +
-        `and larger than what's currently stored (${storedLen} characters). This would grow an already-oversized page. ` +
-        `Move the excess into a child page linked from this doc's index, then retry with a body no larger than what's ` +
-        `stored now — an over-budget page can always be corrected or shrunk, it just cannot be grown further.`,
+      `${who}: refusing this write — proposed body is an estimated ${proposedLen} characters once stored ` +
+        `(${proposed.length} as sent), over the ${budget}-character budget and larger than what's currently ` +
+        `stored (${storedLen} characters). This would grow an already-oversized page. Move the excess into a ` +
+        `child page linked from this doc's index, then retry with a body no larger than what's stored now — ` +
+        `an over-budget page can always be corrected or shrunk, it just cannot be grown further.`,
     );
   }
 }
