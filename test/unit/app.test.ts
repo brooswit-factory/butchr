@@ -3,6 +3,7 @@ import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
 import { createCoverageTracker } from "../../src/daemon/coverage.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
 import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
@@ -405,6 +406,80 @@ describe("/health carries detector coverage as a sibling of components, and neve
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
       expect(body.coverage).toBeUndefined();
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-284: /health carries the admission cap and current residency as a
+// THIRD sibling — never inside components[], and never able to flip `ok`:
+// sitting AT the cap is a normal, healthy state. Driven through the real
+// production composition (combineHealth + buildApp + a real listening
+// server), same as the build-identity/coverage tests above.
+describe("/health carries the admission cap + residency as a sibling of components, and never flips ok (BUTCHR-284)", () => {
+  test("combineHealth's optional admission param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const admission = createAdmissionController({ cap: 8, residency: async () => ["A", "B", "C"] });
+    await admission.admit([], []); // establishes a trusted residency reading
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.admission).toEqual({ cap: 8, residency: 3 });
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "cap" in c || "residency" in c)).toBe(false);
+      // Being at the cap is healthy: `ok` reflects pollLoop's own state only.
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("residency is null before any trusted census has ever run", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const admission = createAdmissionController({ cap: 8, residency: async () => { throw new Error("never called yet"); } });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.admission).toEqual({ cap: 8, residency: null });
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting admission (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.admission).toBeUndefined();
       expect(body.ok).toBe(true);
     } finally {
       health.stop();
