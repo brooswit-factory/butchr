@@ -43,6 +43,35 @@ describe("StalledTracker", () => {
     t.forget("KAN-1");
     expect(t.observe("KAN-1", "idle")).toBe(false); // fresh floor at `now`, not yet 10 minutes
   });
+
+  // BUTCHR-221/BUTCHR-210: the genuine, measured idle-since-spawn duration,
+  // exposed for the stall remediator's wake comment (see
+  // src/agents/stall-remediation.ts) — a pure query, distinct from observe's
+  // own boolean.
+  describe("elapsedMinutes", () => {
+    test("null when untracked (never observed)", () => {
+      const t = new StalledTracker(() => 0, 10);
+      expect(t.elapsedMinutes("KAN-1")).toBe(null);
+    });
+
+    test("grows with real elapsed time since the floor started", () => {
+      let now = 0;
+      const t = new StalledTracker(() => now, 10);
+      t.observe("KAN-1", "idle");
+      expect(t.elapsedMinutes("KAN-1")).toBe(0);
+      now = 450 * 60_000;
+      expect(t.elapsedMinutes("KAN-1")).toBe(450);
+    });
+
+    test("null again after forget", () => {
+      let now = 0;
+      const t = new StalledTracker(() => now, 10);
+      t.observe("KAN-1", "idle");
+      now = 5 * 60_000;
+      t.forget("KAN-1");
+      expect(t.elapsedMinutes("KAN-1")).toBe(null);
+    });
+  });
 });
 
 describe("createStalledCheck", () => {
@@ -114,5 +143,19 @@ describe("createStalledCheck", () => {
     now = 10 * 60_000;
     expect(await check.check("KAN-1", "idle")).toBe(null); // could not verify — NOT treated as "no comments found"
     expect(logs.some((l) => l.includes("WARNING") && l.includes("KAN-1") && l.includes("timeout"))).toBe(true);
+  });
+
+  test("elapsedMinutes is exposed on the built StalledCheck, backed by the same tracker check() already advances", async () => {
+    let now = 0;
+    const check = createStalledCheck({
+      now: () => now,
+      minutes: 10,
+      comments: async () => [],
+      accountEmail: "daemon@example.com",
+    });
+    expect(check.elapsedMinutes?.("KAN-1")).toBe(null); // never observed yet
+    await check.check("KAN-1", "idle");
+    now = 25 * 60_000;
+    expect(check.elapsedMinutes?.("KAN-1")).toBe(25);
   });
 });
