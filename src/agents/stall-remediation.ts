@@ -145,7 +145,7 @@ export class StallRemediationTracker {
  */
 function wakeComment(issue: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${issue} has read agent:stalled, continuously, for ${elapsedMinutes} minute(s): idle or done since first observed running, with no comment from this daemon's account in that window.`,
+    `${MARKER} ${issue} has read agent:stalled, continuously, for ${elapsedMinutes} minute(s): idle or done since it last stopped working, with no comment from this daemon's account among its recent comments.`,
     "",
     `fingerprint: ${issue}`,
     "",
