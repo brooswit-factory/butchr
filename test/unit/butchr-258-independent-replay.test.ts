@@ -824,13 +824,32 @@ describe("SECTION 7 — the pagination blind spot, constructed per axis", () => 
   // module's source. That asymmetry is itself worth reporting: one axis's
   // blind spot is a quantified, testable boundary; the other axis's is
   // qualitatively admitted but not quantified anywhere in-repo.
-  test("ROOT-DOC AXIS: no coded numeric window size exists in this repo for getPageComments — asserted here as a standing fact about the source, not a live measurement", () => {
-    // This assertion is intentionally about STRING CONTENT, not behavior: it
-    // fails (usefully) the moment someone adds an explicit numeric cap to
-    // this doc comment, which is exactly when this test's own claim ("no
-    // numeric cap is stated here") should be revisited.
-    const docCommentHasNoStatedNumericCap = true; // see this test's own comment for how this was checked
-    expect(docCommentHasNoStatedNumericCap).toBe(true);
+  // A REAL, BREAKABLE check — reads src/tools/atlassian-real.ts's own source
+  // rather than asserting a hand-typed boolean (the prior version of this
+  // test was `expect(true).toBe(true)`, flagged in review as reporting its
+  // own conclusion rather than reading for it — exactly the staleness
+  // failure mode this ticket exists to catch, inside its own artefact).
+  // FALSIFIER, stated before this version was run: if `getPageComments`'s
+  // call site ever gains a `limit` argument or a `_links.next`/cursor
+  // follow, OR if the sibling `getChildPages` in the same file ever LOSES
+  // its own pagination follow, this test must fail — either change would
+  // mean the asymmetry this section reports no longer holds.
+  test("ROOT-DOC AXIS: getPageComments passes no limit and follows no cursor, unlike the sibling getChildPages in the same file — the asymmetry itself, read from source", () => {
+    const source = readFileSync(join(import.meta.dir, "..", "..", "src", "tools", "atlassian-real.ts"), "utf8");
+    const getPageCommentsBody = source.slice(source.indexOf("getPageComments:"), source.indexOf("getPageComments:") + 400);
+    // (1) no `limit` argument on the root-doc comment read's own call site.
+    expect(getPageCommentsBody).toContain('wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" })');
+    expect(getPageCommentsBody).not.toMatch(/getPageFooterComments\([^)]*limit/s);
+    // (2) no `_links.next` / cursor follow anywhere in that call's own body.
+    expect(getPageCommentsBody).not.toContain("_links");
+    expect(getPageCommentsBody).not.toContain("cursor");
+    // (3) the sibling getChildPages, in the SAME file, DOES paginate — the
+    // asymmetry DoD item 9 asks to be checked, not just the comment-axis gap
+    // alone.
+    const getChildPagesBody = source.slice(source.indexOf("getChildPages:"), source.indexOf("getChildPages:") + 400);
+    expect(getChildPagesBody).toContain("limit: 50");
+    expect(getChildPagesBody).toContain("_links?.next");
+    expect(getChildPagesBody).toContain("cursor");
   });
 });
 
@@ -982,5 +1001,27 @@ describe("SECTION 8 — verdicts", () => {
     // against the retention-bearing doc comment's own surrounding source
     // rather than re-run against a fixture).
     expect(source).not.toMatch(/commentsSeen[^\n]*\.sort\(/);
+  });
+
+  // DoD item 8 (any stored-id-vs-threshold-id comparison) — a REAL,
+  // BREAKABLE check against `unseenIds` ITSELF, the one function both axes
+  // share, rather than only deferring to project-resource-type.test.ts's own
+  // "no Number()/magnitude" test (this file's §10 leaned on that sibling
+  // check alone, flagged in review as a soft spot for an increment whose
+  // premise is not relying on the implementer's own pinning). FALSIFIER: if
+  // `unseenIds`'s body ever gains `Number(`, a comparison operator
+  // (`<`/`>`/`<=`/`>=`), or `.sort(`, this must fail — a `Set`+`.filter`
+  // membership check has no arithmetic or ordering to smuggle a threshold
+  // into.
+  test("VERDICT: unseenIds — the one function both axes share — is set membership only, read directly from its own body, not deferred to a sibling suite", () => {
+    const source = readFileSync(join(import.meta.dir, "..", "..", "src", "resources", "project.ts"), "utf8");
+    const start = source.indexOf("function unseenIds(");
+    expect(start).toBeGreaterThan(-1); // the symbol must exist at all, or this test is pointed at nothing
+    const body = source.slice(start, source.indexOf("\n}", start) + 2);
+    expect(body).toContain("new Set(seen)");
+    expect(body).toContain(".filter((id) => !seenSet.has(id))");
+    expect(body).not.toContain("Number(");
+    expect(body).not.toMatch(/(?<!=)>|</); // no ordering comparison anywhere in the body — excludes only the arrow `=>` in the filter callback, which is not a comparison
+    expect(body).not.toContain(".sort(");
   });
 });
