@@ -122,8 +122,9 @@ export class StallRemediationTracker {
 /**
  * Deliberately OBSERVATIONAL, not accusatory — same reasoning as parked.ts /
  * frozen-asleep.ts's comment functions: the daemon can see state (idle, for
- * how long, no comment from this account) but not intent, so it reports what
- * it measured and lets the reader draw the conclusion.
+ * how long, nobody attending — see stalled.ts's BUTCHR-289 kind×recency
+ * rule) but not intent, so it reports what it measured and lets the reader
+ * draw the conclusion.
  *
  * THE FINGERPRINT IS NOT LAST, DELIBERATELY (BUTCHR-210's own late-arriving
  * finding, verified independently here — see the `need` array at this
@@ -147,7 +148,7 @@ export class StallRemediationTracker {
  */
 function wakeComment(issue: string, elapsedMinutes: number): string {
   return [
-    `${MARKER} ${issue} has read agent:stalled, continuously, for ${elapsedMinutes} minute(s): idle or done since it last stopped working, with no comment from this daemon's account among its recent comments.`,
+    `${MARKER} ${issue} has read agent:stalled, continuously, for ${elapsedMinutes} minute(s): idle or done since it last stopped working, with no non-daemon-chatter comment landing during that streak.`,
     "",
     `fingerprint: ${issue}`,
     "",
