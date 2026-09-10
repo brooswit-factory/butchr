@@ -71,6 +71,22 @@
  * `./media-scan.ts` for the one piece of it a check CAN close (a whole
  * medium's registry module appearing or disappearing on disk).
  *
+ * A DELIBERATE, NARROW EXCEPTION TO THE PARAGRAPH ABOVE (BUTCHR-254):
+ * `blindSpotIds` below DOES import `LABEL_BLIND_SPOT_IDS`/`HEADER_BLIND_
+ * SPOT_IDS`/`WORKSPACE_BLIND_SPOT_IDS` from each medium's own SCANNER file
+ * (`label-scan.ts`/`header-scan.ts`/`workspace-scan.ts`), never from a
+ * REGISTRY file — this is not the same import the paragraph above forbids.
+ * The ban above exists because importing `LABEL_REGISTRY` etc. would let a
+ * check "pass" by a registry agreeing with itself (see `label-scan.ts`'s
+ * own AC-9(a) for the concrete circularity this guards against); a
+ * blind-spot id ARRAY carries no such risk — it is an independently-
+ * authored enumeration of claims a DIFFERENT file's own test suite
+ * witnesses, and importing it is the whole point: assigning it directly
+ * (never copying its values into a new literal array here) is what makes
+ * `blindSpotIds` below UNABLE to drift from the list it names,
+ * structurally, not by a human remembering to keep two copies in sync. See
+ * `blindSpotIds`'s own field doc below.
+ *
  * THE GRADING — five ways a record is made safe, ordered by strength, and
  * this is the whole point of this file: it must be able to express all five
  * without forcing a record into a grade it does not actually earn.
@@ -208,6 +224,10 @@
  * Pure documentation with a type system holding it honest.
  */
 
+import { HEADER_BLIND_SPOT_IDS } from "../headers/header-scan.js";
+import { LABEL_BLIND_SPOT_IDS } from "../labels/label-scan.js";
+import { WORKSPACE_BLIND_SPOT_IDS } from "../workspace/workspace-scan.js";
+
 /** Every medium this codebase declares a cached-assertion withdrawal grading for. Closed union — extending it without a matching `MEDIA_REGISTRY` entry fails to compile (see `MEDIA_REGISTRY`'s own `Record<Medium, ...>` type below). */
 export type Medium = "labels" | "headers" | "workspace" | "docTitle";
 
@@ -245,14 +265,37 @@ export type DetectorField =
   | { readonly detector: string }
   | { readonly detector: null; readonly noDetectorReason: string };
 
-export type MediaRegistryEntry = DetectorField & {
-  /** How this medium's own records are made safe — see `WithdrawalStory` above for why this is a list. */
-  readonly withdrawal: WithdrawalStory;
-  /** Prose, pointing at the per-medium file that argues each blind spot at length — never re-argued or summarised into something weaker here. */
-  readonly blindSpots: string;
-  /** What the detector(s) above prove about the RUNNING FLEET. Honest value for every entry today: nothing — see this file's header. */
-  readonly deployedTruth: string;
-};
+/**
+ * `blindSpotIds: null` REQUIRES a written reason, the same "you cannot say
+ * 'none' without writing why" discipline `detector: null`/`witness: null`
+ * already enforce. See `test/unit/media-registry.test.ts` for the
+ * `@ts-expect-error` proof this really does fail to compile.
+ *
+ * BUTCHR-254, THE LOOP THIS FIELD CLOSES: `blindSpots` (below) used to BE
+ * the enumeration — hand-typed prose that duplicated, then drifted from,
+ * each medium's own scanner-file blind-spot list once BUTCHR-224/BUTCHR-254
+ * built one. `blindSpotIds` ties this entry to that list BY IMPORTING THE
+ * SAME ARRAY (see this file's header, "A DELIBERATE, NARROW EXCEPTION"),
+ * never by copying its values into a new literal here — so there is no
+ * second copy left to drift. `docTitle` has no scanner module and
+ * therefore no blind-spot id list of its own to tie to (see
+ * `./media-scan.ts`'s own header for why that absence is itself a named
+ * blind spot in THAT check, not an oversight here); `blindSpotIds: null`
+ * with a written reason is the honest value for it, not an invented list.
+ */
+export type BlindSpotIdsField =
+  | { readonly blindSpotIds: readonly string[] }
+  | { readonly blindSpotIds: null; readonly noBlindSpotIdsReason: string };
+
+export type MediaRegistryEntry = DetectorField &
+  BlindSpotIdsField & {
+    /** How this medium's own records are made safe — see `WithdrawalStory` above for why this is a list. */
+    readonly withdrawal: WithdrawalStory;
+    /** Prose UNIQUE to this file's own analysis of the medium's blind spots — e.g. a gap in registry.ts's own GRADING, not a claim about the scanner's own coverage (that content now lives ONLY behind `blindSpotIds`, never duplicated here — see that field's own doc). May be a short pointer sentence when there is nothing registry.ts-specific left to say. */
+    readonly blindSpots: string;
+    /** What the detector(s) above prove about the RUNNING FLEET. Honest value for every entry today: nothing — see this file's header. */
+    readonly deployedTruth: string;
+  };
 
 const DEPLOYED_TRUTH_NOTHING =
   "Nothing — timelessly, not as of any particular measurement. This medium's detector(s) run once, against one commit, as a static source check; they never execute inside the deployed daemon process and are never re-run against it, so by construction they cannot prove anything about which commit that process is currently running. Whether this medium's own write-path code (its registry.ts, its scanner) happens to be present in today's deployed tree is a SEPARATE, genuinely dated fact — see this file's header for the method to check it yourself (content first, ancestry as corroboration only) and for the worked example of exactly why a specific answer to that question does not belong baked in here as a present-tense claim.";
@@ -278,8 +321,9 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
     ],
     detector:
       "src/labels/label-scan.ts (whole-string-literal scan over src/**/*.ts via the real TypeScript parser) plus src/labels/registry.ts's own type-level door (RegisteredLabel, built from AgentLabelKey/PrLabelKey/VerbLabelKey).",
+    blindSpotIds: LABEL_BLIND_SPOT_IDS,
     blindSpots:
-      "src/labels/label-scan.ts's own header, in full — most load-bearingly AC-9(a): the nine agent:*/pr:* values are found by the scanner ONLY as this registry's own declared keys (the registry agreeing with itself), never at their real emission sites, which are AGENT_PREFIX/PR_PREFIX concatenations in src/labels/sync.ts. Real coverage for those nine comes entirely from the TYPE-level door, never the scanner. The two verb-owned labels (butchr:shelved, butchr:orphan) ARE genuinely found by the scanner at independent declaration sites (src/agents/parked.ts, src/tools/relationship.ts), so for those two the scan is a real, non-circular check. Also: test/ and scripts/ are unscanned by design (fixtures use label literals freely); a label-shaped literal that is not actually a Jira label needs a named KNOWN_NON_LABEL_LITERALS entry.",
+      "See src/labels/label-scan.ts's own LABEL_BLIND_SPOTS (blindSpotIds above ties this entry to it directly, by import, so this field no longer re-argues the claims — a second, independently-driftable copy of the same list is exactly the drift BUTCHR-224/BUTCHR-254 exist to remove). Nothing registry.ts-specific remains to add for this medium beyond that list: AC-9(a)'s circularity warning (the nine agent:*/pr:* values being found only as this registry's own declared keys, never at their real AGENT_PREFIX/PR_PREFIX emission sites) now lives in that list's own concatenationAndInterpolation entry.",
     deployedTruth: DEPLOYED_TRUTH_NOTHING,
   },
   headers: {
@@ -297,8 +341,9 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
     ],
     detector:
       "src/headers/header-scan.ts (a bracketed, all-caps tag SHAPE — /^\\[[A-Z][A-Z0-9_]*\\]/ — never today's literal text) plus src/headers/registry.ts's own type-level door (DescriptionHeaderKind).",
+    blindSpotIds: HEADER_BLIND_SPOT_IDS,
     blindSpots:
-      "src/headers/header-scan.ts's own header, in full — most concretely: an opening line that is not itself a single, whole string literal (a template literal WITH substitutions is invisible to ts.isStringLiteralLike; this is not hypothetical — BUTCHR-157's own first draft of the [ADOPTED] line shipped exactly this shape and was caught only in human review, fixed by hoisting the tag-bearing prefix into its own whole-literal constant). Also: test/ and scripts/ are unscanned; a bracketed-all-caps literal that is not actually a description-header opening line needs a named KNOWN_NON_HEADER_LITERALS entry (empty today, per that file's own grep).",
+      "See src/headers/header-scan.ts's own HEADER_BLIND_SPOTS (blindSpotIds above ties this entry to it directly, by import). Nothing registry.ts-specific remains to add for this medium: the most concrete claim (a template literal WITH substitutions being invisible to ts.isStringLiteralLike — not hypothetical, BUTCHR-157's own first draft of the [ADOPTED] line shipped exactly this shape, caught only in human review) now lives in that list's own templateLiteralOpeningLine entry.",
     deployedTruth: DEPLOYED_TRUTH_NOTHING,
   },
   workspace: {
@@ -321,8 +366,9 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
     ],
     detector:
       "src/workspace/workspace-scan.ts (a {{[A-Z][A-Z0-9_]*}}-shaped regex over briefs/*.md — plain text, not TypeScript, so no AST is available; see that file's header for why this is a mechanical difference from the parser-based scanners, not a weaker discipline) plus src/workspace/registry.ts's own type-level door (WorkspacePlaceholder, tied in both directions to interpolate()'s own substitution table).",
+    blindSpotIds: WORKSPACE_BLIND_SPOT_IDS,
     blindSpots:
-      "src/workspace/registry.ts's and src/workspace/workspace-scan.ts's own headers, in full — most load-bearingly: THREE categorically different non-template write sites share no single mechanism a scanner could target (mcp.json's x-issue via direct JSON.stringify; ENVIRONMENT.md's content via direct writeFileSync, never living under briefs/ and never containing {{...}} syntax; and 'some path this ticket's author did not find'). Covered only by prose in the KEY and GROUND_TRUTH entries, verified by reading src/agents/workspace.ts, never by either door actually seeing them. SEPARATELY, and this does not fit either grade named above: PARENT (src/workspace/registry.ts) is withdrawnBy: null but is NOT time-invariant (its source, an Implements link, can genuinely change after workspace-build time via a real jira_link_issues re-parent — reachable, not hypothetical, named by that tool's own refusal message) and is NOT self-declaring (nothing in the rendered {{PARENT}} text itself tells a reader when to distrust it). Its only mitigation is an OPPORTUNISTIC side effect of SUMMARY's own same-call withdrawal above (correctWorker regenerates brief.md, including a fresh {{PARENT}}, whenever anyone corrects that ticket's summary) — not a dedicated mechanism of its own, and not triggered by a re-parent itself. PARENT is a live, reachable, ungraded gap; do not read its presence in this medium as covered by any grade above. SEPARATELY AGAIN, AND A FINER-GRAINED CLAIM THAN PARENT'S (BUTCHR-203) — do not read this as a restatement of PARENT, it is a different gap one level down: {{GROUND_TRUTH}} itself is a properly REGISTERED placeholder — WorkspacePlaceholder's type-level door forces it to have this very entry — but nothing whatever grades the ASSERTIONS INSIDE that placeholder's own expansion. groundTruthText (src/agents/ground-truth.ts) writes a flat array of hand-written string lines — measured-at timestamp, host, port, systemd unit, journalctl command, daemon pid, plus a build-identity/currency block — and the mechanism prose above is a hand-written DESCRIPTION of what that function writes, with nothing tying the two together. Verified, not assumed, and re-run yourself rather than inheriting this: the only test touching GROUND_TRUTH's neverWithdrawnReason (test/unit/workspace-registry.test.ts) asserts `.toContain(\"measured at\")` against the REASON's own prose — never against groundTruthText's actual return value — so a new assertion added inside groundTruthText's array requires no door, no scanner and no test to grade it. THE DURABLE CLAIM, timeless and meant to survive every number below rotting: two assertions inside ONE record, at ONE instant, can have OPPOSITE truth values — a hand-measured field false while a machine-derived field in the same record is true — so grading a record as a single unit is lossy. DATED ILLUSTRATION ONLY, expected to be superseded, never re-read as a present-tense fact: in one agent's workspace, ENVIRONMENT.md's daemon-pid line named a process that no longer existed while the build-sha line in that same file was exactly correct, confirmed by resolving the daemon actually serving that workspace's port and reading its tree from /proc — the specific pid and sha will rot; the contrast they illustrate will not. To re-measure this for YOUR OWN workspace rather than trust this paragraph's numbers or anyone else's: (1) read the pid from your own workspace's ENVIRONMENT.md, never from a ticket or a comment; (2) a MISSING pid is ambiguous between DEAD and merely INVISIBLE to your account — confirm you can see *other* users' processes at all before concluding one is gone, since more than one butchr daemon can run on one host under different Unix users; (3) resolve the daemon actually serving your port and read ITS tree from /proc/<pid>/cwd — that, not this file's prose, is what tells you which assertions in your own ENVIRONMENT.md are currently true. KEEP THIS SEPARATE FROM FAILURE MODE #3 IN THIS FILE'S HEADER (\"the path exists, reaches, and is not running\"): the illustration above is a witness for a self-declaring record going STALE, never for merged-but-not-deployed — the daemon's tree in that observation was clean and current, so merged-but-not-deployed still has no live witness here, and claiming otherwise would be exactly the overclaim this epic exists to catch. NO MECHANISM CLOSES THIS, argued rather than assumed: ./family-scan.ts's own header names, as its third blind spot, \"a family with NO value-level anchor at all — this scanner has nothing to check membership against\" — the lines inside groundTruthText's returned array are exactly that shape, a flat list with no enumerable member set for any scanner to check against, and inventing one for the sake of checking it would be the false-unification mistake this story already declined on its Q2 (BUTCHR-169's conclusion stands unchanged: where a record has no source-level representation, the type-level door plus a verified prose cross-reference is the necessary fallback, and no scanner design closes it). Like PARENT, this is a live, reachable, UNGRADED gap named as fitting no grade rather than filed under the nearest one — but where PARENT is one placeholder missing a grade, this is that a placeholder CAN be gradable while the assertions its expansion actually makes are not, individually, accounted for anywhere — a distinction the type-level door was never built to see, because its job is only 'a placeholder has a registry entry,' never 'the values that placeholder's expansion asserts are each covered.'",
+      "See src/workspace/workspace-scan.ts's own WORKSPACE_BLIND_SPOTS (blindSpotIds above ties this entry to it directly, by import) for the scanner's own claims — most load-bearingly, the THREE categorically different non-template write sites (mcp.json's x-issue via direct JSON.stringify; ENVIRONMENT.md's content via direct writeFileSync; and an admittedly-unfound third) now live in that list's own nonTemplateWriteSites entry, not re-argued here. WHAT REMAINS HERE IS REGISTRY.TS'S OWN, DIFFERENT KIND OF GAP — not a scanner blind spot at all, but a GRADING gap this file's own header defines and only this file can name: PARENT (src/workspace/registry.ts) is withdrawnBy: null but is NOT time-invariant (its source, an Implements link, can genuinely change after workspace-build time via a real jira_link_issues re-parent — reachable, not hypothetical, named by that tool's own refusal message) and is NOT self-declaring (nothing in the rendered {{PARENT}} text itself tells a reader when to distrust it). Its only mitigation is an OPPORTUNISTIC side effect of SUMMARY's own same-call withdrawal above (correctWorker regenerates brief.md, including a fresh {{PARENT}}, whenever anyone corrects that ticket's summary) — not a dedicated mechanism of its own, and not triggered by a re-parent itself. PARENT is a live, reachable, ungraded gap; do not read its presence in this medium as covered by any grade above. SEPARATELY AGAIN, AND A FINER-GRAINED CLAIM THAN PARENT'S (BUTCHR-203) — do not read this as a restatement of PARENT, it is a different gap one level down: {{GROUND_TRUTH}} itself is a properly REGISTERED placeholder — WorkspacePlaceholder's type-level door forces it to have this very entry — but nothing whatever grades the ASSERTIONS INSIDE that placeholder's own expansion. groundTruthText (src/agents/ground-truth.ts) writes a flat array of hand-written string lines — measured-at timestamp, host, port, systemd unit, journalctl command, daemon pid, plus a build-identity/currency block — and the mechanism prose above is a hand-written DESCRIPTION of what that function writes, with nothing tying the two together. Verified, not assumed, and re-run yourself rather than inheriting this: the only test touching GROUND_TRUTH's neverWithdrawnReason (test/unit/workspace-registry.test.ts) asserts `.toContain(\"measured at\")` against the REASON's own prose — never against groundTruthText's actual return value — so a new assertion added inside groundTruthText's array requires no door, no scanner and no test to grade it. THE DURABLE CLAIM, timeless and meant to survive every number below rotting: two assertions inside ONE record, at ONE instant, can have OPPOSITE truth values — a hand-measured field false while a machine-derived field in the same record is true — so grading a record as a single unit is lossy. DATED ILLUSTRATION ONLY, expected to be superseded, never re-read as a present-tense fact: in one agent's workspace, ENVIRONMENT.md's daemon-pid line named a process that no longer existed while the build-sha line in that same file was exactly correct, confirmed by resolving the daemon actually serving that workspace's port and reading its tree from /proc — the specific pid and sha will rot; the contrast they illustrate will not. To re-measure this for YOUR OWN workspace rather than trust this paragraph's numbers or anyone else's: (1) read the pid from your own workspace's ENVIRONMENT.md, never from a ticket or a comment; (2) a MISSING pid is ambiguous between DEAD and merely INVISIBLE to your account — confirm you can see *other* users' processes at all before concluding one is gone, since more than one butchr daemon can run on one host under different Unix users; (3) resolve the daemon actually serving your port and read ITS tree from /proc/<pid>/cwd — that, not this file's prose, is what tells you which assertions in your own ENVIRONMENT.md are currently true. KEEP THIS SEPARATE FROM FAILURE MODE #3 IN THIS FILE'S HEADER (\"the path exists, reaches, and is not running\"): the illustration above is a witness for a self-declaring record going STALE, never for merged-but-not-deployed — the daemon's tree in that observation was clean and current, so merged-but-not-deployed still has no live witness here, and claiming otherwise would be exactly the overclaim this epic exists to catch. NO MECHANISM CLOSES THIS, argued rather than assumed: ./family-scan.ts's own FAMILY_BLIND_SPOTS (BUTCHR-254) names, in its noValueLevelAnchor entry, \"a family with NO value-level anchor at all — this scanner has nothing to check membership against\" — the lines inside groundTruthText's returned array are exactly that shape, a flat list with no enumerable member set for any scanner to check against, and inventing one for the sake of checking it would be the false-unification mistake this story already declined on its Q2 (BUTCHR-169's conclusion stands unchanged: where a record has no source-level representation, the type-level door plus a verified prose cross-reference is the necessary fallback, and no scanner design closes it). Like PARENT, this is a live, reachable, UNGRADED gap named as fitting no grade rather than filed under the nearest one — but where PARENT is one placeholder missing a grade, this is that a placeholder CAN be gradable while the assertions its expansion actually makes are not, individually, accounted for anywhere — a distinction the type-level door was never built to see, because its job is only 'a placeholder has a registry entry,' never 'the values that placeholder's expansion asserts are each covered.'",
     deployedTruth: DEPLOYED_TRUTH_NOTHING,
   },
   docTitle: {
@@ -336,6 +382,9 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
     detector: null,
     noDetectorReason:
       "structural is precisely the grade that needs no detector: there is no window in which this record can be stale for a scan to catch, because the guarantee is enforced by the same running code that would falsify it, not by a separate source-scanning pass over a corpus of literals. Unlike the other three media, this one has no registry.ts module and no scanner module — see src/media/media-scan.ts's own header for why that absence is itself a named, deliberate blind spot in THAT check, not an oversight here.",
+    blindSpotIds: null,
+    noBlindSpotIdsReason:
+      "docTitle has no scanner module (src/media/media-scan.ts's own header names this absence) and therefore no blind-spot id list of its own to tie to — inventing one here would misrepresent a medium that is genuinely, deliberately not enforced by a source-scanning list at all. This is a DIFFERENT claim from media-scan.ts's own MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention entry (that one is about media-scan's blindness TO docTitle's shape; this one is about docTitle having no list of its OWN residual gaps to reference) — see blindSpots below for what registry.ts can honestly say about docTitle's own gaps instead.",
     blindSpots:
       "None found in src/tools/docs.ts's own set_doc/isProvisional logic — there is no source artifact (a registry file, a scanner file) this medium could have a residual gap in, by construction. The one caveat this grade cannot remove: the guarantee only holds for whichever build of set_doc the deployed daemon is actually running — see deployedTruth.",
     deployedTruth:

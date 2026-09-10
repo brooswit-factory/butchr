@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as ts from "typescript";
 import { listTsFiles } from "../labels/label-scan.js";
+import type { BlindSpotEntry } from "./blind-spot.js";
 
 /**
  * BUTCHR-172/BUTCHR-154 — the ONE source-visible sub-shape of "exists but
@@ -79,47 +80,15 @@ import { listTsFiles } from "../labels/label-scan.js";
  *     `LABEL_REGISTRY`'s own `Record<RegisteredLabel, ...>` type door), not
  *     hand-typed, even though `PrState` itself has no anchor of its own.
  *
- * WHAT THIS SCANNER CANNOT SEE (write it down; a scanner with a silent
- * bypass is the exact failure this whole rule exists to catch) — ALL FOUR
- * of the following would make this check PASS WHILE THE BUG IT EXISTS TO
- * CATCH IS STILL PRESENT, and none of them is hypothetical busywork; each
- * is a real, available way to write the same defect this scanner is meant
- * to close:
- *   - A selection built from SUFFIXES rather than one literal, e.g.
- *     `["working","idle","blocked","none"].map(l => AGENT_PREFIX + l)` —
- *     no single string literal anywhere contains two family members as
- *     substrings, so there is nothing for a literal-substring scan to find,
- *     even though the selection is exactly as incomplete as the original
- *     bug.
- *   - A selection that is complete IN SOURCE but filtered again at RUNTIME
- *     (e.g. a complete literal list immediately `.filter()`-ed down before
- *     use) — the source-level literal this scanner reads would be
- *     unimpeachable while the actual runtime selection still drops a
- *     member.
- *   - A family with NO value-level anchor at all — this scanner has
- *     nothing to check membership against, so a hand-enumerated selection
- *     over such a family is invisible to it by construction (this is
- *     exactly `pr:*`'s situation today, mitigated only because
- *     `REGISTERED_LABELS` happens to provide a derived stand-in — a family
- *     with neither its own anchor NOR a registry to borrow one from has no
- *     coverage here at all).
- *   - A family enumerated across SEVERAL SEPARATE string literals rather
- *     than one (e.g. `if (l === "agent:working" || l === "agent:idle") ...`
- *     as two separate two-member comparisons, or four single-member
- *     literals used one at a time) — each individual literal contains at
- *     most ONE family member, so no literal ever crosses this scanner's
- *     "two or more DISTINCT members in one literal" threshold, even though
- *     the selection they jointly form can still be incomplete.
- *
- * SEPARATELY, THIS SCANNER'S CORPUS ITSELF IS BOUNDED, THE SAME WAY
- * `label-scan.ts`'s/`header-scan.ts`'s IS — a scope limit, not one more
- * shape of selection drift, though a real hand-enumerated collision sitting
- * inside either would be exactly as invisible as one of the four above:
- *   - `test/` and `scripts/` are unscanned: fixtures use family-shaped
- *     literals freely by design, and `scripts/` is operator tooling, not
- *     the write path.
- *   - Non-`.ts` files, and anything generated under `src/` (none checked in
- *     today; re-examine this assumption if that changes).
+ * WHAT THIS SCANNER CANNOT SEE: see `FAMILY_BLIND_SPOTS` below (BUTCHR-254)
+ * — the enumerable source of truth, each entry with either an executable
+ * witness (a test that constructs the claimed-invisible input, confirms
+ * silence, and pairs it with a near-miss variant that IS detected) or a
+ * written `noWitnessReason`. This comment stops enumerating the claims in
+ * prose, on purpose: a second, independently-driftable copy of the same
+ * list is exactly the drift BUTCHR-224/BUTCHR-254 exist to remove. The
+ * substantive reasoning for each claim now lives in that entry's own
+ * `claim` field, not here.
  *
  * SO THIS SCANNER ASSERTS REACH FOR EXACTLY ONE SHAPE OF SELECTION DRIFT —
  * TWO OR MORE DISTINCT FAMILY MEMBERS HAND-ENUMERATED TOGETHER INSIDE ONE
@@ -244,3 +213,68 @@ export function scanDirForFamilyCollisions(srcDir: string, repoRoot: string, fam
   }
   return hits;
 }
+
+/**
+ * BUTCHR-254 (applying BUTCHR-222/BUTCHR-224's mechanism to this detector).
+ * Every blind spot this scanner's own module header (above) used to
+ * enumerate in prose, now an enumerable value with a type-level door
+ * (`Record` keyed by a closed union fails to compile in both directions —
+ * an excess key or a missing one — the same door `HEADER_BLIND_SPOTS`/
+ * `LABEL_BLIND_SPOTS`/`WORKSPACE_BLIND_SPOTS`/`MEDIA_REGISTRY` already hold
+ * their own families honest with). See `test/unit/family-scan.test.ts` for
+ * the witness each entry below drives, and `src/media/blind-spot.ts` for
+ * what "witness" means here and the runtime link that makes a
+ * declared-but-unwritten witness fail the suite.
+ *
+ * EVERY ENTRY BELOW IS WITNESSED, NONE IS `witness: null` — including
+ * `noValueLevelAnchor`, which is a DELIBERATE TRAP: the witness for that
+ * entry demonstrates the blindness itself (a family this scanner is never
+ * even asked to check, by construction) using an ad hoc, throwaway `Family`
+ * built ONLY inside the test to show what CAN happen when an anchor exists.
+ * It must never be read as this codebase inventing a real anchor for `pr:*`
+ * or for `{{GROUND_TRUTH}}`'s own gaps — see this file's header, and
+ * `src/media/registry.ts`'s `workspace` entry, for why those stay live,
+ * reachable, and deliberately ungraded.
+ */
+export const FAMILY_BLIND_SPOT_IDS = [
+  "suffixConcatenation",
+  "filteredAfterDerivation",
+  "noValueLevelAnchor",
+  "severalSeparateLiterals",
+  "unscannedDirectories",
+  "nonTsFiles",
+] as const;
+export type FamilyBlindSpotId = (typeof FAMILY_BLIND_SPOT_IDS)[number];
+
+export const FAMILY_BLIND_SPOTS: Readonly<Record<FamilyBlindSpotId, BlindSpotEntry>> = {
+  suffixConcatenation: {
+    claim:
+      "A selection built from SUFFIXES rather than one literal, e.g. `[\"working\",\"idle\",\"blocked\",\"none\"].map(l => AGENT_PREFIX + l)`, or from a value-level anchor via `.map()`/`.join()` (e.g. `ALL_AGENT_LABEL_KEYS.map((l) => \\`\"${l}\"\\`).join(\", \")`) — no single string literal anywhere contains two family members as substrings, so there is nothing for a literal-substring scan to find, even though the selection is exactly as incomplete as the original bug would have been had it been written this way. THE LIVE PRIOR ART: `src/labels/sweep.ts`'s real, post-BUTCHR-155 `SWEEP_JQL` is built exactly this way today (derived from `ALL_AGENT_LABEL_KEYS`), which is why this scanner correctly finds nothing to flag there now — not because the selection is complete (it is), but because this scanner cannot tell a complete derived selection from an incomplete one; it can only ever see whether a literal hand-enumerates two or more members.",
+    witness: "family:suffix-concatenation",
+  },
+  filteredAfterDerivation: {
+    claim:
+      "A selection that is complete IN SOURCE but filtered again at RUNTIME (e.g. a derivation immediately `.filter()`-ed down before use, `ALL_AGENT_LABEL_KEYS.filter(l => l !== \"agent:stalled\").map(...).join(...)`) — the source-level text this scanner reads contains no literal with two or more members either way, so it is silent whether or not a `.filter()` call sits in the expression narrowing the runtime selection. This scanner performs no runtime evaluation of any kind — it reads AST shape only — so it cannot distinguish 'derived, unfiltered, complete' from 'derived, then filtered, incomplete' by construction; both are equally invisible to it.",
+    witness: "family:filtered-after-derivation",
+  },
+  noValueLevelAnchor: {
+    claim:
+      "A family with NO value-level anchor at all — this scanner has nothing to check membership against, so a hand-enumerated selection over such a family is invisible to it by construction, because nobody can build a `Family` object (this file's own leaf-pure `members: ReadonlySet<string>` input) for a family with no anchor to build it from. This is exactly `pr:*`'s situation today, mitigated only because `REGISTERED_LABELS` happens to provide a derived stand-in (`PrState` itself, in `src/labels/plan.ts`, has no anchor of its own) — a family with neither its own anchor NOR a registry to borrow one from has no coverage here at all. SCOPE FENCE (BUTCHR-254): this entry's witness demonstrates the blindness using a throwaway `Family` constructed only inside the test; it must never be read as this codebase inventing a real anchor for `pr:*`, for `PARENT`, or for `{{GROUND_TRUTH}}`'s own ungraded sub-record gap (`src/media/registry.ts`'s `workspace` entry) — an honest anchor, if one is ever found for any of these, is a finding to report, not to quietly build here.",
+    witness: "family:no-value-level-anchor",
+  },
+  severalSeparateLiterals: {
+    claim:
+      "A family enumerated across SEVERAL SEPARATE string literals rather than one — e.g. an `||` chain of single-member `===` comparisons, one member per literal, or four single-member literals used one at a time (see `test/unit/family-scan.test.ts`'s own witness for the concrete two-member shape; not quoted here as real member names, on purpose — this claim's own prose would otherwise BE the two-literal-collision text it describes, self-matching this file's own scan the way `label-scan.ts`'s `KNOWN_NON_LABEL_LITERALS` self-reference entry does for its scanner) — each individual literal contains at most ONE family member, so no literal ever crosses this scanner's 'two or more DISTINCT members in one literal' threshold, even though the selection they jointly form can still be incomplete.",
+    witness: "family:several-separate-literals",
+  },
+  unscannedDirectories: {
+    claim:
+      "`test/` and `scripts/` are not scanned — only `src/` is, because `scanDirForFamilyCollisions` is always called with `srcDir` fixed to the repo's `src/` directory (see `test/unit/family-scan.test.ts`'s own call). `test/` fixtures use family-shaped literals freely by design, and `scripts/` is operator tooling, not the write path.",
+    witness: "family:unscanned-directories",
+  },
+  nonTsFiles: {
+    claim:
+      "Non-`.ts` files, and anything generated under `src/` (none checked in today; re-examine this assumption if that changes) — `listTsFiles` (`../labels/label-scan.js`) only collects names ending `.ts` (and excludes `.d.ts`), so an identical family-collision-shaped literal sitting in, say, a `.md` or `.json` file under `src/` is never even read.",
+    witness: "family:non-ts-files",
+  },
+};

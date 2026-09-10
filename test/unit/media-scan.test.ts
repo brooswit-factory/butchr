@@ -5,8 +5,10 @@ import {
   formatUnexpectedRegistryModulesError,
   KNOWN_NON_MEDIUM_REGISTRY_MODULES,
   listRegistryModules,
+  MEDIA_SCAN_BLIND_SPOTS,
 } from "../../src/media/media-scan.js";
 import { MEDIA_REGISTRY } from "../../src/media/registry.js";
+import { assertBlindSpotCoverage } from "../../src/media/blind-spot.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -74,5 +76,33 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     const injected = [...modules, "src/example-injected/registry.ts"].sort();
     const unexplained = findUnexplainedRegistryModules(injected);
     expect(unexplained).toContain("src/example-injected/registry.ts");
+  });
+});
+
+/**
+ * BUTCHR-254 — MEDIA_SCAN_BLIND_SPOTS. Unlike the other detectors converted
+ * under this epic, this one entry is `witness: null` with a written
+ * `noWitnessReason` — see that entry's own reason, and this file's own
+ * module header, for why. No `test()` here calls `witnessBlindSpot`;
+ * `assertBlindSpotCoverage` still runs, because it must, for every list this
+ * mechanism is applied to (see src/media/blind-spot.ts, "THE ORDERING
+ * HAZARD") — it passes trivially here since `assertBlindSpotCoverage` only
+ * ever demands execution for entries that declare a witness id, and this
+ * list declares none.
+ */
+describe("MEDIA_SCAN_BLIND_SPOTS (BUTCHR-254)", () => {
+  test("docTitleNotRegistryConvention is witness: null with a non-empty written reason", () => {
+    expect(MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.witness).toBeNull();
+    if (MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.witness === null) {
+      expect(MEDIA_SCAN_BLIND_SPOTS.docTitleNotRegistryConvention.noWitnessReason.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("exactly one entry, unwitnessed — a change here means this claim became witnessable or a second unwitnessable one was added; update this pin deliberately, not by reflex", () => {
+    expect(Object.keys(MEDIA_SCAN_BLIND_SPOTS)).toEqual(["docTitleNotRegistryConvention"]);
+  });
+
+  test("COVERAGE (see src/media/blind-spot.ts, 'THE ORDERING HAZARD'): every MEDIA_SCAN_BLIND_SPOTS entry's declared witness id was actually executed, or it declares a written noWitnessReason instead", () => {
+    assertBlindSpotCoverage("MEDIA_SCAN_BLIND_SPOTS", MEDIA_SCAN_BLIND_SPOTS);
   });
 });
