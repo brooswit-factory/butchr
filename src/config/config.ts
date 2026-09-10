@@ -175,6 +175,63 @@ export interface Config {
    * keys, same shape as `BUTCHR_GITHUB_ORGS` above.
    */
   projectAllowlist: string[];
+  /**
+   * BUTCHR-284: a fixed COUNT cap on agents THIS DAEMON keeps RESIDENT at
+   * once (see the ticket's own design ruling for why a count cap, never a
+   * memory-headroom watermark or a per-project quota — a watermark reads
+   * memory as free at t=0, exactly when a post-reboot stampede would admit
+   * the whole fleet before any of it has allocated anything). Enforced
+   * fleet-wide across BOTH resource tiers by ONE shared `AdmissionController`
+   * (src/agents/admission.ts) built over the raw, unscoped herd — see that
+   * module's own top comment for why a per-tier count would leave the HOST
+   * unbounded.
+   *
+   * A CAP INSIDE ONE DAEMON BINDS ONLY THAT DAEMON'S OWN AGENTS: this host
+   * (servyboi, re-measured for this ticket) runs a SECOND butchr daemon
+   * under a different Unix user at the same time — confirmed live, not a
+   * hypothetical (see ENVIRONMENT.md) — so a cap of N here still permits up
+   * to 2N agents host-wide if the other daemon is also near its own cap.
+   * This default does not assume this daemon is alone on the host.
+   *
+   * DERIVATION (method: `ps -eo user=,rss=,args=` filtered to argv carrying
+   * `--permission-mode bypassPermissions`, aggregated by Unix user —
+   * reproduce or re-derive this if the host's memory or this fleet's agent
+   * footprint changes materially; a number nobody can re-derive is a number
+   * the next reader will change at random):
+   *   - measured on THIS host, THIS daemon's own Unix user: n=14 resident
+   *     agents, mean RSS ~440MB, p95 ~552MB, max ~560MB.
+   *   - total host memory ~15.6GB, with a second daemon co-resident under a
+   *     different Unix user (n=10, ~4.3GB) and ~0.43GB already in swap —
+   *     swap is NEVER budgeted as available memory below.
+   *   - RSS DRIFTS UPWARD WITH SESSION AGE (an agent's RSS grows with its
+   *     own context, so the oldest sessions in a fleet are the fattest) —
+   *     this is why the HIGH-WATER mark is used below, never the mean (the
+   *     mean under-books exactly the tail that matters), and why even
+   *     TODAY's own measured max is rounded up rather than used verbatim: a
+   *     fleet sitting at cap after hours of uptime weighs more than the
+   *     same fleet at cap freshly after a reboot, and a post-reboot stampede
+   *     is exactly the case this cap exists to protect. 560MB measured,
+   *     rounded up to 700MB/agent for that drift margin.
+   *   - a co-residency estimate has been OFFERED elsewhere (by a sibling
+   *     ticket) as arithmetic, explicitly not as a ruling to adopt — it is
+   *     re-derived here, independently, against THIS daemon's own numbers
+   *     above, not copied.
+   *   - reserving ~4GB for the OS, page cache, herdr, and everything that is
+   *     not an agent, and assuming a SECOND daemon could be running at its
+   *     own cap concurrently (see above — two daemons under different Unix
+   *     users, with mutually invisible herds, are already confirmed
+   *     co-resident on this host):
+   *       cap <= (15.6GB − 4GB) / (2 daemons × 0.7GB/agent) ≈ 8.3
+   *   - default 8, rounded down from 8.3 for additional margin.
+   *
+   * NOT DISRUPTIVE AT THIS DEFAULT: the cap only limits NEW spawns — it
+   * never stops an agent already running (see AdmissionController's own top
+   * comment). A default (8) below the current live agent count on this host
+   * (14, this daemon's own user, at measurement time) simply drains
+   * naturally as those tickets finish; nothing already running is stopped
+   * by this cap.
+   */
+  maxAgents: number;
 }
 
 export interface ConfigEnv {
@@ -201,6 +258,7 @@ export interface ConfigEnv {
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
+  BUTCHR_MAX_AGENTS?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -252,6 +310,12 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
+  // BUTCHR-284: unlike the *_MINUTES knobs above (fractional is meaningless
+  // but harmless for a duration), this is a COUNT of agents — Number.isInteger
+  // is the correctness check, not merely Number.isFinite.
+  const maxAgents = env.BUTCHR_MAX_AGENTS ? Number(env.BUTCHR_MAX_AGENTS) : 8;
+  if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
+
   return {
     atlassian: { site, email, token },
     port,
@@ -274,6 +338,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     },
     captureDir,
     projectAllowlist,
+    maxAgents,
   };
 }
 
@@ -379,4 +444,5 @@ export const describeConfig = (c: Config): string =>
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +
-  `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"}`;
+  `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
+  `maxAgents=${c.maxAgents}`;
