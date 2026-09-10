@@ -198,7 +198,7 @@ const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: pan
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
-// KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
+// KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
 const stalled = createStalledCheck({
