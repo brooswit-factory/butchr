@@ -89,20 +89,35 @@
  * `verdictFor` actually needs, and what closes the self-wake hazard below
  * with no ledger involved at all.
  *
- * WHO WRITES THE WATERMARK — A STATED, DELIBERATE GAP: this module
- * advances the COMMENT watermark itself, from `src/tools/speak.ts`
- * (Hazard 1 — a project's own `report_to_boss`/`ask_boss` call is the one
- * write this story owns end-to-end). The VERSION and per-EPIC watermarks
- * have no call site inside this story's scope to advance them from: doing
- * so requires the project agent to check in as its LAST act before exiting,
- * and "exit" is BUTCHR-66's wake MECHANISM to own, not this story's (the
- * project tool surface that would carry a check-in verb is BUTCHR-65,
- * explicitly out of scope here too). `advanceProjectWatermark` below is
- * exported, tested, and ready for that exit hook to call with
- * `{version, epic}` — this is reported on BUTCHR-81 and in this story's doc
- * as a live, stated cross-story dependency rather than silently assumed:
- * until something calls it, an eligible project's version/epic watermarks
- * never advance past their initial (absent) state, so `verdictFor` will
+ * WHO WRITES THE WATERMARK: this module advances the COMMENT watermark
+ * itself, from `src/tools/speak.ts` (Hazard 1 — a project's own
+ * `report_to_boss`/`ask_boss` call is the one write this story owns
+ * end-to-end). The VERSION and per-EPIC watermarks are advanced by
+ * `check_in` (src/tools/defs.ts, BUTCHR-67/BUTCHR-81's own tool surface),
+ * the project agent's LAST act before exiting — it re-reads root-doc
+ * version, every root-doc comment id, and every epic currently In Review
+ * directly from Jira/Confluence, then calls `advanceProjectWatermark` below
+ * with `{version, seenComments, epics}`. CORRECTED (BUTCHR-275): an earlier
+ * version of this comment described the version/epic watermarks as having
+ * "no call site inside this story's scope to advance them from" and named
+ * "exit" as a still-unbuilt wake mechanism `advanceProjectWatermark` was
+ * merely "ready for" — that call site has since been built (`check_in`
+ * itself), so the gap this comment used to describe had already closed by
+ * the time BUTCHR-275 read it. What was ACTUALLY still missing, and what
+ * BUTCHR-275 built, was narrower: `check_in` advancing the watermark was
+ * never itself the exit — nothing ended the project agent's session
+ * afterward, so it sat at its `"asleep"` verdict, still running, until
+ * `checkFrozenAsleep` (src/agents/frozen-asleep.ts) reaped it roughly
+ * `BUTCHR_ATREST_MINUTES` minutes later. `check_in`'s own handler now also
+ * declares that fact to the daemon, in-process, via
+ * `src/agents/check-in-exit.ts`'s registry — strictly after its watermark
+ * write above has already landed — so the daemon's existing, working
+ * `herd.stop()` route closes the pane on the very next project poll instead
+ * of waiting for the frozen-asleep bound. See that module's own top comment
+ * for the full mechanism and why it is a separate hook from
+ * `checkFrozenAsleep` rather than folded into it. Until `check_in` is
+ * called at all, an eligible project's version/epic watermarks never
+ * advance past their initial (absent) state, so `verdictFor` will
  * correctly, honestly report `active` for them (fail-open — an unset
  * watermark means "never checked in", not "caught up"; see `projectVerdict`)
  * rather than silently under-reporting activity because a comparison was

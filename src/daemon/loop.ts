@@ -214,6 +214,58 @@ export interface ReconcileOptions {
    */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
   /**
+   * BUTCHR-275: the project agent's own positive "I have checked in" signal,
+   * the same `atRest`-reduction shape as `checkFrozenAsleep` above (both are
+   * given the ids that are BOTH `atRest` and running, and both remove
+   * whatever they return from `atRest` before `planReconcile` sees it — see
+   * that call site below) but a DELIBERATELY SEPARATE hook: `checkFrozenAsleep`'s
+   * contract is "never on a bare timeout, only after an audible complaint" —
+   * a defect report. This hook fires on the opposite of a defect: the agent
+   * itself declared it is done (src/agents/check-in-exit.ts, called from
+   * `check_in`'s own tool handler after its watermark write has already
+   * landed — see that module's own doc comment for why the ordering is
+   * structural). Posts nothing — nothing is wrong, so there is nothing to
+   * report. Optional; omitted, no project ever exits promptly on its own
+   * check-in, and every existing caller (before this ticket) is unaffected.
+   */
+  checkDeclaredDone?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * BUTCHR-275 (review round 2): prunes a declared-done signal the instant
+   * the SAME id is observed ACTIVE again (i.e. present in `desired`),
+   * independent of `atRest`/`restingRunning` — this must run on EVERY poll,
+   * never gated the way `checkFrozenAsleep`/`checkDeclaredDone` are, because
+   * the exact id this needs to catch is, by definition, NOT resting this
+   * poll (it is active, the opposite of resting), so it would never appear
+   * in `restingRunning` for `checkDeclaredDone` to see.
+   *
+   * THE HAZARD THIS CLOSES: `checkDeclaredDone`'s consumption is deferred
+   * until some LATER poll observes the declared id resting-and-running —
+   * there is no guarantee that poll is the very next one. Without this
+   * hook, a declaration can survive an entire intervening ACTIVE period
+   * and then be consumed against a DIFFERENT, later agent instance for the
+   * same project id — silently stopping a live agent mid-work, which is
+   * exactly what DoD item 3 (`atRest` must mean nothing is genuinely
+   * pending) forbids. Concretely: a project can return to `"asleep"` with
+   * NO fresh `check_in` at all — `epicsBehind` (`src/resources/project.ts`,
+   * `projectVerdict`) is computed over epics CURRENTLY in review, so an
+   * epic simply LEAVING review takes that axis from behind to caught-up
+   * with no watermark write. A stale declaration left over from a finished
+   * episode would then be consumed on exactly that transition, against
+   * whatever agent is running for the project now — found in code review,
+   * not by this ticket's own author.
+   *
+   * Called with `[...desired.keys()]` — the live "active verdict" set this
+   * poll already computed (see `desired`'s own construction, `atRestFrom`'s
+   * doc comment above `reconcileNow`) — BEFORE the `atRest`-reduction block
+   * below, so a stale entry is gone before anything downstream could act on
+   * it. Return value is `void`: this only prunes, it never itself
+   * unprotects an id (that stays `checkDeclaredDone`'s job, on a
+   * SUBSEQUENT, later poll's fresh declaration). Optional; omitted, a
+   * `checkDeclaredDone` registry has no way to be pruned mid-episode and
+   * the hazard above stands exactly as it would without this addendum.
+   */
+  invalidateDeclaredDone?: (desired: readonly string[]) => void;
+  /**
    * BUTCHR-141: audible-only crash-loop detection. Called BEFORE the spawn
    * loop below runs, with this poll's `plan.spawn` and `desired.keys()` —
    * see src/agents/crash-loop.ts for the full mechanism (the candidate set,
@@ -314,12 +366,35 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // nothing extra: the branch below is skipped whenever `atRest` (or its
   // intersection with `running`) is empty, and `atRest` defaults to empty.
   let atRest = new Set(opts.atRest ?? []);
-  if (opts.checkFrozenAsleep && atRest.size) {
+  // BUTCHR-275 (review round 2): prune stale declarations BEFORE anything
+  // else touches `atRest` this poll, and unconditionally — never gated on
+  // `atRest.size`, since the id this needs to catch is by definition
+  // active (in `desired`), not resting, this very poll. See
+  // `ReconcileOptions.invalidateDeclaredDone`'s own doc comment for the
+  // hazard this closes.
+  if (opts.invalidateDeclaredDone) opts.invalidateDeclaredDone([...desired.keys()]);
+  // BUTCHR-275: `checkDeclaredDone` runs BEFORE `checkFrozenAsleep`, and its
+  // hits are subtracted from `restingRunning` before that narrower set ever
+  // reaches `checkFrozenAsleep` — NOT the same `restingRunning` handed to
+  // both. Getting this backwards is silently wrong: a project that checked
+  // in this very poll, after sitting resting long enough to also cross the
+  // frozen bound, would still be offered to `checkFrozenAsleep` as a
+  // candidate and could draw its `[butchr:frozen]` complaint — released a
+  // moment later by `checkDeclaredDone`, but with a false "this froze"
+  // complaint already posted, which is exactly the DoD-1 guarantee
+  // ("without a `[butchr:frozen]` complaint, since nothing froze") this
+  // ordering exists to keep true by construction.
+  if ((opts.checkFrozenAsleep || opts.checkDeclaredDone) && atRest.size) {
     const runningSet = new Set(running);
-    const restingRunning = [...atRest].filter((id) => runningSet.has(id));
+    let restingRunning = [...atRest].filter((id) => runningSet.has(id));
     if (restingRunning.length) {
-      const frozen = await opts.checkFrozenAsleep(restingRunning);
-      if (frozen.size) atRest = new Set([...atRest].filter((id) => !frozen.has(id)));
+      const unprotected = new Set<string>();
+      if (opts.checkDeclaredDone) {
+        for (const id of await opts.checkDeclaredDone(restingRunning)) unprotected.add(id);
+        restingRunning = restingRunning.filter((id) => !unprotected.has(id));
+      }
+      if (opts.checkFrozenAsleep && restingRunning.length) for (const id of await opts.checkFrozenAsleep(restingRunning)) unprotected.add(id);
+      if (unprotected.size) atRest = new Set([...atRest].filter((id) => !unprotected.has(id)));
     }
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
@@ -566,6 +641,10 @@ export interface GenericLoopDeps<T> {
   checkAbandoned?: (issues: readonly T[]) => Promise<void>;
   /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /** BUTCHR-275: see `ReconcileOptions.checkDeclaredDone`'s doc comment — threaded straight through to `reconcileNow` below, alongside (never merged with) `checkFrozenAsleep`. Optional; omitted, no resource type ever exits promptly on its own declared-done signal (every resource type before this ticket, and the issue tier, which never sleeps and so never declares). */
+  checkDeclaredDone?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /** BUTCHR-275 (review round 2): see `ReconcileOptions.invalidateDeclaredDone`'s own doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, a `checkDeclaredDone` registry has no way to be pruned mid-episode. */
+  invalidateDeclaredDone?: (desired: readonly string[]) => void;
   /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   /** BUTCHR-147: see `ReconcileOptions.checkReconcileFailure`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance, same reasoning as `checkCrashLoop` above. Optional; omitted, no isolated-failure detection runs. */
@@ -653,6 +732,8 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
+        ...(deps.checkDeclaredDone ? { checkDeclaredDone: deps.checkDeclaredDone } : {}),
+        ...(deps.invalidateDeclaredDone ? { invalidateDeclaredDone: deps.invalidateDeclaredDone } : {}),
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
