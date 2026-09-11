@@ -64,7 +64,7 @@ describe("briefFor / modelFor", () => {
     const brief = briefFor("project");
     expect(brief).not.toContain("an epic has no verb that edits or comments on your root doc");
     expect(brief).not.toContain("no verb that edits");
-    expect(brief).toContain("no verb that\n   comments on your root doc");
+    expect(brief).toMatch(/no verb that\s+comments on your root doc/);
     expect(brief).toContain("confluence_update_page");
     expect(brief).toContain("not a message reaching you");
     expect(brief).toContain("not a way for an epic to talk to you");
