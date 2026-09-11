@@ -45,18 +45,24 @@ describe("LABEL_REGISTRY contents (verified against the code that writes each la
       expect(LABEL_REGISTRY[l as keyof typeof LABEL_REGISTRY]).toBeDefined();
     }
   });
+  // BUTCHR-352: the admission:* family — a SEPARATE namespace from agent:*,
+  // deliberately (see src/labels/plan.ts's ADMISSION_PREFIX doc comment for
+  // the mixed-build hazard this avoids).
+  test("the admission:* family — the one AdmissionLabel value (BUTCHR-352)", () => {
+    expect(LABEL_REGISTRY["admission:withheld"]).toBeDefined();
+  });
   test("the two verb-owned labels", () => {
     expect(LABEL_REGISTRY["butchr:shelved"]).toBeDefined();
     expect(LABEL_REGISTRY["butchr:orphan"]).toBeDefined();
   });
-  test("exactly 11 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
-    expect(REGISTERED_LABELS.size).toBe(11);
+  test("exactly 12 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
+    expect(REGISTERED_LABELS.size).toBe(12);
   });
   // AC-6: this registry describes labels butchr writes; it must never become
   // a list of labels butchr enforces onto tickets it doesn't own.
   test("AC-6: every registered label is under butchr's own namespaces — never a human label", () => {
     for (const label of REGISTERED_LABELS) {
-      expect(/^(agent|pr|butchr):/.test(label)).toBe(true);
+      expect(/^(agent|pr|admission|butchr):/.test(label)).toBe(true);
     }
   });
   // AC-5: butchr:shelved's documented treatment (verb-owned, NOT daemon-owned)

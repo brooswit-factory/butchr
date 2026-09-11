@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
+import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isActiveStatusLabel, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 import type { StallRemediator } from "../agents/stall-remediation.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
@@ -39,6 +39,26 @@ export interface SyncDeps {
    * ledger hazard that module documents in full.
    */
   stallRemediation?: StallRemediator;
+  /**
+   * BUTCHR-352: THIS poll's admission census for the withheld set
+   * (src/agents/admission.ts's `AdmissionController.census()`) — either the
+   * set of issue keys a TRUSTED (`checked: true`) bucket reports withheld
+   * this poll, or the literal `"unknown"` when the census could not check at
+   * all this poll (`checked: false` — residency threw, an untrusted
+   * implausible zero, or this source has never reported). `"unknown"` is
+   * passed straight through to `desiredLabels`' own `withheld: "unknown"`
+   * handling (src/labels/plan.ts) for EVERY issue this poll — which re-emits
+   * whatever `admission:withheld` marker a ticket already carries instead of
+   * reading a blind poll as "confirmed not withheld" (the KAN-832/837
+   * pattern, reused). Called once per poll, synchronously (the census this
+   * reads was already computed earlier in the SAME poll, before syncLabels
+   * ever runs — see src/daemon/index.ts's own wiring comment and
+   * src/daemon/loop.ts's `reconcileNow`-before-`syncLabels` ordering), never
+   * a second I/O call of its own. Optional so every existing caller/fixture
+   * that doesn't supply it is unaffected — admission:withheld is then simply
+   * never emitted (desiredLabels defaults `withheld` to `false`).
+   */
+  withheld?: () => ReadonlySet<string> | "unknown";
   /**
    * Called once per poll with the keys this poll wrote daemon-owned labels
    * for (only when non-empty), so the caller can feed the own-write ledger
@@ -146,6 +166,9 @@ export function createLabelSync(deps: SyncDeps) {
     const written = new Set<string>();
     const seen = new Set(issues.map((i) => i.key));
     const agents = await deps.agentStatuses();
+    // BUTCHR-352: read once per poll, synchronously — see this dep's own doc
+    // comment for why this is never a second I/O call.
+    const withheldKeys = deps.withheld?.();
 
     for (const issue of issues) {
       let agentStatus: string | null;
@@ -232,7 +255,8 @@ export function createLabelSync(deps: SyncDeps) {
       // KAN-824: epics never have a branch, so a search for one can only ever
       // miss — skip the call entirely rather than let it burn a GitHub search.
       const prState = deps.prState && canHavePr(issue.issuetype) ? await deps.prState(issue.key) : null;
-      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, currentLabels: issue.labels });
+      const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
+      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
       const ok = await write(written, issue.key, issue.labels, desired);
       if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }
@@ -243,7 +267,11 @@ export function createLabelSync(deps: SyncDeps) {
       deps.stalled?.forget(key);
       deps.stallRemediation?.forget(key);
       const current = lastLabels.get(key)!;
-      const desired = current.filter((l) => !l.startsWith(AGENT_PREFIX));
+      // BUTCHR-352: admission:* is lifecycle-bound to active status the same
+      // way agent:* is — see isActiveStatusLabel's own doc comment — so both
+      // are stripped here; pr:* is deliberately left untouched (independent
+      // of status).
+      const desired = current.filter((l) => !isActiveStatusLabel(l));
       const ok = await write(written, key, current, desired);
       if (ok) lastLabels.delete(key);
     }

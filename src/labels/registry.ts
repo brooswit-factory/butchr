@@ -1,4 +1,4 @@
-import { AGENT_PREFIX, PR_PREFIX, type AgentLabel, type PrState } from "./plan.js";
+import { ADMISSION_PREFIX, AGENT_PREFIX, PR_PREFIX, type AdmissionLabel, type AgentLabel, type PrState } from "./plan.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { ORPHAN_LABEL } from "../tools/relationship.js";
 
@@ -189,11 +189,13 @@ export type LabelRegistryEntry =
 type AgentLabelKey = `${typeof AGENT_PREFIX}${AgentLabel}`;
 /** `pr:open` | `pr:approved` | `pr:changes-requested` | `pr:merged` — grows automatically if `PrState` grows. */
 type PrLabelKey = `${typeof PR_PREFIX}${NonNullable<PrState>}`;
+/** BUTCHR-352: `admission:withheld` today — grows automatically if `AdmissionLabel` grows. A deliberately SEPARATE namespace from `agent:*` — see `./plan.ts`'s `ADMISSION_PREFIX` doc comment for the mixed-build hazard that rules out folding this into `AgentLabelKey`. */
+type AdmissionLabelKey = `${typeof ADMISSION_PREFIX}${AdmissionLabel}`;
 /** The two verb-owned labels that live outside the daemon's own prefix machinery — see `./plan.ts`'s `isDaemonLabel` comment for why they're a separate category. */
 type VerbLabelKey = typeof EXEMPT_LABEL | typeof ORPHAN_LABEL;
 
 /** Every label string this registry declares. The type-level door: this is a CLOSED union, not `string` — see this file's header. */
-export type RegisteredLabel = AgentLabelKey | PrLabelKey | VerbLabelKey;
+export type RegisteredLabel = AgentLabelKey | PrLabelKey | AdmissionLabelKey | VerbLabelKey;
 
 const AGENT_LABEL_LIFECYCLE_NOTES =
   "One of exactly five mutually exclusive agent:* values (mapAgentStatus / desiredLabels in ./plan.ts) computed fresh every ~15s poll for a ticket whose status isActive(). Flapping is damped by AgentLabelStabilizer in ./sync.ts (a candidate value must be observed on two consecutive polls before it's written), but that only delays which value gets applied — it never changes who applies or withdraws it. Former hole, live example for AC-9(b) (BUTCHR-144, outside this epic — AC-7 forbade fixing it here): SWEEP_JQL in ./sweep.ts's startup sweep once omitted agent:stalled from its hand-written `labels IN (...)` list, so a ticket carrying agent:stalled when it went inactive was not picked up by that particular sweep. BUTCHR-155 closed it by deriving SWEEP_JQL from AgentLabel itself (./plan.ts's ALL_AGENT_LABEL_KEYS) rather than adding one more string to the list. This entry's withdrawnBy was, and remains, correct throughout — the poll-loop diff below IS a real withdrawal path — the AC-9(b) point this instance illustrates is that a registry entry only ever records that a path exists, never that every caller on it is hole-free; see this file's header, AC-9(b).";
@@ -235,6 +237,14 @@ export const LABEL_REGISTRY: Readonly<Record<RegisteredLabel, LabelRegistryEntry
     appliedBy: "src/labels/sync.ts's syncLabels — mapAgentStatus's value when no butchr agent is currently running for an active ticket (raw herdr status is null).",
     notes: AGENT_LABEL_LIFECYCLE_NOTES,
     withdrawnBy: AGENT_LABEL_WITHDRAWN_BY,
+  },
+  "admission:withheld": {
+    appliedBy:
+      "src/labels/sync.ts's syncLabels — layered ALONGSIDE agent:none (never instead of it, and never with any other agent:* value — see desiredLabels' own comment in ./plan.ts) whenever THIS poll's admission census (src/agents/admission.ts's AdmissionController.census(), read from the SAME shared controller instance src/daemon/index.ts wires into syncLabels) reports this ticket's key in a checked:true bucket's withheld set. A checked:false bucket (residency threw, an untrusted implausible zero, or this source has never reported) never produces this label — it is only ever written from a TRUSTED, positive observation.",
+    notes:
+      "BUTCHR-352: deliberately NOT an agent:* value, on a SEPARATE prefix (ADMISSION_PREFIX, ./plan.ts) — the mixed-build hazard this decision closes: the fleet's daemons deploy independently, so a new-build daemon can write a new state while an old-build checkWorker (src/tools/relationship.ts) is still reading it. Confirmed by execution at 25edb44: a hypothetical fourth agent:* value maps to a CONFIDENT \"staffed\" on unchanged code (any value other than the \"no agent running\" one does), strictly worse than today's honest \"not-staffed\". A separate, non-agent:-prefixed marker is structurally invisible to that same old code (it only ever scans AGENT_PREFIX-matching labels), so an unupgraded reader degrades to the old honest-but-incomplete answer instead. Same lifecycle discipline as agent:* despite the separate prefix: see ./plan.ts's isActiveStatusLabel, which both syncLabels' disappearance-cleanup pass and ./sweep.ts's startup sweep filter through, so this label is cleared/swept exactly when agent:* is, never left to strand the way a hand-maintained sweep list once left a stalled-state value out entirely (BUTCHR-144).",
+    withdrawnBy:
+      "src/labels/sync.ts's syncLabels, via diffLabels in ./plan.ts — every poll, diffLabels removes this label whenever this poll's desired set omits it (the ticket is no longer withheld, its agent:* value is no longer none, or the admission census could not confirm withheld status this poll — see appliedBy). Leaving the active status set removes it too, via the SAME disappearance-cleanup/isActiveStatusLabel path agent:* uses (./plan.ts), and src/labels/sweep.ts's startup sweep additionally catches a ticket that went inactive while the daemon staffing it was down.",
   },
   "pr:open": {
     appliedBy: "src/labels/sync.ts's syncLabels, via desiredLabels/diffLabels in ./plan.ts — PrTracker.stateFor (src/labels/pr.ts) resolved this ticket's tracked PR to \"open\".",
