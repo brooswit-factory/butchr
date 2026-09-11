@@ -389,8 +389,25 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           });
         }
         const nextUrl: string | undefined = r?._links?.next;
-        cursor = nextUrl ? (new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor") ?? undefined) : undefined;
-        if (!cursor) break;
+        // BUTCHR-309 review round 1: NO next link and a next link PRESENT
+        // but UNPARSEABLE are two genuinely different states, not one — the
+        // first means the walk is complete (break, correctly); the second
+        // means the server is telling us there IS more and we could not
+        // follow it, which is a FAILED read, not a completed one. Collapsing
+        // them (as an earlier version of this loop did, via `?? undefined`)
+        // silently returned "one page" as if it were "the whole list" the
+        // instant `_links.next`'s shape ever changed — exactly the DoD 4
+        // violation this ticket exists to close, reintroduced by its own
+        // fix. MEASURED at review: a `next` link with no `cursor` query
+        // parameter reproduces this with one page returned as complete.
+        if (!nextUrl) break;
+        const parsedCursor = new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor");
+        if (!parsedCursor) {
+          throw new Error(
+            `getPageComments(${pageId}): _links.next was present ("${nextUrl}") but no \`cursor\` query parameter could be parsed from it — refusing to treat "more data exists" as "pagination complete"`,
+          );
+        }
+        cursor = parsedCursor;
       }
       return { results };
     },
@@ -439,28 +456,47 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // by the response's own `total` (jira.js's `PageOfCommentsSchema` — see
     // that op's doc comment on AtlassianOps for why this reader no longer
     // shares a cap with `src/atlassian/client.ts`'s own, differently-tiered
-    // reader). `maxResults: 100` is a page-size choice, not a completeness
-    // bound — the loop keeps requesting pages until it has read `total`
-    // comments (or a page comes back empty, which stops it even if `total`
-    // is ever absent/unreliable). Runaway protection: `MAX_COMMENT_PAGES`
-    // throws rather than returning a silently partial list if `total` is
-    // ever wrong in a way that makes the loop never naturally terminate.
+    // reader). `PAGE_SIZE` is a page-size choice, not a completeness bound —
+    // the loop keeps requesting pages until it has read `total` comments,
+    // when a `total` is actually reported. REVIEW ROUND 1 FIX: an earlier
+    // version, when `total` was ABSENT from the response, set `total` to
+    // `results.length` (what had already been read) as a fallback — that
+    // made `startAt < total` false on the very next check, so a response
+    // with no `total` field silently stopped after ONE page (MEASURED at
+    // review: 250 comments across pages of 100/100/50 with no `total` field
+    // returned only the first 100). It also made the "or a page comes back
+    // empty" safety net this comment used to claim UNREACHABLE on that same
+    // path — a doc comment asserting a safety net that doesn't fire is
+    // exactly the stale-and-wrong-authoritative-claim shape this ticket's
+    // own DoD 8 exists to close, so shipping a second one here would have
+    // been the same defect one level up. Fixed: `total` is left `undefined`
+    // when the response doesn't carry a number, and the ONLY termination
+    // signal in that case is a page SHORTER than `PAGE_SIZE` (including
+    // empty) — a full page can never safely be assumed to be the last one
+    // without a `total` to compare against. This also covers the case where
+    // `total` WAS reported but the server runs out of comments before
+    // `startAt` reaches it (e.g. a concurrent deletion mid-walk): a short
+    // page still stops the loop cleanly rather than re-requesting an empty
+    // range until the runaway guard fires. Runaway protection:
+    // `MAX_COMMENT_PAGES` throws rather than returning a silently partial
+    // list if neither a short page nor the reported `total` is ever reached.
     getIssueComments: async (key) => {
       const results: Array<{ id: string }> = [];
       let startAt = 0;
       let total: number | undefined;
+      const PAGE_SIZE = 100;
       for (let page = 0; total === undefined || startAt < total; page++) {
         if (page >= MAX_COMMENT_PAGES) {
           throw new Error(
             `getIssueComments(${key}): exceeded ${MAX_COMMENT_PAGES} pages without reaching the reported total (${total ?? "unknown"}) — refusing to return a silently partial list`,
           );
         }
-        const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: 100 });
+        const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
         const batch: any[] = r?.comments ?? [];
         for (const c of batch) results.push({ id: c.id });
-        total = typeof r?.total === "number" ? r.total : results.length;
-        if (batch.length === 0) break;
+        if (typeof r?.total === "number") total = r.total;
         startAt += batch.length;
+        if (batch.length < PAGE_SIZE) break; // short (including empty) page: nothing more to fetch, whether or not `total` was ever reported
       }
       return { results };
     },

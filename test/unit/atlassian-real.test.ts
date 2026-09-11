@@ -326,6 +326,35 @@ describe("realAtlassian getPageComments pagination (BUTCHR-309)", () => {
     const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
     await expect(ops.getPageComments("42")).rejects.toThrow(/exceeded 100 pages/);
   });
+
+  // BUTCHR-309 REVIEW ROUND 1 (measured against the pre-fix code): a
+  // `_links.next` that IS present but whose `cursor` query parameter does
+  // not parse (an API change, or a next-link shape this parse misses) used
+  // to collapse to the SAME `cursor = undefined` as "no next link at all",
+  // so the walk silently stopped and returned one page as if it were
+  // complete. FALSIFIER: if this ever resolves instead of rejecting, or
+  // resolves having silently returned only the first page's results, the
+  // present-but-unparseable case has regressed back to "treated as done".
+  test("REVIEW FIX: a `next` link present but with NO parseable `cursor` THROWS — 'more data exists' must never read as 'pagination complete'", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          // `_links.next` IS present, but its query string carries no
+          // `cursor` param at all — an unparseable-for-our-purposes next link.
+          getPageFooterComments: () =>
+            Promise.resolve({
+              results: [{ id: "1", body: { storage: { value: "" } }, version: {} }],
+              _links: { next: "/wiki/api/v2/pages/42/footer-comments?limit=250" },
+            }),
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getPageComments("42")).rejects.toThrow(/no `cursor` query parameter could be parsed/);
+  });
 });
 
 describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
@@ -359,15 +388,47 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
   test("MAX_COMMENT_PAGES guards a `total` that never gets reached: THROWS rather than returning a silently truncated list (DoD 5)", async () => {
     mock.module("jira.js", () => ({
       createCloudClient: () => ({
-        // Reports a total far beyond what any page ever delivers, so the
-        // startAt < total loop condition never naturally terminates.
-        issueComments: { getComments: () => Promise.resolve({ comments: [{ id: "x" }], total: 100_000 }) },
+        // ALWAYS a full (100-item) page, so the short-page stop never fires
+        // — and a `total` far beyond what any page ever delivers, so the
+        // startAt < total loop condition never naturally terminates either.
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })), total: 100_000 }) },
       }),
       isNotFoundError: () => false,
     }));
     const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
     const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
     await expect(ops.getIssueComments("KAN-9")).rejects.toThrow(/exceeded 100 pages/);
+  });
+
+  // BUTCHR-309 REVIEW ROUND 1 (measured against the pre-fix code, not
+  // reasoned out of the source): a response with NO numeric `total` field
+  // used to make the loop set `total = results.length` as a fallback, which
+  // made `startAt < total` false on the very next check — so a 250-comment
+  // issue, paginated in pages of 100/100/50 with `total` NEVER reported,
+  // silently returned only the first 100. FALSIFIER: if this ever regresses
+  // to fewer than 250 results (or fewer than 3 calls), the no-`total`
+  // fallback has broken again.
+  test("REVIEW FIX: a response with no `total` field still paginates to exhaustion, stopping on the first SHORT page (not the immediate next check)", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            const sizes = [100, 100, 50];
+            const size = sizes[calls.length - 1] ?? 0;
+            // NO `total` field anywhere in any of these responses.
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })) });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // did NOT stop after page 1
+    expect(got.results.length).toBe(250); // the full 100+100+50, not just the first 100
   });
 });
 
