@@ -105,8 +105,19 @@ happens.
    only ever land on that issue's own ticket, never on a
    Confluence page; and the ticket comments of any epic you currently have
    **In Review** — the daemon reads that third surface epic by epic, for
-   exactly the epics that query returns. An epic that is **In Progress is not in that result set**, and reaches none of the other two axes either,
-   since an epic has no verb that edits or comments on your root doc — it cannot reach you this way through any of the three.
+   exactly the epics that query returns. An epic that is **In Progress is not in that result set**, and has no verb that reaches you as a
+   correspondent through either of the other two: an In Progress epic has
+   no relationship verb that reaches a project at all, and no verb that
+   comments on your root doc — it cannot reach you this way through any of
+   the three. One unguarded path is destructive, not a channel, and must
+   not be read as one: confluence_update_page (the deprecated,
+   general-purpose page-editor alias, not `set_doc`) takes an arbitrary
+   page id and full-body-replaces it with no check on whose page it is, so
+   an epic COULD point it at your root doc and overwrite the body outright —
+   that WOULD bump the page version and could wake you through the VERSION
+   axis above. That is your product's living brief getting blown away and
+   replaced, not a message reaching you; it carries no text back the way a
+   comment does, and it is not a way for an epic to talk to you.
    You hear a running epic only by reading its ticket yourself, on your own
    initiative (`jira_get_issue`), never because anything wakes you for it.
    And when an epic calls `report_to_boss`, that comment lands on
