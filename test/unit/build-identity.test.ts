@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildIdentity, realGitAtStart, resolveSha, toBuildReport, type GitAtStart } from "../../src/agents/build-identity.js";
+import { buildIdentity, describeBuild, realGitAtStart, resolveSha, toBuildReport, type GitAtStart } from "../../src/agents/build-identity.js";
 import pkg from "../../package.json" with { type: "json" };
 
 describe("resolveSha — pure, given an injected gitAtStart", () => {
@@ -194,5 +194,45 @@ describe("toBuildReport", () => {
     });
     expect(report.unit).toBe("(none)");
     expect(report.journalctl).toBe("");
+  });
+});
+
+// BUTCHR-320 (C): the startup line's own formatting — falsifier 1 (mutation
+// test): deleting the `describeBuild(toBuildReport(buildIdentity))` call in
+// src/daemon/index.ts's startup banner must fail a test naming this exact
+// line's content; that check lives at the call site (there is no daemon
+// startup test harness in this suite), verified by hand for the PR. These
+// tests pin the pure formatting function itself.
+describe("describeBuild (BUTCHR-320 C) — reuses toBuildReport's own fields, never a second sha/version derivation", () => {
+  test("a known sha: short sha, provenance, and dirty/clean are all named", () => {
+    const line = describeBuild({
+      sha: "0fa494297ff6d0d32a8c6e17b69f8bd2889edbf7", shaProvenance: "git-at-start", shaDirty: false, shaUnknownReason: null,
+      version: "0.15.5", startedAt: "2026-01-01T00:00:00.000Z", pid: 641076, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service",
+    });
+    expect(line).toBe("build 0fa49429 (git-at-start, clean) version=0.15.5 pid=641076 unit=butchr.service");
+  });
+
+  test("a dirty tree is named, not silently omitted", () => {
+    const line = describeBuild({
+      sha: "a".repeat(40), shaProvenance: "baked", shaDirty: true, shaUnknownReason: null,
+      version: "1.0.0", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
+    });
+    expect(line).toContain("dirty");
+  });
+
+  test("an unknown sha states the reason, never a blank or guessed sha", () => {
+    const line = describeBuild({
+      sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no readable git repository above /x",
+      version: "1.0.0", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
+    });
+    expect(line).toContain("unknown (no readable git repository above /x)");
+  });
+
+  test("reuses toBuildReport's OWN output — the same object /health's build field serves — not a second sha derivation", () => {
+    const report = toBuildReport(buildIdentity);
+    const line = describeBuild(report);
+    expect(line).toContain(`version=${report.version}`);
+    expect(line).toContain(`pid=${report.pid}`);
+    expect(line).toContain(`unit=${report.unit}`);
   });
 });
