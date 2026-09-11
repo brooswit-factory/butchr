@@ -2802,7 +2802,7 @@ describe("newWorker: idempotency — a retry cannot produce a twin (BUTCHR-244)"
   });
 });
 
-describe("checkWorker (BUTCHR-244): the three-valued staffing verdict", () => {
+describe("checkWorker (BUTCHR-244/BUTCHR-352): the four-valued staffing verdict", () => {
   function setupCaller(addIssue: ReturnType<typeof makeWorld>["addIssue"]) {
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
   }
@@ -2945,5 +2945,128 @@ describe("checkWorker (BUTCHR-244): the three-valued staffing verdict", () => {
     const result = await checkWorker(ops, "BUTCHR", "BUTCHR-8");
     expect(result.staffing).toBe("staffed");
     expect(result.observedLabel).toBe("agent:idle");
+  });
+
+  // -------------------------------------------------------------------
+  // BUTCHR-352: the fourth verdict, "withheld" — admission control is
+  // holding this worker at the fleet-wide cap, correctly. Carried on a
+  // SEPARATE admission:withheld label (never a new agent:* value — see this
+  // file's own doc comment on checkWorker for the mixed-build argument),
+  // read ALONGSIDE the existing agent:* label, never instead of it.
+  // -------------------------------------------------------------------
+  describe("withheld (BUTCHR-352)", () => {
+    test("no probe wired: agent:none + admission:withheld -> withheld, sourced from the label", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: ["agent:none", "admission:withheld"] });
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+      expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "withheld", source: "label", observedLabel: "agent:none" });
+    });
+
+    // Falsifier 2 restated for this branch: agent:none ALONE (no marker)
+    // still yields not-staffed, exactly as it did before this label existed
+    // — this is the "ordering consequence" the ticket names explicitly.
+    test("no probe wired: agent:none ALONE (no admission:withheld) -> not-staffed, unchanged", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: ["agent:none"] });
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+      expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "label", observedLabel: "agent:none" });
+    });
+
+    // The deliberate, stated decision for the "some OTHER agent:* value"
+    // case the ticket calls out explicitly: a stale/contradictory
+    // admission:withheld marker alongside a RUNNING agent's label is
+    // IGNORED — the real agent:* value is trusted at face value.
+    test("a stale admission:withheld marker alongside agent:working is IGNORED — staffed wins, deliberately (BUTCHR-352)", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress", labels: ["agent:working", "admission:withheld"] });
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9");
+      expect(result.staffing).toBe("staffed");
+      expect(result.observedLabel).toBe("agent:working");
+    });
+
+    // THE SAME-DAEMON CASE (falsifier 1, non-cross-daemon half) — the trap
+    // named explicitly on this ticket: a probe IN SCOPE resolving false
+    // must NOT short-circuit past the withheld marker the way it used to
+    // short-circuit straight to "not-staffed".
+    test("SAME-DAEMON: probe in scope, resolves false, admission:withheld label present -> withheld (not not-staffed)", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: ["agent:none", "admission:withheld"] });
+      const probe = async () => false;
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "withheld", source: "label", observedLabel: "agent:none" });
+    });
+
+    // THE CONTROL for the probe above: without the marker, the SAME
+    // probed===false path still returns exactly what it always has —
+    // proving the withheld check didn't accidentally widen what
+    // probed===false means for every OTHER worker.
+    test("SAME-DAEMON control: probe in scope, resolves false, NO admission:withheld label -> not-staffed, sourced from herd (unchanged)", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress" });
+      const probe = async () => false;
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "herd" });
+    });
+
+    // A probe resolving TRUE must still short-circuit immediately — a live
+    // "running" read is never overridden by a stale withheld marker either.
+    test("SAME-DAEMON control: probe resolving true short-circuits to staffed even with a stale admission:withheld label present", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: ["agent:working", "admission:withheld"] });
+      const probe = async () => true;
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(result).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "staffed", source: "herd" });
+    });
+
+    // THE CROSS-DAEMON CASE (falsifier 1, the story's own headline scenario
+    // — BUTCHR-343/BUTCHR-316 measured live): the caller's own herd is
+    // structurally blind (probeOutOfScope), but the RIGHT daemon already
+    // wrote BOTH labels — the marker still answers correctly.
+    test("CROSS-DAEMON: out-of-scope probe, but the RIGHT daemon wrote agent:none + admission:withheld -> withheld, probeOutOfScope named", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["agent:none", "admission:withheld"] });
+      let probeCalled = false;
+      const probe = async (): Promise<boolean | null> => { probeCalled = true; return false; };
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(probeCalled).toBe(false); // never even consulted — same AC-5 discipline as the existing cross-daemon tests
+      expect(result.staffing).toBe("withheld");
+      expect(result.source).toBe("label");
+      expect(result.observedLabel).toBe("agent:none");
+      expect(result.probeOutOfScope).toBe(true);
+    });
+
+    // Falsifier 3: out-of-scope with NO cross-daemon signal at all (no
+    // labels whatsoever) must never guess "withheld" — could-not-look,
+    // exactly like the existing AC-5 "different account" test.
+    test("CROSS-DAEMON, no signal at all: could-not-look, NEVER withheld", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress" });
+      const probe = async (): Promise<boolean | null> => false;
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(result.staffing).toBe("could-not-look");
+      expect(result.staffing).not.toBe("withheld");
+      expect(result.probeOutOfScope).toBe(true);
+    });
+
+    // Falsifier 3, sharpened: out-of-scope, agent:none present but NO
+    // admission:withheld marker (the right daemon confirmed not-staffed,
+    // not withheld) -> not-staffed, not could-not-look, not withheld.
+    test("CROSS-DAEMON: right daemon wrote agent:none alone (no marker) -> not-staffed, never withheld", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["agent:none"] });
+      const probe = async (): Promise<boolean | null> => false;
+      const result = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", probe);
+      expect(result.staffing).toBe("not-staffed");
+      expect(result.probeOutOfScope).toBe(true);
+    });
   });
 });

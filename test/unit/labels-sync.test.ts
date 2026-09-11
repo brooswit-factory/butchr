@@ -1047,4 +1047,100 @@ describe("createLabelSync", () => {
       expect(posted.length).toBe(1); // exactly one wake comment across the WHOLE sequence, including the re-stall
     });
   });
+
+  // BUTCHR-352: `withheld` reads THIS poll's admission census for the
+  // withheld set (or the literal "unknown" when the census could not check)
+  // and threads it into desiredLabels — end-to-end through the real Jira
+  // diff, same style as the pr:* "unknown" tests above.
+  describe("withheld (BUTCHR-352)", () => {
+    test("no probe wired at all: admission:withheld is never emitted (today's exact pre-BUTCHR-352 behaviour)", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map() });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:none"], remove: [] }]);
+    });
+
+    test("a key in the trusted withheld set gets agent:none PLUS admission:withheld, in one write", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(), withheld: () => new Set(["KAN-1"]) });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:none", "admission:withheld"], remove: [] }]);
+    });
+
+    test("a key NOT in the trusted withheld set gets agent:none alone", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(), withheld: () => new Set(["KAN-999"]) });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:none"], remove: [] }]);
+    });
+
+    // THE REGRESSION TRAP: a withheld key with a RUNNING agent must never
+    // get admission:withheld — desiredLabels' own "only when label===none"
+    // guard is what this pins end-to-end, through the real agentStatuses
+    // wiring rather than a hand-built DesiredInput.
+    test("a withheld key with a RUNNING agent gets its real agent:* label, never admission:withheld", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "working"]]), withheld: () => new Set(["KAN-1"]) });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:working"], remove: [] }]);
+    });
+
+    // THE TWO-FLIPS-PER-EPISODE BOUND (BUTCHR-311's second correction): a
+    // census decline ("unknown") mid-episode must cause ZERO Jira writes —
+    // it re-emits the existing marker, which diffs to no-op.
+    test('a "checked: false" (unknown) poll mid-episode causes ZERO Jira writes — holds the last TRUSTED marker', async () => {
+      const jira = fakeJira();
+      const withheldState = { mode: "withheld" as "withheld" | "unknown" | "clear" };
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map(),
+        withheld: () => (withheldState.mode === "unknown" ? "unknown" : withheldState.mode === "withheld" ? new Set(["KAN-1"]) : new Set()),
+      });
+      // poll 1: confirmed withheld — ON, one write
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:none", "admission:withheld"], remove: [] }]);
+      jira.calls.length = 0;
+
+      // poll 2 & 3: census declines (residency threw / untrusted zero) — re-emits the SAME marker, zero writes
+      withheldState.mode = "unknown";
+      await sync([iss("KAN-1", "In Progress", ["agent:none", "admission:withheld"])]);
+      await sync([iss("KAN-1", "In Progress", ["agent:none", "admission:withheld"])]);
+      expect(jira.calls).toEqual([]);
+
+      // poll 4: confirmed NOT withheld — OFF, one write
+      withheldState.mode = "clear";
+      await sync([iss("KAN-1", "In Progress", ["agent:none", "admission:withheld"])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["admission:withheld"] }]);
+    });
+
+    test("a genuinely confirmed-not-withheld poll (not \"unknown\") DOES clear an existing marker — the guard against KAN-814-style stickiness", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(), withheld: () => new Set() });
+      await sync([iss("KAN-1", "In Progress", ["agent:none", "admission:withheld"])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["admission:withheld"] }]);
+    });
+
+    // BUTCHR-352: admission:* is lifecycle-bound to active status the same
+    // way agent:* is — leaving the active set clears BOTH in the same write.
+    test("a withheld ticket leaving the active status set has admission:withheld cleared alongside agent:*", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(), withheld: () => new Set(["KAN-1"]) });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      jira.calls.length = 0;
+      await sync([iss("KAN-1", "Done", ["agent:none", "admission:withheld"])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:none", "admission:withheld"] }]);
+    });
+
+    // Same disappearance-from-the-feed path agent:* already covers (the
+    // `for (const key of [...lastLabels.keys()])` loop) — admission:* rides
+    // along via isActiveStatusLabel (src/labels/plan.ts), not a second path.
+    test("a withheld ticket disappearing from the feed entirely has admission:withheld cleared too", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map(), withheld: () => new Set(["KAN-1"]) });
+      await sync([iss("KAN-1", "In Progress", [])]); // establishes agent:none + admission:withheld
+      jira.calls.length = 0;
+      await sync([]); // KAN-1 no longer active/visible
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:none", "admission:withheld"] }]);
+    });
+  });
 });

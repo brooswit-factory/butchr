@@ -8,7 +8,7 @@ import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
-import { AGENT_PREFIX } from "../labels/plan.js";
+import { ADMISSION_PREFIX, AGENT_PREFIX } from "../labels/plan.js";
 import { Refusal } from "./outcome.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
@@ -851,8 +851,22 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
   return ops.transition(workerKey, "In Progress");
 }
 
-/** `check_worker`'s staffing verdict — three-valued, NEVER two: conflating "could not look" with "not staffed" is the specific error this codebase has already been bitten by and guards against elsewhere (see `PrLookup`, src/labels/plan.ts, and its own doc comment) — this type keeps that same illegal conflation unrepresentable here. */
-export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look";
+/**
+ * `check_worker`'s staffing verdict — FOUR-valued, never fewer: conflating
+ * "could not look" with "not staffed" is the specific error this codebase
+ * has already been bitten by and guards against elsewhere (see `PrLookup`,
+ * src/labels/plan.ts, and its own doc comment) — this type keeps that same
+ * illegal conflation unrepresentable here.
+ *
+ * BUTCHR-352: `"withheld"` is the fourth value — admission control is
+ * holding this worker at the fleet-wide cap, correctly, and will admit it
+ * when a slot frees; this is NOT "not staffed" (which means genuinely
+ * undesired) and NOT "could-not-look" (this IS a positive, checked
+ * observation). See `checkWorker`'s own doc comment for the full mixed-build
+ * argument for why this is carried on a SEPARATE `admission:withheld` label
+ * rather than a new `agent:*` value.
+ */
+export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look" | "withheld";
 
 export interface CheckWorkerResult {
   key: string;
@@ -861,7 +875,7 @@ export interface CheckWorkerResult {
   staffing: StaffingVerdict;
   /** Which source produced `staffing` — "herd" is the live, authoritative probe (`herd.runningIssues()`, src/agents/herd.ts), consulted ONLY when it is known to cover this worker (see `probeOutOfScope` below); "label" is the `agent:*` label already on the ticket, which can be up to a poll stale and is further damped by the stabilizer in src/labels/sync.ts (a candidate value must be observed on two consecutive polls before it's written) — but is written by WHICHEVER daemon actually staffs this ticket, so it stays a valid signal even when a probe wired into THIS call is not. A caller that cares about freshness reads THIS field, never just `staffing` — a label-derived verdict must never be mistaken for a live one. */
   source: "herd" | "label";
-  /** Present ONLY when `source` is "label" AND the ticket actually carries an `agent:*` label — the exact value observed (e.g. "agent:none"). Absent when `source` is "label" but no `agent:*` label was found at all (e.g. the ticket's status was never active, so the label machinery never wrote one) — that absence is exactly the case where `staffing` is "could-not-look", not a guessed "not-staffed". */
+  /** Present ONLY when `source` is "label" AND the ticket actually carries an `agent:*` label — the exact value observed (e.g. "agent:none"). Absent when `source` is "label" but no `agent:*` label was found at all (e.g. the ticket's status was never active, so the label machinery never wrote one) — that absence is exactly the case where `staffing` is "could-not-look", not a guessed "not-staffed". This is always the `agent:*` value, even when `staffing` is "withheld" — that verdict is a SEPARATE `admission:withheld` marker layered on top of `agent:none`, which this field does not carry a second copy of (see `checkWorker`'s own doc comment). */
   observedLabel?: string;
   /**
    * BUTCHR-244 (AC-5, added after a live near-miss during THIS ticket's own
@@ -941,6 +955,38 @@ async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boo
  * a guessed "not-staffed". `source` on the result always names which one
  * actually answered; `probeOutOfScope` says when a probe existed but was
  * never even asked.
+ *
+ * BUTCHR-352 — THE FOURTH VERDICT, "withheld": an `agent:none` ticket can
+ * mean three DIFFERENT things (about to spawn, silently never spawned, or
+ * correctly withheld at the fleet-wide admission cap) that a boss must react
+ * to in opposite ways, and `agent:none` alone cannot tell them apart. The
+ * daemon that actually staffs this worker writes a SEPARATE `admission:*`
+ * label (src/labels/plan.ts's `ADMISSION_PREFIX`) — deliberately NOT a new
+ * `agent:*` value — the moment its own admission census confirms this
+ * ticket is withheld; this function reads it ALONGSIDE `agent:*`, not
+ * instead of it: `agent:none` plus `admission:withheld` means "withheld";
+ * `agent:none` alone still means "not-staffed", exactly as before. A worker
+ * whose `agent:*` label is anything else is trusted at face value — an
+ * `admission:withheld` marker under any other `agent:*` value is stale or
+ * contradictory (admission only ever withholds a candidate with no running
+ * agent) and is deliberately ignored rather than asserted.
+ *
+ * WHY A SEPARATE LABEL, NOT A NEW `agent:*` VALUE (the mixed-build hazard):
+ * this fleet's daemons deploy INDEPENDENTLY, and the restart-that-pulls new
+ * code belongs to a different story — so for an unbounded window a NEW-build
+ * daemon can write a state that an OLD-build `checkWorker` still has to
+ * read. Confirmed by execution against unchanged code (25edb44), label
+ * branch, no probe (the same branch `probeOutOfScope: true` forces): a
+ * hypothetical `agent:withheld` value reads as a confident `"staffed"` on
+ * that old code (`observedLabel === "agent:none" ? "not-staffed" :
+ * "staffed"` treats ANY non-`agent:none` value as a running agent) —
+ * strictly worse than today's honest `"not-staffed"`. A separate,
+ * non-`agent:`-prefixed marker is structurally invisible to that same old
+ * code (it only ever looks at `AGENT_PREFIX`-matching labels), so an
+ * UNUPGRADED reader simply keeps seeing `agent:none` alone and keeps
+ * returning `"not-staffed"` — an honest, incomplete answer, never a
+ * confident wrong one. This is the same discipline this whole verdict type
+ * exists to enforce, applied to the carrier itself, not only to the value.
  */
 export async function checkWorker(
   ops: AtlassianOps,
@@ -960,9 +1006,28 @@ export async function checkWorker(
       } catch {
         probed = null; // a rejecting probe means "could not look", never "not staffed" — falls through to the label below, same as an explicit null.
       }
-      if (probed !== null) {
-        return { key: workerKey, status, staffing: probed ? "staffed" : "not-staffed", source: "herd" };
+      if (probed === true) {
+        return { key: workerKey, status, staffing: "staffed", source: "herd" };
       }
+      if (probed === false) {
+        // BUTCHR-352: a live "not running" read does not, by itself,
+        // distinguish "genuinely not desired" from "withheld at capacity
+        // this poll" — admission's own decision is not visible to this
+        // probe, but the SAME daemon's syncLabels writes it into the
+        // admission:* label. This is the "same-daemon case is not the easy
+        // one" trap named on this ticket: a worker withheld on the CALLER's
+        // OWN daemon takes exactly this path, so it must be checked here,
+        // not only in the label branch below (which a `probed === true`/
+        // `false` result never reaches). Narrowly checking for the withheld
+        // marker (rather than falling through to the full label branch)
+        // keeps every OTHER probed===false case — including "no agent:*
+        // label at all" — returning exactly what it always has.
+        if (labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`)) {
+          return { key: workerKey, status, staffing: "withheld", source: "label", observedLabel: `${AGENT_PREFIX}none` };
+        }
+        return { key: workerKey, status, staffing: "not-staffed", source: "herd" };
+      }
+      // probed === null: falls through to the label branch below, same as a rejecting probe.
     } else {
       outOfScope = true;
     }
@@ -972,9 +1037,18 @@ export async function checkWorker(
   if (observedLabel === undefined) {
     return { key: workerKey, status, staffing: "could-not-look", source: "label", ...(outOfScope ? { probeOutOfScope: true } : {}) };
   }
+  if (observedLabel !== `${AGENT_PREFIX}none`) {
+    // BUTCHR-352: any OTHER agent:* value is trusted at face value — an
+    // admission:withheld marker alongside it would be stale/contradictory
+    // (admission only ever withholds a candidate with no running agent) and
+    // is deliberately ignored here rather than asserted; see this
+    // function's own doc comment.
+    return { key: workerKey, status, source: "label", observedLabel, staffing: "staffed", ...(outOfScope ? { probeOutOfScope: true } : {}) };
+  }
+  const withheld = labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`);
   return {
     key: workerKey, status, source: "label", observedLabel,
-    staffing: observedLabel === `${AGENT_PREFIX}none` ? "not-staffed" : "staffed",
+    staffing: withheld ? "withheld" : "not-staffed",
     ...(outOfScope ? { probeOutOfScope: true } : {}),
   };
 }
