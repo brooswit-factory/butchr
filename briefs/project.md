@@ -98,8 +98,8 @@ happens.
    terminal state — you sleep and wake again, you don't finish.
    **Name your inbound surfaces precisely — there are three wake axes, not
    two:** an edit to your own root doc's BODY (the VERSION axis — real and
-   used: epics have been told to put load-bearing directives in the page
-   body, since you read the body every session); a COMMENT on your own
+   used: a person editing your page body wakes you, since you read the
+   body every session); a COMMENT on your own
    root doc, written by YOUR OWN `report_to_boss`/`ask_boss`, a peer project's `tell_peer`, or a person or agent commenting on the page directly
    — never by an issue caller's `report_to_boss`/`ask_boss`, which can
    only ever land on that issue's own ticket, never on a
