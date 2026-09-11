@@ -86,17 +86,29 @@ export const MARKER = "[butchr:abandoned]";
  * field set (`issuetype, priority, status, summary` — MEASURED, BUTCHR-192)
  * never includes `labels`, so this predicate could not see `butchr:shelved`
  * on the boss even if it wanted to. It reads the WORKER's own labels (which
- * `issues` already carries in full), not the boss's — but a shelved worker
- * is, by `shelve_worker`'s own contract, moved to To Do, which is outside
- * `ISSUE_JQL` and therefore outside this detector's candidate set entirely
- * (see the `KNOWN LIMITATION` on `abandonedCandidates` below). The no-
- * exemption decision is recorded and tested here anyway, deliberately,
- * for the anomalous case a worker reaches this detector's candidate set
- * (In Progress/In Review) while still carrying a stale `butchr:shelved`
- * label — e.g. a labelling bug, or a hand-added label that was never
- * withdrawn — so a future reader does not have to re-derive the decision
- * from first principles, and so a future change to `shelve_worker`'s own
- * status contract does not silently resurrect the exemption question.
+ * `issues` already carries in full), not the boss's.
+ *
+ * BEFORE BUTCHR-240, that worker-label read was where this decision mostly
+ * stopped mattering in practice: a shelved worker is, by `shelve_worker`'s
+ * own contract, moved to To Do, which was outside `ISSUE_JQL` and therefore
+ * outside this detector's candidate set entirely — so the no-exemption
+ * decision only ever bit on an anomalous case (a stale `butchr:shelved`
+ * label surviving on an In Progress/In Review worker, e.g. a labelling bug
+ * or a hand-added label that was never withdrawn).
+ *
+ * BUTCHR-240 changed that at the INPUT layer, not this predicate: a second
+ * JQL search (`TODO_WORKER_JQL`, src/resources/issue.ts) now feeds this
+ * daemon's own To Do workers into `check()`'s candidate list, concatenated
+ * with `issues` BEFORE `abandonedCandidates` ever runs (see the `FORMER
+ * KNOWN LIMITATION` on `abandonedCandidates` below). The worker's own
+ * labels are therefore now reachable in To Do too, not only In Progress/In
+ * Review, and a shelved worker moved to To Do is no longer outside this
+ * detector's candidate set — it is an ORDINARY candidate. The anomalous
+ * case this decision was originally written for is no longer the only one
+ * it bites on: it is now the largest population this detector reaches. The
+ * no-exemption decision itself does not change (see above) — the new facts
+ * are stronger support for it, not weaker, since a worker shelved under a
+ * Done boss can never be reactivated by anyone.
  */
 
 export interface AbandonedCandidate {
