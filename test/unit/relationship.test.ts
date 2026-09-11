@@ -3014,41 +3014,89 @@ describe("checkWorker (BUTCHR-244/BUTCHR-352): the four-valued staffing verdict"
     });
 
     // -----------------------------------------------------------------
-    // REVIEW ROUND 1 FIX: the probed===false branch used to hardcode
-    // `observedLabel: "agent:none"` without ever reading the real agent:*
-    // label, and applied a NARROWER rule than the label branch below for
-    // the identical ticket state — reachable via exactly the stranded-
-    // ticket shape this PR's own doc names (an admission:withheld marker
-    // surviving with no agent:* label at all, or alongside some other
-    // agent:* value, on a ticket an old-build sweep never touched). Each
-    // pair below is the SAME labels, once through the probe branch (P) and
-    // once through the label branch (C, forced via an out-of-scope probe
-    // so the label branch runs but the result shape stays comparable) — the
-    // two orderings must agree.
+    // REVIEW ROUND 1 found: the probed===false branch hardcoded
+    // `observedLabel: "agent:none"` without reading the real agent:* label.
+    // ROUND 1's OWN FIX FOR THAT was itself wrong (round 2's finding): it
+    // deferred wholesale to the label branch's `staffingFromAgentLabel`
+    // whenever the marker was present, which let a stale/lagging agent:*
+    // label OVERRIDE a live "not running" observation — reporting a dead
+    // agent as `staffed`, or discarding a real "not running" read as
+    // `could-not-look`. Both are worse than the herd's own honest answer.
+    //
+    // THE CORRECT INVARIANT (round 2): a live observation on the probe path
+    // outranks a label; the marker only ever CONVERTS the herd's own
+    // verdict (not-staffed -> withheld) in the one state with no
+    // contradicting observation — agent:none exactly — and never borrows
+    // the label branch's could-not-look/staffed outcomes for any other
+    // state. So P (probe path) and C (label-branch control, same labels,
+    // forced via an out-of-scope probe) are EXPECTED TO DIVERGE for every
+    // non-agent:none state — that divergence is the fix, not a bug to
+    // reconcile away. Only the agent:none+marker case (already pinned
+    // above, "SAME-DAEMON: ... -> withheld") is expected to agree.
     // -----------------------------------------------------------------
-    test("P1/C1: marker present, NO agent:* label at all -> could-not-look on BOTH paths, never withheld", async () => {
+    test("P1 vs C1: marker present, NO agent:* label at all — probe path keeps the herd's own not-staffed (a live look DID happen); label path says could-not-look (nothing looked there)", async () => {
       const { ops, addIssue } = makeWorld();
       setupCaller(addIssue);
       addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: ["admission:withheld"] });
       const p1 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", async () => false);
-      expect(p1).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "could-not-look", source: "label" });
+      expect(p1).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "herd" }); // the live herd read wins — never discarded for a bare marker
 
       addIssue("BUTCHR-8", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["admission:withheld"] });
-      const c1 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-8", async () => false);
+      const c1 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-8", async () => false); // out of scope -> forced onto the label branch, nothing ever looked
       expect(c1.staffing).toBe("could-not-look");
     });
 
-    test("P2/C2: marker present alongside agent:working -> staffed on BOTH paths, marker ignored, real label reported (never a fabricated agent:none)", async () => {
+    test("P2 vs C2: marker present alongside agent:working — probe path keeps not-staffed (the live read outranks the lagging label); label path trusts the label as staffed", async () => {
       const { ops, addIssue } = makeWorld();
       setupCaller(addIssue);
       addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: ["agent:working", "admission:withheld"] });
       const p2 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", async () => false);
-      expect(p2).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "staffed", source: "label", observedLabel: "agent:working" });
+      // THE REGRESSION ROUND 1's OWN FIX PRODUCED: this used to read "staffed" here — a live "not
+      // running" read overridden by a stale agent:working label, a confident WRONG answer.
+      expect(p2).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "herd" });
 
       addIssue("BUTCHR-8", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["agent:working", "admission:withheld"] });
       const c2 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-8", async () => false);
-      expect(c2.staffing).toBe("staffed");
+      expect(c2.staffing).toBe("staffed"); // correct FOR the label branch — nothing else looked there
       expect(c2.observedLabel).toBe("agent:working");
+    });
+
+    // Second non-none value (round 2 explicitly asked for this): pins the
+    // rule as "not agent:none", not "not agent:working" specifically.
+    test("P7 vs C7: marker present alongside agent:stalled — same divergence, a different non-none label", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: ["agent:stalled", "admission:withheld"] });
+      const p7 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-9", async () => false);
+      expect(p7).toEqual({ key: "BUTCHR-9", status: "In Progress", staffing: "not-staffed", source: "herd" });
+
+      addIssue("BUTCHR-8", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-daemons-account", status: "In Progress", labels: ["agent:stalled", "admission:withheld"] });
+      const c7 = await checkWorker(ops, "BUTCHR-1", "BUTCHR-8", async () => false);
+      expect(c7.staffing).toBe("staffed");
+      expect(c7.observedLabel).toBe("agent:stalled");
+    });
+
+    // THE INVARIANT'S OWN FALSIFIER (round 2's requirement 3): the marker
+    // changes NOTHING on the probe path for every non-agent:none state,
+    // including agent:none's absence — a single table pinning "not-staffed,
+    // herd" regardless of the marker, for every label shape except
+    // agent:none itself.
+    test("invariant: on the probe path, admission:withheld changes nothing unless the real label is exactly agent:none", async () => {
+      const { ops, addIssue } = makeWorld();
+      setupCaller(addIssue);
+      const cases: Array<{ key: string; labels: string[] }> = [
+        { key: "BUTCHR-20", labels: [] },
+        { key: "BUTCHR-21", labels: ["admission:withheld"] },
+        { key: "BUTCHR-22", labels: ["agent:working"] },
+        { key: "BUTCHR-23", labels: ["agent:working", "admission:withheld"] },
+        { key: "BUTCHR-24", labels: ["agent:blocked", "admission:withheld"] },
+        { key: "BUTCHR-25", labels: ["agent:idle", "admission:withheld"] },
+      ];
+      for (const c of cases) {
+        addIssue(c.key, { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "test-account", status: "In Progress", labels: c.labels });
+        const result = await checkWorker(ops, "BUTCHR-1", c.key, async () => false);
+        expect(result).toEqual({ key: c.key, status: "In Progress", staffing: "not-staffed", source: "herd" });
+      }
     });
 
     // A probe resolving TRUE must still short-circuit immediately — a live
