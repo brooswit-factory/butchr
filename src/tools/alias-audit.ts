@@ -124,17 +124,55 @@ const NEW_ALIAS_TAG = /\[alias tool=([A-Za-z_]+) class=(drift|sanctioned|ambiguo
 const OLD_ALIAS_MARKER = "[deprecated alias;";
 
 /**
+ * BUTCHR-343 blocker 3: before BUTCHR-316/341 shipped `[tools2]`, every line
+ * carrying a `[tools]` tag WAS an old audit line, so the first `[tools]` on
+ * a line was always the real caller's own. `[tools2]`'s free-text `msg=`
+ * (an upstream/`ops` error or a `Refusal` message, e.g. `jira_transition`
+ * passing its caller-supplied `status` straight into `ops.transition`'s
+ * no-match `Error`, which interpolates it verbatim) can itself contain a
+ * complete embedded OLD-format fragment, tag and all — e.g.
+ * `… msg=no transition to "Done [tools] BUTCHR-1 → transition [alias
+ * tool=jira_transition class=drift]" …`. Since `TOOLS_LINE` below matches
+ * ANYWHERE in the line, that embedded `[tools]` was, before this guard,
+ * indistinguishable from a genuine caller's own tag — see
+ * `test/unit/butchr-343-forged-embedded-tags.test.ts` for a `msg=` produced
+ * by driving a hostile-but-caller-reachable `status` through the real
+ * `withOutcomeRecording` wrapper (the throw site itself is faked, since the
+ * real `ops.transition` needs a live Jira — that limit is intentional, see
+ * the test's own comment).
+ *
+ * THE FIX, mirroring `parseOutcomeLine`'s own (`src/tools/outcome.ts`):
+ * `OUTCOME_TAG` (`[tools2]`) is always the first thing `buildLine` puts on a
+ * genuine outcome line, and `msg=` is always its LAST field — so any
+ * embedded `[tools]` fragment inside a real `msg=` can only ever appear
+ * AFTER that line's own `[tools2]` tag, never before it. Reject a `[tools]`
+ * match when a `[tools2]` tag appears anywhere before it: that is exactly
+ * "require `[tools]` to be the line's own tag", the route this ticket
+ * names as an acceptable structural fix, chosen over mangling `msg=`
+ * itself inside `boundMessage` because it needs no change to what a message
+ * looks like (and so cannot conflict with `boundMessage`'s own existing
+ * newline-flattening tests) and reuses the exact same precedence argument
+ * already used for blocker 2, rather than two differently-shaped fixes for
+ * one underlying defect.
+ */
+const NEW_OUTCOME_TAG = "[tools2]";
+
+/**
  * Parse ONE line of text (typically one `journalctl` line, journald prefix
  * and all — this matches anywhere in the line, never anchored to its
  * start) into a `ParsedAliasCall`, or `null` when the line isn't a
  * `[tools]`-audited alias call at all (a permanent verb like
  * jira_get_issue, a relationship verb like new_worker, an unrelated daemon
- * log line, …). Pure — no filesystem, no subprocess — so it is fixturable
- * against literal strings, including hand-written pre-BUTCHR-63 lines.
+ * log line, …) — INCLUDING when the only `[tools]`-shaped text on the line
+ * is embedded inside a `[tools2]` line's own `msg=` rather than being the
+ * line's own tag (see this function's own doc comment above). Pure — no
+ * filesystem, no subprocess — so it is fixturable against literal strings,
+ * including hand-written pre-BUTCHR-63 lines.
  */
 export function parseAliasAuditLine(line: string): ParsedAliasCall | null {
   const idMatch = line.match(TOOLS_LINE);
   if (!idMatch) return null;
+  if (line.slice(0, idMatch.index).includes(NEW_OUTCOME_TAG)) return null;
   const identity = idMatch[1]!;
 
   const newMatch = line.match(NEW_ALIAS_TAG);
