@@ -1025,6 +1025,12 @@ export function startLoop(deps: LoopDeps): Stop {
     eventRules: createIssueEventRules({
       ...(deps.suppress ? { suppress: deps.suppress } : {}),
       ...(deps.comments ? { comments: deps.comments } : {}),
+      // BUTCHR-350: the SAME free-text channel `LoopDeps.log` already
+      // carries (e.g. the storm guard's WARNING) now also carries
+      // `[notify-suppressed]` lines — one log seam per test/caller, not two,
+      // and lets a test spy on `deps.log` to assert on suppression lines
+      // the same way it already can for every other daemon log line.
+      ...(deps.log ? { log: deps.log } : {}),
     }),
     spawnConfig: ISSUE_SPAWN_CONFIG,
   };

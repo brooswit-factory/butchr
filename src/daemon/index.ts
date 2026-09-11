@@ -729,6 +729,12 @@ const issueResourceType = createIssueResourceType({
   // stand-down gate (createIssueEventRules's decide()) to the SAME registry
   // `stand_down`'s tool handler declares into above.
   standDown: issueStandDown,
+  // BUTCHR-350: the SUPPRESSION side of the notify record — `[notify]`'s own
+  // sibling, `[notify-suppressed]`. Same `console.error` + two-space-indent
+  // convention as every other `log:` dep in this file (e.g. `runResourceLoop`
+  // below), so it reads as one stream in `journalctl` alongside `[notify]`,
+  // `[labels]`, `[reconcile]`, etc.
+  log: (line) => console.error(`  ${line}`),
 });
 
 runResourceLoop(issueResourceType, {

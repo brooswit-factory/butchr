@@ -64,7 +64,7 @@ describe("changeNudge", () => {
   });
 
   test("comment observed", () => {
-    expect(changeNudge("KAN-1", "KAN-1", { comment: true })).toBe("[butchr] Ticket KAN-1 got a new comment — re-read it.");
+    expect(changeNudge("KAN-1", "KAN-1", { comment: "c1" })).toBe("[butchr] Ticket KAN-1 got a new comment — re-read it.");
   });
 
   test("a pr reason passed through anyway (should never happen — pr renders via prReviewStateNudge) falls back honestly rather than mis-rendering", () => {
@@ -72,6 +72,18 @@ describe("changeNudge", () => {
     expect(changeNudge("KAN-1", "KAN-1", prReason)).toBe(
       "[butchr] Ticket KAN-1 was updated (reason not determinable from the poll) — re-read it.",
     );
+  });
+
+  // BUTCHR-350 (§3D): all three `undetermined` sub-reasons collapse to the
+  // SAME agent-facing sentence as a bare `undefined` — the finer distinction
+  // is operator-facing forensics (notifyReasonTag below), not something an
+  // agent acting on its own ticket needs.
+  test("undetermined (any sub-reason) falls back to the same honest sentence as no reason at all", () => {
+    for (const undetermined of ["unchecked", "check-failed", "checked-unchanged"] as const) {
+      expect(changeNudge("KAN-1", "KAN-1", { undetermined })).toBe(
+        "[butchr] Ticket KAN-1 was updated (reason not determinable from the poll) — re-read it.",
+      );
+    }
   });
 });
 
@@ -99,8 +111,36 @@ describe("notifyReasonTag", () => {
     expect(notifyReasonTag({ label: { prefix: "pr", from: null, to: "open" } })).toBe(" (pr:none→pr:open)");
   });
 
-  test("summary / comment", () => {
+  test("summary", () => {
     expect(notifyReasonTag({ summary: true })).toBe(" (summary changed)");
-    expect(notifyReasonTag({ comment: true })).toBe(" (comment)");
+  });
+
+  // BUTCHR-350 (§3D): `comment` now carries the actual moved-to id, rendered
+  // as `(comment:<id>)` — a SUPERSET of the old bare `(comment)` literal for
+  // any `grep '(comment'` (prefix) reader; see notifyReasonTag's own doc
+  // comment for why no separate tag is warranted for this additive change.
+  test("comment carries the moved-to comment id", () => {
+    expect(notifyReasonTag({ comment: "17072447" })).toBe(" (comment:17072447)");
+  });
+
+  // BUTCHR-350 (§3D): the three `undetermined` sub-reasons render as three
+  // DISTINCT, honest sentences — replacing the one collapsed "(reason: not
+  // determinable)" that used to cover all three facts (the defect this
+  // ticket's own §3(D) names). `reason: undefined` itself (a caller that
+  // never populates it, e.g. the project tier) is UNCHANGED — pinned above.
+  test("undetermined: three distinct, honest sub-reasons, none of them the bare undefined fallback text alone", () => {
+    expect(notifyReasonTag({ undetermined: "unchecked" })).toBe(" (reason: not determinable — comments not checked this poll)");
+    expect(notifyReasonTag({ undetermined: "check-failed" })).toBe(" (reason: could not check — comments fetch failed)");
+    expect(notifyReasonTag({ undetermined: "checked-unchanged" })).toBe(" (reason: not determinable — checked comments, unchanged)");
+    // Pairwise distinct, and distinct from the bare-undefined fallback —
+    // exactly the property §3(D) requires: a pending/unlooked-at reason
+    // must not render identically to a DIFFERENT fact.
+    const rendered = new Set([
+      notifyReasonTag(undefined),
+      notifyReasonTag({ undetermined: "unchecked" }),
+      notifyReasonTag({ undetermined: "check-failed" }),
+      notifyReasonTag({ undetermined: "checked-unchanged" }),
+    ]);
+    expect(rendered.size).toBe(4);
   });
 });
