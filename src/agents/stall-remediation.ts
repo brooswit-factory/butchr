@@ -206,7 +206,7 @@ const DEFAULT_TAIL = "This comment exists to wake this ticket's agent. If it is 
  * marker-at-body-start check and this module's fingerprint delimiter are
  * both unaffected by which branch fired.
  */
-function correctlyWaitingTail(callerKey: string, s: WorkerSignals): string {
+function correctlyWaitingTail(s: WorkerSignals): string {
   const clauses: string[] = [];
   if (s.unansweredAsks.length) {
     clauses.push(`${s.unansweredAsks.join(", ")} asked you something (an [ask] comment on its own ticket) that has no reply from you yet — answer it there with tell_worker, that is what it is waiting on.`);
@@ -230,7 +230,7 @@ function wakeComment(issue: string, elapsedMinutes: number, signals: WorkerSigna
     "",
     `fingerprint: ${issue}`,
     "",
-    hasAnySignal(signals) ? correctlyWaitingTail(issue, signals) : DEFAULT_TAIL,
+    hasAnySignal(signals) ? correctlyWaitingTail(signals) : DEFAULT_TAIL,
   ].join("\n");
 }
 
@@ -416,12 +416,29 @@ export interface StallRemediator {
  * shape, relationship.ts) is "answered" if any comment ABOVE it (more
  * recent, since `comments` is newest-first) starts with `[<stalledKey>] `
  * (tellWorker's own identity-tag shape) — a reply from THIS boss,
- * specifically. FAILURE MODE, STATED (per this ticket's own requirement): a
+ * specifically. FAILURE MODE 1, STATED (per this ticket's own requirement): a
  * worker that itself moves past its own question without this boss ever
  * replying (e.g. it found another way forward) still reads as "unanswered"
  * here — a false positive. Accepted deliberately: naming a stale question is
  * redundant at worst, never the harmful direction (a false "you are done or
  * stuck" or a false "you are correctly waiting") this ticket exists to stop.
+ *
+ * FAILURE MODE 2, STATED (found at review — an undisclosed blind window a
+ * green suite cannot see): `deps.comments` is wired to `AtlassianClient.
+ * comments()` (src/atlassian/client.ts), whose `maxResults` DEFAULTS to 20
+ * and is never overridden on this path (src/daemon/index.ts's wiring) — so
+ * this only ever sees a worker's 20 NEWEST comments, never the full history.
+ * An `[ask]` sitting behind 20 more recent comments on a busy worker ticket
+ * is INVISIBLE here: `askIdx` never finds it, and the wake silently falls
+ * back to today's default text — the exact founding shape scope (C) was
+ * built to catch (BUTCHR-316/BUTCHR-341), missed by this same rule, if the
+ * ask is old enough. STILL THE SAFE DIRECTION (under-reporting, never a
+ * false "correctly waiting") — DELIBERATELY NOT FIXED HERE: raising
+ * `maxResults`, paging, or adding a second read would disturb the cost bound
+ * this module states and pins elsewhere, which is out of scope for what
+ * found this. A reader debugging "the wake didn't name an ask I know is
+ * there" should check the worker ticket's own comment count FIRST, against
+ * this 20-comment window, before suspecting the rule above.
  */
 async function gatherWorkerSignals(deps: StallRemediationDeps, stalledKey: string, workers: readonly WorkerLink[] | undefined, log: (line: string) => void): Promise<WorkerSignals> {
   const nonDone = (workers ?? []).filter((w) => w.status !== "Done");
