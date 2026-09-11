@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createIssueEventRules, createIssueResourceType, ISSUE_ACTIVATION, ISSUE_JQL } from "../../src/resources/issue.js";
+import { standDownSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { createStandDownRegistry } from "../../src/agents/stand-down.js";
 import { createCrashLoopDetector } from "../../src/agents/crash-loop.js";
 import { desiredFrom, atRestFrom, runResourceLoop } from "../../src/daemon/loop.js";
@@ -107,7 +108,8 @@ describe("BUTCHR-307 DoD 3(f): the agent's OWN last writes (report_to_boss/tell_
     const sd = newRegistry();
     // stand_down runs AFTER the agent's own report_to_boss/tell_worker write, so its snapshot already includes comment 101.
     sd.standDown("KAN-1", new Map([["KAN-1", ["100", "101"]]]));
-    const rules = createIssueEventRules({ comments: store.comments, standDown: sd });
+    const lines: string[] = [];
+    const rules = createIssueEventRules({ comments: store.comments, standDown: sd, log: (l) => lines.push(l) });
 
     const before = issue({ updated: "2026-01-01T00:00:00.000Z" });
     const after = issue({ updated: "2026-01-01T00:05:00.000Z" }); // the foreign write's own `updated` bump — no status/label/summary diff at all
@@ -118,6 +120,12 @@ describe("BUTCHR-307 DoD 3(f): the agent's OWN last writes (report_to_boss/tell_
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
     expect(verdict.deliver).toBe(false); // no unseen comment id -> gated
     expect(sd.isAsleep("KAN-1")).toBe(true); // still asleep — never woken
+    // BUTCHR-350 (§3A, arm 4): this IS the stand-down gate's own genuine
+    // suppression of an observed change — logged unconditionally (unlike
+    // arms 2/3, see suppressed-log.ts's own top comment). Pinned against
+    // the real emitter (src/jira-watch/suppressed-log.ts), not a
+    // hand-written string.
+    expect(lines).toEqual([standDownSuppressedLine("KAN-1", "KAN-1", 2)]);
   });
 
   test("a pr:* review-state transition wakes unconditionally, with no comment involved and no seen-set check at all (contrast case)", async () => {
