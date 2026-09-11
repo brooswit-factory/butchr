@@ -10,7 +10,8 @@ import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import type { AdmissionView, DashboardResponse } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
@@ -131,6 +132,99 @@ describe("butchr webapp + open action", () => {
   });
 });
 
+// BUTCHR-344: the shared fixture app's `noDashboard` above always uses
+// `rows: []`, so neither href closure in `src/web/view.ts`'s `/` route
+// (`terminalLinkHref`/`resourceLinkHref`), nor its `now: Date.now()` wiring,
+// ever runs against a real row in this file's other tests — that's also
+// this route's own function-coverage gap. This describe block drives a
+// NON-EMPTY dashboard (one issue-tier row, one project-tier row) through a
+// real, listening app, reads each row's own href OUT OF THE SERVED HTML, and
+// fetches it back through the SAME app — never a hardcoded, presumed-correct
+// href string — so a wrong href (L4, R7) or a wrong clock (A2) actually
+// fails this test instead of one that only re-asserts what the route is
+// supposed to do.
+function rowSlice(html: string, resourceKey: string): string {
+  const marker = `<span class="key">${resourceKey}</span>`;
+  const start = html.indexOf(marker);
+  if (start === -1) throw new Error(`expected to find a row for resourceKey ${JSON.stringify(resourceKey)}`);
+  const nextStart = html.indexOf('<span class="key">', start + marker.length);
+  return html.slice(start, nextStart === -1 ? html.length : nextStart);
+}
+
+describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/href wiring end-to-end", () => {
+  test("the page's age is derived from the row's own confirmedAt (kills A2), each row's own terminal/resource links, read from the served HTML, actually work when fetched back (kills L4/R7), and the real header() is what's actually served (kills V1)", async () => {
+    // The poll that "produced" this snapshot happened 65s before this
+    // request — enough for humanDuration to round into the "1m" bucket
+    // (60-119s) regardless of a few seconds of test overhead, and never "0s"
+    // (which is what A2's mutated clock — dating the page against its OWN
+    // confirmedAt/declinedAt instead of the real request time — would always
+    // render, no matter how old the row actually is).
+    const pollTime = Date.now() - 65_000;
+    const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
+    const rows = buildDashboardRows(
+      [
+        { name: "butchr-butchr-1", agent_status: "working", pane_id: "w1:p3" }, // issue-tier row
+        { name: "butchr-butchr", agent_status: "idle", pane_id: "p2" }, // project-tier row
+      ],
+      { now: () => pollTime, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => pollTime) },
+    );
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(pollTime).toISOString(), rows, admission: noAdmissionView };
+    // Distinct, clearly-shaped targets so a mismatch (e.g. the project row
+    // 302ing to the issue row's Jira url) is unambiguous.
+    const resourceLink = async (key: string) => {
+      if (key === "BUTCHR-1") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/BUTCHR-1" };
+      if (key === "BUTCHR") return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
+      return { ok: false as const, error: `unexpected resource key ${key}` };
+    };
+    // BUTCHR-344 [correction] (V1): a REAL header — distinct from every other
+    // fixture in this file (all of which use `noHeader`'s `sha: null`, so
+    // they can never tell a real header from `{ build: null }`). Asserts the
+    // sha and the stale-currency line the route is supposed to pass through
+    // from `deps.header()` actually reach the served page.
+    const header = (): DashboardHeaderInfo => ({
+      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" },
+      currency: {
+        checkedAt: new Date(pollTime).toISOString(),
+        verdict: { status: "stale", commitsBehind: 5, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
+      },
+    });
+    const { app } = buildApp({ ...view, dashboard: async () => response, resourceLink, header });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const html = await (await fetch(`${b}/`)).text();
+
+      expect(html).toContain("1m ago");
+      expect(html).toContain("e".repeat(8)); // the real header's own sha, never "build sha unknown"
+      expect(html).toContain("behind by 5"); // the real header's own stale currency verdict
+      expect(html).not.toContain("build sha unknown");
+
+      const issueRow = rowSlice(html, "BUTCHR-1");
+      const projectRow = rowSlice(html, "BUTCHR");
+
+      const terminalHrefMatch = issueRow.match(/href="([^"]+)">open terminal</);
+      if (!terminalHrefMatch) throw new Error("expected a terminal link in the issue row's own HTML");
+      const terminalRes = await fetch(`${b}${terminalHrefMatch[1]}`);
+      expect(terminalRes.status).toBe(200);
+      expect(await terminalRes.text()).toContain("launched a terminal for w1:p3");
+
+      const issueResourceHrefMatch = issueRow.match(/href="([^"]+)">resource</);
+      const projectResourceHrefMatch = projectRow.match(/href="([^"]+)">resource</);
+      if (!issueResourceHrefMatch || !projectResourceHrefMatch) throw new Error("expected a resource link in both rows' own HTML");
+
+      const issueRedirect = await fetch(`${b}${issueResourceHrefMatch[1]}`, { redirect: "manual" });
+      expect(issueRedirect.status).toBe(302);
+      expect(issueRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/BUTCHR-1");
+
+      const projectRedirect = await fetch(`${b}${projectResourceHrefMatch[1]}`, { redirect: "manual" });
+      expect(projectRedirect.status).toBe(302);
+      expect(projectRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview");
+    } finally {
+      app.stop();
+    }
+  });
+});
+
 // BUTCHR-269: /dashboard is a POLL-FED SNAPSHOT — the route does no I/O of
 // its own, it just returns whatever `dashboard()` currently resolves to.
 // Every test below simulates the real production shape (src/daemon/
@@ -246,6 +340,14 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
     // was attempted, since the spawn is fire-and-forget.
     expect(body).toContain("w1:p3");
     expect(body).not.toMatch(/window (appeared|opened)/);
+    // BUTCHR-344 (L1): pin the fire-and-forget WORDING itself, not just the
+    // absence of "window (appeared|opened)" — "opened a terminal window for
+    // w1:p3" matches neither alternative in that regex, so it would still
+    // pass the check above while quietly turning a launch into a
+    // confirmation. This exact phrase is what the route actually promises.
+    expect(body).toContain("launched a terminal for w1:p3");
+    expect(body).toContain("fire-and-forget");
+    expect(body).not.toMatch(/opened a terminal window/i);
     expect(openedPanes).toContain("w1:p3");
   });
   test("a colon-bearing pane id survives the route unmangled — criterion 1", async () => {

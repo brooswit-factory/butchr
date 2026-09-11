@@ -158,6 +158,16 @@ describe("renderDashboard: mutation 1 — could-not-check rendered like known (t
     // the carried-forward row must read STALE, never as a fresh confirmation
     expect(html).toContain('class="conf cnc"');
     expect(html).not.toContain('class="conf known"');
+    // BUTCHR-344 (A4): the class alone doesn't pin the badge's own WORDING —
+    // scope to the carried-forward row's own freshness element and assert
+    // its required text: "at least X" (never a bare age, which is what
+    // dropping the "at least " prefix would leave behind) and "as of
+    // <its own confirmedAt>" (the row's OWN timestamp, from the poll at
+    // now:1000, not the response-level declinedAt).
+    const staleConfText = elementText(html, 'class="conf cnc"', "</span>");
+    expect(staleConfText).toContain("at least");
+    expect(staleConfText).toContain("as of");
+    expect(staleConfText).toContain(new Date(1000).toISOString());
   });
 
   test("1b. a row's issuetype: an unavailable issuetype renders the cnc tier marker, never the plain known styling", () => {
@@ -477,11 +487,21 @@ describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
     const html = renderDashboard(response, opts({ header: { build, currency: { checkedAt: new Date(1000).toISOString(), verdict: { status: "current", base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false } } }, now: 1000 }));
     expect(html).toContain("currency: current");
     expect(html).not.toMatch(/hdrline build cnc|hdrline cnc/);
+    // BUTCHR-344 (C2b): the opening tag itself must be EXACTLY this literal
+    // — no inline style riding along beside the class. A class-only check
+    // (or a regex rejecting one specific class spelling) still lets an
+    // INLINE `style="color:#f85149;..."` through, because that's a
+    // different attribute, not a different class.
+    expect(html).toContain('<div class="hdrline build">');
   });
 
   test("stale with commitsAhead exactly 0: renders 'behind by N'", () => {
     const html = renderDashboard(response, opts({ header: { build, currency: { checkedAt: new Date(0).toISOString(), verdict: { status: "stale", commitsBehind: 42, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false } } } }));
     expect(html).toContain("behind by 42");
+    // BUTCHR-344 (C2b): pin class+style together for the STALE verdict too —
+    // this is the exact verdict the epic's own C2b mutation targets (an
+    // inline `style="color:#f85149;font-weight:700"` on a stale header).
+    expect(html).toContain('<div class="hdrline build">');
   });
 
   test("stale with commitsAhead null: NEVER 'behind' — renders diverged/undetermined instead (the field's own documented rule)", () => {
@@ -501,6 +521,10 @@ describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
     expect(html).toContain("could not determine — no local base ref");
     expect(html).toContain("never computed yet");
     expect(html).not.toContain("currency: current");
+    // BUTCHR-344 (C2b): and the UNKNOWN verdict too — the ticket's own
+    // instruction names current, stale, AND unknown as the three verdicts
+    // this exact opening tag must be pinned for.
+    expect(html).toContain('<div class="hdrline build">');
   });
 });
 
@@ -523,5 +547,220 @@ describe("renderDashboard: a response mixing agent and withheld rows renders bot
     expect(html).toContain("waiting for a slot");
     // the withheld row has no pane -> no terminal link for BUTCHR-2 specifically
     expect(html).not.toContain(`/agents/pane/${encodeURIComponent("BUTCHR-2")}/attach`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 (K5): a could-not-check residency (no trusted census yet) must
+// never render as an ordinary known number in the admission cap line — the
+// shared NO_ADMISSION fixture used everywhere else in this file has
+// `residency: null` but nothing above ever asserts on that slot at all.
+// Driven by the REAL createAdmissionController (never a hand-typed
+// AdmissionView), whose `census()` reports `residency: null` before any
+// `admit()` call ever lands — a genuine "no trusted census yet" producer.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: residency's could-not-check case is never rendered as a known number (BUTCHR-344, review gap K5)", () => {
+  test("a fresh admission controller (no admit() call yet) renders could-not-check in the .admcap element, with no number in the residency slot", () => {
+    const controller = createAdmissionController({ cap: 5, residency: async () => [] });
+    const census = controller.census();
+    expect(census.residency).toBeNull(); // sanity: this producer really is in the could-not-check state
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const admcapText = elementText(html, 'class="admcap"', "</div>");
+    expect(admcapText.toLowerCase()).toContain("could not check");
+    // never the known-value span, and never a bare digit standing in for the
+    // unresolved residency (the K5 mutation renders `admission.cap`, e.g.
+    // "5", in the residency slot instead)
+    expect(admcapText).not.toMatch(/residency: <span class="known">/);
+    expect(admcapText).not.toMatch(/residency:\s*\d/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (X6): the OPPOSITE gap from K5 — a KNOWN, non-null
+// residency must actually appear in the .admcap line at all. Dropping the
+// whole " · residency: ..." segment leaves the rest of the suite green,
+// because K5 only asserts on the could-not-check wording, never that a real,
+// trusted residency count is rendered anywhere. Driven by a REAL
+// createAdmissionController with an actual admit() call, so `census().residency`
+// is a genuine trusted number, never a hand-typed one.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a known, non-null residency actually appears in .admcap — dropping the whole segment must fail (BUTCHR-344 [correction], review item X6)", () => {
+  test("a trusted residency count renders in the admission cap line", async () => {
+    const controller = createAdmissionController({ cap: 10, residency: async () => ["a", "b", "c"] });
+    await controller.admit([], [], "issue");
+    const census = controller.census();
+    expect(census.residency).toBe(3); // sanity: a real, known, non-null residency
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const admcapText = elementText(html, 'class="admcap"', "</div>");
+    expect(admcapText).toContain("residency:");
+    expect(admcapText).toContain("3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (X2): the not-applicable marker's own TITLE must
+// carry the row's REAL reason, never a generic string. Deliberately scoped
+// down from an earlier (wrong) characterization: `renderNotApplicable`'s
+// VISIBLE text ("no agent — n/a") is unconditional and is not itself part of
+// this assertion — only the tooltip (`title` attribute) is under test here.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the not-applicable marker's own title carries its real reason (BUTCHR-344 [correction], review item X2)", () => {
+  test("a withheld row's .na title attribute is its own agentFields.reason, not a generic string", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
+    await controller.admit(["BUTCHR-3"], [], "issue");
+    const census = controller.census();
+    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
+    expect(withheldRows).toHaveLength(1);
+    const reason = withheldRows[0]!.agentFields.reason;
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const titleMatch = html.match(/<span class="na" title="([^"]+)">/);
+    if (!titleMatch) throw new Error("expected a .na element with a title attribute");
+    expect(titleMatch[1]).toBe(reason);
+    expect(titleMatch[1]).not.toBe("could not check");
+    // deliberately NOT a conflation test (BUTCHR-344 [correction]): the
+    // visible text stays unconditional regardless of the title's content.
+    expect(elementText(html, 'class="na"', "</span>")).toBe("no agent — n/a");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (F1): deleting the auto-refresh meta tag leaves the
+// page's VISIBLE TEXT identical (the hint still promises "refreshes every
+// Ns"), so a strip-tags-and-compare check would NOT catch this one — it is a
+// behaviour change (the browser never reloads) with no visible-text
+// difference. Assert the tag is PRESENT and that its interval is COUPLED to
+// the hint's own stated number — two independent assertions would let the
+// two drift apart silently, which is the same defect one level down.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the auto-refresh meta tag is present and coupled to the hint's stated interval (BUTCHR-344 [correction], review item F1)", () => {
+  test("the <meta http-equiv=refresh> tag exists and its interval equals the number the hint states", () => {
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts({ refreshSeconds: 7 }));
+    const metaMatch = html.match(/<meta http-equiv="refresh" content="(\d+)">/);
+    if (!metaMatch) throw new Error("expected an auto-refresh meta tag");
+    const hintText = elementText(html, 'class="hint"', "</div>");
+    const hintMatch = hintText.match(/refreshes every (\d+)s/);
+    if (!hintMatch) throw new Error("expected the hint to state its own refresh interval");
+    expect(metaMatch[1]).toBe(hintMatch[1]);
+    expect(metaMatch[1]).toBe("7");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (H1): the currency verdict must carry its own AGE,
+// not just the word "checked" — BUTCHR-266's own criterion asks for currency
+// WITH its age, and no existing currency test asserted the age text at all.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the currency line carries its own age, never a bare 'checked' (BUTCHR-344 [correction], review item H1)", () => {
+  test("a known checkedAt/now renders 'checked <age> ago', not a bare 'checked'", () => {
+    const build = { sha: "d".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0" };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(
+      response,
+      opts({
+        header: {
+          build,
+          currency: {
+            checkedAt: new Date(1000).toISOString(),
+            verdict: { status: "current", base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
+          },
+        },
+        now: 1000 + 65_000,
+      }),
+    );
+    expect(html).toContain("(checked 1m ago)");
+    expect(html).not.toContain("(checked)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (Y2): a DECLINED census source's own entry must
+// carry the could-not-check CLASS, never the known one — the page's own
+// stylesheet carries BOTH `.admsrc.cnc{color:#f0b429}` (amber) and
+// `.admsrc.known{color:#3fb950}` (GREEN), so swapping just the class (text
+// left untouched) paints a could-not-check source in the success colour.
+// This is the exact inverse of a mutation that keeps the class and changes
+// the text: here the words still say "COULD NOT CHECK" but the colour lies.
+// A sibling assertion that a CHECKED source still carries `known` guards
+// against the swap going the other way too.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a declined census source's own entry carries the could-not-check class, never the known class (BUTCHR-344 [correction], review item Y2)", () => {
+  test("a declined source renders admsrc cnc (never admsrc known); a checked source renders admsrc known (never admsrc cnc)", async () => {
+    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue", "project"] });
+    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked; "project" never reports -> declined
+    const census = controller.census();
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    expect(html).toMatch(/class="admsrc cnc" data-source="project"/);
+    expect(html).not.toMatch(/class="admsrc known" data-source="project"/);
+    expect(html).toMatch(/class="admsrc known" data-source="issue"/);
+    expect(html).not.toMatch(/class="admsrc cnc" data-source="issue"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 (L5): the hint's own wording — nothing else on this page reads
+// it, so a mutation that quietly over-claims ("opens a terminal window for
+// that agent", stated as a plain fact) survives unless something is scoped
+// to `.hint` itself.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the hint's own wording, scoped to .hint (BUTCHR-344, review gap L5)", () => {
+  test("the hint states the terminal link is fire-and-forget (attaches, not a confirmed 'opens' claim)", () => {
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    const hintText = elementText(html, 'class="hint"', "</div>");
+    expect(hintText).toContain("attaches a terminal to that agent");
+    expect(hintText).toContain("fire-and-forget");
+    expect(hintText).not.toMatch(/opens a terminal window/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 (P3): a withheld row must never carry a terminal link at all —
+// scoped to the withheld row's OWN html, not merely "the one specific href
+// this fixture happens to produce" (the pre-existing structural test above
+// only rejects `/agents/pane/BUTCHR-2/attach`, which no plausible bug would
+// literally produce for a withheld row that has no pane in the first place).
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a withheld row never gains a terminal link, scoped to its own HTML (BUTCHR-344, review gap P3)", () => {
+  test("a withheld row's own rendered HTML contains neither 'open terminal' nor '/attach' anywhere in it", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
+    await controller.admit(["BUTCHR-2"], [], "issue");
+    const census = controller.census();
+    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
+    expect(withheldRows).toHaveLength(1);
+    // The only row in this response, so the `#rows` container's own content
+    // IS this withheld row's own HTML, start to finish.
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const rowsStart = html.indexOf('<div id="rows">') + '<div id="rows">'.length;
+    const hintStart = html.indexOf('<div class="hint">');
+    const rowHtml = html.slice(rowsStart, hintStart);
+    expect(rowHtml).toContain('class="row withheld"');
+    expect(rowHtml).not.toContain("open terminal");
+    expect(rowHtml).not.toContain("/attach");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 (E1): `esc()` is exercised elsewhere only with panes that need
+// no escaping at all ("w1:p3"), so a broken `esc()` that returns its input
+// unchanged still passes every existing assertion. This drives a pane
+// containing '<', '&', and '"' through the REAL buildDashboardRows and
+// checks the `.pane` element's RAW HTML is the fully-escaped form.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: esc() actually escapes, verified with a pane containing characters that need it (BUTCHR-344, review gap E1)", () => {
+  test("a pane containing '<', '&', and '\"' renders as escaped text inside the .pane element's raw HTML", () => {
+    const pane = `<img src=x onerror=alert(1)>&"'`;
+    const rows = buildDashboardRows([agent("butchr-butchr-1", "working", pane)], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    const paneHtml = elementText(html, 'class="pane"', "</span>");
+    expect(paneHtml).toBe("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;");
+    // the raw '<'/'>' must never survive unescaped — that would open a real tag
+    expect(paneHtml).not.toContain("<img");
   });
 });
