@@ -489,8 +489,8 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // doc comment for why this must be `admitted` minus only the `"spawn"`-
   // staged failures just collected above (never a `"respawn"`-staged one,
   // which is a different code path entirely, appended to `failures` further
-  // below). Computed even when `opts.onAdmitted` is absent costs nothing
-  // this function doesn't already have in scope.
+  // below). Only computed when `opts.onAdmitted` is actually present —
+  // there is no ledger anywhere to report to otherwise.
   if (opts.onAdmitted) {
     const failedSpawnIds = new Set(failures.filter((f) => f.stage === "spawn").map((f) => f.id));
     opts.onAdmitted(admitted.filter((id) => !failedSpawnIds.has(id)));

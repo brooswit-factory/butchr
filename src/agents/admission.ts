@@ -414,7 +414,17 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     }
 
     lastTrusted = observed;
-    if (candidates.length === 0) return candidates;
+    // Review fix (round 1): an empty candidate list means nothing is
+    // withheld, full stop — `lastWithheld` must say so too, or a candidate
+    // that leaves `desired` WITHOUT ever being admitted (ticket closed,
+    // moved out of an active status, mid-withholding) leaves `/health`
+    // reporting it as the longest-waiting one forever, since nothing else
+    // ever recomputes `lastWithheld` once its own candidate list goes
+    // empty. This does NOT touch the wait ledger (`waits`/`lastSeenCall`/
+    // `callCount` are untouched below, same as before) and does not
+    // violate B3 — B3 is about the ledger, and both fail-safe paths return
+    // earlier than this line already.
+    if (candidates.length === 0) { lastWithheld = []; return candidates; }
     callCount++;
     // BUTCHR-297: order BEFORE slicing — see this file's own top-comment
     // addendum for why aging lives here and why the tie-break reproduces

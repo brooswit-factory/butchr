@@ -287,6 +287,24 @@ describe("B3 — the two fail-safe paths never touch the wait ledger either", ()
   });
 });
 
+describe("/health's longestWait must not go stale (review round 1 finding)", () => {
+  test("a withheld candidate that leaves `desired` WITHOUT ever being admitted (ticket closed mid-withholding) is no longer reported as waiting once the candidate list goes empty", async () => {
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["R1"] }); // saturated — nothing is ever actually admitted from an empty residency drop
+    await ctrl.admit(["A"], []); // A withheld -> wait 1
+    await ctrl.admit(["A"], []); // A withheld again -> wait 2
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "A", polls: 2 });
+
+    // A's ticket closes (or leaves the active statuses) before it was ever
+    // admitted — it simply stops appearing in ANY candidate list at all.
+    await ctrl.admit([], []);
+    // An empty candidate list means nothing is withheld, full stop — the
+    // wait ledger itself is untouched (A's entry still exists, same as any
+    // other unseen-but-not-yet-evicted key — see B2), but `/health` must
+    // not go on reporting a candidate nobody is even asking about anymore.
+    expect(ctrl.snapshot().longestWait).toBeNull();
+  });
+});
+
 describe("B2 — the ledger is bounded, but not so tightly it can expire an entry between spawn retries (BUTCHR-297)", () => {
   test("unseen for fewer calls than the bound: the accumulated wait survives intact", async () => {
     const depsObj = { cap: 0, residency: async () => [] as readonly string[] };
