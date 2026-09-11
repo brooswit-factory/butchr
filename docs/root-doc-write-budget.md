@@ -215,6 +215,18 @@ This table answers BUTCHR-232's blast-radius question as "which projects are
 pinned the moment this merges," not "should the bound be widened" — that
 question is already decided at the epic level.
 
+**BUTCHR's own row has since moved, and this is expected, not a correction to
+the table above.** BUTCHR-249's split landed after this table was measured;
+the live BUTCHR root doc read at 52,301 characters shortly after the split
+(the epic's own measurement) and at 57,791 characters later the same
+session (this ticket's own re-check, under "Re-checking the budget" below) —
+the page is under active edit and both are snapshots, not disagreements.
+**The conclusion this table exists to support is unchanged either way: BUTCHR
+is still over the 50,000 budget and still pinned at merge time**, correctable
+and shrinkable, never bricked. The other ten rows were not re-measured for
+this update — nothing in this PR's later rounds touched them, and the split
+was BUTCHR-specific.
+
 ## The residual limit on any content-based comparison on this surface — MEASURED live in review, and fixed
 
 This bound turns on a **size** comparison, never a content comparison — it
@@ -303,17 +315,93 @@ table's exact size (252) and a set of representative rows — including every
 character either review round named — so a bad regeneration (wrong source,
 a parser bug, a truncated fetch) fails loudly instead of drifting silently.
 
-**What this closes, and what it still does not.** This closes the
-character-substitution residual EXACTLY, per the measured rule above — not
-an approximation this time, an exact model of it, confirmed against 37
-characters with zero exceptions in either direction. **It does not claim
-anything about BUTCHR-235's separate, still-unresolved caution** — attribute
-ordering, whitespace handling, self-closing tag forms and empty-element
-normalisation were never tested by either ticket, and a transform of THAT
-kind (not a character substitution) would still be invisible to this size
-comparison. This bound turns on size, not content, precisely because that
-residual is real; closing the character-substitution instance of it does
-not retire the broader caution.
+**What round 2's fix closed, and what it still did not.** It closed the
+character-substitution residual against a 37-character probe with zero
+exceptions — but every one of those 37 characters was, by the probing
+reviewer's own later correction, above U+007F (non-ASCII). The rule as
+stated — "encodes iff it has an HTML4 named entity" — was true of every
+character actually tested and still over-generalised, because 4 of HTML4's
+252 named entities are ASCII: `"` (quot), `&` (amp), `<` (lt), `>` (gt).
+
+**Third review round measured why those four are different, and it matters:
+Confluence's storage format IS XHTML.** `<`, `>`, `&` and `"` appearing in a
+stored body are that format's OWN MARKUP SYNTAX — the brackets of a `<p>`
+tag, the quotes around an `href` attribute, the leading `&` of an entity
+reference already present — not content the storage layer re-encodes.
+Measured directly: a real 54,824-character stored body containing 160
+literal `&`, 953 literal `<`, 953 literal `>` and 30 literal `"` round-tripped
+byte-identical (zero diff opcodes) on its last write. Running round 2's own
+(then-unfixed) estimator against three real, currently-stored pages showed
+the cost concretely — 12–14% phantom inflation on ordinary storage-markup
+bodies, including one **genuinely under-budget page it scored as over**:
+exactly the false-refusal failure mode this whole design exists to prevent,
+now happening to a real page because of this bound's own estimator.
+
+**Fix:** `scripts/vendor/html4-entities.ts` now excludes those 4 codepoints
+by construction — not by hand-editing the `GENERATED` table (the exclusion
+lives in the generator, with an explicit check that exactly 4 were found and
+removed, so a future spec fetch can't silently re-include or over-exclude
+them) — regenerating `html4-named-entities.generated.ts` to 248 entries. The
+remaining 248 were checked for the same kind of storage-syntax significance
+(the generator's own header comment has the reasoning: no other ASCII
+delimiter Confluence's storage XML depends on — `'`, `=`, `/`, `;` — is even
+an HTML4 named entity, so none of them could have been in this table
+regardless) and found clean.
+
+**Also corrected: a backwards polarity claim.** An earlier version of
+`estimateStoredLength`'s doc comment said over-estimating could "never
+manufacture a false refusal", reasoning that lengthening (never shrinking) a
+body was inherently safe. That is wrong, and this bug is the proof: an
+over-estimate is not a safe conservative bias here, it is the SAME failure
+this design exists to avoid, just approached from the opposite direction —
+locking the writing tier out of a page it is entitled to write is exactly as
+real a defect as letting an over-budget page grow. Correctness means neither
+direction of error, not merely "never shrinks."
+
+`test/unit/docs.test.ts` gained a regression arm using realistic storage
+markup (a `<p>` tag, a quoted `href`, an already-present `&mdash;` entity) —
+genuinely under budget in raw form, verified by hand to fail against the
+round-2 table and pass against this one. `test/unit/html4-named-entities.test.ts`
+pins the new 248 count and asserts all four excluded codepoints are absent.
+
+**What this closes, and what it still does not.** Three rounds in, this
+closes the character-substitution residual exactly for NON-ASCII content
+characters, while correctly leaving Confluence's own storage-format markup
+syntax alone — an exact model of the measured transform, not an
+approximation. **It does not claim anything about BUTCHR-235's separate,
+still-unresolved caution** — attribute ordering, whitespace handling,
+self-closing tag forms and empty-element normalisation were never tested by
+either ticket, and a transform of THAT kind (not a character substitution)
+would still be invisible to this size comparison. This bound turns on size,
+not content, precisely because that residual is real; closing the
+character-substitution instance of it does not retire the broader caution.
+
+## Re-checking the budget after the phantom inflation and after BUTCHR-249's split
+
+Round 3's reviewer asked, correctly, whether `DOC_BODY_CHAR_BUDGET = 50_000`
+still stands once the ~12–14% phantom inflation is gone, and against the
+corpus as it exists after BUTCHR-249's split landed (merged into this
+branch's base as of the merge commit bringing BUTCHR-235/236 in too).
+
+**It stands, unchanged, and the phantom inflation never actually bore on its
+derivation.** The 50,000 figure was derived from `docs/tool-result-size-cap.md`'s
+directly-measured (56,239, 61,376] PREVIEW/ERROR bracket — real MCP result
+sizes observed by the harness — with margin for whole-result envelope
+overhead and the bracket's own imprecision. None of that measurement ever
+passed through `estimateStoredLength`; the phantom inflation was a bug in
+how THIS bound's own guard judged a write's size, not a re-derivation of the
+underlying cap experiment. Fixing the guard's estimator doesn't move a
+number that was never computed by it.
+
+**Re-measured against the live, post-split corpus (2026-09-10, this
+session):** BUTCHR's root doc, after BUTCHR-249's split landed, reads at
+**57,791 characters** via `get_doc` — still over the 50,000 budget (the
+epic's own agent separately measured it at 52,301 characters earlier the
+same day; the page is under active edit and both readings are consistent
+with "still over budget," which is the only fact this re-check needed).
+**BUTCHR remains pinned at merge time** — correctable and shrinkable, never
+bricked, exactly as designed — and the split having landed does not change
+that conclusion or the budget number.
 
 ## Read this next to `docs/tool-result-size-cap.md`
 
