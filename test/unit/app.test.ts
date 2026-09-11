@@ -152,7 +152,7 @@ function rowSlice(html: string, resourceKey: string): string {
 }
 
 describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/href wiring end-to-end", () => {
-  test("the page's age is derived from the row's own confirmedAt (kills A2), and each row's own terminal/resource links, read from the served HTML, actually work when fetched back (kills L4/R7)", async () => {
+  test("the page's age is derived from the row's own confirmedAt (kills A2), each row's own terminal/resource links, read from the served HTML, actually work when fetched back (kills L4/R7), and the real header() is what's actually served (kills V1)", async () => {
     // The poll that "produced" this snapshot happened 65s before this
     // request — enough for humanDuration to round into the "1m" bucket
     // (60-119s) regardless of a few seconds of test overhead, and never "0s"
@@ -176,13 +176,28 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
       if (key === "BUTCHR") return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
       return { ok: false as const, error: `unexpected resource key ${key}` };
     };
-    const { app } = buildApp({ ...view, dashboard: async () => response, resourceLink });
+    // BUTCHR-344 [correction] (V1): a REAL header — distinct from every other
+    // fixture in this file (all of which use `noHeader`'s `sha: null`, so
+    // they can never tell a real header from `{ build: null }`). Asserts the
+    // sha and the stale-currency line the route is supposed to pass through
+    // from `deps.header()` actually reach the served page.
+    const header = (): DashboardHeaderInfo => ({
+      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" },
+      currency: {
+        checkedAt: new Date(pollTime).toISOString(),
+        verdict: { status: "stale", commitsBehind: 5, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
+      },
+    });
+    const { app } = buildApp({ ...view, dashboard: async () => response, resourceLink, header });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
       const html = await (await fetch(`${b}/`)).text();
 
       expect(html).toContain("1m ago");
+      expect(html).toContain("e".repeat(8)); // the real header's own sha, never "build sha unknown"
+      expect(html).toContain("behind by 5"); // the real header's own stale currency verdict
+      expect(html).not.toContain("build sha unknown");
 
       const issueRow = rowSlice(html, "BUTCHR-1");
       const projectRow = rowSlice(html, "BUTCHR");

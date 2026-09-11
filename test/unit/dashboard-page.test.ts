@@ -627,6 +627,56 @@ describe("renderDashboard: the not-applicable marker's own title carries its rea
 });
 
 // ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (F1): deleting the auto-refresh meta tag leaves the
+// page's VISIBLE TEXT identical (the hint still promises "refreshes every
+// Ns"), so a strip-tags-and-compare check would NOT catch this one — it is a
+// behaviour change (the browser never reloads) with no visible-text
+// difference. Assert the tag is PRESENT and that its interval is COUPLED to
+// the hint's own stated number — two independent assertions would let the
+// two drift apart silently, which is the same defect one level down.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the auto-refresh meta tag is present and coupled to the hint's stated interval (BUTCHR-344 [correction], review item F1)", () => {
+  test("the <meta http-equiv=refresh> tag exists and its interval equals the number the hint states", () => {
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts({ refreshSeconds: 7 }));
+    const metaMatch = html.match(/<meta http-equiv="refresh" content="(\d+)">/);
+    if (!metaMatch) throw new Error("expected an auto-refresh meta tag");
+    const hintText = elementText(html, 'class="hint"', "</div>");
+    const hintMatch = hintText.match(/refreshes every (\d+)s/);
+    if (!hintMatch) throw new Error("expected the hint to state its own refresh interval");
+    expect(metaMatch[1]).toBe(hintMatch[1]);
+    expect(metaMatch[1]).toBe("7");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (H1): the currency verdict must carry its own AGE,
+// not just the word "checked" — BUTCHR-266's own criterion asks for currency
+// WITH its age, and no existing currency test asserted the age text at all.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the currency line carries its own age, never a bare 'checked' (BUTCHR-344 [correction], review item H1)", () => {
+  test("a known checkedAt/now renders 'checked <age> ago', not a bare 'checked'", () => {
+    const build = { sha: "d".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0" };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(
+      response,
+      opts({
+        header: {
+          build,
+          currency: {
+            checkedAt: new Date(1000).toISOString(),
+            verdict: { status: "current", base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
+          },
+        },
+        now: 1000 + 65_000,
+      }),
+    );
+    expect(html).toContain("(checked 1m ago)");
+    expect(html).not.toContain("(checked)");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BUTCHR-344 (L5): the hint's own wording — nothing else on this page reads
 // it, so a mutation that quietly over-claims ("opens a terminal window for
 // that agent", stated as a plain fact) survives unless something is scoped
