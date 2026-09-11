@@ -6,6 +6,8 @@ import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { StatusFloorTracker } from "../agents/status-floor.js";
+import { buildDashboardRows, DASHBOARD_DETECTOR, type IssueMeta, type DashboardResponse, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
@@ -60,7 +62,30 @@ const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassia
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
-const summaries = new Map<string, string>();
+// BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
+// `issuetype` is a declared field on every `JiraIssue` the issue loop's
+// `search()` already returns on every poll (src/atlassian/types.ts) and was
+// simply being thrown away here; retaining it alongside `summary` is what
+// lets /dashboard's tier field distinguish epic/story/task WITHOUT a second
+// Jira call. A key genuinely absent from this map (a fresh daemon before its
+// first search lands, or a key that dropped out of the search while its
+// agent is still winding down) must read as "could not check the tier", not
+// as a guessed default — see src/agents/dashboard.ts's own header.
+const issueMeta = new Map<string, IssueMeta>();
+// BUTCHR-269: the dashboard's own "time in current agent_status" floor — see
+// src/agents/status-floor.ts for why this is a THIRD tracker rather than a
+// widening of StalledTracker/FrozenAsleepTracker (both load-bearing for a
+// different question). One instance for the whole daemon, fed once per poll
+// (see the `agentStatuses` tee below) — a floor must persist across polls to
+// mean anything.
+const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
+// BUTCHR-269: the poll-fed snapshot `/dashboard` serves — see
+// src/agents/dashboard.ts's own header for why the fetch and the "could not
+// check"/stale-on-decline decision live here rather than in that module.
+// Starts in the declined shape (nothing has been confirmed yet at process
+// start) with no rows, since none have ever been fetched; the first
+// successful `agentStatuses` tee (below) replaces it.
+let dashboardSnapshot: DashboardResponse = { checked: false, declinedAt: new Date().toISOString(), rows: [] };
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -167,7 +192,7 @@ const { app, mcp } = buildApp({
     const { agents } = await herdr.agent.list();
     return agents.flatMap((a) => {
       const issue = issueOfAgentName((a as { name?: string }).name);
-      return issue ? [{ issue, status: a.agent_status, summary: summaries.get(issue) ?? "" }] : [];
+      return issue ? [{ issue, status: a.agent_status, summary: issueMeta.get(issue)?.summary ?? "" }] : [];
     });
   },
   open: async (issue) => {
@@ -178,6 +203,12 @@ const { app, mcp } = buildApp({
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
+  // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
+  // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
+  // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
+  // for why a request-time fetch is the wrong pattern here even though it's
+  // what `state` above does.
+  dashboard: async () => dashboardSnapshot,
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -356,8 +387,35 @@ const projectReaper = createReaper({
 });
 const syncLabels = createLabelSync({
   jira: labelWriter,
+  // BUTCHR-269: this is the poll-driven `agent.list()` call /dashboard tees
+  // off of, rather than adding a second one — the same discipline
+  // createQuotaGate documents for itself elsewhere in this file. A failure
+  // here already aborted the whole poll before this ticket (nothing in
+  // syncLabels catches it — see createLabelSync's own top comment); that
+  // behaviour is deliberately UNCHANGED (the try/catch below only exists to
+  // record the dashboard's own coverage/snapshot before the error
+  // propagates, never to swallow it) — this is also the measured
+  // `loop error: agent.list: connection closed before a response` case the
+  // ticket cites.
   agentStatuses: async () => {
-    const { agents } = await herdr.agent.list();
+    let agents: readonly DashboardAgent[];
+    try {
+      ({ agents } = await herdr.agent.list());
+    } catch (e) {
+      coverage.recordDeclined(DASHBOARD_DETECTOR);
+      // Stale rows, honestly labeled, beat either discarding them or
+      // re-serving them as freshly confirmed (the ticket's own ruling on
+      // this exact case) — so `rows` carries forward unchanged; only the
+      // top-level `checked`/`declinedAt` move, and no row's own
+      // `confirmedAt` is touched.
+      dashboardSnapshot = { checked: false, declinedAt: new Date().toISOString(), rows: dashboardSnapshot.rows };
+      throw e;
+    }
+    coverage.recordChecked(DASHBOARD_DETECTOR);
+    dashboardSnapshot = {
+      checked: true,
+      rows: buildDashboardRows(agents, { now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor }),
+    };
     const m = new Map<string, string>();
     for (const a of agents) {
       const issue = issueOfAgentName((a as { name?: string }).name);
@@ -411,7 +469,7 @@ void sweepStaleAgentLabels({
 const issueResourceType = createIssueResourceType({
   search: async (jql) => {
     const issues = await atlassian.search(jql);
-    for (const i of issues) summaries.set(i.key, i.summary);
+    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
   },
   links: (key) => atlassian.links(key),
