@@ -827,6 +827,40 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(Object.keys(tools.ask_boss!.input).sort()).toEqual(["text"]);
   });
 
+  // BUTCHR-318: report_to_boss/ask_boss's own descriptions must state, for
+  // an EPIC caller specifically, that the boss is a project which reads an
+  // epic's ticket comments only while that epic is In Review — and must
+  // NOT weaken the unconditional Story/Task promise while doing it.
+  test("report_to_boss's description states the Epic→Project conditionality without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.report_to_boss!.description;
+    expect(d).toMatch(/EPIC caller/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while that epic is In Review/);
+    expect(d).toMatch(/nobody is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller this lands on a surface its boss actually watches, whatever the ticket's status/);
+    // BUTCHR-331 defect 4: the wiring guarantees the comment lands on a
+    // watched surface, never that it is actually delivered/read — the boss
+    // itself can be withheld at the agent cap or blocked by quota (measured
+    // on BUTCHR-318 itself). "always reaches" claims delivery; drop it.
+    expect(d).not.toMatch(/always reaches its boss/);
+  });
+
+  test("ask_boss's description states the same Epic→Project conditionality for its [ask] marker, without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.ask_boss!.description;
+    expect(d).toMatch(/EPIC caller it is conditional/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while you are In Review/);
+    expect(d).toMatch(/no agent is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller that marker lands on a surface your boss actually watches, whatever your ticket's status/);
+    // BUTCHR-331 defect 4: same DELIVERY overclaim as report_to_boss's own
+    // fix, on this verb's "always eventually found" phrasing — the wiring
+    // only guarantees the marker lands where the boss watches, not that a
+    // (possibly withheld/quota-blocked) boss ever actually finds it.
+    expect(d).not.toMatch(/always eventually found/);
+  });
+
   test("submit_to_boss takes NO arguments at all", () => {
     const tools = rigNoOp();
     expect(Object.keys(tools.submit_to_boss!.input)).toEqual([]);

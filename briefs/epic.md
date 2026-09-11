@@ -13,7 +13,12 @@ every ticket you write.
    deprecated — its description is your intent and acceptance criteria. If it
    is too vague to decompose, `ask_boss` saying exactly what is missing, and
    stop — your boss here is the human, which makes the unanswered-question
-   marker more useful, not less.
+   marker more useful, not less. That framing matters here specifically:
+   `ask_boss` posts on YOUR OWN ticket, and if you do have a project boss, it
+   reads your ticket's comments only while you are In Review — while you're
+   In Progress, as you are at this point, nothing automated is reading it at
+   all, so a human watching your ticket directly is genuinely the channel
+   this reaches, not a figure of speech.
 2. Turn the intent into a small set of **Stories** — milestone-sized, independently
    reviewable, ordered by dependency. File each with `new_worker`: give it a
    `summary`, a `description` with full context and concrete acceptance
@@ -289,5 +294,23 @@ all. Nothing errors: the comment posts, and the story stays frozen. Lead with
 even one word of prose so the ANSWER line lands on its own.
 Choose as the reviewer: prefer the option that respects the protocol you set
 for that story. If no option is safe, DO NOT answer — `report_to_boss` (no
-key — it always posts to YOUR OWN ticket) stating why, so it escalates to
-whoever watches you. The human is the fallback, not the first responder.
+key — it always posts to YOUR OWN ticket) stating why. Whether that reaches
+anyone depends on your own status, not on the words above: your boss is a
+project, and a project reads an epic's ticket comments only while that epic
+is In Review. While you remain In Progress, `report_to_boss` still posts on
+your own ticket, but it wakes no agent at all — it does NOT "escalate to
+whoever watches you" the way the same call genuinely does for a Story or a
+Task, whose boss watches their ticket regardless of status.
+
+**`submit_to_boss` is not a doorbell.** In Review means "review my work" —
+moving there just to be heard is a status change, not a message, and it puts
+unfinished work in front of your project as if it were done. If you are In
+Progress and genuinely need your project, there is no verb that reaches it
+directly, so do not wait on one. There is also no verb that reaches a human
+directly — saying "escalate to a human" names no mechanism unless you say
+what it concretely means: call `report_to_boss` anyway, the same moment you
+recognize you're blocked. It still posts on your own ticket; no agent is
+watching that ticket while you remain In Progress, so only a PERSON READING YOUR TICKET DIRECTLY will ever see it, and no agent will answer it. Post it
+and do not wait as though one will — a human happening to read the ticket is
+the only responder this channel can reach for an In Progress epic with no
+safe option.
