@@ -6,6 +6,8 @@ import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { StatusFloorTracker } from "../agents/status-floor.js";
+import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
@@ -79,7 +81,32 @@ const admissionController = createAdmissionController({
   log: (line) => console.error(`  ${line}`),
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
-const summaries = new Map<string, string>();
+// BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
+// `issuetype` is a declared field on every `JiraIssue` the issue loop's
+// `search()` already returns on every poll (src/atlassian/types.ts) and was
+// simply being thrown away here; retaining it alongside `summary` is what
+// lets /dashboard's tier field distinguish epic/story/task WITHOUT a second
+// Jira call. A key genuinely absent from this map (a fresh daemon before its
+// first search lands, or a key that dropped out of the search while its
+// agent is still winding down) must read as "could not check the tier", not
+// as a guessed default — see src/agents/dashboard.ts's own header.
+const issueMeta = new Map<string, IssueMeta>();
+// BUTCHR-269: the dashboard's own "time in current agent_status" floor — see
+// src/agents/status-floor.ts for why this is a THIRD tracker rather than a
+// widening of StalledTracker/FrozenAsleepTracker (both load-bearing for a
+// different question). One instance for the whole daemon, fed once per poll
+// (see the `agentStatuses` tee below) — a floor must persist across polls to
+// mean anything.
+const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
+// BUTCHR-269/BUTCHR-308: the poll-fed snapshot `/dashboard` serves. The fetch
+// itself stays here (only this daemon knows whether THIS poll's
+// `agent.list()` succeeded, and only it also needs the raw `agents` array to
+// feed `createLabelSync`'s own status map below) but the "could not
+// check"/stale-on-decline DECISION — what the snapshot looks like on success
+// vs. failure — lives in `createDashboardFeed` (src/agents/dashboard.ts),
+// unit-tested there directly. This daemon is wiring only: call `.poll()`
+// with the real fetch, record coverage, serve `.snapshot()`.
+const dashboardFeed = createDashboardFeed({ now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor });
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -195,7 +222,7 @@ const { app, mcp } = buildApp({
     const { agents } = await herdr.agent.list();
     return agents.flatMap((a) => {
       const issue = issueOfAgentName((a as { name?: string }).name);
-      return issue ? [{ issue, status: a.agent_status, summary: summaries.get(issue) ?? "" }] : [];
+      return issue ? [{ issue, status: a.agent_status, summary: issueMeta.get(issue)?.summary ?? "" }] : [];
     });
   },
   open: async (issue) => {
@@ -224,6 +251,12 @@ const { app, mcp } = buildApp({
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+  // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
+  // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
+  // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
+  // for why a request-time fetch is the wrong pattern here even though it's
+  // what `state` above does.
+  dashboard: async () => dashboardFeed.snapshot(),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -243,14 +276,55 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // existing seam, do not add a second reader". Behaviour-preserving: this is
 // the exact closure `syncLabels` was already given, moved to a name instead
 // of an inline argument.
-const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
-  const { agents } = await herdr.agent.list();
+const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
   const m = new Map<string, string>();
   for (const a of agents) {
     const issue = issueOfAgentName((a as { name?: string }).name);
     if (issue) m.set(issue, a.agent_status ?? "unknown");
   }
   return m;
+};
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMapFromAgents((await herdr.agent.list()).agents);
+// BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
+// the shared one above except that it tees /dashboard's poll-fed snapshot off
+// the SAME single `agent.list()` — not a second fetch, the same discipline
+// createQuotaGate documents for itself elsewhere in this file.
+//
+// On BUTCHR-305/BUTCHR-238's "share the SAME read, do not add a second
+// reader" just above — that intent is met, and this is not a second reader:
+// the issue loop calls THIS function and nothing else, the project loop calls
+// the shared one and nothing else, and each performs exactly one
+// `agent.list()`. The per-poll read count is unchanged; only the map-building
+// is shared, via `statusMapFromAgents`.
+//
+// Deliberately NOT folded into the shared `agentStatuses`, and the reason is
+// not tidiness: unlike that one, this is STATEFUL. It advances the dashboard
+// snapshot's `confirmedAt`, the StatusFloorTracker's per-agent floors, and
+// the DASHBOARD_DETECTOR coverage counters. The shared `agentStatuses` is
+// also wired into `pinnedActiveDetector` on the PROJECT loop, which polls on
+// its own cadence — so folding this in would make `confirmedAt` mean "the
+// last poll of either loop" and would mix two cadences into one coverage
+// denominator, which is the precise conflation src/daemon/coverage.ts exists
+// to prevent. The dashboard is fed by the issue loop's poll, exactly where it
+// was designed, reviewed and tested.
+//
+// A failure here already aborted the whole poll before this ticket (nothing
+// in syncLabels catches it — see createLabelSync's own top comment); that
+// behaviour is deliberately UNCHANGED. The try/catch exists only to record
+// the dashboard's own coverage before the error propagates, never to swallow
+// it — `dashboardFeed.poll` likewise updates its snapshot and rethrows. This
+// is the measured `loop error: agent.list: connection closed before a
+// response` case.
+const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
+  let agents: readonly DashboardAgent[];
+  try {
+    agents = await dashboardFeed.poll(() => herdr.agent.list());
+  } catch (e) {
+    coverage.recordDeclined(DASHBOARD_DETECTOR);
+    throw e;
+  }
+  coverage.recordChecked(DASHBOARD_DETECTOR);
+  return statusMapFromAgents(agents);
 };
 const stalled = createStalledCheck({
   now: () => Date.now(),
@@ -479,7 +553,7 @@ const projectResidencyGuard = createResidencyGuard({
 });
 const syncLabels = createLabelSync({
   jira: labelWriter,
-  agentStatuses,
+  agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
@@ -526,7 +600,7 @@ void sweepStaleAgentLabels({
 const issueResourceType = createIssueResourceType({
   search: async (jql) => {
     const issues = await atlassian.search(jql);
-    for (const i of issues) summaries.set(i.key, i.summary);
+    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
   },
   links: (key) => atlassian.links(key),
