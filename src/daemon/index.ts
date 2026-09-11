@@ -42,6 +42,7 @@ import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 
 let config;
 try {
@@ -236,6 +237,21 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
+// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
+// `pinnedActiveDetector` further down (project loop only) share the SAME
+// herdr.agent.list() read rather than each defining its own — "wire from the
+// existing seam, do not add a second reader". Behaviour-preserving: this is
+// the exact closure `syncLabels` was already given, moved to a name instead
+// of an inline argument.
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
+  const { agents } = await herdr.agent.list();
+  const m = new Map<string, string>();
+  for (const a of agents) {
+    const issue = issueOfAgentName((a as { name?: string }).name);
+    if (issue) m.set(issue, a.agent_status ?? "unknown");
+  }
+  return m;
+};
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
@@ -335,6 +351,39 @@ const frozenAsleepDetector = createFrozenAsleepDetector({
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-305/BUTCHR-238: audible-only detection of a PROJECT pinned "active"
+// by an agent that has stopped acting — see src/agents/pinned-active.ts for
+// the full mechanism. Wired into the project loop ONLY (see that call site
+// below): the issue tier already covers this same shape via
+// `syncLabels`/`stallRemediation` above. Reuses `agentStatuses` (this file's
+// existing herdr.agent.list() seam), the SAME `speakOnOwnChannel`/
+// `ownChannelComments` seams every sibling detector uses, and the SAME
+// `quotaGate.isBlocked` predicate `stallRemediation` above already wires
+// (constraint 6 — a quota-blocked agent is the session-limit path's case,
+// not this one's). `comments` is wrapped to report BUTCHR-179 coverage
+// (`/health`) the same way `stalled`'s own check does in src/labels/sync.ts:
+// `recordChecked` for a resolved fetch (found an adoption target or not),
+// `recordDeclined` for a rejected one — never invoked for a poll that never
+// reached the fetch at all (nothing stalled, already spoken, or
+// quota-blocked this poll).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: async (id) => {
+    try {
+      const rows = await ownChannelComments(id);
+      coverage.recordChecked("pinned-active");
+      return rows;
+    } catch (e) {
+      coverage.recordDeclined("pinned-active");
+      throw e;
+    }
+  },
+  quotaBlocked: quotaGate.isBlocked,
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
 // for the full mechanism. TWO SEPARATE INSTANCES, one per loop (unlike
 // frozenAsleepDetector above, which only the project tier can ever produce a
@@ -430,15 +479,7 @@ const projectResidencyGuard = createResidencyGuard({
 });
 const syncLabels = createLabelSync({
   jira: labelWriter,
-  agentStatuses: async () => {
-    const { agents } = await herdr.agent.list();
-    const m = new Map<string, string>();
-    for (const a of agents) {
-      const issue = issueOfAgentName((a as { name?: string }).name);
-      if (issue) m.set(issue, a.agent_status ?? "unknown");
-    }
-    return m;
-  },
+  agentStatuses,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
@@ -639,6 +680,11 @@ runResourceLoop(projectResourceType, {
   // real crash loop still needs to reach the threshold well inside the
   // configured window (see crashLoopCount's own doc comment, config.ts).
   checkCrashLoop: projectCrashLoopDetector.check,
+  // BUTCHR-305/BUTCHR-238: wired here ONLY — the issue tier already covers
+  // this same "active+running+idle" shape via `syncLabels`/`stallRemediation`
+  // above (see src/agents/pinned-active.ts's own top comment for why wiring
+  // both would double-post).
+  checkPinnedActive: pinnedActiveDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
   // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style

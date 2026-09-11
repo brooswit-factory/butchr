@@ -375,6 +375,27 @@ export interface ReconcileOptions {
    * this ticket, and any caller with nothing to clear).
    */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  /**
+   * BUTCHR-305/BUTCHR-238: audible-only detection of a resource pinned
+   * `"active"` by an agent that has stopped acting — see
+   * src/agents/pinned-active.ts for the full mechanism (why every other hook
+   * on this interface structurally cannot see this shape, and why this one
+   * is wired into the PROJECT loop only, not the issue loop, which already
+   * covers the same phenomenon via `syncLabels`/`stallRemediation`). Called
+   * with `desired ∩ running` — ids that are BOTH currently desired
+   * (`"active"`) AND running, computed here since this function already has
+   * both sets — same candidate-set shape `checkCrashLoop` is given, not
+   * `checkFrozenAsleep`'s `atRest`-scoped one (an `"active"` verdict is never
+   * a member of `atRest`, by construction — this is exactly the shape none
+   * of the `atRest`-gated hooks can reach). Its return value is `void` and is
+   * NEVER consulted here: like `checkCrashLoop`/`checkReconcileFailure`, it
+   * only observes and speaks, never gates or retries anything — `plan`,
+   * `atRest`, `desired`, `running` and `admitted` are all untouched by
+   * whatever this hook does. Optional; omitted, no pinned-active detection
+   * runs (every caller before this ticket, and any caller with nothing to
+   * report through).
+   */
+  checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
 }
 
 /**
@@ -426,6 +447,19 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
   const running = await herd.runningIssues();
+  // BUTCHR-305/BUTCHR-238: audible-only pinned-active detection, run BEFORE
+  // `atRest` is ever touched and independent of it — `desired ∩ running` is
+  // the shape `planReconcile` never puts in `spawn`/`stop`/`respawn` (see
+  // src/agents/pinned-active.ts's own top comment for the full derivation),
+  // and it exists regardless of whether this resource type ever produces a
+  // non-empty `atRest` at all (the issue tier never does). Never affects
+  // `plan`/`atRest`/`desired`/`running` — same "observe and speak, never
+  // gate" contract as `checkCrashLoop`/`checkReconcileFailure` below.
+  if (opts.checkPinnedActive) {
+    const runningSet = new Set(running);
+    const activeRunning = [...desired.keys()].filter((id) => runningSet.has(id));
+    if (activeRunning.length) await opts.checkPinnedActive(activeRunning);
+  }
   // BUTCHR-95/123: bound `atRest` in time, BEFORE it reaches `planReconcile`
   // below — the reconciler, per the epic's ruling that the timing state must
   // live here or in the loop, never inside `Activation.verdictFor` (which
@@ -763,6 +797,8 @@ export interface GenericLoopDeps<T> {
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
+  checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -852,6 +888,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+        ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
