@@ -129,7 +129,8 @@ export interface ParsedSuppressedLine {
  * AC2: anchored exactly like `src/tools/outcome.ts`'s `OUTCOME_LINE_RE` —
  * an optional `journalctl` transport prefix (`JOURNALD_PREFIX_SRC`, every
  * single-line `--output=` mode), then `SUPPRESSED_TAG` as the LINE'S OWN
- * FIRST token (nothing else may precede it), then `key=`/`watcher=`/`arm=`
+ * FIRST NON-WHITESPACE token (nothing but the optional prefix and
+ * whitespace may precede it), then `key=`/`watcher=`/`arm=`
  * in that fixed order, then zero or more further `name=value` tokens (never
  * `msg=` — the negative lookahead is what stops this repetition from eating
  * into free text whose first word happens to look like `msg=<word>`, see
@@ -146,9 +147,29 @@ export interface ParsedSuppressedLine {
  * backstop against a raw newline forging a second line, exactly as for
  * every other emitter, but there is no ATTACKER-CONTROLLED text on this
  * line at all for that backstop to need to catch.
+ *
+ * BUTCHR-351 CORRECTION: the "every single-line `--output=` mode" claim
+ * above was true of `JOURNALD_PREFIX_SRC` in isolation, but this regex used
+ * to interpolate it directly against `\[notify-suppressed\]` with nothing
+ * between them. Production never emits a bare tag: every `log:` dep in
+ * `src/daemon/index.ts`, this one included, is `(line) => console.error(\`
+ * ${line}\`)` — a two-space indent applied UNCONDITIONALLY, prefix or not
+ * (see that file's own call site). Alongside a genuine journalctl prefix,
+ * `JOURNALD_PREFIX_SRC`'s own trailing `:\s*` happened to absorb that
+ * indent too, so the old regex matched — but under `journalctl -o cat` (no
+ * prefix at all) or any other raw capture, the indent had nothing to
+ * absorb it, and a genuine, unmodified production line failed to parse: a
+ * silent false negative, exactly what this module exists to prevent. Fixed
+ * by tolerating optional whitespace between the (optional) prefix and the
+ * tag — the same `\s*` `parseAliasAuditLine`'s `TOOLS_LINE` already carries
+ * (`src/tools/alias-audit.ts`) for the identical reason. Pinned by a test
+ * that builds the line through the PRODUCTION log closure's own shape, not
+ * the bare emitter return value (`test/unit/suppressed-log.test.ts`),
+ * failing first at `5119e61` for exactly this reason (a `null` parse under
+ * `-o cat`), not a missing import.
  */
 const SUPPRESSED_LINE_RE = new RegExp(
-  `^${JOURNALD_PREFIX_SRC}\\[notify-suppressed\\]\\s+key=(\\S+)\\s+watcher=(\\S+)\\s+arm=(\\S+)((?:\\s+(?!msg=)\\S+=\\S+)*)(?:\\s+msg=(.*))?$`,
+  `^${JOURNALD_PREFIX_SRC}\\s*\\[notify-suppressed\\]\\s+key=(\\S+)\\s+watcher=(\\S+)\\s+arm=(\\S+)((?:\\s+(?!msg=)\\S+=\\S+)*)(?:\\s+msg=(.*))?$`,
 );
 
 export function parseSuppressedLine(line: string): ParsedSuppressedLine | null {

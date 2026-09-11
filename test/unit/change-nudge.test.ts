@@ -67,6 +67,13 @@ describe("changeNudge", () => {
     expect(changeNudge("KAN-1", "KAN-1", { comment: "c1" })).toBe("[butchr] Ticket KAN-1 got a new comment — re-read it.");
   });
 
+  // BUTCHR-351: `comment: null` is the comment-DELETION edge (the ticket's
+  // newest comment id moved because the comment list went to empty, not
+  // because one was added) — "got a new comment" would be actively wrong.
+  test("comment deleted (null) renders honestly, distinct from a new comment", () => {
+    expect(changeNudge("KAN-1", "KAN-1", { comment: null })).toBe("[butchr] Ticket KAN-1 had a comment removed — re-read it.");
+  });
+
   test("a pr reason passed through anyway (should never happen — pr renders via prReviewStateNudge) falls back honestly rather than mis-rendering", () => {
     const prReason = { pr: { from: "open", to: "approved" } } as unknown as NotifyReason;
     expect(changeNudge("KAN-1", "KAN-1", prReason)).toBe(
@@ -121,6 +128,15 @@ describe("notifyReasonTag", () => {
   // comment for why no separate tag is warranted for this additive change.
   test("comment carries the moved-to comment id", () => {
     expect(notifyReasonTag({ comment: "17072447" })).toBe(" (comment:17072447)");
+  });
+
+  // BUTCHR-351: `comment: null` (the comment-deletion edge — see
+  // NotifyReason's own doc comment) renders the honest `comment:deleted`,
+  // never the literal string "null" a bare template would produce, and
+  // stays a `(comment:` PREFIX (a superset), so no distinct tag is needed —
+  // same additive reasoning as the string-id case above.
+  test("comment deleted (null) renders as 'comment:deleted', never the literal 'null'", () => {
+    expect(notifyReasonTag({ comment: null })).toBe(" (comment:deleted)");
   });
 
   // BUTCHR-350 (§3D): the three `undetermined` sub-reasons render as three

@@ -264,16 +264,39 @@ function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
  *
  * BUTCHR-350: `becauseComment: boolean` widened to `commentId?: string` —
  * the actual moved-to comment id, not just the fact that one moved. Every
- * existing producer/consumer only ever checked truthiness, so this is
- * additive: `commentId !== undefined` is exactly the old `becauseComment ===
- * true`. Left `undefined` (rather than forcing a string) on the one edge a
- * mover exists but has no id to report — the newest comment id read back as
- * `null` (a comment was DELETED, not added) — see crossDaemonSuppressed's
- * own comment at its `commentId` assignment.
+ * existing producer/consumer only ever checked truthiness, so this was
+ * MEANT to be additive: `commentId !== undefined` was meant to be exactly
+ * the old `becauseComment === true`.
+ *
+ * BUTCHR-351 CORRECTION: that intent was not what the code did. On the one
+ * edge a mover genuinely exists but has no id to report — the newest
+ * comment id read back as `null`, because the ticket's comment list went
+ * from non-empty to EMPTY (a deletion, not an addition) — `commentId` was
+ * left OMITTED (`undefined`) instead of present-but-`null`. That made
+ * `commentId !== undefined` false on a genuine mover — silently NOT the old
+ * `becauseComment === true` on this one edge — so `decide()` fell through
+ * to the general (status/label/summary) classifier below, which for a
+ * daemon-label-only diff coinciding with this edge named a STRUCTURAL
+ * `label` reason instead. That woke a sleeping watcher unconditionally,
+ * where the pre-BUTCHR-350 code (and every other edge here) would have
+ * gone through the non-structural `unseenFor` gate instead — a real
+ * behaviour change BUTCHR-322's own §4 OUT forbids. Nothing exercised this
+ * edge before, so nothing caught it (see test/unit/issue-standdown-loop.test.ts's
+ * own BUTCHR-351 case, added to pin it).
+ *
+ * `commentId` is now typed `string | null`: `undefined` still means "this
+ * arm did not determine a mover" (suppressed, or not reached — unchanged);
+ * `null` means "a mover WAS positively determined, but it deleted the
+ * ticket's newest comment rather than adding one, so there is no id to
+ * report" — mirrors the pre-BUTCHR-350 `becauseComment: true` on this exact
+ * edge, which never carried an id either. A caller recovers the old
+ * `becauseComment === true` meaning by checking `commentId !== undefined`
+ * (not truthiness, which `null` would silently fail) — see `decide()`'s own
+ * use of it below.
  */
 interface SuppressionVerdict {
   suppressed: boolean;
-  commentId?: string;
+  commentId?: string | null;
 }
 
 /**
@@ -416,11 +439,14 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             commentCursor.set(key, result.newest);
             if (!hadBaseline) return { suppressed: false }; // unknown baseline: never suppress
             if (result.newest === baseline) return { suppressed: true }; // arm 3 echo — no line, see above
-            // `result.newest` is only ever `null` here if the ticket's
-            // comment list went from non-empty to empty (a deletion, not an
-            // addition) — SuppressionVerdict's own doc comment on why that
-            // edge leaves `commentId` unset rather than reporting `"null"`.
-            return { suppressed: false, ...(result.newest !== null ? { commentId: result.newest } : {}) };
+            // A mover is now established (`result.newest !== baseline`,
+            // both checks above already ruled out). `result.newest` is only
+            // ever `null` here if the ticket's comment list went from
+            // non-empty to empty (a deletion, not an addition) — reported
+            // as `commentId: null` (BUTCHR-351), never omitted: omitting it
+            // is exactly what made `decide()` misclassify this edge as
+            // structural — see SuppressionVerdict's own doc comment.
+            return { suppressed: false, commentId: result.newest };
           })();
           crossDaemonCache.set(key, p);
         }
@@ -553,9 +579,9 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             if (result.newest === baseline) return { suppressed: true }; // arm 2 echo — no line, see crossDaemonSuppressed's own comment on why
             commentCursor.set(key, result.newest);
             // See crossDaemonSuppressed's own comment for why `result.newest`
-            // being `null` here (a deletion, not an addition) leaves
-            // `commentId` unset rather than reporting the literal `"null"`.
-            return { suppressed: false, ...(result.newest !== null ? { commentId: result.newest } : {}) }; // newest comment moved -> deliver
+            // being `null` here (a deletion, not an addition) is reported as
+            // `commentId: null`, never omitted (BUTCHR-351).
+            return { suppressed: false, commentId: result.newest }; // newest comment moved -> deliver
           })();
           ledgerHitCache.set(key, p);
         }
@@ -673,7 +699,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         // unconditionally, unlike arms 2/3: it is bounded by how many
         // watchers are CURRENTLY ASLEEP at all, a small, deliberately
         // stood-down population, nowhere near arms 2/3's routine-echo
-        // volume).
+        // volume). NUMERIC BOUND (BUTCHR-351, from existing figures, no new
+        // measurement): the issue tier polls every `intervalMs: 15_000`
+        // (src/daemon/index.ts) and `standDownMaxSleepMinutes` defaults to
+        // 60 (src/config/config.ts) — a sleep episode is at most 240 polls,
+        // so a single asleep watcher contributes at most 240
+        // `arm=stand-down` lines PER KEY IT WATCHES for the whole time it
+        // stays asleep, a ceiling only reached if every single poll in that
+        // window produced a qualifying nothing-unseen suppression on that
+        // key, not an observed rate.
         if (unseen.length === 0) {
           log(standDownSuppressedLine(key, watcher, result.ids.length));
           return { deliver: false };
@@ -758,7 +792,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // BUTCHR-350: `commentId` (was `becauseComment: boolean`) carries
           // the actual moved-to id now — see NotifyReason's own doc comment
           // for why (journal correlation across the §3D duplicate pair).
-          if (verdict.commentId) return finalize(key, watcher, { deliver: true, reason: { comment: verdict.commentId } });
+          // BUTCHR-351: was a truthiness check, which silently treated
+          // `commentId: null` (a genuine mover — the comment-DELETION edge,
+          // see SuppressionVerdict's own doc comment) the same as
+          // `commentId: undefined` (no mover at all), falling through to
+          // the general classifier below and letting it name a STRUCTURAL
+          // reason for what should stay non-structural. `!== undefined`
+          // recovers the old `becauseComment === true` meaning on both the
+          // with-id and no-id-because-deleted cases.
+          if (verdict.commentId !== undefined) return finalize(key, watcher, { deliver: true, reason: { comment: verdict.commentId } });
           // The general classifier: every remaining diff the poll can name
           // from the (before, after) `JiraIssue` pair alone, no I/O. Order
           // is a deliberate, documented precedence (more than one can be
