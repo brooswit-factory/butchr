@@ -594,11 +594,11 @@ describe("docs.ts: the provisional body's ASSIST pointer", () => {
 // fresh per-ticket page, already has a real title from provisioning).
 // ---------------------------------------------------------------------------
 describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Contract 1)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>, id: string, title: string, body: string) {
+  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
     // A project's root doc is provisioned AHEAD OF TIME (BUTCHR-62's doc: six
     // product projects + ASSIST already carry one) — seeded directly here,
     // never via ensureDoc, matching that reality.
-    pages.set(id, { parentId: "", title, body, labels: [] });
+    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
   }
 
   test("resolves the project's root doc via the EXISTING entity-property reader — same shape ensureDoc already reads, no second reader", async () => {
@@ -681,8 +681,8 @@ describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Con
 // tested for gets its own mirror here rather than being assumed to transfer.
 // ---------------------------------------------------------------------------
 describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTCHR-270)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version?: number }>, id: string, title: string, body: string) {
-    pages.set(id, { parentId: "", title, body, labels: [] });
+  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
+    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
   }
 
   test("empty body -> complete: true, body: \"\", size.chars === 0 — distinct from not-found", async () => {
