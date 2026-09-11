@@ -9,6 +9,8 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { projectRootDoc } from "../tools/docs.js";
+import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
@@ -326,6 +328,15 @@ const { app, mcp } = buildApp({
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
+  // BUTCHR-339: the dashboard page's header info — the SAME `build`/`currency`
+  // values `/health` already reads via `toBuildReport(buildIdentity)` and
+  // `currency.snapshot()` (see `health` above), never a second derivation.
+  // Synchronous, no I/O — same discipline as `dashboard` above.
+  header: () => ({ build: toBuildReport(buildIdentity), currency: currency.snapshot() }),
+  // BUTCHR-339: the dashboard row's resource-link redirect target — the
+  // decision itself is `resolveResourceLink` (src/resources/resource-link.ts,
+  // directly unit-tested there); this just supplies its real deps.
+  resourceLink: (key) => resolveResourceLink(key, { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare, (key, seen) => {
   // BUTCHR-307: `stand_down`'s effect is composed from TWO registries — see
   // `issueCheckInExit`/`issueStandDown`'s own construction comments above
