@@ -214,6 +214,58 @@ export interface ReconcileOptions {
    */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
   /**
+   * BUTCHR-275: the project agent's own positive "I have checked in" signal,
+   * the same `atRest`-reduction shape as `checkFrozenAsleep` above (both are
+   * given the ids that are BOTH `atRest` and running, and both remove
+   * whatever they return from `atRest` before `planReconcile` sees it — see
+   * that call site below) but a DELIBERATELY SEPARATE hook: `checkFrozenAsleep`'s
+   * contract is "never on a bare timeout, only after an audible complaint" —
+   * a defect report. This hook fires on the opposite of a defect: the agent
+   * itself declared it is done (src/agents/check-in-exit.ts, called from
+   * `check_in`'s own tool handler after its watermark write has already
+   * landed — see that module's own doc comment for why the ordering is
+   * structural). Posts nothing — nothing is wrong, so there is nothing to
+   * report. Optional; omitted, no project ever exits promptly on its own
+   * check-in, and every existing caller (before this ticket) is unaffected.
+   */
+  checkDeclaredDone?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * BUTCHR-275 (review round 2): prunes a declared-done signal the instant
+   * the SAME id is observed ACTIVE again (i.e. present in `desired`),
+   * independent of `atRest`/`restingRunning` — this must run on EVERY poll,
+   * never gated the way `checkFrozenAsleep`/`checkDeclaredDone` are, because
+   * the exact id this needs to catch is, by definition, NOT resting this
+   * poll (it is active, the opposite of resting), so it would never appear
+   * in `restingRunning` for `checkDeclaredDone` to see.
+   *
+   * THE HAZARD THIS CLOSES: `checkDeclaredDone`'s consumption is deferred
+   * until some LATER poll observes the declared id resting-and-running —
+   * there is no guarantee that poll is the very next one. Without this
+   * hook, a declaration can survive an entire intervening ACTIVE period
+   * and then be consumed against a DIFFERENT, later agent instance for the
+   * same project id — silently stopping a live agent mid-work, which is
+   * exactly what DoD item 3 (`atRest` must mean nothing is genuinely
+   * pending) forbids. Concretely: a project can return to `"asleep"` with
+   * NO fresh `check_in` at all — `epicsBehind` (`src/resources/project.ts`,
+   * `projectVerdict`) is computed over epics CURRENTLY in review, so an
+   * epic simply LEAVING review takes that axis from behind to caught-up
+   * with no watermark write. A stale declaration left over from a finished
+   * episode would then be consumed on exactly that transition, against
+   * whatever agent is running for the project now — found in code review,
+   * not by this ticket's own author.
+   *
+   * Called with `[...desired.keys()]` — the live "active verdict" set this
+   * poll already computed (see `desired`'s own construction, `atRestFrom`'s
+   * doc comment above `reconcileNow`) — BEFORE the `atRest`-reduction block
+   * below, so a stale entry is gone before anything downstream could act on
+   * it. Return value is `void`: this only prunes, it never itself
+   * unprotects an id (that stays `checkDeclaredDone`'s job, on a
+   * SUBSEQUENT, later poll's fresh declaration). Optional; omitted, a
+   * `checkDeclaredDone` registry has no way to be pruned mid-episode and
+   * the hazard above stands exactly as it would without this addendum.
+   */
+  invalidateDeclaredDone?: (desired: readonly string[]) => void;
+  /**
    * BUTCHR-141: audible-only crash-loop detection. Called BEFORE the spawn
    * loop below runs, with this poll's `plan.spawn` and `desired.keys()` —
    * see src/agents/crash-loop.ts for the full mechanism (the candidate set,
@@ -254,6 +306,53 @@ export interface ReconcileOptions {
    * ticket).
    */
   checkReap?: () => Promise<void>;
+  /**
+   * BUTCHR-287: a live per-issue residency census, independent of
+   * `agent.list()` — see src/agents/residency-guard.ts and
+   * src/agents/residency-census.ts for the full mechanism (why a second,
+   * live source of truth closes the cold-start case a steady-state
+   * transition guard cannot). Called with `(plan.spawn, [...desired.keys()])`
+   * IMMEDIATELY AFTER `planReconcile` — before `opts.admission` below, before
+   * `checkCrashLoop`, and before the spawn loop — and its return value
+   * REPLACES `plan.spawn` for every one of them, same "consulted for control
+   * flow, not merely observed" shape `opts.admission` uses. THE REASON THIS
+   * RUNS FIRST (write the reason here, not an ordering rule that could go
+   * stale — see this ticket's own report): a spawn candidate that already
+   * has a live agent must be removed from the list before anything
+   * downstream rations or counts against that list, because rationing
+   * (`opts.admission`) a list that contains phantoms under-delivers real
+   * work by exactly the number of phantoms it admits, and counting
+   * (`checkCrashLoop`) a withheld phantom as a genuine attempt manufactures
+   * a false complaint on a resource that was never in trouble. Never
+   * shrinks `desired` — a withheld id is offered again next poll exactly
+   * like an ordinary `plan.spawn` candidate not yet reached (the BUTCHR-218
+   * liveness trap this ticket's own DoD names explicitly). Optional;
+   * omitted (every caller before this ticket, and any direct `reconcileNow`
+   * caller that doesn't opt in), the value handed to `opts.admission` and
+   * `checkCrashLoop` is `plan.spawn` itself, unchanged — today's exact
+   * behaviour.
+   */
+  checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /**
+   * BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts
+   * for the full mechanism (why a count cap, the two Trap-2 failure shapes,
+   * the bounded-mistrust window). Called with `(plan.spawn, plan.stop)`
+   * BEFORE `checkCrashLoop` and the spawn loop below, and its return value
+   * REPLACES its input for BOTH — unlike most other hooks in this
+   * interface, this one is consulted for control flow, not merely observed.
+   * `plan.stop`/`plan.respawn` are never touched: only the spawn candidate
+   * list is admission-controlled (criterion 4 on the ticket — a respawn
+   * never consumes budget). READS FROM `checkResidency`'s output above
+   * (BUTCHR-287), not `plan.spawn` directly: a spawn candidate that already
+   * has a live agent must be removed from the list before anything rations
+   * that list, because rationing a list that contains phantoms under-
+   * delivers real work — see `checkResidency`'s own doc comment. Optional;
+   * omitted (every caller before this ticket, and any direct `reconcileNow`
+   * caller that doesn't opt in), `admitted` below is that same input
+   * unchanged (which is itself `plan.spawn` when `checkResidency` is ALSO
+   * omitted) — today's exact behaviour either way.
+   */
+  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
 }
 
 /**
@@ -314,21 +413,70 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // nothing extra: the branch below is skipped whenever `atRest` (or its
   // intersection with `running`) is empty, and `atRest` defaults to empty.
   let atRest = new Set(opts.atRest ?? []);
-  if (opts.checkFrozenAsleep && atRest.size) {
+  // BUTCHR-275 (review round 2): prune stale declarations BEFORE anything
+  // else touches `atRest` this poll, and unconditionally — never gated on
+  // `atRest.size`, since the id this needs to catch is by definition
+  // active (in `desired`), not resting, this very poll. See
+  // `ReconcileOptions.invalidateDeclaredDone`'s own doc comment for the
+  // hazard this closes.
+  if (opts.invalidateDeclaredDone) opts.invalidateDeclaredDone([...desired.keys()]);
+  // BUTCHR-275: `checkDeclaredDone` runs BEFORE `checkFrozenAsleep`, and its
+  // hits are subtracted from `restingRunning` before that narrower set ever
+  // reaches `checkFrozenAsleep` — NOT the same `restingRunning` handed to
+  // both. Getting this backwards is silently wrong: a project that checked
+  // in this very poll, after sitting resting long enough to also cross the
+  // frozen bound, would still be offered to `checkFrozenAsleep` as a
+  // candidate and could draw its `[butchr:frozen]` complaint — released a
+  // moment later by `checkDeclaredDone`, but with a false "this froze"
+  // complaint already posted, which is exactly the DoD-1 guarantee
+  // ("without a `[butchr:frozen]` complaint, since nothing froze") this
+  // ordering exists to keep true by construction.
+  if ((opts.checkFrozenAsleep || opts.checkDeclaredDone) && atRest.size) {
     const runningSet = new Set(running);
-    const restingRunning = [...atRest].filter((id) => runningSet.has(id));
+    let restingRunning = [...atRest].filter((id) => runningSet.has(id));
     if (restingRunning.length) {
-      const frozen = await opts.checkFrozenAsleep(restingRunning);
-      if (frozen.size) atRest = new Set([...atRest].filter((id) => !frozen.has(id)));
+      const unprotected = new Set<string>();
+      if (opts.checkDeclaredDone) {
+        for (const id of await opts.checkDeclaredDone(restingRunning)) unprotected.add(id);
+        restingRunning = restingRunning.filter((id) => !unprotected.has(id));
+      }
+      if (opts.checkFrozenAsleep && restingRunning.length) for (const id of await opts.checkFrozenAsleep(restingRunning)) unprotected.add(id);
+      if (unprotected.size) atRest = new Set([...atRest].filter((id) => !unprotected.has(id)));
     }
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
+  // BUTCHR-287: a spawn candidate that already has a live agent must be
+  // removed from the list before anything downstream rations or counts
+  // against that list — see ReconcileOptions.checkResidency's own doc
+  // comment for the full reasoning (written as a REASON here deliberately,
+  // not an ordering rule: once a future admission cap consumes this census
+  // as its own residency input rather than a preceding filter, there is no
+  // longer a "before" for a rule to name, but the reason stays true either
+  // way). `live` — never `plan.spawn` directly — is what both `opts.admission`
+  // and `checkCrashLoop` below actually see. Omitted, `live` is `plan.spawn`
+  // itself (the same array), so every existing caller and test is unaffected.
+  const live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
+  // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
+  // spawn loop below, and is the ONE hook in this function that actually
+  // replaces its input rather than merely observing it — see
+  // ReconcileOptions.admission's own doc comment and src/agents/admission.ts
+  // for the full mechanism. `admitted` (never `plan.spawn`/`live` directly)
+  // is what actually gets attempted below: a withheld candidate was never
+  // really spawned this poll, so it must not count toward `checkCrashLoop`'s
+  // own rolling window either — only a GENUINE attempt should. Reads from
+  // `live` (BUTCHR-287's own residency filter, immediately above) rather
+  // than `plan.spawn`, for the same reason stated there. Omitted, `admitted`
+  // is `live` itself, so every existing caller and test (including
+  // crash-loop.test.ts's own pinned "checkCrashLoop receives exactly
+  // plan.spawn" assertions, and admission.test.ts's own reconcileNow
+  // integration tests) is unaffected.
+  const admitted = opts.admission ? await opts.admission(live, plan.stop) : live;
   // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
   // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
   // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
   // (not `plan.spawn`) is what the detector prunes its own tracking against —
   // the pruning trap that module's top comment names.
-  if (opts.checkCrashLoop) await opts.checkCrashLoop(plan.spawn, [...desired.keys()]);
+  if (opts.checkCrashLoop) await opts.checkCrashLoop(admitted, [...desired.keys()]);
   // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
   // freed THIS poll is available to THIS poll's spawns rather than sitting
   // idle an extra cycle. This ordering is not what makes an in-flight spawn
@@ -354,7 +502,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // failure is recorded into `failures` and never touches any other
   // resource's spawn this same `Promise.all`.
   const failures: ReconcileFailure[] = [];
-  await Promise.all(plan.spawn.map(async (issue) => {
+  await Promise.all(admitted.map(async (issue) => {
     try {
       await herd.spawn(desired.get(issue)!);
     } catch (e) {
@@ -566,12 +714,20 @@ export interface GenericLoopDeps<T> {
   checkAbandoned?: (issues: readonly T[]) => Promise<void>;
   /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /** BUTCHR-275: see `ReconcileOptions.checkDeclaredDone`'s doc comment — threaded straight through to `reconcileNow` below, alongside (never merged with) `checkFrozenAsleep`. Optional; omitted, no resource type ever exits promptly on its own declared-done signal (every resource type before this ticket, and the issue tier, which never sleeps and so never declares). */
+  checkDeclaredDone?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
+  /** BUTCHR-275 (review round 2): see `ReconcileOptions.invalidateDeclaredDone`'s own doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, a `checkDeclaredDone` registry has no way to be pruned mid-episode. */
+  invalidateDeclaredDone?: (desired: readonly string[]) => void;
   /** BUTCHR-141: see `ReconcileOptions.checkCrashLoop`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance — a crash loop has no `atRest`-style single-tier restriction. Optional; omitted, no crash-loop detection runs. */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   /** BUTCHR-147: see `ReconcileOptions.checkReconcileFailure`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own detector instance, same reasoning as `checkCrashLoop` above. Optional; omitted, no isolated-failure detection runs. */
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   /** BUTCHR-245: see `ReconcileOptions.checkReap`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `Reaper` instance, same reasoning as `checkCrashLoop`/`checkReconcileFailure` above. Optional; omitted, no reclamation runs. */
   checkReap?: () => Promise<void>;
+  /** BUTCHR-287: see `ReconcileOptions.checkResidency`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `HerdrHerd.residency()`-backed census (no per-loop state to keep, unlike `checkCrashLoop`/`checkReap` — the census is a live read every call). Optional; omitted, no residency guard runs (plan.spawn reaches `opts.admission`/`checkCrashLoop` in full, today's exact behaviour). */
+  checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
+  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -653,9 +809,13 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         guard: respawnGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
+        ...(deps.checkDeclaredDone ? { checkDeclaredDone: deps.checkDeclaredDone } : {}),
+        ...(deps.invalidateDeclaredDone ? { invalidateDeclaredDone: deps.invalidateDeclaredDone } : {}),
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
+        ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
+        ...(deps.admission ? { admission: deps.admission } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];

@@ -67,6 +67,7 @@ describe("watchSessionLimits", () => {
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("KAN-1");
     expect(logs[0]).toContain("resets");
+    expect(logs[0]).toContain("recognised-and-scheduled"); // BUTCHR-259 AC4
 
     // Jump `now` to exactly the resolved resetsAt + margin (computed the same
     // way detectSessionLimitRefusal would, from the log line's own math is
@@ -135,12 +136,59 @@ describe("watchSessionLimits", () => {
     expect(logs).toEqual([]);
   });
 
+  // BUTCHR-259 AC2/AC4, through the whole watcher: a ⎿-prefixed
+  // refusal-shaped line, real bytes, PAIRED with its own real wrap
+  // continuation and sitting at the pane's own tail (the shape a
+  // prefix-strip-only fix would wrongly treat as live) must be suppressed —
+  // not silently null (AC4): logged WITH a reason, never closed, and still
+  // captured as evidence (same trigger class as an outright miss).
+  test("suppressed outcome: a paired ⎿-refusal at the tail, not the banner's own wrap, never closes and logs recognised-but-suppressed-with-reason", async () => {
+    const { sink, files } = fakeSink();
+    const closed: string[] = []; const logs: string[] = [];
+    const stop = watchSessionLimits({
+      list: async () => [row("KAN-1", "idle")],
+      read: async () => fixture("pane-cap-session-limit-quoted-ticket-in-tail.txt"),
+      close: async (i) => { closed.push(i); },
+      now: () => Date.now(),
+      log: (l) => logs.push(l),
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    expect(closed).toEqual([]);
+    expect(logs.some((l) => l.includes("recognised-but-suppressed-with-reason"))).toBe(true);
+    expect(logs.some((l) => l.includes("not immediately followed by its own wrap continuation"))).toBe(true);
+    expect(files.size).toBe(1); // still captured as evidence, same as an outright miss
+    expect([...files.keys()][0]).toMatch(/^KAN-1-unrecognised-/);
+  });
+
+  // BUTCHR-259 review (comment 19445): the reviewer's own falsifier — a pane
+  // reading THIS FIX's documentation of the pairing guard, where the pair is
+  // nested inside an enclosing tool result. Run through the whole watcher,
+  // not just the bare classifier, so a future regression here is caught at
+  // the level that actually decides whether a pane gets closed.
+  test("nested-pair regression guard (BUTCHR-259 review): a pane reading this fix's own doc, quoting the real paired banner nested inside an enclosing tool result, never closes", async () => {
+    const closed: string[] = []; const logs: string[] = [];
+    const stop = watchSessionLimits({
+      list: async () => [row("KAN-1", "idle")],
+      read: async () => fixture("pane-cap-session-limit-nested-pair-with-truncation.txt"),
+      close: async (i) => { closed.push(i); },
+      now: () => Date.now(),
+      log: (l) => logs.push(l),
+    }, 10);
+    await wait(30);
+    stop();
+    expect(closed).toEqual([]);
+  });
+
   // Positive-fixture counterpart, through the whole watcher rather than the
   // bare recogniser: a genuine refusal with the real composer chrome
   // rendered below it (PR #68) must still log and, past reset+margin, close.
   test("real fixture: a genuine refusal with composer chrome below it is detected, logged once, and closed only after reset+margin", async () => {
     const closed: string[] = []; const logs: string[] = [];
-    let nowMs = new Date(2026, 7, 28, 18, 59, 0).getTime(); // 6:59pm, before the fixture's 9:50pm reset
+    // BUTCHR-259: this fixture is now a REAL capture (see session-limit.test.ts)
+    // whose printed reset time is 12:10pm, not the old hand-built 9:50pm.
+    let nowMs = new Date(2026, 7, 28, 6, 0, 0).getTime(); // 6am, before the fixture's 12:10pm reset
     const stop = watchSessionLimits({
       list: async () => [row("KAN-1", "idle")],
       read: async () => fixture("pane-cap-session-limit-with-composer.txt"),
@@ -153,7 +201,7 @@ describe("watchSessionLimits", () => {
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("KAN-1");
 
-    nowMs = new Date(2026, 7, 28, 21, 50, 0).getTime() + POST_RESET_MARGIN_MS;
+    nowMs = new Date(2026, 7, 28, 12, 10, 0).getTime() + POST_RESET_MARGIN_MS;
     await wait(30);
     stop();
     // DoD #4 says "exactly one close" on purpose: >= 1 would also pass a
@@ -212,7 +260,8 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
   test("(b) recognised WITH a reset time => NOT captured (the working path is not noise)", async () => {
     const { sink, files } = fakeSink();
     const closed: string[] = []; const logs: string[] = [];
-    let nowMs = new Date(2026, 7, 28, 18, 59, 0).getTime();
+    // BUTCHR-259: real-capture fixture, reset time 12:10pm — see above.
+    let nowMs = new Date(2026, 7, 28, 6, 0, 0).getTime();
     const stop = watchSessionLimits({
       list: async () => [row("KAN-1", "idle")],
       read: async () => fixture("pane-cap-session-limit-with-composer.txt"),
@@ -223,7 +272,7 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     }, 5);
     await wait(30);
     expect(files.size).toBe(0);
-    nowMs = new Date(2026, 7, 28, 21, 50, 0).getTime() + POST_RESET_MARGIN_MS;
+    nowMs = new Date(2026, 7, 28, 12, 10, 0).getTime() + POST_RESET_MARGIN_MS;
     await wait(30);
     stop();
     expect(closed).toEqual(["KAN-1"]);

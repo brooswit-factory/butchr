@@ -3,12 +3,14 @@ import { buildApp, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
 import { createCoverageTracker } from "../../src/daemon/coverage.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
 import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const opened: string[] = [];
+const openedPanes: string[] = [];
 // BUTCHR-57: /health now reports TWO components — pollLoop (the fetch
 // stage) and notify (the notify stage, this ticket) — so this fixture,
 // which previously hardcoded a one-element array, must reflect the real
@@ -20,9 +22,25 @@ const healthy = {
     { name: "notify", ok: true, state: "ok" as const, lastSuccessAt: "2026-08-30T00:00:00.000Z", staleForMs: 0 },
   ],
 };
+// BUTCHR-267: `openPane` fixture exercises the four outcomes the pane-keyed
+// attach route (criterion 8, amended) must be able to reach — "w1:p3" (a
+// colon-bearing pane, per criterion 1) succeeds; "KAN-NO-TERM:p1" simulates
+// no terminal emulator configured; "KAN-NO-DISPLAY:p1" simulates the daemon
+// having no display to reach (per the ticket's [correction]: on at least one
+// real daemon this is the ONLY branch that ever runs, not a rare edge case,
+// so it gets its own end-to-end test rather than only unit coverage on
+// `resolveAttach`); anything else is an unknown/not-live pane.
+const openPane = async (pane: string) => {
+  openedPanes.push(pane);
+  if (pane === "KAN-NO-TERM:p1") return { ok: false, error: "no terminal emulator found on this host (set BUTCHR_TERMINAL, e.g. \"alacritty -e\")" };
+  if (pane === "KAN-NO-DISPLAY:p1") return { ok: false, error: "this daemon's own process has neither DISPLAY nor WAYLAND_DISPLAY set, so it cannot launch a terminal window itself — if this host does have a display, set DISPLAY (or WAYLAND_DISPLAY) in the daemon's own environment (e.g. its systemd unit) and restart it" };
+  if (pane !== "w1:p3") return { ok: false, error: `no such live pane: ${pane} (not one of this daemon's own running agents)` };
+  return { ok: true };
+};
 const view = {
   state: async () => [{ issue: "KAN-9", status: "working", summary: "do a thing" }],
   open: async (issue: string) => { opened.push(issue); return issue === "KAN-BAD" ? { ok: false, error: "nope" } : { ok: true }; },
+  openPane,
   health: () => healthy,
 };
 const { app, mcp } = buildApp(view);
@@ -80,6 +98,66 @@ describe("butchr webapp + open action", () => {
   });
 });
 
+// BUTCHR-267: the dashboard row's pane-keyed terminal-attach link — an
+// ordinary GET a person can click (unlike the issue-keyed POST above, which
+// is `fetch()`-driven and never reachable via `<a href>`). Criterion 8 wants
+// the happy path, an unknown pane and no-emulator-configured, each asserted
+// on the specific human-readable text (criterion 5) rather than just the
+// status code.
+describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-267)", () => {
+  test("a live pane launches and reports what actually happened, in plain text", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("w1:p3")}/attach`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    // Criterion 6: never claims a window appeared — only that launching it
+    // was attempted, since the spawn is fire-and-forget.
+    expect(body).toContain("w1:p3");
+    expect(body).not.toMatch(/window (appeared|opened)/);
+    expect(openedPanes).toContain("w1:p3");
+  });
+  test("a colon-bearing pane id survives the route unmangled — criterion 1", async () => {
+    // Exercised again here, raw (unencoded) in the URL, since colon is a
+    // legal pchar and a dashboard link need not necessarily percent-encode it.
+    const r = await fetch(`${base}/agents/pane/w1:p3/attach`);
+    expect(r.status).toBe(200);
+    expect(await r.text()).toContain("w1:p3");
+  });
+  test("an unknown pane is refused with the specific reason, not a generic failure", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("nope:p9")}/attach`);
+    expect(r.status).toBe(409);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    expect(body).toContain("no such live pane");
+    expect(body).toContain("nope:p9");
+  });
+  test("no terminal emulator configured is refused with ITS OWN specific reason, distinct from unknown-pane", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("KAN-NO-TERM:p1")}/attach`);
+    expect(r.status).toBe(409);
+    const body = await r.text();
+    expect(body).toContain("no terminal emulator found");
+    expect(body).toContain("BUTCHR_TERMINAL");
+    expect(body).not.toContain("no such live pane");
+  });
+  // BUTCHR-267 [correction]: on at least one real daemon this is the ONLY
+  // branch that ever runs (no DISPLAY/WAYLAND_DISPLAY in the daemon's own
+  // process, while a terminal emulator IS on PATH) — not an exotic edge case,
+  // so it needs the same end-to-end coverage as the other two refusals, and
+  // its wording must be scoped to what was measured (this process's env) and
+  // actionable, not a flat unscoped claim about the host.
+  test("no display to reach is refused with ITS OWN specific, scoped, actionable reason", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("KAN-NO-DISPLAY:p1")}/attach`);
+    expect(r.status).toBe(409);
+    const body = await r.text();
+    expect(body).toContain("DISPLAY");
+    expect(body).toContain("WAYLAND_DISPLAY");
+    expect(body).toContain("own process");
+    expect(body.toLowerCase()).toContain("systemd unit");
+    expect(body).not.toContain("no such live pane");
+    expect(body).not.toContain("no terminal emulator found");
+  });
+});
+
 // KAN/BUTCHR-18 (BUTCHR-6): /health must go red when the poll loop stops
 // completing cycles, and recover once it resumes — driven through the REAL
 // startLoop/buildApp composition and a real listening app, not a fake-clock
@@ -92,6 +170,7 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => health.status(),
     });
     app.listen(0);
@@ -181,6 +260,7 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([pollHealth, notifyHealth]),
     });
     app.listen(0);
@@ -285,6 +365,7 @@ describe("/health carries build identity as a sibling of components, never insid
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], build),
     });
     app.listen(0);
@@ -313,6 +394,7 @@ describe("/health carries build identity as a sibling of components, never insid
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
     });
     app.listen(0);
@@ -346,6 +428,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
     });
     app.listen(0);
@@ -379,6 +462,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
     });
     app.listen(0);
@@ -399,12 +483,96 @@ describe("/health carries detector coverage as a sibling of components, and neve
     const { app, mcp } = buildApp({
       state: async () => [],
       open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
     });
     app.listen(0);
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
       expect(body.coverage).toBeUndefined();
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+// BUTCHR-284: /health carries the admission cap and current residency as a
+// THIRD sibling — never inside components[], and never able to flip `ok`:
+// sitting AT the cap is a normal, healthy state. Driven through the real
+// production composition (combineHealth + buildApp + a real listening
+// server), same as the build-identity/coverage tests above.
+describe("/health carries the admission cap + residency as a sibling of components, and never flips ok (BUTCHR-284)", () => {
+  test("combineHealth's optional admission param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const admission = createAdmissionController({ cap: 8, residency: async () => ["A", "B", "C"] });
+    await admission.admit([], []); // establishes a trusted residency reading
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.admission).toEqual({ cap: 8, residency: 3 });
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "cap" in c || "residency" in c)).toBe(false);
+      // Being at the cap is healthy: `ok` reflects pollLoop's own state only.
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("residency is null before any trusted census has ever run", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const admission = createAdmissionController({ cap: 8, residency: async () => { throw new Error("never called yet"); } });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.admission).toEqual({ cap: 8, residency: null });
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting admission (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
+      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.admission).toBeUndefined();
       expect(body.ok).toBe(true);
     } finally {
       health.stop();
