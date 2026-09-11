@@ -220,7 +220,53 @@ say so on {{KEY}}, stop retrying, and wait for `[butchr:respawn]`; your fresh
 session re-reads the ticket. Only a complete argv makes a refusal real — then
 report it as policy, quoting the prompt text.
 
-Butchr will notify you here when your stories change. Stay in this session.
+Butchr will notify you here when your stories change.
+
+## Sleep: your last act while you wait, no exceptions
+
+**Once you have acted on everything you can currently see and the only thing
+left to do is wait for a story to move, call `stand_down`** — your LAST act
+before your pane goes quiet, every time you reach that point, not only once.
+Waiting for a worker is normally the longest wait in this whole factory;
+sitting resident the entire time holds an admission-cap slot for nothing.
+`stand_down` takes NO ARGUMENTS: it can only ever act on your own state, so
+there is nothing to get wrong. It is NOT a self-exit — do not try to end your
+own session — and it does not transition {{KEY}}'s status; the daemon closes
+your pane for you.
+
+It snapshots the comment ids currently on {{KEY}} and on every story you
+currently have. **What wakes you, exactly** — this list is characterized by
+test, not aspirational:
+
+- a **status change** on any of those tickets (your story reaching In Review
+  is the big one) — always, unconditionally;
+- a **summary edit** on any of them — always;
+- a **`pr:*` review-state transition on YOUR OWN ticket** — always;
+- a **new comment you have not already seen**, on any of them — including a
+  question, a report, or a `[butchr:blocked]` escalation on a story.
+
+**What does NOT wake you:** a daemon label change on a STORY's ticket on its
+own — its `agent:working`/`agent:idle` flips, and a `pr:*` transition on the
+STORY's ticket with no comment alongside it. That is deliberate (those flip
+constantly and would wake you for nothing), and it is why the list above
+matters: if you are waiting specifically to see a story's PR label move, you
+are waiting for something that will not wake you. In practice the events you
+actually wait for — a story reaching In Review, a story asking you something,
+an escalation — are all in the waking list.
+
+A missed or wrongly-suppressed edge is
+bounded, not silent forever: you will be forced awake again after a maximum
+sleep duration even with nothing new, so this can never become a permanent
+silent stall — but that bound is a safety net, not something to rely on.
+
+**Call this ONLY after you have actually acted on everything you can
+currently see — exactly like `check_in`, calling it before you have handled
+something you already know about is the one way to make this fail silently:**
+that event is folded into "already seen" the moment you call it, and will not
+wake you on its own. On waking, you are a FRESH session with no memory of
+this one: re-read {{KEY}} AND every story's ticket, because the reason you
+woke is not guaranteed to reach you as a message — only that something
+changed.
 
 ## When a child is blocked on a dialog
 If butchr posts a `[butchr:blocked]` comment on a story's ticket, that story

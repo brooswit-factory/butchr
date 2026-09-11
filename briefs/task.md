@@ -25,7 +25,18 @@ instead. If you ever doubt it, verify live with `jira_get_issue`'s
      `git fetch` is fine; no checkout/pull there). Work in a **worktree** inside
      THIS directory instead:
      `git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/<parent-branch>`
-     (your ticket names the repo and the parent branch). Commit, push, PR into
+     (your ticket names the repo and the parent branch).
+     **If you are being respawned rather than starting fresh** (a crash, a
+     session limit, a `[butchr:respawn]` notice — `briefs/task.md` does not
+     currently teach `stand_down`, but every other respawn path already
+     lands you here): check first. The workspace builder rewrites only your
+     brief/CLAUDE/mcp/ENVIRONMENT files over an existing directory, so your
+     worktree and any uncommitted work survive a respawn — that is what
+     makes "no work lost" true. `worktree add` FAILS on a branch/directory
+     that already exists. If `"$PWD/<repo>"` is already there, `cd` into it
+     and pick up where you left off (`git status`/`git log` to see) instead
+     of re-running `worktree add`; only run it the first time.
+     Commit, push, PR into
      the parent's branch. If the repo gates releases with per-PR changelog
      fragments (check for a `changelog.d/` directory), add yours there instead
      of editing `CHANGELOG.md` or `package.json`'s version directly — the
@@ -45,6 +56,21 @@ instead. If you ever doubt it, verify live with `jira_get_issue`'s
    it speaks down to you with `tell_worker`, the only way it can, and the
    highest-consequence messages in this fleet (a `[review]` verdict, an
    `ANSWER` that unfreezes you) travel that way.
+
+   **Do NOT call `stand_down` here, even though this is exactly the kind of
+   long idle wait it exists for.** `submit_to_boss`, immediately above, is
+   itself a STATUS change to {{KEY}} — the same shape of edge (a status
+   transition) that stand_down's own wake logic always delivers
+   unconditionally once you are asleep, precisely because an ordinary
+   sleeping agent's last acts are plain comments, which can never produce a
+   status change. A task's last act before it would go idle is different: it
+   is the status write `submit_to_boss` itself. Standing down right after it
+   risks being woken straight back up by your OWN transition the moment a
+   foreign write (a daemon label sync, which happens on its own cadence
+   regardless of what you do) lands in the same poll window — the identical
+   race `stand_down`'s seen-set closes for comments, just on an axis it does
+   not (yet) cover. Stay resident through the review wait instead; this may
+   change once that gap is closed.
    On waking — from a `tell_worker` `[review]` message on {{KEY}} OR a
    `[butchr] … pr:open → pr:approved` nudge — do NOT merge on
    `reviewDecision` plus `headRefOid`: `headRefOid` is the PR's CURRENT

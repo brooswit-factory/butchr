@@ -5,6 +5,8 @@ import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/da
 import { createCoverageTracker } from "../../src/daemon/coverage.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
+import { createCurrencyTracker } from "../../src/daemon/currency.js";
+import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
@@ -689,6 +691,180 @@ describe("/health carries the admission cap + residency as a sibling of componen
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
       expect(body.admission).toBeUndefined();
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+});
+
+const STALE_VERDICT: CurrencyVerdict = {
+  status: "stale",
+  commitsBehind: 5,
+  commitsAhead: 0,
+  base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: "2026-09-10T00:00:00.000Z", changedAtUnknownReason: null, fetchedAt: "2026-09-10T00:00:00.000Z", fetchedAtUnknownReason: null },
+  dirtyUndeterminable: false,
+};
+const CURRENT_VERDICT: CurrencyVerdict = {
+  status: "current",
+  base: { ref: "refs/remotes/origin/main", sha: "d".repeat(40), changedAt: "2026-09-10T00:00:00.000Z", changedAtUnknownReason: null, fetchedAt: "2026-09-10T00:00:00.000Z", fetchedAtUnknownReason: null },
+  dirtyUndeterminable: false,
+};
+const UNKNOWN_VERDICT: CurrencyVerdict = { status: "unknown", reason: "no local refs/remotes/origin/main to compare against" };
+
+// BUTCHR-329: /health carries the build-currency verdict (BUTCHR-163's
+// build-currency.ts, reused here not reimplemented) as a FOURTH sibling —
+// never inside components[], and never able to flip `ok`: a daemon running
+// stale code is not thereby unhealthy in the liveness sense. Driven through
+// the real production composition (combineHealth + buildApp + a real
+// listening server), same as the build-identity/coverage/admission tests
+// above. The tracker is fed a FAKE `compute` (never real git) so these stay
+// unit tests of the wiring, not of build-currency.ts itself (see
+// test/unit/build-currency.test.ts and test/unit/currency.test.ts for that).
+describe("/health carries the build-currency verdict as a sibling of components, and never flips ok (BUTCHR-329)", () => {
+  test("combineHealth's optional currency param round-trips through the real /health endpoint", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const currency = createCurrencyTracker({ compute: () => STALE_VERDICT, now: () => 1_700_000_000_000 });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const res = await fetch(`http://localhost:${app.server!.port}/health`);
+      const body = (await res.json()) as HealthStatus;
+      expect(body.currency).toEqual({ checkedAt: new Date(1_700_000_000_000).toISOString(), verdict: STALE_VERDICT });
+      // Never folded into components[] — components stays exactly the liveness list.
+      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
+      expect(body.components.some((c) => "commitsBehind" in c || "checkedAt" in c)).toBe(false);
+      // A stale build is not thereby a daemon liveness failure: `ok` here
+      // reflects pollLoop's own state (fresh — recordSuccess was called),
+      // completely independent of the currency verdict.
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("a stale verdict still leaves ok true when every component is healthy — declining never fails closed the OTHER way", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const currency = createCurrencyTracker({ compute: () => STALE_VERDICT, now: () => 0 });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.currency!.verdict.status).toBe("stale");
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("an unknown verdict also leaves ok true when every component is healthy — 'I could not check' is not itself a fault", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const currency = createCurrencyTracker({ compute: () => UNKNOWN_VERDICT, now: () => 0 });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.currency!.verdict).toEqual(UNKNOWN_VERDICT);
+      expect(body.ok).toBe(true);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("unknown is machine-distinguishable from current by verdict.status alone, and always carries its reason — never a missing field", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const currency = createCurrencyTracker({ compute: () => UNKNOWN_VERDICT, now: () => 0 });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      // A consumer parsing JSON distinguishes the two states by `status`
+      // alone, not by reading prose — and `unknown` is present with its
+      // reason, never absent (an absent field would be indistinguishable
+      // from an older daemon that never had this feature).
+      expect(body.currency!.verdict.status).toBe("unknown");
+      expect(body.currency!.verdict.status).not.toBe("current");
+      expect((body.currency!.verdict as { reason: string }).reason).toBe(UNKNOWN_VERDICT.reason);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("a genuinely unhealthy component still makes ok false while a currency verdict is present — a currency field can never mask a real liveness failure", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    // recordSuccess deliberately never called: pollLoop stays "starting"/unhealthy.
+    const currency = createCurrencyTracker({ compute: () => CURRENT_VERDICT, now: () => 0 });
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.currency!.verdict.status).toBe("current");
+      expect(body.ok).toBe(false);
+    } finally {
+      health.stop();
+      await mcp.closeAll();
+      app.stop();
+    }
+  });
+
+  test("omitting currency (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
+    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
+    health.recordSuccess();
+    const { app, mcp } = buildApp({
+      state: async () => [],
+      open: async () => ({ ok: true }),
+      openPane: async () => ({ ok: true }),
+      health: () => combineHealth([health]),
+      dashboard: noDashboard,
+    });
+    app.listen(0);
+    try {
+      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
+      expect(body.currency).toBeUndefined();
       expect(body.ok).toBe(true);
     } finally {
       health.stop();

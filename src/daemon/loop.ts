@@ -898,7 +898,26 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
         atRest,
       });
-      const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];
+      // BUTCHR-307 REVIEW FIX: `atRest` ids are unioned in here, not just
+      // `desired`. `desiredFrom` correctly excludes an asleep resource (it
+      // deserves no agent right now) — but `related()`'s ONLY job is to walk
+      // WHICH tickets an id's own links say it watches, a question that is
+      // unrelated to whether that id currently has a live agent. Passing
+      // `desired` alone silently asked a second question this loop never
+      // meant to ask: "and drop everything a sleeping watcher used to watch,
+      // too" — which manufactures a SELF-CAUSED disappearance the very next
+      // poll (the sleeping id's own related entry vanishes from `next` while
+      // `prev` still has it, `changedKeys`' own `for (const goneKey of
+      // before.keys())` tail reports it as changed, and `finalize`
+      // (src/resources/issue.ts) correctly classifies a bare disappearance
+      // as structural and wakes unconditionally) — with ZERO Jira activity
+      // behind it. Reproduced live at BUTCHR-307's review: a stood-down boss
+      // woke itself on the very next poll purely because its own sleep
+      // shrank the set this line reads from. A resource that is asleep is
+      // still fully eligible to keep watching its related chain — nothing
+      // about being asleep changes what it watches, only whether it
+      // currently has an agent — so this must read `atRest` too.
+      const related = resourceType.discovery.related ? await resourceType.discovery.related([...new Set([...desired.keys(), ...atRest])]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
       // A detector failure must never take down the poll — caught HERE too
       // (belt and suspenders on top of parked.ts's own internal try/catch):
