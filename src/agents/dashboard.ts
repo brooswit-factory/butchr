@@ -122,8 +122,20 @@ export type DashboardRow = AgentDashboardRow;
  * — "this daemon runs no agents"); `false` means it did not, and `rows` (if
  * non-empty) is left over from a PRIOR successful poll — each row's own
  * `confirmedAt` says exactly how stale.
+ *
+ * BUTCHR-308: the `checked: true` shape carries its OWN `confirmedAt` (the
+ * poll that produced it), not just each row's. A genuinely empty fleet
+ * (`rows: []`) has no row to carry a time at all — without a response-level
+ * timestamp, "checked: this daemon runs nothing" and "checked: this daemon
+ * ran nothing, as of some unknowable time" collapse into the same shape,
+ * reopening this story's founding distinction (BUTCHR-116) for exactly the
+ * response that has zero rows to leak it through. Every row from the same
+ * poll already shares one `confirmedAt` value (see `AgentDashboardRow`); this
+ * is that same value, lifted to the top so it survives when `rows` is empty.
+ * The declined shape is deliberately NOT given the same field — it already
+ * carries `declinedAt`, which is its own answer to "as of when".
  */
-export type DashboardResponse = { checked: true; rows: DashboardRow[] } | { checked: false; declinedAt: string; rows: DashboardRow[] };
+export type DashboardResponse = { checked: true; confirmedAt: string; rows: DashboardRow[] } | { checked: false; declinedAt: string; rows: DashboardRow[] };
 
 /** The subset of `AgentInfo` this module actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardAgent {
@@ -172,4 +184,87 @@ function buildTier(resourceKey: string, issueMeta: (key: string) => IssueMeta | 
   if (isProjectId(resourceKey)) return { kind: "project" };
   const meta = issueMeta(resourceKey);
   return { kind: "issue", issuetype: meta ? { checked: true, value: meta.issuetype } : { checked: false, declinedAt } };
+}
+
+/**
+ * BUTCHR-308: the "could not check" decision — what `/dashboard`'s snapshot
+ * looks like after a poll succeeds or fails — moved OUT of
+ * `src/daemon/index.ts` and in here, next to `buildDashboardRows`, so it is
+ * unit-testable at all. Before this ticket the decision lived inline inside
+ * `createLabelSync`'s `agentStatuses` provider in `index.ts`, a module no
+ * unit test in this repo imports (its own generated load test only
+ * transpiles it) — so a mutation that discarded the prior rows on decline,
+ * or one that laundered a decline into `checked: true`, passed the whole
+ * suite unnoticed. `index.ts` keeps the fetch itself (only it knows whether
+ * `agent.list()` succeeded this poll, and only it also needs the raw
+ * `agents` array to feed `createLabelSync`'s own status map — see this
+ * module's header for why a second fetch here would violate "no new I/O")
+ * and keeps `coverage.recordChecked`/`recordDeclined` (per this module's own
+ * header, recorded where the fetch's outcome is actually known). Everything
+ * else — carry the prior rows forward on decline, stamp a fresh
+ * `confirmedAt`/`declinedAt` from `deps.now`, build fresh rows on success —
+ * lives here instead, where `test/unit/dashboard.test.ts` can drive it
+ * directly against the real function.
+ */
+export interface DashboardFeed {
+  /**
+   * Runs one poll: calls `list()` exactly once. On success, replaces the
+   * snapshot with `{checked: true, confirmedAt, rows}` (rows built by
+   * `buildDashboardRows`, sharing that SAME `confirmedAt`) and returns the
+   * raw `agents` array so the caller can reuse it (its own status map for
+   * `createLabelSync`) without a second fetch. On failure, the snapshot
+   * flips to `{checked: false, declinedAt, rows}` with `rows` carried
+   * forward BYTE-IDENTICAL from whatever the snapshot held before this call
+   * (no row's own `confirmedAt` moves) — and the error is rethrown. This
+   * feed never swallows a failed poll; it only decides what the snapshot
+   * looks like while that failure propagates to the caller's own poll loop,
+   * which is what actually aborts the poll and produces its `loop error:`
+   * line (see `index.ts`'s own comment on that call site).
+   */
+  poll(list: () => Promise<{ agents: readonly DashboardAgent[] }>): Promise<readonly DashboardAgent[]>;
+  /** The current snapshot. No I/O of its own: never calls `list`, never advances `confirmedAt` — a request-time read is exactly that, a read. */
+  snapshot(): DashboardResponse;
+}
+
+/**
+ * `checked: false` with no rows and no history — the correct answer BEFORE
+ * the first poll has ever run, not "fleet empty" (this endpoint's whole
+ * reason to exist: those two must never collapse into one shape). Exported
+ * so both `createDashboardFeed`'s own initial state and any caller that
+ * needs to reason about "never polled yet" read the same literal.
+ */
+export function initialDashboardSnapshot(now: () => number): DashboardResponse {
+  return { checked: false, declinedAt: new Date(now()).toISOString(), rows: [] };
+}
+
+export function createDashboardFeed(deps: BuildDashboardRowsDeps): DashboardFeed {
+  let current: DashboardResponse = initialDashboardSnapshot(deps.now);
+  return {
+    snapshot: () => current,
+    async poll(list) {
+      let agents: readonly DashboardAgent[];
+      try {
+        ({ agents } = await list());
+      } catch (e) {
+        // Stale rows, honestly labeled, beat either discarding them or
+        // re-serving them as freshly confirmed (the ticket's own ruling on
+        // this exact case) — so `rows` carries forward unchanged; only the
+        // top-level `checked`/`declinedAt` move, and no row's own
+        // `confirmedAt` is touched.
+        current = { checked: false, declinedAt: new Date(deps.now()).toISOString(), rows: current.rows };
+        throw e;
+      }
+      // Captured once so the response-level `confirmedAt` and every row's
+      // own `confirmedAt` (built from the SAME clock read, via the `now: ()
+      // => nowMs` override below) are the literal same value, not merely two
+      // separate reads of a clock that could in principle disagree.
+      const nowMs = deps.now();
+      current = {
+        checked: true,
+        confirmedAt: new Date(nowMs).toISOString(),
+        rows: buildDashboardRows(agents, { ...deps, now: () => nowMs }),
+      };
+      return agents;
+    },
+  };
 }

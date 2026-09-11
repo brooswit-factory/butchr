@@ -14,7 +14,7 @@ import type { DashboardResponse } from "../../src/agents/dashboard.js";
 // ViewDeps literal below that predates /dashboard and isn't exercising it —
 // the real row-shape/could-not-check contract gets its own dedicated
 // describe block (and its own dedicated fixtures) further down this file.
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, rows: [] });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -116,12 +116,13 @@ describe("butchr webapp + open action", () => {
 // not an artifact of a fixture that fakes freshness some other way.
 describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request path", () => {
   test("smoke: the shared fixture app's /dashboard reflects its dashboard() fixture verbatim", async () => {
-    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, rows: [] });
+    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
   });
 
-  test("a bare re-request does NOT advance confirmedAt — only a new poll does", async () => {
+  test("a bare re-request does NOT advance confirmedAt (row-level or response-level) — only a new poll does", async () => {
     let snapshot: DashboardResponse = {
       checked: true,
+      confirmedAt: new Date(1000).toISOString(),
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
     };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
@@ -133,13 +134,16 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       expect(first).toEqual(second);
       if (!first.checked || !second.checked) throw new Error("expected checked:true");
       expect(second.rows[0]!.confirmedAt).toBe(first.rows[0]!.confirmedAt);
+      expect(second.confirmedAt).toBe(first.confirmedAt);
 
       // Now simulate a poll: the daemon's own tee reassigns `snapshot`, never the route.
-      snapshot = { checked: true, rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
+      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
       const third = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       if (!third.checked) throw new Error("expected checked:true");
       expect(third.rows[0]!.confirmedAt).not.toBe(first.rows[0]!.confirmedAt);
       expect(third.rows[0]!.confirmedAt).toBe(new Date(2000).toISOString());
+      expect(third.confirmedAt).not.toBe(first.confirmedAt);
+      expect(third.confirmedAt).toBe(new Date(2000).toISOString());
     } finally {
       app.stop();
     }
@@ -147,7 +151,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("could-not-check (case 1: the agent.list() read itself fails) is distinguishable from a genuinely empty fleet — never {checked:true, rows:[]}", async () => {
     // A genuine finding: the poll succeeded and there really are no agents.
-    const genuinelyEmpty: DashboardResponse = { checked: true, rows: [] };
+    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [] };
     // A declined poll: the whole-response shape carries checked:false and a
     // declinedAt, distinct at the type level from the empty-but-checked case
     // above — this is the assertion that fails if the two were ever
@@ -180,7 +184,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
-    let snapshot: DashboardResponse = { checked: true, rows: [staleRow] };
+    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow] };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
     app.listen(0);
     try {

@@ -7,7 +7,7 @@ import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
-import { buildDashboardRows, DASHBOARD_DETECTOR, type IssueMeta, type DashboardResponse, type DashboardAgent } from "../agents/dashboard.js";
+import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
@@ -96,13 +96,15 @@ const issueMeta = new Map<string, IssueMeta>();
 // (see the `agentStatuses` tee below) — a floor must persist across polls to
 // mean anything.
 const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
-// BUTCHR-269: the poll-fed snapshot `/dashboard` serves — see
-// src/agents/dashboard.ts's own header for why the fetch and the "could not
-// check"/stale-on-decline decision live here rather than in that module.
-// Starts in the declined shape (nothing has been confirmed yet at process
-// start) with no rows, since none have ever been fetched; the first
-// successful `agentStatuses` tee (below) replaces it.
-let dashboardSnapshot: DashboardResponse = { checked: false, declinedAt: new Date().toISOString(), rows: [] };
+// BUTCHR-269/BUTCHR-308: the poll-fed snapshot `/dashboard` serves. The fetch
+// itself stays here (only this daemon knows whether THIS poll's
+// `agent.list()` succeeded, and only it also needs the raw `agents` array to
+// feed `createLabelSync`'s own status map below) but the "could not
+// check"/stale-on-decline DECISION — what the snapshot looks like on success
+// vs. failure — lives in `createDashboardFeed` (src/agents/dashboard.ts),
+// unit-tested there directly. This daemon is wiring only: call `.poll()`
+// with the real fetch, record coverage, serve `.snapshot()`.
+const dashboardFeed = createDashboardFeed({ now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor });
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -252,7 +254,7 @@ const { app, mcp } = buildApp({
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
-  dashboard: async () => dashboardSnapshot,
+  dashboard: async () => dashboardFeed.snapshot(),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -436,29 +438,23 @@ const syncLabels = createLabelSync({
   // here already aborted the whole poll before this ticket (nothing in
   // syncLabels catches it — see createLabelSync's own top comment); that
   // behaviour is deliberately UNCHANGED (the try/catch below only exists to
-  // record the dashboard's own coverage/snapshot before the error
-  // propagates, never to swallow it) — this is also the measured
-  // `loop error: agent.list: connection closed before a response` case the
-  // ticket cites.
+  // record the dashboard's own coverage before the error propagates, never
+  // to swallow it) — this is also the measured `loop error: agent.list:
+  // connection closed before a response` case the ticket cites.
+  // BUTCHR-308: `dashboardFeed.poll` (src/agents/dashboard.ts) owns turning
+  // this ONE fetch's outcome into a snapshot (stale-rows-on-decline,
+  // confirmedAt-on-success) and rethrows either way; this closure only
+  // records coverage off that same outcome and reuses the already-fetched
+  // `agents` for the status map below — no second fetch.
   agentStatuses: async () => {
     let agents: readonly DashboardAgent[];
     try {
-      ({ agents } = await herdr.agent.list());
+      agents = await dashboardFeed.poll(() => herdr.agent.list());
     } catch (e) {
       coverage.recordDeclined(DASHBOARD_DETECTOR);
-      // Stale rows, honestly labeled, beat either discarding them or
-      // re-serving them as freshly confirmed (the ticket's own ruling on
-      // this exact case) — so `rows` carries forward unchanged; only the
-      // top-level `checked`/`declinedAt` move, and no row's own
-      // `confirmedAt` is touched.
-      dashboardSnapshot = { checked: false, declinedAt: new Date().toISOString(), rows: dashboardSnapshot.rows };
       throw e;
     }
     coverage.recordChecked(DASHBOARD_DETECTOR);
-    dashboardSnapshot = {
-      checked: true,
-      rows: buildDashboardRows(agents, { now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor }),
-    };
     const m = new Map<string, string>();
     for (const a of agents) {
       const issue = issueOfAgentName((a as { name?: string }).name);
