@@ -81,6 +81,42 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
 });
 
 // ---------------------------------------------------------------------------
+// BUTCHR-342: the pane is one of the five fields BUTCHR-266 requires as
+// VISIBLE text on every agent row — not merely present somewhere in the HTML
+// (it was already present, inside the terminal link's href, which is exactly
+// the bug this ticket fixes). `elementText`, scoped to the dedicated `.pane`
+// element, is what makes this assertion fail on the pre-fix code: a page-wide
+// `toContain("w1:p3")` would still pass today, because the href already
+// contains it — confirmed by running this test against the pre-fix render
+// (the href-only version, before the `.pane` span was added) and watching it
+// fail with "expected to find an element with class=\"pane\"".
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the pane is visible text on every agent row (BUTCHR-342)", () => {
+  test("an agent row renders its pane as its own visible element, escaped, distinct from the terminal link's href", () => {
+    const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "w1:p3")], {
+      now: () => 0,
+      issueMeta: () => undefined,
+      tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(elementText(html, 'class="pane"', "</span>")).toBe("w1:p3");
+  });
+
+  test("a withheld row (real updateWithheldRows, cap 0) renders no pane and no pane slot at all — a withheld row has no agent, so no pane to show", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
+    await controller.admit(["BUTCHR-99"], [], "issue");
+    const census = controller.census();
+    const withheldRows = updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() });
+    const rows = [...withheldRows.values()].flat();
+    expect(rows).toHaveLength(1);
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    expect(html).not.toContain('class="pane"');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Mutation 1: a could-not-check value rendered like a known value — all THREE
 // sub-cases the ticket names (whole response, a row's issuetype, a census
 // source). Each assertion below is a NAMED test that fails if the
