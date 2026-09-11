@@ -170,6 +170,18 @@ export const PANE_BUSY_MAX_RETRIES = 4;
  * quotes it needs updating to match) — never a behaviour change: `spec` and
  * the three outcomes are exactly as before, `origin` only labels which
  * caller produced the attempt.
+ *
+ * REVIEW FIX (round 1): `origin=` sits BEFORE the free-text error message on
+ * the failure line — `failed origin=<x> — <message>`, never `failed — <message>
+ * origin=<x>` — because `<message>` is SERVER-SUPPLIED text (`HerdrError`'s
+ * own message comes from `body.message` off the wire) with nothing excluding
+ * a newline in it. A structured field placed AFTER unbounded free text can
+ * end up on a different journal line than its own tag the moment that text
+ * contains one, silently undercounting `respawn attempts = count of [spawn]
+ * lines with origin=respawn` in exactly the failing-and-looks-like-a-broken-
+ * instrument shape this whole epic exists to close. The success/noop lines
+ * don't have this hazard (`paneId` and the literal noop text are both
+ * bounded), so only the failure line's field order matters here.
  */
 export const SPAWN_TAG = "[spawn]";
 
@@ -353,7 +365,7 @@ export class HerdrHerd implements Herd {
       await this.verifyKickoff(issue);
       this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId} origin=${origin}`);
     } catch (e) {
-      this.log?.(`${SPAWN_TAG} ${issue} failed — ${(e as Error)?.message ?? e} origin=${origin}`);
+      this.log?.(`${SPAWN_TAG} ${issue} failed origin=${origin} — ${(e as Error)?.message ?? e}`);
       throw e;
     }
   }

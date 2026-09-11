@@ -174,7 +174,7 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
     };
     const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
     await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
-    expect(lines).toEqual([`${SPAWN_TAG} KAN-9 failed — boom origin=spawn`]);
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-9 failed origin=spawn — boom`]);
   });
 
   // A failure is logged whatever the complaint/latch state (hard constraint
@@ -193,7 +193,7 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
     const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
     await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
     await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
-    expect(lines.filter((l) => l === `${SPAWN_TAG} KAN-9 failed — boom origin=spawn`).length).toBe(2);
+    expect(lines.filter((l) => l === `${SPAWN_TAG} KAN-9 failed origin=spawn — boom`).length).toBe(2);
   });
 
   // THE TRAP: an issue that already has a live agent attempts nothing — not
@@ -228,7 +228,30 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
     };
     const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => lines.push(l));
     await expect(herd.spawn({ key: "KAN-42", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("herdr socket closed");
-    expect(lines).toEqual([`${SPAWN_TAG} KAN-42 failed — herdr socket closed origin=spawn`]);
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-42 failed origin=spawn — herdr socket closed`]);
+  });
+
+  // BUTCHR-334 review fix (round 1): `origin=` must sit BEFORE the free-text
+  // error message, never after — the message is server-supplied
+  // (HerdrError's own message comes off the wire) and nothing excludes a
+  // newline in it. Placed after, a multi-line message would push `origin=`
+  // onto a SECOND journal line, undercounting `respawn attempts = count of
+  // [spawn] lines with origin=respawn`. Pinned directly against the
+  // reviewer's own repro shape: a multi-line rejection message must still
+  // leave the tag AND `origin=` on the line's own first line.
+  test("a multi-line rejection message never separates origin= from the tag onto a later line (review fix, round 1)", async () => {
+    const lines: string[] = [];
+    const client = {
+      agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("connect ECONNREFUSED\n    at Socket.<anonymous>"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+      pane: { close: async () => {} },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null }, "respawn")).rejects.toThrow();
+    const firstLine = lines[0]!.split("\n")[0]!;
+    expect(firstLine).toBe(`${SPAWN_TAG} KAN-9 failed origin=respawn — connect ECONNREFUSED`);
+    expect(firstLine.startsWith(SPAWN_TAG)).toBe(true);
+    expect(firstLine.includes("origin=respawn")).toBe(true);
   });
 });
 
@@ -375,7 +398,7 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
     // all (that line is written only on a SUCCESSFUL respawn and is not
     // involved here).
     const failedRespawn = respawnAttempts.find((l) => l.includes("KAN-RESPAWN-FAIL"));
-    expect(failedRespawn).toBe(`${SPAWN_TAG} KAN-RESPAWN-FAIL failed — boom origin=respawn`);
+    expect(failedRespawn).toBe(`${SPAWN_TAG} KAN-RESPAWN-FAIL failed origin=respawn — boom`);
     expect(respawnAttempts.some((l) => l.includes("KAN-RESPAWN-OK") && l.includes("succeeded"))).toBe(true);
   });
 });
