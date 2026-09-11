@@ -305,10 +305,18 @@ describe("GET /resource/:key/open — the dashboard row's resource link target (
   app.listen(0);
   const b = `http://localhost:${app.server!.port}`;
 
-  test("a resolvable key 302s to the resolved url, not a JSON body", async () => {
+  // BUTCHR-266's review: VERIFY the 302 against a real, booted app with a
+  // plain GET, rather than reasoning about what the handler appears to do —
+  // this is exactly that (a real `fetch()` against `app.listen(0)`, `redirect:
+  // "manual"` so the client doesn't silently follow it and hide what the
+  // server actually sent). Checks the full shape: status line, the exact
+  // `location` header, and that the body is empty (never a mangled or
+  // leftover JSON body riding along with the redirect).
+  test("a resolvable key 302s to the resolved url with an empty body — verified against a real booted app, not reasoned about", async () => {
     const r = await fetch(`${b}/resource/KAN-9/open`, { redirect: "manual" });
     expect(r.status).toBe(302);
     expect(r.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/KAN-9");
+    expect(await r.text()).toBe("");
   });
   test("an unresolvable key is refused with a specific, human-readable reason, in plain text — never a blank page", async () => {
     const r = await fetch(`${b}/resource/nope/open`, { redirect: "manual" });

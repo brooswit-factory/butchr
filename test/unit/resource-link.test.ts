@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { resolveResourceLink } from "../../src/resources/resource-link.js";
+import { buildDashboardRows } from "../../src/agents/dashboard.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 
 const deps = (projectUrl: string | (() => Promise<string>) = "https://wroosbit.atlassian.net/wiki/spaces/KAN/pages/1") => ({
   jiraSite: "https://wroosbit.atlassian.net",
@@ -51,5 +53,33 @@ describe("resolveResourceLink: tier -> correct target (BUTCHR-339 mutation 7 —
   test("a key that is neither a valid issue key nor a valid project id is refused with a specific reason, never silently defaulted to either branch", async () => {
     const r = await resolveResourceLink("not a key!", deps());
     expect(r).toEqual({ ok: false, error: "\"not a key!\" is neither a valid Jira issue key nor a valid project id — cannot resolve a resource link for it" });
+  });
+
+  // BUTCHR-266's review, question 3: `resolveResourceLink` decides its branch
+  // from the KEY'S OWN SHAPE (isIssueKey/isProjectId), never from
+  // `row.tier.kind` — a deliberate choice (the two predicates can never
+  // disagree, since `buildTier` in src/agents/dashboard.ts decides
+  // `tier.kind` with the SAME `isProjectId`, so there is only one spelling of
+  // "is this a project id" in the whole codebase). This test pins the
+  // EQUIVALENCE directly: real rows from the real `buildDashboardRows`, one
+  // per tier, each resolving to the target its OWN `tier.kind` implies.
+  test("equivalence with tier.kind: a REAL issue-tier row (from buildDashboardRows) resolves to Jira, a REAL project-tier row resolves to Confluence — the key-shape decision and tier.kind never disagree", async () => {
+    const rows = buildDashboardRows(
+      [
+        { name: "butchr-kan-9", agent_status: "idle", pane_id: "p1" }, // issue tier (herdr agent name prefix is "butchr-", see src/agents/herd.ts)
+        { name: "butchr-kan", agent_status: "idle", pane_id: "p2" }, // project tier (no issue-number suffix)
+      ],
+      { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) },
+    );
+    const issueRow = rows.find((r) => r.tier.kind === "issue")!;
+    const projectRow = rows.find((r) => r.tier.kind === "project")!;
+    expect(issueRow.resourceKey).toBe("KAN-9");
+    expect(projectRow.resourceKey).toBe("KAN");
+
+    const issueResult = await resolveResourceLink(issueRow.resourceKey, deps("https://wroosbit.atlassian.net/wiki/x"));
+    const projectResult = await resolveResourceLink(projectRow.resourceKey, deps("https://wroosbit.atlassian.net/wiki/x"));
+    if (!issueResult.ok || !projectResult.ok) throw new Error("expected both to resolve");
+    expect(issueResult.url).toBe("https://wroosbit.atlassian.net/browse/KAN-9"); // matches issueRow.tier.kind === "issue"
+    expect(projectResult.url).toBe("https://wroosbit.atlassian.net/wiki/x"); // matches projectRow.tier.kind === "project"
   });
 });

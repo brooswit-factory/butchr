@@ -92,10 +92,37 @@ function renderTier(tier: TierField): TierRendering {
   return { text: "could not check", cnc: true };
 }
 
-/** The time-in-status floor, rendered PROMINENTLY (large text, its own element) per the ticket's own "cheapest thing that would have made the outage visible" requirement — never buried as one more small cell. `exact: false` is marked with an explicit "(since daemon start)" qualifier — mutation 4 is exactly dropping this qualifier or shrinking this element to ordinary cell size. */
-function renderFloor(floor: StatusFloor, label: string): string {
-  const inexactNote = floor.exact ? "" : ` <span class="inexact">(since daemon start — floor only, not the true start)</span>`;
-  return `<div class="floor" title="${esc(label)} since ${esc(floor.since)}"><span class="floorval">${esc(floor.humanDuration)}</span>${inexactNote}</div>`;
+/**
+ * The time-in-status floor, rendered PROMINENTLY (large text, its own
+ * element) per the ticket's own "cheapest thing that would have made the
+ * outage visible" requirement — never buried as one more small cell.
+ * `exact: false` is marked with an explicit "(since daemon start)" qualifier
+ * — mutation 4 is exactly dropping this qualifier or shrinking this element
+ * to ordinary cell size.
+ *
+ * TWO THINGS THIS DOES DELIBERATELY, BOTH FROM BUTCHR-266's OWN REVIEW OF THE
+ * FIRST DRAFT:
+ *   (1) Recomputes the duration against `now` (this render's own clock) from
+ *       the floor's ANCHOR (`sinceMs`), rather than trusting `floor.humanDuration`
+ *       verbatim — that field was baked in at POLL time, so a bare display of
+ *       it would sit frozen between polls even on the browser's 5s auto-
+ *       refresh. This function already has everything needed (`sinceMs`,
+ *       `now`) to keep the page's own most-glanced-at number live.
+ *   (2) Prefixes "at least " onto the number itself — not only a trailing
+ *       note — whenever `exact: false`: the ticket's own review found that a
+ *       carried-forward duration must read "at least X", and putting that
+ *       qualifier only in a small side note lets the big, glanced-at figure
+ *       read as exact when it is only a lower bound. `exact: true` gets NO
+ *       prefix, deliberately: this tracker personally witnessed that
+ *       transition, so the duration is the genuine answer, not a floor —
+ *       prefixing "at least" there would be a false conservatism, not an
+ *       honest one.
+ */
+function renderFloor(floor: StatusFloor, now: number, label: string): string {
+  const elapsed = humanDuration(Math.max(0, now - floor.sinceMs));
+  const text = floor.exact ? elapsed : `at least ${elapsed}`;
+  const inexactNote = floor.exact ? "" : ` <span class="inexact">(since daemon start — this tracker never witnessed the true start)</span>`;
+  return `<div class="floor" title="${esc(label)} since ${esc(floor.since)}"><span class="floorval">${esc(text)}</span>${inexactNote}</div>`;
 }
 
 /** The page/row freshness badge. `stale` (the RESPONSE's own `checked === false`) changes both the wording and the class: a carried-forward row must read "at least X, as of <its own confirmedAt>" and never look like a fresh, current confirmation (mutation 5's row-level twin, and the ticket's own explicit wording). `extraAttrs`, when given, is spliced verbatim into the opening tag (used by a withheld row to carry its own `data-source`). */
@@ -114,7 +141,7 @@ function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDash
     `<span class="key">${esc(row.resourceKey)}</span>` +
     `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
     `<span class="st ${safeClass(row.agentStatus)}">${esc(row.agentStatus)}</span>` +
-    renderFloor(row.timeInStatus, `in status "${row.agentStatus}"`) +
+    renderFloor(row.timeInStatus, opts.now, `in status "${row.agentStatus}"`) +
     renderFreshness(row.confirmedAt, opts.now, stale, "confirmed") +
     `<a class="link" href="${esc(opts.terminalLinkHref(row.pane))}">open terminal</a>` +
     `<a class="link" href="${esc(opts.resourceLinkHref(row.resourceKey))}">resource</a>` +
@@ -127,20 +154,31 @@ function renderNotApplicable(reason: string): string {
   return `<span class="na" title="${esc(reason)}">no agent — n/a</span>`;
 }
 
-function renderWithheldRow(row: WithheldDashboardRow, opts: RenderDashboardOpts): string {
+/**
+ * `sourceDeclined`: whether THIS ROW's OWN `source` currently reports
+ * `census.checked === false` on `response.admission` (see `renderDashboard`'s
+ * own `declinedSources` set). A withheld row's `confirmedAt` is its census
+ * bucket's own observation time — independent of the response-level
+ * `checked` flag, which is a DIFFERENT signal (the agent-list read, not this
+ * source's census) — so it is NEVER driven by that flag (BUTCHR-266's review
+ * confirmed this reasoning). But when the row's OWN source has since
+ * declined, `updateWithheldRows` carries that row forward byte-identical
+ * (src/agents/dashboard.ts) — so its `confirmedAt` stops advancing while
+ * still rendering with calm, "known" styling unless something says
+ * otherwise. `sourceDeclined` is that something: it reuses the SAME
+ * `data-source` tie the admission panel already renders, so a row's own
+ * freshness badge goes STALE in lockstep with its source's own panel entry,
+ * never smeared onto rows from a source that is still checking in fine.
+ */
+function renderWithheldRow(row: WithheldDashboardRow, opts: RenderDashboardOpts, sourceDeclined: boolean): string {
   const tier = renderTier(row.tier);
   return (
     `<div class="row withheld">` +
     `<span class="key">${esc(row.resourceKey)}</span>` +
     `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
     `<span class="st waiting">waiting for a slot</span>` +
-    renderFloor(row.waiting, "withheld") +
-    // A withheld row's own confirmedAt is the CENSUS BUCKET's observation time
-    // (src/agents/dashboard.ts's own doc comment on WithheldDashboardRow), not
-    // the whole-response poll clock — always rendered plainly ("observed X
-    // ago"), independent of the response-level `checked` flag, which is a
-    // DIFFERENT signal (the agent-list read, not this source's census).
-    renderFreshness(row.confirmedAt, opts.now, false, "observed", ` data-source="${esc(row.source)}"`) +
+    renderFloor(row.waiting, opts.now, "withheld") +
+    renderFreshness(row.confirmedAt, opts.now, sourceDeclined, "observed", ` data-source="${esc(row.source)}"`) +
     renderNotApplicable(row.agentFields.reason) +
     `<a class="link" href="${esc(opts.resourceLinkHref(row.resourceKey))}">resource</a>` +
     `</div>`
@@ -280,7 +318,14 @@ const STYLE = `
  */
 export function renderDashboard(response: DashboardResponse, opts: RenderDashboardOpts): string {
   const stale = !response.checked;
-  const rowsHtml = response.rows.map((row) => (row.kind === "agent" ? renderAgentRow(row, stale, opts) : renderWithheldRow(row, opts))).join("");
+  // Which sources currently report `census.checked === false` — a withheld
+  // row's OWN freshness badge goes stale in lockstep with its own source's
+  // panel entry (see `renderWithheldRow`'s own doc comment), never any
+  // other source's, and never the whole-response `checked` flag.
+  const declinedSources = new Set(response.admission.sources.filter((s) => !s.census.checked).map((s) => s.source));
+  const rowsHtml = response.rows
+    .map((row) => (row.kind === "agent" ? renderAgentRow(row, stale, opts) : renderWithheldRow(row, opts, declinedSources.has(row.source))))
+    .join("");
   const refresh = opts.refreshSeconds ?? 5;
   return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr dashboard</title>
 <style>${STYLE}</style></head><body>
