@@ -25,6 +25,7 @@ import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
+import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
 import type {
   Activation,
@@ -187,6 +188,17 @@ export interface IssueResourceDeps {
    * module's own top comment for the self-wake hazard this exists to close).
    */
   standDown?: StandDownRegistry;
+  /**
+   * BUTCHR-350: where `createIssueEventRules`'s suppression stack writes its
+   * `[notify-suppressed]` lines (src/jira-watch/suppressed-log.ts) — the
+   * SUPPRESSION side of the notify record, `[notify]`'s own sibling.
+   * Optional; the default, resolved at CALL time (a plain `console.error`
+   * lookup inside the closure below, never a reference captured at import
+   * time), picks up `installLogSink()`'s wrap automatically exactly like
+   * every other `log:`/`deps.log` default in this codebase (see
+   * src/daemon/log-sink.ts's own doc comment for why that matters — AC1).
+   */
+  log?: (line: string) => void;
 }
 
 /**
@@ -247,13 +259,44 @@ function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
  * BUTCHR-87: a suppression arm's answer, widened from a bare `boolean` so a
  * "not suppressed" outcome can say WHY, when the arm already knows — see
  * crossDaemonSuppressed/ledgerHitSuppressed below, and `decide()`'s use of
- * `becauseComment`. `becauseComment` is only ever meaningful alongside
+ * `commentId`. `commentId` is only ever meaningful alongside
  * `suppressed: false`; a caller must not (and does not) read it otherwise.
+ *
+ * BUTCHR-350: `becauseComment: boolean` widened to `commentId?: string` —
+ * the actual moved-to comment id, not just the fact that one moved. Every
+ * existing producer/consumer only ever checked truthiness, so this was
+ * MEANT to be additive: `commentId !== undefined` was meant to be exactly
+ * the old `becauseComment === true`.
+ *
+ * BUTCHR-351 CORRECTION: that intent was not what the code did. On the one
+ * edge a mover genuinely exists but has no id to report — the newest
+ * comment id read back as `null`, because the ticket's comment list went
+ * from non-empty to EMPTY (a deletion, not an addition) — `commentId` was
+ * left OMITTED (`undefined`) instead of present-but-`null`. That made
+ * `commentId !== undefined` false on a genuine mover — silently NOT the old
+ * `becauseComment === true` on this one edge — so `decide()` fell through
+ * to the general (status/label/summary) classifier below, which for a
+ * daemon-label-only diff coinciding with this edge named a STRUCTURAL
+ * `label` reason instead. That woke a sleeping watcher unconditionally,
+ * where the pre-BUTCHR-350 code (and every other edge here) would have
+ * gone through the non-structural `unseenFor` gate instead — a real
+ * behaviour change BUTCHR-322's own §4 OUT forbids. Nothing exercised this
+ * edge before, so nothing caught it (see test/unit/issue-standdown-loop.test.ts's
+ * own BUTCHR-351 case, added to pin it).
+ *
+ * `commentId` is now typed `string | null`: `undefined` still means "this
+ * arm did not determine a mover" (suppressed, or not reached — unchanged);
+ * `null` means "a mover WAS positively determined, but it deleted the
+ * ticket's newest comment rather than adding one, so there is no id to
+ * report" — mirrors the pre-BUTCHR-350 `becauseComment: true` on this exact
+ * edge, which never carried an id either. A caller recovers the old
+ * `becauseComment === true` meaning by checking `commentId !== undefined`
+ * (not truthiness, which `null` would silently fail) — see `decide()`'s own
+ * use of it below.
  */
 interface SuppressionVerdict {
   suppressed: boolean;
-  /** True only when this verdict's `suppressed: false` is caused by the ticket's newest comment id having moved since the recorded baseline — the one case a suppression arm can honestly name a `comment` notify reason. */
-  becauseComment?: boolean;
+  commentId?: string | null;
 }
 
 /**
@@ -265,7 +308,15 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log">): EventRules<JiraIssue> {
+  // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
+  // only this — never a direct `process.stdout`/`process.stderr` write. The
+  // default is a fresh closure that looks up `console.error` at CALL time
+  // (a property read inside the arrow body, not a reference captured when
+  // this line itself runs) — see IssueResourceDeps.log's own doc comment for
+  // why that is what lets `installLogSink()`'s wrap apply automatically
+  // regardless of construction order.
+  const log = deps.log ?? ((line: string) => console.error(line));
   // Persists ACROSS polls (one instance per createIssueEventRules call, kept
   // alive for the resource type's lifetime — exactly as the old `commentCursor`
   // persisted for startLoop's lifetime): the last comment id observed per
@@ -281,6 +332,17 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
 
   return {
     async poll(prev: PollSnapshot<JiraIssue>, next: PollSnapshot<JiraIssue>): Promise<EventPoll> {
+      // BUTCHR-350 (§3D): a snapshot of `commentCursor` as it stood BEFORE
+      // this poll touches it — a plain Map copy, no I/O, changes nothing
+      // about this poll's own behaviour. Every suppression arm below
+      // advances `commentCursor` itself as part of its OWN bookkeeping
+      // (unchanged by this ticket), so by the time `decide()`'s own
+      // no-structural-reason fallback runs, `commentCursor.get(key)` may
+      // already read the NEW value — comparing against it there would be
+      // tautological. This is the one fixed point `decide()` can honestly
+      // compare a same-poll comments() result against to learn "did the
+      // newest comment id move THIS poll", the fact §3(D)'s fix needs.
+      const preCommentCursor = new Map(commentCursor);
       // ONE deps.comments(key) call per key, per poll — shared by baseline
       // seeding below, the DAEMON_WRITER ledger-hit comment-cursor check, and
       // the cross-daemon label-only echo check (KAN-828 item 4). Fails OPEN:
@@ -345,13 +407,25 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       //
       // BUTCHR-87: return shape widened from `boolean` to `SuppressionVerdict`
       // — control flow and every suppress/don't-suppress OUTCOME below is
-      // UNCHANGED; the only addition is `becauseComment`, set exactly when
+      // UNCHANGED; the only addition is `commentId`, set exactly when
       // this function already learned (from the comments() call it was
       // making anyway) that the newest comment id moved, which is also
       // exactly the one case where "not suppressed" here is caused BY a
       // comment rather than by a missing/unknown baseline. See `decide()`'s
-      // use of it below — that flag exists to NAME the delivery, not to
+      // use of it below — that field exists to NAME the delivery, not to
       // change whether one happens.
+      //
+      // BUTCHR-350 (§3A, arm 3): when this DOES suppress (`newest ===
+      // baseline`, the cross-daemon label-only echo), NO `[notify-suppressed]`
+      // line is written — deliberately, by this ticket's own volume
+      // measurement (see suppressed-log.ts's top comment): this arm fires on
+      // the order of a hundred times/hour on this fleet alone, every one of
+      // them a routine agent:*/pr:* echo, not a lost message. A MISSING
+      // `[notify-suppressed] arm=... ` line for a poll where this arm ran
+      // means exactly one of: this echo (arm 3, omitted by design), the
+      // sibling DAEMON-arm echo (arm 2, `ledgerHitSuppressed` below, also
+      // omitted), or a genuine delivery (check for the matching `[notify]`
+      // line) — never a claim that nothing happened.
       const crossDaemonCache = new Map<string, Promise<SuppressionVerdict>>();
       const crossDaemonSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<SuppressionVerdict> => {
         let p = crossDaemonCache.get(key);
@@ -364,8 +438,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             const baseline = commentCursor.get(key) ?? null;
             commentCursor.set(key, result.newest);
             if (!hadBaseline) return { suppressed: false }; // unknown baseline: never suppress
-            if (result.newest === baseline) return { suppressed: true };
-            return { suppressed: false, becauseComment: true };
+            if (result.newest === baseline) return { suppressed: true }; // arm 3 echo — no line, see above
+            // A mover is now established (`result.newest !== baseline`,
+            // both checks above already ruled out). `result.newest` is only
+            // ever `null` here if the ticket's comment list went from
+            // non-empty to empty (a deletion, not an addition) — reported
+            // as `commentId: null` (BUTCHR-351), never omitted: omitting it
+            // is exactly what made `decide()` misclassify this edge as
+            // structural — see SuppressionVerdict's own doc comment.
+            return { suppressed: false, commentId: result.newest };
           })();
           crossDaemonCache.set(key, p);
         }
@@ -412,16 +493,63 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // suppressed — outside this discriminator's reach, on the DAEMON arm,
       // unchanged since KAN-828.
       //
-      // Second known residual (KAN-838): on the AGENT arm, a foreign comment
-      // landing in the SAME fetch window as the agent's own write is folded
-      // into the cursor advance below and is never delivered to the
-      // ticket's own agent that poll (it still reaches any WATCHER via
-      // crossDaemonSuppressed, which never consults this cursor for a pure
-      // comment diff) — the arm's job is only to keep the cursor honest for
-      // later polls, not to reconsider what it suppresses on its own poll.
+      // Second known residual (KAN-838). BUTCHR-350(C) CORRECTS this
+      // comment's own prior claim: a foreign comment landing in the SAME
+      // fetch window as the agent's own write, folded into the cursor
+      // advance below, is not merely withheld "that poll" — it is NEVER
+      // delivered to the ticket's own agent, full stop. Verified at this
+      // commit (test/unit/loop.test.ts's KAN-838 suite, case (g), and this
+      // ticket's own suppressed-log tests): the fold ALSO advances
+      // `commentCursor` to the true newest id in the same step, so on every
+      // later poll, whatever arm next consults this key's cursor (almost
+      // always crossDaemonSuppressed, via the next routine agent:* flip)
+      // compares against a baseline that ALREADY includes the folded-in
+      // comment — finds no further movement — and suppresses again. There
+      // is no later poll at which the comparison could still be "new". The
+      // message still reaches any WATCHER via crossDaemonSuppressed (which
+      // never consults this cursor for a pure comment diff, so it is
+      // unaffected by the fold) — this residual is specific to the ticket's
+      // OWN agent. Re-delivering it is BUTCHR-321's job, not this ticket's
+      // (§4 OUT) — this ticket only makes the loss VISIBLE (§3B below).
+      //
       // BUTCHR-87: same return-shape widening as crossDaemonSuppressed above
-      // (see its comment) — `becauseComment` is set on exactly the branch
-      // whose own comment text already said "newest comment moved -> deliver".
+      // (see its comment) — `commentId` is set on exactly the branch whose
+      // own comment text already said "newest comment moved -> deliver".
+      //
+      // BUTCHR-350 (§3B, arm 1 — THE LOSSY ARM): the AGENT-writer branch
+      // ALWAYS suppresses, unconditionally, exactly as before — nothing
+      // about WHAT is suppressed changes here (§4 OUT). What's new is
+      // comparing the just-fetched id list against the baseline it is
+      // about to overwrite, BEFORE overwriting it, so a genuine fold can be
+      // told apart from the ordinary case (the agent's own new comment
+      // being the only thing that moved). A NAIVE "did newest change since
+      // baseline" comparison cannot do this: the agent's own write is
+      // ITSELF a comment far more often than not (this arm's own doc
+      // comment: "typically its own comment"), so `newest !== baseline`
+      // is true on nearly EVERY hit — logging on that alone would mean
+      // logging nearly every own-write ledger hit, defeating the whole
+      // point of choosing this as the LOW-volume arm to always log.
+      // Instead: `result.ids` (already fetched, no second call) is newest
+      // first; the recorded baseline's OWN position in that list says how
+      // many comments are newer than it. Position 1 (baseline is the
+      // second-newest) is consistent with "only the agent's one new
+      // comment landed" — not logged, the ordinary case. Position 2 or
+      // deeper means AT LEAST TWO comments are newer than the baseline in
+      // one window; the agent wrote at most one of them, so at least one
+      // more is foreign and was just folded into this suppression and lost
+      // — logged, loud, every time (`agentFoldSuppressedLine`,
+      // src/jira-watch/suppressed-log.ts). STATED LIMIT, not claimed away:
+      // if the agent's OWN write this round-trip was NOT itself a comment
+      // (e.g. a bare status transition) and exactly one foreign comment
+      // landed in the same window, the position is 1 — indistinguishable,
+      // by this signal alone, from the ordinary case, and is NOT logged.
+      // This heuristic therefore UNDER-reports folds in that specific
+      // narrower race; it never OVER-reports one (position >= 2 is only
+      // ever reachable when more than one comment is genuinely newer than
+      // the recorded baseline). Baseline not found in `result.ids` at all
+      // (more comments landed than the fetch's own page size — see
+      // AtlassianClient.comments's cap) is the same "cannot positively
+      // establish a fold" case and is also not logged, for the same reason.
       const ledgerHitCache = new Map<string, Promise<SuppressionVerdict>>();
       const ledgerHitSuppressed = (key: string, before: JiraIssue, after: JiraIssue): Promise<SuppressionVerdict> => {
         let p = ledgerHitCache.get(key);
@@ -432,15 +560,28 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
               // the cursor must still learn the newest id it just observed
               // (KAN-838) — see the block comment above.
               const result = await fetchComments(key);
-              if (result.ok) commentCursor.set(key, result.newest);
+              if (result.ok) {
+                const hadBaseline = commentCursor.has(key);
+                const oldBaseline = commentCursor.get(key) ?? null;
+                commentCursor.set(key, result.newest);
+                if (hadBaseline && oldBaseline !== null) {
+                  const idx = result.ids.indexOf(oldBaseline);
+                  if (idx >= 2 && result.newest !== null) {
+                    log(agentFoldSuppressedLine(key, oldBaseline, result.newest, idx));
+                  }
+                }
+              }
               return { suppressed: true };
             }
             const result = await fetchComments(key);
             if (!result.ok) return { suppressed: false }; // fail open: deliver, cursor untouched
             const baseline = commentCursor.get(key) ?? null;
-            if (result.newest === baseline) return { suppressed: true }; // no new comment -> suppress
+            if (result.newest === baseline) return { suppressed: true }; // arm 2 echo — no line, see crossDaemonSuppressed's own comment on why
             commentCursor.set(key, result.newest);
-            return { suppressed: false, becauseComment: true }; // newest comment moved -> deliver
+            // See crossDaemonSuppressed's own comment for why `result.newest`
+            // being `null` here (a deletion, not an addition) is reported as
+            // `commentId: null`, never omitted (BUTCHR-351).
+            return { suppressed: false, commentId: result.newest }; // newest comment moved -> deliver
           })();
           ledgerHitCache.set(key, p);
         }
@@ -514,7 +655,20 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         if (!verdict.deliver) return verdict;
         const sd = deps.standDown;
         if (!sd?.isAsleep(watcher)) return verdict;
-        const structural = Boolean(verdict.reason) && !("comment" in verdict.reason!);
+        // BUTCHR-350: `decide()` no longer ever hands this a bare `{ deliver:
+        // true }` with no `reason` for the ambiguous "maybe a comment"
+        // fallback — it now always carries `{ undetermined: ... }` there
+        // (see NotifyReason's own doc comment). That fallback is EXACTLY the
+        // shape stand_down's own last-act writes (a plain comment) CAN
+        // produce, same as `{ comment: ... }` already was — so it must stay
+        // grouped with `comment`, non-structural, gated by the seen-set
+        // check below, not promoted to `structural` merely because `Boolean(
+        // verdict.reason)` is now true where it used to be false. Getting
+        // this wrong would reopen the exact self-wake hazard stand-down.ts's
+        // own top comment names: an agent's own comment, landing while it is
+        // asleep, waking it unconditionally instead of being checked against
+        // its own seen-set.
+        const structural = Boolean(verdict.reason) && !("comment" in verdict.reason!) && !("undetermined" in verdict.reason!);
         if (structural) {
           await sd.wake(watcher, "edge");
           return verdict;
@@ -537,7 +691,27 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           return verdict;
         }
         const unseen = sd.unseenFor(watcher, key, result.ids);
-        if (unseen.length === 0) return { deliver: false };
+        // BUTCHR-350 (§3A, arm 4): a genuine suppression of an OBSERVED
+        // change — this poll's own classifier already decided `deliver:
+        // true` before this gate downgraded it — not an echo (see this
+        // module's own top-of-file suppression-stack comment and
+        // suppressed-log.ts's top comment for why this arm is logged
+        // unconditionally, unlike arms 2/3: it is bounded by how many
+        // watchers are CURRENTLY ASLEEP at all, a small, deliberately
+        // stood-down population, nowhere near arms 2/3's routine-echo
+        // volume). NUMERIC BOUND (BUTCHR-351, from existing figures, no new
+        // measurement): the issue tier polls every `intervalMs: 15_000`
+        // (src/daemon/index.ts) and `standDownMaxSleepMinutes` defaults to
+        // 60 (src/config/config.ts) — a sleep episode is at most 240 polls,
+        // so a single asleep watcher contributes at most 240
+        // `arm=stand-down` lines PER KEY IT WATCHES for the whole time it
+        // stays asleep, a ceiling only reached if every single poll in that
+        // window produced a qualifying nothing-unseen suppression on that
+        // key, not an observed rate.
+        if (unseen.length === 0) {
+          log(standDownSuppressedLine(key, watcher, result.ids.length));
+          return { deliver: false };
+        }
         await sd.wake(watcher, "edge");
         return verdict;
       };
@@ -615,7 +789,18 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // swallowed. Checked before the structural classifier below on
           // purpose, so the label change that would otherwise have been
           // suppressed never shadows the actual cause of delivery.
-          if (verdict.becauseComment) return finalize(key, watcher, { deliver: true, reason: { comment: true } });
+          // BUTCHR-350: `commentId` (was `becauseComment: boolean`) carries
+          // the actual moved-to id now — see NotifyReason's own doc comment
+          // for why (journal correlation across the §3D duplicate pair).
+          // BUTCHR-351: was a truthiness check, which silently treated
+          // `commentId: null` (a genuine mover — the comment-DELETION edge,
+          // see SuppressionVerdict's own doc comment) the same as
+          // `commentId: undefined` (no mover at all), falling through to
+          // the general classifier below and letting it name a STRUCTURAL
+          // reason for what should stay non-structural. `!== undefined`
+          // recovers the old `becauseComment === true` meaning on both the
+          // with-id and no-id-because-deleted cases.
+          if (verdict.commentId !== undefined) return finalize(key, watcher, { deliver: true, reason: { comment: verdict.commentId } });
           // The general classifier: every remaining diff the poll can name
           // from the (before, after) `JiraIssue` pair alone, no I/O. Order
           // is a deliberate, documented precedence (more than one can be
@@ -626,14 +811,67 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // tie-break when both changed), summary third. A diff naming none
           // of these (every visible field identical but `updated` itself —
           // a comment this poll never learned about, a link, or a field
-          // JiraIssue does not carry at all) falls through to the honest
-          // "looked, could not tell" fallback: no `reason` at all, exactly
-          // as it explained the "why".
+          // JiraIssue does not carry at all) falls through to §3(D)'s
+          // fallback below.
           if (before.status !== after.status) return finalize(key, watcher, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
           const labelTransition = daemonLabelTransition(before, after);
           if (labelTransition) return finalize(key, watcher, { deliver: true, reason: { label: labelTransition } });
           if (before.summary !== after.summary) return finalize(key, watcher, { deliver: true, reason: { summary: true } });
-          return finalize(key, watcher, { deliver: true });
+          // BUTCHR-350 (§3D): the honest "looked, could not (from the
+          // taxonomy above) tell" fallback — REPLACES the old bare `{
+          // deliver: true }` (no `reason` at all). Confirmed at this commit
+          // (the epic's own hypothesis in the ticket, and its own follow-up
+          // comment's structural-constraint finding): a `{ comment: ... }`
+          // reason is reachable ONLY via `verdict.commentId` above, which is
+          // reachable ONLY through crossDaemonSuppressed/ledgerHitSuppressed,
+          // both gated on a daemon-label change being present in THIS
+          // poll's OWN (before, after) diff. A pure foreign-comment bump
+          // (nothing else changed) never reaches that gate, so its FIRST
+          // delivery always fell through to here with no way to name a
+          // comment — not a race, structural, exactly as hypothesised.
+          //
+          // Do NOT change delivery here (§3D's own explicit constraint) —
+          // every branch below still returns `deliver: true`, unconditionally,
+          // exactly as the old bare fallback did. What's added is READING
+          // (never fetching new) already-available per-poll comments()
+          // state to give the REASON three honest, distinguishable shapes
+          // instead of one collapsed "not determinable":
+          //   - `commentsCache` (this poll's shared fetchComments memo) has
+          //     NO entry for `key` at all: no arm had an I/O reason to check
+          //     comments for this key this poll — "unchecked", the common
+          //     case, and the literal mechanism behind §3D's duplicate-notify
+          //     pair (this delivery, then a LATER poll whose daemon-label
+          //     flip finally triggers the check and names `comment`).
+          //   - an entry exists but its fetch failed: "check-failed" — a
+          //     real, different fact from "unchecked" (reuses this
+          //     codebase's existing "could not check" vocabulary — §4 OUT).
+          //   - an entry exists, succeeded, and its `newest` genuinely
+          //     matches `preCommentCursor`'s pre-THIS-poll baseline: comments
+          //     were consulted and POSITIVELY ruled out — "checked-unchanged".
+          //   - an entry exists, succeeded, and `newest` differs from the
+          //     pre-poll baseline (and is non-null): this delivery genuinely
+          //     IS comment-caused, discovered via a DIFFERENT arm's already-
+          //     paid-for fetch this same poll (e.g. a sibling watcher's
+          //     ledger/crossDaemon check on the same key) — named `comment`
+          //     directly, same as `verdict.commentId` above, not a fourth
+          //     `undetermined` shape. STATED RESIDUAL: if an untracked field
+          //     (not status/summary/label/comment — e.g. assignee) is what
+          //     actually bumped `updated` for THIS key, and a genuinely
+          //     unrelated comment happens to have landed in the same window
+          //     AND some other arm happened to have already fetched this
+          //     poll, this could attribute the delivery to that coincidental
+          //     comment. Strictly better than the prior "never even try",
+          //     not a claim of perfect causal precision — see this module's
+          //     own PR description and Confluence doc.
+          const cached = commentsCache.get(key);
+          if (!cached) return finalize(key, watcher, { deliver: true, reason: { undetermined: "unchecked" } });
+          const peeked = await cached;
+          if (!peeked.ok) return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
+          const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
+          if (preBaseline !== undefined && peeked.newest !== null && peeked.newest !== preBaseline) {
+            return finalize(key, watcher, { deliver: true, reason: { comment: peeked.newest } });
+          }
+          return finalize(key, watcher, { deliver: true, reason: { undetermined: "checked-unchanged" } });
         },
       };
     },

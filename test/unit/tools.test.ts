@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
+import { OUTCOME_TAG } from "../../src/tools/outcome.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -93,7 +96,15 @@ describe("atlassianTools", () => {
     expect(calls[6]![0]).toBe("linkIssues");
     expect(calls[6]![1]).toEqual(["KAN-2", "KAN-9", "Implements"]);               // the explicit jira_link_issues call; default type applied
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
-    expect(audits.length).toBe(12);
+    // BUTCHR-341: each of the 12 calls above now produces TWO lines on this
+    // same `log` stream — the pre-existing `[tools]` line (unchanged, fires
+    // before the verb runs) AND a NEW `[tools2]` outcome record (fires after
+    // it resolves) — see src/tools/outcome.ts's own doc comment for why both
+    // are kept. 12 calls × 2 lines = 24.
+    expect(audits.length).toBe(24);
+    expect(audits.filter((a) => a.startsWith("  [tools] ")).length).toBe(12);
+    expect(audits.filter((a) => a.includes(OUTCOME_TAG)).length).toBe(12);
+    expect(audits.filter((a) => a.includes(OUTCOME_TAG))).toSatisfy((lines: string[]) => lines.every((l) => l.includes("outcome=ok")));
   });
   test("search defaults maxResults when omitted", async () => {
     const { tools, calls, conn } = rig();
@@ -823,6 +834,40 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     const tools = rigNoOp();
     expect(Object.keys(tools.report_to_boss!.input).sort()).toEqual(["text"]);
     expect(Object.keys(tools.ask_boss!.input).sort()).toEqual(["text"]);
+  });
+
+  // BUTCHR-318: report_to_boss/ask_boss's own descriptions must state, for
+  // an EPIC caller specifically, that the boss is a project which reads an
+  // epic's ticket comments only while that epic is In Review — and must
+  // NOT weaken the unconditional Story/Task promise while doing it.
+  test("report_to_boss's description states the Epic→Project conditionality without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.report_to_boss!.description;
+    expect(d).toMatch(/EPIC caller/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while that epic is In Review/);
+    expect(d).toMatch(/nobody is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller this lands on a surface its boss actually watches, whatever the ticket's status/);
+    // BUTCHR-331 defect 4: the wiring guarantees the comment lands on a
+    // watched surface, never that it is actually delivered/read — the boss
+    // itself can be withheld at the agent cap or blocked by quota (measured
+    // on BUTCHR-318 itself). "always reaches" claims delivery; drop it.
+    expect(d).not.toMatch(/always reaches its boss/);
+  });
+
+  test("ask_boss's description states the same Epic→Project conditionality for its [ask] marker, without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.ask_boss!.description;
+    expect(d).toMatch(/EPIC caller it is conditional/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while you are In Review/);
+    expect(d).toMatch(/no agent is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller that marker lands on a surface your boss actually watches, whatever your ticket's status/);
+    // BUTCHR-331 defect 4: same DELIVERY overclaim as report_to_boss's own
+    // fix, on this verb's "always eventually found" phrasing — the wiring
+    // only guarantees the marker lands where the boss watches, not that a
+    // (possibly withheld/quota-blocked) boss ever actually finds it.
+    expect(d).not.toMatch(/always eventually found/);
   });
 
   test("submit_to_boss takes NO arguments at all", () => {
@@ -2382,5 +2427,65 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
     const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn)) as { ok: boolean };
     expect(result.ok).toBe(true);
     expect(pageComments.length).toBe(1);
+  });
+});
+
+// BUTCHR-336: backstop for the MECHANISM sentence — a lightweight guard so
+// deleting the sentence from a tool description also fails something, not
+// just the reader's trust. The REAL pin is the ordering behaviour itself,
+// in test/unit/admission.test.ts's "priority is not an admission-order
+// input" describe block; this only proves the boss-facing prose is present,
+// not that the mechanism it describes is true.
+describe("BUTCHR-336: every boss-facing priority surface states the admission mechanism", () => {
+  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+
+  test("prioritize_worker, new_worker, file_where_it_belongs, jira_create_issue and jira_set_priority all carry the mechanism sentence", () => {
+    const { tools } = rig();
+    for (const name of ["prioritize_worker", "new_worker", "file_where_it_belongs", "jira_create_issue", "jira_set_priority"] as const) {
+      expect(tools[name]!.description).toContain(MECHANISM_CLAUSE);
+    }
+  });
+});
+
+// BUTCHR-299 (review of BUTCHR-336): the SAME backstop, extended to the
+// briefs — the copy every boss agent actually reads. The tool-description
+// guard above left a hole this fills: deleting the mechanism sentence from
+// a brief used to fail nothing, and a claim in prose that nothing executes
+// is exactly the defect this work exists to remove.
+//
+// The set of briefs is DERIVED, never hand-listed: any brief that tells a
+// boss to revise a worker's priority ("priority as reality shifts") must
+// also state that doing so does not change what gets staffed. That way a
+// brief which GAINS the guidance later is covered automatically, and
+// briefs/task.md — whose only mention is about WHO sets priority, not its
+// effect — is correctly excluded without naming it.
+//
+// Briefs HARD-WRAP, so both sides are matched on whitespace-collapsed text.
+// A line-naive match here reports a confident false negative: the sentence
+// is present but spans a line break. That mistake was actually made while
+// verifying this change, which is why the unwrapping is load-bearing
+// rather than incidental.
+describe("BUTCHR-299: every brief that tells a boss to revise priority also states the admission mechanism", () => {
+  const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
+  const GUIDANCE = "priority as reality shifts";
+  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+  const unwrapped = (file: string) => readFileSync(join(BRIEFS_DIR, file), "utf8").replace(/\s+/g, " ");
+
+  const briefs = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md"));
+  const withGuidance = briefs.filter((f) => unwrapped(f).includes(GUIDANCE));
+
+  // Positive control on the derivation itself. Without this, rewording the
+  // guidance would empty `withGuidance`, and a test.each over an empty list
+  // PASSES while pinning nothing — the silent-zero failure mode.
+  test("the derived set is non-empty, so the checks below are actually asserting something", () => {
+    expect(withGuidance.length).toBeGreaterThan(0);
+  });
+
+  test.each(withGuidance)("%s carries the mechanism sentence", (file) => {
+    expect(unwrapped(file)).toContain(MECHANISM_CLAUSE);
+  });
+
+  test("briefs/task.md is deliberately excluded — its mention is about WHO sets priority, not its effect", () => {
+    expect(withGuidance).not.toContain("task.md");
   });
 });

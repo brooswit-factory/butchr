@@ -608,7 +608,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // this guard window at all).
     try {
       await herd.stop(issue);
-      await herd.spawn(desired.get(issue)!);
+      await herd.spawn(desired.get(issue)!, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
       // is unaffected. If `stop` succeeded but `spawn` then threw, `issue`
@@ -746,7 +746,14 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
   return {
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
     staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
-    spawn: (spec) => herd.spawn(spec),
+    // BUTCHR-334: `origin` threaded straight through, unchanged — dropping it
+    // here (the pre-existing `(spec) => herd.spawn(spec)`) would have
+    // silently discarded the respawn loop's own `"respawn"` argument at the
+    // one wrapper every production reconcile call actually goes through
+    // (`runResourceLoop` below calls `reconcileNow(scopedHerd(...), ...)`),
+    // reintroducing finding 2 in production while every direct-`herd`-object
+    // test (which bypasses this wrapper entirely) kept passing.
+    spawn: (spec, origin) => herd.spawn(spec, origin),
     stop: (issue) => herd.stop(issue),
     paneFor: (issue) => herd.paneFor(issue),
     nudge: (issue, text) => herd.nudge(issue, text),
@@ -1018,6 +1025,12 @@ export function startLoop(deps: LoopDeps): Stop {
     eventRules: createIssueEventRules({
       ...(deps.suppress ? { suppress: deps.suppress } : {}),
       ...(deps.comments ? { comments: deps.comments } : {}),
+      // BUTCHR-350: the SAME free-text channel `LoopDeps.log` already
+      // carries (e.g. the storm guard's WARNING) now also carries
+      // `[notify-suppressed]` lines — one log seam per test/caller, not two,
+      // and lets a test spy on `deps.log` to assert on suppression lines
+      // the same way it already can for every other daemon log line.
+      ...(deps.log ? { log: deps.log } : {}),
     }),
     spawnConfig: ISSUE_SPAWN_CONFIG,
   };

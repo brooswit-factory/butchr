@@ -1,0 +1,8 @@
+bump: patch
+
+### Fixed
+- **`briefs/project.md`'s VERSION-axis parenthetical claimed "epics have been told to put load-bearing directives in the page body" — false, and self-contradicting within its own paragraph**, which a dozen lines later calls an epic overwriting the root doc body "your product's living brief getting blown away and replaced, not a message reaching you … not a way for an epic to talk to you." Both cannot be true. The claim is dropped; the VERSION axis itself stays real and used — the brief now says a person editing the page body wakes the project, which needs no unverifiable claim about who told whom what.
+- **`changelog.d/BUTCHR-335.md` misattributed the comment-on-page op to `confluence_update_page`.** The comment-on-page op is `commentOnPage`, declared on the Atlassian ops interface (`src/tools/atlassian.ts`) and called from `src/tools/speak.ts` and `src/tools/relationship.ts`; `confluence_update_page`'s own handler (`src/tools/defs.ts`) calls `updatePage` and never references `commentOnPage`. The bullet now names the op correctly without changing its "exactly two call sites, both project-caller-only" claim, which still holds.
+- **A comment in `test/unit/workspace.test.ts` above the blocked-dialog test had gone stale.** It said the brief tells a blocked In Progress epic to "escalate to a human immediately" — BUTCHR-331 replaced that framing; the shipped brief, and the assertions in the test right below the comment, say to call `report_to_boss` anyway. The comment now matches the assertions it sits above.
+
+No verb, wake edge, predicate, guard, or route changed — words only.

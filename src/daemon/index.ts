@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { HerdrClient } from "@brooswit/herdr-sdk";
+import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
@@ -9,7 +10,9 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
-import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
+import { projectRootDoc } from "../tools/docs.js";
+import { resolveResourceLink } from "../resources/resource-link.js";
+import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
@@ -49,6 +52,15 @@ import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 import { createStandDownRegistry } from "../agents/stand-down.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 
+// BUTCHR-346: installed before anything else in this file ever logs — every
+// `log:`/`deps.log` seam below that defaults to or directly calls
+// `console.error` resolves that reference at CALL time, so this single
+// install covers all of them, including the config-load error path
+// immediately below and every closure defined later in this file. See
+// `log-sink.ts`'s own doc comment for why this is the sink and why it is
+// installed here rather than at any individual call site.
+installLogSink();
+
 let config;
 try {
   config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
@@ -67,7 +79,11 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+// BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
+// per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
+// comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
+// wait; only `log` is being threaded through here.
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`));
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH
@@ -78,10 +94,21 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 // `HerdrHerd` instance, before either loop's own `scopedHerd` wrapping),
 // which is the one seam that can see every `butchr-*` agent regardless of
 // which loop desired it.
+// BUTCHR-332: the two tiers' own names on the admission census — declared up
+// front (not discovered lazily) and passed as `sources` below, so
+// `admissionController.census()` can report "this tier has not reported
+// yet" from construction (see AdmissionControllerDeps.sources's own doc
+// comment). The two thin wrappers further down (`admission:` at each
+// `runResourceLoop` call site) are what actually name a call's own tier —
+// this daemon never calls `admissionController.admit` directly.
+const ADMISSION_SOURCE_ISSUE = "issue";
+const ADMISSION_SOURCE_PROJECT = "project";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
+  now: () => Date.now(),
+  sources: [ADMISSION_SOURCE_ISSUE, ADMISSION_SOURCE_PROJECT],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -101,6 +128,10 @@ const issueMeta = new Map<string, IssueMeta>();
 // (see the `agentStatuses` tee below) — a floor must persist across polls to
 // mean anything.
 const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
+// BUTCHR-332: a SECOND, dedicated StatusFloorTracker for the withheld set —
+// see src/agents/dashboard.ts's `UpdateWithheldRowsDeps.tracker` doc comment
+// for why this must not be the agent rows' own tracker above.
+const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 // BUTCHR-269/BUTCHR-308: the poll-fed snapshot `/dashboard` serves. The fetch
 // itself stays here (only this daemon knows whether THIS poll's
 // `agent.list()` succeeded, and only it also needs the raw `agents` array to
@@ -109,7 +140,19 @@ const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
 // vs. failure — lives in `createDashboardFeed` (src/agents/dashboard.ts),
 // unit-tested there directly. This daemon is wiring only: call `.poll()`
 // with the real fetch, record coverage, serve `.snapshot()`.
-const dashboardFeed = createDashboardFeed({ now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor });
+//
+// BUTCHR-332: `admission` reads `admissionController.census()` — the SAME
+// controller instance both `runResourceLoop` calls below share — never a
+// fresh call of its own; the census was already computed earlier in this
+// same poll (see admission.ts's own top comment and this ticket's own
+// falsifier for the ordering proof).
+const dashboardFeed = createDashboardFeed({
+  now: () => Date.now(),
+  issueMeta: (key) => issueMeta.get(key),
+  tracker: dashboardStatusFloor,
+  withheldTracker: dashboardWithheldStatusFloor,
+  admission: () => admissionController.census(),
+});
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -295,6 +338,15 @@ const { app, mcp } = buildApp({
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
+  // BUTCHR-339: the dashboard page's header info — the SAME `build`/`currency`
+  // values `/health` already reads via `toBuildReport(buildIdentity)` and
+  // `currency.snapshot()` (see `health` above), never a second derivation.
+  // Synchronous, no I/O — same discipline as `dashboard` above.
+  header: () => ({ build: toBuildReport(buildIdentity), currency: currency.snapshot() }),
+  // BUTCHR-339: the dashboard row's resource-link redirect target — the
+  // decision itself is `resolveResourceLink` (src/resources/resource-link.ts,
+  // directly unit-tested there); this just supplies its real deps.
+  resourceLink: (key) => resolveResourceLink(key, { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare, (key, seen) => {
   // BUTCHR-307: `stand_down`'s effect is composed from TWO registries — see
   // `issueCheckInExit`/`issueStandDown`'s own construction comments above
@@ -306,6 +358,11 @@ const { app, mcp } = buildApp({
 }));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
+// BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
+// daemon's own /health `build` field serves (see `health` above) — never a
+// second derivation — so a journal window can be attributed to a BUILD, not
+// only a pid (journald's pid only bounds one daemon generation).
+console.error(`  ${describeBuild(toBuildReport(buildIdentity))}`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
@@ -409,6 +466,18 @@ const stallRemediation = createStallRemediator({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   quotaBlocked: quotaGate.isBlocked,
+  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
+  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
+  // never a herd/live probe: a boss's worker is staffed under a different
+  // Atlassian account than the boss (this fleet's own tier->account split),
+  // so a probe wired here would be structurally blind to every worker it
+  // could ever be asked about (three independent live confirmations, all
+  // probeOutOfScope:true — see this ticket's own PR body) — the label path
+  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
+  // doc comment argues (src/tools/relationship.ts). Paid at most once per
+  // non-Done worker, only on the one poll that is actually about to post a
+  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
+  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
@@ -613,12 +682,36 @@ const projectResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-352: the issue tier's own admission census bucket — the SAME
+// `admissionController` instance the issue/project `runResourceLoop` calls
+// below already share (see that construction's own comment for why one
+// instance, not one per tier). Only the ISSUE tier's bucket is relevant here:
+// syncLabels only ever processes Jira issues (only the issue `runResourceLoop`
+// call wires `syncLabels` in at all — see that call site's own comment), so
+// a project-tier candidate is never a `syncLabels` input in the first place.
+// Returns the TRUSTED withheld set from a `checked: true` bucket, or the
+// literal `"unknown"` from a `checked: false` one (residency threw, an
+// untrusted implausible zero, or this source has never reported) — never a
+// guess either way. `desiredLabels` (src/labels/plan.ts) re-emits whatever
+// admission:withheld marker a ticket already carries on `"unknown"` rather
+// than flipping it off from an observation never made (KAN-832/837's own
+// pattern) — so a bad poll holds the last TRUSTED state rather than
+// asserting a confident wrong one in either direction. Synchronous:
+// `census()` reads state `admit()` already computed EARLIER in this SAME
+// poll (`reconcileNow` runs before `syncLabels` — see src/daemon/loop.ts's
+// own call order), never a second/stale read.
+const issueAdmissionWithheld = (): ReadonlySet<string> | "unknown" => {
+  const bucket = admissionController.census().buckets.find((b) => b.source === ADMISSION_SOURCE_ISSUE);
+  return bucket?.checked ? new Set(bucket.withheld) : "unknown";
+};
+
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
+  withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
@@ -672,6 +765,12 @@ const issueResourceType = createIssueResourceType({
   // stand-down gate (createIssueEventRules's decide()) to the SAME registry
   // `stand_down`'s tool handler declares into above.
   standDown: issueStandDown,
+  // BUTCHR-350: the SUPPRESSION side of the notify record — `[notify]`'s own
+  // sibling, `[notify-suppressed]`. Same `console.error` + two-space-indent
+  // convention as every other `log:` dep in this file (e.g. `runResourceLoop`
+  // below), so it reads as one stream in `journalctl` alongside `[notify]`,
+  // `[labels]`, `[reconcile]`, etc.
+  log: (line) => console.error(`  ${line}`),
 });
 
 runResourceLoop(issueResourceType, {
@@ -750,7 +849,9 @@ runResourceLoop(issueResourceType, {
   // BUTCHR-284: the SAME shared controller instance the project loop below
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
-  admission: admissionController.admit,
+  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
+  // the recording itself lives in admission.ts's `admit`.
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
   // BUTCHR-297: the SAME shared controller instance's success signal — see
   // admissionController's own construction comment above and
   // src/agents/admission.ts's own B4 addendum for why this must be one
@@ -855,7 +956,9 @@ runResourceLoop(projectResourceType, {
   // BUTCHR-284: the SAME shared controller instance the issue loop above
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
-  admission: admissionController.admit,
+  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
+  // the recording itself lives in admission.ts's `admit`.
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_PROJECT),
   // BUTCHR-297: the SAME shared controller instance's success signal the
   // issue loop above also uses — see that call site's own comment for why
   // this must be one instance, not one per tier.

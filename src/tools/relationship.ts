@@ -8,7 +8,8 @@ import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { readProjectTierProperty, resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
-import { AGENT_PREFIX } from "../labels/plan.js";
+import { ADMISSION_PREFIX, AGENT_PREFIX } from "../labels/plan.js";
+import { Refusal } from "./outcome.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
@@ -88,7 +89,7 @@ export function guardShortProse(verb: string, argName: string, raw: string): voi
     m[1] !== undefined
       ? `what looks like a premature closing tag naming \`${name}\``
       : `what looks like the wrapper that opens the NEXT tool-call argument (naming \`${name}\`)`;
-  throw new Error(
+  throw new Refusal(
     `${verb}: \`${argName}\` contains ${what}, partway through its own text — the exact seam a malformed tool call leaves when the harness's argument parser folds a LATER argument into this one instead of starting it separately (measured twice in this corpus: BUTCHR-127, BUTCHR-164). ` +
       `Length alone is not the problem — a long, honest \`${argName}\` is fine on its own. Rewrite the call so \`${argName}\` holds only its own value, and check that every other argument you meant to send is still its own separate argument rather than text trapped inside this one. If you genuinely need literal tag syntax inside \`${argName}\`, describe it in words instead of the raw characters — the same discipline this defect's own tickets use when they have to talk about it. This call was refused before anything was written or posted.`,
   );
@@ -371,20 +372,22 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
     // Same two conditions, same messages, same order as before this was
     // factored through the shared `isEpicMemberOfProject` predicate
     // (BUTCHR-326) — only reached when that predicate is false, so exactly
-    // one of the two throws below fires.
+    // one of the two throws below fires. Both are `Refusal` (BUTCHR-341):
+    // deliberate precondition guards that reject the call before anything
+    // is attempted, so they classify as `refused`, not `error`.
     if (!isEpicMemberOfProject(issue, callerKey)) {
       const project = projectKeyOf(issue);
       if (project !== callerKey) {
-        throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
+        throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
       }
       const type = issuetypeOf(issue);
-      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
+      throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
     }
     return issue;
   }
   const boss = findBossKey(issue);
   if (boss !== callerKey) {
-    throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
+    throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
   return issue;
 }
@@ -596,7 +599,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
 
   const { disposition } = input;
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   guardShortProse("new_worker", "summary", input.summary);
   if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
@@ -627,12 +630,12 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     const msg = callerType === "Task"
       ? `new_worker: ${callerKey} is a Task — a Task is the bottom of this hierarchy and has no worker beneath it; new_worker can only be called by an Epic or a Story`
       : `new_worker: ${callerKey}'s issue type ("${callerType ?? "unknown"}") has no defined child type — new_worker can only be called by an Epic or a Story`;
-    throw new Error(msg);
+    throw new Refusal(msg);
   }
   const role = childType === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("new_worker", childType));
+  if (!role) throw new Refusal(noRoleMsg("new_worker", childType));
   const projectKey = projectKeyOf(callerIssue);
-  if (!projectKey) throw new Error(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
+  if (!projectKey) throw new Refusal(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
   // (1) create — irreversible; the shelve label, if any, lands HERE.
   const created = (await ops.createIssue({
@@ -645,7 +648,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to link or transition against nothing");
+  if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to link or transition against nothing");
 
   // Rollback for steps 2/3 only (see the function comment for why step 4
   // never rolls back). Attempts the delete unconditionally — see
@@ -762,12 +765,12 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
 async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   guardShortProse("new_worker", "summary", input.summary);
   if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
   const role = roles.epic;
-  if (!role) throw new Error(noRoleMsg("new_worker", "Epic"));
+  if (!role) throw new Refusal(noRoleMsg("new_worker", "Epic"));
 
   // (1) create — irreversible; the shelve label, if any, lands HERE.
   // Membership in `projectKey` is already real the instant this returns.
@@ -781,7 +784,7 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to transition against nothing");
+  if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to transition against nothing");
 
   const rollback = makeRollback(ops, "new_worker", key);
 
@@ -869,8 +872,22 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
   return ops.transition(workerKey, "In Progress");
 }
 
-/** `check_worker`'s staffing verdict — three-valued, NEVER two: conflating "could not look" with "not staffed" is the specific error this codebase has already been bitten by and guards against elsewhere (see `PrLookup`, src/labels/plan.ts, and its own doc comment) — this type keeps that same illegal conflation unrepresentable here. */
-export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look";
+/**
+ * `check_worker`'s staffing verdict — FOUR-valued, never fewer: conflating
+ * "could not look" with "not staffed" is the specific error this codebase
+ * has already been bitten by and guards against elsewhere (see `PrLookup`,
+ * src/labels/plan.ts, and its own doc comment) — this type keeps that same
+ * illegal conflation unrepresentable here.
+ *
+ * BUTCHR-352: `"withheld"` is the fourth value — admission control is
+ * holding this worker at the fleet-wide cap, correctly, and will admit it
+ * when a slot frees; this is NOT "not staffed" (which means genuinely
+ * undesired) and NOT "could-not-look" (this IS a positive, checked
+ * observation). See `checkWorker`'s own doc comment for the full mixed-build
+ * argument for why this is carried on a SEPARATE `admission:withheld` label
+ * rather than a new `agent:*` value.
+ */
+export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look" | "withheld";
 
 export interface CheckWorkerResult {
   key: string;
@@ -879,7 +896,7 @@ export interface CheckWorkerResult {
   staffing: StaffingVerdict;
   /** Which source produced `staffing` — "herd" is the live, authoritative probe (`herd.runningIssues()`, src/agents/herd.ts), consulted ONLY when it is known to cover this worker (see `probeOutOfScope` below); "label" is the `agent:*` label already on the ticket, which can be up to a poll stale and is further damped by the stabilizer in src/labels/sync.ts (a candidate value must be observed on two consecutive polls before it's written) — but is written by WHICHEVER daemon actually staffs this ticket, so it stays a valid signal even when a probe wired into THIS call is not. A caller that cares about freshness reads THIS field, never just `staffing` — a label-derived verdict must never be mistaken for a live one. */
   source: "herd" | "label";
-  /** Present ONLY when `source` is "label" AND the ticket actually carries an `agent:*` label — the exact value observed (e.g. "agent:none"). Absent when `source` is "label" but no `agent:*` label was found at all (e.g. the ticket's status was never active, so the label machinery never wrote one) — that absence is exactly the case where `staffing` is "could-not-look", not a guessed "not-staffed". */
+  /** Present ONLY when `source` is "label" AND the ticket actually carries an `agent:*` label — the exact value observed (e.g. "agent:none"). Absent when `source` is "label" but no `agent:*` label was found at all (e.g. the ticket's status was never active, so the label machinery never wrote one) — that absence is exactly the case where `staffing` is "could-not-look", not a guessed "not-staffed". This is always the `agent:*` value, even when `staffing` is "withheld" — that verdict is a SEPARATE `admission:withheld` marker layered on top of `agent:none`, which this field does not carry a second copy of (see `checkWorker`'s own doc comment). */
   observedLabel?: string;
   /**
    * BUTCHR-244 (AC-5, added after a live near-miss during THIS ticket's own
@@ -959,7 +976,114 @@ async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boo
  * a guessed "not-staffed". `source` on the result always names which one
  * actually answered; `probeOutOfScope` says when a probe existed but was
  * never even asked.
+ *
+ * BUTCHR-352 — THE FOURTH VERDICT, "withheld": an `agent:none` ticket can
+ * mean three DIFFERENT things (about to spawn, silently never spawned, or
+ * correctly withheld at the fleet-wide admission cap) that a boss must react
+ * to in opposite ways, and `agent:none` alone cannot tell them apart. The
+ * daemon that actually staffs this worker writes a SEPARATE `admission:*`
+ * label (src/labels/plan.ts's `ADMISSION_PREFIX`) — deliberately NOT a new
+ * `agent:*` value — the moment its own admission census confirms this
+ * ticket is withheld; this function reads it ALONGSIDE `agent:*`, not
+ * instead of it: `agent:none` plus `admission:withheld` means "withheld";
+ * `agent:none` alone still means "not-staffed", exactly as before. A worker
+ * whose `agent:*` label is anything else is trusted at face value — an
+ * `admission:withheld` marker under any other `agent:*` value is stale or
+ * contradictory (admission only ever withholds a candidate with no running
+ * agent) and is deliberately ignored rather than asserted. This rule
+ * (`staffingFromAgentLabel` below) is the SAME rule on BOTH paths that can
+ * reach it — the label branch, and the `probed === false` herd branch when
+ * the marker is present — never two independently-drifting versions of it
+ * (review round 1 caught exactly that: the herd branch once hardcoded
+ * `observedLabel: "agent:none"` without reading it, reachable via the
+ * stranded-marker shape described below).
+ *
+ * WHY A SEPARATE LABEL, NOT A NEW `agent:*` VALUE (the mixed-build hazard):
+ * this fleet's daemons deploy INDEPENDENTLY, and the restart-that-pulls new
+ * code belongs to a different story — so for an unbounded window a NEW-build
+ * daemon can write a state that an OLD-build `checkWorker` still has to
+ * read. Confirmed by execution against unchanged code (25edb44), label
+ * branch, no probe (the same branch `probeOutOfScope: true` forces): a
+ * hypothetical `agent:withheld` value reads as a confident `"staffed"` on
+ * that old code (`observedLabel === "agent:none" ? "not-staffed" :
+ * "staffed"` treats ANY non-`agent:none` value as a running agent) —
+ * strictly worse than today's honest `"not-staffed"`. A separate,
+ * non-`agent:`-prefixed marker is structurally invisible to that same old
+ * code (it only ever looks at `AGENT_PREFIX`-matching labels), so an
+ * UNUPGRADED reader simply keeps seeing `agent:none` alone and keeps
+ * returning `"not-staffed"` — an honest, incomplete answer, never a
+ * confident wrong one. This is the same discipline this whole verdict type
+ * exists to enforce, applied to the carrier itself, not only to the value.
+ *
+ * WHY THE TWO PATHS DIFFER (review round 2 — round 1's own first attempt at
+ * this got it backwards): the `probed === false` herd branch and the label
+ * branch below do NOT hold the same evidence, so they must not be forced to
+ * agree. The herd branch has a LIVE observation — the herd itself just
+ * looked and found no running agent. The label branch has no observation at
+ * all, only a label that can be a poll stale and further damped by a
+ * two-poll stabilizer (src/labels/sync.ts's `AgentLabelStabilizer`). A LIVE
+ * OBSERVATION OUTRANKS A LABEL — it is never overridden by one, never
+ * relabelled as `could-not-look` or a lagging `staffed`/`stalled` value just
+ * because some `agent:*` label says so. What `admission:withheld` can do on
+ * the herd branch is narrower: CONVERT the herd's own verdict, never
+ * override it with an unrelated one — and the only ticket state where "not
+ * running" is genuinely ambiguous between "not desired" and "withheld" is
+ * when the REAL `agent:*` label reads exactly `agent:none` (the one case
+ * with no contradicting observation to outrank). Every other probed===false
+ * state returns exactly what it always has: `{ staffing: "not-staffed",
+ * source: "herd" }`. See that branch's own comment for the full argument,
+ * and `staffingFromAgentLabel`'s own doc comment for why it is deliberately
+ * NOT reused there.
  */
+/**
+ * BUTCHR-352: the rule for turning an OBSERVED `agent:*` label (or its
+ * genuine absence) plus whether the `admission:withheld` marker is present
+ * into a staffing verdict — used ONLY on the LABEL branch below, where
+ * nothing else looked. Deliberately NOT shared with the `probed === false`
+ * herd branch above: that branch has a LIVE observation to defer to, this
+ * one does not, and the two must not be conflated into one "the marker
+ * decides" rule (review round 2's own finding — see `checkWorker`'s own
+ * "WHY THE TWO PATHS DIFFER" doc paragraph above for the full argument).
+ *
+ * No `agent:*` label at all -> `could-not-look`, regardless of the marker: a
+ * stray marker with no `agent:*` label is not itself evidence of a running
+ * (or not-running) agent. Any `agent:*` value other than `none` -> `staffed`,
+ * and the marker is deliberately ignored — a stale/contradictory combination
+ * (admission only ever withholds a candidate with no running agent), never
+ * asserted. `agent:none` -> `withheld` if the marker is present, else
+ * `not-staffed`. `observedLabel` in the result is always the REAL value read,
+ * never a literal — absent only when no `agent:*` label was found at all.
+ */
+export function staffingFromAgentLabel(observedLabel: string | undefined, withheldMarker: boolean): { staffing: StaffingVerdict; observedLabel?: string } {
+  if (observedLabel === undefined) return { staffing: "could-not-look" };
+  if (observedLabel !== `${AGENT_PREFIX}none`) return { staffing: "staffed", observedLabel };
+  return { staffing: withheldMarker ? "withheld" : "not-staffed", observedLabel };
+}
+
+/**
+ * BUTCHR-353: `staffingFromAgentLabel` above, fed from a plain labels array
+ * instead of a raw Jira issue payload — the shape the stall remediator's own
+ * `labels` dep returns (see StallRemediationDeps there), so that module
+ * never has to know Jira's raw `fields.labels` shape at all, matching every
+ * other dependency it already takes as pre-parsed. Composes the SAME two
+ * reads `checkWorker`'s label branch performs (find the `agent:*` value,
+ * check for the `admission:withheld` marker) through the SAME rule — never
+ * a second, independently-drifting version of either.
+ *
+ * Exported and reused because the stall remediator has NO live probe of a
+ * worker's agent to defer to (workers are staffed by role, never the same
+ * account as their boss — a probe wired there would be structurally blind,
+ * see that module's own doc comment) — it is always on this same label
+ * path, so this is the exact rule that governs it, not a fresh
+ * "marker present -> waiting" read that would reopen BUTCHR-352 review round
+ * 2's mistake (a marker overriding a live observation) in prose form.
+ */
+export function staffingFromWorkerLabels(labels: readonly string[]): { staffing: StaffingVerdict; observedLabel?: string } {
+  const observedLabel = labels.find((l) => l.startsWith(AGENT_PREFIX));
+  const withheldMarker = labels.includes(`${ADMISSION_PREFIX}withheld`);
+  return staffingFromAgentLabel(observedLabel, withheldMarker);
+}
+
 export async function checkWorker(
   ops: AtlassianOps,
   callerKey: string,
@@ -978,21 +1102,57 @@ export async function checkWorker(
       } catch {
         probed = null; // a rejecting probe means "could not look", never "not staffed" — falls through to the label below, same as an explicit null.
       }
-      if (probed !== null) {
-        return { key: workerKey, status, staffing: probed ? "staffed" : "not-staffed", source: "herd" };
+      if (probed === true) {
+        return { key: workerKey, status, staffing: "staffed", source: "herd" };
       }
+      if (probed === false) {
+        // BUTCHR-352 — WHY THE TWO PATHS DIFFER (review round 2's own
+        // finding, correcting round 1's own clause): this branch has a LIVE
+        // observation — the herd itself just looked and found no running
+        // agent — while the label branch below has none, only a label that
+        // can be a poll stale and is further damped by a two-poll
+        // stabilizer. A live observation OUTRANKS a label; it is never
+        // overridden by one. So `admission:withheld` does not get to
+        // relabel a live "not running" read as `could-not-look` or
+        // `staffed` just because some `agent:*` label says so (round 1's
+        // mistake: deferring wholesale to `staffingFromAgentLabel` let a
+        // lagging `agent:working`/`agent:stalled` label override a live
+        // "not running" read into a confident, WRONG `staffed` — strictly
+        // worse than the defect round 1 was fixing).
+        //
+        // What the marker CAN do here is narrower: CONVERT the herd's own
+        // verdict, never override an observation with a different one. The
+        // only ticket state where "not running" is ambiguous between
+        // "genuinely not desired" and "withheld at capacity this poll" is
+        // when the ticket's own `agent:*` label reads exactly `agent:none`
+        // — that is the one case with no contradicting observation to
+        // outrank. So: read the REAL label (round 1's own finding still
+        // holds — never a hardcoded literal); if it is exactly `agent:none`
+        // AND the marker is present, convert to `withheld`. Every other
+        // state — any other label, or no label at all — returns exactly
+        // what a `probed === false` read has always returned:
+        // `{ staffing: "not-staffed", source: "herd" }`, never routed
+        // through the label branch's own `could-not-look`/`staffed`
+        // outcomes (which is what `staffingFromAgentLabel` computes — kept
+        // deliberately unused here, see its own doc comment).
+        const observedLabel = labelsOf(issue).find((l) => l.startsWith(AGENT_PREFIX));
+        if (observedLabel === `${AGENT_PREFIX}none` && labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`)) {
+          return { key: workerKey, status, staffing: "withheld", source: "label", observedLabel };
+        }
+        return { key: workerKey, status, staffing: "not-staffed", source: "herd" };
+      }
+      // probed === null: falls through to the label branch below, same as a rejecting probe.
     } else {
       outOfScope = true;
     }
   }
 
   const observedLabel = labelsOf(issue).find((l) => l.startsWith(AGENT_PREFIX));
-  if (observedLabel === undefined) {
-    return { key: workerKey, status, staffing: "could-not-look", source: "label", ...(outOfScope ? { probeOutOfScope: true } : {}) };
-  }
+  const withheldMarker = labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`);
+  const result = staffingFromAgentLabel(observedLabel, withheldMarker);
   return {
-    key: workerKey, status, source: "label", observedLabel,
-    staffing: observedLabel === `${AGENT_PREFIX}none` ? "not-staffed" : "staffed",
+    key: workerKey, status, source: "label", staffing: result.staffing,
+    ...(result.observedLabel !== undefined ? { observedLabel: result.observedLabel } : {}),
     ...(outOfScope ? { probeOutOfScope: true } : {}),
   };
 }
@@ -1020,7 +1180,7 @@ export async function checkWorker(
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("finish_worker", workerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_worker", workerKey, open));
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
@@ -1034,7 +1194,7 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
  * workers, and refuses an empty reason.
  */
 export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerKey: string, reason: string): Promise<void> {
-  if (!reason.trim()) throw new Error("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+  if (!reason.trim()) throw new Refusal("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   guardShortProse("shelve_worker", "reason", reason);
   await assertOwnWorker(ops, "shelve_worker", callerKey, workerKey);
   // LABEL BEFORE TRANSITION, on purpose (order the writes by how bad it is to
@@ -1122,7 +1282,7 @@ export interface AdoptWorkerResult {
  */
 export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   if (disposition.kind === "shelve") guardShortProse("adopt_worker", "reason", disposition.reason);
   if (isProjectId(callerKey)) return adoptProjectWorker(ops, roles, callerKey, workerKey, disposition);
@@ -1130,15 +1290,15 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const issue = await ops.getIssue(workerKey);
   const existingBoss = findBossKey(issue);
   if (existingBoss && existingBoss !== callerKey) {
-    throw new Error(`adopt_worker: ${workerKey} is already linked to a different boss (${existingBoss}) — stealing another boss's worker must be an explicit act, not a side effect of a mistyped key; use jira_link_issues only if this is deliberate`);
+    throw new Refusal(`adopt_worker: ${workerKey} is already linked to a different boss (${existingBoss}) — stealing another boss's worker must be an explicit act, not a side effect of a mistyped key; use jira_link_issues only if this is deliberate`);
   }
 
   const issuetype = issuetypeOf(issue) as "Story" | "Task" | undefined;
   if (issuetype !== "Story" && issuetype !== "Task") {
-    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
+    throw new Refusal(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
   }
   const role = issuetype === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
+  if (!role) throw new Refusal(noRoleMsg("adopt_worker", issuetype));
 
   const labels = labelsOf(issue);
   const linkedCorrectly = existingBoss === callerKey;
@@ -1315,15 +1475,15 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   const issue = await ops.getIssue(workerKey);
   const existingProject = projectKeyOf(issue);
   if (existingProject !== projectKey) {
-    throw new Error(`adopt_worker: ${workerKey} belongs to project ${existingProject ?? "an unreadable project"}, not ${projectKey} — stealing another project's epic must be an explicit act, not a side effect of a mistyped key`);
+    throw new Refusal(`adopt_worker: ${workerKey} belongs to project ${existingProject ?? "an unreadable project"}, not ${projectKey} — stealing another project's epic must be an explicit act, not a side effect of a mistyped key`);
   }
 
   const issuetype = issuetypeOf(issue);
   if (issuetype !== "Epic") {
-    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted by a project caller — only an Epic can be`);
+    throw new Refusal(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted by a project caller — only an Epic can be`);
   }
   const role = roles.epic;
-  if (!role) throw new Error(noRoleMsg("adopt_worker", "Epic"));
+  if (!role) throw new Refusal(noRoleMsg("adopt_worker", "Epic"));
 
   const labels = labelsOf(issue);
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
@@ -1411,7 +1571,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
 /** Revises a worker's priority. Refuses a key that is not one of the caller's own workers, AND refuses the caller's OWN key — your priority is your boss's judgment, never your own. */
 export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, workerKey: string, priority: string): Promise<unknown> {
   if (workerKey === callerKey) {
-    throw new Error(`prioritize_worker: refusing to set ${callerKey}'s own priority — your priority is your boss's judgment, never your own`);
+    throw new Refusal(`prioritize_worker: refusing to set ${callerKey}'s own priority — your priority is your boss's judgment, never your own`);
   }
   await assertOwnWorker(ops, "prioritize_worker", callerKey, workerKey);
   return ops.setPriority(workerKey, priority);
@@ -1715,7 +1875,7 @@ async function postCorrectionArchive(
   const overhead = tagPrefixLen + CORRECTION_MARKER.length + 1 + PART_HEADER_RESERVED_LEN + CHAIN_SAFETY_MARGIN;
   const perPartBudget = JIRA_COMMENT_CHAR_LIMIT - overhead;
   if (perPartBudget <= 0) {
-    throw new Error(`correct_worker: cannot chain the archive comment on ${workerKey} — the identity tag and markers alone leave no room under Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap; ${workerKey} is UNCHANGED.`);
+    throw new Refusal(`correct_worker: cannot chain the archive comment on ${workerKey} — the identity tag and markers alone leave no room under Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap; ${workerKey} is UNCHANGED.`);
   }
   const chunks = splitPreservingSurrogates(body, perPartBudget);
   const n = chunks.length;
@@ -1740,7 +1900,7 @@ async function postCorrectionArchive(
         // the correct, already-established error thrown next — never a
         // secondary error about the annotation itself failing to post.
       }
-      throw new Error(
+      throw new Refusal(
         `correct_worker: the archive comment for ${workerKey} exceeded Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap and had to be split into ${n} parts; part ${i} of ${n} failed to post (${postError}) — refusing to edit without a complete archive; ${workerKey} is UNCHANGED. Safe to retry.`,
       );
     }
@@ -1948,25 +2108,25 @@ function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace
  */
 export async function correctWorker(ops: AtlassianOps, callerKey: string, workerKey: string, input: CorrectWorkerInput): Promise<CorrectWorkerResult> {
   if (workerKey === callerKey) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing to correct ${callerKey}'s own description/summary — your own brief is your boss's judgment, never your own; an agent that can rewrite its own definition of done can launder a failure into a success, and the resulting ticket would be indistinguishable from one that was always right. Ask your own boss to correct it instead (ask_boss / report_to_boss) — it can correct you, you cannot correct yourself.`,
     );
   }
   if (input.description === undefined && input.summary === undefined) {
-    throw new Error("correct_worker: neither `description` nor `summary` was given — a correction that corrects nothing is a mistake, not a no-op");
+    throw new Refusal("correct_worker: neither `description` nor `summary` was given — a correction that corrects nothing is a mistake, not a no-op");
   }
   if (!input.why.trim()) {
-    throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
+    throw new Refusal("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
   guardShortProse("correct_worker", "why", input.why);
   if (input.summary !== undefined) guardShortProse("correct_worker", "summary", input.summary);
   if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
     );
   }
   if (input.summary !== undefined && input.summary.length > JIRA_SUMMARY_CHAR_LIMIT) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing — the new summary is ${input.summary.length} characters, over Jira's ${JIRA_SUMMARY_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
     );
   }
@@ -2286,20 +2446,20 @@ export async function tellPeer(
   intent: PeerIntent,
 ): Promise<TellPeerResult> {
   if (!PEER_INTENTS.includes(intent)) {
-    throw new Error(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
+    throw new Refusal(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
   }
   if (peer === callerKey) {
-    throw new Error(
+    throw new Refusal(
       `tell_peer: ${callerKey} cannot send itself a peer message — a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer, which is a channel to OTHER projects only`,
     );
   }
   if (intent === "decline") {
     const trimmed = text.trim();
     if (!trimmed) {
-      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
+      throw new Refusal(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
     }
     if (PEER_DECLINE_PLACEHOLDERS.has(normalizePeerDeclineText(trimmed))) {
-      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
+      throw new Refusal(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
     }
   }
 
@@ -2310,7 +2470,7 @@ export async function tellPeer(
   const target = peers.find((p) => p.key === peer);
   if (!target) {
     const names = peers.length ? peers.map((p) => `${p.key} (${p.name})`).join(", ") : "none";
-    throw new Error(
+    throw new Refusal(
       `tell_peer: "${peer}" is not an eligible peer of ${callerKey} — unknown key, not live, not led by this credential, or missing a readable "butchr" entity property. Eligible peers: ${names}`,
     );
   }
@@ -2345,7 +2505,7 @@ export async function tellPeer(
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("submit_to_boss", callerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("submit_to_boss", callerKey, open));
   return ops.transition(callerKey, "In Review");
 }
 
@@ -2452,7 +2612,7 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
   const issue = await ops.getIssue(callerKey);
   const boss = findBossKey(issue);
   if (boss) {
-    throw new Error(
+    throw new Refusal(
       `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
@@ -2477,25 +2637,35 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
     try {
       tier = await readProjectTierProperty(ops, projectKey);
     } catch (e) {
-      // FAIL CLOSED: a project-tier read we could not complete must never
+      // FAIL CLOSED, and a `Refusal` not an `Error` (BUTCHR-341): this is
+      // a guard declining to act on an UNRELIABLE READ — nothing was
+      // attempted or committed, the guard simply chose not to proceed
+      // without trustworthy information. That is the exact case
+      // outcome.ts's own doc comment names as staying `refused` despite
+      // wrapping a caught failure (its cited precedent,
+      // projectRootDoc/ensureDoc's "'butchr' entity property is unreadable
+      // — refusing rather than guessing", is the SAME property and the
+      // same shape as this read). Classifying it `error` would make a
+      // working guard read as flakiness in every outcome record.
+      // A project-tier read we could not complete must never
       // be read as "no boss" — that would let exactly the six-epic
       // self-close defect this ticket exists to close back in through a
       // transient error instead of a design gap. Distinguishable from both
       // the has-a-boss refusals above and the open-workers refusal below —
       // a test asserts on that.
-      throw new Error(
+      throw new Refusal(
         `finish_without_a_boss: could not determine whether ${callerKey} has a boss — reading the project tier for ${projectKey} failed (${(e as Error).message}). Refusing rather than treating "could not look" as "no boss".`,
       );
     }
     if (tier) {
-      throw new Error(
+      throw new Refusal(
         `finish_without_a_boss: ${callerKey} has a boss — its project ${projectKey} carries a project-tier root doc and reviews its own Epics — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${projectKey} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
       );
     }
   }
 
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("finish_without_a_boss", callerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");
 }
 
@@ -2566,8 +2736,8 @@ function normalizeDestinationText(raw: string): string {
  * destination looks like, both accepted shapes, and WHY it's asked at all.
  * `reason` is the specific complaint, stated plainly and without scolding.
  */
-function destinationRefusal(reason: string): Error {
-  return new Error(
+function destinationRefusal(reason: string): Refusal {
+  return new Refusal(
     `file_where_it_belongs: ${reason} A destination is either an EXISTING EPIC KEY this work belongs under (e.g. "BUTCHR-25"), or a short REASON it needs a brand-new epic (e.g. "no epic covers observability tooling yet") — both are legitimate, neither is a fallback for the other. ` +
       "This is required, not bureaucracy: filing a ticket outside your own scope is only half the job — saying where it should live is the other half. An orphan with no stated destination is exactly the silent failure this verb exists to prevent.",
   );
@@ -2917,7 +3087,7 @@ async function topmostBoss(ops: AtlassianOps, startKey: string, startIssue: unkn
     key = boss;
     issue = await ops.getIssue(key);
   }
-  throw new Error(`file_where_it_belongs: ${startKey}'s own Implements chain is more than ${MAX_ORPHAN_CHAIN_DEPTH} hops deep — refusing rather than risking a cycle looping forever`);
+  throw new Refusal(`file_where_it_belongs: ${startKey}'s own Implements chain is more than ${MAX_ORPHAN_CHAIN_DEPTH} hops deep — refusing rather than risking a cycle looping forever`);
 }
 
 export interface FileWhereItBelongsInput {
@@ -3045,11 +3215,11 @@ export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, caller
   }
 
   const role = input.issuetype === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("file_where_it_belongs", input.issuetype));
+  if (!role) throw new Refusal(noRoleMsg("file_where_it_belongs", input.issuetype));
 
   const callerIssue = await ops.getIssue(callerKey);
   const projectKey = projectKeyOf(callerIssue);
-  if (!projectKey) throw new Error(`file_where_it_belongs: could not read ${callerKey}'s own project key — refusing rather than guessing`);
+  if (!projectKey) throw new Refusal(`file_where_it_belongs: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
   const header = orphanHeader(destination, callerKey);
   const description = input.description ? `${header}\n\n---\n\n${input.description}` : header;
@@ -3065,7 +3235,7 @@ export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, caller
     labels: [ORPHAN_LABEL],
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
+  if (!key) throw new Refusal("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
 
   // (2) notice — best-effort, never a link.
   const noticeTarget = destination.kind === "epic" ? destination.key : await topmostBoss(ops, callerKey, callerIssue);

@@ -528,4 +528,280 @@ describe("createStallRemediator", () => {
       expect(jira.posted.length).toBe(1);
     });
   });
+
+  // BUTCHR-353: the wake gains a "correctly waiting" branch (a worker
+  // withheld at the admission cap, or In Review awaiting this ticket's own
+  // review) and names any unanswered [ask] from the stalled ticket's own
+  // workers — instead of the two harmful default branches (close/transition,
+  // or "act now") that a correctly-waiting boss would otherwise be told.
+  describe("BUTCHR-353: correctly-waiting / In Review / unanswered-ask branches", () => {
+    /** A fake per-issue labels store, call-counted so tests can pin the cost bound (at most once per non-Done worker, only on the posting poll). */
+    function fakeLabels(initial: Record<string, readonly string[]> = {}) {
+      const store = new Map(Object.entries(initial));
+      const calls: string[] = [];
+      return {
+        calls,
+        set: (key: string, labels: readonly string[]) => store.set(key, labels),
+        labels: async (key: string) => {
+          calls.push(key);
+          return store.get(key) ?? [];
+        },
+      };
+    }
+
+    // Falsifier 4 (must NOT change with none of the new signals) is already
+    // pinned by every pre-existing test above (all call `check` with no
+    // `workers` argument at all); this test additionally pins it with an
+    // explicit EMPTY `workers` array, and asserts the exact byte-for-byte
+    // DEFAULT_TAIL text survives — a body-shape regression, not merely
+    // "still acted", would otherwise slip through unnoticed.
+    test("no workers (or none non-Done): today's wake text, byte-for-byte unchanged", async () => {
+      const jira = fakeJira();
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true, null, []);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).toContain(
+        "This comment exists to wake this ticket's agent. If it is genuinely done, close or transition this ticket so agent:stalled clears. If it is stuck, act on this ticket now.",
+      );
+      expect(jira.posted[0]!.text).not.toContain("[butchr:stall:waiting]");
+    });
+
+    test("a Done worker is excluded entirely: no labels/comments call for it, and it produces no signal even with stale [ask]/withheld data present", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:none", "admission:withheld"] });
+      jira.seed("WORK-1", "c1", "[WORK-1] [ask] still waiting?", "2026-01-01T00:00:00.000Z");
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "Done" }]);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).not.toContain("WORK-1");
+      expect(jira.posted[0]!.text).not.toContain("[butchr:stall:waiting]");
+      expect(lbl.calls).toEqual([]);
+    });
+
+    // (B) — the core "correctly waiting" case BUTCHR-207 measured on
+    // BUTCHR-238: agent:none + admission:withheld reads as withheld via
+    // BUTCHR-352's own reused label-path rule, and the wake must NOT advise
+    // transitioning/closing or acting now (falsifier 2).
+    test("(B) a non-Done, non-In-Review worker with agent:none + admission:withheld: named as withheld, harmful advice absent", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:none", "admission:withheld"] });
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).toContain("[butchr:stall:waiting]");
+      expect(text).toContain("WORK-1");
+      expect(text).toContain("admission:withheld");
+      expect(text).not.toContain("close or transition this ticket so agent:stalled clears");
+      expect(text).not.toContain("act on this ticket now");
+      // BUTCHR-353 review round 2: the tail must not read as "this wake
+      // comment already cleared the streak" — it starts with DAEMON_CHATTER_
+      // PREFIX ("[butchr:") and stalled.ts's own findMarked-adjacent streak
+      // check excludes daemon chatter, so only a REPLY from the agent counts.
+      expect(text).toContain("a comment from you saying so counts; this one does not");
+    });
+
+    // Falsifier 5, control A: a STALE marker (worker's real agent:* label is
+    // NOT none — it is genuinely running) must NOT convert to "withheld" —
+    // BUTCHR-352's own rule (admission only ever withholds a candidate with
+    // no running agent) makes this state unreachable by construction, not by
+    // a special case here. Falls all the way through to the unchanged
+    // default text since no other signal applies.
+    test("falsifier 5 (a): agent:working + admission:withheld is a STALE marker — never reported as withheld", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:working", "admission:withheld"] });
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).not.toContain("[butchr:stall:waiting]");
+      expect(text).not.toContain("WORK-1");
+      expect(text).toContain("close or transition this ticket so agent:stalled clears");
+    });
+
+    // Falsifier 5, control B: the STRANDING case (BUTCHR-352 review round
+    // 1's own finding) — a marker with NO agent:* label at all is
+    // could-not-look, not withheld, regardless of the marker.
+    test("falsifier 5 (b): admission:withheld with NO agent:* label at all (stranded) — never reported as withheld", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["admission:withheld"] });
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).not.toContain("[butchr:stall:waiting]");
+    });
+
+    // (B2) — new scope: a worker In Review awaiting THIS boss's own review
+    // counts as correctly waiting too (falsifier 3), and — because status
+    // alone (a live read) already answers it — the labels dep is never even
+    // consulted for that worker (cost bound: labels paid only for the
+    // non-In-Review subset).
+    test("(B2) a non-Done worker In Review: named, no harmful advice, and labels() is never called for it", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels();
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Review" }]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).toContain("[butchr:stall:waiting]");
+      expect(text).toContain("WORK-1");
+      expect(text).toContain("In Review");
+      expect(text).not.toContain("close or transition this ticket so agent:stalled clears");
+      expect(text).not.toContain("act on this ticket now");
+      expect(lbl.calls).toEqual([]);
+    });
+
+    // (C) — BUTCHR-316/BUTCHR-341's own measured deadlock: a worker's own
+    // [ask], with no reply from THIS boss yet, must be named (falsifier 1).
+    test("(C) a non-Done worker with an unanswered [ask]: named, harmful advice absent", async () => {
+      const jira = fakeJira();
+      jira.seed("WORK-1", "c1", "[WORK-1] [ask] can I proceed without a reviewer?", "2026-01-01T00:00:00.000Z");
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).toContain("[butchr:stall:waiting]");
+      expect(text).toContain("WORK-1");
+      expect(text).toContain("[ask]");
+      expect(text).not.toContain("close or transition this ticket so agent:stalled clears");
+    });
+
+    // (C), the other direction (falsifier 1's own "without one, it does
+    // not" half): a reply from THIS boss, posted AFTER the ask (i.e. newer,
+    // earlier in the newest-first list), makes it answered — not named.
+    test("(C) an [ask] answered by THIS boss (a later tell_worker reply) is NOT named", async () => {
+      const jira = fakeJira();
+      jira.seed("WORK-1", "c1", "[WORK-1] [ask] can I proceed without a reviewer?", "2026-01-01T00:00:00.000Z");
+      jira.seed("WORK-1", "c2", "[KAN-1] yes, go ahead", "2026-01-01T00:05:00.000Z"); // seeded AFTER c1 -> newer, unshifted to the front
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).not.toContain("[butchr:stall:waiting]");
+      expect(text).toContain("This comment exists to wake this ticket's agent");
+    });
+
+    // (C) control: a reply from a DIFFERENT ticket's identity tag (not this
+    // boss) must not count as an answer — proves the check is keyed on
+    // "reply from THIS caller", not "any later comment at all".
+    test("(C) a later comment from someone OTHER than this boss does not count as an answer", async () => {
+      const jira = fakeJira();
+      jira.seed("WORK-1", "c1", "[WORK-1] [ask] can I proceed without a reviewer?", "2026-01-01T00:00:00.000Z");
+      jira.seed("WORK-1", "c2", "[OTHER-9] unrelated chatter", "2026-01-01T00:05:00.000Z");
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      const text = jira.posted[0]!.text;
+      expect(text).toContain("[butchr:stall:waiting]");
+      expect(text).toContain("WORK-1");
+    });
+
+    // Multiple simultaneous signals across different workers are all named
+    // in one wake, rather than the module picking only one.
+    test("multiple workers with different signals are all named in one wake", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:none", "admission:withheld"] });
+      jira.seed("WORK-2", "c1", "[WORK-2] [ask] need a decision", "2026-01-01T00:00:00.000Z");
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      const outcome = await rem.check("KAN-1", true, true, null, [
+        { key: "WORK-1", status: "In Progress" },
+        { key: "WORK-2", status: "In Progress" },
+        { key: "WORK-3", status: "In Review" },
+      ]);
+      expect(outcome.kind).toBe("acted");
+      const text = jira.posted[0]!.text;
+      expect(text).toContain("WORK-1");
+      expect(text).toContain("admission:withheld");
+      expect(text).toContain("WORK-2");
+      expect(text).toContain("[ask]");
+      expect(text).toContain("WORK-3");
+      expect(text).toContain("In Review");
+    });
+
+    // Unknown never becomes a confident claim: a labels() rejection for a
+    // worker is caught, logged, and that worker is simply dropped from the
+    // withheld signal — never defaulted into "withheld".
+    test("a labels() fetch failure for a worker is not claimed as withheld, and is logged without the failure crashing the poll", async () => {
+      const jira = fakeJira();
+      const logs: string[] = [];
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        labels: async () => { throw new Error("Jira 500"); },
+        log: (l) => logs.push(l),
+      });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).not.toContain("[butchr:stall:waiting]");
+      expect(logs.some((l) => l.startsWith("WARNING: [stall]") && l.includes("WORK-1") && l.includes("labels fetch failed"))).toBe(true);
+    });
+
+    // Same discipline for the ask check's own comments() read of a WORKER's
+    // ticket (distinct from the stalled ticket's own comments() read used
+    // for adoption/dedupe, which must still succeed for this poll to reach
+    // the posting path at all).
+    test("a comments() fetch failure for a worker's own ticket is not claimed as an unanswered ask, and is logged", async () => {
+      const jira = fakeJira();
+      const logs: string[] = [];
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: async (issue) => { if (issue === "WORK-1") throw new Error("timeout"); return jira.comments(issue); },
+        log: (l) => logs.push(l),
+      });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).not.toContain("[butchr:stall:waiting]");
+      expect(logs.some((l) => l.startsWith("WARNING: [stall]") && l.includes("WORK-1") && l.includes("comments fetch failed"))).toBe(true);
+    });
+
+    // `labels` omitted entirely: the ask/In-Review branches still work
+    // (they don't need it), and the withheld branch is simply unavailable
+    // — never a throw.
+    test("labels dep omitted: ask/In-Review branches still work; withheld branch is silently unavailable", async () => {
+      const jira = fakeJira();
+      jira.seed("WORK-1", "c1", "[WORK-1] [ask] anyone there?", "2026-01-01T00:00:00.000Z");
+      const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome.kind).toBe("acted");
+      expect(jira.posted[0]!.text).toContain("[butchr:stall:waiting]");
+    });
+
+    // COST BOUND: worker reads happen at most once per stalled EPISODE — on
+    // the poll that actually posts — never on a steady-state
+    // "already remediated" poll, matching the log-flood discipline the rest
+    // of this module already enforces.
+    test("cost bound: labels()/comments(worker) are called only on the poll that actually posts, never again in steady state", async () => {
+      let now = 0;
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:none", "admission:withheld"] });
+      const rem = createStallRemediator({ now: () => now, addComment: jira.addComment, comments: jira.comments, labels: lbl.labels });
+      await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(lbl.calls).toEqual(["WORK-1"]);
+      for (let i = 0; i < 50; i++) {
+        now += 15_000;
+        const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+        expect(outcome.kind).toBe("suppressed");
+      }
+      expect(lbl.calls).toEqual(["WORK-1"]); // still just the one call, from the posting poll
+    });
+
+    // COST BOUND, the other short-circuits: quota-blocked and rate-capped
+    // polls must not touch labels()/comments(worker) either — they return
+    // before gatherWorkerSignals is ever reached.
+    test("cost bound: a quota-blocked poll never calls labels() for a worker", async () => {
+      const jira = fakeJira();
+      const lbl = fakeLabels({ "WORK-1": ["agent:none", "admission:withheld"] });
+      const rem = createStallRemediator({
+        now: () => 0,
+        addComment: jira.addComment,
+        comments: jira.comments,
+        labels: lbl.labels,
+        quotaBlocked: () => true,
+      });
+      const outcome = await rem.check("KAN-1", true, true, null, [{ key: "WORK-1", status: "In Progress" }]);
+      expect(outcome).toEqual({ kind: "suppressed", issue: "KAN-1", reason: "quota-blocked" });
+      expect(lbl.calls).toEqual([]);
+    });
+  });
 });

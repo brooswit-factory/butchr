@@ -1,3 +1,5 @@
+import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
+
 /**
  * HALF B of BUTCHR-49/BUTCHR-63: a per-call classification for a deprecated
  * alias's audit line, machine-readable enough for scripts/audit-alias-calls.ts
@@ -119,18 +121,74 @@ export interface ParsedAliasCall {
   classification: AliasClass | "unknown";
 }
 
-const TOOLS_LINE = /\[tools\]\s+(\S+)\s+→/;
+/**
+ * BUTCHR-343 blocker 3, and its own round-2 tightening (BUTCHR-316's review
+ * of #348, non-blocking but decided here — see below): before BUTCHR-316/341
+ * shipped `[tools2]`, every line carrying a `[tools]` tag WAS an old audit
+ * line, so the first `[tools]` on a line was always the real caller's own.
+ * `[tools2]`'s free-text `msg=` (an upstream/`ops` error or a `Refusal`
+ * message, e.g. `jira_transition` passing its caller-supplied `status`
+ * straight into `ops.transition`'s no-match `Error`, which interpolates it
+ * verbatim) can itself contain a complete embedded OLD-format fragment, tag
+ * and all — e.g. `… msg=no transition to "Done [tools] BUTCHR-1 →
+ * transition [alias tool=jira_transition class=drift]" …`. Since `TOOLS_LINE`
+ * used to match ANYWHERE in the line, that embedded `[tools]` was, before
+ * this guard, indistinguishable from a genuine caller's own tag — see
+ * `test/unit/butchr-343-forged-embedded-tags.test.ts` for a `msg=` produced
+ * by driving a hostile-but-caller-reachable `status` through the real
+ * `withOutcomeRecording` wrapper (the throw site itself is faked, since the
+ * real `ops.transition` needs a live Jira — that limit is intentional, see
+ * the test's own comment).
+ *
+ * ROUND 1 of this fix rejected a `[tools]` match only when a `[tools2]` tag
+ * preceded it — closing exactly the embedded-in-`msg=` vector above, but (as
+ * the reviewer named, explicitly NON-blocking, and left to this file's own
+ * judgement) not the more general shape: `TOOLS_LINE` matching anywhere also
+ * lets a `[tools]`-tagged fragment embedded in ANY OTHER daemon line — not
+ * only a `[tools2]` one — forge an identity+call. This predates BUTCHR-316/
+ * 341 entirely (`TOOLS_LINE` has always matched anywhere), so it was never
+ * this story's own regression, but the fix for blocker 2's OWN round 2
+ * (`src/tools/outcome.ts`'s `OUTCOME_LINE_RE`) already builds the general
+ * mechanism this needs — a real structural anchor, not a check against one
+ * named tag — so the marginal cost of closing it here too is near zero, and
+ * leaving a known, mechanically-identical hole open in the sibling reader
+ * once the tooling to close it exists would be an inconsistent posture, not
+ * a considered one. Decision recorded here rather than left implicit: CLOSED,
+ * not filed as a separate ticket.
+ *
+ * THE FIX: mirrors `OUTCOME_LINE_RE`'s own doc comment exactly (`src/tools/
+ * outcome.ts`) — `[tools]` is always the very first thing `defs.ts`'s
+ * `audit` helper puts on its own line (`  [tools] <issue> → <what>`, mod
+ * `journalctl`'s own transport prefix). `JOURNALD_PREFIX_SRC`
+ * (`src/tools/journald-prefix.ts`, shared with `parseOutcomeLine`) matches
+ * every single-line `journalctl --output=` mode, not only the default one —
+ * see that module's own doc comment for why (a human/agent reader is
+ * explicitly sent to run `journalctl` by hand, not only this repo's own
+ * programmatic callers) and for real captured samples of each mode. Anchor
+ * the identity match to the START of the line (that prefix optionally
+ * aside) instead of searching for it anywhere. Deliberately NOT anchored at
+ * the END, unlike `OUTCOME_LINE_RE`: an OLD line's trailing content is
+ * genuinely free-form and verb-specific (`get <key>`, `search <jql>`,
+ * `transition <key> → <status> [deprecated alias; …] [alias …]`, …) with no
+ * single fixed shape to anchor against — the START anchor alone is what "is
+ * the line's own tag" requires; requiring a fixed tail shape that does not
+ * exist would just make this function reject real lines.
+ */
+const TOOLS_LINE = new RegExp(`^${JOURNALD_PREFIX_SRC}\\s*\\[tools\\]\\s+(\\S+)\\s+→`);
 const NEW_ALIAS_TAG = /\[alias tool=([A-Za-z_]+) class=(drift|sanctioned|ambiguous)\]/;
 const OLD_ALIAS_MARKER = "[deprecated alias;";
 
 /**
  * Parse ONE line of text (typically one `journalctl` line, journald prefix
- * and all — this matches anywhere in the line, never anchored to its
- * start) into a `ParsedAliasCall`, or `null` when the line isn't a
- * `[tools]`-audited alias call at all (a permanent verb like
+ * and all — see `TOOLS_LINE`'s own doc comment for exactly what prefix is
+ * tolerated and why) into a `ParsedAliasCall`, or `null` when the line isn't
+ * GENUINELY a `[tools]`-audited alias call — a permanent verb like
  * jira_get_issue, a relationship verb like new_worker, an unrelated daemon
- * log line, …). Pure — no filesystem, no subprocess — so it is fixturable
- * against literal strings, including hand-written pre-BUTCHR-63 lines.
+ * log line, and now also every line where a `[tools]`-shaped fragment is
+ * merely embedded inside another line's own free text, a `[tools2]` line's
+ * `msg=` included (see `TOOLS_LINE`'s own doc comment above). Pure — no
+ * filesystem, no subprocess — so it is fixturable against literal strings,
+ * including hand-written pre-BUTCHR-63 lines.
  */
 export function parseAliasAuditLine(line: string): ParsedAliasCall | null {
   const idMatch = line.match(TOOLS_LINE);

@@ -3,6 +3,7 @@ import { isApiError } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
 import { advanceProjectWatermark } from "../resources/project.js";
 import { HTML4_NAMED_ENTITIES } from "./html4-named-entities.generated.js";
+import { Refusal } from "./outcome.js";
 
 /** The fixed remote-link globalId that carries the ticket -> doc binding. */
 export const DOC_LINK_GLOBAL_ID = "butchr:doc";
@@ -171,7 +172,7 @@ function refuseIfGrowingOverBudget(who: string, stored: string, proposed: string
   const storedLen = stored.length;
   const proposedLen = estimateStoredLength(proposed);
   if (proposedLen > budget && proposedLen > storedLen) {
-    throw new Error(
+    throw new Refusal(
       `${who}: refusing this write — proposed body is an estimated ${proposedLen} characters once stored ` +
         `(${proposed.length} as sent), over the ${budget}-character budget and larger than what's currently ` +
         `stored (${storedLen} characters). This would grow an already-oversized page. Move the excess into a ` +
@@ -186,7 +187,7 @@ export const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]*-[0-9]+$/;
 
 function assertValidKey(key: string, who: string): void {
   if (!JIRA_KEY_RE.test(key)) {
-    throw new Error(`${who}: "${key}" is not a valid Jira key (expected [A-Z][A-Z0-9_]*-[0-9]+) — refusing rather than emitting a label that can't be inverted back to it`);
+    throw new Refusal(`${who}: "${key}" is not a valid Jira key (expected [A-Z][A-Z0-9_]*-[0-9]+) — refusing rather than emitting a label that can't be inverted back to it`);
   }
 }
 
@@ -463,7 +464,7 @@ function buildGetDocResult(who: string, doc: VersionedDocResult, offset: number,
   const { body } = doc;
   const total = body.length;
   if (offset > total) {
-    throw new Error(`${who}: offset ${offset} is past the end of "${doc.title || doc.id}" (${total} characters) — refusing rather than silently clamping to the end`);
+    throw new Refusal(`${who}: offset ${offset} is past the end of "${doc.title || doc.id}" (${total} characters) — refusing rather than silently clamping to the end`);
   }
   const rawEnd = Math.min(offset + limit, total);
   const end = nudgeSurrogateBoundary(body, offset, rawEnd);
@@ -517,17 +518,17 @@ function buildGetDocResult(who: string, doc: VersionedDocResult, offset: number,
 function validateRange(who: string, offset: number | undefined, limit: number | undefined, expectVersion: number | undefined): { offset: number; limit: number; expectVersion?: number } {
   const o = offset ?? 0;
   if (!Number.isInteger(o) || o < 0) {
-    throw new Error(`${who}: offset must be a non-negative integer — got ${JSON.stringify(offset)}`);
+    throw new Refusal(`${who}: offset must be a non-negative integer — got ${JSON.stringify(offset)}`);
   }
   const l = limit ?? DEFAULT_GET_DOC_LIMIT_CHARS;
   if (!Number.isInteger(l) || l < 1) {
-    throw new Error(`${who}: limit must be a positive integer — got ${JSON.stringify(limit)}`);
+    throw new Refusal(`${who}: limit must be a positive integer — got ${JSON.stringify(limit)}`);
   }
   if (expectVersion !== undefined && (!Number.isInteger(expectVersion) || expectVersion < 1)) {
-    throw new Error(`${who}: expectVersion must be a positive integer — got ${JSON.stringify(expectVersion)}`);
+    throw new Refusal(`${who}: expectVersion must be a positive integer — got ${JSON.stringify(expectVersion)}`);
   }
   if (o > 0 && expectVersion === undefined) {
-    throw new Error(
+    throw new Refusal(
       `${who}: expectVersion is required when offset > 0 — pass the \`version\` from the first slice of this read, so a mid-read edit REFUSES instead of silently splicing two versions into a body that never existed. Start again at offset 0 if you no longer have it.`,
     );
   }
@@ -544,10 +545,10 @@ function validateRange(who: string, offset: number | undefined, limit: number | 
 function assertVersionMatches(who: string, doc: VersionedDocResult, expectVersion: number | undefined): void {
   if (expectVersion === undefined) return;
   if (doc.version === null) {
-    throw new Error(`${who}: cannot honour expectVersion=${expectVersion} — this page read carried no version, so the pin is unverifiable. Refusing rather than assuming the document did not change under a multi-call read.`);
+    throw new Refusal(`${who}: cannot honour expectVersion=${expectVersion} — this page read carried no version, so the pin is unverifiable. Refusing rather than assuming the document did not change under a multi-call read.`);
   }
   if (doc.version !== expectVersion) {
-    throw new Error(
+    throw new Refusal(
       `${who}: the document changed mid-read — you pinned expectVersion=${expectVersion} but "${doc.title || doc.id}" is now version ${doc.version}. DISCARD every chunk collected so far and restart from offset 0; concatenating across versions would produce a body that never existed.`,
     );
   }
@@ -697,11 +698,11 @@ export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Pro
   try {
     prop = (await ops.getProjectProperty(projectKey, "butchr")) as typeof prop;
   } catch (e) {
-    throw new Error(`project ${projectKey}: "butchr" entity property is unreadable — refusing rather than guessing a root doc (${(e as Error).message})`);
+    throw new Refusal(`project ${projectKey}: "butchr" entity property is unreadable — refusing rather than guessing a root doc (${(e as Error).message})`);
   }
   const rootDocId = prop?.rootDoc?.id;
   if (!rootDocId) {
-    throw new Error(`project ${projectKey}: "butchr" entity property is missing rootDoc.id — refusing rather than falling back to a space default`);
+    throw new Refusal(`project ${projectKey}: "butchr" entity property is missing rootDoc.id — refusing rather than falling back to a space default`);
   }
   const page = (await ops.getPage(rootDocId)) as { title?: string; body?: { storage?: { value?: string } }; _links?: { base?: string; webui?: string }; version?: { number?: number } } | undefined;
   return {
@@ -879,7 +880,7 @@ async function findLabelledChild(ops: AtlassianOps, parentId: string, label: str
 export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Promise<DocResult> {
   assertValidKey(key, "ensureDoc");
   if (depth > MAX_BOSS_DEPTH) {
-    throw new Error(`ensureDoc: boss chain for ${key} is more than ${MAX_BOSS_DEPTH} hops deep — refusing rather than risking an Implements-link cycle looping forever`);
+    throw new Refusal(`ensureDoc: boss chain for ${key} is more than ${MAX_BOSS_DEPTH} hops deep — refusing rather than risking an Implements-link cycle looping forever`);
   }
 
   // (1) direct read, immediately consistent.
@@ -892,12 +893,12 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
   try {
     prop = (await ops.getProjectProperty(projectKey, "butchr")) as typeof prop;
   } catch (e) {
-    throw new Error(`ensureDoc: project entity property "butchr" is unreadable for project ${projectKey} — refusing rather than guessing a space/root doc (${(e as Error).message})`);
+    throw new Refusal(`ensureDoc: project entity property "butchr" is unreadable for project ${projectKey} — refusing rather than guessing a space/root doc (${(e as Error).message})`);
   }
   const spaceKey = prop?.space?.key;
   const rootDocId = prop?.rootDoc?.id;
   if (!spaceKey || !rootDocId) {
-    throw new Error(`ensureDoc: project entity property "butchr" for project ${projectKey} is missing space.key or rootDoc.id — refusing rather than falling back to Confluence's implicit space default`);
+    throw new Refusal(`ensureDoc: project entity property "butchr" for project ${projectKey} is missing space.key or rootDoc.id — refusing rather than falling back to Confluence's implicit space default`);
   }
 
   // (2) resolve the boss via Implements; recurse for the parent page, or bottom out at the root doc.
@@ -990,7 +991,7 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
 export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<SetDocResult> {
   const doc = await ensureDoc(ops, key);
   if (isProvisional(doc.title) && !title) {
-    throw new Error(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
+    throw new Refusal(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
   }
   refuseIfGrowingOverBudget(`setDoc(${key})`, doc.body, body, DOC_BODY_CHAR_BUDGET);
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });

@@ -10,13 +10,28 @@ import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import type { DashboardResponse } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
+import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
+import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
+
+// BUTCHR-332: a trivial, empty-sources fixture for every existing
+// DashboardResponse literal below that predates the admission view and isn't
+// exercising it.
+const noAdmissionView: AdmissionView = { cap: 0, residency: null, sources: [] };
 
 // BUTCHR-269: a trivial, always-checked-empty fixture for every existing
 // ViewDeps literal below that predates /dashboard and isn't exercising it —
 // the real row-shape/could-not-check contract gets its own dedicated
 // describe block (and its own dedicated fixtures) further down this file.
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+
+// BUTCHR-339: a trivial header fixture for every existing ViewDeps literal
+// below that predates the dashboard PAGE and isn't exercising it — the page's
+// own render contract gets its dedicated fixtures in dashboard-page.test.ts,
+// and this file's own dedicated `GET /` describe block below.
+const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
+const noResourceLink = async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -52,6 +67,8 @@ const view = {
   openPane,
   health: () => healthy,
   dashboard: noDashboard,
+  header: noHeader,
+  resourceLink: noResourceLink,
 };
 const { app, mcp } = buildApp(view);
 app.listen(0);
@@ -86,11 +103,51 @@ describe("butchr daemon app", () => {
   });
 });
 
+// BUTCHR-341 (B): a connection refused for missing `x-issue` produces
+// exactly one [tools2] record — before this ticket, @brooswit/thatch
+// returned the 401 with no log line of any kind (see src/tools/outcome.ts's
+// own doc comment for where that was confirmed) and nothing else observed
+// it either, so this path left NO record at all.
+describe("BUTCHR-341 (B): a pre-identity connection refusal is recorded", () => {
+  test("a connection with no x-issue header logs exactly one [tools2] outcome=refused line with the explicit unknown-caller marker", async () => {
+    const lines: string[] = [];
+    const { app: appB, mcp: mcpB } = buildApp(view, {}, (l) => lines.push(l));
+    appB.listen(0);
+    const baseB = `http://localhost:${appB.server!.port}`;
+    try {
+      await expect(FakeConnection.connect(baseB, { headers: {} })).rejects.toThrow();
+      const outcomeLines = lines.filter((l) => l.includes(OUTCOME_TAG));
+      expect(outcomeLines).toHaveLength(1);
+      expect(outcomeLines[0]).toBe(preIdentityRefusalLine());
+      expect(outcomeLines[0]).toContain(`caller=${UNKNOWN_CALLER}`);
+      expect(outcomeLines[0]).toContain("outcome=refused");
+      expect(outcomeLines[0]).not.toContain("verb=");
+      expect(outcomeLines[0]).not.toContain("target=");
+
+      // a SUCCESSFUL connect, on the same app, must NOT add another one.
+      const a = await FakeConnection.connect(baseB, { headers: { "x-issue": "KAN-1" } });
+      await a.disconnect(); await Bun.sleep(30);
+      expect(lines.filter((l) => l.includes(OUTCOME_TAG))).toHaveLength(1);
+    } finally {
+      await mcpB.closeAll();
+      appB.stop();
+    }
+  });
+});
+
 describe("butchr webapp + open action", () => {
-  test("GET / serves the html page", async () => {
+  // BUTCHR-339: `/` now serves the real dashboard page (src/web/dashboard-page.ts),
+  // rendered from the SAME `dashboard()`/`header()` this fixture's `view`
+  // object already supplies — the render function's own contract (could-not-
+  // check vs. not-applicable vs. known, the two links, freshness) gets its
+  // dedicated coverage in test/unit/dashboard-page.test.ts; this is just the
+  // route-level smoke test that `/` is actually wired to it.
+  test("GET / serves the real dashboard page, built from the injected dashboard()/header()", async () => {
     const html = await (await fetch(`${base}/`)).text();
-    expect(html).toContain("butchr — active agents");
-    expect(html).toContain("/agents/");
+    expect(html).toContain("butchr — dashboard");
+    expect(html).toContain("this daemon runs no agents"); // noDashboard fixture: checked:true, rows:[]
+    expect(html).toContain("open terminal");
+    expect(html).toContain("resource");
   });
   test("GET /state returns the active agents", async () => {
     expect(await (await fetch(`${base}/state`)).json()).toEqual([{ issue: "KAN-9", status: "working", summary: "do a thing" }]);
@@ -108,6 +165,99 @@ describe("butchr webapp + open action", () => {
   });
 });
 
+// BUTCHR-344: the shared fixture app's `noDashboard` above always uses
+// `rows: []`, so neither href closure in `src/web/view.ts`'s `/` route
+// (`terminalLinkHref`/`resourceLinkHref`), nor its `now: Date.now()` wiring,
+// ever runs against a real row in this file's other tests — that's also
+// this route's own function-coverage gap. This describe block drives a
+// NON-EMPTY dashboard (one issue-tier row, one project-tier row) through a
+// real, listening app, reads each row's own href OUT OF THE SERVED HTML, and
+// fetches it back through the SAME app — never a hardcoded, presumed-correct
+// href string — so a wrong href (L4, R7) or a wrong clock (A2) actually
+// fails this test instead of one that only re-asserts what the route is
+// supposed to do.
+function rowSlice(html: string, resourceKey: string): string {
+  const marker = `<span class="key">${resourceKey}</span>`;
+  const start = html.indexOf(marker);
+  if (start === -1) throw new Error(`expected to find a row for resourceKey ${JSON.stringify(resourceKey)}`);
+  const nextStart = html.indexOf('<span class="key">', start + marker.length);
+  return html.slice(start, nextStart === -1 ? html.length : nextStart);
+}
+
+describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/href wiring end-to-end", () => {
+  test("the page's age is derived from the row's own confirmedAt (kills A2), each row's own terminal/resource links, read from the served HTML, actually work when fetched back (kills L4/R7), and the real header() is what's actually served (kills V1)", async () => {
+    // The poll that "produced" this snapshot happened 65s before this
+    // request — enough for humanDuration to round into the "1m" bucket
+    // (60-119s) regardless of a few seconds of test overhead, and never "0s"
+    // (which is what A2's mutated clock — dating the page against its OWN
+    // confirmedAt/declinedAt instead of the real request time — would always
+    // render, no matter how old the row actually is).
+    const pollTime = Date.now() - 65_000;
+    const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
+    const rows = buildDashboardRows(
+      [
+        { name: "butchr-butchr-1", agent_status: "working", pane_id: "w1:p3" }, // issue-tier row
+        { name: "butchr-butchr", agent_status: "idle", pane_id: "p2" }, // project-tier row
+      ],
+      { now: () => pollTime, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => pollTime) },
+    );
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(pollTime).toISOString(), rows, admission: noAdmissionView };
+    // Distinct, clearly-shaped targets so a mismatch (e.g. the project row
+    // 302ing to the issue row's Jira url) is unambiguous.
+    const resourceLink = async (key: string) => {
+      if (key === "BUTCHR-1") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/BUTCHR-1" };
+      if (key === "BUTCHR") return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
+      return { ok: false as const, error: `unexpected resource key ${key}` };
+    };
+    // BUTCHR-344 [correction] (V1): a REAL header — distinct from every other
+    // fixture in this file (all of which use `noHeader`'s `sha: null`, so
+    // they can never tell a real header from `{ build: null }`). Asserts the
+    // sha and the stale-currency line the route is supposed to pass through
+    // from `deps.header()` actually reach the served page.
+    const header = (): DashboardHeaderInfo => ({
+      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" },
+      currency: {
+        checkedAt: new Date(pollTime).toISOString(),
+        verdict: { status: "stale", commitsBehind: 5, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
+      },
+    });
+    const { app } = buildApp({ ...view, dashboard: async () => response, resourceLink, header });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const html = await (await fetch(`${b}/`)).text();
+
+      expect(html).toContain("1m ago");
+      expect(html).toContain("e".repeat(8)); // the real header's own sha, never "build sha unknown"
+      expect(html).toContain("behind by 5"); // the real header's own stale currency verdict
+      expect(html).not.toContain("build sha unknown");
+
+      const issueRow = rowSlice(html, "BUTCHR-1");
+      const projectRow = rowSlice(html, "BUTCHR");
+
+      const terminalHrefMatch = issueRow.match(/href="([^"]+)">open terminal</);
+      if (!terminalHrefMatch) throw new Error("expected a terminal link in the issue row's own HTML");
+      const terminalRes = await fetch(`${b}${terminalHrefMatch[1]}`);
+      expect(terminalRes.status).toBe(200);
+      expect(await terminalRes.text()).toContain("launched a terminal for w1:p3");
+
+      const issueResourceHrefMatch = issueRow.match(/href="([^"]+)">resource</);
+      const projectResourceHrefMatch = projectRow.match(/href="([^"]+)">resource</);
+      if (!issueResourceHrefMatch || !projectResourceHrefMatch) throw new Error("expected a resource link in both rows' own HTML");
+
+      const issueRedirect = await fetch(`${b}${issueResourceHrefMatch[1]}`, { redirect: "manual" });
+      expect(issueRedirect.status).toBe(302);
+      expect(issueRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/BUTCHR-1");
+
+      const projectRedirect = await fetch(`${b}${projectResourceHrefMatch[1]}`, { redirect: "manual" });
+      expect(projectRedirect.status).toBe(302);
+      expect(projectRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview");
+    } finally {
+      app.stop();
+    }
+  });
+});
+
 // BUTCHR-269: /dashboard is a POLL-FED SNAPSHOT — the route does no I/O of
 // its own, it just returns whatever `dashboard()` currently resolves to.
 // Every test below simulates the real production shape (src/daemon/
@@ -118,7 +268,7 @@ describe("butchr webapp + open action", () => {
 // not an artifact of a fixture that fakes freshness some other way.
 describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request path", () => {
   test("smoke: the shared fixture app's /dashboard reflects its dashboard() fixture verbatim", async () => {
-    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
+    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
   });
 
   test("a bare re-request does NOT advance confirmedAt (row-level or response-level) — only a new poll does", async () => {
@@ -126,8 +276,9 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       checked: true,
       confirmedAt: new Date(1000).toISOString(),
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
+      admission: noAdmissionView,
     };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -139,7 +290,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       expect(second.confirmedAt).toBe(first.confirmedAt);
 
       // Now simulate a poll: the daemon's own tee reassigns `snapshot`, never the route.
-      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
+      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }], admission: noAdmissionView };
       const third = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       if (!third.checked) throw new Error("expected checked:true");
       expect(third.rows[0]!.confirmedAt).not.toBe(first.rows[0]!.confirmedAt);
@@ -153,16 +304,16 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("could-not-check (case 1: the agent.list() read itself fails) is distinguishable from a genuinely empty fleet — never {checked:true, rows:[]}", async () => {
     // A genuine finding: the poll succeeded and there really are no agents.
-    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [] };
+    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [], admission: noAdmissionView };
     // A declined poll: the whole-response shape carries checked:false and a
     // declinedAt, distinct at the type level from the empty-but-checked case
     // above — this is the assertion that fails if the two were ever
     // collapsed (e.g. both serializing to `{rows: []}` with `checked`
     // dropped, or a declined poll silently reusing `checked:true`).
-    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [] };
+    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [], admission: noAdmissionView };
 
     let snapshot: DashboardResponse = genuinelyEmpty;
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -186,8 +337,8 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
-    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow] };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow], admission: noAdmissionView };
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -195,7 +346,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       // own tee) carries `rows` forward unchanged, only flipping the
       // top-level checked/declinedAt — this test pins that CHOICE, not just
       // that a value exists.
-      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows };
+      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows, admission: noAdmissionView };
       const body = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       expect(body.checked).toBe(false);
       expect(body.rows).toEqual([staleRow]);
@@ -222,6 +373,14 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
     // was attempted, since the spawn is fire-and-forget.
     expect(body).toContain("w1:p3");
     expect(body).not.toMatch(/window (appeared|opened)/);
+    // BUTCHR-344 (L1): pin the fire-and-forget WORDING itself, not just the
+    // absence of "window (appeared|opened)" — "opened a terminal window for
+    // w1:p3" matches neither alternative in that regex, so it would still
+    // pass the check above while quietly turning a launch into a
+    // confirmation. This exact phrase is what the route actually promises.
+    expect(body).toContain("launched a terminal for w1:p3");
+    expect(body).toContain("fire-and-forget");
+    expect(body).not.toMatch(/opened a terminal window/i);
     expect(openedPanes).toContain("w1:p3");
   });
   test("a colon-bearing pane id survives the route unmangled — criterion 1", async () => {
@@ -266,6 +425,48 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
   });
 });
 
+// BUTCHR-339: the dashboard row's RESOURCE link target — a small server-side
+// redirect resolved only when a human clicks (never on /dashboard's own
+// request path). Route-level wiring only: which tier resolves to which
+// target is `resourceLink`'s own job (src/daemon/index.ts in production),
+// exercised directly in that file's own describe block further down and in
+// dashboard-page.test.ts for the template's own href-building.
+describe("GET /resource/:key/open — the dashboard row's resource link target (BUTCHR-339)", () => {
+  const resourceLink = async (key: string) => {
+    if (key === "KAN-9") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/KAN-9" };
+    return { ok: false as const, error: `"${key}" is neither a valid Jira issue key nor a valid project id — cannot resolve a resource link for it` };
+  };
+  const { app } = buildApp({ ...view, resourceLink });
+  app.listen(0);
+  const b = `http://localhost:${app.server!.port}`;
+
+  // BUTCHR-266's review: VERIFY the 302 against a real, booted app with a
+  // plain GET, rather than reasoning about what the handler appears to do —
+  // this is exactly that (a real `fetch()` against `app.listen(0)`, `redirect:
+  // "manual"` so the client doesn't silently follow it and hide what the
+  // server actually sent). Checks the full shape: status line, the exact
+  // `location` header, and that the body is empty (never a mangled or
+  // leftover JSON body riding along with the redirect).
+  test("a resolvable key 302s to the resolved url with an empty body — verified against a real booted app, not reasoned about", async () => {
+    const r = await fetch(`${b}/resource/KAN-9/open`, { redirect: "manual" });
+    expect(r.status).toBe(302);
+    expect(r.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/KAN-9");
+    expect(await r.text()).toBe("");
+  });
+  test("an unresolvable key is refused with a specific, human-readable reason, in plain text — never a blank page", async () => {
+    const r = await fetch(`${b}/resource/nope/open`, { redirect: "manual" });
+    expect(r.status).toBe(409);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    expect(body).toContain("nope");
+    expect(body.length).toBeGreaterThan(0);
+  });
+  test("the key is URL-decoded from the path", async () => {
+    const r = await fetch(`${b}/resource/${encodeURIComponent("KAN-9")}/open`, { redirect: "manual" });
+    expect(r.status).toBe(302);
+  });
+});
+
 // KAN/BUTCHR-18 (BUTCHR-6): /health must go red when the poll loop stops
 // completing cycles, and recover once it resumes — driven through the REAL
 // startLoop/buildApp composition and a real listening app, not a fake-clock
@@ -279,6 +480,8 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => health.status(),
       dashboard: noDashboard,
     });
@@ -370,6 +573,8 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([pollHealth, notifyHealth]),
       dashboard: noDashboard,
     });
@@ -476,6 +681,8 @@ describe("/health carries build identity as a sibling of components, never insid
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], build),
       dashboard: noDashboard,
     });
@@ -506,6 +713,8 @@ describe("/health carries build identity as a sibling of components, never insid
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -541,6 +750,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -576,6 +787,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -598,6 +811,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -631,6 +846,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -661,6 +878,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -684,6 +903,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health]),
     });
@@ -732,6 +953,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -762,6 +985,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -785,6 +1010,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -808,6 +1035,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -836,6 +1065,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -858,6 +1089,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });

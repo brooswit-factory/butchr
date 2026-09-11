@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd } from "../../src/daemon/loop.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
+import { agentFoldSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
@@ -65,6 +66,30 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
     const real = new HerdrHerd({ agent: { list: async () => ({ agents: [{ name: "butchr-task-1", pane_id: "p1" }, { name: "butchr-proj1", pane_id: "p2" }] }) } } as never, "http://x/mcp");
     const scoped = scopedHerd(real, (id) => id.startsWith("TASK"));
     expect(await scoped.runningIssues()).toEqual(["TASK-1"]);
+  });
+
+  // BUTCHR-334: `scopedHerd`'s `spawn` delegation is the ONE wrapper every
+  // production reconcile call actually passes through (runResourceLoop calls
+  // `reconcileNow(scopedHerd(deps.herd, deps.ownsId), ...)`) — a delegation
+  // written as `(spec) => herd.spawn(spec)` would silently DROP the respawn
+  // loop's own `"respawn"` origin argument in production while every test
+  // that talks to a bare `herd` object directly (bypassing this wrapper)
+  // kept passing. Pinned directly: the origin actually reaching the wrapped
+  // herd's own `spawn` must be exactly what was passed to the scoped one.
+  test("scopedHerd's spawn delegation threads the origin argument through unchanged — regression guard for finding 2(b)", async () => {
+    const received: Array<[string, unknown]> = [];
+    const inner: Herd = {
+      runningIssues: async () => [],
+      staleIssues: async () => [],
+      spawn: async (spec, origin) => { received.push([spec.key, origin]); },
+      stop: async () => {},
+      paneFor: async () => null,
+      nudge: async () => ({ delivered: false }),
+    };
+    const scoped = scopedHerd(inner, () => true);
+    await scoped.spawn({ key: "KAN-1", issuetype: "Task", summary: "s", parent: null }, "respawn");
+    await scoped.spawn({ key: "KAN-2", issuetype: "Task", summary: "s", parent: null });
+    expect(received).toEqual([["KAN-1", "respawn"], ["KAN-2", undefined]]);
   });
 });
 
@@ -1168,9 +1193,11 @@ describe("startLoop: a pr:* transition wakes the ticket's own agent past both su
     expect(kEvents.length).toBe(2); // poll2 (the transition, exempted), poll3 (delivered despite the stale cursor)
     expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
     // BUTCHR-87: poll3 is delivered BECAUSE the newest comment id moved past
-    // the stale baseline (crossDaemonSuppressed's becauseComment branch) —
-    // that is now named as its own reason, honestly, rather than left bare.
-    expect(kEvents[1]!.reason).toEqual({ comment: true });
+    // the stale baseline (crossDaemonSuppressed's commentId branch) — that
+    // is now named as its own reason, honestly, rather than left bare.
+    // BUTCHR-350: carries the actual moved-to id ("6", from `responses`
+    // above), not just the boolean fact that one moved.
+    expect(kEvents[1]!.reason).toEqual({ comment: "6" });
     // Exactly 2 comments() calls: poll1 (baseline seeding) and poll3
     // (crossDaemonSuppressed) — poll2's transition never consults the cursor
     // at all, so it genuinely never advances during it; the swap to "6" is
@@ -1279,7 +1306,16 @@ describe("startLoop: every notify reason class is named, driven through the real
     expect(wEvents[0]!.reason).toEqual({ label: { prefix: "pr", from: "open", to: "approved" } });
   });
 
-  test("a pure `updated` bump with every other field identical, and no comments dep wired up, carries NO reason — the honest fallback, not a guess", async () => {
+  // BUTCHR-350 (§3D): with no `comments` dep at all, EVERY poll's baseline
+  // seeding still attempts `fetchComments(K)` for K (it never has anywhere
+  // to record a successful baseline, so `commentCursor.has(K)` never
+  // becomes true and seeding never stops retrying) — so `decide()`'s
+  // fallback correctly finds an ATTEMPTED-and-failed entry in this poll's
+  // shared cache, not an absent one. `check-failed`, not `unchecked`, is
+  // the honest label: this codebase's own "could not check" vocabulary
+  // (§4 OUT) covers both "the dep isn't wired" and "the call rejected" —
+  // both are, from `decide()`'s own vantage point, "tried, could not tell".
+  test("a pure `updated` bump with every other field identical, and no comments dep wired up, is reported as 'could not check' — never a guess", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
     const polls: JiraIssue[][] = [[mk({ updated: "t1" })], [mk({ updated: "t2" })]];
@@ -1290,14 +1326,55 @@ describe("startLoop: every notify reason class is named, driven through the real
       notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
       // No `suppress` and no `comments` deps at all: nothing in this poll
       // could ever learn about a comment, so this must fall all the way
-      // through to the honest "no reason" fallback, never a guess.
+      // through to the honest "could not check" fallback, never a guess.
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 40));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K");
     expect(kEvents.length).toBe(1);
-    expect(kEvents[0]!.reason).toBeUndefined();
+    expect(kEvents[0]!.reason).toEqual({ undetermined: "check-failed" });
+  });
+
+  // BUTCHR-350 (§3D): the TRUE "unchecked" case — a `comments` dep IS
+  // wired (so a check is genuinely POSSIBLE), K's baseline was already
+  // seeded on the poll it appeared (so seeding does not re-fire on a later
+  // poll), and that later poll's own diff is a pure non-structural
+  // `updated` bump with no label change (so neither crossDaemonSuppressed
+  // nor the own-write ledger ever has a reason to call fetchComments THIS
+  // poll either) — the literal mechanism behind the epic's §3(D)
+  // hypothesis: the first notify for a pure foreign comment has no I/O
+  // signal available to name it, because nothing this poll ever looked.
+  test("a pure `updated` bump with comments genuinely never consulted this poll (comments dep wired, but no arm had a reason to call it) is 'unchecked', not 'check-failed'", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    let commentCalls = 0;
+    const comments = async () => { commentCalls++; return [{ id: "c1", body: "x", created: "c", authorEmail: null }]; };
+    // idx0 empty (silent baseline) -> idx1 K appears (seeds the baseline,
+    // one comments() call) -> idx2 a pure `updated` bump, no label change
+    // -> then idx2 repeats forever (Math.min caps), producing no further
+    // K events (identical content, nothing changed).
+    const polls: JiraIssue[][] = [[], [mk({ updated: "t1" })], [mk({ updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ undetermined: "unchecked" });
+    // Exactly one comments() call for the whole run — the appear-poll's own
+    // baseline seed. Nothing else this test does ever has an I/O reason to
+    // call it again, which is precisely what makes idx2's own delivery
+    // "unchecked" rather than "checked-unchanged": there was genuinely no
+    // second look, not a look that found nothing.
+    expect(commentCalls).toBe(1);
   });
 
   describe("precedence: more than one class true of the same diff (documented order — status > daemon label > summary > comment)", () => {
@@ -1366,6 +1443,160 @@ describe("startLoop: every notify reason class is named, driven through the real
       expect(kEvents.length).toBe(1);
       expect(kEvents[0]!.reason).toEqual({ pr: { from: "open", to: "approved" } });
     });
+  });
+});
+
+describe("startLoop §3(D): the delivered-line duplicate pair — a pure foreign comment's FIRST notify is honestly 'unchecked', and a LATER, unrelated daemon-label flip's notify carries the SAME comment id, making the pair recognisable as one change", () => {
+  const mk = (labels: string[], updated: string): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("FALSIFIER (§6 'D'): reproduces the measured incident shape — comment posted, first [notify] carries no id (honest 'unchecked'), a LATER routine agent:*-flip's [notify] carries the SAME id via `comment:<id>`", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    let pollIndex = 0;
+    const commentsByPoll: Record<number, JiraComment[]> = {
+      1: [comment("c0")],  // idx1: K appears — baseline seed sees "c0"
+      3: [comment("c1"), comment("c0")], // idx3: a genuine foreign comment "c1" landed since idx2 — first learned HERE, by the label-flip's own fetch
+    };
+    const comments = async () => commentsByPoll[pollIndex] ?? commentsByPoll[1]!;
+    const polls: JiraIssue[][] = [
+      [],                              // idx0: silent baseline
+      [mk(["agent:working"], "t1")],   // idx1: K appears, seeded on "c0"
+      [mk(["agent:working"], "t2")],   // idx2: comment "c1" landed (updated bump), NO label change — nothing this poll has an I/O reason to check
+      [mk(["agent:idle"], "t3")],      // idx3: an UNRELATED routine daemon label flip — its own crossDaemonSuppressed fetch is the first thing to actually look
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
+    // idx1: appeared. idx2: the pure comment bump — no arm has an I/O reason
+    // to check comments this poll (K was already seeded), so this delivers
+    // honestly as "unchecked" — NOT a guess, and critically NOT the SAME
+    // text as "checked, found nothing" (§3D's own stated requirement).
+    // idx3: the routine label flip finally triggers crossDaemonSuppressed's
+    // own fetch, discovers "c1" moved since the stale "c0" baseline, and
+    // delivers `{ comment: "c1" }` — the exact id the FIRST notify could not
+    // name. A reader sees TWO notifies for (K, K) back-to-back, the second
+    // one naming "c1" — recognisable, by key+adjacency+id, as one change.
+    expect(kEvents.length).toBe(3);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ undetermined: "unchecked" });
+    expect(kEvents[2]!.reason).toEqual({ comment: "c1" });
+  });
+});
+
+describe("startLoop §3(D) case 4: a watcher's own delivery can be honestly named `comment:<id>` from a SIBLING arm's already-paid-for fetch this same poll — no new Jira call, and delivery is unchanged", () => {
+  const withLabels = (labels: string[], updated: string): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const relK = (labels: string[], updated: string) => [{ issue: withLabels(labels, updated), watchers: ["W"] }];
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("K's own AGENT-arm ledger hit (no label change) fetches comments and finds its OWN new comment — watcher W's decide() never fetches on its own path (isDaemonLabelOnlyDiff false) but still gets `comment:<id>`, discovered via the shared per-poll cache", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    let pollIndex = 0;
+    let commentCalls = 0;
+    const commentsByPoll: Record<number, JiraComment[]> = {
+      1: [comment("c1")],               // idx1: K appears, seeded on "c1"
+      2: [comment("c2"), comment("c1")], // idx2: K's own agent posts "c2" — no label change
+    };
+    const comments = async () => { commentCalls++; return commentsByPoll[pollIndex] ?? commentsByPoll[1]!; };
+    const polls: JiraIssue[][] = [[], [withLabels(["agent:working"], "t1")], [withLabels(["agent:working"], "t2")]];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:working"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n, polls.length - 1); return polls[pollIndex]!; },
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      suppress: (key, updated, watcher) => key === "K" && updated === "t2" && watcher === "K", // K's own write — only watcher K's consult routes through the ledger (see `suppressed()`); W must route through crossDaemonSuppressed
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    // idx1: appear. idx2: W's own crossDaemonSuppressed check never fetches
+    // (no label diff at all) — but K's OWN ledger-hit arm already fetched
+    // this poll (it ran first, `changedPrimary` before `changedRelated`),
+    // learned "c2" is newest, and W's fallback peeks that SAME cached
+    // result rather than guessing "unchecked".
+    expect(wEvents.length).toBe(2);
+    expect(wEvents[0]!.reason).toEqual({ appeared: true });
+    expect(wEvents[1]!.reason).toEqual({ comment: "c2" });
+    // Exactly one comments() call this poll (K's own arm's) — W's delivery
+    // cost NO additional Jira call, per the ticket's own constraint.
+    expect(commentCalls).toBe(2); // idx1 seed + idx2 K's own arm; W added zero
+  });
+
+  test("case 3: the sibling arm's fetch finds NOTHING new (the agent's own write was not itself a comment) — W's delivery is honestly 'checked-unchanged', not a guess and not 'comment'", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    let pollIndex = 0;
+    // The SAME single comment the whole run — K's own write at idx2 was
+    // NOT a comment (e.g. a non-label field the ledger still recorded).
+    const comments = async () => [comment("c1")];
+    const polls: JiraIssue[][] = [[], [withLabels(["agent:working"], "t1")], [withLabels(["agent:working"], "t2")]];
+    const relatedPolls = [[], relK(["agent:working"], "t1"), relK(["agent:working"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n, polls.length - 1); return polls[pollIndex]!; },
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      suppress: (key, updated, watcher) => key === "K" && updated === "t2" && watcher === "K",
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
+    expect(wEvents.length).toBe(2);
+    expect(wEvents[0]!.reason).toEqual({ appeared: true });
+    expect(wEvents[1]!.reason).toEqual({ undetermined: "checked-unchanged" });
+  });
+});
+
+describe("startLoop §6 CONTROL: a foreign comment delivered normally must produce NO `[notify-suppressed]` line at all — nothing here was suppressed", () => {
+  const mk = (labels: string[], updated: string): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("a foreign comment landing alongside a routine daemon-label flip is delivered (named `comment:<id>`), and the log carries zero suppressed lines", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const logLines: string[] = [];
+    let pollIndex = 0;
+    const commentsByPoll: Record<number, JiraComment[]> = {
+      1: [comment("c0")],
+      2: [comment("c1"), comment("c0")], // a genuinely new, foreign comment — no agent write, no ledger hit at all (no `suppress` dep wired)
+    };
+    const comments = async () => commentsByPoll[pollIndex] ?? commentsByPoll[1]!;
+    const polls: JiraIssue[][] = [[], [mk(["agent:working"], "t1")], [mk(["agent:idle"], "t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (_issue, _about, reason) => { notified.push({ issue: "K", reason }); },
+      comments,
+      log: (l) => logLines.push(l),
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // delivered, not suppressed
+    expect(logLines.filter((l) => l.includes("[notify-suppressed]"))).toEqual([]);
   });
 });
 
@@ -1576,6 +1807,7 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
   test("(f) THE BUG: an agent's own comment (agent-writer arm, no label change) leaves the cursor stale, so the VERY NEXT daemon label flip with no new comment wrongly wakes K's own agent AND its watcher W", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string }> = [];
+    const logLines: string[] = [];
     let commentCalls = 0;
     let pollIndex = 0;
     // What deps.comments(K) would genuinely return if queried during poll
@@ -1613,6 +1845,7 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
         return false;
       },
       comments,
+      log: (l) => logLines.push(l),
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 100));
@@ -1631,11 +1864,21 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
     // delivers to both — the exact self-notify-storm shape from the ticket.
     expect(kEvents.length).toBe(1); // idx1 appear only — idx3 must NOT wake K about its own already-suppressed comment
     expect(wEvents.length).toBe(2); // idx1 appear + idx2's genuine (unrelated) deliver — idx3 must NOT add a third
+    // BUTCHR-350 (§3B) CONTROL: idx2's comment list is [c2, c1] — exactly
+    // ONE new id ahead of the recorded baseline "c1", consistent with
+    // "only the agent's own new comment landed" (not a fold). idx3 is a
+    // pure daemon-label echo (arms 2/3, deliberately omitted — see
+    // suppressed-log.ts's own top comment). NO `[notify-suppressed]` line
+    // of ANY kind fires anywhere in this run — proving the fold detector
+    // does not fire on the ordinary case, and that omitting arms 2/3 is a
+    // deliberate choice this test can see, not a silent gap.
+    expect(logLines.filter((l) => l.includes("[notify-suppressed]"))).toEqual([]);
   });
 
   test("(g) WATCHER + FOREIGN COMMENT IN WINDOW: a foreign comment folded into the SAME read-back window as the agent's own write still reaches watcher W (via crossDaemon, cursor-independent); K's own agent stays suppressed either way (stated residual); the cursor still advances to the TRUE newest id, not just the agent's own", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string }> = [];
+    const logLines: string[] = [];
     let pollIndex = 0;
     const commentsByPoll: Record<number, JiraComment[]> = {
       1: [comment("c1")],
@@ -1668,6 +1911,7 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
         return false;
       },
       comments,
+      log: (l) => logLines.push(l),
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 100));
@@ -1685,6 +1929,16 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
     // any cursor state) + idx3 must NOT add a third, because the cursor
     // correctly advanced to the TRUE newest ("f1"), not "c2".
     expect(wEvents.length).toBe(2);
+    // BUTCHR-350 (§3B) THE FALSIFIER: idx2's comment list is [f1, c2, c1] —
+    // baseline "c1" sits at position 2, meaning TWO ids are newer than it in
+    // one window; the agent's own write accounts for at most one of them
+    // ("c2"), so "f1" is provably foreign — a genuine fold, logged loud,
+    // exactly once, with the real ids (never comment bodies). This is the
+    // ticket's own named falsifier: run against code with the comparison
+    // deleted (see this file's own PR description for the manual mutation
+    // run) and confirm this exact assertion is what catches it.
+    const suppressedLines = logLines.filter((l) => l.includes("[notify-suppressed]"));
+    expect(suppressedLines).toEqual([agentFoldSuppressedLine("K", "c1", "f1", 2)]);
   });
 });
 

@@ -12,6 +12,7 @@ import {
 import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 import { unwrapStorageParagraph } from "./speak.js";
+import { Refusal, withOutcomeRecording } from "./outcome.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -39,7 +40,7 @@ const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 
 /** Every one of BUTCHR-35's ten relationship verbs refuses a connection with no `x-issue`, in the same shape get_doc/set_doc already use — refusing beats resolving to an unknown caller. */
 function requireCaller(c: { headers: Record<string, string> }, verb: string): string {
   const who = c.headers["x-issue"];
-  if (!who) throw new Error(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
+  if (!who) throw new Refusal(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
   return who;
 }
 
@@ -69,7 +70,7 @@ function requireCaller(c: { headers: Record<string, string> }, verb: string): st
 function refuseProjectCaller(c: { headers: Record<string, string> }, verb: string, why: string): void {
   const who = c.headers["x-issue"];
   if (who && isProjectId(who)) {
-    throw new Error(`${verb}: refusing a project caller — ${why}`);
+    throw new Refusal(`${verb}: refusing a project caller — ${why}`);
   }
 }
 
@@ -90,7 +91,7 @@ function requireProjectCaller(
 ): string {
   const who = requireCaller(c, verb);
   if (!isProjectId(who)) {
-    throw new Error(`${verb}: refusing an issue caller — ${why}`);
+    throw new Refusal(`${verb}: refusing an issue caller — ${why}`);
   }
   return who;
 }
@@ -113,7 +114,7 @@ function requireIssueCaller(
 ): string {
   const who = requireCaller(c, verb);
   if (isProjectId(who)) {
-    throw new Error(`${verb}: refusing a project caller — ${why}`);
+    throw new Refusal(`${verb}: refusing a project caller — ${why}`);
   }
   return who;
 }
@@ -232,7 +233,7 @@ export function atlassianTools(
     const writer = c.headers["x-issue"];
     if (writer) onWrite?.(keys, writer);
   };
-  return {
+  const tools: Record<string, ToolDef<any>> = {
     jira_get_issue: {
       description: "Read a Jira issue (fields incl. description, status, parent, labels).",
       input: { key: z.string() },
@@ -285,7 +286,7 @@ export function atlassianTools(
     jira_create_issue: {
       description:
         "DEPRECATED for staffing a worker under your own ticket — use new_worker, which infers the issue type/assignee/project/link direction and requires a disposition so it can never leave an undeclared child. For a DELIBERATE ORPHAN (`implements: \"none\"`, explicit out-of-scope/triage work your brief tells you to file outside your epic), prefer file_where_it_belongs instead — it demands and records WHERE the work belongs and pushes a notice a person actually receives; `implements: \"none\"` here still works, unchanged, but leaves the destination undocumented and nobody notified unless you do that by hand. new_worker always links to its caller and has no orphan route either way. " +
-        "Create a Jira issue. ASSIGNMENT: a Story or a Task is assigned BY ROLE from its issuetype (configured on this daemon) — pass an explicit `assignee` (an Atlassian accountId) to override, which always wins; an Epic is unchanged (caller-supplied assignee, or none — Epics are the human's). If the role's accountId isn't configured on this daemon and you passed no `assignee`, the call is REFUSED. HOME: a Story or a Task also requires a home — pass `implements` (the issue key it reports to: a Story implements an Epic, a Task implements a Story) or `parent` (nests it in Jira for membership; a Story can parent to an Epic, but a Task CANNOT parent to a Story in this project — use `implements` for Tasks). Omitting both refuses the call; an Epic needs neither. OPT-OUT: pass `implements: \"none\"` (case-insensitive) to file a deliberate orphan — the ticket is still created and still staffed by role, but no link is made; use this ONLY for the explicit out-of-scope/triage tickets your brief tells you to file outside your epic — silence (omitting both `implements` and `parent`) is never the opt-out. LINKING: after creating the issue, the tool itself creates the Implements link (from = the new issue, to = the resolved target) — the result carries both the new `key` and the link outcome as `implements: { ok, to, error? }`; a link failure never hides the key, so retry the LINK, not the create, on failure. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
+        "Create a Jira issue. ASSIGNMENT: a Story or a Task is assigned BY ROLE from its issuetype (configured on this daemon) — pass an explicit `assignee` (an Atlassian accountId) to override, which always wins; an Epic is unchanged (caller-supplied assignee, or none — Epics are the human's). If the role's accountId isn't configured on this daemon and you passed no `assignee`, the call is REFUSED. HOME: a Story or a Task also requires a home — pass `implements` (the issue key it reports to: a Story implements an Epic, a Task implements a Story) or `parent` (nests it in Jira for membership; a Story can parent to an Epic, but a Task CANNOT parent to a Story in this project — use `implements` for Tasks). Omitting both refuses the call; an Epic needs neither. OPT-OUT: pass `implements: \"none\"` (case-insensitive) to file a deliberate orphan — the ticket is still created and still staffed by role, but no link is made; use this ONLY for the explicit out-of-scope/triage tickets your brief tells you to file outside your epic — silence (omitting both `implements` and `parent`) is never the opt-out. LINKING: after creating the issue, the tool itself creates the Implements link (from = the new issue, to = the resolved target) — the result carries both the new `key` and the link outcome as `implements: { ok, to, error? }`; a link failure never hides the key, so retry the LINK, not the create, on failure. Set priority (a Jira priority name) to set a boss's child's priority at filing — omit it to take the site default. MECHANISM (BUTCHR-336): priority is not read by admission or reconcile, so it does not change which ticket is staffed first — a deliberate policy state, not a bug (whether that should ever change is BUTCHR-299/BUTCHR-304's call, not this tool's). The ticket you write is the interface: put the full context and a concrete definition of done in the description.",
       input: {
         projectKey: z.string(), issuetype: z.enum(["Epic", "Story", "Task"]), summary: z.string(),
         description: z.string().optional(), parent: z.string().optional(), labels: z.array(z.string()).optional(),
@@ -312,7 +313,7 @@ export function atlassianTools(
           if (!assignee) {
             const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
             audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker] ${clsTag}`);
-            throw new Error(noAssigneeMsg(p.issuetype));
+            throw new Refusal(noAssigneeMsg(p.issuetype));
           }
         }
 
@@ -329,7 +330,7 @@ export function atlassianTools(
             target = p.parent;
           } else {
             audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker] ${clsTag}`);
-            throw new Error(noTargetMsg(p.issuetype));
+            throw new Refusal(noTargetMsg(p.issuetype));
           }
         }
 
@@ -381,7 +382,7 @@ export function atlassianTools(
       },
     },
     jira_set_priority: {
-      description: "DEPRECATED — use prioritize_worker, which also refuses your own key (your priority is your boss's judgment, never your own) rather than leaving that as an unenforced instruction. Set a Jira issue's priority by name. For a boss re-prioritizing its children as reality shifts — YOUR OWN priority is set by your boss, so never call this on your own ticket.",
+      description: "DEPRECATED — use prioritize_worker, which also refuses your own key (your priority is your boss's judgment, never your own) rather than leaving that as an unenforced instruction. Set a Jira issue's priority by name. For a boss re-prioritizing its children as reality shifts — YOUR OWN priority is set by your boss, so never call this on your own ticket. MECHANISM (BUTCHR-336): priority is not read by admission or reconcile, so it does not change which ticket is staffed first — a deliberate policy state, not a bug (whether that should ever change is BUTCHR-299/BUTCHR-304's call, not this tool's).",
       input: { key: z.string(), priority: z.string() },
       handler: (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
@@ -412,7 +413,7 @@ export function atlassianTools(
           if (!resolved) {
             const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
             audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker] ${aliasTag("jira_assign", "ambiguous")}`);
-            throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
+            throw new Refusal(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
           }
           accountId = resolved;
           label = role;
@@ -457,7 +458,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const p = a as { titleContains?: string; cql?: string; spaceId?: string; spaceKey?: string; limit?: number };
         if (!p.titleContains && !p.cql) {
-          throw new Error("confluence_search_pages: pass `titleContains` or `cql` — at least one is required");
+          throw new Refusal("confluence_search_pages: pass `titleContains` or `cql` — at least one is required");
         }
         const escape = (s: string) => s.replace(/"/g, '\\"');
         let cql: string;
@@ -473,7 +474,7 @@ export function atlassianTools(
             // rather than emit a clause that would silently match nothing.
             const spaces = (await ops.listSpaces()) as { results?: Array<{ id?: string; key?: string }> };
             const match = spaces?.results?.find((s) => s.id === p.spaceId);
-            if (!match?.key) throw new Error(`confluence_search_pages: no space found with id ${p.spaceId}`);
+            if (!match?.key) throw new Refusal(`confluence_search_pages: no space found with id ${p.spaceId}`);
             clauses.push(`space = "${escape(match.key)}"`);
           }
           cql = clauses.join(" AND ");
@@ -509,7 +510,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const { key, offset, limit, expectVersion } = a as { key?: string; offset?: number; limit?: number; expectVersion?: number };
         const who = c.headers["x-issue"];
-        if (!who) throw new Error("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        if (!who) throw new Refusal("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         const target = key ?? who;
         audit(c, `get_doc ${target}${key ? "" : " (self)"}`);
         // Dispatch is on the TARGET's own shape, never the caller's — this is
@@ -527,7 +528,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const { body, title } = a as { body: string; title?: string };
         const who = c.headers["x-issue"];
-        if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        if (!who) throw new Refusal("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
         const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title, log) : await setDoc(ops, who, body, title);
         noted(c, [who]); // the remote-link upsert (issue) / page update (project) bumps the doc's own `updated`
@@ -546,7 +547,7 @@ export function atlassianTools(
     new_worker: {
       description:
         "Create a worker one tier below the CALLER: an Epic's new_worker makes a Story, a Story's makes a Task — a Task has no worker beneath it and this REFUSES for a Task caller, explaining in words that it has reached the bottom of the hierarchy. " +
-        "YOU SUPPLY: `summary`, `description` (the full context a fresh agent needs to meet the definition of done), `priority` (optional — omitting it takes the site default), and a REQUIRED `disposition`: `\"start\"`, or `\"shelve\"` with a non-empty `reason` (the activation condition, in words — a `shelve` with no reason is REFUSED, and so is a missing disposition entirely; there is no default and no third option, because a worker this tool creates always has a DECLARED disposition — In Progress or shelved (To Do + the exemption label) — never undeclared). " +
+        "YOU SUPPLY: `summary`, `description` (the full context a fresh agent needs to meet the definition of done), `priority` (optional — omitting it takes the site default; MECHANISM, BUTCHR-336: priority is not read by admission or reconcile, so it does not change which ticket is staffed first — a deliberate policy state, not a bug, whether that should ever change is BUTCHR-299/BUTCHR-304's call), and a REQUIRED `disposition`: `\"start\"`, or `\"shelve\"` with a non-empty `reason` (the activation condition, in words — a `shelve` with no reason is REFUSED, and so is a missing disposition entirely; there is no default and no third option, because a worker this tool creates always has a DECLARED disposition — In Progress or shelved (To Do + the exemption label) — never undeclared). " +
         "INFERRED, WITH NO ARGUMENT FOR ANY OF IT: the child's issue type (from your own type, per the rule above), the assignee (from this daemon's role map — REFUSED if that role's accountId is unset, naming the missing env var), the project (from your own), the link direction (Implements, outward from the new child to you, never the reverse), and the new doc's parent page (your own doc). " +
         "STAFFING (BUTCHR-244 — READ THIS BEFORE TREATING A NORMAL RETURN AS \"AN AGENT IS RUNNING\", BECAUSE IT NEVER MEANS THAT): a `\"start\"` disposition moves the ticket to In Progress, one of the ACTIVE statuses the daemon's reconcile poll spawns agents FROM, on its own later, independent cadence — this call does not start an agent and cannot confirm one exists, or ever will (the spawn itself can fail, e.g. herdr's `agent_pane_busy`, and nothing routes that failure back to this caller — it lands on the WORKER's own ticket instead, as a `[butchr:reconcile]`/`[butchr:crashloop]` comment and an `agent:*` label). The result's `staffing` field says this in words for whichever disposition you chose; use `check_worker` on the new key to actually find out. " +
         "WHAT A RETURNED RESULT GUARANTEES, AND WHAT A THROWN ERROR MEANS — READ THIS BEFORE TREATING EITHER AS DONE: writes happen in the order create → Implements link → disposition → doc, each step chosen to be less harmful to stop at than the last. A NORMAL RETURN ALWAYS MEANS a ticket that has a boss (the link succeeded) AND a declared disposition (never undeclared) AND a doc — UNLESS `created: false` is present (see IDEMPOTENCY below), in which case none of this call's own writes happened at all. If ONLY the doc step failed, this THROWS rather than returning a partial result — but by then the ticket, its boss link and its disposition are ALL already real and are NOT rolled back; the error names the surviving key, and its doc is completed by that ticket's own first `set_doc` call, whenever the agent working it makes one. Nothing here retries or fixes it automatically: a ticket that never gets a `set_doc` call simply has no doc until something calls for that key — strictly better than a duplicate or an orphan, but not invisible, and not something a caller should infer from a successful-looking throw. " +
@@ -603,7 +604,8 @@ export function atlassianTools(
     check_worker: {
       description:
         "BUTCHR-244: the verb that can actually answer \"is my worker staffed?\" — new_worker/start_worker/adopt_worker only ever move a ticket into the status set the daemon's reconcile poll spawns agents FROM; none of them starts an agent or can confirm one exists (see their own `staffing` field). This is that check. Refuses a `key` that is not one of the caller's own workers, the same way start_worker/tell_worker do (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker). " +
-        "RETURNS `status` (the worker's current Jira status) and `staffing`, a THREE-VALUED verdict — \"staffed\" / \"not-staffed\" / \"could-not-look\" — NEVER just two: conflating \"could not look\" with \"not staffed\" is a real, previously-shipped mistake in this fleet (a boss on this exact ticket checked the wrong daemon's herd, saw nothing, and reported a confident, wrong \"not staffed\" — read as a cautionary tale, not a hypothetical). `source` says which read answered — \"herd\" (this daemon's own live agent registry, when wired and known to cover this worker) or \"label\" (the ticket's own `agent:*` label, which can be up to a poll stale and is further damped by a two-poll stabilizer, but is written by WHICHEVER daemon actually staffs the ticket, so it stays valid even when this call's own herd probe is not the right one to ask). `observedLabel` names the exact label read, when `source` is \"label\" and one was present. " +
+        "RETURNS `status` (the worker's current Jira status) and `staffing`, a FOUR-VALUED verdict — \"staffed\" / \"not-staffed\" / \"could-not-look\" / \"withheld\" — NEVER collapsed to fewer: conflating \"could not look\" with \"not staffed\" is a real, previously-shipped mistake in this fleet (a boss on this exact ticket checked the wrong daemon's herd, saw nothing, and reported a confident, wrong \"not staffed\" — read as a cautionary tale, not a hypothetical). `source` says which read answered — \"herd\" (this daemon's own live agent registry, when wired and known to cover this worker) or \"label\" (the ticket's own `agent:*` label, which can be up to a poll stale and is further damped by a two-poll stabilizer, but is written by WHICHEVER daemon actually staffs the ticket, so it stays valid even when this call's own herd probe is not the right one to ask). `observedLabel` names the exact `agent:*` label read, when `source` is \"label\" and one was present (including when `staffing` is \"withheld\" — that verdict layers on top of `agent:none`, it does not replace it). " +
+        "\"withheld\" (BUTCHR-352) means admission control is holding this worker at the fleet-wide agent cap, correctly, and will admit it when a slot frees — this is NOT \"not staffed\" (which stays reserved for a worker that is genuinely undesired) and NOT \"could-not-look\" (this is a positive, checked observation, written by the daemon that actually staffs the worker onto a SEPARATE `admission:withheld` label the ticket carries, cross-daemon-correct the same way `agent:*` already is). A `probeOutOfScope: true` worker with no `admission:withheld` label present still reads \"could-not-look\", never a guessed \"withheld\". " +
         "SCOPE (why a live herd read can itself become \"could not look\"): a single host can run more than one butchr daemon, each with a herd that only ever covers ITS OWN Atlassian account's tickets. If this worker is staffed by a DIFFERENT account/daemon, this daemon's own herd is structurally blind to it — an empty read from it is not evidence of \"not staffed\", so this call never trusts it: the herd is consulted only when the worker's own assignee matches this credential's own identity, and otherwise falls back to the label instead (still a valid, cross-daemon-correct signal) with `probeOutOfScope: true` on the result naming why. " +
         "Replaces reading the `agent:*` label off jira_get_issue by hand and hoping you inferred the right thing from it.",
       input: { key: z.string() },
@@ -671,9 +673,15 @@ export function atlassianTools(
         return orOk(r, { ok: true, key, status: "Done" });
       },
     },
+    // BUTCHR-336: the MECHANISM sentence in this description (and the matching
+    // one in new_worker/file_where_it_belongs/jira_create_issue/
+    // jira_set_priority) is pinned by test/unit/admission.test.ts's
+    // "priority is not an admission-order input" describe block — that test
+    // fails BY NAME the moment priority becomes an ordering input, and its
+    // own comment points back here. Edit both together.
     prioritize_worker: {
       description:
-        "Revise ONE OF THE CALLER'S OWN workers' priority — a boss's judgment of what matters NOW, not only at filing. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker), AND — distinctively — refuses the CALLER'S OWN key: your priority is your boss's judgment, never your own, and this makes that a refusal instead of an unenforced sentence in a brief (holds for a project caller too). Replaces jira_set_priority for this case.",
+        "Revise ONE OF THE CALLER'S OWN workers' priority — a boss's judgment of what matters NOW, not only at filing. Refuses a `key` that is not one of the caller's own workers (a PROJECT caller's own workers are the Epics that are MEMBERS of its project — see start_worker), AND — distinctively — refuses the CALLER'S OWN key: your priority is your boss's judgment, never your own, and this makes that a refusal instead of an unenforced sentence in a brief (holds for a project caller too). Replaces jira_set_priority for this case. MECHANISM (BUTCHR-336): priority is not read by admission or reconcile, so it does not change which ticket is staffed first — a deliberate policy state, not a bug (whether that should ever change is BUTCHR-299/BUTCHR-304's call, not this tool's).",
       input: { key: z.string(), priority: z.string() },
       handler: async (a, c) => {
         const { key, priority } = a as { key: string; priority: string };
@@ -728,7 +736,7 @@ export function atlassianTools(
     },
     report_to_boss: {
       description:
-        'Speaks on the CALLER\'S OWN CHANNEL — the routing a boss actually listens to. THERE IS NO KEY PARAMETER, AND THERE MUST NEVER BE ONE: a boss listens to its workers\' tickets, so a comment written onto the BOSS\'s own ticket routes one tier too high — the empty arg list settles that question faster than any name could ("report_to_boss" sounds like it writes to the boss\'s ticket; it must not). Refuses nothing else — a verb with no key has no key to get wrong. For an ISSUE caller: comments on its own ticket, replacing jira_add_comment(my_own_key, text). For a PROJECT caller (BUTCHR-71): posts on its own ROOT DOC instead (a project has no ticket) — same identity tag, and this is deliberately ALLOWED, not refused, because a project genuinely needs a way to escalate when it is blocked and no option is safe, same as every other tier.',
+        'Speaks on the CALLER\'S OWN CHANNEL — the routing a boss actually listens to. THERE IS NO KEY PARAMETER, AND THERE MUST NEVER BE ONE: a boss listens to its workers\' tickets, so a comment written onto the BOSS\'s own ticket routes one tier too high — the empty arg list settles that question faster than any name could ("report_to_boss" sounds like it writes to the boss\'s ticket; it must not). Refuses nothing else — a verb with no key has no key to get wrong. For an ISSUE caller: comments on its own ticket, replacing jira_add_comment(my_own_key, text). For a STORY or TASK caller this lands on a surface its boss actually watches, whatever the ticket\'s status: a Story\'s boss (an Epic) and a Task\'s boss (a Story) watch that ticket\'s comments regardless of status. For an EPIC caller it is NOT unconditional: your boss is a PROJECT, and a project reads an epic\'s ticket comments only while that epic is In Review — while you are In Progress, this still posts on your own ticket, but no agent is watching it, so nobody is woken by it. For a PROJECT caller (BUTCHR-71): posts on its own ROOT DOC instead (a project has no ticket) — same identity tag, and this is deliberately ALLOWED, not refused, because a project genuinely needs a way to escalate when it is blocked and no option is safe, same as every other tier.',
       input: { text: z.string() },
       handler: async (a, c) => {
         const { text } = a as { text: string };
@@ -741,7 +749,7 @@ export function atlassianTools(
     },
     ask_boss: {
       description:
-        `Same channel as report_to_boss (an ISSUE caller's own ticket; a PROJECT caller's own root doc — see report_to_boss), no key parameter — but marked with the literal \`${ASK_MARKER}\` right after the identity tag, so a boss can find its workers' UNANSWERED questions without reading every comment they wrote. ASKING DOES NOT CHANGE THE ASKER'S STATUS — an agent that asks and can still make progress should carry on; one that genuinely cannot proceed is a different situation (the daemon's own blocked-dialog escalation handles that). Use report_to_boss for information; use this only when there's a real outstanding answer you're waiting on.`,
+        `Same channel as report_to_boss (an ISSUE caller's own ticket; a PROJECT caller's own root doc — see report_to_boss), no key parameter — but marked with the literal \`${ASK_MARKER}\` right after the identity tag, so a boss can find its workers' UNANSWERED questions without reading every comment they wrote. For a STORY or TASK caller that marker lands on a surface your boss actually watches, whatever your ticket\'s status: your boss watches your ticket regardless of status. For an EPIC caller it is conditional in the same way report_to_boss is: your boss is a PROJECT that reads your ticket's comments only while you are In Review, so the same marker sits unread on your own ticket for as long as you remain In Progress — no agent is woken by it. ASKING DOES NOT CHANGE THE ASKER'S STATUS — an agent that asks and can still make progress should carry on; one that genuinely cannot proceed is a different situation (the daemon's own blocked-dialog escalation handles that). Use report_to_boss for information; use this only when there's a real outstanding answer you're waiting on.`,
       input: { text: z.string() },
       handler: async (a, c) => {
         const { text } = a as { text: string };
@@ -954,7 +962,7 @@ export function atlassianTools(
     file_where_it_belongs: {
       description:
         "The successor to jira_create_issue's `implements: \"none\"` deliberate-orphan escape (still an unchanged alias this release). Files a ticket that is explicitly NOT the caller's — genuine out-of-scope work your brief tells you to file outside your own epic. NO Implements link is ever made, to the destination or to anything else: this stays a true orphan. " +
-        "YOU SUPPLY: `summary`, `description` (optional), `issuetype` (`\"Story\"` or `\"Task\"`), `priority` (optional — omitting it takes the site default), and a REQUIRED `destination`. " +
+        "YOU SUPPLY: `summary`, `description` (optional), `issuetype` (`\"Story\"` or `\"Task\"`), `priority` (optional — omitting it takes the site default; MECHANISM, BUTCHR-336: priority is not read by admission or reconcile, so it does not change which ticket is staffed first — a deliberate policy state, not a bug, whether that should ever change is BUTCHR-299/BUTCHR-304's call), and a REQUIRED `destination`. " +
         "`destination` IS EITHER: an EXISTING EPIC KEY this work belongs under (e.g. \"BUTCHR-25\"), OR a short prose REASON it needs a brand-new epic (e.g. \"no epic covers observability tooling yet\") — both are legitimate, neither is a fallback for the other. REFUSED: an empty or whitespace-only destination; a placeholder (\"n/a\", \"tbd\", \"unknown\", \"none\", \"?\", \"-\", \"idk\", and the like); a Jira-key-shaped destination that doesn't exist, or that exists but isn't an Epic (naming what it actually is); and prose too thin to be a real reason. This is the point of the tool, not an obstacle to route around: filing work outside your scope is only half the job, saying where it should live is the other half. " +
         "TAKES NO DISPOSITION, unlike new_worker/adopt_worker — argued, not omitted: a disposition answers \"what happens to MY worker\", and nobody can answer that for a ticket that is by definition not yours. It is filed To Do, staffed by role exactly as jira_create_issue staffs it today, and stays there — never staffed by this daemon — until some future boss calls adopt_worker on it. Never carries the shelved-exemption label: the parked-ticket detector only ever walks tickets reachable by an Implements link, and this ticket has none, so that label would mean nothing here. " +
         "WHAT IT WRITES: the created ticket's OWN description gets a destination header block baked in at creation (never only in a comment) plus the `butchr:orphan` label (a one-line JQL away from \"show me every undirected ticket\") — withdrawn later by adopt_worker, whichever disposition it's adopted with, the moment this ticket gains a boss; see adopt_worker's own description; then a best-effort NOTICE comment — on the named epic (case A), or, when the destination is a \"needs a new epic\" reason, on the TOPMOST ticket in the CALLER's own Implements chain (case B, since there's no epic yet to comment on and this daemon has no configured human/root key). CASE B CREATES NO LINK: the notice says where the filer thinks the work belongs, it does not make it so — quietly re-parenting an orphan onto whatever it lands near would be exactly the suppression this verb exists to prevent. " +
@@ -985,4 +993,8 @@ export function atlassianTools(
       },
     },
   };
+  // BUTCHR-341: the ONE place `tools` is assembled — see `withOutcomeRecording`'s
+  // own doc comment (src/tools/outcome.ts) for why wrapping happens exactly
+  // here rather than at each of the 34 definitions above.
+  return withOutcomeRecording(tools, log);
 }

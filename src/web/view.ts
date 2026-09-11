@@ -1,6 +1,6 @@
 import { Elysia } from "elysia";
 import type { McpHandle } from "@brooswit/thatch";
-import { PAGE } from "./page.js";
+import { renderDashboard, type DashboardHeaderInfo } from "./dashboard-page.js";
 import type { HealthStatus } from "../daemon/health.js";
 import type { DashboardResponse } from "../agents/dashboard.js";
 
@@ -27,12 +27,46 @@ export interface ViewDeps {
    * src/agents/dashboard.ts for the shape and the "could not check" contract.
    */
   dashboard: () => Promise<DashboardResponse>;
+  /**
+   * BUTCHR-339: the dashboard PAGE's own header info (build sha + the
+   * optional build-currency verdict) — SYNCHRONOUS, same discipline as
+   * `dashboard` above (no I/O on the request path): the caller (src/daemon/
+   * index.ts) already has both values in hand from its own build-identity
+   * and currency-tracker singletons, so this reads them, never recomputes.
+   */
+  header: () => DashboardHeaderInfo;
+  /**
+   * BUTCHR-339: resolves a resource key (a Jira issue key, or a project id)
+   * to its correct external target — the Jira issue for an issue key, the
+   * project's Confluence ROOT DOC for a project id — for the `/resource/:key/open`
+   * redirect route. Unlike `dashboard`/`header`, this DOES do I/O (a project's
+   * root doc is not cached anywhere on the dashboard snapshot — see
+   * src/tools/docs.ts's `projectRootDoc`), but only when a human clicks the
+   * link, never on `/dashboard`'s or `/`'s own request path. `error`, when
+   * present, is the exact human-readable refusal reason — the same honesty
+   * bar as `openPane` above.
+   */
+  resourceLink: (key: string) => Promise<{ ok: true; url: string } | { ok: false; error: string }>;
 }
 
 /** The live view: the page, its data (/state), the connected-agents feed (/agents), and the open action. */
 export function liveView(mcp: McpHandle, deps: ViewDeps) {
   return new Elysia()
-    .get("/", () => new Response(PAGE, { headers: { "content-type": "text/html; charset=utf-8" } }))
+    // BUTCHR-339: the dashboard page itself — a pure, synchronous render
+    // (src/web/dashboard-page.ts) of the SAME snapshot `/dashboard` serves,
+    // plus the SAME synchronous header info `/health`'s `build`/`currency`
+    // fields already carry. No I/O on this request path either: `dashboard()`
+    // and `header()` both just read state a poll already produced.
+    .get("/", async () => {
+      const response = await deps.dashboard();
+      const html = renderDashboard(response, {
+        now: Date.now(),
+        header: deps.header(),
+        terminalLinkHref: (pane) => `/agents/pane/${encodeURIComponent(pane)}/attach`,
+        resourceLinkHref: (key) => `/resource/${encodeURIComponent(key)}/open`,
+      });
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    })
     // 503 (not just a false `ok`) when unhealthy, so a `curl -f` or any dumb
     // uptime checker goes red too — an endpoint nobody curls doesn't satisfy
     // "loud" (BUTCHR-18/BUTCHR-6).
@@ -77,5 +111,20 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // is actually known (the emulator was launched), never that a window
       // appeared, which was never observed.
       return `launched a terminal for ${pane} (fire-and-forget: whether a window actually appeared was not, and cannot be, confirmed)`;
+    })
+    // BUTCHR-339: the dashboard row's RESOURCE link target — a small
+    // server-side redirect that resolves a resource key to its correct
+    // target ONLY when a human clicks (never on `/dashboard`'s own request
+    // path, per that route's own no-I/O contract). 302 on success; a plain-
+    // text, human-readable refusal on failure — the same honesty bar as the
+    // terminal-attach route above, never a blank page or a silent failure.
+    .get("/resource/:key/open", async ({ params, set }) => {
+      const key = decodeURIComponent(params.key);
+      const r = await deps.resourceLink(key);
+      set.headers["content-type"] = "text/plain; charset=utf-8";
+      if (!r.ok) { set.status = 409; return r.error; }
+      set.status = 302;
+      set.headers["location"] = r.url;
+      return "";
     });
 }
