@@ -219,6 +219,59 @@
 export const MAX_IMPLAUSIBLE_POLLS = 4;
 
 /**
+ * BUTCHR-320 criterion (D) — a LEGIBLE DISCONTINUITY against TWO prior
+ * formats, both still `[admission]`-tagged and both guarded on
+ * `withheld > 0` (never fired at `withheld = 0`):
+ *
+ *   Format 1 (the build in production as of BUTCHR-320's own writing,
+ *   `0fa49429`): `[admission] cap=13 residency=13 withheld 2/2 wanted:
+ *   BUTCHR-307, BUTCHR-308` — a bare comma-separated id list.
+ *
+ *   Format 2 (main since BUTCHR-297's aging merge, and this file's own emit
+ *   immediately below before this ticket): `[admission] cap=13 residency=13
+ *   withheld 2/2 wanted: BUTCHR-307(4), BUTCHR-308(2)` — each id carries a
+ *   `(count)` wait suffix.
+ *
+ * Once (B) makes the line fire on `withheld = 0` polls too, a before/after
+ * comparison spanning this deploy would show an apparent RISE in admissions
+ * that is purely the instrument gaining sight of polls it could not observe
+ * before — indistinguishable from a real change unless the reader can tell,
+ * from the line's own shape, which instrument produced it. A DISTINCT TAG
+ * (not a version marker appended to the same `[admission]` tag) was chosen
+ * deliberately: `startsWith("[admission]")` — the exact test both
+ * `admission.test.ts` and any external reader would reach for first — must
+ * never accidentally match the new line, and a trailing marker (e.g.
+ * `[admission] v2 ...`) still starts with the literal substring
+ * `"[admission]"` only if a space follows immediately after "admission",
+ * which it does NOT here (`[admission] v2` has `[admission]` as an exact
+ * prefix) — a hazard a same-tag marker cannot help but risk. A wholly
+ * different tag has no such trap. THIS IS NOT BACKWARD COMPATIBILITY (the
+ * ticket's own words): the old tag is retired outright, not kept parseable
+ * alongside the new one — see `test/unit/admission.test.ts`'s six-direction
+ * discontinuity test for the mechanical proof against both prior formats.
+ *
+ * BEFORE/AFTER COMPARISONS OF ADMISSIONS ACROSS THIS CHANGE MUST BE
+ * RE-BASELINED — restated here because this is the module that changed, not
+ * only on the ticket's own doc.
+ *
+ * BUTCHR-334 — "NO LINE THIS POLL" NOW MEANS EXACTLY ONE THING: zero spawn
+ * candidates, full stop, true on EVERY path through `admit()` — not only the
+ * ordinary one. Before this ticket, `admit()`'s two fail-safe early returns
+ * (`residency()` throwing; a readable-but-still-untrusted implausible zero —
+ * see this file's own top-comment Trap 2) withheld every candidate but
+ * `return`ed before this line was ever reached, so a poll that HAD
+ * candidates, all of them withheld by a fail-safe, produced no
+ * `[admission2]` line at all — a reader had to already know and remember
+ * that caveat. Both paths now also log, under this SAME tag, via
+ * `admissionFailSafeLine` (see its own doc comment for the exact shape and
+ * why it omits `residency=`) — so the guarantee holds by construction
+ * rather than by a caveat a reader has to carry. `admit()`'s return value
+ * (always `[]` on both paths) is UNCHANGED by this — this is an emission
+ * change only, pinned by test alongside the behavioural pin.
+ */
+export const ADMISSION2_TAG = "[admission2]";
+
+/**
  * BUTCHR-297 (§B2): how many `admit()` calls (counted across BOTH tiers
  * sharing this one controller instance — see this file's own top-comment
  * addendum for why a call, not a poll of either tier alone, is the unit) a
@@ -308,6 +361,61 @@ export interface AdmissionControllerDeps {
   /** Poll-count bound for a readable-but-implausible zero — see `ImplausibleZeroGuard`. Optional; defaults to `MAX_IMPLAUSIBLE_POLLS`. */
   maxImplausiblePolls?: number;
   log?: (line: string) => void;
+  /**
+   * BUTCHR-332: clock for `census()`'s per-bucket `confirmedAt`/`declinedAt`
+   * timestamps — injected so a test can move time rather than asserting
+   * against a frozen `Date.now()`. Optional; defaults to `Date.now`.
+   */
+  now?: () => number;
+  /**
+   * BUTCHR-332: every source that will ever call `admit(..., source)` —
+   * taken up front, not discovered lazily, so "this tier has not reported
+   * yet" is expressible from the very first `census()` read. A bucket for
+   * each name here is created at CONSTRUCTION time, `{checked: false,
+   * reason: "never-reported"}` — a lazily-created bucket set cannot
+   * distinguish "never reported" from "does not exist", which is the same
+   * collapse this whole feature exists to close (BUTCHR-332's own mutations
+   * 11/12: a vacuous "every bucket that has reported is trusted" reads as
+   * checked with zero buckets ever having reported at all). Optional;
+   * defaults to empty — a caller that never names its sources up front
+   * simply gets no pre-seeded buckets, and `admit`'s own default source
+   * name (see `DEFAULT_ADMISSION_SOURCE`) still records correctly once
+   * called.
+   */
+  sources?: readonly string[];
+}
+
+/** `admit`'s `source` name when the caller omits it — every existing 2-arg caller/test (this file's own, `reconcileNow`'s `ReconcileOptions.admission`) still compiles and records under one shared bucket rather than losing its census entirely. */
+export const DEFAULT_ADMISSION_SOURCE = "default";
+
+/**
+ * BUTCHR-332: one calling tier's residency-census bucket — see `AdmissionCensus`.
+ * A `checked: false` bucket's `reason` distinguishes three distinct declines:
+ * `"census-threw"` (§Trap 2 shape 1), `"census-untrusted"` (shape 2, still
+ * within `ImplausibleZeroGuard`'s bound), and `"never-reported"` (this source
+ * has never once called `admit` — the construction-time default, see
+ * `AdmissionControllerDeps.sources`). None of the three may ever be
+ * conflated with `AgentDashboardRow`'s own "not applicable" state
+ * (src/agents/dashboard.ts) — this is "could not check", a different thing.
+ */
+export type AdmissionCensusBucket =
+  | { source: string; checked: true; confirmedAt: string; withheld: readonly string[] }
+  | { source: string; checked: false; declinedAt: string; reason: "census-threw" | "census-untrusted" | "never-reported" };
+
+/**
+ * BUTCHR-332: the full per-source residency census — `cap`/`residency` are
+ * the SAME values `AdmissionSnapshot` already exposes (never a second
+ * source), `buckets` is ONE ENTRY PER SOURCE THAT HAS EVER BEEN DECLARED OR
+ * CALLED, deliberately with NO aggregate "is everything fine" boolean
+ * anywhere on this shape: a single flag would let one source's trusted
+ * bucket vouch for a DIFFERENT source that failed or never reported (the
+ * exact smear BUTCHR-332's own review bar names as mutations 3/4/11/12) —
+ * a consumer must look at the specific bucket(s) it cares about.
+ */
+export interface AdmissionCensus {
+  cap: number;
+  residency: number | null;
+  buckets: readonly AdmissionCensusBucket[];
 }
 
 export interface AdmissionController {
@@ -318,9 +426,17 @@ export interface AdmissionController {
    * the cold-start/implausible-zero discriminator — see this module's own
    * top comment, Trap 2). Never throws.
    */
-  admit(candidates: readonly string[], stopping: readonly string[]): Promise<readonly string[]>;
+  admit(candidates: readonly string[], stopping: readonly string[], source?: string): Promise<readonly string[]>;
   /** Current snapshot for `/health` — see AdmissionSnapshot. Synchronous: reads the last TRUSTED census `admit()` itself already took, never makes a fresh call. */
   snapshot(): AdmissionSnapshot;
+  /**
+   * BUTCHR-332: the per-source census — see `AdmissionCensus`. Synchronous,
+   * like `snapshot()`: reads state `admit()` calls already recorded, never
+   * makes a fresh call of its own. Additive alongside `snapshot()`, which
+   * keeps its own existing contract untouched (both read the same
+   * `cap`/`lastTrusted` internals — never a second source).
+   */
+  census(): AdmissionCensus;
   /**
    * BUTCHR-297 (§B4): clear the accumulated wait for candidates whose spawn
    * ACTUALLY SUCCEEDED this poll — see this file's own top-comment B4
@@ -360,9 +476,67 @@ export function orderByWait(candidates: readonly string[], waits: ReadonlyMap<st
   });
 }
 
+/**
+ * BUTCHR-320 (B/D): the self-describing admission line, built once here so
+ * `admit()`'s one call site and any test constructing an expected sample
+ * (see the discontinuity test) share the exact same formatting — never two
+ * independent string templates that could drift. Fires unconditionally
+ * whenever the caller reaches it (i.e. `candidates.length > 0` — the
+ * `candidates.length === 0` short-circuit in `admit()` never calls this at
+ * all, and that silence is documented at that call site, not here). Carries
+ * `admittedCount` even when it's 0 (a fully-saturated poll) and the withheld
+ * id list only when there's something withheld — `withheld 0/N` with no
+ * trailing `wanted:` clause is exactly as parseable as the withheld-nonzero
+ * case, just shorter.
+ */
+export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>): string {
+  const base = `${ADMISSION2_TAG} cap=${cap} residency=${residency} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
+  if (withheld.length === 0) return base;
+  const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
+  return `${base} wanted: ${withheldDesc}`;
+}
+
+/** Which of `admit()`'s two early-return fail-safe paths produced an `admissionFailSafeLine` — see that function's own doc comment. */
+export type AdmissionFailSafe = "census-threw" | "implausible-zero";
+
+/**
+ * BUTCHR-334 (finding 1): the SAME tag as `admissionLine` (never a
+ * second/silent format), for `admit()`'s two fail-safe early returns —
+ * `residency()` throwing, and a readable-but-still-untrusted implausible
+ * zero (see this file's own top-comment Trap 2). BEFORE this ticket, both
+ * paths withheld every candidate but returned before `admissionLine` was
+ * ever called, so "a missing `[admission2]` line means this poll had zero
+ * spawn candidates" was FALSE on either path whenever `candidates.length >
+ * 0` — the WARNING line was the only trace, and only in the journal, never
+ * mechanically distinguishable from an absent poll. This line closes that:
+ * every poll `admit()` reaches with at least one candidate now logs exactly
+ * one `[admission2]`-tagged line, whichever of the three paths (ordinary,
+ * census-threw, implausible-zero) it took — so "no `[admission2]` line" now
+ * means, by construction, "zero candidates that poll," full stop. Mirrors
+ * `admissionLine`'s own `admitted=`/`withheld N/M` fields exactly (every
+ * candidate is withheld on a fail-safe path, so `admittedCount` is always 0
+ * and the ratio is always `N/N`) but OMITS `residency=`, deliberately: a
+ * fail-safe path by definition has no TRUSTED residency figure to report
+ * (`census-threw` has no reading at all; `implausible-zero`'s own reading is
+ * exactly the untrusted one this path exists to reject — reporting it as if
+ * it were `residency=` would misrepresent it as trusted). `fail-safe=<reason>`
+ * takes that field's place instead, naming which of the two paths fired — a
+ * reader who greps for `residency=` therefore correctly gets zero hits on a
+ * fail-safe line, distinguishing it from an ordinary one at a glance, same
+ * spirit as `ADMISSION2_TAG`'s own doc comment on why a wholly distinct
+ * signal (here, a field, not a tag) beats a caveat the reader has to
+ * remember. Only ever called with `candidates.length > 0` (the empty-
+ * candidates case logs nothing on ANY path, ordinary or fail-safe alike —
+ * the existing, unchanged short-circuit in `admit()`).
+ */
+export function admissionFailSafeLine(cap: number, reason: AdmissionFailSafe, candidates: readonly string[]): string {
+  return `${ADMISSION2_TAG} cap=${cap} admitted=0 withheld ${candidates.length}/${candidates.length} fail-safe=${reason} wanted: ${candidates.join(", ")}`;
+}
+
 /** Builds the shared, fleet-wide admission controller wired into BOTH `runResourceLoop` call sites (src/daemon/index.ts) via `ReconcileOptions.admission` (src/daemon/loop.ts). */
 export function createAdmissionController(deps: AdmissionControllerDeps): AdmissionController {
   const log = (line: string) => deps.log?.(line);
+  const now = deps.now ?? Date.now;
   const guard = new ImplausibleZeroGuard(deps.maxImplausiblePolls);
   /** Last TRUSTED residency — null means no trusted observation yet (cold start: the very next zero is trusted, not treated as implausible). */
   let lastTrusted: number | null = null;
@@ -374,8 +548,23 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   let callCount = 0;
   /** BUTCHR-297: the withheld set from the last TRUSTED, non-empty `admit()` call — `/health`'s `longestWait` (see AdmissionSnapshot) reads its FIRST element, which is already the longest-waiting (or equal-longest, lexicographically-first) candidate, since `withheld` is itself a suffix of `orderByWait`'s fully-sorted order. */
   let lastWithheld: readonly string[] = [];
+  // BUTCHR-332: one bucket per source, keyed by the `source` name `admit`
+  // was called with — pre-seeded here, at CONSTRUCTION time, for every name
+  // in `deps.sources`, so a tier that has not polled yet is expressible as
+  // "never-reported" from the very first `census()` read rather than simply
+  // absent (mutations 11/12 on the ticket — a lazily-created bucket set has
+  // nothing to quantify over, so "no source has reported" and "one of two
+  // hasn't" would both silently read as an empty, vacuously-trusted set).
+  // NEVER written to except by the single `setBucket(source, ...)` call
+  // inside `admit` below, keyed by the exact `source` string that call
+  // received — this is what makes C1 (one tier's call can never clear
+  // another's bucket) structural rather than a discipline to remember.
+  const buckets = new Map<string, AdmissionCensusBucket>(
+    (deps.sources ?? []).map((source) => [source, { source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "never-reported" }]),
+  );
+  const setBucket = (bucket: AdmissionCensusBucket) => buckets.set(bucket.source, bucket);
 
-  async function admit(candidates: readonly string[], stopping: readonly string[]): Promise<readonly string[]> {
+  async function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
     let resident: readonly string[];
     try {
       resident = await deps.residency();
@@ -385,7 +574,12 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       // outage is a different condition from a readable-but-wrong answer).
       if (candidates.length) {
         log(`WARNING: [admission] residency census threw (${(e as Error)?.message ?? e}) — withholding all ${candidates.length} wanted this poll (fail-safe): ${candidates.join(", ")}`);
+        log(admissionFailSafeLine(deps.cap, "census-threw", candidates));
       }
+      // BUTCHR-332: a bucket WRITE beside the existing fail-safe `return []`
+      // — never a change to it (§B3: the wait ledger/lastTrusted/lastWithheld
+      // are all still untouched below, exactly as before this ticket).
+      setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-threw" });
       return [];
     }
     const observed = resident.length;
@@ -400,7 +594,9 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       if (stillUntrusted) {
         if (candidates.length) {
           log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only stops ${stopping.length} of that — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${candidates.length} wanted this poll`);
+          log(admissionFailSafeLine(deps.cap, "implausible-zero", candidates));
         }
+        setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-untrusted" });
         return [];
       }
       // Trap 2(d): the bound is exceeded — accept the zero as real rather
@@ -424,7 +620,15 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // `callCount` are untouched below, same as before) and does not
     // violate B3 — B3 is about the ledger, and both fail-safe paths return
     // earlier than this line already.
-    if (candidates.length === 0) { lastWithheld = []; return candidates; }
+    if (candidates.length === 0) {
+      lastWithheld = [];
+      // BUTCHR-332: a real, TRUSTED observation — "checked: nothing wanted
+      // this poll" — not a decline and not silence (the ticket's own
+      // explicit correction: an empty shape carrying no timestamp reopens
+      // the exact gap BUTCHR-264 closed, one level down).
+      setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld: [] });
+      return candidates;
+    }
     callCount++;
     // BUTCHR-297: order BEFORE slicing — see this file's own top-comment
     // addendum for why aging lives here and why the tie-break reproduces
@@ -459,15 +663,17 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       }
     }
     lastWithheld = withheld;
-    if (withheld.length > 0) {
-      // §E: each withheld candidate's CURRENT wait count, not just its id —
-      // this is the legibility the epic accepted losing determinism-from-
-      // the-key-alone for. The existing tokens (`cap=`, `residency=`,
-      // `withheld N/M wanted:`) are unchanged and still parseable; only the
-      // trailing id list gained a `(count)` suffix per id.
-      const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
-      log(`[admission] cap=${deps.cap} residency=${observed} withheld ${withheld.length}/${candidates.length} wanted: ${withheldDesc}`);
-    }
+    // BUTCHR-320 (B/D): fires on EVERY poll that reaches this point — i.e.
+    // every poll with at least one candidate, including `withheld = 0` —
+    // unlike the old `[admission]` line this replaces, which only ever fired
+    // behind `withheld.length > 0` (confirmed at this commit: any admissions
+    // total summed from the old line was a floor, never a count, biased low
+    // by exactly the polls where spawning proceeded freely). Carries the
+    // ADMITTED count too, not only withheld — see `ADMISSION2_TAG`'s own doc
+    // comment for why the tag itself changed (criterion D) rather than
+    // reusing `[admission]` with a wider firing condition.
+    log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits));
+    setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
     return admitted;
   }
 
@@ -486,5 +692,9 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       const longestWait = longestId !== undefined ? { id: longestId, polls: waits.get(longestId) ?? 0 } : null;
       return { cap: deps.cap, residency: lastTrusted, longestWait };
     },
+    // BUTCHR-332: reads the SAME `cap`/`lastTrusted` `snapshot()` already
+    // reads (never a second source) plus the per-source `buckets` map —
+    // synchronous, no fresh call of its own.
+    census: () => ({ cap: deps.cap, residency: lastTrusted, buckets: [...buckets.values()] }),
   };
 }

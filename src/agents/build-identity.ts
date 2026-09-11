@@ -167,3 +167,21 @@ export function toBuildReport(b: BuildIdentity): BuildReport {
     journalctl: b.systemd.kind === "none" ? "" : b.systemd.journalctl,
   };
 }
+
+/**
+ * BUTCHR-320 (C): a one-line, human-readable rendering of a `BuildReport` —
+ * for the daemon's OWN startup banner (src/daemon/index.ts), so a journal
+ * window can be attributed to a build as well as to a pid (journald's pid
+ * only bounds a window to one daemon GENERATION; nothing before this ticket
+ * said which BUILD produced it). Takes the already-flattened `BuildReport`,
+ * never `BuildIdentity` directly and never re-derives anything — the exact
+ * same report `/health`'s `build` field serves (see `combineHealth`,
+ * src/daemon/health.ts), reused rather than recomputed, per the ticket's own
+ * "reuse; do not recompute" instruction.
+ */
+export function describeBuild(b: BuildReport): string {
+  const sha = b.sha
+    ? `${b.sha.slice(0, 8)} (${b.shaProvenance}${b.shaDirty === true ? ", dirty" : b.shaDirty === false ? ", clean" : ""})`
+    : `unknown (${b.shaUnknownReason ?? "no reason recorded"})`;
+  return `build ${sha} version=${b.version} pid=${b.pid} unit=${b.unit}`;
+}
