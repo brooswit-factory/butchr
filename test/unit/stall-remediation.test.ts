@@ -594,6 +594,11 @@ describe("createStallRemediator", () => {
       expect(text).toContain("admission:withheld");
       expect(text).not.toContain("close or transition this ticket so agent:stalled clears");
       expect(text).not.toContain("act on this ticket now");
+      // BUTCHR-353 review round 2: the tail must not read as "this wake
+      // comment already cleared the streak" — it starts with DAEMON_CHATTER_
+      // PREFIX ("[butchr:") and stalled.ts's own findMarked-adjacent streak
+      // check excludes daemon chatter, so only a REPLY from the agent counts.
+      expect(text).toContain("a comment from you saying so counts; this one does not");
     });
 
     // Falsifier 5, control A: a STALE marker (worker's real agent:* label is

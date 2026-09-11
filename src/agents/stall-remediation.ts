@@ -220,7 +220,7 @@ function correctlyWaitingTail(s: WorkerSignals): string {
   return (
     `[butchr:stall:waiting] This looks like correct waiting, not done or stuck, based on your own worker(s): ${clauses.join(" ")} ` +
     "Do not close or transition this ticket over this, and there is nothing to re-assert — a disposition that is already correct only gets withheld again. " +
-    "Saying what you are waiting on (this comment counts) is what actually clears agent:stalled; if none of the above is what you are ACTUALLY waiting on, say so and act."
+    "Saying what you are waiting on is what clears agent:stalled — a comment from you saying so counts; this one does not, since it starts with \"[butchr:\". If none of the above is what you are ACTUALLY waiting on, say so and act."
   );
 }
 
@@ -404,12 +404,21 @@ export interface StallRemediator {
  * omitted or empty short-circuits to zero calls and `NO_SIGNALS`.
  *
  * UNKNOWN NEVER BECOMES A CONFIDENT CLAIM (this ticket's central
- * requirement): a `deps.labels`/`deps.comments` rejection for a given
- * worker is caught, logged, and that worker is simply DROPPED from every
- * signal for this poll — never defaulted into "withheld" or "unanswered".
- * The worst case is under-reporting (falls through toward `NO_SIGNALS`,
- * i.e. today's existing wake text) rather than a false "you are correctly
- * waiting" — the asymmetry this whole ticket exists to enforce.
+ * requirement), CORRECTED (found at review — an earlier version of this
+ * comment overstated it, and BUTCHR-311's own doc repeated the overstatement
+ * upward): a `deps.labels`/`deps.comments` rejection for a given worker is
+ * caught, logged, and drops ONLY the signal that read was for — NOT every
+ * signal for that worker. `inReview` is read off `w.status` alone (no I/O,
+ * see the loop below), so a failed `comments()` never touches it; a failed
+ * `comments()` drops only that worker's `unansweredAsks` claim, and a failed
+ * `labels()` drops only its `withheldAtCap` claim — the other signal(s) for
+ * the SAME worker still post if they were themselves observed. Each signal
+ * rests on its own observation, and a failed read removes only the claim
+ * that rested on it; it never invents one. The worst case per signal is
+ * under-reporting (that one claim falls through toward `NO_SIGNALS`, i.e.
+ * today's existing wake text, if nothing else fired either) rather than a
+ * false "you are correctly waiting" — the asymmetry this whole ticket exists
+ * to enforce.
  *
  * THE ASK RULE, STATED: the newest comment on a worker's own ticket that
  * starts with `[<workerKey>] [ask]` (askBoss's own identity-tag + ASK_MARKER
@@ -433,12 +442,41 @@ export interface StallRemediator {
  * back to today's default text — the exact founding shape scope (C) was
  * built to catch (BUTCHR-316/BUTCHR-341), missed by this same rule, if the
  * ask is old enough. STILL THE SAFE DIRECTION (under-reporting, never a
- * false "correctly waiting") — DELIBERATELY NOT FIXED HERE: raising
- * `maxResults`, paging, or adding a second read would disturb the cost bound
- * this module states and pins elsewhere, which is out of scope for what
- * found this. A reader debugging "the wake didn't name an ask I know is
- * there" should check the worker ticket's own comment count FIRST, against
- * this 20-comment window, before suspecting the rule above.
+ * false "correctly waiting").
+ *
+ * WHY NOT FIXED HERE, CORRECTED (found at review — the reason this comment
+ * previously gave does not survive measurement, and this ticket's own PR
+ * body/doc, plus BUTCHR-311's own PR body/doc, both repeated the wrong
+ * reason upward before it was caught): this is NOT a cost-bound tradeoff.
+ * The withheld check below already pays for one `getIssue` per non-Done
+ * worker, and that response's embedded `fields.comment` block would appear
+ * to let the ask check reuse the SAME read — taking the bound from 2N to N
+ * and REMOVING the window entirely, not disturbing anything.
+ *
+ * The real reason is a standing precedent this codebase already paid for,
+ * the hard way: an earlier read (src/tools/defs.ts, in-review-epic comment
+ * gathering — verify at your own commit) tried exactly this, serving from
+ * `getIssue`'s embedded block instead of a paginating reader, and was found
+ * at review to be ASCENDING/oldest-first with an unconfirmed cap — silently
+ * disagreeing with discovery's own newest-first reader if ever truncated.
+ * BUTCHR-311 independently confirmed this shape on five live `getIssue`
+ * payloads (`returned == total == maxResults` on every one — 12, 6, 14, 18,
+ * 8 — embedded list oldest-first, matching defs.ts's finding), with two
+ * stated limits on that measurement: it went through an older daemon's
+ * tooling, not this PR's own wiring, and the largest list seen was ~71, so
+ * a cap above that remains unconfirmed. Verify both the defs.ts precedent
+ * and BUTCHR-311's measurement yourself rather than trusting this citation.
+ *
+ * The rule above also needs newest-first order (it walks from the newest
+ * comment down looking for the `[ask]`); the embedded block runs the other
+ * way, so reusing it would need the walk direction inverted, and getting
+ * that backwards fails quietly rather than loudly — a second, sharper
+ * reason not to. Given that precedent, `deps.comments` (`AtlassianClient.
+ * comments()`, paginating, newest-first) stays the ask check's only reader:
+ * do NOT raise `maxResults`, add paging, or switch to the embedded block to
+ * close this window. A reader debugging "the wake didn't name an ask I know
+ * is there" should check the worker ticket's own comment count FIRST,
+ * against this 20-comment window, before suspecting the rule above.
  */
 async function gatherWorkerSignals(deps: StallRemediationDeps, stalledKey: string, workers: readonly WorkerLink[] | undefined, log: (line: string) => void): Promise<WorkerSignals> {
   const nonDone = (workers ?? []).filter((w) => w.status !== "Done");
