@@ -754,6 +754,15 @@ void sweepStaleAgentLabels({
 // ledger) to the generic loop below.
 const issueResourceType = createIssueResourceType({
   search: async (jql) => {
+    // BUTCHR-354: `discovery.search()` calls this dep exactly once as the
+    // very FIRST thing the fetch stage does each tick (loop.ts's own step
+    // 1, before reconcileNow/related/syncLabels) — the earliest point
+    // available to reset `dashboardFeed`'s tick-scoped "already touched"
+    // bookkeeping. `related()` (step 3, src/resources/issue.ts's
+    // `createRelated`) calls this SAME dep a second time for its own
+    // linked-tickets lookup — a harmless extra reset, since step 4
+    // (syncLabels) never runs before step 3 finishes either way.
+    dashboardFeed.beginPoll();
     const issues = await atlassian.search(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
@@ -859,7 +868,43 @@ runResourceLoop(issueResourceType, {
   onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
-  onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
+  // BUTCHR-354: `onError` is @brooswit/sundry's `watch()` calling back
+  // whenever the FETCH stage itself (search/reconcileNow/related, or
+  // syncLabels — loop.ts's own `runResourceLoop`) rejects — see that
+  // package's own `watcher.d.ts`: "A throw/reject skips that tick … onError
+  // sees it if provided." Before this ticket, a rejection here was ONLY
+  // ever logged: an upstream rejection (steps 1-3) never reaches
+  // `syncLabels`/`agentStatusesFeedingDashboard` at all, so `/dashboard`'s
+  // own decline path never ran and never got the chance to say it could not
+  // check — the snapshot just froze at whatever it last held (measured:
+  // this ticket's own STEP 1 falsifier).
+  //
+  // `dashboardFeed.declineUpstream()` closes that: it is a NO-OP whenever
+  // `agentStatusesFeedingDashboard` already ran (and already recorded its
+  // own outcome) this same tick — see that method's own doc comment
+  // (src/agents/dashboard.ts) for how it guarantees this without this call
+  // site needing to know which stage actually rejected. Only when it
+  // reports it actually recorded something is `coverage.recordDeclined`
+  // called here too — calling it unconditionally would double-count the
+  // step-4 (`agent.list()`) failure mode that `agentStatusesFeedingDashboard`
+  // already counts correctly on its own.
+  //
+  // DECISION (must hold, recorded here beside the code — not only in the
+  // PR): a SINGLE rejected poll declines `/dashboard` immediately, on this
+  // very tick, rather than only once `config.pollStaleMs` has elapsed.
+  // Waiting would reproduce, for this surface, exactly the blind window
+  // `/health`'s own `pollLoop` staleness already has (this ticket's own
+  // Falsifier B) — the blind window this story exists to close, not one to
+  // copy onto a second surface. The cost is a one-poll flap to `declined`
+  // on a single transient failure, with no debounce — but that is already
+  // `agentStatusesFeedingDashboard`'s own established, reviewed behaviour
+  // for the step-4 case (BUTCHR-308: one rejected `agent.list()` call
+  // already declines immediately, no threshold). This is parity with it,
+  // not a new risk.
+  onError: (e) => {
+    console.error(`  loop error: ${(e as Error)?.message ?? e}`);
+    if (dashboardFeed.declineUpstream()) coverage.recordDeclined(DASHBOARD_DETECTOR);
+  },
   onPollSuccess: () => loopHealth.recordSuccess(),
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });

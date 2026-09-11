@@ -210,6 +210,92 @@ describe("createDashboardFeed: the could-not-check decision, unit-tested directl
   });
 });
 
+// BUTCHR-354: `declineUpstream`/`beginPoll` — the "could not check" decision
+// for a poll that never reached THIS feed's own `poll()` at all (an upstream
+// rejection: search/reconcileNow/related, aborting the fetch stage before it
+// ever reaches syncLabels). Unit-tested directly, same discipline as
+// BUTCHR-308's own decision above.
+describe("createDashboardFeed: declineUpstream/beginPoll — the upstream 'could not check' decision, unit-tested directly (BUTCHR-354)", () => {
+  function feed(now: () => number) {
+    const admission = noWithholding();
+    return createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+  }
+
+  test("declineUpstream after a poll that already succeeded this tick reflects the fresh success, not a manufactured decline (agent wins/no-op case)", async () => {
+    let now = 1000;
+    const f = feed(() => now);
+    f.beginPoll();
+    await f.poll(async () => ({ agents: [agent("butchr-butchr-1", "working")] }));
+    const afterPoll = f.snapshot();
+
+    const recorded = f.declineUpstream(); // same tick — poll() already ran
+    expect(recorded).toBe(false); // no-op: must not double-record
+
+    const afterDecline = f.snapshot();
+    expect(afterDecline).toEqual(afterPoll); // snapshot untouched by the no-op
+  });
+
+  test("declineUpstream on a tick whose poll() rejected (step 4) is ALSO a no-op — the double-recording property this method exists to pin", async () => {
+    let now = 1000;
+    const f = feed(() => now);
+    await f.poll(async () => ({ agents: [] })); // establish a baseline snapshot
+
+    now = 5000;
+    f.beginPoll();
+    let caught: unknown;
+    try {
+      await f.poll(async () => { throw new Error("agent.list: connection closed before a response"); });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(Error);
+    const afterPollDecline = f.snapshot();
+    if (afterPollDecline.checked) throw new Error("expected checked:false");
+    expect(afterPollDecline.declinedAt).toBe(new Date(5000).toISOString());
+
+    const recorded = f.declineUpstream(); // same tick — poll() already recorded ITS OWN decline
+    expect(recorded).toBe(false); // must NOT flip declinedAt again / double-count
+
+    expect(f.snapshot()).toEqual(afterPollDecline); // byte-identical to what poll() alone produced
+  });
+
+  test("declineUpstream on a FRESH tick (beginPoll called, poll() never reached — the upstream case) flips checked:false, carries rows forward untouched, and records exactly once", async () => {
+    let now = 1000;
+    const f = feed(() => now);
+    await f.poll(async () => ({ agents: [agent("butchr-butchr-1", "working")] }));
+    const beforeRows = f.snapshot().rows;
+
+    now = 9000;
+    f.beginPoll(); // loop.ts step 1 (search()) ran; steps 2/3 then rejected upstream of syncLabels
+    const recorded = f.declineUpstream();
+    expect(recorded).toBe(true);
+
+    const after = f.snapshot();
+    if (after.checked) throw new Error("expected checked:false");
+    expect(after.declinedAt).toBe(new Date(9000).toISOString());
+    expect(after.rows).toEqual(beforeRows); // carried forward byte-identical, same ruling as poll()'s own catch branch
+    expect(after.rows[0]!.confirmedAt).toBe(new Date(1000).toISOString()); // not laundered to look fresh
+
+    // A second declineUpstream() call the SAME tick (no intervening beginPoll) must not re-stamp declinedAt.
+    now = 12000;
+    const recordedAgain = f.declineUpstream();
+    expect(recordedAgain).toBe(false);
+    const finalSnapshot = f.snapshot();
+    if (finalSnapshot.checked) throw new Error("expected checked:false");
+    expect(finalSnapshot.declinedAt).toBe(new Date(9000).toISOString());
+  });
+
+  test("beginPoll is safe to call more than once per tick before poll()/declineUpstream (related()'s own secondary search() call) — still exactly one decline recorded", async () => {
+    let now = 1000;
+    const f = feed(() => now);
+    await f.poll(async () => ({ agents: [] }));
+
+    now = 4000;
+    f.beginPoll(); // step 1's search()
+    f.beginPoll(); // related()'s own secondary search() call, still before step 4
+    expect(f.declineUpstream()).toBe(true);
+    expect(f.declineUpstream()).toBe(false); // still idempotent within the same tick
+  });
+});
+
 // BUTCHR-332: one row per admission-withheld ticket, per-source, driven
 // through the REAL `createAdmissionController` and `createDashboardFeed` —
 // never a hand-assembled `AdmissionCensus` (the ticket's own review-bar

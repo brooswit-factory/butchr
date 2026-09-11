@@ -5,6 +5,12 @@ import { agentFoldSuppressedLine } from "../../src/jira-watch/suppressed-log.js"
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
+import { createDashboardFeed, DASHBOARD_DETECTOR, type DashboardAgent } from "../../src/agents/dashboard.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
+import { createCoverageTracker } from "../../src/daemon/coverage.js";
+import { createLoopHealth, combineHealth } from "../../src/daemon/health.js";
+import { createLabelSync } from "../../src/labels/sync.js";
 
 function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
   const running = new Set(initial);
@@ -2033,5 +2039,157 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
     stop();
     expect(calls).toBeGreaterThan(1); // kept polling despite the rejection
     expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkParked's internal errors
+  });
+});
+
+/**
+ * BUTCHR-354: an upstream rejection (search/reconcileNow/related — loop.ts's
+ * fetch stage, steps 1-3) has NO enclosing try/catch at that call site and
+ * aborts BEFORE syncLabels (step 4) ever runs — see loop.ts's own
+ * `runResourceLoop` doc comment. Before this ticket's fix, that meant
+ * `/dashboard`'s own `agentStatusesFeedingDashboard` (src/daemon/index.ts,
+ * step 4's own caller) never got a chance to run at all, so the dashboard
+ * snapshot simply froze at whatever it last held — `checked: true`, an
+ * aging `confirmedAt`, no `declinedAt`, and no coverage decline either.
+ * MEASURED against the unmodified tree (this ticket's own STEP 1 falsifier,
+ * reported on BUTCHR-354): a rejecting `search()` left `dashboardFeed.snapshot()`
+ * at `{checked:true, confirmedAt: <baseline>}` FOREVER, and
+ * `coverage.snapshot()`'s `dashboard` entry never moved off
+ * `declinedCount: 0` — while `/health`'s own `pollLoop` component correctly
+ * went STALE (confirming the epic's own Falsifier B).
+ *
+ * This test drives the REAL `startLoop` (built on `runResourceLoop`),
+ * `createDashboardFeed`, `createCoverageTracker` and `createLabelSync` —
+ * the same modules src/daemon/index.ts wires together — replicating that
+ * wiring (a `search` dep that calls `dashboardFeed.beginPoll()` first, same
+ * as the real `issueResourceType.search` in index.ts; an `onError` that
+ * calls `dashboardFeed.declineUpstream()`, same as the real issue loop's
+ * `onError`) so the assertions below exercise the production call graph,
+ * not a stand-in for it.
+ */
+describe("startLoop + createDashboardFeed + createCoverageTracker (BUTCHR-354): /dashboard reaches its own could-not-check state when the poll rejects upstream of syncLabels", () => {
+  function wireDashboard() {
+    const now = () => Date.now();
+    const coverage = createCoverageTracker(now);
+    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [] });
+    const dashboardFeed = createDashboardFeed({
+      now,
+      issueMeta: () => undefined,
+      tracker: new StatusFloorTracker(now),
+      withheldTracker: new StatusFloorTracker(now),
+      admission: () => admission.census(),
+    });
+    return { coverage, dashboardFeed };
+  }
+
+  test("a search() rejection upstream of syncLabels flips /dashboard to {checked:false, declinedAt}, carries rows forward, and records exactly one coverage decline per failed poll", async () => {
+    const { coverage, dashboardFeed } = wireDashboard();
+    let listAgents: readonly DashboardAgent[] = [];
+    const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
+      let agents: readonly DashboardAgent[];
+      try {
+        agents = await dashboardFeed.poll(async () => ({ agents: listAgents }));
+      } catch (e) {
+        coverage.recordDeclined(DASHBOARD_DETECTOR);
+        throw e;
+      }
+      coverage.recordChecked(DASHBOARD_DETECTOR);
+      return new Map();
+    };
+    const syncLabels = createLabelSync({ jira: { async updateLabels() {} }, agentStatuses: agentStatusesFeedingDashboard });
+
+    let searchShouldReject = false;
+    const herd = fakeHerd();
+    const errors: unknown[] = [];
+    const stop = startLoop({
+      search: async () => {
+        dashboardFeed.beginPoll(); // loop.ts's own step 1 — always first, every tick
+        if (searchShouldReject) throw new Error("jira search: upstream rejection (BUTCHR-354 falsifier)");
+        return [iss("BUTCHR-1", "In Progress")];
+      },
+      herd,
+      notify: () => {},
+      syncLabels,
+      intervalMs: 10,
+      onError: (e) => {
+        errors.push(e);
+        if (dashboardFeed.declineUpstream()) coverage.recordDeclined(DASHBOARD_DETECTOR);
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 40));
+    const baseline = dashboardFeed.snapshot();
+    if (!baseline.checked) throw new Error("expected a healthy baseline poll to have landed");
+    const baselineConfirmedAt = baseline.confirmedAt;
+    const baselineDeclined = coverage.snapshot().find((c) => c.name === DASHBOARD_DETECTOR)!.declinedCount;
+    expect(baselineDeclined).toBe(0);
+
+    searchShouldReject = true;
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+
+    expect(errors.length).toBeGreaterThan(0); // onError did fire for the upstream rejection
+
+    const after = dashboardFeed.snapshot();
+    if (after.checked) throw new Error("THE DEFECT: /dashboard stayed checked:true after an upstream poll rejection — never reached its own could-not-check state");
+    expect(after.declinedAt > baselineConfirmedAt).toBe(true); // a fresh decline, not the stale baseline restated
+    expect(after.rows).toEqual(baseline.rows); // carried forward, same ruling as the existing step-4 decline path
+
+    const afterCoverage = coverage.snapshot().find((c) => c.name === DASHBOARD_DETECTOR)!;
+    expect(afterCoverage.declinedCount).toBeGreaterThan(0); // the coverage sibling moved too — the OTHER founding-error target
+    // Exactly one decline per rejecting poll — never two for the same poll (see the sibling test below for the step-4 double-recording pin).
+    expect(afterCoverage.declinedCount).toBe(errors.length);
+  });
+
+  test("a step-4 rejection (agent.list() itself failing) still records exactly ONE coverage decline — declineUpstream must be a no-op when agentStatusesFeedingDashboard already recorded its own", async () => {
+    const { coverage, dashboardFeed } = wireDashboard();
+    let listShouldReject = false;
+    const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
+      let agents: readonly DashboardAgent[];
+      try {
+        agents = await dashboardFeed.poll(async () => {
+          if (listShouldReject) throw new Error("agent.list: connection closed before a response");
+          return { agents: [] };
+        });
+      } catch (e) {
+        coverage.recordDeclined(DASHBOARD_DETECTOR);
+        throw e;
+      }
+      coverage.recordChecked(DASHBOARD_DETECTOR);
+      return new Map();
+    };
+    const syncLabels = createLabelSync({ jira: { async updateLabels() {} }, agentStatuses: agentStatusesFeedingDashboard });
+
+    const herd = fakeHerd();
+    const errors: unknown[] = [];
+    const stop = startLoop({
+      search: async () => {
+        dashboardFeed.beginPoll();
+        return [iss("BUTCHR-1", "In Progress")];
+      },
+      herd,
+      notify: () => {},
+      syncLabels,
+      intervalMs: 10,
+      onError: (e) => {
+        errors.push(e);
+        if (dashboardFeed.declineUpstream()) coverage.recordDeclined(DASHBOARD_DETECTOR);
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 25));
+    listShouldReject = true;
+    await new Promise((r) => setTimeout(r, 30));
+    stop();
+
+    expect(errors.length).toBeGreaterThan(0);
+    const after = dashboardFeed.snapshot();
+    if (after.checked) throw new Error("expected checked:false after agent.list() itself rejected");
+    // The regression this test exists to catch: a naive unconditional
+    // `coverage.recordDeclined` in `onError` would double this count for
+    // every one of these polls (agentStatusesFeedingDashboard's own catch
+    // records once, THEN onError would record a second time).
+    const declinedCount = coverage.snapshot().find((c) => c.name === DASHBOARD_DETECTOR)!.declinedCount;
+    expect(declinedCount).toBe(errors.length); // exactly one per failed poll, never two
   });
 });
