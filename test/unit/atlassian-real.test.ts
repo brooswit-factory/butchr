@@ -430,6 +430,46 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
     expect(calls.length).toBe(3); // did NOT stop after page 1
     expect(got.results.length).toBe(250); // the full 100+100+50, not just the first 100
   });
+
+  // BUTCHR-309 REVIEW ROUND 2 (measured against the round-1 fix, not
+  // reasoned out of the source): Jira caps `maxResults` SERVER-SIDE and
+  // reports the effective value back in the response's own `maxResults`
+  // field — a page measured "short" against the REQUESTED size (PAGE_SIZE)
+  // rather than the size the server actually honoured looks identical to a
+  // genuine last page. FALSIFIER: if this ever returns fewer than 125
+  // results, or stops after 1 call, the yardstick has regressed back to
+  // "requested size" instead of "server-reported size".
+  test("REVIEW FIX ROUND 2: a server that caps `maxResults` below what was requested (but reports its own effective size and a `total`) still paginates to exhaustion", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            // The server honours only 50 per page regardless of the
+            // requested `maxResults: 100`, and says so via its own
+            // `maxResults` in the response — the same shape jira.js's
+            // PageOfCommentsSchema declares.
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining);
+            return Promise.resolve({
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              total: 125,
+              startAt,
+              maxResults: 50,
+            });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // 50 + 50 + 25, not stopped after the first capped-at-50 page
+    expect(got.results.length).toBe(125); // the FULL 125, not just the first capped page of 50
+  });
 });
 
 // ===========================================================================
