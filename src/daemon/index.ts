@@ -40,6 +40,7 @@ import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
+import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 
 let config;
@@ -405,6 +406,28 @@ const projectReaper = createReaper({
   close: (c) => herd.closeStranded(c),
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-287: a live per-issue residency census, independent of
+// agent.list() — see src/agents/residency-guard.ts and
+// src/agents/residency-census.ts for the full mechanism. TWO SEPARATE
+// INSTANCES, same reasoning as issueReaper/projectReaper above: each
+// `runResourceLoop` call needs its own unknown-streak tracker (the bounded
+// decay for a persistently-ambiguous census — see ResidencyGuard's own doc
+// comment), same "one instance per loop" discipline `RespawnGuard`/
+// `ReapGuard` already follow — unlike `admissionController` above, which is
+// deliberately ONE shared instance because IT bounds the host, not a tier.
+// `herd.residency` (the raw HerdrHerd instance's own method, not part of
+// the `Herd` interface `scopedHerd` wraps) is used directly, same as
+// `herd.strandedCandidates`/`herd.closeStranded` above — candidates always
+// arrive pre-scoped to this loop's own `plan.spawn`, so there is nothing
+// for `scopedHerd`'s `ownsId` filtering to add here.
+const issueResidencyGuard = createResidencyGuard({
+  census: (candidates) => herd.residency(candidates),
+  log: (line) => console.error(`  ${line}`),
+});
+const projectResidencyGuard = createResidencyGuard({
+  census: (candidates) => herd.residency(candidates),
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: async () => {
@@ -525,10 +548,20 @@ runResourceLoop(issueResourceType, {
   // one most likely to actually clear a stranded workspace's grace period
   // quickly. See src/agents/reap.ts.
   checkReap: issueReaper.check,
+  // BUTCHR-287: see src/agents/residency-guard.ts. Runs BEFORE `admission`
+  // below (its output feeds `admission`, not `plan.spawn` — see
+  // ReconcileOptions.checkResidency's own doc comment in loop.ts for the
+  // reason, not merely the order).
+  checkResidency: issueResidencyGuard.filter,
   // BUTCHR-284: the SAME shared controller instance the project loop below
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal — see
+  // admissionController's own construction comment above and
+  // src/agents/admission.ts's own B4 addendum for why this must be one
+  // ledger, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -613,10 +646,17 @@ runResourceLoop(projectResourceType, {
   // (5min cadence) is still a valid independent chance to catch a candidate
   // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
   checkReap: projectReaper.check,
+  // BUTCHR-287: wired here too, same reasoning as issueResidencyGuard above
+  // — see src/agents/residency-guard.ts.
+  checkResidency: projectResidencyGuard.filter,
   // BUTCHR-284: the SAME shared controller instance the issue loop above
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal the
+  // issue loop above also uses — see that call site's own comment for why
+  // this must be one instance, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

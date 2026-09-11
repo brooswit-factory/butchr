@@ -1,10 +1,12 @@
-import type { HerdrClient, results } from "@brooswit/herdr-sdk";
+import { HerdrError, type HerdrClient, type results } from "@brooswit/herdr-sdk";
 import { buildWorkspace, workspaceRoot, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
+import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
 export type { SpawnSpec } from "./workspace.js";
 export type { StrandedCandidate } from "./reap.js";
+export type { ResidencyVerdict } from "./residency-census.js";
 
 const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
 /**
@@ -97,6 +99,36 @@ const NUDGE_VERIFY_MS = 8_000;
  */
 const KICKOFF_VERIFY_MS = 12_000;
 
+/**
+ * BUTCHR-268: `workspace.create`'s own just-returned root pane is not
+ * reliably ready for `agent.start` — herdr rejects it with `agent_pane_busy`
+ * ("not an available shell") on a race, measured (this branch's own commit,
+ * see PR) to resolve within roughly the low hundreds of ms on a loaded herd,
+ * but NOT bounded by any fixed wait: a repeated measurement still saw a
+ * single busy rejection out past 1s. Waiting this long before EVERY
+ * `agent.start` attempt (first attempt included) closes most of the gap
+ * cheaply — it's negligible next to `KICKOFF_VERIFY_MS`'s multi-second wait
+ * a few lines below — but per the measurement above a wait alone is not
+ * sufficient; see `PANE_BUSY_MAX_RETRIES`.
+ *
+ * Exported so `scripts/repro-pane-busy.ts`'s "fixed" measurement mode can
+ * exercise the SAME constants this file actually uses, rather than a copy
+ * that could silently drift from them.
+ */
+export const PANE_READY_WAIT_MS = 200;
+
+/**
+ * Sibling to `PANE_READY_WAIT_MS`: bounded retries specifically on
+ * `agent_pane_busy`, never on any other `agent.start` rejection (those must
+ * still reach `spawn()`'s own catch immediately, which closes the pane it
+ * just created — BUTCHR-111's leak-safety guarantee). At `PANE_READY_WAIT_MS`
+ * between attempts, this bounds the extra wait spawn() can spend retrying to
+ * `PANE_BUSY_MAX_RETRIES * PANE_READY_WAIT_MS` = 800ms in the worst case —
+ * still negligible next to `KICKOFF_VERIFY_MS`, and small next to the whole
+ * poll cycle a failed spawn used to cost before this existed.
+ */
+export const PANE_BUSY_MAX_RETRIES = 4;
+
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   constructor(
@@ -163,15 +195,15 @@ export class HerdrHerd implements Herd {
     if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
     const name = nameFor(issue);
     try {
-      await this.herdr.agent.start({
-      pane_id: paneId,
-      name,
-      kind: "claude",
-      // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
-      // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
-      // single source the staleness check compares a restored pane against.
-      args: spawnArgs(spec, dir),
-    } as Parameters<HerdrClient["agent"]["start"]>[0]);
+      await this.startWithReadinessRetry({
+        pane_id: paneId,
+        name,
+        kind: "claude",
+        // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
+        // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
+        // single source the staleness check compares a restored pane against.
+        args: spawnArgs(spec, dir),
+      } as Parameters<HerdrClient["agent"]["start"]>[0]);
     } catch (e) {
       // A failed start must not leak the workspace we just created: the next
       // reconcile would create another, forever (measured: 7 in 2 minutes).
@@ -179,6 +211,27 @@ export class HerdrHerd implements Herd {
       throw e;
     }
     await this.verifyKickoff(issue);
+  }
+
+  /**
+   * BUTCHR-268: waits `PANE_READY_WAIT_MS` before every attempt (including
+   * the first), and retries ONLY an `agent_pane_busy` rejection, up to
+   * `PANE_BUSY_MAX_RETRIES` extra times. Any other rejection — including a
+   * busy rejection that has exhausted its retries — propagates immediately,
+   * unchanged, so `spawn()`'s own catch above still sees it and closes the
+   * pane it just created.
+   */
+  private async startWithReadinessRetry(params: Parameters<HerdrClient["agent"]["start"]>[0]): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      await this.wait(PANE_READY_WAIT_MS);
+      try {
+        await this.herdr.agent.start(params);
+        return;
+      } catch (e) {
+        const busy = e instanceof HerdrError && e.code === "agent_pane_busy";
+        if (!busy || attempt >= PANE_BUSY_MAX_RETRIES) throw e;
+      }
+    }
   }
 
   /**
@@ -231,6 +284,80 @@ export class HerdrHerd implements Herd {
       this.herdr.agent.list(),
     ]);
     return strandedCandidates(workspaces, panes, agents, workspaceRoot());
+  }
+
+  /**
+   * BUTCHR-287 — a live per-issue residency census, independent of
+   * `agent.list()`: for each of `candidates`, whether a pane at that
+   * issue's OWN workspace directory (`buildWorkspace()`'s convention,
+   * checked by `panesFor` — residency-census.ts) currently shows a live
+   * claude in its foreground, reusing the exact `processInfo`/`isClaude`
+   * check `paneVerdict` already applies as the reaper's decisive safety
+   * layer. `pane.list()` itself is one whole-herd read (herdr has no
+   * narrower query); only the `processInfo` calls that follow are scoped
+   * to `candidates` — see residency-guard.ts's own doc comment for why
+   * that scoping is what keeps this cheap in the common case (an empty or
+   * small `plan.spawn`).
+   *
+   * Deliberately NOT part of the `Herd` interface (mirrors
+   * `strandedCandidates`/`closeStranded` above — herdr I/O with no
+   * `ownsId` scoping need, since `candidates` already arrives pre-scoped
+   * from the caller's own `desired` set): see src/agents/residency-guard.ts
+   * for the per-poll orchestration that calls this. A `pane.list()` fetch
+   * failure reports every candidate "unknown" rather than throwing — same
+   * unknown-≠-vacant discipline `staleIssues()`/`paneVerdict()` already
+   * apply, and it leaves the decision of what unknown means to the caller
+   * (residency-guard.ts) rather than baking one in here.
+   */
+  async residency(candidates: readonly string[]): Promise<ReadonlyMap<string, ResidencyVerdict>> {
+    const out = new Map<string, ResidencyVerdict>();
+    if (!candidates.length) return out;
+    let panes: readonly results.PaneInfo[];
+    try {
+      ({ panes } = await this.herdr.pane.list());
+    } catch {
+      for (const id of candidates) out.set(id, "unknown");
+      return out;
+    }
+    const root = workspaceRoot();
+    for (const id of candidates) {
+      const owned = panesFor(id, panes, root);
+      const verdicts = await Promise.all(owned.map((p) => this.paneVerdict(p.pane_id)));
+      out.set(id, aggregateVerdict(verdicts));
+    }
+    return out;
+  }
+
+  /**
+   * BUTCHR-287 — the minimal reusable shape of the census above: every
+   * currently-RESIDENT issue key, with no candidate list supplied at all
+   * (a whole-herd sweep, via `groupOwnedPanes` rather than `panesFor` —
+   * residency-census.ts), built on the exact same primitives as
+   * `residency()`. Exposed so a future consumer needing only "which issues
+   * are alive right now" (e.g. BUTCHR-284's admission cap, whose own
+   * `residency` dependency is already shaped `() => Promise<readonly
+   * string[]>`) can point at it with a one-line change — NOT wired to
+   * anything in this ticket; that wiring is a deliberate follow-up owned
+   * elsewhere (see this ticket's own report for why).
+   *
+   * Throws rather than reporting an empty list on a `pane.list()` failure
+   * (unlike `residency()` above, which reports "unknown" per candidate):
+   * a bare `[]` here would be indistinguishable from "genuinely nothing is
+   * resident" to a caller that only asked for resident KEYS with no
+   * unknown channel to report into — exactly the confident-zero hazard
+   * this whole ticket exists to close. A future caller must decide its own
+   * fail-open/fail-safe behaviour on a rejection, not inherit a silent
+   * zero from this method.
+   */
+  async residentIssues(): Promise<readonly string[]> {
+    const { panes } = await this.herdr.pane.list();
+    const grouped = groupOwnedPanes(panes, workspaceRoot());
+    const out: string[] = [];
+    for (const [issue, ownedPanes] of grouped) {
+      const verdicts = await Promise.all(ownedPanes.map((p) => this.paneVerdict(p.pane_id)));
+      if (aggregateVerdict(verdicts) === "resident") out.push(issue);
+    }
+    return out;
   }
 
   /**
