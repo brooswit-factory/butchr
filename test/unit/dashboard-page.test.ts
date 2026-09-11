@@ -18,6 +18,29 @@ function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
 
 const NO_ADMISSION = { cap: 0, residency: null, sources: [] as const };
 
+/**
+ * Extracts the inner text of the FIRST element whose opening tag contains
+ * `openTagMarker` (e.g. `class="na"`), up to the next `closeTag`. Scopes a
+ * wording assertion to ONE SPECIFIC ELEMENT rather than "does this substring
+ * appear anywhere on the page" — a page with more than one row, or a row
+ * whose OTHER fields also happen to render the same could-not-check text
+ * (e.g. an agent row's own tier), can make an unscoped `toContain` pass even
+ * when the element actually under test has been mutated. Found the hard way
+ * (BUTCHR-266's review): two of its own mutations — the not-applicable
+ * marker's text swapped for could-not-check wording, and the whole-page
+ * banner's text swapped for reassuring prose — both kept their CSS class and
+ * both survived the full suite, because the surviving assertions checked
+ * class presence and a page-wide substring, never this element's own words.
+ */
+function elementText(html: string, openTagMarker: string, closeTag: string): string {
+  const tagStart = html.indexOf(openTagMarker);
+  if (tagStart === -1) throw new Error(`expected to find an element with ${JSON.stringify(openTagMarker)} in the rendered HTML`);
+  const contentStart = html.indexOf(">", tagStart) + 1;
+  const contentEnd = html.indexOf(closeTag, contentStart);
+  if (contentEnd === -1) throw new Error(`expected a ${closeTag} after ${JSON.stringify(openTagMarker)}`);
+  return html.slice(contentStart, contentEnd);
+}
+
 function opts(over: Partial<RenderDashboardOpts> = {}): RenderDashboardOpts {
   return {
     now: 0,
@@ -80,9 +103,17 @@ describe("renderDashboard: mutation 1 — could-not-check rendered like known (t
     expect(response.checked).toBe(false);
 
     const html = renderDashboard(response, opts({ now: 5000 }));
-    expect(html).toContain("COULD NOT CHECK");
     expect(html).toContain('class="pagefresh cnc banner"');
     expect(html).not.toContain('class="pagefresh known"');
+    // THE WORDING ITSELF, scoped to the banner element and case-insensitive
+    // (BUTCHR-266's review): a mutation that keeps the loud `cnc banner`
+    // class but swaps the TEXT for reassuring prose ("All good.") must fail
+    // here — checking for "COULD NOT CHECK" anywhere on the page is not
+    // enough, because this response's own row ALSO renders could-not-check
+    // tier text, which would let a mutated, reassuring banner hide behind
+    // the row's unrelated wording.
+    const bannerText = elementText(html, 'class="pagefresh cnc banner"', "</div>");
+    expect(bannerText.toLowerCase()).toContain("could not check");
     // the carried-forward row must read STALE, never as a fresh confirmation
     expect(html).toContain('class="conf cnc"');
     expect(html).not.toContain('class="conf known"');
@@ -93,7 +124,7 @@ describe("renderDashboard: mutation 1 — could-not-check rendered like known (t
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
     const html = renderDashboard(response, opts());
     expect(html).toContain('class="tier cnc"');
-    expect(html).toContain("COULD NOT CHECK");
+    expect(elementText(html, 'class="tier cnc"', "</span>").toLowerCase()).toContain("could not check");
     expect(html).not.toContain('class="tier known"');
   });
 
@@ -126,11 +157,18 @@ describe("renderDashboard: mutation 2 — not-applicable vs could-not-check, nev
 
     expect(html).toContain('class="tier cnc"'); // could-not-check issuetype
     expect(html).toContain('class="na"'); // not-applicable agent marker
-    // NEVER SWAPPED: the na marker never carries could-not-check wording, and
-    // the cnc tier marker never carries the na wording — this is the "single
-    // row carries both, and they must look different" requirement.
-    expect(html).not.toMatch(/class="na"[^<]*COULD NOT CHECK/);
-    expect(html).not.toMatch(/class="tier cnc">no agent/);
+    // NEVER SWAPPED — THE WORDING ITSELF, scoped to each element and
+    // CASE-INSENSITIVE (BUTCHR-266's review: a mutation that kept class="na"
+    // but changed its text to "could not check" — lowercase — survived a
+    // case-sensitive regex check here). The na marker must never carry
+    // could-not-check wording in ANY case, and the cnc tier marker must
+    // never carry the na wording, in either case.
+    const naText = elementText(html, 'class="na"', "</span>").toLowerCase();
+    expect(naText).not.toContain("could not check");
+    expect(naText).toContain("no agent"); // still says what it actually is
+    const tierText = elementText(html, 'class="tier cnc"', "</span>").toLowerCase();
+    expect(tierText).not.toContain("no agent");
+    expect(tierText).toContain("could not check");
   });
 
   test("reverse: an ordinary agent row (a real pane + agentStatus) never renders the not-applicable marker — nothing about it is inapplicable", () => {
