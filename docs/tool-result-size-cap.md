@@ -431,6 +431,13 @@ Surface enumerated from the tool registry in my own worktree,
 | `new_worker`, `start_worker`, `shelve_worker`, `adopt_worker`, `finish_worker`, `prioritize_worker`, `check_in`, `submit_to_boss`, `finish_without_a_boss` | write | small acks | no | REASONED — none of these construct a return value from a large stored document or from unbounded caller input |
 | `file_where_it_belongs` | write | creates a ticket; description bounded by `JIRA_DESCRIPTION_CHAR_LIMIT` | no | REASONED, same basis as `jira_create_issue` |
 
+**Superseded (BUTCHR-236, PR #298, 2026-09-10):** the `set_doc` row above
+records the pre-236 state and is left as measured, not rewritten. As of
+this PR, `setDoc`/`setProjectDoc` no longer echo the input `body`; both
+return a bounded `SetDocResult` receipt (`landed`, `wrote`/`stored`
+digests, `version`) built from a post-write read-back, independent of
+document size.
+
 ### Q4(a) — Is the cap a property of RESULTS generally, or of doc verbs specifically?
 
 **MEASURED: a property of results generally, not a doc-verb problem.**
@@ -564,6 +571,10 @@ while measuring; not acted on here, per this ticket's scope.)*
   (Q4) and Q4(b) both corroborate what its own scope already targets —
   the echoed-body shape is real at the source level (`src/tools/docs.ts:249,449`),
   not merely reported secondhand.
+  **Superseded (BUTCHR-236, PR #298, 2026-09-10):** the echoed-body shape
+  named here is gone as of this PR — `set_doc` now returns a bounded
+  receipt independent of document size. This bullet records the state
+  BUTCHR-236 was filed against.
 - **General:** any fix that changes a tool's description should ship the
   description change in the same PR as the behavior change — a stale
   description advertising old behavior would reproduce exactly the kind
