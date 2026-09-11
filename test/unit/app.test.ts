@@ -11,6 +11,7 @@ import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import type { AdmissionView, DashboardResponse } from "../../src/agents/dashboard.js";
+import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
 // DashboardResponse literal below that predates the admission view and isn't
@@ -22,6 +23,13 @@ const noAdmissionView: AdmissionView = { cap: 0, residency: null, sources: [] };
 // the real row-shape/could-not-check contract gets its own dedicated
 // describe block (and its own dedicated fixtures) further down this file.
 const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+
+// BUTCHR-339: a trivial header fixture for every existing ViewDeps literal
+// below that predates the dashboard PAGE and isn't exercising it — the page's
+// own render contract gets its dedicated fixtures in dashboard-page.test.ts,
+// and this file's own dedicated `GET /` describe block below.
+const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
+const noResourceLink = async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -57,6 +65,8 @@ const view = {
   openPane,
   health: () => healthy,
   dashboard: noDashboard,
+  header: noHeader,
+  resourceLink: noResourceLink,
 };
 const { app, mcp } = buildApp(view);
 app.listen(0);
@@ -92,10 +102,18 @@ describe("butchr daemon app", () => {
 });
 
 describe("butchr webapp + open action", () => {
-  test("GET / serves the html page", async () => {
+  // BUTCHR-339: `/` now serves the real dashboard page (src/web/dashboard-page.ts),
+  // rendered from the SAME `dashboard()`/`header()` this fixture's `view`
+  // object already supplies — the render function's own contract (could-not-
+  // check vs. not-applicable vs. known, the two links, freshness) gets its
+  // dedicated coverage in test/unit/dashboard-page.test.ts; this is just the
+  // route-level smoke test that `/` is actually wired to it.
+  test("GET / serves the real dashboard page, built from the injected dashboard()/header()", async () => {
     const html = await (await fetch(`${base}/`)).text();
-    expect(html).toContain("butchr — active agents");
-    expect(html).toContain("/agents/");
+    expect(html).toContain("butchr — dashboard");
+    expect(html).toContain("this daemon runs no agents"); // noDashboard fixture: checked:true, rows:[]
+    expect(html).toContain("open terminal");
+    expect(html).toContain("resource");
   });
   test("GET /state returns the active agents", async () => {
     expect(await (await fetch(`${base}/state`)).json()).toEqual([{ issue: "KAN-9", status: "working", summary: "do a thing" }]);
@@ -133,7 +151,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
       admission: noAdmissionView,
     };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -168,7 +186,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
     const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [], admission: noAdmissionView };
 
     let snapshot: DashboardResponse = genuinelyEmpty;
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -193,7 +211,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
     let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow], admission: noAdmissionView };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -272,6 +290,48 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
   });
 });
 
+// BUTCHR-339: the dashboard row's RESOURCE link target — a small server-side
+// redirect resolved only when a human clicks (never on /dashboard's own
+// request path). Route-level wiring only: which tier resolves to which
+// target is `resourceLink`'s own job (src/daemon/index.ts in production),
+// exercised directly in that file's own describe block further down and in
+// dashboard-page.test.ts for the template's own href-building.
+describe("GET /resource/:key/open — the dashboard row's resource link target (BUTCHR-339)", () => {
+  const resourceLink = async (key: string) => {
+    if (key === "KAN-9") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/KAN-9" };
+    return { ok: false as const, error: `"${key}" is neither a valid Jira issue key nor a valid project id — cannot resolve a resource link for it` };
+  };
+  const { app } = buildApp({ ...view, resourceLink });
+  app.listen(0);
+  const b = `http://localhost:${app.server!.port}`;
+
+  // BUTCHR-266's review: VERIFY the 302 against a real, booted app with a
+  // plain GET, rather than reasoning about what the handler appears to do —
+  // this is exactly that (a real `fetch()` against `app.listen(0)`, `redirect:
+  // "manual"` so the client doesn't silently follow it and hide what the
+  // server actually sent). Checks the full shape: status line, the exact
+  // `location` header, and that the body is empty (never a mangled or
+  // leftover JSON body riding along with the redirect).
+  test("a resolvable key 302s to the resolved url with an empty body — verified against a real booted app, not reasoned about", async () => {
+    const r = await fetch(`${b}/resource/KAN-9/open`, { redirect: "manual" });
+    expect(r.status).toBe(302);
+    expect(r.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/KAN-9");
+    expect(await r.text()).toBe("");
+  });
+  test("an unresolvable key is refused with a specific, human-readable reason, in plain text — never a blank page", async () => {
+    const r = await fetch(`${b}/resource/nope/open`, { redirect: "manual" });
+    expect(r.status).toBe(409);
+    expect(r.headers.get("content-type")).toContain("text/plain");
+    const body = await r.text();
+    expect(body).toContain("nope");
+    expect(body.length).toBeGreaterThan(0);
+  });
+  test("the key is URL-decoded from the path", async () => {
+    const r = await fetch(`${b}/resource/${encodeURIComponent("KAN-9")}/open`, { redirect: "manual" });
+    expect(r.status).toBe(302);
+  });
+});
+
 // KAN/BUTCHR-18 (BUTCHR-6): /health must go red when the poll loop stops
 // completing cycles, and recover once it resumes — driven through the REAL
 // startLoop/buildApp composition and a real listening app, not a fake-clock
@@ -285,6 +345,8 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => health.status(),
       dashboard: noDashboard,
     });
@@ -376,6 +438,8 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([pollHealth, notifyHealth]),
       dashboard: noDashboard,
     });
@@ -482,6 +546,8 @@ describe("/health carries build identity as a sibling of components, never insid
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], build),
       dashboard: noDashboard,
     });
@@ -512,6 +578,8 @@ describe("/health carries build identity as a sibling of components, never insid
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -547,6 +615,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -582,6 +652,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -604,6 +676,8 @@ describe("/health carries detector coverage as a sibling of components, and neve
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -637,6 +711,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -667,6 +743,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -690,6 +768,8 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       dashboard: noDashboard,
       health: () => combineHealth([health]),
     });
@@ -738,6 +818,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -768,6 +850,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -791,6 +875,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -814,6 +900,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -842,6 +930,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -864,6 +954,8 @@ describe("/health carries the build-currency verdict as a sibling of components,
       state: async () => [],
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
+      header: noHeader,
+      resourceLink: noResourceLink,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
