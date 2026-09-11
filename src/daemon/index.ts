@@ -466,6 +466,18 @@ const stallRemediation = createStallRemediator({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   quotaBlocked: quotaGate.isBlocked,
+  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
+  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
+  // never a herd/live probe: a boss's worker is staffed under a different
+  // Atlassian account than the boss (this fleet's own tier->account split),
+  // so a probe wired here would be structurally blind to every worker it
+  // could ever be asked about (three independent live confirmations, all
+  // probeOutOfScope:true — see this ticket's own PR body) — the label path
+  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
+  // doc comment argues (src/tools/relationship.ts). Paid at most once per
+  // non-Done worker, only on the one poll that is actually about to post a
+  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
+  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
@@ -670,12 +682,36 @@ const projectResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-352: the issue tier's own admission census bucket — the SAME
+// `admissionController` instance the issue/project `runResourceLoop` calls
+// below already share (see that construction's own comment for why one
+// instance, not one per tier). Only the ISSUE tier's bucket is relevant here:
+// syncLabels only ever processes Jira issues (only the issue `runResourceLoop`
+// call wires `syncLabels` in at all — see that call site's own comment), so
+// a project-tier candidate is never a `syncLabels` input in the first place.
+// Returns the TRUSTED withheld set from a `checked: true` bucket, or the
+// literal `"unknown"` from a `checked: false` one (residency threw, an
+// untrusted implausible zero, or this source has never reported) — never a
+// guess either way. `desiredLabels` (src/labels/plan.ts) re-emits whatever
+// admission:withheld marker a ticket already carries on `"unknown"` rather
+// than flipping it off from an observation never made (KAN-832/837's own
+// pattern) — so a bad poll holds the last TRUSTED state rather than
+// asserting a confident wrong one in either direction. Synchronous:
+// `census()` reads state `admit()` already computed EARLIER in this SAME
+// poll (`reconcileNow` runs before `syncLabels` — see src/daemon/loop.ts's
+// own call order), never a second/stale read.
+const issueAdmissionWithheld = (): ReadonlySet<string> | "unknown" => {
+  const bucket = admissionController.census().buckets.find((b) => b.source === ADMISSION_SOURCE_ISSUE);
+  return bucket?.checked ? new Set(bucket.withheld) : "unknown";
+};
+
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
+  withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),

@@ -7,9 +7,22 @@ import { isActive } from "../reconcile/plan.js";
  */
 export const AGENT_PREFIX = "agent:";
 export const PR_PREFIX = "pr:";
+/**
+ * BUTCHR-352: a THIRD daemon-owned namespace, deliberately separate from
+ * `agent:` — see this file's `desiredLabels` and its own top comment for why
+ * "withheld at capacity" cannot be a new `AgentLabel` member (the mixed-build
+ * hazard: an old-build `checkWorker` maps ANY non-`agent:none` value to a
+ * confident "staffed", so a new `agent:*` value would read as a confident
+ * wrong answer on every not-yet-upgraded reader). A wholly distinct prefix
+ * makes it structurally invisible to an old build's `AGENT_PREFIX`-scoped
+ * reads (src/tools/relationship.ts's `checkWorker`, src/jira-watch/diff.ts's
+ * `agentLabelValue`) instead of merely conventionally so.
+ */
+export const ADMISSION_PREFIX = "admission:";
 
 export const isAgentLabel = (label: string): boolean => label.startsWith(AGENT_PREFIX);
 export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX);
+export const isAdmissionLabel = (label: string): boolean => label.startsWith(ADMISSION_PREFIX);
 
 /**
  * BUTCHR-24: `butchr:shelved` (src/agents/parked.ts's `EXEMPT_LABEL`) is NOT
@@ -40,7 +53,20 @@ export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX)
  * agent-invoked relationship verb owns the lifecycle, never this file's own
  * unattended machinery.
  */
-export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label);
+export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label) || isAdmissionLabel(label);
+
+/**
+ * BUTCHR-352: labels tied to ACTIVE STATUS the same way `agent:*` already is
+ * — i.e. `agent:*` and `admission:*` — cleared the moment a ticket leaves the
+ * active set or disappears from the feed. Unlike `pr:*` (independent of
+ * status, deliberately NOT covered by the startup sweep — see sweep.ts's own
+ * comment), a stray `admission:*` marker on an inactive ticket is exactly the
+ * same stranding hazard BUTCHR-144 found for `agent:stalled`: this is the
+ * shared predicate both src/labels/sync.ts's disappearance-cleanup pass and
+ * src/labels/sweep.ts's startup sweep filter through, so the two can never
+ * independently drift on which prefixes are lifecycle-bound to status.
+ */
+export const isActiveStatusLabel = (label: string): boolean => isAgentLabel(label) || isAdmissionLabel(label);
 
 export type PrState = "open" | "approved" | "changes-requested" | "merged" | null;
 
@@ -86,6 +112,32 @@ export interface DesiredInput {
    * kickoff can never look like a completed agent (KAN-804/807).
    */
   stalled?: boolean;
+  /**
+   * BUTCHR-352: whether THIS poll's admission census (src/agents/admission.ts's
+   * `AdmissionController.census()`, read by whichever daemon actually staffs
+   * this ticket) reports this ticket's key as currently withheld at capacity.
+   * A real, TRUSTED (`checked: true`) observation only — never a guess:
+   *   - `true`/`false` — a trusted, positive read this poll.
+   *   - `"unknown"` — the census could not check this poll (`checked: false`
+   *     — residency threw, an untrusted implausible zero, or this source has
+   *     never reported). Handled the SAME way `prState`'s own `"unknown"`
+   *     already is (KAN-832/837, see that branch below): re-emit whatever
+   *     `admission:withheld` marker the ticket already carries instead of
+   *     reading a blind poll as "confirmed not withheld" — the very next
+   *     `true`/`false` read resolves it either direction, including removal.
+   *     This is what bounds a withheld episode to exactly TWO label writes
+   *     (on at the first confirming poll, off at the first disconfirming
+   *     one) regardless of how many declined polls fall in between.
+   * Omitted defaults to `false` — every existing caller not wired to
+   * admission at all keeps today's exact pre-BUTCHR-352 behaviour. Only
+   * meaningful when the mapped agent label would otherwise be "none" (an
+   * admitted or running candidate is never simultaneously withheld) — same
+   * "only overlays one specific base value" shape `stalled` above already
+   * uses for "idle". The caller (src/labels/sync.ts) is responsible for
+   * never synthesizing `true`/`false` from a `checked: false` bucket; this
+   * field only ever reflects what it was told.
+   */
+  withheld?: boolean | "unknown";
 }
 
 export type AgentLabel = "working" | "idle" | "blocked" | "stalled" | "none";
@@ -176,6 +228,27 @@ const ALL_AGENT_LABELS: Record<AgentLabel, true> = {
 export const ALL_AGENT_LABEL_KEYS: readonly string[] = (Object.keys(ALL_AGENT_LABELS) as AgentLabel[]).map((label) => AGENT_PREFIX + label);
 
 /**
+ * BUTCHR-352: `AdmissionLabel` is its own single-member union today, on
+ * purpose kept as a real union (not a bare string constant) with the SAME
+ * value-level completeness door `ALL_AGENT_LABELS` above uses for
+ * `AgentLabel` — mirroring that mechanism is what the ticket asks for, and
+ * it is what makes a SECOND value under this prefix, if one is ever needed,
+ * fail to compile here until `ALL_ADMISSION_LABELS` is updated to match,
+ * exactly like `AgentLabel` already does. See that Record's own doc comment
+ * for the full argument; this is the same anchor, independently applied to
+ * a second namespace so `ALL_ADMISSION_LABEL_KEYS` — and therefore the
+ * startup sweep's JQL, see ./sweep.ts — stays complete the same way.
+ */
+export type AdmissionLabel = "withheld";
+
+const ALL_ADMISSION_LABELS: Record<AdmissionLabel, true> = {
+  withheld: true,
+};
+
+/** `ADMISSION_PREFIX`-qualified form of every AdmissionLabel member — see ALL_AGENT_LABEL_KEYS's own doc comment for why this mirrors that mechanism. */
+export const ALL_ADMISSION_LABEL_KEYS: readonly string[] = (Object.keys(ALL_ADMISSION_LABELS) as AdmissionLabel[]).map((label) => ADMISSION_PREFIX + label);
+
+/**
  * idle and blocked map directly. "done" — herdr's status for an agent sitting
  * at its prompt after finishing a turn (confirmed against a live `herdr agent
  * list`: several done agents doing nothing) — is idle in every sense this
@@ -193,11 +266,41 @@ export const mapAgentStatus = (raw: string | null): ObservedAgentLabel => {
 };
 
 /** The desired daemon-owned label set for a ticket, given its current known state. Pure. */
-export function desiredLabels({ status, agentStatus, prState, stalled, currentLabels }: DesiredInput): string[] {
+export function desiredLabels({ status, agentStatus, prState, stalled, withheld = false, currentLabels }: DesiredInput): string[] {
   const out: string[] = [];
   if (isActive(status)) {
     const label = mapAgentStatus(agentStatus);
     out.push(AGENT_PREFIX + (label === "idle" && stalled ? "stalled" : label));
+    // BUTCHR-352: `admission:withheld` is a SEPARATE marker, deliberately
+    // NOT an agent:* value — see ADMISSION_PREFIX's own doc comment for the
+    // mixed-build hazard that rules out folding this into AgentLabel. Only
+    // ever considered alongside `agent:none`: admission control withholds a
+    // candidate that was NOT admitted this poll, which by construction has
+    // no running agent, so a withheld marker should never apply to any
+    // other mapped label — enforced here explicitly (`label === "none"`)
+    // rather than trusted, so a stale/contradictory read (e.g. the census
+    // still lists a key withheld from a slightly earlier poll while herdr
+    // already shows it running) never asserts a self-contradictory pair. In
+    // that case this simply emits no admission:* marker for this poll,
+    // regardless of `withheld`'s own value — a deliberate, stated choice,
+    // not a fallthrough.
+    if (label === "none") {
+      if (withheld === "unknown") {
+        // KAN-832/837's own pattern, reused rather than reinvented (see this
+        // field's own doc comment in DesiredInput): a poll that could not
+        // check re-emits whatever admission:withheld marker the ticket
+        // already carries, so a blind poll is never read as "confirmed not
+        // withheld" — the next TRUSTED (true/false) poll resolves it either
+        // direction, including removal. Bounds a withheld episode to
+        // exactly two label writes: on at the first confirming poll, off at
+        // the first disconfirming one, regardless of how many declined
+        // polls fall in between.
+        const existing = currentLabels?.find(isAdmissionLabel);
+        if (existing) out.push(existing);
+      } else if (withheld) {
+        out.push(ADMISSION_PREFIX + "withheld");
+      }
+    }
   }
   if (prState === "unknown") {
     // KAN-832/837: re-emit whatever pr:* label is already on the ticket instead of
