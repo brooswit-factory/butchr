@@ -307,17 +307,50 @@ export interface ReconcileOptions {
    */
   checkReap?: () => Promise<void>;
   /**
+   * BUTCHR-287: a live per-issue residency census, independent of
+   * `agent.list()` — see src/agents/residency-guard.ts and
+   * src/agents/residency-census.ts for the full mechanism (why a second,
+   * live source of truth closes the cold-start case a steady-state
+   * transition guard cannot). Called with `(plan.spawn, [...desired.keys()])`
+   * IMMEDIATELY AFTER `planReconcile` — before `opts.admission` below, before
+   * `checkCrashLoop`, and before the spawn loop — and its return value
+   * REPLACES `plan.spawn` for every one of them, same "consulted for control
+   * flow, not merely observed" shape `opts.admission` uses. THE REASON THIS
+   * RUNS FIRST (write the reason here, not an ordering rule that could go
+   * stale — see this ticket's own report): a spawn candidate that already
+   * has a live agent must be removed from the list before anything
+   * downstream rations or counts against that list, because rationing
+   * (`opts.admission`) a list that contains phantoms under-delivers real
+   * work by exactly the number of phantoms it admits, and counting
+   * (`checkCrashLoop`) a withheld phantom as a genuine attempt manufactures
+   * a false complaint on a resource that was never in trouble. Never
+   * shrinks `desired` — a withheld id is offered again next poll exactly
+   * like an ordinary `plan.spawn` candidate not yet reached (the BUTCHR-218
+   * liveness trap this ticket's own DoD names explicitly). Optional;
+   * omitted (every caller before this ticket, and any direct `reconcileNow`
+   * caller that doesn't opt in), the value handed to `opts.admission` and
+   * `checkCrashLoop` is `plan.spawn` itself, unchanged — today's exact
+   * behaviour.
+   */
+  checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /**
    * BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts
    * for the full mechanism (why a count cap, the two Trap-2 failure shapes,
    * the bounded-mistrust window). Called with `(plan.spawn, plan.stop)`
    * BEFORE `checkCrashLoop` and the spawn loop below, and its return value
-   * REPLACES `plan.spawn` for BOTH — unlike every other hook in this
+   * REPLACES its input for BOTH — unlike most other hooks in this
    * interface, this one is consulted for control flow, not merely observed.
-   * `plan.stop`/`plan.respawn` are never touched: only `plan.spawn` is
-   * admission-controlled (criterion 4 on the ticket — a respawn never
-   * consumes budget). Optional; omitted (every caller before this ticket,
-   * and any direct `reconcileNow` caller that doesn't opt in), `admitted`
-   * below is `plan.spawn` itself, unchanged — today's exact behaviour.
+   * `plan.stop`/`plan.respawn` are never touched: only the spawn candidate
+   * list is admission-controlled (criterion 4 on the ticket — a respawn
+   * never consumes budget). READS FROM `checkResidency`'s output above
+   * (BUTCHR-287), not `plan.spawn` directly: a spawn candidate that already
+   * has a live agent must be removed from the list before anything rations
+   * that list, because rationing a list that contains phantoms under-
+   * delivers real work — see `checkResidency`'s own doc comment. Optional;
+   * omitted (every caller before this ticket, and any direct `reconcileNow`
+   * caller that doesn't opt in), `admitted` below is that same input
+   * unchanged (which is itself `plan.spawn` when `checkResidency` is ALSO
+   * omitted) — today's exact behaviour either way.
    */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /**
@@ -434,18 +467,32 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     }
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
+  // BUTCHR-287: a spawn candidate that already has a live agent must be
+  // removed from the list before anything downstream rations or counts
+  // against that list — see ReconcileOptions.checkResidency's own doc
+  // comment for the full reasoning (written as a REASON here deliberately,
+  // not an ordering rule: once a future admission cap consumes this census
+  // as its own residency input rather than a preceding filter, there is no
+  // longer a "before" for a rule to name, but the reason stays true either
+  // way). `live` — never `plan.spawn` directly — is what both `opts.admission`
+  // and `checkCrashLoop` below actually see. Omitted, `live` is `plan.spawn`
+  // itself (the same array), so every existing caller and test is unaffected.
+  const live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
   // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
   // spawn loop below, and is the ONE hook in this function that actually
   // replaces its input rather than merely observing it — see
   // ReconcileOptions.admission's own doc comment and src/agents/admission.ts
-  // for the full mechanism. `admitted` (never `plan.spawn` directly) is what
-  // actually gets attempted below: a withheld candidate was never really
-  // spawned this poll, so it must not count toward `checkCrashLoop`'s own
-  // rolling window either — only a GENUINE attempt should. Omitted, `admitted`
-  // is `plan.spawn` itself (the same array), so every existing caller and
-  // test (including crash-loop.test.ts's own pinned "checkCrashLoop receives
-  // exactly plan.spawn" assertions) is unaffected.
-  const admitted = opts.admission ? await opts.admission(plan.spawn, plan.stop) : plan.spawn;
+  // for the full mechanism. `admitted` (never `plan.spawn`/`live` directly)
+  // is what actually gets attempted below: a withheld candidate was never
+  // really spawned this poll, so it must not count toward `checkCrashLoop`'s
+  // own rolling window either — only a GENUINE attempt should. Reads from
+  // `live` (BUTCHR-287's own residency filter, immediately above) rather
+  // than `plan.spawn`, for the same reason stated there. Omitted, `admitted`
+  // is `live` itself, so every existing caller and test (including
+  // crash-loop.test.ts's own pinned "checkCrashLoop receives exactly
+  // plan.spawn" assertions, and admission.test.ts's own reconcileNow
+  // integration tests) is unaffected.
+  const admitted = opts.admission ? await opts.admission(live, plan.stop) : live;
   // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
   // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
   // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
@@ -710,6 +757,8 @@ export interface GenericLoopDeps<T> {
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   /** BUTCHR-245: see `ReconcileOptions.checkReap`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `Reaper` instance, same reasoning as `checkCrashLoop`/`checkReconcileFailure` above. Optional; omitted, no reclamation runs. */
   checkReap?: () => Promise<void>;
+  /** BUTCHR-287: see `ReconcileOptions.checkResidency`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `HerdrHerd.residency()`-backed census (no per-loop state to keep, unlike `checkCrashLoop`/`checkReap` — the census is a live read every call). Optional; omitted, no residency guard runs (plan.spawn reaches `opts.admission`/`checkCrashLoop` in full, today's exact behaviour). */
+  checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
@@ -800,6 +849,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
+        ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
         atRest,

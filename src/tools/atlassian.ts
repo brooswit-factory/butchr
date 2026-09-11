@@ -25,8 +25,23 @@ export interface AtlassianOps {
   /** `parentId` nests the page under it; omitted, Confluence lands it under the space's own default (the SD homepage today). */
   createPage(p: { spaceId: string; title: string; body: string; parentId?: string }): Promise<unknown>;
   getPage(id: string): Promise<unknown>;
-  /** Full-body replace. The op reads the page's current version internally and PUTs version.number + 1 — callers never hand-roll optimistic locking. */
-  updatePage(p: { id: string; body: string; title?: string }): Promise<unknown>;
+  /**
+   * Full-body replace. The op reads the page's current version internally and PUTs version.number + 1 — callers never hand-roll optimistic locking.
+   *
+   * `version` (BUTCHR-214/226, defect 2): the page version THIS CALL'S OWN
+   * write produced — the same `version.number` the internal PUT just sent,
+   * never a value read back afterward. `setProjectDoc` (src/tools/docs.ts)
+   * uses this identity-of-write value to close the project wake predicate's
+   * version axis (see `advanceProjectWatermark`, src/resources/project.ts):
+   * a read-back-after-write would risk picking up a FOREIGN edit that landed
+   * in the gap between this write and a later read, which would wrongly
+   * suppress a genuine wake — the entire point of identity-of-write is that
+   * a writer only ever records what IT produced, never what it later
+   * observes. Every other field of the real Confluence response may also be
+   * present on the resolved value; `version` is the only one any caller may
+   * rely on.
+   */
+  updatePage(p: { id: string; body: string; title?: string }): Promise<{ version: number }>;
   /** Raw CQL search (CQL construction lives in the tool layer, defs.ts). */
   searchPages(cql: string, limit: number): Promise<unknown>;
   listSpaces(): Promise<unknown>;
