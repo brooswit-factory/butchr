@@ -442,6 +442,48 @@ describe("createEscalator — 15-minute follow-up", () => {
     await h.poll("p1", "KAN-1", prompt);
     expect(h.posted.length).toBe(2);
   });
+
+  // BUTCHR-318: this comment is posted on ANY blocked issue — Epic, Story or
+  // Task — so its own promise must be true for all three at once. The old
+  // text unconditionally claimed "escalates to whoever watches you", which
+  // is false for an In Progress epic (its boss is a project that reads the
+  // epic's ticket only while it's In Review). Tier-neutral wording was
+  // chosen over branching on issue type: neither PaneState nor
+  // EscalatorDeps carries the issue's type at this call site, only a bare
+  // issue key, so branching would need an extra fetch this code doesn't make.
+  test("the follow-up states the Story/Task-vs-Epic conditionality directly, and drops the old unconditional 'escalates to whoever watches you' claim", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates at clock=0
+    h.setClock(15 * 60_000);
+    await h.poll("p1", "KAN-1", prompt); // follow-up fires
+    expect(h.posted.length).toBe(2);
+    const text = h.posted[1]!.text;
+
+    expect(text).toMatch(/Story's or Task's boss reads that ticket regardless of status/);
+    expect(text).toMatch(/an Epic's project boss reads it only while the epic is In Review/);
+    expect(text).toMatch(/an In Progress epic reaches nobody this way/);
+    expect(text).not.toMatch(/escalates to whoever watches you/);
+  });
+
+  // BUTCHR-331 defect 3(b): "escalate to a human directly instead" named no
+  // mechanism — no verb reaches a human. The follow-up must instead say the
+  // concrete substance: post anyway, only a person reading the ticket
+  // directly will ever see it, and no agent will answer.
+  test("the follow-up names the concrete mechanism (post on your own ticket; only a human reading it directly will see it; no agent answers) instead of the undefined 'escalate to a human directly' phrase", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates at clock=0
+    h.setClock(15 * 60_000);
+    await h.poll("p1", "KAN-1", prompt); // follow-up fires
+    const text = h.posted[1]!.text;
+
+    expect(text).toMatch(/only a PERSON READING THIS TICKET DIRECTLY will see it/);
+    expect(text).toMatch(/no agent will answer/);
+    expect(text).not.toMatch(/escalate to a human directly instead/);
+  });
 });
 
 // BUTCHR-159: a rejected `ownChannelComments` read must never throw into the
