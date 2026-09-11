@@ -141,6 +141,7 @@ function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDash
     `<span class="key">${esc(row.resourceKey)}</span>` +
     `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
     `<span class="st ${safeClass(row.agentStatus)}">${esc(row.agentStatus)}</span>` +
+    `<span class="pane">${esc(row.pane)}</span>` +
     renderFloor(row.timeInStatus, opts.now, `in status "${row.agentStatus}"`) +
     renderFreshness(row.confirmedAt, opts.now, stale, "confirmed") +
     `<a class="link" href="${esc(opts.terminalLinkHref(row.pane))}">open terminal</a>` +
@@ -292,6 +293,7 @@ const STYLE = `
  .key{font-weight:600;color:#58a6ff;min-width:90px}
  .tier{font-size:12px;color:#8b949e}
  .tier.cnc{color:#f0b429;font-weight:600}
+ .pane{font-size:12px;color:#8b949e}
  .st{font-size:12px;padding:2px 8px;border-radius:10px}
  .working{background:#132e1a;color:#3fb950}.blocked{background:#3a1e12;color:#e3893a}
  .idle{background:#1b2129;color:#8b949e}.done{background:#161b22;color:#6e7681}.unknown{background:#161b22;color:#6e7681}
