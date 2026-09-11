@@ -6,7 +6,7 @@ import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
-import { readProjectTierProperty, resolveEligibleProjects } from "../resources/project.js";
+import { readProjectTierProperty, resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 import { AGENT_PREFIX } from "../labels/plan.js";
 
@@ -2050,10 +2050,68 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
  * travel here: the `[review] APPROVED <pr-url> @ <sha>` / `[review]
  * CHANGES_REQUESTED` lines that wake a PR author, and the `ANSWER <n>
  * <fingerprint>` reply that unfreezes a worker blocked on a dialog.
+ *
+ * BUTCHR-292/BUTCHR-328 — THE EPIC-AXIS SELF-WAKE, CLOSED HERE, PROJECT
+ * CALLER ONLY: a project's own review hop through this verb — the `[review]
+ * APPROVED ...`/`CHANGES_REQUESTED` line above among them — posts to one of
+ * its own Epics, and "the epic received a comment" is one of
+ * `projectVerdict`'s three wake axes (src/resources/project.ts). Left
+ * unwatermarked, that write wakes the writer on the very next poll — the
+ * review hop itself, every time. This is the exact HAZARD 1 shape
+ * `speakOnOwnChannel` (src/tools/speak.ts) already closes for the comment
+ * axis, ported to the epic axis, WRITER C in `advanceProjectWatermark`'s own
+ * naming (src/resources/project.ts).
+ *
+ * THE WRITE: immediately after `ops.addComment` succeeds, this advances the
+ * CALLER's own `wake.epicsSeen[workerKey]` set to include the id it just
+ * returned, via `patch.epicsPartial` — a PARTIAL, per-key UNION, never
+ * `patch.epics`'s complete-observation KEY-SET REPLACE (`check_in`'s own
+ * shape) — see `advanceProjectWatermark`'s own doc comment for why routing
+ * this through the replace shape would wipe every OTHER In-Review epic's
+ * seen set and turn one self-wake into many. FAIL-OPEN, matching WRITER A/B:
+ * a rejected watermark write is caught, logged, and absorbed by
+ * `advanceProjectWatermark`'s own DEFECT 1b in-process fallback — it never
+ * fails this call, because a comment that already landed must never be
+ * reported as a failure over bookkeeping (BUTCHR-105).
+ *
+ * `workerKey`'s status comes from `assertOwnWorker`'s OWN fetch (`issue`,
+ * captured below) — no extra Jira call, since that helper already performs
+ * exactly the read this needs.
+ *
+ * TWO GUARDS, BOTH DELIBERATE, NEITHER OPTIONAL:
+ * - ISSUE CALLERS NEVER REACH THIS WRITE (`isProjectId(callerKey)`): the
+ *   issue tier (an Epic telling its own Story) uses a different mechanism —
+ *   an in-memory per-key newest-comment cursor, fail-open, reset on restart,
+ *   never the project property (confirmed by reading that tier's own
+ *   mechanism; there is nothing there for this ticket to change).
+ * - ONLY WHEN `workerKey` READS "In Review" RIGHT NOW (`statusOf(issue)`):
+ *   `projectVerdict` treats an epic key ABSENT from `wm.epicsSeen` as "never
+ *   acted on this review episode" — the signal that makes a fresh entry into
+ *   review observable, and `check_in`'s own key-set replace is what restores
+ *   that absence when an epic re-enters review. Creating the key here is
+ *   therefore a real behaviour change, defensible only because the project
+ *   genuinely just acted on this epic WHILE it was in review — seeding the
+ *   key for an epic that has not yet entered (or has already left) review
+ *   would instead consume a FUTURE episode's own fresh-entry signal before
+ *   that episode has even begun, the same hazard with worse consequences. A
+ *   `tell_worker` to an epic outside review still posts its comment
+ *   unconditionally — only the watermark write is gated.
+ *
+ * NEVER KEYS ON AUTHOR OR CONTENT: the daemon and every tier post under the
+ * same Atlassian account (`author` is genuinely absent when unreadable), and
+ * a `[butchr:...]`/`[review]`-shaped prefix is reader-facing only. This
+ * write keys on exactly one fact — this call just wrote comment C to epic
+ * E — never on who wrote it or what it says.
  */
-export async function tellWorker(ops: AtlassianOps, callerKey: string, workerKey: string, text: string): Promise<unknown> {
-  await assertOwnWorker(ops, "tell_worker", callerKey, workerKey);
-  return ops.addComment(workerKey, tagComment(callerKey, text));
+export async function tellWorker(ops: AtlassianOps, callerKey: string, workerKey: string, text: string, log: (line: string) => void = console.error): Promise<unknown> {
+  const issue = await assertOwnWorker(ops, "tell_worker", callerKey, workerKey);
+  const created = (await ops.addComment(workerKey, tagComment(callerKey, text))) as { id?: string } | undefined;
+  if (isProjectId(callerKey) && created?.id && statusOf(issue) === "In Review") {
+    await advanceProjectWatermark(ops, callerKey, { epicsPartial: { [workerKey]: [created.id] } }, log).catch((e) =>
+      log(`  WARNING: [tellWorker] epic-axis self-wake watermark advance failed for ${callerKey} (epic ${workerKey}, comment ${created.id}): ${(e as Error)?.message ?? e} — comment posted; project may nudge itself on it next poll`),
+    );
+  }
+  return created;
 }
 
 // ---------------------------------------------------------------------------
@@ -2202,12 +2260,18 @@ export interface TellPeerResult {
  * a symbol BUTCHR-227 deleted) silently failing to notice a low-id
  * comment — that comparison no longer exists; the comment axis is now a
  * SEEN SET, compared by membership, never by magnitude (see
- * src/resources/project.ts's `ProjectWatermark.commentsSeen`). The WAKE is
- * still best-effort, for a DIFFERENT, honest reason: `peer`'s reader has a
- * page-window/pagination bound (see `getPageComments`'s own doc comment on
- * `AtlassianOps`) — a comment that never appears inside that window is
- * never observed, therefore never wakes anything, regardless of its id.
- * This function also does not bump `peer`'s root-doc page VERSION, so the
+ * src/resources/project.ts's `ProjectWatermark.commentsSeen`). CORRECTED
+ * AGAIN (BUTCHR-309): this then attributed best-effort wake to `peer`'s
+ * reader having a page-window/pagination bound — also no longer true,
+ * `getPageComments` now paginates to exhaustion (its own doc comment on
+ * `AtlassianOps` has the fix), so a comment is observed on `peer`'s very
+ * next successful poll no matter how many comments its root doc holds. The
+ * WAKE is still best-effort, for the narrower, still-honest reason left once
+ * both of those are fixed: this is a POLLED read — `peer` observes it at
+ * most once per poll interval, and a read failure on a given poll fails that
+ * WHOLE poll rather than recording a partial observation (see `loadProjects`'
+ * own doc comment, src/resources/project.ts), so it delays being seen, it
+ * does not lose it. This function also does not bump `peer`'s root-doc page VERSION, so the
  * version axis is not a second delivery path here either. The comment is
  * never lost — it sits on a durable page and is read whenever `peer` next
  * reads its own comments — but the wake remains best-effort, and its

@@ -1,7 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
@@ -91,6 +91,29 @@ function requireProjectCaller(
   const who = requireCaller(c, verb);
   if (!isProjectId(who)) {
     throw new Error(`${verb}: refusing an issue caller — ${why}`);
+  }
+  return who;
+}
+
+/**
+ * BUTCHR-307: the mirror image of `requireProjectCaller` just above, first
+ * needed for `stand_down` — a verb that ONLY makes sense for an ISSUE
+ * caller (the project tier's own sleep/wake signal is `check_in`, a
+ * durable state comparison; see src/agents/stand-down.ts's own top comment
+ * for why the issue tier's mechanism is a different registry entirely, not
+ * a relaxation of `check_in`'s own project-only contract). Same shape,
+ * same verb-specific `why` passed in rather than hardcoded, same reasoning:
+ * refusing here, in words, is cheaper than a project caller discovering
+ * this verb silently does nothing for it.
+ */
+function requireIssueCaller(
+  c: { headers: Record<string, string> },
+  verb: string,
+  why: string,
+): string {
+  const who = requireCaller(c, verb);
+  if (isProjectId(who)) {
+    throw new Error(`${verb}: refusing a project caller — ${why}`);
   }
   return who;
 }
@@ -187,6 +210,21 @@ export function atlassianTools(
    * (reaped by `checkFrozenAsleep`, not exited promptly).
    */
   declareCheckInDone?: (key: string) => void,
+  /**
+   * BUTCHR-307: `stand_down`'s own effect — called from that handler below
+   * with the caller's own key and the seen-comment-id snapshot (own ticket
+   * plus every current worker's) it just read, AFTER every read that
+   * snapshot depends on has resolved without throwing. The daemon composes
+   * this from TWO registries (src/agents/stand-down.ts's own sleep/wake
+   * registry, and a second, issue-tier instance of
+   * src/agents/check-in-exit.ts's generic `CheckInExitRegistry` — see that
+   * module's own top comment for why pane release is a separate signal from
+   * sleep itself) rather than this tool layer knowing either one exists.
+   * Optional — every existing caller of `atlassianTools` keeps working
+   * unchanged; when omitted, `stand_down` still reads and returns its
+   * snapshot, it just never actually sleeps or releases its pane.
+   */
+  standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -683,7 +721,7 @@ export function atlassianTools(
         const { key, text } = a as { key: string; text: string };
         const who = requireCaller(c, "tell_worker");
         audit(c, `tell_worker ${key}`);
-        const r = await tellWorker(ops, who, key, text);
+        const r = await tellWorker(ops, who, key, text, log);
         noted(c, [key]);
         return r;
       },
@@ -762,12 +800,15 @@ export function atlassianTools(
         // premise. BUTCHR-227 removes the dependence on that premise
         // entirely rather than measuring it: the value recorded below is
         // the FULL observed id SET, and "seen" is set membership, not
-        // "equal to the newest id by any ordering". `getIssueComments`'s
-        // own doc comment on `AtlassianOps` states its `maxResults` cap —
-        // that cap is a still-live pagination blind spot (an id outside
-        // the window is never observed, so never seen, so never wakes
-        // anything), unchanged and unfixed by this ticket; it is not the
-        // id-monotonicity defect this ticket does fix.
+        // "equal to the newest id by any ordering". BUTCHR-309: `getIssueComments`
+        // used to cap at `maxResults: 20` with no pagination — a still-live
+        // blind spot at the time BUTCHR-227 shipped (an id outside that
+        // window was never observed, so never seen, so never woke anything).
+        // BUTCHR-309 fixed that separately: `getIssueComments` now paginates
+        // to exhaustion (see its own doc comment on `AtlassianOps`), so this
+        // read is the FULL observed id set, not a 20-item window — the
+        // pagination blind spot named above is closed, distinct from (and
+        // fixed after) the id-monotonicity defect BUTCHR-227 fixed here.
         const epics: Record<string, readonly string[]> = {};
         for (const epic of epicsRaw?.issues ?? []) {
           epics[epic.key] = (await ops.getIssueComments(epic.key)).results.map((c) => c.id);
@@ -798,6 +839,32 @@ export function atlassianTools(
         // that module's own doc comment for the full mechanism this feeds.
         declareCheckInDone?.(who);
         return { ok: true, key: who, version: version ?? null, seenComments, epics };
+      },
+    },
+    stand_down: {
+      description:
+        'ISSUE CALLER ONLY (refuses a project caller — a project already has `check_in` for this same last-act purpose; use that instead). Your LAST ACT before your session ends, when the next thing that can happen is an event you cannot cause yourself: releases your pane and stops you from occupying an admission-cap slot while you wait. NOT a self-exit — do not try to end your own session, and this does not transition your ticket\'s status at all; the daemon closes your pane FOR you, through its existing stop route, once this call lands. TAKES NO ARGUMENTS: the only state this can ever act on is the caller\'s own, so there is nothing to get wrong — same reasoning as check_in/submit_to_boss/report_to_boss. ' +
+        'It re-reads, directly from Jira, the current comment ids on your own ticket and on every ticket you currently have a worker on, and records that as what you have already seen. WHAT WAKES YOU, EXACTLY (characterized by test, not aspirational): a STATUS change on any of those tickets (a worker reaching In Review is the common one) always wakes you; a SUMMARY edit on any of them always wakes you; a pr:* review-state transition on YOUR OWN ticket always wakes you; and a NEW COMMENT that is not in the recorded set — on your own ticket or a worker\'s, including a question, a report, or a [butchr:blocked] escalation — wakes you. WHAT DOES NOT WAKE YOU: a daemon label change on a WORKER\'s ticket on its own — that worker\'s own agent:* label flipping between states, and a pr:* transition on the WORKER\'s ticket unaccompanied by a new comment. That is deliberate (those flip constantly and would wake a boss for nothing), so do not stand down expecting to be woken by a worker\'s PR label moving; the events you actually wait for (a worker reaching In Review, a worker asking you something, an escalation) are all in the waking list. ' +
+        'A missed or wrongly-suppressed edge is BOUNDED, not silent forever: you will be forced awake again after a maximum sleep duration even if nothing new ever arrives — if you see yourself woken with nothing apparently new, that bound is very likely why, and it means an edge was probably missed, not that anything is wrong with your ticket. ' +
+        '**Call this ONLY after you have actually acted on everything you can currently see — exactly like check_in, calling this before you have handled something you already know about is the one way to make this fail silently:** that event is folded into "already seen" the moment you call this, and will not wake you on its own. ' +
+        'On waking, you are a FRESH session with no memory of this one — re-read your own ticket AND every worker\'s ticket, because the reason you woke is not guaranteed to reach you as a message: the channel push this fires only lands on a currently-connected session, and you were not one. Never call this on behalf of another issue — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireIssueCaller(c, "stand_down", "a project already has `check_in` for this same last-act purpose — use that instead; an issue's sleep/wake mechanism (BUTCHR-307) is a separate, in-memory registry from check_in's durable watermark");
+        const issue = await ops.getIssue(who);
+        const keys = [who, ...findWorkers(issue).map((w) => w.key)];
+        const seen = new Map<string, readonly string[]>();
+        for (const key of keys) {
+          const comments = await ops.getIssueComments(key);
+          seen.set(key, comments.results.map((r) => r.id));
+        }
+        audit(c, `stand_down (watching ${keys.length} ticket${keys.length === 1 ? "" : "s"}: ${keys.join(", ")})`);
+        // BUTCHR-307: declared only after every read above has resolved
+        // without throwing — see standDown's own doc comment (this
+        // function's parameter list) for why the daemon composes this from
+        // two registries rather than this handler knowing either exists.
+        standDown?.(who, seen);
+        return { ok: true, key: who, asleep: true, watching: keys };
       },
     },
     get_doc_comments: {
@@ -835,7 +902,7 @@ export function atlassianTools(
     },
     tell_peer: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). The WAKE this comment can trigger is still BEST EFFORT, but for a DIFFERENT, honest reason: the recipient\'s reader has a page-window/pagination bound (see `getPageComments`\'s own doc comment on AtlassianOps) — a comment that never appears inside that window is never observed, therefore never wakes anything, regardless of its id. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). CORRECTED AGAIN (BUTCHR-309): this then warned the recipient\'s reader had a page-window/pagination bound — that is also no longer true, `getPageComments` now paginates to exhaustion (see its own doc comment on AtlassianOps), so a comment is observed on the recipient\'s very next successful poll regardless of how many comments its root doc holds. The WAKE this comment can trigger is still BEST EFFORT, for the narrower, still-honest reason that is left once both of those are fixed: this is a POLLED read, not a push — the recipient observes it at most once every poll interval (`PROJECT_POLL_INTERVAL_MS`, src/resources/project.ts), and a read failure on a given poll (a timeout, a malformed pagination cursor) fails that WHOLE poll rather than recording a partial observation, so it delays being seen rather than losing it — the comment sits on a durable page and is picked up the next time that project polls successfully. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
         'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
         'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
       input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },

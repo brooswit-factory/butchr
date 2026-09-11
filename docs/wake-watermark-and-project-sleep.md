@@ -734,3 +734,51 @@ idle, and NOT quota-blocked, simply not acting, for any other reason (parked,
 hung, or a turn that ended without ever calling `check_in`). Neither
 mechanism substitutes for the other, and neither one's silence on the other's
 case is a hole — it is the intended division.
+
+# The epic axis's own self-wake, closed at `tell_worker` (BUTCHR-292, implementing BUTCHR-328)
+
+This page's own top comment already names the causal chain for the COMMENT
+axis (`check_in`/`speak.ts -> advanceProjectWatermark -> setProjectProperty`)
+and Hazard 1's closure for it (`speakOnOwnChannel`, `src/tools/speak.ts`).
+The EPIC axis had no equivalent closure at all until this section: a
+project's own `tell_worker` call to one of its In-Review epics — the ONLY
+way a project speaks down to an epic, carrying the `[review]
+APPROVED/CHANGES_REQUESTED` line among others — posted a comment with no
+watermark write behind it, so the review hop woke its own writer on the very
+next poll, every time.
+
+**The fix, in one sentence:** `tellWorker` (`src/tools/relationship.ts`) now
+advances `wake.epicsSeen[workerKey]` with the id it just posted, immediately
+after the comment succeeds, via a NEW patch field on `advanceProjectWatermark`
+(`src/resources/project.ts`) — `patch.epicsPartial` — a per-key UNION,
+structurally distinct from `check_in`'s own `patch.epics` complete-observation
+KEY-SET REPLACE. Routing this write through the replace shape would wipe
+every OTHER In-Review epic's seen set on every suppression write; the two
+shapes are kept explicitly separate at the call site rather than inferred
+from what's in the patch.
+
+**Gated on the epic reading "In Review" right now**, not on it existing at
+all: `projectVerdict` treats an absent epic key as "never acted on this
+review episode," the same absence signal `check_in`'s key-set replace
+restores on re-entry (see this page's earlier discussion of
+`ProjectWatermark.epicsSeen`, and that field's own doc comment in
+`src/resources/project.ts`). Seeding the key while the project genuinely
+just acted on the epic during review is defensible; seeding it for an epic
+NOT currently in review would instead consume a future episode's own
+fresh-entry signal before that episode begins. `tell_worker`'s comment is
+unconditional either way — only the watermark write is gated.
+
+**DEFECT 1b's in-process fallback (this page's own earlier "Why the
+defect-1b fallback takes this shape" note, carried into
+`changelog.d/BUTCHR-226.md`) is extended to the epic axis, not duplicated**:
+`pendingWatermarkFallback` and its read-side merge now also carry a per-epic
+seen-ids map, merged by the same per-key union discipline the persisted write
+uses — so a rejected epic-axis write still suppresses the very thing it just
+tried and failed to record, exactly as the version/comment axes already did.
+
+**Confirmed, not assumed, before shipping:** the issue tier (an Epic's own
+`tell_worker` to its Story) never reaches this write — it uses a separate,
+pre-existing in-memory newest-comment cursor (`src/resources/issue.ts`),
+untouched by this change. See `changelog.d/BUTCHR-328.md` for the full
+account, including what stays explicitly out of scope (the per-epic reader's
+pagination, BUTCHR-256's; comment ordering, BUTCHR-195/199/227's).

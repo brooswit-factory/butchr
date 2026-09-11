@@ -24,6 +24,20 @@ export const adf = (text: string) => ({
 const adfForCorrection = (text: string) => (text === "" ? { type: "doc", version: 1, content: [{ type: "paragraph" }] } : adf(text));
 
 /**
+ * BUTCHR-309: shared runaway guard for the two comment-pagination loops
+ * below (`getPageComments`, `getIssueComments`). Each page observed is
+ * strictly more comments than the last real-world root doc ever measured to
+ * hold (39, see those ops' own doc comments) at the smallest page size
+ * either loop uses, so hitting this is a malformed/never-terminating cursor
+ * or an API contract change, never a legitimately large comment thread.
+ * FAILS LOUDLY (throws) rather than returning whatever was accumulated so
+ * far — DoD 4/5 (BUTCHR-309): a partial list must never be mistaken for a
+ * complete one, and a silently-truncated return here would be exactly that,
+ * committed by the very guard meant to prevent it.
+ */
+const MAX_COMMENT_PAGES = 100;
+
+/**
  * The real Atlassian operations, over the de-facto SDKs (jira.js 6, confluence.js 3).
  * NOTE the 6.x config shape is `auth: { type: "basic", email, apiToken }` — the
  * older `authentication: { basic: … }` shape is silently ignored (no header sent,
@@ -337,15 +351,66 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Deliberately NOT `?? deps.now()` or any other synthesis: an
     // unavailable `created` must read as unavailable (`undefined`), never
     // as "just now" — see this op's doc comment on AtlassianOps.
-    getPageComments: (pageId) =>
-      wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
-        results: (r?.results ?? []).map((c: any) => ({
-          id: c.id,
-          body: c?.body?.storage?.value ?? "",
-          author: c?.version?.authorId,
-          created: c?.version?.createdAt instanceof Date ? c.version.createdAt.toISOString() : undefined,
-        })),
-      })),
+    // BUTCHR-309: paginated to exhaustion via `_links.next`'s opaque `cursor`
+    // — the SAME shape `getChildPages` above already follows, confirmed to
+    // reach this call's own parsed response too (not just the raw wire
+    // response): confluence.js 3.2.0's `PageFooterCommentsSchema` DECLARES
+    // `_links: MultiEntityLinksSchema.optional()` and that schema declares
+    // `next: z.string().optional()` (read from the installed package's own
+    // `dist/v2/models/{pageFooterComments,multiEntityLinks}.js` — re-verify
+    // against YOUR installed version before trusting this). `limit: 250` is
+    // the endpoint's documented MAX page size, chosen to minimize call count
+    // — it bounds a single page's size only, never the completeness of the
+    // walk, which is what the `do…while` loop (not the limit) guarantees.
+    // No `sort` is requested: the spec documents no default for it, this
+    // reader's own callers already compare observed ids as a SET rather than
+    // relying on any order (BUTCHR-227's seen-set design; see
+    // `src/resources/project.ts`'s `changed()`), and not pinning one keeps
+    // this op's only behavior change the pagination itself. Runaway
+    // protection: `MAX_COMMENT_PAGES` throws rather than returning a
+    // silently partial list if a malformed cursor never resolves to
+    // `undefined` — see that constant's own doc comment.
+    getPageComments: async (pageId) => {
+      const results: Array<{ id: string; body: string; author?: string; created?: string }> = [];
+      let cursor: string | undefined;
+      for (let page = 0; ; page++) {
+        if (page >= MAX_COMMENT_PAGES) {
+          throw new Error(
+            `getPageComments(${pageId}): exceeded ${MAX_COMMENT_PAGES} pages without the cursor running out — refusing to return a silently partial list; likely a malformed/never-terminating _links.next cursor`,
+          );
+        }
+        const r: any = await wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage", limit: 250, ...(cursor ? { cursor } : {}) });
+        for (const c of r?.results ?? []) {
+          results.push({
+            id: c.id,
+            body: c?.body?.storage?.value ?? "",
+            author: c?.version?.authorId,
+            created: c?.version?.createdAt instanceof Date ? c.version.createdAt.toISOString() : undefined,
+          });
+        }
+        const nextUrl: string | undefined = r?._links?.next;
+        // BUTCHR-309 review round 1: NO next link and a next link PRESENT
+        // but UNPARSEABLE are two genuinely different states, not one — the
+        // first means the walk is complete (break, correctly); the second
+        // means the server is telling us there IS more and we could not
+        // follow it, which is a FAILED read, not a completed one. Collapsing
+        // them (as an earlier version of this loop did, via `?? undefined`)
+        // silently returned "one page" as if it were "the whole list" the
+        // instant `_links.next`'s shape ever changed — exactly the DoD 4
+        // violation this ticket exists to close, reintroduced by its own
+        // fix. MEASURED at review: a `next` link with no `cursor` query
+        // parameter reproduces this with one page returned as complete.
+        if (!nextUrl) break;
+        const parsedCursor = new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor");
+        if (!parsedCursor) {
+          throw new Error(
+            `getPageComments(${pageId}): _links.next was present ("${nextUrl}") but no \`cursor\` query parameter could be parsed from it — refusing to treat "more data exists" as "pagination complete"`,
+          );
+        }
+        cursor = parsedCursor;
+      }
+      return { results };
+    },
 
     // MEASURED live (2026-09-01, re-confirmed after an initial "null" read
     // turned out to understate it): `expand: "lead"` is REQUIRED for
@@ -387,12 +452,78 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return out;
     },
 
-    // Same endpoint, same ordering/cap as src/atlassian/client.ts's own
-    // `comments()` — see this op's doc comment on AtlassianOps for why that
-    // match is load-bearing rather than incidental.
-    getIssueComments: (key) =>
-      jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", maxResults: 20 }).then((r: any) => ({
-        results: (r?.comments ?? []).map((c: any) => ({ id: c.id })),
-      })),
+    // BUTCHR-309: paginated to exhaustion via `startAt`/`maxResults`, bounded
+    // by the response's own `total` (jira.js's `PageOfCommentsSchema` — see
+    // that op's doc comment on AtlassianOps for why this reader no longer
+    // shares a cap with `src/atlassian/client.ts`'s own, differently-tiered
+    // reader). `PAGE_SIZE` is a page-size choice, not a completeness bound.
+    //
+    // THE TERMINATION RULE (settled over three review rounds, each closing a
+    // silent truncation the previous round's fix didn't cover) picks its
+    // signal from what the SERVER actually told this call, never from what
+    // was merely requested — in this priority order, per response:
+    //   1. a numeric `total` -> `startAt >= total` ends it (an empty page is
+    //      still checked too, as a safety net — see case 2 below for why
+    //      that alone isn't enough when `total` is ABSENT);
+    //   2. else a numeric `maxResults` -> a page shorter than THAT (the
+    //      server's own effective page size, which it can cap below what
+    //      was requested) ends it;
+    //   3. else (neither field present) -> ONLY a genuinely EMPTY page ends
+    //      it — a merely-short page proves nothing when there is no
+    //      server-reported number to compare it against.
+    // ROUND 1 (measured at review): an earlier version set `total` to
+    // `results.length` (what had already been read) whenever the response
+    // omitted it — that made `startAt < total` false on the very next check,
+    // so 250 comments across pages of 100/100/50 with no `total` field
+    // silently returned only the first 100. It also made an "empty page"
+    // safety net this comment used to claim unreachable on that same path —
+    // an authoritative-and-wrong doc comment being exactly the shape this
+    // ticket's own DoD 8 exists to close. Fixed by leaving `total` genuinely
+    // `undefined` until a real number arrives.
+    // ROUND 2 (measured at review): with `total` fixed, the next version
+    // measured "short" against `PAGE_SIZE` (what was REQUESTED) rather than
+    // what the server actually returned — Jira caps `maxResults`
+    // server-side and reports the effective value back, so a server
+    // honouring only 50 of a requested 100 (with `total: 125` sitting right
+    // there) silently returned just that 50, because 50 looks short against
+    // 100 even though it was the FULL page offered. Fixed by comparing
+    // against the response's own `maxResults` instead.
+    // ROUND 3 (measured at review): with rounds 1 and 2 fixed, a response
+    // carrying NEITHER `total` NOR `maxResults` still fell back to
+    // `PAGE_SIZE` for the "short" comparison — the same round-2 defect,
+    // reachable by a rarer response shape. Fixed by rule 3 above: absent
+    // BOTH server-reported numbers, nothing but a truly empty page may ever
+    // be read as "done" — one extra call in the ordinary case (an exact
+    // multiple of the page size with no `total`), cheap and never silent.
+    // Runaway protection: `MAX_COMMENT_PAGES` throws rather than returning a
+    // silently partial list if none of the three signals above is ever hit.
+    getIssueComments: async (key) => {
+      const results: Array<{ id: string }> = [];
+      let startAt = 0;
+      let total: number | undefined;
+      const PAGE_SIZE = 100;
+      for (let page = 0; total === undefined || startAt < total; page++) {
+        if (page >= MAX_COMMENT_PAGES) {
+          throw new Error(
+            `getIssueComments(${key}): exceeded ${MAX_COMMENT_PAGES} pages without reaching the reported total (${total ?? "unknown"}) — refusing to return a silently partial list`,
+          );
+        }
+        const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
+        const batch: any[] = r?.comments ?? [];
+        for (const c of batch) results.push({ id: c.id });
+        const responseTotal = typeof r?.total === "number" ? r.total : undefined;
+        const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
+        if (responseTotal !== undefined) total = responseTotal;
+        startAt += batch.length;
+        if (responseTotal !== undefined) {
+          if (batch.length === 0) break; // safety net even when `total` is known — see this op's own doc comment
+        } else if (responseMaxResults !== undefined) {
+          if (batch.length < responseMaxResults) break; // short against what the server actually honoured
+        } else if (batch.length === 0) {
+          break; // neither field reported: only a genuinely empty page may end the walk
+        }
+      }
+      return { results };
+    },
   };
 }
