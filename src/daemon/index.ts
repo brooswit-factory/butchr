@@ -16,7 +16,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
-import { detectTerminalPrefix } from "../terminal/open.js";
+import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
@@ -201,6 +201,24 @@ const { app, mcp } = buildApp({
     if (!pane) return { ok: false, error: "agent not running for " + issue };
     if (!terminalPrefix) return { ok: false, error: "no terminal emulator found (set BUTCHR_TERMINAL)" };
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
+    return { ok: true };
+  },
+  // BUTCHR-267: pane-keyed sibling of `open` above — the dashboard row link
+  // target (BUTCHR-266 will build the link; BUTCHR-264 serves the pane in
+  // the row data). "This daemon's own live agent registry" (criterion 4) is
+  // the SAME `issueOfAgentName`-filtered set `state` above already builds
+  // from `herdr.agent.list()` — a pane belonging to some other, non-butchr
+  // pane on this host is never in that set, so it's refused rather than
+  // handed to `herdr agent attach`.
+  openPane: async (pane) => {
+    const { agents } = await herdr.agent.list();
+    const livePanes = agents
+      .filter((a) => issueOfAgentName((a as { name?: string }).name))
+      .map((a) => a.pane_id);
+    const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+    const decision = resolveAttach(pane, livePanes, terminalPrefix ?? null, hasDisplay);
+    if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
+    Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
