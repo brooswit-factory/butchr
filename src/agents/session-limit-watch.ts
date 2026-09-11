@@ -1,4 +1,4 @@
-import { detectSessionLimitRefusal } from "./session-limit.js";
+import { classifySessionLimitText } from "./session-limit.js";
 
 export interface AgentRow { pane_id: string; agent_status: string; issue: string | null }
 
@@ -211,24 +211,42 @@ export function watchSessionLimits(deps: SessionLimitWatchDeps, intervalMs: numb
         const text = await deps.read(row.pane_id);
         const phrasePresent = CHEAP_PHRASE.test(text);
         if (!phrasePresent) clearCaptured(captured, row.issue);
-        const refusal = detectSessionLimitRefusal(text, new Date(deps.now()));
-        if (!refusal) {
+        // BUTCHR-259 AC4: classifySessionLimitText's three-way outcome is
+        // the whole point — a `not-recognised` and a `suppressed` used to
+        // collapse into the same bare `null` (detectSessionLimitRefusal
+        // still does, for herd.ts's simpler callers), which is exactly the
+        // "a mechanism that did nothing looked identical to one that was
+        // working" defect this epic exists to close. Every branch below
+        // logs a distinguishable outcome; a suppression always says why.
+        const outcome = classifySessionLimitText(text, new Date(deps.now()));
+        if (outcome.kind === "not-recognised") {
           seen.delete(row.issue);
-          if (phrasePresent) await maybeCapture(deps, captured, row, "unrecognised", "phrase present, detectSessionLimitRefusal returned null", text);
+          if (phrasePresent) await maybeCapture(deps, captured, row, "unrecognised", "phrase present, classifySessionLimitText returned not-recognised", text);
           continue;
         }
-        if (refusal.resetsAt === null) {
+        if (outcome.kind === "suppressed") {
+          seen.delete(row.issue);
+          deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} recognised-but-suppressed-with-reason: ${outcome.reason}`);
+          // Same trigger class as `not-recognised` (BUTCHR-12's capture
+          // classes are a closed pair — see CAPTURE_NAME below): a
+          // suppression IS "detection didn't treat this as live", the same
+          // evidence-worth signal as an outright miss, just with a reason
+          // attached in the log line above.
+          if (phrasePresent) await maybeCapture(deps, captured, row, "unrecognised", `phrase present, suppressed: ${outcome.reason}`, text);
+          continue;
+        }
+        if (outcome.resetsAt === null) {
           // Conservative: never invent a reset time. An operator-visible line
           // beats silently never recovering — this pane needs a human.
-          deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} refused ("${refusal.raw}") but no reset time could be parsed — cannot schedule recovery, needs an operator`);
-          await maybeCapture(deps, captured, row, "no-reset-time", `recognised ("${refusal.raw}"), no reset time parseable`, text);
+          deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} refused ("${outcome.raw}") but no reset time could be parsed — cannot schedule recovery, needs an operator`);
+          await maybeCapture(deps, captured, row, "no-reset-time", `recognised ("${outcome.raw}"), no reset time parseable`, text);
           continue;
         }
-        const entry = seen.get(row.issue) ?? { resetsAt: refusal.resetsAt, logged: false };
+        const entry = seen.get(row.issue) ?? { resetsAt: outcome.resetsAt, logged: false };
         seen.set(row.issue, entry);
         if (!entry.logged) {
           entry.logged = true;
-          deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} refused ("${refusal.raw}"), resets ${new Date(entry.resetsAt).toISOString()} — will close the pane ${POST_RESET_MARGIN_MS / 60_000}m after reset so the reconciler respawns with a fresh kickoff`);
+          deps.log(`[session-limit] ${row.issue} pane ${row.pane_id} recognised-and-scheduled: refused ("${outcome.raw}"), resets ${new Date(entry.resetsAt).toISOString()} — will close the pane ${POST_RESET_MARGIN_MS / 60_000}m after reset so the reconciler respawns with a fresh kickoff`);
         }
         if (deps.now() >= entry.resetsAt + POST_RESET_MARGIN_MS) {
           await deps.close(row.issue);

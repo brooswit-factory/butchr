@@ -54,7 +54,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
     getPage: async (id: string) => {
       const p = pages.get(id);
       if (!p) throw new Error(`fake world: no such page ${id}`);
-      return { title: p.title, body: { storage: { value: p.body } }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
+      return { title: p.title, body: { storage: { value: p.body } }, version: { number: p.version }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
     },
     updatePage: async (p) => {
       const page = pages.get(p.id);
@@ -473,6 +473,212 @@ describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Con
     const result = await setProjectDoc(ops, "KAN", "<p>x</p>", "new title");
     expect(result.title).toBe("new title");
     expect(pages.get("4")!.title).toBe("new title");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-236 (story BUTCHR-235): set_doc's result is a BOUNDED RECEIPT, never
+// the body it just wrote. The old echo (`{ id, url, title, body }`, `body`
+// being the caller's OWN input argument) proved nothing about what actually
+// landed and scaled with document size — a successful write to a large doc
+// came back as an oversize error indistinguishable from a failed one. Pinned
+// here, for BOTH callers (`setDoc`/issue and `setProjectDoc`/project — the
+// root doc is the LARGEST document on this surface and the reason the epic
+// exists, so covering only the issue path would fix nothing that matters):
+// ordinary, oversize (named, with an asserted size floor so the fixture
+// can't quietly shrink into decoration), entity-normalised read-back, and
+// unconfirmed. What would make each of these fail is stated inline.
+// ---------------------------------------------------------------------------
+describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", () => {
+  // The field-observed boundary (BUTCHR-236's own ticket): a set_doc call
+  // whose write SUCCEEDED came back as "result (81,019 characters across 1
+  // line) exceeds maximum allowed tokens". This establishes 81,019 is past
+  // the boundary; it does not establish where the boundary is, and the
+  // receipt contract doesn't need to know — it must stay bounded at ANY size.
+  const FIELD_OBSERVED_OVERSIZE_CHARS = 81_019;
+
+  function seedProjectRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
+    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
+  }
+
+  describe("issue caller (setDoc)", () => {
+    test('ordinary small write — receipt correct, landed: "confirmed"', async () => {
+      const { ops, addIssue, setProjectProperty } = makeWorld();
+      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      addIssue("BUTCHR-910", "ordinary write");
+      const body = "<p>hello</p>";
+      const result = await setDoc(ops, "BUTCHR-910", body, "Ordinary write");
+      // Would fail if: the receipt ever carries the body itself, in any field.
+      expect(JSON.stringify(result)).not.toContain("hello");
+      expect(result.landed).toBe("confirmed");
+      expect(result.wrote).toEqual({ chars: body.length, bytes: Buffer.byteLength(body, "utf8"), sha256: expect.any(String) });
+      expect(result.stored).toEqual(result.wrote); // the fake world doesn't rewrite plain ASCII — a genuine byte-identical landing
+      expect(result.identical).toBe(true);
+      expect(typeof result.version).toBe("number");
+      expect(JSON.stringify(result).length).toBeLessThan(500); // bounded — a few hundred bytes, per the contract
+    });
+
+    test("the oversize arm, named as such — a body far past the field-observed 81,019-char boundary", async () => {
+      const { ops, addIssue, pages, setProjectProperty } = makeWorld();
+      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      addIssue("BUTCHR-911", "oversize write");
+      const body = `<p>${"x".repeat(200_000)}</p>`;
+      // Would fail if: a later edit shrinks this fixture back under the boundary that actually broke — loudly, not as silent decoration.
+      expect(body.length).toBeGreaterThan(FIELD_OBSERVED_OVERSIZE_CHARS * 2);
+      const result = await setDoc(ops, "BUTCHR-911", body, "Oversize write");
+      // (a) the serialised RECEIPT stays small regardless of document size —
+      // would fail if the old echo-the-body shape ever came back.
+      expect(JSON.stringify(result).length).toBeLessThan(500);
+      expect(result.landed).toBe("confirmed");
+      // (b) the WRITE ITSELF still landed byte-for-byte — read the fake
+      // STORE, never the receipt, for that half (the receipt is bounded and
+      // therefore structurally incapable of proving this on its own).
+      const stored = [...pages.values()].find((p) => p.title === "Oversize write");
+      expect(stored?.body).toBe(body);
+    });
+
+    test('entity-normalised read-back — landed stays "confirmed", no throw, both digests and sizes still reported', async () => {
+      const { ops, addIssue, setProjectProperty } = makeWorld();
+      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      addIssue("BUTCHR-912", "normalised write");
+      // Simulates the MEASURED Confluence behaviour (this ticket): storage
+      // XHTML is normalised on write, on ordinary prose — a literal em dash
+      // and quotation mark read back as `&mdash;`/`&quot;`. Forced here at
+      // the fake's getPage, since the in-memory fake store doesn't do this
+      // itself.
+      const normalisingOps: AtlassianOps = {
+        ...ops,
+        getPage: async (id: string) => {
+          const page = (await ops.getPage(id)) as { body?: { storage?: { value?: string } } };
+          const raw = page.body?.storage?.value ?? "";
+          return { ...page, body: { storage: { value: raw.replaceAll("—", "&mdash;").replaceAll('"', "&quot;") } } };
+        },
+      };
+      const body = '<p>an em dash — and a "quote"</p>';
+      const result = await setDoc(normalisingOps, "BUTCHR-912", body, "Normalised write");
+      // Pins the measured behaviour so nobody later "fixes" it into an error.
+      expect(result.landed).toBe("confirmed");
+      expect(result.identical).toBe(false); // EXPECTED on a healthy write, never an error
+      expect(result.stored).not.toBeNull();
+      expect(result.stored!.chars).toBeGreaterThan(result.wrote.chars); // normalisation makes stored LARGER
+      expect(result.stored!.bytes).toBeGreaterThan(result.wrote.bytes);
+      expect(result.stored!.sha256).not.toBe(result.wrote.sha256);
+    });
+
+    test('"unconfirmed" (read-back throws) — the call resolves, does not throw, identical/stored are null', async () => {
+      const { ops, addIssue, setProjectProperty } = makeWorld();
+      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      addIssue("BUTCHR-913", "unconfirmable write");
+      // Pre-create + title the doc with working ops first, so the call under
+      // test starts from an already-ensured doc — isolating the failure to
+      // the CONFIRMATION read (buildReceipt's own getPage), not ensureDoc's
+      // unrelated one.
+      await setDoc(ops, "BUTCHR-913", "<p>v1</p>", "Unconfirmable write");
+      let getPageCalls = 0;
+      const flakyOps: AtlassianOps = {
+        ...ops,
+        getPage: async (id: string) => {
+          getPageCalls++;
+          if (getPageCalls > 1) throw new Error("simulated Confluence read-back outage");
+          return ops.getPage(id); // ensureDoc's own getPage call (step 5) — must still succeed
+        },
+      };
+      const result = await setDoc(flakyOps, "BUTCHR-913", "<p>v2</p>");
+      expect(result.landed).toBe("unconfirmed");
+      expect(result.identical).toBeNull();
+      expect(result.stored).toBeNull();
+      expect(getPageCalls).toBeGreaterThan(1); // confirms the confirmation read was actually attempted, not skipped
+    });
+
+    test('"unconfirmed" (read-back resolves with no body) — the call resolves, does not throw, identical/stored are null', async () => {
+      const { ops, addIssue, setProjectProperty } = makeWorld();
+      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      addIssue("BUTCHR-914", "malformed read-back");
+      await setDoc(ops, "BUTCHR-914", "<p>v1</p>", "Malformed read-back");
+      let getPageCalls = 0;
+      const malformedOps: AtlassianOps = {
+        ...ops,
+        getPage: async (id: string) => {
+          getPageCalls++;
+          if (getPageCalls > 1) return { title: "whatever" }; // resolves — but with no body.storage.value at all
+          return ops.getPage(id);
+        },
+      };
+      const result = await setDoc(malformedOps, "BUTCHR-914", "<p>v2</p>");
+      expect(result.landed).toBe("unconfirmed");
+      expect(result.identical).toBeNull();
+      expect(result.stored).toBeNull();
+    });
+  });
+
+  describe("project caller (setProjectDoc)", () => {
+    test('ordinary small write — receipt correct, landed: "confirmed"', async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      seedProjectRootDoc(pages, "20", "PROJ — product brief", "<p>stale</p>");
+      setProjectProperty("PROJ", { space: { key: "PROJ" }, rootDoc: { id: "20" } });
+      const body = "<p>current</p>";
+      const result = await setProjectDoc(ops, "PROJ", body);
+      expect(JSON.stringify(result)).not.toContain("current");
+      expect(result.landed).toBe("confirmed");
+      expect(result.wrote).toEqual({ chars: body.length, bytes: Buffer.byteLength(body, "utf8"), sha256: expect.any(String) });
+      expect(result.stored).toEqual(result.wrote);
+      expect(result.identical).toBe(true);
+      expect(JSON.stringify(result).length).toBeLessThan(500);
+    });
+
+    test("the oversize arm, named as such — a body far past the field-observed 81,019-char boundary, on the root doc (the largest document on this surface)", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      seedProjectRootDoc(pages, "21", "BIG — product brief", "<p>small</p>");
+      setProjectProperty("BIG", { space: { key: "BIG" }, rootDoc: { id: "21" } });
+      const body = `<p>${"y".repeat(200_000)}</p>`;
+      expect(body.length).toBeGreaterThan(FIELD_OBSERVED_OVERSIZE_CHARS * 2);
+      const result = await setProjectDoc(ops, "BIG", body);
+      expect(JSON.stringify(result).length).toBeLessThan(500);
+      expect(result.landed).toBe("confirmed");
+      expect(pages.get("21")?.body).toBe(body); // the write landed byte-for-byte — read the fake STORE, not the receipt
+    });
+
+    test('entity-normalised read-back — landed stays "confirmed", no throw, both digests and sizes still reported', async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      seedProjectRootDoc(pages, "22", "NORM — product brief", "<p>stale</p>");
+      setProjectProperty("NORM", { space: { key: "NORM" }, rootDoc: { id: "22" } });
+      const normalisingOps: AtlassianOps = {
+        ...ops,
+        getPage: async (id: string) => {
+          const page = (await ops.getPage(id)) as { body?: { storage?: { value?: string } } };
+          const raw = page.body?.storage?.value ?? "";
+          return { ...page, body: { storage: { value: raw.replaceAll("—", "&mdash;") } } };
+        },
+      };
+      const body = "<p>an em dash — right here</p>";
+      const result = await setProjectDoc(normalisingOps, "NORM", body);
+      expect(result.landed).toBe("confirmed");
+      expect(result.identical).toBe(false);
+      expect(result.stored).not.toBeNull();
+      expect(result.stored!.chars).toBeGreaterThan(result.wrote.chars);
+      expect(result.stored!.sha256).not.toBe(result.wrote.sha256);
+    });
+
+    test('"unconfirmed" — read-back fails after a successful write; resolves, does not throw, identical/stored are null', async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      seedProjectRootDoc(pages, "23", "FLKY — product brief", "<p>v1</p>");
+      setProjectProperty("FLKY", { space: { key: "FLKY" }, rootDoc: { id: "23" } });
+      let getPageCalls = 0;
+      const flakyOps: AtlassianOps = {
+        ...ops,
+        getPage: async (id: string) => {
+          getPageCalls++;
+          if (getPageCalls > 1) throw new Error("simulated Confluence read-back outage");
+          return ops.getPage(id); // projectRootDoc's own resolve-current-doc read — must still succeed
+        },
+      };
+      const result = await setProjectDoc(flakyOps, "FLKY", "<p>v2</p>");
+      expect(result.landed).toBe("unconfirmed");
+      expect(result.identical).toBeNull();
+      expect(result.stored).toBeNull();
+      // Would fail if: the write itself never happened either — but it must (updatePage runs BEFORE the failing confirmation read).
+      expect(pages.get("23")?.body).toBe("<p>v2</p>");
+    });
   });
 });
 
