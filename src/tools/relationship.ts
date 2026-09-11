@@ -2241,12 +2241,18 @@ export interface TellPeerResult {
  * a symbol BUTCHR-227 deleted) silently failing to notice a low-id
  * comment — that comparison no longer exists; the comment axis is now a
  * SEEN SET, compared by membership, never by magnitude (see
- * src/resources/project.ts's `ProjectWatermark.commentsSeen`). The WAKE is
- * still best-effort, for a DIFFERENT, honest reason: `peer`'s reader has a
- * page-window/pagination bound (see `getPageComments`'s own doc comment on
- * `AtlassianOps`) — a comment that never appears inside that window is
- * never observed, therefore never wakes anything, regardless of its id.
- * This function also does not bump `peer`'s root-doc page VERSION, so the
+ * src/resources/project.ts's `ProjectWatermark.commentsSeen`). CORRECTED
+ * AGAIN (BUTCHR-309): this then attributed best-effort wake to `peer`'s
+ * reader having a page-window/pagination bound — also no longer true,
+ * `getPageComments` now paginates to exhaustion (its own doc comment on
+ * `AtlassianOps` has the fix), so a comment is observed on `peer`'s very
+ * next successful poll no matter how many comments its root doc holds. The
+ * WAKE is still best-effort, for the narrower, still-honest reason left once
+ * both of those are fixed: this is a POLLED read — `peer` observes it at
+ * most once per poll interval, and a read failure on a given poll fails that
+ * WHOLE poll rather than recording a partial observation (see `loadProjects`'
+ * own doc comment, src/resources/project.ts), so it delays being seen, it
+ * does not lose it. This function also does not bump `peer`'s root-doc page VERSION, so the
  * version axis is not a second delivery path here either. The comment is
  * never lost — it sits on a durable page and is read whenever `peer` next
  * reads its own comments — but the wake remains best-effort, and its

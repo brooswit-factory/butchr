@@ -443,10 +443,13 @@ interface StoredWake {
  * ticket doc for the measured evidence a scalar high-water-mark reading
  * would mishandle). A regressed legacy scalar therefore degrades
  * gracefully under this adapter: it simply seeds one fewer id into the
- * set, and every other previously-stepped-over comment still inside the
- * reader's page window (see `getPageComments`/`getIssueComments`'s own
- * doc comments for that window's size) re-delivers once, the next time it
- * is observed.
+ * set, and every other previously-stepped-over comment re-delivers once,
+ * the next time it is observed — BUTCHR-309: both readers now paginate to
+ * exhaustion, so "the next time it is observed" means the very next poll,
+ * not "whenever it happens to fall inside a page window" as it did before
+ * (see `getPageComments`/`getIssueComments`'s own doc comments on
+ * `AtlassianOps` for that fix and its own stated failure mode — a
+ * mid-pagination error, not a silent window).
  *
  * Once `commentsSeen` (or `epicsSeen`, per key) exists in storage — even
  * as an empty array, which `??` treats as present, correctly — the
@@ -474,7 +477,7 @@ function normalizeWake(wake: StoredWake | undefined): ProjectWatermark {
  */
 export interface ProjectEpic {
   key: string;
-  /** Every comment id `getIssueComments` returned for this epic this poll — see that op's own doc comment for its cap, which bounds what this can ever contain. */
+  /** Every comment id `getIssueComments` returned for this epic this poll — BUTCHR-309: that op now paginates to exhaustion, so this is the FULL observed set, not a 20-item newest-first window; see that op's own doc comment on `AtlassianOps` for the fix and its stated failure mode (a thrown error mid-pagination, never a silent truncation). */
   commentIds: readonly string[];
 }
 
@@ -491,7 +494,7 @@ export interface ProjectResource {
   eligible: boolean;
   rootDocId: string | null;
   observedVersion: number | null;
-  /** Every comment id `getPageComments` returned for this project's root doc this poll — BUTCHR-227: the FULL observation, never collapsed to a "newest" scalar. See `unseenCommentIds` for the derived subset novel against the watermark, and `getPageComments`'s own doc comment for this read's pagination window (this module's stated blind spot: a comment outside that window is never observed, therefore never in this array, therefore never seen or woken — a pagination limitation, not the id-monotonicity defect this ticket fixes). */
+  /** Every comment id `getPageComments` returned for this project's root doc this poll — BUTCHR-227: the FULL observation, never collapsed to a "newest" scalar. See `unseenCommentIds` for the derived subset novel against the watermark. BUTCHR-309: `getPageComments` now paginates to exhaustion, so this array is the project's full observed comment set, not a first-page window — the earlier pagination blind spot (a comment outside the default first page was never observed, therefore never seen or woken) is fixed; the reader's own doc comment on `AtlassianOps` states the fix and the failure mode that replaces it (a thrown error on a malformed/never-terminating cursor, never a silently partial list). */
   observedCommentIds: readonly string[];
   observedEpics: readonly ProjectEpic[];
   /**
@@ -607,6 +610,30 @@ export const PROJECT_SPAWN_CONFIG: SpawnConfig<ProjectResource> = {
  * calls/poll, ~756/hour — the interval dominates the batching by an order
  * of magnitude, which is why the cadence is the real decision here, not the
  * batching.
+ *
+ * PAGE COST, UPDATED (BUTCHR-309): the "N comment reads" and "per-epic
+ * comment reads" above were each ONE call per project/epic before this
+ * ticket, because neither reader paginated — that undercounted the true
+ * cost by exactly the defect this ticket fixes. Both readers now walk their
+ * own pages to exhaustion (see `getPageComments`/`getIssueComments`'s own
+ * doc comments on `AtlassianOps`), so "one call" is really "however many
+ * pages that project's/epic's comment count needs at the reader's own page
+ * size" — `getPageComments` requests `limit: 250` per page (Confluence's
+ * documented max), `getIssueComments` requests `maxResults: 100` per page.
+ * Worked example at TODAY's measured root-doc size (39 comments, the BUTCHR
+ * project's own root doc — see `getPageComments`'s doc comment for the
+ * measurement and the specimen comment id): 39 < 250, so still exactly ONE
+ * page, i.e. one call, same as before this ticket — the ~2N+3 figure above
+ * is UNCHANGED at N=6 and N=30 for as long as every eligible project's root
+ * doc and every in-review epic stays under one page. The number that
+ * actually moves as a doc grows is the PAGE count, not this formula: a root
+ * doc that grows past 250 comments costs that project's read one additional
+ * call per additional 250 (`ceil(commentCount / 250)`), and an epic that
+ * grows past 100 comments costs that epic's read one additional call per
+ * additional 100 (`ceil(commentCount / 100)`) — additive to the ~2N+3
+ * baseline above, only for whichever specific project/epic actually grows
+ * that large, and bounded per read by `MAX_COMMENT_PAGES` (the runaway
+ * guard in `atlassian-real.ts`) throwing rather than paging forever.
  */
 export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 
