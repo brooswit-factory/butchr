@@ -1,6 +1,7 @@
 import type { BuildReport } from "../agents/build-identity.js";
 import type { DetectorCoverage } from "./coverage.js";
 import type { AdmissionSnapshot } from "../agents/admission.js";
+import type { CurrencyReport } from "./currency.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -67,6 +68,40 @@ export interface HealthStatus {
    * addition).
    */
   admission?: AdmissionSnapshot;
+  /**
+   * BUTCHR-329: this daemon's own build-currency verdict (whether its
+   * running build matches `refs/remotes/origin/main` — see
+   * src/agents/build-currency.ts) — a FOURTH sibling, alongside
+   * `build`/`coverage`/`admission`, for the same reason those three are:
+   * `ok` is the AND over liveness `components[]` on purpose, and a daemon
+   * running STALE code is not thereby *unhealthy* in the liveness sense —
+   * it is stale, which is a different claim, and conflating the two is the
+   * whole disease this field exists to name honestly instead of hiding.
+   * `/health` already has a 503 contract other things key on; flipping `ok`
+   * for staleness would change the meaning of an endpoint other things
+   * depend on, and whether `/health` may ever go red for a non-liveness
+   * reason is a separate, still-open question (BUTCHR-276) this field
+   * deliberately does not touch.
+   *
+   * `verdict.status` is `"current" | "stale" | "unknown"`, always present
+   * and always carrying its own evidence (an `unknown` verdict always
+   * carries a `reason` — required by `CurrencyVerdict`'s own type, so it
+   * can never be silently empty) — a consumer parsing JSON can distinguish
+   * "nothing is wrong" from "I could not check" by `verdict.status` alone,
+   * never merely by a human reading prose (BUTCHR-175's founding rule).
+   *
+   * Expensive to compute (see src/daemon/currency.ts's own doc comment), so
+   * this is a CACHED value, recomputed at most once per interval — read
+   * `checkedAt` alongside `verdict`: a cached verdict is itself a thing
+   * that can go stale, and a reader must be able to tell a fresh one from a
+   * cached one, the same disease this whole field exists to fix, one level
+   * up. Absent entirely when the caller doesn't pass one to `combineHealth`
+   * (e.g. every existing test fixture in this file's own test suite,
+   * unaffected by this addition) — never a bare missing field once the
+   * daemon IS passing one, which would be indistinguishable from an older
+   * daemon that never had the feature.
+   */
+  currency?: CurrencyReport;
 }
 
 export interface LoopHealthOptions {
@@ -108,7 +143,13 @@ export interface LoopHealth {
  * fields on the returned `HealthStatus` — see each type's own doc comment
  * for why none of them is ever folded into `components[]`.
  */
-export const combineHealth = (components: readonly LoopHealth[], build?: BuildReport, coverage?: readonly DetectorCoverage[], admission?: AdmissionSnapshot): HealthStatus => {
+export const combineHealth = (
+  components: readonly LoopHealth[],
+  build?: BuildReport,
+  coverage?: readonly DetectorCoverage[],
+  admission?: AdmissionSnapshot,
+  currency?: CurrencyReport,
+): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
     ok: statuses.every((s) => s.ok),
@@ -116,6 +157,7 @@ export const combineHealth = (components: readonly LoopHealth[], build?: BuildRe
     ...(build ? { build } : {}),
     ...(coverage ? { coverage: [...coverage] } : {}),
     ...(admission ? { admission } : {}),
+    ...(currency ? { currency } : {}),
   };
 };
 
