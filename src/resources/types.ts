@@ -109,15 +109,44 @@ export interface Activation<T> {
  * this ticket does not touch — every other member is rendered by
  * src/agents/change-nudge.ts instead. `appeared`/`disappeared` cover a key
  * entering or leaving a poll's snapshot (no `before` or no `after` to diff
- * at all); `comment` is populated only where the suppression stack
- * (issue.ts) already learned the ticket's newest comment id moved while
- * deciding whether to suppress — never from a call made just to answer this
- * question, per the ticket's no-new-Jira-call constraint. A delivery this
- * taxonomy cannot explain (every field identical but `updated`, or a class
- * whose only signal came from a Jira call the poll didn't already make —
- * e.g. a genuinely new comment nothing else touched) carries no `reason` at
- * all; the renderer says so honestly rather than guessing (see
- * change-nudge.ts's fallback text).
+ * at all); `comment` is populated wherever `decide()` (src/resources/issue.ts)
+ * has POSITIVE evidence the ticket's newest comment id moved — either
+ * because a suppression arm already learned that while deciding whether to
+ * suppress, or (BUTCHR-350) because SOME arm's `fetchComments` call already
+ * ran THIS poll for this key (shared per-poll cache — no second Jira call)
+ * and its result, compared against the baseline recorded before this poll
+ * began, shows movement. Carries the moved-to comment id itself (BUTCHR-350
+ * widened this from a bare `true`) so a journal reader can recognise a later
+ * `(comment:<id>)` delivery as the SAME underlying change as an earlier
+ * `(reason: not determinable …)` delivery for the same id — see
+ * change-nudge.ts's own doc comment. `undetermined` (BUTCHR-350) is what a
+ * delivery this taxonomy cannot explain now carries INSTEAD of no `reason`
+ * at all — every field identical but `updated`, and no comments signal
+ * available this poll that pins it to a comment either: `"unchecked"` when
+ * no arm fetched comments for this key at all this poll (the common case —
+ * nothing was wrong, there was simply no I/O reason to look);
+ * `"check-failed"` when an arm DID try and the fetch rejected (fail-open,
+ * same discipline as every suppression arm's own comments() call); and
+ * `"checked-unchanged"` when an arm DID succeed and the newest comment id
+ * genuinely matches the pre-poll baseline (comments were ruled out as the
+ * cause, not merely un-consulted). These three used to render identically
+ * as a bare "not determinable" — collapsing them was exactly the defect
+ * BUTCHR-350's own ticket names in its §3(D). A caller that never populates
+ * `reason` at all (the project tier, or any future resource type) is
+ * unaffected: `reason: undefined` still renders the original bare fallback
+ * (see notifyReasonTag's own doc comment).
+ *
+ * BUTCHR-351 widened `comment` again, to `string | null`: `null` carries
+ * the SAME positive evidence of movement as a string id — a suppression
+ * arm's own comments() fetch showed the ticket's newest comment id
+ * changed — but the mover was a DELETION, not an addition: the ticket's
+ * comment list went from non-empty to empty, so there is no id to report.
+ * Mirrors the pre-BUTCHR-350 bare `{ comment: true }` on this one edge
+ * exactly (see src/resources/issue.ts's `SuppressionVerdict` doc comment)
+ * — restoring the classification a BUTCHR-350 regression had turned
+ * structural: a daemon-label-only diff coinciding with this edge used to
+ * wake a sleeping watcher unconditionally instead of going through the
+ * `unseenFor` gate like every other comment-caused delivery does.
  */
 export type NotifyReason =
   | { pr: { from: string | null; to: string } }
@@ -126,7 +155,8 @@ export type NotifyReason =
   | { status: { from: string; to: string } }
   | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
   | { summary: true }
-  | { comment: true };
+  | { comment: string | null }
+  | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" };
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };
 
