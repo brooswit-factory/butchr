@@ -352,6 +352,125 @@ describe("reconcileNow: BUTCHR-147 fault isolation — one rejecting herd.spawn/
   });
 });
 
+describe("reconcileNow: BUTCHR-287 residency guard — cold start, independent of agent.list()", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+
+  /**
+   * THE TICKET'S OWN FALSIFIER, reproduced: BUTCHR-287 exists because a
+   * blind `herd.runningIssues()` (agent.list() reporting nothing running,
+   * even though agents are alive) turns straight into a duplicate spawn via
+   * `plan.spawn = desired − running`. The COLD-START variant specifically
+   * (the incident's own shape) is a SINGLE `reconcileNow` call with no
+   * prior in-process observation at all — nothing here relies on a second
+   * poll or any persisted state. If the current code, given this fixture,
+   * still spawned RESIDENT-1 (i.e. `checkResidency` made no difference),
+   * that would mean either the hook isn't wired into the spawn path or this
+   * reproduction itself is wrong — this test fails on a `reconcileNow` with
+   * the BUTCHR-287 hook omitted/no-op, and passes once it correctly
+   * narrows `plan.spawn`.
+   */
+  test("THE FALSIFIER: a blind agent.list() (herd.runningIssues() → []) at COLD START — one reconcileNow call, no prior poll — still withholds a spawn for a candidate an independent census finds resident, while spawning a genuinely vacant one normally", async () => {
+    const herd = fakeHerd([]); // agent.list() reports NOTHING running — the exact blind-read shape
+    const desired = new Map([["RESIDENT-1", spec("RESIDENT-1")], ["VACANT-1", spec("VACANT-1")]]);
+    const censusCalls: string[][] = [];
+    await reconcileNow(herd, desired, {
+      checkResidency: async (spawning) => {
+        censusCalls.push([...spawning]);
+        // independent of agent.list(): RESIDENT-1 is actually alive.
+        return spawning.filter((id) => id !== "RESIDENT-1");
+      },
+    });
+    expect(censusCalls).toEqual([["RESIDENT-1", "VACANT-1"]]); // consulted for exactly plan.spawn
+    expect(herd.spawned).toEqual(["VACANT-1"]); // RESIDENT-1 withheld; VACANT-1 spawned normally
+    expect([...herd.running]).toEqual(["VACANT-1"]);
+  });
+
+  test("NEGATIVE CONTROL: a genuine cold start with NOTHING alive still spawns the whole fleet — the guard must never withhold merely because residency reads uniformly vacant", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["A", spec("A")], ["B", spec("B")], ["C", spec("C")]]);
+    await reconcileNow(herd, desired, {
+      checkResidency: async (spawning) => spawning, // every candidate genuinely vacant
+    });
+    expect(herd.spawned.sort()).toEqual(["A", "B", "C"]);
+  });
+
+  test("NEGATIVE CONTROL: a genuinely dead workspace (agent exited, no live claude) is still spawnable — the guard is not a one-way ratchet that strands a ticket forever", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["DEAD-1", spec("DEAD-1")]]);
+    await reconcileNow(herd, desired, {
+      checkResidency: async (spawning) => spawning, // census finds it vacant, not resident
+    });
+    expect(herd.spawned).toEqual(["DEAD-1"]);
+  });
+
+  test("checkResidency omitted behaves exactly as before — plan.spawn reaches herd.spawn untouched", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["A", spec("A")]]);
+    await reconcileNow(herd, desired, {});
+    expect(herd.spawned).toEqual(["A"]);
+  });
+
+  test("checkResidency narrows only the spawn candidate list — plan.stop and the respawn (stop+spawn) path are untouched", async () => {
+    const herd = fakeHerd(["OLD", "STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const desired = new Map([["NEW", spec("NEW")], ["STALE", spec("STALE")]]);
+    await reconcileNow(herd, desired, {
+      checkResidency: async () => [], // withhold every spawn candidate
+    });
+    // NEW (a plan.spawn candidate) withheld; STALE (a plan.respawn candidate
+    // — desired AND running, just stale) is untouched by checkResidency
+    // entirely, since the respawn loop never consults `live`/`admitted`.
+    expect(herd.spawned).toEqual(["STALE"]);
+    expect(herd.stopped.sort()).toEqual(["OLD", "STALE"]); // OLD's stop + STALE's respawn-stop-half unaffected
+  });
+
+  test("never shrinks `desired`: a withheld candidate is offered again next poll exactly like an ordinary not-yet-reached plan.spawn entry (BUTCHR-218 liveness trap)", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["RESIDENT-1", spec("RESIDENT-1")]]);
+    let stillResident = true;
+    await reconcileNow(herd, desired, { checkResidency: async (spawning) => (stillResident ? [] : spawning) });
+    expect(herd.spawned).toEqual([]); // withheld poll 1
+    stillResident = false; // the agent genuinely exits between polls
+    await reconcileNow(herd, desired, { checkResidency: async (spawning) => (stillResident ? [] : spawning) });
+    expect(herd.spawned).toEqual(["RESIDENT-1"]); // desired never shrank, so it's picked up the moment residency clears
+  });
+
+  test("checkResidency is called BEFORE checkReap and the spawn loop, and its output — not plan.spawn — is what checkCrashLoop sees (BE DELIBERATE, NOT LUCKY: this is the exact BUTCHR-279 false-complaint shape a later refactor could silently resurrect by re-pointing checkCrashLoop at plan.spawn)", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["RESIDENT-1", spec("RESIDENT-1")], ["VACANT-1", spec("VACANT-1")]]);
+    const order: string[] = [];
+    const crashLoopSaw: string[][] = [];
+    herd.spawn = async (sp) => { order.push(`spawn:${sp.key}`); herd.running.add(sp.key); };
+    await reconcileNow(herd, desired, {
+      checkResidency: async (spawning) => { order.push("residency"); return spawning.filter((id) => id !== "RESIDENT-1"); },
+      checkReap: async () => { order.push("reap"); },
+      checkCrashLoop: async (spawning) => { crashLoopSaw.push([...spawning]); },
+    });
+    expect(order).toEqual(["residency", "reap", "spawn:VACANT-1"]);
+    // checkCrashLoop must NEVER see RESIDENT-1 — it was never really spawned
+    // this poll, so counting it would manufacture a false "spawned N times"
+    // complaint on a ticket whose agent was alive and working the whole time.
+    expect(crashLoopSaw).toEqual([["VACANT-1"]]);
+  });
+
+  test("composes with BUTCHR-284's admission cap: a resident duplicate is filtered out BEFORE admission rations the list, so it never consumes a cap slot a genuinely-new ticket could have used", async () => {
+    const herd = fakeHerd([]);
+    const desired = new Map([["RESIDENT-1", spec("RESIDENT-1")], ["NEW-1", spec("NEW-1")], ["NEW-2", spec("NEW-2")]]);
+    const admissionSaw: string[][] = [];
+    await reconcileNow(herd, desired, {
+      checkResidency: async (spawning) => spawning.filter((id) => id !== "RESIDENT-1"),
+      // A cap of 2, admitting from the front of whatever it's handed: if it
+      // were handed the unfiltered plan.spawn (3 candidates, RESIDENT-1
+      // included), it would admit RESIDENT-1 + one genuine candidate and
+      // strand the other genuine one — under-delivering real work by
+      // exactly the phantom it admitted. With RESIDENT-1 already filtered,
+      // it admits both genuine candidates.
+      admission: async (candidates) => { admissionSaw.push([...candidates]); return candidates.slice(0, 2); },
+    });
+    expect(admissionSaw).toEqual([["NEW-1", "NEW-2"]]); // RESIDENT-1 never reached admission at all
+    expect(herd.spawned.sort()).toEqual(["NEW-1", "NEW-2"]);
+  });
+});
+
 describe("startLoop: parent is membership only — never notified", () => {
   test("a changed child notifies its own agent only; its parent is NOT notified", async () => {
     const herd = fakeHerd();

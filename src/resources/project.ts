@@ -683,10 +683,197 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  *   leaves the corresponding set(s) exactly as `normalizeWake` last
  *   resolved them — not the raw stored value, per the point above.
  */
+/**
+ * THE VERSION AXIS'S MONOTONIC GUARD (BUTCHR-214/226 defect 1, NARROWED by
+ * BUTCHR-260 to this one axis — see this function's own closing note for
+ * why the COMMENT axis's twin, `monotonicMaxId`, and the `reconcile` escape
+ * hatch both used to need, are gone rather than carried forward). `incoming
+ * === undefined` means this patch never touched this axis at all — the
+ * stored value passes through completely unchanged (this is what makes a
+ * comment/epics-only advance leave `version` alone; see the call site
+ * below).
+ *
+ * A stored value that is not a finite number is treated as ABSENT, not as
+ * "smaller than everything": a `null`/never-set watermark is the normal
+ * first-write case (see `ProjectWatermark`'s own doc comments, "absent means
+ * never checked in"), and a stored value that is some OTHER non-numeric
+ * garbage (outside this guard's control — e.g. hand-edited via the raw
+ * Jira API) must not silently coerce to `NaN` and then compare false against
+ * everything, which would silently swallow every future real write forever.
+ * Both resolve the same way: accept the incoming value outright rather than
+ * comparing against something that cannot be trusted as an order.
+ *
+ * An incoming value that is not a finite number (a caller bug, since every
+ * real caller only ever passes a value it read off Jira/Confluence) is
+ * treated as the ABSENT case in the other direction: kept out, so a bad
+ * write can never lower a genuinely numeric stored value — "no writer may
+ * lower it" holds even when the writer itself is confused.
+ *
+ * ONE OPERATOR, TWO OPPOSITE IMPLICATIONS, DEPENDING ON WHICH SIDE OF IT YOU
+ * STAND (the reason this guard is easy to get half-right): `projectVerdict`
+ * compares observed-vs-watermark with EXACT inequality (`!==`), never an
+ * ordering comparison. That makes the READ sound — the comparison itself
+ * loses nothing, and any gap between "seen" and "acted on" lives upstream,
+ * in what gets OBSERVED, not in how it's compared. But the SAME `!==` makes
+ * a WRITE that only ever raises the watermark UNSOUND IF the true value
+ * could ever legitimately need to go DOWN — a watermark strictly ABOVE
+ * what's observed is exactly as "unequal", and wakes the project exactly as
+ * hard, as one strictly below.
+ *
+ * WHY NO EXCEPTION IS NEEDED HERE, UNLIKE THE NOW-DELETED COMMENT-AXIS TWIN
+ * (BUTCHR-260 — reconciling BUTCHR-214 with the seen-set BUTCHR-227 landed
+ * on `main`): BUTCHR-214/226 ALSO carried this exact guard (plus an explicit
+ * `patch.reconcile` bypass, and a sibling `monotonicMaxId` function) for the
+ * COMMENT axis, because that axis's OLD representation — a single "newest
+ * comment id by numeric magnitude" scalar — could legitimately need to go
+ * DOWN: deleting the root doc's top comment drops the page's true max below
+ * an already-stored scalar, and `check_in` (the designated recovery path)
+ * could never lower it back without the bypass, becoming a PERMANENT spawn
+ * loop. BUTCHR-227 replaced that scalar with `commentsSeen`, a SEEN SET
+ * compared by membership, unioned, never replaced — it has no analogous
+ * problem: nothing is ever evicted from it (`ProjectWatermark.commentsSeen`'s
+ * own doc comment, "NO RETENTION RULE"), so there is no "true max" for a
+ * deletion to drop it below, and nothing left for `reconcile`/
+ * `monotonicMaxId` to protect. VERIFIED, not inherited, before dropping
+ * either (both falsifiers this ticket named, checked): (1) a Confluence
+ * page version has no deletion-style analogue — this module's own top
+ * comment and `ProjectWatermark.version`'s doc comment both assert page
+ * versions are genuinely monotonic by construction, a real platform
+ * guarantee (restoring an old version creates a NEW, still-higher version
+ * number; a version number is never reused or decremented), independent of
+ * anything BUTCHR-214/226/227 touched. (2) an audit of every remaining
+ * wake-path caller (`check_in`/src/tools/defs.ts, `speakOnOwnChannel`/
+ * `setProjectDoc`) found no place that still derives a "newest" or a bound
+ * from `commentsSeen`/`epicsSeen` — the one remaining numeric sort left in
+ * this codebase (`createOwnChannelComments`, src/tools/speak.ts) is a
+ * DIFFERENT consumer (escalation-loop's dedupe), documented there as
+ * explicitly outside the wake path BUTCHR-227 fixed. Both hold, so a plain
+ * `monotonicMax`, with NO exception, is sound for `version` alone — a
+ * future report that a page version DID decrease would falsify (1) and
+ * should reopen this, not be patched around silently.
+ */
+function monotonicMax(stored: number | null | undefined, incoming: number | undefined): number | null {
+  if (incoming === undefined) return stored ?? null;
+  if (!Number.isFinite(incoming)) return stored ?? null;
+  if (stored === null || stored === undefined || !Number.isFinite(stored)) return incoming;
+  return Math.max(stored, incoming);
+}
+
+/**
+ * DEFECT 1b (BUTCHR-214/226) — the swallowed watermark-write failure is a
+ * SECOND, INDEPENDENT mechanism that produces the identical "wakes on its
+ * own write" symptom as the old comment-axis regression used to, by
+ * staleness rather than regression: the write below is deliberately
+ * fail-open (BUTCHR-105 — a bookkeeping failure must never fail the
+ * caller's `report_to_boss`/`ask_boss`/`set_doc`), so a persistent rejection
+ * (MEASURED live, BUTCHR-115: a 403 from a project-tier account lacking
+ * write permission) left the true stored watermark forever behind the
+ * page's real max, waking the project on its own already-posted complaint
+ * every poll, indefinitely. UNCHANGED BY BUTCHR-227/BUTCHR-260 (BUTCHR-260
+ * DoD): still absent from `main`, so adapted here rather than dropped.
+ *
+ * THE CHOSEN MECHANISM, AND WHY, AGAINST THE ALTERNATIVES THIS TICKET NAMED:
+ * a bounded in-PROCESS (never persisted) fallback — the version/seen-comment
+ * ids this process most recently tried and failed to persist for a project,
+ * merged into BOTH the next read (`loadProjects`, via `mergePendingFallback`
+ * below) and the next write attempt (this function, so a LATER successful
+ * write — from ANY caller, not necessarily the one that failed — durably
+ * absorbs what an earlier one could not persist). Rejected alternatives:
+ *   - A bare RETRY inside this function fixes only a TRANSIENT failure
+ *     (timeout, rate limit). It does nothing for the measured case — a
+ *     permission error is not fixed by retrying it — so retry alone would
+ *     leave defect 1b's actual production incident unfixed. (A retry is
+ *     still cheap insurance and composes fine with this fallback, but this
+ *     ticket's time is better spent on the mechanism that actually closes
+ *     the measured gap; not added here to keep one mechanism, not two.)
+ *   - A DURABLE side-channel (a second Jira/Confluence write, or changing
+ *     what the `wake` property itself stores) would need BUTCHR-195/199's
+ *     sign-off (they own the stored field's meaning) and is exactly the
+ *     "stop and ask" tripwire this ticket names — not needed here, because
+ *     this fallback changes nothing about what is PERSISTED or what it
+ *     means; it only changes what this process additionally consults before
+ *     deciding, entirely in memory.
+ * ACCEPTED COST, STATED RATHER THAN HIDDEN: this resets on daemon restart,
+ * same as the issue tier's own per-issue in-memory cursor (a DIFFERENT
+ * mechanism on a DIFFERENT surface — not modified, not reused — but the same
+ * accepted shape: in-memory resilience is not required to survive a
+ * restart to be worth having). A persistent-failure incident that survives
+ * a restart before its write ever succeeds will resume waking the project
+ * until then — a real gap, and the reason the WARNING log line below stays
+ * loud rather than being treated as fully closed.
+ */
+const pendingWatermarkFallback = new Map<string, { version: number | null; seenComments: readonly string[] }>();
+
+/** Test-only: `pendingWatermarkFallback` is process-lifetime state shared across every caller in this module, so a test suite that reuses a project key across tests (as this file's own fixtures do) must reset it between tests to avoid one test's failed write leaking into another's assertions. */
+export function resetPendingWatermarkFallbackForTests(): void {
+  pendingWatermarkFallback.clear();
+}
+
+/**
+ * `loadProjects`' own merge of a persisted watermark with any still-pending
+ * in-memory fallback for the same project — see `pendingWatermarkFallback`'s
+ * doc comment. Never touches `epicsSeen` (out of this fallback's scope; see
+ * that doc comment).
+ *
+ * BUTCHR-260: this used to branch on a `pending.reconcile` flag (a pending
+ * value from `check_in`'s reconciling write was used DIRECTLY, bypassing
+ * `monotonicMax`, because it could legitimately be LOWER than the stale
+ * persisted value after a comment deletion — see `monotonicMax`'s own doc
+ * comment for the full history). That branch, and the flag, are gone: the
+ * comment axis this existed to protect is now `commentsSeen`, a plain
+ * union with no "stale ceiling" a reconciling write would ever need to
+ * override, so every pending value merges the same way.
+ */
+function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): ProjectWatermark {
+  const pending = pendingWatermarkFallback.get(projectKey);
+  if (!pending) return persisted;
+  return {
+    version: monotonicMax(persisted.version, pending.version ?? undefined),
+    commentsSeen: Array.from(new Set([...persisted.commentsSeen, ...pending.seenComments])),
+    epicsSeen: persisted.epicsSeen,
+  };
+}
+
+/**
+ * Read-modify-write of ONLY the `wake` sub-key — see this file's top comment
+ * for why the rest of the `butchr` property (owned by the external
+ * scaffolding tool) is never overwritten wholesale, and `monotonicMax`'s own
+ * doc comment for why `version` alone still needs a monotonic floor while
+ * `commentsSeen`/`epicsSeen` (BUTCHR-227's union-only shapes) do not.
+ *
+ * BUTCHR-260 (reconciling BUTCHR-214 with `main` after BUTCHR-227 landed):
+ * this function used to take an explicit `patch.reconcile` flag — the ONLY
+ * caller that ever passed it was `check_in` (src/tools/defs.ts), saying "the
+ * following is a COMPLETE observation over everything currently on the
+ * page, not a partial fact about one write, so it may set the watermark
+ * authoritatively, INCLUDING DOWNWARD". That flag, and the branch it
+ * selected, are DROPPED HERE, not adapted — see `monotonicMax`'s own doc
+ * comment for the evidence: the axis it existed to let `check_in` correct
+ * downward (the old comment scalar) is gone, and `version` never had a
+ * legitimate downward case to begin with (a real Confluence page version
+ * never decreases). `check_in`'s own call site (src/tools/defs.ts) no
+ * longer passes `reconcile` — its `seenComments`/`epics` were already a
+ * plain union/replace regardless of the flag, so removing it changes
+ * NOTHING about `check_in`'s observable behavior, only removes a
+ * now-meaningless parameter.
+ *
+ * STATED RISK, NOT AN IMPLIED GUARANTEE: this reads the property immediately
+ * before writing it back, but the two calls are NOT atomic — Jira's project
+ * entity property endpoint has no compare-and-swap/version field to make
+ * them so (contrast `updatePage`, which does exact this locking for
+ * Confluence pages via `version.number`). A write landing between this
+ * function's own read and write is last-writer-wins. Accepted rather than
+ * engineered around, same reasoning as before BUTCHR-260: the only other
+ * writers of the `butchr` property are humans and the external scaffolding
+ * tool that provisions a project once, up front — not a second, frequent,
+ * automated writer this function's own call frequency could plausibly
+ * collide with.
+ */
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
   patch: { version?: number; seenComments?: readonly string[]; epics?: Readonly<Record<string, readonly string[]>> },
+  log: (line: string) => void = console.error,
 ): Promise<void> {
   // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
   // `getProjectProperty().catch(() => undefined)` this used to call. That
@@ -708,7 +895,14 @@ export async function advanceProjectWatermark(
   // empty" and silently deletes whatever was actually there.
   const current = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as Record<string, unknown> | null ?? {};
   const wake = (current.wake as StoredWake | undefined) ?? {};
-  const normalized = normalizeWake(wake);
+  // BUTCHR-260 (defect 1b, adapted): this process's own still-pending
+  // fallback (see `pendingWatermarkFallback`'s doc comment) is merged in
+  // BEFORE this write's own union/monotonic-max, exactly as `loadProjects`
+  // merges it on read (`mergePendingFallback`, reused here so read and
+  // write can never disagree about what "currently known" means) — so a
+  // LATER write, from ANY caller, durably absorbs what an earlier one could
+  // not persist, never lowered by this write.
+  const normalized = mergePendingFallback(projectKey, normalizeWake(wake));
 
   const commentsSeen = patch.seenComments ? Array.from(new Set([...normalized.commentsSeen, ...patch.seenComments])) : normalized.commentsSeen;
 
@@ -723,13 +917,24 @@ export async function advanceProjectWatermark(
 
   const nextWake: StoredWake = {
     ...wake, // preserves the legacy `comment`/`epics` scalars VERBATIM — see this function's own doc comment.
-    version: patch.version ?? normalized.version,
+    version: monotonicMax(normalized.version, patch.version),
     commentsSeen,
     epicsSeen,
   };
   const nextProperty = { ...current, wake: nextWake };
   assertWithinPropertySizeCeiling(projectKey, nextProperty);
-  await ops.setProjectProperty(projectKey, PROPERTY_KEY, nextProperty);
+  try {
+    await ops.setProjectProperty(projectKey, PROPERTY_KEY, nextProperty);
+    // The durable write just became the new ground truth for whatever it
+    // covered — `nextWake` already absorbed any pending value (see above) —
+    // so dropping the fallback outright here (never merging it back in) is
+    // correct.
+    pendingWatermarkFallback.delete(projectKey);
+  } catch (e) {
+    pendingWatermarkFallback.set(projectKey, { version: nextWake.version ?? null, seenComments: commentsSeen });
+    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, commentsSeen=${commentsSeen.length}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
+    throw e;
+  }
 }
 
 /** `project = "KEY-123"` -> `"KEY"`. Project keys never contain a hyphen (`PROJECT_ID_RE`, src/resources/id.ts) so the first split segment is always the whole prefix. */
@@ -955,7 +1160,14 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       // pre-migration project's stored scalar is turned into a one-member
       // seen set, never treated as a threshold. See that function's own
       // doc comment for the reasoning this module must reproduce in its PR.
-      const watermark = normalizeWake(p.wake);
+      //
+      // DEFECT 1b (BUTCHR-260, adapted from BUTCHR-214/226): merge in this
+      // process's own in-memory fallback (see `pendingWatermarkFallback`'s
+      // doc comment) BEFORE computing anything derived from the watermark,
+      // so a watermark write that failed to persist still suppresses a
+      // poll's own re-read of the very thing it just tried and failed to
+      // record.
+      const watermark = mergePendingFallback(p.key, normalizeWake(p.wake));
       const observedCommentIds = commentsByProject[i]!.results.map((c) => c.id);
       // THE CLASSIFICATION SEAM (BUTCHR-227) — computed once, here, where
       // both the observation and the watermark are in hand, and reused by

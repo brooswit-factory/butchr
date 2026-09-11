@@ -6,9 +6,11 @@ import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { StatusFloorTracker } from "../agents/status-floor.js";
+import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
-import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
+import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
 import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
@@ -40,8 +42,10 @@ import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
+import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 import { createStandDownRegistry } from "../agents/stand-down.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 
 let config;
 try {
@@ -78,7 +82,32 @@ const admissionController = createAdmissionController({
   log: (line) => console.error(`  ${line}`),
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
-const summaries = new Map<string, string>();
+// BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
+// `issuetype` is a declared field on every `JiraIssue` the issue loop's
+// `search()` already returns on every poll (src/atlassian/types.ts) and was
+// simply being thrown away here; retaining it alongside `summary` is what
+// lets /dashboard's tier field distinguish epic/story/task WITHOUT a second
+// Jira call. A key genuinely absent from this map (a fresh daemon before its
+// first search lands, or a key that dropped out of the search while its
+// agent is still winding down) must read as "could not check the tier", not
+// as a guessed default — see src/agents/dashboard.ts's own header.
+const issueMeta = new Map<string, IssueMeta>();
+// BUTCHR-269: the dashboard's own "time in current agent_status" floor — see
+// src/agents/status-floor.ts for why this is a THIRD tracker rather than a
+// widening of StalledTracker/FrozenAsleepTracker (both load-bearing for a
+// different question). One instance for the whole daemon, fed once per poll
+// (see the `agentStatuses` tee below) — a floor must persist across polls to
+// mean anything.
+const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
+// BUTCHR-269/BUTCHR-308: the poll-fed snapshot `/dashboard` serves. The fetch
+// itself stays here (only this daemon knows whether THIS poll's
+// `agent.list()` succeeded, and only it also needs the raw `agents` array to
+// feed `createLabelSync`'s own status map below) but the "could not
+// check"/stale-on-decline DECISION — what the snapshot looks like on success
+// vs. failure — lives in `createDashboardFeed` (src/agents/dashboard.ts),
+// unit-tested there directly. This daemon is wiring only: call `.poll()`
+// with the real fetch, record coverage, serve `.snapshot()`.
+const dashboardFeed = createDashboardFeed({ now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor });
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -221,7 +250,7 @@ const { app, mcp } = buildApp({
     const { agents } = await herdr.agent.list();
     return agents.flatMap((a) => {
       const issue = issueOfAgentName((a as { name?: string }).name);
-      return issue ? [{ issue, status: a.agent_status, summary: summaries.get(issue) ?? "" }] : [];
+      return issue ? [{ issue, status: a.agent_status, summary: issueMeta.get(issue)?.summary ?? "" }] : [];
     });
   },
   open: async (issue) => {
@@ -250,6 +279,12 @@ const { app, mcp } = buildApp({
     return { ok: true };
   },
   health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+  // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
+  // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
+  // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
+  // for why a request-time fetch is the wrong pattern here even though it's
+  // what `state` above does.
+  dashboard: async () => dashboardFeed.snapshot(),
 }, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare, (key, seen) => {
   // BUTCHR-307: `stand_down`'s effect is composed from TWO registries — see
   // `issueCheckInExit`/`issueStandDown`'s own construction comments above
@@ -271,6 +306,62 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
+// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
+// `pinnedActiveDetector` further down (project loop only) share the SAME
+// herdr.agent.list() read rather than each defining its own — "wire from the
+// existing seam, do not add a second reader". Behaviour-preserving: this is
+// the exact closure `syncLabels` was already given, moved to a name instead
+// of an inline argument.
+const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
+  const m = new Map<string, string>();
+  for (const a of agents) {
+    const issue = issueOfAgentName((a as { name?: string }).name);
+    if (issue) m.set(issue, a.agent_status ?? "unknown");
+  }
+  return m;
+};
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMapFromAgents((await herdr.agent.list()).agents);
+// BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
+// the shared one above except that it tees /dashboard's poll-fed snapshot off
+// the SAME single `agent.list()` — not a second fetch, the same discipline
+// createQuotaGate documents for itself elsewhere in this file.
+//
+// On BUTCHR-305/BUTCHR-238's "share the SAME read, do not add a second
+// reader" just above — that intent is met, and this is not a second reader:
+// the issue loop calls THIS function and nothing else, the project loop calls
+// the shared one and nothing else, and each performs exactly one
+// `agent.list()`. The per-poll read count is unchanged; only the map-building
+// is shared, via `statusMapFromAgents`.
+//
+// Deliberately NOT folded into the shared `agentStatuses`, and the reason is
+// not tidiness: unlike that one, this is STATEFUL. It advances the dashboard
+// snapshot's `confirmedAt`, the StatusFloorTracker's per-agent floors, and
+// the DASHBOARD_DETECTOR coverage counters. The shared `agentStatuses` is
+// also wired into `pinnedActiveDetector` on the PROJECT loop, which polls on
+// its own cadence — so folding this in would make `confirmedAt` mean "the
+// last poll of either loop" and would mix two cadences into one coverage
+// denominator, which is the precise conflation src/daemon/coverage.ts exists
+// to prevent. The dashboard is fed by the issue loop's poll, exactly where it
+// was designed, reviewed and tested.
+//
+// A failure here already aborted the whole poll before this ticket (nothing
+// in syncLabels catches it — see createLabelSync's own top comment); that
+// behaviour is deliberately UNCHANGED. The try/catch exists only to record
+// the dashboard's own coverage before the error propagates, never to swallow
+// it — `dashboardFeed.poll` likewise updates its snapshot and rethrows. This
+// is the measured `loop error: agent.list: connection closed before a
+// response` case.
+const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
+  let agents: readonly DashboardAgent[];
+  try {
+    agents = await dashboardFeed.poll(() => herdr.agent.list());
+  } catch (e) {
+    coverage.recordDeclined(DASHBOARD_DETECTOR);
+    throw e;
+  }
+  coverage.recordChecked(DASHBOARD_DETECTOR);
+  return statusMapFromAgents(agents);
+};
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
@@ -343,12 +434,20 @@ const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comm
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
 // default cannot spam anything on day one — see this ticket's PR body for
 // why steady-state volume should NOT be assumed to stay zero.
+// BUTCHR-240: `todoWorkers` closes the To Do gap — see abandoned.ts's own
+// "FORMER KNOWN LIMITATION" doc comment. A separate, narrower query
+// (TODO_WORKER_JQL, src/resources/issue.ts) from `ISSUE_JQL` above,
+// deliberately not folded into it — see that constant's own doc comment for
+// why. Uses the raw `atlassian.search` call, not the `summaries`-recording
+// wrapper `issueResourceType` below is given: a To Do worker has no running
+// agent, so there is nothing here for that side-effect to usefully feed.
 const abandonedDetector = createAbandonedDetector({
   now: () => Date.now(),
   minutes: config.abandonedMinutes,
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
+  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
@@ -376,6 +475,39 @@ const issueFrozenAsleepDetector = createFrozenAsleepDetector({
   minutes: config.atRestMinutes,
   addComment: async (id, text) => { await ops.addComment(id, text); },
   comments: (id) => atlassian.comments(id),
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-305/BUTCHR-238: audible-only detection of a PROJECT pinned "active"
+// by an agent that has stopped acting — see src/agents/pinned-active.ts for
+// the full mechanism. Wired into the project loop ONLY (see that call site
+// below): the issue tier already covers this same shape via
+// `syncLabels`/`stallRemediation` above. Reuses `agentStatuses` (this file's
+// existing herdr.agent.list() seam), the SAME `speakOnOwnChannel`/
+// `ownChannelComments` seams every sibling detector uses, and the SAME
+// `quotaGate.isBlocked` predicate `stallRemediation` above already wires
+// (constraint 6 — a quota-blocked agent is the session-limit path's case,
+// not this one's). `comments` is wrapped to report BUTCHR-179 coverage
+// (`/health`) the same way `stalled`'s own check does in src/labels/sync.ts:
+// `recordChecked` for a resolved fetch (found an adoption target or not),
+// `recordDeclined` for a rejected one — never invoked for a poll that never
+// reached the fetch at all (nothing stalled, already spoken, or
+// quota-blocked this poll).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: async (id) => {
+    try {
+      const rows = await ownChannelComments(id);
+      coverage.recordChecked("pinned-active");
+      return rows;
+    } catch (e) {
+      coverage.recordDeclined("pinned-active");
+      throw e;
+    }
+  },
+  quotaBlocked: quotaGate.isBlocked,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
@@ -449,17 +581,31 @@ const projectReaper = createReaper({
   close: (c) => herd.closeStranded(c),
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-287: a live per-issue residency census, independent of
+// agent.list() — see src/agents/residency-guard.ts and
+// src/agents/residency-census.ts for the full mechanism. TWO SEPARATE
+// INSTANCES, same reasoning as issueReaper/projectReaper above: each
+// `runResourceLoop` call needs its own unknown-streak tracker (the bounded
+// decay for a persistently-ambiguous census — see ResidencyGuard's own doc
+// comment), same "one instance per loop" discipline `RespawnGuard`/
+// `ReapGuard` already follow — unlike `admissionController` above, which is
+// deliberately ONE shared instance because IT bounds the host, not a tier.
+// `herd.residency` (the raw HerdrHerd instance's own method, not part of
+// the `Herd` interface `scopedHerd` wraps) is used directly, same as
+// `herd.strandedCandidates`/`herd.closeStranded` above — candidates always
+// arrive pre-scoped to this loop's own `plan.spawn`, so there is nothing
+// for `scopedHerd`'s `ownsId` filtering to add here.
+const issueResidencyGuard = createResidencyGuard({
+  census: (candidates) => herd.residency(candidates),
+  log: (line) => console.error(`  ${line}`),
+});
+const projectResidencyGuard = createResidencyGuard({
+  census: (candidates) => herd.residency(candidates),
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
-  agentStatuses: async () => {
-    const { agents } = await herdr.agent.list();
-    const m = new Map<string, string>();
-    for (const a of agents) {
-      const issue = issueOfAgentName((a as { name?: string }).name);
-      if (issue) m.set(issue, a.agent_status ?? "unknown");
-    }
-    return m;
-  },
+  agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
@@ -506,7 +652,7 @@ void sweepStaleAgentLabels({
 const issueResourceType = createIssueResourceType({
   search: async (jql) => {
     const issues = await atlassian.search(jql);
-    for (const i of issues) summaries.set(i.key, i.summary);
+    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
   },
   links: (key) => atlassian.links(key),
@@ -586,10 +732,20 @@ runResourceLoop(issueResourceType, {
   // one most likely to actually clear a stranded workspace's grace period
   // quickly. See src/agents/reap.ts.
   checkReap: issueReaper.check,
+  // BUTCHR-287: see src/agents/residency-guard.ts. Runs BEFORE `admission`
+  // below (its output feeds `admission`, not `plan.spawn` — see
+  // ReconcileOptions.checkResidency's own doc comment in loop.ts for the
+  // reason, not merely the order).
+  checkResidency: issueResidencyGuard.filter,
   // BUTCHR-284: the SAME shared controller instance the project loop below
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal — see
+  // admissionController's own construction comment above and
+  // src/agents/admission.ts's own B4 addendum for why this must be one
+  // ledger, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -671,6 +827,11 @@ runResourceLoop(projectResourceType, {
   // real crash loop still needs to reach the threshold well inside the
   // configured window (see crashLoopCount's own doc comment, config.ts).
   checkCrashLoop: projectCrashLoopDetector.check,
+  // BUTCHR-305/BUTCHR-238: wired here ONLY — the issue tier already covers
+  // this same "active+running+idle" shape via `syncLabels`/`stallRemediation`
+  // above (see src/agents/pinned-active.ts's own top comment for why wiring
+  // both would double-post).
+  checkPinnedActive: pinnedActiveDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
   // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
@@ -678,10 +839,17 @@ runResourceLoop(projectResourceType, {
   // (5min cadence) is still a valid independent chance to catch a candidate
   // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
   checkReap: projectReaper.check,
+  // BUTCHR-287: wired here too, same reasoning as issueResidencyGuard above
+  // — see src/agents/residency-guard.ts.
+  checkResidency: projectResidencyGuard.filter,
   // BUTCHR-284: the SAME shared controller instance the issue loop above
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal the
+  // issue loop above also uses — see that call site's own comment for why
+  // this must be one instance, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

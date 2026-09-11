@@ -1,14 +1,23 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach } from "bun:test";
 import {
   createProjectResourceType,
   projectVerdict,
   advanceProjectWatermark,
+  resetPendingWatermarkFallbackForTests,
   type ProjectResourceDeps,
 } from "../../src/resources/project.js";
 import { speakOnOwnChannel } from "../../src/tools/speak.js";
 import { setProjectDoc } from "../../src/tools/docs.js";
 import { desiredFrom } from "../../src/daemon/loop.js";
+import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+
+// BUTCHR-226: `pendingWatermarkFallback` (src/resources/project.ts) is
+// process-lifetime state shared across every test in this process, and this
+// file reuses project key "ACME" across many tests/describe blocks — reset
+// it before each test so one test's failed-write fallback can never leak
+// into another's assertions.
+beforeEach(() => resetPendingWatermarkFallbackForTests());
 
 /**
  * BUTCHR-217 — characterizes TODAY'S REAL project root-doc wake rule,
@@ -44,6 +53,19 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
  *
  * Every describe block states its own failure condition first, per this
  * ticket's evidence-discipline requirement.
+ *
+ * BUTCHR-226 UPDATE: this file characterized PRE-FIX behavior — the three
+ * defects it pins were left unfixed on purpose (211's own PR body: "no
+ * behavior change"). BUTCHR-226 fixes all three (the monotonic guard,
+ * defect 1; the in-process pending-watermark fallback, defect 1b; the
+ * version-axis identity-of-write advance in `setProjectDoc`, defect 2), so
+ * three tests below that asserted the DEFECT's outcome now assert the FIXED
+ * outcome instead — each edited test says so explicitly, in place, rather
+ * than being silently deleted or weakened (per this ticket's own
+ * instruction). Every OTHER test here is untouched and still passes
+ * unmodified: they prove properties BUTCHR-226 does not change (a foreign
+ * comment/edit still wakes, content/author never matter, epics semantics),
+ * which is exactly the invariant this fix is not allowed to weaken.
  */
 
 interface World {
@@ -101,7 +123,7 @@ function world(opts: {
     // whether or not anything else ever reads it back to a watermark.
     updatePage: async (_p: unknown) => {
       pageVersion++;
-      return { ok: true };
+      return { ok: true, version: pageVersion };
     },
     searchPages: unimplemented("searchPages"),
     listSpaces: unimplemented("listSpaces"),
@@ -182,29 +204,22 @@ describe("end-to-end (real speakOnOwnChannel write, real loadProjects read): the
   });
 });
 
-describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS: a project's own root-doc BODY EDIT — no comment involved at all — self-wakes it deterministically, because nothing but check_in ever advances the version watermark", () => {
-  // Failure condition: this whole block is wrong if the project reads
-  // "asleep" after a body edit with the comment/epics axes untouched and
-  // caught up — that would mean something DOES suppress the version axis,
-  // contradicting the writer inventory below. It does NOT come back
-  // "asleep": confirmed by re-deriving the writer inventory directly
-  // (`grep -rn "advanceProjectWatermark(" src/` at this PR's own commit
-  // finds EXACTLY TWO non-definition call sites — src/tools/defs.ts's
-  // check_in, which passes `{version, comment, epics}` every time, and
-  // src/tools/speak.ts's speakOnOwnChannel, which passes `{comment}` ONLY,
-  // never `version` — so there is no third writer and nothing advances the
-  // version axis outside check_in). `setProjectDoc` (src/tools/docs.ts),
-  // the function `set_doc` actually calls for a project caller, calls
-  // ONLY `ops.updatePage` and never `advanceProjectWatermark` — confirmed
-  // by reading its full body, not by absence-of-a-grep-hit alone.
+describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS — BUTCHR-226 FIXED THIS: a project's own root-doc BODY EDIT no longer self-wakes it, and a FOREIGN edit still does", () => {
+  // PRE-BUTCHR-226, this block asserted the DEFECT's outcome (own edit ->
+  // "active", traced to an actual spawn). BUTCHR-226 closed the version axis
+  // with the same identity-of-write shape the comment axis already used
+  // (`setProjectDoc`, src/tools/docs.ts, now advances `wake.version` to the
+  // version ITS OWN `ops.updatePage` call produced, via
+  // `advanceProjectWatermark`). Updated in place rather than left to fail
+  // silently disagree with shipped code — see this file's own top-of-file
+  // BUTCHR-226 update note.
   //
-  // UNLIKE the comment-axis regression (F5/F6, above), this is not
-  // probabilistic — it does not depend on a non-monotonic id landing below
-  // a watermark. Every body edit bumps Confluence's own `version.number`
-  // by exactly 1 (this fake's `updatePage`/`getPageVersions` mirror that
-  // real behavior); there is no scenario where it does NOT diverge from a
-  // watermark nothing ever touches.
-  test("a project's own set_doc call (a REAL setProjectDoc write, not a hand-set version number) leaves the version watermark behind and reads active on the next poll — comment and epics axes stay fully caught up", async () => {
+  // Failure condition, post-fix: the OWN-edit test below is wrong if it
+  // reads "active" (the version suppression regressed or was never wired);
+  // the FOREIGN-edit test below is wrong if it reads "asleep" (the
+  // suppression widened to swallow a write it must not — the failure this
+  // whole ticket names as worse than the bug).
+  test("a project's own set_doc call (a REAL setProjectDoc write) advances the version watermark to the version IT produced — reads asleep on the next poll, comment/epics axes untouched", async () => {
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -221,7 +236,37 @@ describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS: a project's own root-doc BODY 
 
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
     expect(resource.observedVersion).toBe(6); // Confluence bumped it
-    expect(resource.watermark.version).toBe(5); // never advanced — only check_in could
+    expect(resource.watermark.version).toBe(6); // BUTCHR-226: advanced to the version setProjectDoc's OWN write produced
+    expect(resource.unseenCommentIds).toEqual([]); // comment axis: still caught up, untouched by this edit
+    expect(verdict).toBe("asleep"); // BUTCHR-226: no longer wakes on its own edit
+
+    // Traced through to an actual spawn decision, same discipline as F5/F6.
+    const resourceType = createProjectResourceType(w.deps);
+    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
+    expect(desired.has("ACME")).toBe(false);
+  });
+
+  // The failure this fix must not cause (worth more than the fix itself,
+  // per the ticket): a body edit this project's OWN `setProjectDoc` never
+  // made — e.g. a human editing the page directly, or any other writer —
+  // must still wake it. Exercised here via a raw `ops.updatePage` call,
+  // bypassing `setProjectDoc` entirely, so no version-watermark advance
+  // happens at all.
+  test("a FOREIGN root-doc body edit (a raw ops.updatePage call, never through setProjectDoc) still wakes the project", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialPageVersion: 5,
+      initialComments: [{ id: "100", body: "<p>seed</p>" }],
+      initialWake: { version: 5, comment: "100", epics: {} },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the edit
+
+    await w.ops.updatePage({ id: "doc-1", body: "<p>someone else's edit</p>" });
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.observedVersion).toBe(6);
+    expect(resource.watermark.version).toBe(5); // never advanced — this write never went through setProjectDoc
     // BUTCHR-227 field rename only (observedCommentId -> observedCommentIds,
     // watermark.comment -> watermark.commentsSeen): the PROPERTY under test
     // — the comment axis stays fully caught up, untouched by this edit — is
@@ -229,8 +274,6 @@ describe("F8 / DoD-1(d) / DoD-3 THE VERSION AXIS: a project's own root-doc BODY 
     expect(resource.unseenCommentIds).toEqual([]); // comment axis: still caught up, untouched by this edit
     expect(verdict).toBe("active"); // wakes on the version axis alone
 
-    // Traced through to an actual spawn decision, same as the comment-axis
-    // test above — this is not merely a predicate curiosity.
     const resourceType = createProjectResourceType(w.deps);
     const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
     expect(desired.has("ACME")).toBe(true);
@@ -342,14 +385,95 @@ describe("THE SPECIMEN'S MECHANISM, BUTCHR-227 UPDATE: F5/F6 is FIXED — this b
   });
 });
 
-describe("F7: the swallowed watermark-write failure reproduces the SAME symptom, by a DIFFERENT mechanism than F5/F6's regression", () => {
-  // Failure condition: if the watermark write rejects and the project does
-  // NOT end up "active" on the next poll, F7 is dead — the swallow would be
-  // harmless. It does not come back dead below: a write failure leaves the
-  // OLD watermark in place while a brand-new (even normal, HIGHER-id)
-  // complaint has already landed on the page — same "active" outcome as
-  // F5/F6, but the watermark here is simply stale, never regressed.
-  test("commentOnPage succeeds (id 501, perfectly monotonic) but the watermark write rejects — the .catch swallows it, and the project wakes anyway", async () => {
+describe("BUTCHR-260 — the reconcile/deletion-recovery machinery is DROPPED, not adapted: a comment deletion needs no recovery path under BUTCHR-227's seen-set", () => {
+  // WHAT USED TO LIVE HERE (BUTCHR-226 review round 1): under the
+  // pre-BUTCHR-227 scalar watermark ("newest comment id by numeric
+  // magnitude"), deleting the root doc's highest-id comment could drop the
+  // page's true max BELOW the already-stored scalar. `projectVerdict`'s
+  // exact-inequality comparison then read that stale-high watermark as
+  // "behind" forever, and the ordinary monotonic guard (raise-only) could
+  // never let `check_in` lower it back — a PERMANENT spawn loop only an
+  // explicit `patch.reconcile` escape hatch (check_in-only, bypassing the
+  // guard entirely) could clear. Three tests here proved that recovery
+  // end-to-end (two driving `advanceProjectWatermark` directly, one through
+  // the real `atlassianTools(...)` `check_in` handler).
+  //
+  // WHY THIS IS GONE (BUTCHR-260, VERIFIED rather than assumed — see
+  // `advanceProjectWatermark`'s own doc comment on `monotonicMax`,
+  // src/resources/project.ts, for the full evidence trail): BUTCHR-227
+  // replaced that scalar with `commentsSeen`, a SEEN SET compared by
+  // MEMBERSHIP, never by magnitude, unioned, never replaced, with no
+  // retention/eviction rule. There is no "newest" for a deletion to
+  // invalidate, and nothing is ever removed from the set once seen, so a
+  // deleted comment simply STAYS seen — there is no ceiling to re-lower and
+  // no recovery to perform. The two direct-`reconcile`-flag tests that used
+  // to prove the recovery are deleted outright, not adapted: the scenario
+  // they proved recoverable no longer occurs, so there is nothing left for
+  // them to characterize.
+  //
+  // STILL REQUIRED (BUTCHR-260 DoD): "check_in's real call-site wiring,
+  // driven through the real atlassianTools(...) handler, not a direct
+  // advanceProjectWatermark call" — kept below, repurposed to prove the NEW
+  // claim (no reconciliation needed) instead of the old one (reconciliation
+  // works).
+  test("check_in, driven through the REAL tool-surface handler (atlassianTools(...), not a direct advanceProjectWatermark call): a comment already checked in stays seen after it's deleted from the page — no reconciliation performed or needed, project stays asleep", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialPageVersion: 1,
+      initialComments: [{ id: "500", body: "<p>will be deleted</p>" }, { id: "100", body: "<p>survives</p>" }],
+      initialWake: { version: 1, epics: {} }, // nothing checked in yet
+    });
+    // check_in's real handler also calls `ops.search` for epics currently
+    // In Review (src/tools/defs.ts) — `world()`'s own fake leaves this
+    // `unimplemented`, since no other test in this file exercises the real
+    // check_in handler; none are in review here.
+    w.ops.search = async () => ({ issues: [] });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: two comments, neither seen yet
+
+    // The REAL tool surface, the same handler an agent's MCP call actually
+    // reaches — not a reimplementation of check_in's shape.
+    const tools = atlassianTools(w.ops, () => {});
+    await tools.check_in!.handler({}, { headers: { "x-issue": "ACME" } } as any);
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: check_in caught up on both
+
+    // The specimen this block used to need a `reconcile` escape hatch for:
+    // the comment check_in just recorded as seen is now deleted from the
+    // page entirely.
+    const idx = w.pageComments.findIndex((c) => c.id === "500");
+    w.pageComments.splice(idx, 1);
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    // THE CLAIM: still asleep, with NO reconciliation performed — "500"
+    // stays a member of `commentsSeen` forever (no retention rule), and the
+    // freshly observed set ("100" only, now) is fully contained in it.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "100"]));
+    expect(resource.unseenCommentIds).toEqual([]);
+    expect(verdict).toBe("asleep");
+
+    const resourceType = createProjectResourceType(w.deps);
+    const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
+    expect(desired.has("ACME")).toBe(false);
+  });
+});
+
+describe("F7 — BUTCHR-226 FIXED THIS (defect 1b): the swallowed watermark-write failure no longer reproduces the self-wake symptom, via the in-process pending-watermark fallback", () => {
+  // PRE-BUTCHR-226, this test proved the swallow left the project "active"
+  // forever on its own already-posted complaint (a rejected write meant the
+  // watermark simply never advanced while the page's true max moved on).
+  // BUTCHR-226's fix (`pendingWatermarkFallback`, src/resources/project.ts)
+  // does NOT make the Jira/Confluence write itself succeed — it cannot — but
+  // it remembers, in this process only, what the write was trying to
+  // record, and `loadProjects` merges that into the watermark it compares
+  // against. Updated in place — see this file's top-of-file BUTCHR-226
+  // update note.
+  //
+  // Failure condition, post-fix: this is wrong if the verdict still reads
+  // "active" after the rejected write (the fallback isn't wired into the
+  // read path) or if the WARNING log line disappeared (the failure would go
+  // back to being silent, the exact regression BUTCHR-105 already ruled
+  // against).
+  test("commentOnPage succeeds (id 501, perfectly monotonic) but the persisted watermark write rejects — the .catch still logs it, but the in-process fallback keeps the project asleep anyway", async () => {
     const w = world({
       projectKey: "ACME",
       rootDocId: "doc-1",
@@ -360,16 +484,22 @@ describe("F7: the swallowed watermark-write failure reproduces the SAME symptom,
     });
     const lines: string[] = [];
     await speakOnOwnChannel(w.ops, "ACME", "[butchr:frozen] ACME ...", (l) => lines.push(l));
+    // Both the generic advanceProjectWatermark fallback line and speakOnOwnChannel's
+    // own caller-specific line are expected — see project.ts's own doc
+    // comment on why two distinct, differently-shaped WARNING lines is the
+    // point (a reader can tell which mechanism produced a given incident).
     expect(lines.some((l) => l.includes("WARNING") && l.includes("watermark advance failed"))).toBe(true);
+    expect(lines.some((l) => l.includes("WARNING") && l.includes("[advanceProjectWatermark]") && l.includes("DEFECT 1b"))).toBe(true);
     const { verdict, resource } = await verdictOf(w.deps, "ACME");
-    // BUTCHR-227: field renames only — F7 (the silent-write-failure path)
-    // is explicitly NOT this ticket's to fix (see src/tools/speak.ts's own
-    // doc comment distinguishing "wrote a wrong value" from "failed
-    // silently"), so this test's PROPERTY is unchanged: a failed write
-    // still leaves the seen set exactly where it was.
-    expect(resource.watermark.commentsSeen).toEqual(["500"]); // never advanced
-    expect(resource.unseenCommentIds).toEqual(["501"]); // the new comment IS on the page, and is unseen
-    expect(verdict).toBe("active");
+    // The PERSISTED property was never written (the fake's setProjectProperty
+    // always rejects here) — but `resource.watermark` is what `loadProjects`
+    // hands to the predicate, and BUTCHR-226/BUTCHR-260's fallback merges the
+    // in-process pending value into it (adapted to `commentsSeen`), so the
+    // EFFECTIVE watermark the project is judged against already reflects the
+    // failed write's own intent.
+    expect(new Set(resource.watermark.commentsSeen)).toEqual(new Set(["500", "501"]));
+    expect(resource.unseenCommentIds).toEqual([]); // the new comment IS on the page, but already covered by the fallback
+    expect(verdict).toBe("asleep"); // BUTCHR-226/BUTCHR-260: no longer wakes on its own already-posted (but unpersisted) complaint
   });
 });
 

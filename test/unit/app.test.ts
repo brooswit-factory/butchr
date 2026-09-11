@@ -8,6 +8,13 @@ import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
+import type { DashboardResponse } from "../../src/agents/dashboard.js";
+
+// BUTCHR-269: a trivial, always-checked-empty fixture for every existing
+// ViewDeps literal below that predates /dashboard and isn't exercising it —
+// the real row-shape/could-not-check contract gets its own dedicated
+// describe block (and its own dedicated fixtures) further down this file.
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -42,6 +49,7 @@ const view = {
   open: async (issue: string) => { opened.push(issue); return issue === "KAN-BAD" ? { ok: false, error: "nope" } : { ok: true }; },
   openPane,
   health: () => healthy,
+  dashboard: noDashboard,
 };
 const { app, mcp } = buildApp(view);
 app.listen(0);
@@ -95,6 +103,104 @@ describe("butchr webapp + open action", () => {
   test("open decodes the issue key from the path", async () => {
     await fetch(`${base}/agents/${encodeURIComponent("KAN-9")}/open`, { method: "POST" });
     expect(opened).toContain("KAN-9");
+  });
+});
+
+// BUTCHR-269: /dashboard is a POLL-FED SNAPSHOT — the route does no I/O of
+// its own, it just returns whatever `dashboard()` currently resolves to.
+// Every test below simulates the real production shape (src/daemon/
+// index.ts's `agentStatuses` tee): a mutable `snapshot` variable that only a
+// simulated POLL (never a request) ever reassigns, with `dashboard: async
+// () => snapshot` as the ONLY thing the route touches — so "does confirmedAt
+// advance" is a direct, faithful test of the request-vs-poll distinction,
+// not an artifact of a fixture that fakes freshness some other way.
+describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request path", () => {
+  test("smoke: the shared fixture app's /dashboard reflects its dashboard() fixture verbatim", async () => {
+    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
+  });
+
+  test("a bare re-request does NOT advance confirmedAt (row-level or response-level) — only a new poll does", async () => {
+    let snapshot: DashboardResponse = {
+      checked: true,
+      confirmedAt: new Date(1000).toISOString(),
+      rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
+    };
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const first = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
+      const second = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse; // repeated request, no poll in between
+      expect(first).toEqual(second);
+      if (!first.checked || !second.checked) throw new Error("expected checked:true");
+      expect(second.rows[0]!.confirmedAt).toBe(first.rows[0]!.confirmedAt);
+      expect(second.confirmedAt).toBe(first.confirmedAt);
+
+      // Now simulate a poll: the daemon's own tee reassigns `snapshot`, never the route.
+      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
+      const third = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
+      if (!third.checked) throw new Error("expected checked:true");
+      expect(third.rows[0]!.confirmedAt).not.toBe(first.rows[0]!.confirmedAt);
+      expect(third.rows[0]!.confirmedAt).toBe(new Date(2000).toISOString());
+      expect(third.confirmedAt).not.toBe(first.confirmedAt);
+      expect(third.confirmedAt).toBe(new Date(2000).toISOString());
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("could-not-check (case 1: the agent.list() read itself fails) is distinguishable from a genuinely empty fleet — never {checked:true, rows:[]}", async () => {
+    // A genuine finding: the poll succeeded and there really are no agents.
+    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [] };
+    // A declined poll: the whole-response shape carries checked:false and a
+    // declinedAt, distinct at the type level from the empty-but-checked case
+    // above — this is the assertion that fails if the two were ever
+    // collapsed (e.g. both serializing to `{rows: []}` with `checked`
+    // dropped, or a declined poll silently reusing `checked:true`).
+    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [] };
+
+    let snapshot: DashboardResponse = genuinelyEmpty;
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const emptyBody = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
+      expect(emptyBody.checked).toBe(true);
+      expect("declinedAt" in emptyBody).toBe(false);
+
+      snapshot = declined;
+      const declinedBody = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
+      expect(declinedBody.checked).toBe(false);
+      if (declinedBody.checked) throw new Error("expected checked:false");
+      expect(declinedBody.declinedAt).toBe(new Date(5000).toISOString());
+
+      // THE DISTINCTION ITSELF: the two bodies must not be equal, and a
+      // caller doing `x.checked === true` must see them differently.
+      expect(emptyBody).not.toEqual(declinedBody);
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
+    const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
+    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow] };
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      // Simulate the poll-side decline: the caller (src/daemon/index.ts's
+      // own tee) carries `rows` forward unchanged, only flipping the
+      // top-level checked/declinedAt — this test pins that CHOICE, not just
+      // that a value exists.
+      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows };
+      const body = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
+      expect(body.checked).toBe(false);
+      expect(body.rows).toEqual([staleRow]);
+      expect(body.rows[0]!.confirmedAt).toBe(new Date(1000).toISOString()); // NOT laundered to look fresh
+    } finally {
+      app.stop();
+    }
   });
 });
 
@@ -172,6 +278,7 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => health.status(),
+      dashboard: noDashboard,
     });
     app.listen(0);
     const base = `http://localhost:${app.server!.port}`;
@@ -262,6 +369,7 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([pollHealth, notifyHealth]),
+      dashboard: noDashboard,
     });
     app.listen(0);
     const base = `http://localhost:${app.server!.port}`;
@@ -367,6 +475,7 @@ describe("/health carries build identity as a sibling of components, never insid
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], build),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -396,6 +505,7 @@ describe("/health carries build identity as a sibling of components, never insid
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -430,6 +540,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -464,6 +575,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, coverage.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -485,6 +597,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -516,13 +629,14 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
     app.listen(0);
     try {
       const res = await fetch(`http://localhost:${app.server!.port}/health`);
       const body = (await res.json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: 3 });
+      expect(body.admission).toEqual({ cap: 8, residency: 3, longestWait: null });
       // Never folded into components[] — components stays exactly the liveness list.
       expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
       expect(body.components.some((c) => "cap" in c || "residency" in c)).toBe(false);
@@ -545,12 +659,13 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
     app.listen(0);
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: null });
+      expect(body.admission).toEqual({ cap: 8, residency: null, longestWait: null });
     } finally {
       health.stop();
       await mcp.closeAll();
@@ -567,6 +682,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
+      dashboard: noDashboard,
       health: () => combineHealth([health]),
     });
     app.listen(0);

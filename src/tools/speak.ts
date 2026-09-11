@@ -114,7 +114,7 @@ export async function speakOnOwnChannel(
     const doc = await projectRootDoc(ops, callerKey);
     const created = (await ops.commentOnPage(doc.id, `<p>${escapeStorageText(taggedText)}</p>`)) as { id?: string } | undefined;
     if (created?.id) {
-      await advanceProjectWatermark(ops, callerKey, { seenComments: [created.id] }).catch((e) =>
+      await advanceProjectWatermark(ops, callerKey, { seenComments: [created.id] }, log).catch((e) =>
         log(`  WARNING: [speakOnOwnChannel] self-wake watermark advance failed for ${callerKey} (comment ${created.id}): ${(e as Error)?.message ?? e} — comment posted; project may nudge itself on it next poll`),
       );
     }
