@@ -109,6 +109,37 @@ import { unseenIds } from "../resources/project.js";
  * `herd.stop()` route. This module only ever answers "is this id asleep, and
  * has anything happened it has not seen" — it carries no pane, no herd, no
  * Jira write of its own beyond the audible complaints above.
+ *
+ * THE WAKE PREDICATE'S INPUTS, STATED EXPLICITLY (PR #322 review round 1 —
+ * the ground rule the bug below violated): every fact `unseenFor`/`wake` are
+ * ever fed, and every `NotifyReason` `createIssueEventRules`'s `finalize()`
+ * gate (src/resources/issue.ts) classifies as "structural, always wakes",
+ * MUST be a fact this poll actually OBSERVED FROM JIRA about the ticket
+ * itself — a status, a label, a summary, a comment id genuinely present on
+ * the ticket right now. It must NEVER be a fact about this loop's OWN
+ * bookkeeping, however real that fact is: whether a ticket currently
+ * appears in some intermediate collection the loop builds along the way is
+ * not evidence about the world, because that collection's own membership
+ * can depend on sleep state itself — feed a wake decision from it and the
+ * mechanism can end up citing itself as the reason to wake.
+ *
+ * MEASURED, NOT HYPOTHETICAL: `runResourceLoop`'s related-ticket fetch
+ * (src/daemon/loop.ts) used to be called with `desired.keys()` ALONE —
+ * `desiredFrom` correctly drops an asleep id, so that call silently also
+ * stopped asking about a sleeping boss's own watched tickets, which then
+ * vanished from the related snapshot with NO Jira write behind it at all.
+ * `changedKeys`' own "disappeared from the feed" rule (src/jira-watch/diff.ts)
+ * reported that as a change, and a bare disappearance is exactly the shape
+ * `finalize()` classifies as structural — so a stood-down boss woke itself,
+ * unconditionally, on the very next poll, every time, for any boss with a
+ * worker. Reproduced against BUTCHR-307's own PR #322 head
+ * (c2226edccfb6eed5380be1576c108e08127a6052) before being fixed: the fix is
+ * `runResourceLoop` unioning `atRest` into that same call (an asleep id is
+ * still fully eligible to keep watching its related chain — nothing about
+ * being asleep changes WHAT it watches, only whether it currently has an
+ * agent), not anything in this module. The rule above is what that fix is
+ * an instance of, stated once so the next feed-membership artefact is
+ * recognized before it ships, not after a live measurement finds it.
  */
 
 /** Marker every yield-loop complaint this module writes starts with — distinct from crash-loop.ts's `[butchr:crashloop]`, a different fault with a different remedy. */
@@ -175,8 +206,11 @@ export interface StandDownRegistry {
    * `consumeCrashLoopExemptions`), and logs a greppable, reason-tagged line.
    * `reason: "edge"` additionally counts toward the yield-loop window and
    * may post an audible `[butchr:yieldloop]` complaint; `reason: "bound"`
-   * never does (a lost-wake rescue is not a loop symptom). No-op beyond the
-   * log line if `id` was not asleep. Never throws.
+   * never does (a lost-wake rescue is not a loop symptom). A FULL no-op —
+   * not even the log line — if `id` was not asleep. Never throws: every
+   * Jira read/write this can reach (the yield-loop complaint's own
+   * `comments()`/`addComment()` calls) is caught and logged, never
+   * propagated — see `postYieldLoopComplaint`'s own comments.
    */
   wake(id: string, reason: WakeReason): Promise<void>;
   /**
@@ -250,7 +284,24 @@ export function createStandDownRegistry(deps: StandDownDeps): StandDownRegistry 
       }
       return;
     }
-    await deps.addComment(id, yieldLoopComment(id, count, deps.yieldLoopWindowMinutes));
+    // BUTCHR-307 REVIEW FIX (PR #322 round 1): `wake` documents "Never
+    // throws" (StandDownRegistry's own doc comment) — a REAL Jira write can
+    // reject, and an unguarded `await` here would otherwise propagate
+    // straight through `wake` -> `finalize` -> `decide`, which
+    // `runResourceLoop`'s notify stage (src/daemon/loop.ts) catches by
+    // logging once and abandoning the REST of that poll's deliveries
+    // entirely (that stage's own comment: the diff is gone forever once a
+    // pass fails) — every OTHER ticket's nudge in the same pass would be
+    // silently dropped over one failed comment write. Same fail-and-retry
+    // discipline the `comments()` fetch above already has: caught, logged,
+    // and neither the rate cap nor the "already spoken" latch is recorded,
+    // so a later wake gets a genuine retry rather than a silently lost one.
+    try {
+      await deps.addComment(id, yieldLoopComment(id, count, deps.yieldLoopWindowMinutes));
+    } catch (e) {
+      log(`WARNING: [yieldloop] addComment failed for ${id}: ${(e as Error)?.message ?? e}`);
+      return;
+    }
     rateCap.record(id, deps.now());
     yieldCappedLogged.delete(id);
     yieldSpoken.add(id);

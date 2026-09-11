@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { createIssueEventRules, createIssueResourceType, ISSUE_ACTIVATION } from "../../src/resources/issue.js";
+import { createIssueEventRules, createIssueResourceType, ISSUE_ACTIVATION, ISSUE_JQL } from "../../src/resources/issue.js";
 import { createStandDownRegistry } from "../../src/agents/stand-down.js";
 import { createCrashLoopDetector } from "../../src/agents/crash-loop.js";
-import { desiredFrom, atRestFrom } from "../../src/daemon/loop.js";
+import { desiredFrom, atRestFrom, runResourceLoop } from "../../src/daemon/loop.js";
 import { mapAgentStatus } from "../../src/labels/plan.js";
 import { StalledTracker } from "../../src/agents/stalled.js";
-import type { JiraIssue } from "../../src/atlassian/types.js";
+import type { JiraIssue, IssueLink } from "../../src/atlassian/types.js";
 import type { RelatedResource } from "../../src/resources/types.js";
 
 const MIN = 60_000;
@@ -247,6 +247,176 @@ describe("BUTCHR-307: reconcile level — asleep is excluded from `desired` but 
     await resourceType.discovery.search();
     expect(sd.isAsleep("KAN-1")).toBe(false);
     expect(sd.hasBaseline("KAN-1", "KAN-1")).toBe(false);
+  });
+});
+
+describe("BUTCHR-307 REVIEW FIX (PR #322 round 1): a stood-down boss must not wake itself on the very next poll from zero Jira activity", () => {
+  // Failure condition, reproduced against the pre-fix code before writing
+  // this test: `discovery.related()` was called with `[...desired.keys()]`
+  // alone. `desiredFrom` correctly drops an asleep boss, so the very next
+  // poll's `related()` call never even asks for the boss's own links —
+  // its worker vanishes from `next.related` with NOTHING having changed in
+  // Jira. `changedKeys`' own "disappeared from the feed" tail then reports
+  // the worker as changed, `watchersOf` falls back to `prev.related` (which
+  // still names the sleeping boss as watcher), and `finalize` classifies a
+  // bare disappearance as structural -> wakes unconditionally. This test
+  // drives the REAL per-poll sequence a production loop actually runs —
+  // search() -> desiredFrom -> related(...) -> eventRules.poll(prev, next)
+  // -> decide() -> the notify stage's own watcher-fallback logic — never a
+  // hand-built related snapshot (see this file's earlier DoD-3(a)/(b)/(f)
+  // blocks, which hand-construct `{ primary, related }` on both sides of
+  // `poll()` and therefore cannot reach this bug at all: production
+  // recomputes `related` fresh, from `desired`, every poll).
+  const BOSS = "KAN-1";
+  const WORKER = "KAN-901";
+
+  function bossWorkerWorld(sd: ReturnType<typeof createStandDownRegistry>) {
+    const boss = issue({ key: BOSS });
+    const worker = issue({ key: WORKER, updated: "2026-01-01T00:00:00.000Z" });
+    // Only the boss (KAN-1) is "assigned to me" (ISSUE_JQL); the worker is
+    // reached only via the boss's own outward Implements link — the SAME
+    // two-call shape createRelated (src/resources/issue.ts) actually makes:
+    // `deps.links(activeKey)` to find linked keys, then `deps.search("key IN (...)")`
+    // to hydrate them.
+    const linksOf = new Map<string, IssueLink[]>([[BOSS, [{ type: "Implements", otherEnd: "outward", key: WORKER }]]]);
+    const resourceType = createIssueResourceType({
+      search: async (jql: string) => {
+        if (jql === ISSUE_JQL) return [boss];
+        return jql.includes(WORKER) ? [worker] : [];
+      },
+      links: async (key: string) => linksOf.get(key) ?? [],
+      standDown: sd,
+    });
+    return { resourceType, worker };
+  }
+
+  /** Minimal `Herd` fake, same shape test/unit/loop.test.ts's own `fakeHerd` uses — kept local rather than imported so this file has no cross-test-file coupling. */
+  function fakeHerd(initial: string[] = []) {
+    const running = new Set(initial);
+    return {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(sp: { key: string }) { running.add(sp.key); },
+      async stop(i: string) { running.delete(i); },
+      async paneFor(i: string) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+  }
+
+  test("REGRESSION, driven through the REAL runResourceLoop (src/daemon/loop.ts) end to end — not a hand-rolled snapshot, not this file's own reimplementation of the fix: a stood-down boss is never nudged about its own worker across a poll where nothing in Jira changed", async () => {
+    const sd = newRegistry();
+    const { resourceType } = bossWorkerWorld(sd);
+    const herd = fakeHerd([BOSS]); // the boss's pane is already open, same as any live agent mid-wait
+    const notified: string[] = [];
+    const stop = runResourceLoop(resourceType, {
+      herd,
+      ownsId: () => true,
+      notify: (issueKey, about) => { notified.push(`${issueKey}<-${about}`); },
+      intervalMs: 15,
+    });
+    try {
+      // A few polls with the boss AWAKE — let the baseline (first-sighting
+      // "appeared") noise settle before the thing under test happens.
+      await new Promise((r) => setTimeout(r, 50));
+      notified.length = 0;
+
+      // The boss's own last act, between polls — exactly like the real
+      // `stand_down` tool handler, which calls this same registry method.
+      sd.standDown(BOSS, new Map([[BOSS, []], [WORKER, []]]));
+
+      // Several more REAL polls, boss asleep, nothing in Jira ever changes.
+      await new Promise((r) => setTimeout(r, 80));
+    } finally {
+      stop();
+    }
+    // THE BUG this pins: pre-fix, the very next poll nudges the boss about
+    // its own worker ("KAN-1<-KAN-901") purely because the boss's own sleep
+    // shrank the related feed — with zero Jira activity behind it.
+    expect(notified).toEqual([]);
+    expect(sd.isAsleep(BOSS)).toBe(true);
+  });
+
+  /**
+   * One production poll's worth of discovery, for the two tests below —
+   * SECONDARY characterization, not a substitute for the `runResourceLoop`
+   * test above: this still calls the REAL `discovery.search`/`discovery.related`/
+   * `eventRules.poll` (never a hand-built related snapshot), but the id set
+   * handed to `related()` is computed inline here rather than by actually
+   * calling `runResourceLoop`, so a regression to the WIRING itself (as
+   * opposed to the union formula) would not be caught by these two — only
+   * by the loop-driven test above, which is why that one exists first.
+   */
+  async function pollOnce(resourceType: ReturnType<typeof createIssueResourceType>) {
+    const issues = await resourceType.discovery.search();
+    const desired = desiredFrom(issues, resourceType);
+    const atRest = atRestFrom(issues, resourceType);
+    const related = await resourceType.discovery.related!([...new Set([...desired.keys(), ...atRest])]);
+    return { issues, related, desired, atRest };
+  }
+
+  test("characterization: a stood-down boss stays asleep across a poll where nothing in Jira changed — the related feed keeps naming its worker", async () => {
+    const sd = newRegistry();
+    const { resourceType, worker } = bossWorkerWorld(sd);
+
+    // Poll 1: boss is awake and active — establishes a baseline `related` snapshot with the worker present, watcher = boss.
+    const poll1 = await pollOnce(resourceType);
+    expect(poll1.desired.has(BOSS)).toBe(true);
+    expect(poll1.related.find((r) => r.issue.key === WORKER)?.watchers).toEqual([BOSS]);
+
+    // The boss stands down between poll 1 and poll 2 — e.g. it reported to
+    // its boss and called stand_down as its last act. Nothing in Jira moves.
+    sd.standDown(BOSS, new Map([[BOSS, []], [WORKER, []]]));
+
+    // Poll 2: boss now reads "asleep". THE FIX under test: `related()` must
+    // still be asked about the boss (via `atRest`), so its worker does not
+    // vanish from the feed purely because the boss went to sleep.
+    const poll2 = await pollOnce(resourceType);
+    expect(poll2.desired.has(BOSS)).toBe(false); // correctly excluded — not re-spawned
+    expect(poll2.atRest.has(BOSS)).toBe(true);
+    expect(poll2.related.find((r) => r.issue.key === WORKER)?.watchers).toEqual([BOSS]); // THE FIX: still present, not dropped
+
+    const rules = createIssueEventRules({ standDown: sd });
+    const evPoll = await rules.poll(
+      { primary: poll1.issues, related: poll1.related },
+      { primary: poll2.issues, related: poll2.related },
+    );
+    // Nothing about the worker actually changed (same `updated`, same
+    // status/labels/summary) — it must not appear as changed at all, let
+    // alone as "disappeared".
+    expect(evPoll.changedRelated).toEqual([]);
+    expect(sd.isAsleep(BOSS)).toBe(true); // still asleep — the bug this test pins would have woken it here
+    void worker;
+  });
+
+  test("CONTRAST: a worker that genuinely reaches Done (a real status change) still wakes its stood-down boss — the fix must not make disappearance inert", async () => {
+    const sd = newRegistry();
+    const { resourceType } = bossWorkerWorld(sd);
+    const poll1 = await pollOnce(resourceType);
+    sd.standDown(BOSS, new Map([[BOSS, []], [WORKER, []]]));
+
+    // Simulate the worker genuinely reaching Done between poll 1 and poll 2 —
+    // still returned by the `key IN (...)` search (real Jira does this too:
+    // that query is never filtered by status), but with a real field change.
+    const resourceType2 = createIssueResourceType({
+      search: async (jql: string) => {
+        if (jql === ISSUE_JQL) return [issue({ key: BOSS })];
+        return jql.includes(WORKER) ? [issue({ key: WORKER, status: "Done", updated: "2026-01-01T00:10:00.000Z" })] : [];
+      },
+      links: async (key: string) => (key === BOSS ? [{ type: "Implements", otherEnd: "outward", key: WORKER }] : []),
+      standDown: sd,
+    });
+    const poll2 = await pollOnce(resourceType2);
+    expect(poll2.related.find((r) => r.issue.key === WORKER)?.watchers).toEqual([BOSS]); // still watched, not dropped
+
+    const rules = createIssueEventRules({ standDown: sd });
+    const evPoll = await rules.poll(
+      { primary: poll1.issues, related: poll1.related },
+      { primary: poll2.issues, related: poll2.related },
+    );
+    expect(evPoll.changedRelated).toEqual([WORKER]);
+    const verdict = await evPoll.decide(WORKER, BOSS, "related");
+    expect(verdict.deliver).toBe(true); // a REAL event — must still wake the boss
+    expect(sd.isAsleep(BOSS)).toBe(false);
   });
 });
 

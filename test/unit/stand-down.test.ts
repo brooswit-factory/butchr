@@ -280,6 +280,35 @@ describe("createStandDownRegistry: the yield loop — edge wakes of the same id,
     expect(posted).toEqual([]);
     expect(logs.some((l) => l.startsWith("WARNING: [yieldloop]") && l.includes("comments fetch failed"))).toBe(true);
   });
+
+  test("PR #322 review round 1: a rejected addComment() is caught, not propagated — wake() must NEVER throw (a real Jira write can fail, and an unguarded rejection here would abandon the rest of that poll's notify deliveries in runResourceLoop)", async () => {
+    let now = 0;
+    let shouldFail = true;
+    let posted = 0;
+    const logs: string[] = [];
+    const reg = createStandDownRegistry({
+      now: () => now,
+      maxSleepMinutes: 60,
+      yieldLoopCount: 1,
+      yieldLoopWindowMinutes: 5,
+      addComment: async () => { if (shouldFail) throw new Error("Jira 503"); posted++; },
+      comments: async () => [],
+      log: (l) => logs.push(l),
+    });
+    reg.standDown("KAN-1", new Map());
+    await expect(reg.wake("KAN-1", "edge")).resolves.toBeUndefined(); // does not throw
+    expect(posted).toBe(0);
+    expect(logs.some((l) => l.startsWith("WARNING: [yieldloop]") && l.includes("addComment failed"))).toBe(true);
+
+    // Neither the rate cap nor the "already spoken" latch was recorded for
+    // the failed attempt — a later wake on the SAME registry gets a genuine
+    // retry, and this time the write succeeds.
+    shouldFail = false;
+    now = 1 * MIN;
+    reg.standDown("KAN-1", new Map());
+    await reg.wake("KAN-1", "edge");
+    expect(posted).toBe(1);
+  });
 });
 
 describe("createStandDownRegistry: forgetMissing — bounds memory to currently-active issues", () => {

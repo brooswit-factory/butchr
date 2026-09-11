@@ -440,6 +440,24 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // wake anything. A watcher with NO recorded baseline for `key` (e.g.
       // a worker created after `watcher` stood down — `hasBaseline` false)
       // fails TOWARD waking rather than silently swallowing a ticket the
+      //
+      // APPEARED/DISAPPEARED IS STRUCTURAL FOR A DIFFERENT REASON THAN THE
+      // OTHER FOUR, AND IT MATTERS (PR #322 review round 1): status/label/
+      // pr/summary are safe here because stand_down's own writes cannot
+      // produce them. `appeared`/`disappeared` is safe ONLY because
+      // `runResourceLoop`'s own related-ticket fetch (src/daemon/loop.ts)
+      // is fed `desired.keys()` UNIONED WITH `atRest` — an asleep watcher's
+      // own related chain keeps being walked, so a sleeping watcher's
+      // worker never spuriously vanishes from the snapshot purely because
+      // the watcher itself went to sleep. Get that union wrong (as this
+      // ticket's own PR did on its first head) and appeared/disappeared
+      // stops being structural in the sense this gate needs — it becomes a
+      // FEED-MEMBERSHIP ARTEFACT of the watcher's own sleep state, which is
+      // exactly the class of input `stand-down.ts`'s own top comment now
+      // names as forbidden. This gate has no way to detect that on its own;
+      // it trusts its caller (`runResourceLoop`) to hand it a `related`
+      // snapshot that only ever reflects Jira, never the loop's own
+      // bookkeeping — see that fix's own comment for the measurement.
       // stand-down snapshot never covered.
       const finalize = async (key: string, watcher: string, verdict: EventVerdict): Promise<EventVerdict> => {
         if (!verdict.deliver) return verdict;
