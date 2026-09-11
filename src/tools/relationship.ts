@@ -1033,10 +1033,34 @@ async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boo
  * `not-staffed`. `observedLabel` in the result is always the REAL value read,
  * never a literal — absent only when no `agent:*` label was found at all.
  */
-function staffingFromAgentLabel(observedLabel: string | undefined, withheldMarker: boolean): { staffing: StaffingVerdict; observedLabel?: string } {
+export function staffingFromAgentLabel(observedLabel: string | undefined, withheldMarker: boolean): { staffing: StaffingVerdict; observedLabel?: string } {
   if (observedLabel === undefined) return { staffing: "could-not-look" };
   if (observedLabel !== `${AGENT_PREFIX}none`) return { staffing: "staffed", observedLabel };
   return { staffing: withheldMarker ? "withheld" : "not-staffed", observedLabel };
+}
+
+/**
+ * BUTCHR-353: `staffingFromAgentLabel` above, fed from a plain labels array
+ * instead of a raw Jira issue payload — the shape the stall remediator's own
+ * `labels` dep returns (see StallRemediationDeps there), so that module
+ * never has to know Jira's raw `fields.labels` shape at all, matching every
+ * other dependency it already takes as pre-parsed. Composes the SAME two
+ * reads `checkWorker`'s label branch performs (find the `agent:*` value,
+ * check for the `admission:withheld` marker) through the SAME rule — never
+ * a second, independently-drifting version of either.
+ *
+ * Exported and reused because the stall remediator has NO live probe of a
+ * worker's agent to defer to (workers are staffed by role, never the same
+ * account as their boss — a probe wired there would be structurally blind,
+ * see that module's own doc comment) — it is always on this same label
+ * path, so this is the exact rule that governs it, not a fresh
+ * "marker present -> waiting" read that would reopen BUTCHR-352 review round
+ * 2's mistake (a marker overriding a live observation) in prose form.
+ */
+export function staffingFromWorkerLabels(labels: readonly string[]): { staffing: StaffingVerdict; observedLabel?: string } {
+  const observedLabel = labels.find((l) => l.startsWith(AGENT_PREFIX));
+  const withheldMarker = labels.includes(`${ADMISSION_PREFIX}withheld`);
+  return staffingFromAgentLabel(observedLabel, withheldMarker);
 }
 
 export async function checkWorker(

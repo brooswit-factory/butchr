@@ -466,6 +466,18 @@ const stallRemediation = createStallRemediator({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   quotaBlocked: quotaGate.isBlocked,
+  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
+  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
+  // never a herd/live probe: a boss's worker is staffed under a different
+  // Atlassian account than the boss (this fleet's own tier->account split),
+  // so a probe wired here would be structurally blind to every worker it
+  // could ever be asked about (three independent live confirmations, all
+  // probeOutOfScope:true — see this ticket's own PR body) — the label path
+  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
+  // doc comment argues (src/tools/relationship.ts). Paid at most once per
+  // non-Done worker, only on the one poll that is actually about to post a
+  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
+  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —

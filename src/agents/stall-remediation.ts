@@ -1,4 +1,5 @@
 import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-helper.js";
+import { staffingFromWorkerLabels, ASK_MARKER } from "../tools/relationship.js";
 
 /**
  * BUTCHR-221/BUTCHR-210 — the missing half of the stall deadlock-breaker.
@@ -54,6 +55,23 @@ import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-help
  * This does NOT weaken the ledger (untouched) — it sequences the caller so
  * the write this module makes is never a candidate for being folded into
  * another write's read-back in the first place.
+ *
+ * BUTCHR-353 — THE WAKE PROSE GETS A THIRD BRANCH: the two paragraphs above
+ * are about WHEN this module speaks; this addendum is about WHAT it says.
+ * Until this ticket, `wakeComment` below modelled only *done* and *stuck*,
+ * and offered exactly two pieces of advice (close/transition the ticket, or
+ * act on it now) — both actively harmful to a THIRD state this module had no
+ * vocabulary for: a boss correctly waiting on one of its own workers (a
+ * worker withheld at the fleet-wide admission cap, one sitting In Review
+ * awaiting this ticket's own review, or one that asked this ticket a
+ * question with no reply yet). `gatherWorkerSignals` below reads the stalled
+ * ticket's own non-Done workers (free — `WorkerLink`, from data
+ * src/labels/sync.ts already fetched this poll — plus, ONLY on the one poll
+ * that is actually about to post, one label read and one comment read per
+ * non-Done worker) and reuses BUTCHR-352's own label-path rule
+ * (`staffingFromWorkerLabels`, src/tools/relationship.ts) rather than
+ * inventing a second "marker means waiting" test — see that function's own
+ * doc comment for why a probe was deliberately NOT added here instead.
  */
 
 export const MARKER = "[butchr:stall]";
@@ -146,13 +164,73 @@ export class StallRemediationTracker {
  * proven together — this fix is scoped to THIS module's own call site only;
  * escalation-helper.ts and every other detector are untouched.
  */
-function wakeComment(issue: string, elapsedMinutes: number): string {
+/**
+ * BUTCHR-353: what `gatherWorkerSignals` found among a stalled ticket's own
+ * NON-DONE workers — three independent, non-exclusive observations (a given
+ * poll can have any combination, including none). Every array holds worker
+ * KEYS only, in the order `workers` was given; empty, never absent, so a
+ * caller can test "any signal at all" with one `hasAnySignal` call instead
+ * of three separate undefined-checks.
+ */
+interface WorkerSignals {
+  /** Non-Done workers whose own `[ask]`-tagged comment (identity-tagged with THAT worker's own key) has no later reply tagged with THIS ticket's own key — see `gatherWorkerSignals` for the exact rule and its stated failure mode. */
+  unansweredAsks: readonly string[];
+  /** Non-Done workers currently `status === "In Review"` — (B2), free from `WorkerLink.status` alone, no labels read needed. */
+  inReview: readonly string[];
+  /** Non-Done, non-In-Review workers BUTCHR-352's own label-path rule (`staffingFromWorkerLabels`) confidently reads as `withheld` — never a stale or stranded marker (see that function's own doc comment: `could-not-look` and a stale non-`agent:none` label both fall through to nothing here, never a guessed "waiting"). */
+  withheldAtCap: readonly string[];
+}
+
+const NO_SIGNALS: WorkerSignals = { unansweredAsks: [], inReview: [], withheldAtCap: [] };
+
+function hasAnySignal(s: WorkerSignals): boolean {
+  return s.unansweredAsks.length > 0 || s.inReview.length > 0 || s.withheldAtCap.length > 0;
+}
+
+/** Today's original wake advice — UNCHANGED, byte-for-byte, from before this ticket: the branch for a stall with none of BUTCHR-353's new signals (DoD: "a stall with none of these conditions still produces today's wake, unchanged"). Pinned by test/unit/stall-remediation.test.ts. */
+const DEFAULT_TAIL = "This comment exists to wake this ticket's agent. If it is genuinely done, close or transition this ticket so agent:stalled clears. If it is stuck, act on this ticket now.";
+
+/**
+ * BUTCHR-353's new branch: built ONLY when `hasAnySignal` is true. Starts
+ * with its OWN distinct tag (`[butchr:stall:waiting]`, never confused with
+ * `DEFAULT_TAIL`'s plain prose by a reader skimming the comment, or by a
+ * test asserting which shape a body is — see this ticket's own "keep
+ * discontinuities legible" requirement) and DELIBERATELY never contains the
+ * words "close or transition" or "act on this ticket now" as advice —
+ * BUTCHR-207's own measurement is that both are actively harmful to a
+ * ticket that is correctly waiting: closing/transitioning cancels a queued
+ * spawn or abandons a live review hop, and "act now" means re-asserting a
+ * disposition that is already correct. One physical line (house rule:
+ * fields before free text, a multi-line value stays on one line) — clauses
+ * joined with spaces, never embedded newlines, so `findMarked`'s own
+ * marker-at-body-start check and this module's fingerprint delimiter are
+ * both unaffected by which branch fired.
+ */
+function correctlyWaitingTail(s: WorkerSignals): string {
+  const clauses: string[] = [];
+  if (s.unansweredAsks.length) {
+    clauses.push(`${s.unansweredAsks.join(", ")} asked you something (an [ask] comment on its own ticket) that has no reply from you yet — answer it there with tell_worker, that is what it is waiting on.`);
+  }
+  if (s.inReview.length) {
+    clauses.push(`${s.inReview.join(", ")} is In Review, waiting on your own review of it — that review is what to act on, not this ticket.`);
+  }
+  if (s.withheldAtCap.length) {
+    clauses.push(`${s.withheldAtCap.join(", ")} is withheld at the fleet-wide admission cap (admission:withheld) and will be admitted when a slot frees — nothing to do but wait.`);
+  }
+  return (
+    `[butchr:stall:waiting] This looks like correct waiting, not done or stuck, based on your own worker(s): ${clauses.join(" ")} ` +
+    "Do not close or transition this ticket over this, and there is nothing to re-assert — a disposition that is already correct only gets withheld again. " +
+    "Saying what you are waiting on (this comment counts) is what actually clears agent:stalled; if none of the above is what you are ACTUALLY waiting on, say so and act."
+  );
+}
+
+function wakeComment(issue: string, elapsedMinutes: number, signals: WorkerSignals = NO_SIGNALS): string {
   return [
     `${MARKER} ${issue} has read agent:stalled, continuously, for ${elapsedMinutes} minute(s): idle or done since it last stopped working, with no non-daemon-chatter comment landing during that streak.`,
     "",
     `fingerprint: ${issue}`,
     "",
-    "This comment exists to wake this ticket's agent. If it is genuinely done, close or transition this ticket so agent:stalled clears. If it is stuck, act on this ticket now.",
+    hasAnySignal(signals) ? correctlyWaitingTail(signals) : DEFAULT_TAIL,
   ].join("\n");
 }
 
@@ -195,12 +273,50 @@ export type StallOutcome =
   | { kind: "failed"; issue: string; error: string }
   | { kind: "not-a-candidate"; issue: string };
 
+/**
+ * BUTCHR-353: one of a stalled ticket's own workers, as read off the SAME
+ * search payload src/labels/sync.ts already fetches this poll to drive
+ * everything else it does (`JiraIssue.issuelinks`, src/atlassian/client.ts's
+ * `search()` — its `fields` param always includes `issuelinks`, and
+ * `parseIssueLinks` hydrates each stub's `status`) — filtered to `Implements`
+ * / `otherEnd: "outward"`, i.e. the stalled ticket's own children. ZERO extra
+ * Jira calls to build this: it is a re-shaping of data sync.ts already has in
+ * hand for the SAME issue this poll, not a second read. `status` is
+ * `undefined` only when Jira's stub genuinely didn't hydrate it — treated the
+ * same as "unknown", never "Done" (see `gatherWorkerSignals`'s own doc
+ * comment for how that absence is handled).
+ */
+export interface WorkerLink {
+  key: string;
+  status?: string;
+}
+
 export interface StallRemediationDeps {
   now: () => number;
   /** Post through the daemon's single existing comment-writing seam for an issue — src/daemon/index.ts wires `ops.addComment` (the same seam parked.ts uses): syncLabels's stall path only ever targets an issue key (the project loop never wires syncLabels), so speakOnOwnChannel's project routing is not needed here. Never a second Atlassian writer. */
   addComment: (issue: string, text: string) => Promise<void>;
-  /** Recent comments on the ticket, newest-first is fine — used for the dedupe/adoption check (see findMarked). */
+  /** Recent comments on the ticket, newest-first is fine — used for the dedupe/adoption check (see findMarked). Also reused, unchanged, against a stalled ticket's own WORKER keys (see `gatherWorkerSignals`) to find an unanswered `[ask]` — the SAME reader, never a second one, since both are "recent comments on some issue key", not two different facts. */
   comments: (issue: string) => Promise<readonly CommentRow[]>;
+  /**
+   * BUTCHR-353: a worker's own labels — used ONLY for a stalled ticket's
+   * non-Done workers (see `gatherWorkerSignals`), to determine "withheld at
+   * the admission cap" via BUTCHR-352's own LABEL-path rule
+   * (`staffingFromWorkerLabels`, src/tools/relationship.ts). OPTIONAL:
+   * omitted disables the "correctly waiting on admission" branch only — the
+   * ask/In-Review branches (which don't need labels) still work, and every
+   * existing caller/fixture that doesn't supply it is unaffected, same
+   * convention as `quotaBlocked` above. Deliberately NOT a herd/live probe:
+   * a boss's worker is staffed under a DIFFERENT account than the boss (by
+   * this fleet's own tier->account split), so a probe wired here would be
+   * structurally blind to every worker it could ever be asked about — see
+   * `staffingFromAgentLabel`'s own doc comment (relationship.ts) for why
+   * that makes the label path, not a probe, the only honest source here.
+   * Paid at most once per non-Done worker, and ONLY on the poll that is
+   * actually about to compose a wake comment (after the adoption/rate-cap
+   * gate below) — never on a steady-state "already remediated" poll, and
+   * never for a Done worker.
+   */
+  labels?: (key: string) => Promise<readonly string[]>;
   /**
    * BUTCHR-221 criterion 10 (2026-09-02's first-phase becalming: panes
    * parked at a Claude session-limit refusal). OPTIONAL — omitted disables
@@ -242,10 +358,121 @@ export interface StallRemediator {
    * floor when null/omitted (stalled.ts's optional accessor, or a fresh
    * StalledTracker post-restart with no entry yet) — still honest, just a
    * smaller number, never fabricated upward. Never throws.
+   *
+   * `workers` (BUTCHR-353), when supplied, is the stalled ticket's OWN
+   * workers (src/labels/sync.ts passes `issue.issuelinks` filtered to
+   * outward `Implements` links — zero extra Jira calls, see `WorkerLink`'s
+   * own doc comment) — used to decide whether this wake should name a
+   * "correctly waiting" state (a worker withheld at the admission cap, or
+   * In Review awaiting this ticket's own review) or an unanswered `[ask]`
+   * from one of them, INSTEAD of the harmful default advice to close,
+   * transition, or "act now". Omitted or empty falls back to exactly
+   * today's wake text, unchanged (see `gatherWorkerSignals`'s own doc
+   * comment for the full rule and its cost).
    */
-  check: (issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null) => Promise<StallOutcome>;
+  check: (issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[]) => Promise<StallOutcome>;
   /** Forget tracking for a ticket leaving the active/candidate set (mirrors StalledCheck.forget's call sites in src/labels/sync.ts). */
   forget: (issue: string) => void;
+}
+
+/**
+ * BUTCHR-353: turns a stalled ticket's own `workers` into `WorkerSignals`.
+ * Called at most once per stalled EPISODE (see the one call site's own
+ * comment) — never per poll — so its cost is paid once, not repeatedly.
+ *
+ * SCOPE, PER WORKER: a Done worker is excluded from every check below —
+ * finished work has nothing left to wait on, mirroring `openWorkers`'s own
+ * non-Done filter (src/tools/relationship.ts) for the SAME reason. Every
+ * other (non-Done) worker is checked for an unanswered `[ask]` regardless of
+ * its own status; withheld-at-cap is checked ONLY when the worker is not
+ * already In Review — status (read fresh this poll, off `WorkerLink`) is a
+ * live observation and outranks a possibly-stale `admission:withheld`
+ * marker sitting on a ticket that has since moved past admission entirely,
+ * the same "a live read outranks a label" discipline `checkWorker` itself
+ * applies (relationship.ts).
+ *
+ * COST BOUND, STATED (per this ticket's own requirement): for N non-Done
+ * workers, at most N `deps.comments` calls (the ask check, every non-Done
+ * worker) plus at most N `deps.labels` calls (the withheld check, only the
+ * non-In-Review subset) — i.e. at most 2N extra Jira reads, bounded by the
+ * stalled ticket's own child count (this fleet's admission cap already
+ * bounds how many agents — hence how many live worker tickets — can exist
+ * fleet-wide at once; no separate artificial cap is added here, matching
+ * `openWorkers`'s own already-accepted unbounded-by-worker-count cost
+ * profile). Neither dep is required: `labels` omitted simply never finds a
+ * withheld worker (the ask/In-Review checks are unaffected); `workers`
+ * omitted or empty short-circuits to zero calls and `NO_SIGNALS`.
+ *
+ * UNKNOWN NEVER BECOMES A CONFIDENT CLAIM (this ticket's central
+ * requirement): a `deps.labels`/`deps.comments` rejection for a given
+ * worker is caught, logged, and that worker is simply DROPPED from every
+ * signal for this poll — never defaulted into "withheld" or "unanswered".
+ * The worst case is under-reporting (falls through toward `NO_SIGNALS`,
+ * i.e. today's existing wake text) rather than a false "you are correctly
+ * waiting" — the asymmetry this whole ticket exists to enforce.
+ *
+ * THE ASK RULE, STATED: the newest comment on a worker's own ticket that
+ * starts with `[<workerKey>] [ask]` (askBoss's own identity-tag + ASK_MARKER
+ * shape, relationship.ts) is "answered" if any comment ABOVE it (more
+ * recent, since `comments` is newest-first) starts with `[<stalledKey>] `
+ * (tellWorker's own identity-tag shape) — a reply from THIS boss,
+ * specifically. FAILURE MODE 1, STATED (per this ticket's own requirement): a
+ * worker that itself moves past its own question without this boss ever
+ * replying (e.g. it found another way forward) still reads as "unanswered"
+ * here — a false positive. Accepted deliberately: naming a stale question is
+ * redundant at worst, never the harmful direction (a false "you are done or
+ * stuck" or a false "you are correctly waiting") this ticket exists to stop.
+ *
+ * FAILURE MODE 2, STATED (found at review — an undisclosed blind window a
+ * green suite cannot see): `deps.comments` is wired to `AtlassianClient.
+ * comments()` (src/atlassian/client.ts), whose `maxResults` DEFAULTS to 20
+ * and is never overridden on this path (src/daemon/index.ts's wiring) — so
+ * this only ever sees a worker's 20 NEWEST comments, never the full history.
+ * An `[ask]` sitting behind 20 more recent comments on a busy worker ticket
+ * is INVISIBLE here: `askIdx` never finds it, and the wake silently falls
+ * back to today's default text — the exact founding shape scope (C) was
+ * built to catch (BUTCHR-316/BUTCHR-341), missed by this same rule, if the
+ * ask is old enough. STILL THE SAFE DIRECTION (under-reporting, never a
+ * false "correctly waiting") — DELIBERATELY NOT FIXED HERE: raising
+ * `maxResults`, paging, or adding a second read would disturb the cost bound
+ * this module states and pins elsewhere, which is out of scope for what
+ * found this. A reader debugging "the wake didn't name an ask I know is
+ * there" should check the worker ticket's own comment count FIRST, against
+ * this 20-comment window, before suspecting the rule above.
+ */
+async function gatherWorkerSignals(deps: StallRemediationDeps, stalledKey: string, workers: readonly WorkerLink[] | undefined, log: (line: string) => void): Promise<WorkerSignals> {
+  const nonDone = (workers ?? []).filter((w) => w.status !== "Done");
+  if (nonDone.length === 0) return NO_SIGNALS;
+
+  const unansweredAsks: string[] = [];
+  const inReview: string[] = [];
+  const withheldAtCap: string[] = [];
+
+  for (const w of nonDone) {
+    if (w.status === "In Review") inReview.push(w.key);
+
+    const rows = await deps.comments(w.key).catch((err) => {
+      log(`WARNING: [stall] ${stalledKey}: comments fetch failed for its own worker ${w.key} while composing a wake comment: ${(err as Error)?.message ?? err} — not claiming an ask either way`);
+      return null;
+    });
+    if (rows) {
+      const askIdx = rows.findIndex((r) => r.body.startsWith(`[${w.key}] ${ASK_MARKER}`));
+      if (askIdx !== -1) {
+        const answered = rows.slice(0, askIdx).some((r) => r.body.startsWith(`[${stalledKey}] `));
+        if (!answered) unansweredAsks.push(w.key);
+      }
+    }
+
+    if (w.status !== "In Review" && deps.labels) {
+      const labels = await deps.labels(w.key).catch((err) => {
+        log(`WARNING: [stall] ${stalledKey}: labels fetch failed for its own worker ${w.key} while composing a wake comment: ${(err as Error)?.message ?? err} — not claiming withheld`);
+        return null;
+      });
+      if (labels && staffingFromWorkerLabels(labels).staffing === "withheld") withheldAtCap.push(w.key);
+    }
+  }
+
+  return { unansweredAsks, inReview, withheldAtCap };
 }
 
 /**
@@ -275,7 +502,7 @@ export function createStallRemediator(deps: StallRemediationDeps): StallRemediat
   const quotaLogged = new Set<string>();
   const log = (line: string) => deps.log?.(line);
 
-  async function check(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null): Promise<StallOutcome> {
+  async function check(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[]): Promise<StallOutcome> {
     try {
       if (!labelApplied) {
         // Reset on any poll where the label is not applied — whether that's
@@ -367,8 +594,16 @@ export function createStallRemediator(deps: StallRemediationDeps): StallRemediat
         return { kind: "suppressed", issue, reason: `rate cap reached (${MAX_PER_HOUR}/hour)` };
       }
 
+      // BUTCHR-353: paid ONLY here — past every earlier short-circuit
+      // (already-remediated, quota-blocked, adopted-existing, rate-capped)
+      // — so worker reads happen at most ONCE per stalled episode, on
+      // exactly the poll that is about to actually post, never on every
+      // poll of a becalming (see gatherWorkerSignals's own doc comment for
+      // the per-call bound).
+      const signals = await gatherWorkerSignals(deps, issue, workers, log);
+
       try {
-        await deps.addComment(issue, wakeComment(issue, elapsedMinutes));
+        await deps.addComment(issue, wakeComment(issue, elapsedMinutes, signals));
       } catch (err) {
         const message = (err as Error)?.message ?? String(err);
         // Fail LOUDLY: no state recorded that would make the next poll
