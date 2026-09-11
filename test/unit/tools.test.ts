@@ -1364,7 +1364,16 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
   test("get_doc() resolves to the PROJECT's root doc, not an ensureDoc-created page", async () => {
     const { tools, conn } = projectRig();
     const result = await tools.get_doc!.handler({}, conn);
-    expect(result).toEqual({ found: true, id: "1", url: expect.any(String), title: "BUTCHR — product brief", body: "<p>hi</p>" });
+    expect(result).toEqual({
+      found: true,
+      complete: true,
+      id: "1",
+      url: expect.any(String),
+      title: "BUTCHR — product brief",
+      version: null,
+      size: { chars: 9, bytes: 9 },
+      body: "<p>hi</p>",
+    });
   });
 
   test("set_doc() replaces the PROJECT's root doc, title optional, and returns a bounded receipt — never the body (BUTCHR-236)", async () => {
