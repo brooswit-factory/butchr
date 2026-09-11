@@ -1,7 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
@@ -90,6 +90,29 @@ function requireProjectCaller(
   const who = requireCaller(c, verb);
   if (!isProjectId(who)) {
     throw new Error(`${verb}: refusing an issue caller — ${why}`);
+  }
+  return who;
+}
+
+/**
+ * BUTCHR-307: the mirror image of `requireProjectCaller` just above, first
+ * needed for `stand_down` — a verb that ONLY makes sense for an ISSUE
+ * caller (the project tier's own sleep/wake signal is `check_in`, a
+ * durable state comparison; see src/agents/stand-down.ts's own top comment
+ * for why the issue tier's mechanism is a different registry entirely, not
+ * a relaxation of `check_in`'s own project-only contract). Same shape,
+ * same verb-specific `why` passed in rather than hardcoded, same reasoning:
+ * refusing here, in words, is cheaper than a project caller discovering
+ * this verb silently does nothing for it.
+ */
+function requireIssueCaller(
+  c: { headers: Record<string, string> },
+  verb: string,
+  why: string,
+): string {
+  const who = requireCaller(c, verb);
+  if (isProjectId(who)) {
+    throw new Error(`${verb}: refusing a project caller — ${why}`);
   }
   return who;
 }
@@ -186,6 +209,21 @@ export function atlassianTools(
    * (reaped by `checkFrozenAsleep`, not exited promptly).
    */
   declareCheckInDone?: (key: string) => void,
+  /**
+   * BUTCHR-307: `stand_down`'s own effect — called from that handler below
+   * with the caller's own key and the seen-comment-id snapshot (own ticket
+   * plus every current worker's) it just read, AFTER every read that
+   * snapshot depends on has resolved without throwing. The daemon composes
+   * this from TWO registries (src/agents/stand-down.ts's own sleep/wake
+   * registry, and a second, issue-tier instance of
+   * src/agents/check-in-exit.ts's generic `CheckInExitRegistry` — see that
+   * module's own top comment for why pane release is a separate signal from
+   * sleep itself) rather than this tool layer knowing either one exists.
+   * Optional — every existing caller of `atlassianTools` keeps working
+   * unchanged; when omitted, `stand_down` still reads and returns its
+   * snapshot, it just never actually sleeps or releases its pane.
+   */
+  standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -780,6 +818,32 @@ export function atlassianTools(
         // that module's own doc comment for the full mechanism this feeds.
         declareCheckInDone?.(who);
         return { ok: true, key: who, version: version ?? null, seenComments, epics };
+      },
+    },
+    stand_down: {
+      description:
+        'ISSUE CALLER ONLY (refuses a project caller — a project already has `check_in` for this same last-act purpose; use that instead). Your LAST ACT before your session ends, when the next thing that can happen is an event you cannot cause yourself: releases your pane and stops you from occupying an admission-cap slot while you wait. NOT a self-exit — do not try to end your own session, and this does not transition your ticket\'s status at all; the daemon closes your pane FOR you, through its existing stop route, once this call lands. TAKES NO ARGUMENTS: the only state this can ever act on is the caller\'s own, so there is nothing to get wrong — same reasoning as check_in/submit_to_boss/report_to_boss. ' +
+        'It re-reads, directly from Jira, the current comment ids on your own ticket and on every ticket you currently have a worker on, and records that as what you have already seen. A LATER comment appearing on any of those tickets that is not in that recorded set wakes you again; a status change, a daemon label transition (this includes a pr:* review-state transition), or a summary edit on any watched ticket ALWAYS wakes you, unconditionally, regardless of the seen-set — those are never something your own last-act comments (report_to_boss/tell_worker) can produce, so there is nothing for them to hide behind. ' +
+        'A missed or wrongly-suppressed edge is BOUNDED, not silent forever: you will be forced awake again after a maximum sleep duration even if nothing new ever arrives — if you see yourself woken with nothing apparently new, that bound is very likely why, and it means an edge was probably missed, not that anything is wrong with your ticket. ' +
+        '**Call this ONLY after you have actually acted on everything you can currently see — exactly like check_in, calling this before you have handled something you already know about is the one way to make this fail silently:** that event is folded into "already seen" the moment you call this, and will not wake you on its own. ' +
+        'On waking, you are a FRESH session with no memory of this one — re-read your own ticket AND every worker\'s ticket, because the reason you woke is not guaranteed to reach you as a message: the channel push this fires only lands on a currently-connected session, and you were not one. Never call this on behalf of another issue — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
+      input: {},
+      handler: async (_a, c) => {
+        const who = requireIssueCaller(c, "stand_down", "a project already has `check_in` for this same last-act purpose — use that instead; an issue's sleep/wake mechanism (BUTCHR-307) is a separate, in-memory registry from check_in's durable watermark");
+        const issue = await ops.getIssue(who);
+        const keys = [who, ...findWorkers(issue).map((w) => w.key)];
+        const seen = new Map<string, readonly string[]>();
+        for (const key of keys) {
+          const comments = await ops.getIssueComments(key);
+          seen.set(key, comments.results.map((r) => r.id));
+        }
+        audit(c, `stand_down (watching ${keys.length} ticket${keys.length === 1 ? "" : "s"}: ${keys.join(", ")})`);
+        // BUTCHR-307: declared only after every read above has resolved
+        // without throwing — see standDown's own doc comment (this
+        // function's parameter list) for why the daemon composes this from
+        // two registries rather than this handler knowing either exists.
+        standDown?.(who, seen);
+        return { ok: true, key: who, asleep: true, watching: keys };
       },
     },
     get_doc_comments: {

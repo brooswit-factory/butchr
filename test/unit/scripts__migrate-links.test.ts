@@ -275,7 +275,7 @@ describe("summarize / formatTable", () => {
 });
 
 function fakeConfig(): Config {
-  return { atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" }, port: 7717, stalledMinutes: 10, parkedMinutes: 10, abandonedMinutes: 30, atRestMinutes: 10, crashLoopCount: 5, crashLoopWindowMinutes: 60, unresponsiveMinutes: 5, idleDialogMinutes: 2, pollStaleMs: 60_000, assignees: {}, captureDir: "/tmp/captures", projectAllowlist: [], maxAgents: 8 };
+  return { atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" }, port: 7717, stalledMinutes: 10, parkedMinutes: 10, abandonedMinutes: 30, atRestMinutes: 10, crashLoopCount: 5, crashLoopWindowMinutes: 60, standDownMaxSleepMinutes: 60, yieldLoopCount: 5, yieldLoopWindowMinutes: 5, unresponsiveMinutes: 5, idleDialogMinutes: 2, pollStaleMs: 60_000, assignees: {}, captureDir: "/tmp/captures", projectAllowlist: [], maxAgents: 8 };
 }
 
 describe("fetchAllIssues", () => {

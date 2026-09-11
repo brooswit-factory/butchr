@@ -519,8 +519,22 @@ export const projectIdOf = (p: ProjectResource): string => p.key;
 
 const EMPTY_WATERMARK: ProjectWatermark = { version: null, commentsSeen: [], epicsSeen: {} };
 
-/** Set membership only — no ordering, no magnitude, no `Number()` (BUTCHR-227's hard rule). Exported for this module's own reuse between `projectVerdict`, `loadProjects`' unseen-field computation, and their tests; not part of this module's public API surface (not re-exported from an index). */
-function unseenIds(observed: readonly string[], seen: readonly string[]): readonly string[] {
+/**
+ * Set membership only — no ordering, no magnitude, no `Number()` (BUTCHR-227's
+ * hard rule). Used within this module by `projectVerdict` and `loadProjects`'
+ * unseen-field computation, and their tests.
+ *
+ * BUTCHR-307: also exported for reuse by the issue tier's stand-down
+ * registry (src/agents/stand-down.ts), which needs the exact same
+ * seen-comment-id comparison for its own self-wake hazard — per the owning
+ * epic's explicit instruction, that registry imports this function rather
+ * than re-implementing the rule: two independent implementations of one
+ * comparison rule drift, and the one that drifts silently is the one that
+ * decides whether an agent exists. Still not part of a public barrel/index
+ * (this codebase has none) — every caller, in or out of this module, imports
+ * it directly from this file.
+ */
+export function unseenIds(observed: readonly string[], seen: readonly string[]): readonly string[] {
   if (observed.length === 0) return observed;
   const seenSet = new Set(seen);
   return observed.filter((id) => !seenSet.has(id));
