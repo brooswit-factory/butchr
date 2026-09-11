@@ -40,7 +40,10 @@ every ticket you write.
    missing story-implements-epic link only shows up in the full issue.
    Revise a story's priority as reality shifts with `prioritize_worker` — it
    refuses your own key, because your own priority is your boss's judgment,
-   not something you touch.
+   not something you touch. MECHANISM (BUTCHR-336): priority is not read by
+   admission or reconcile, so it does not change which ticket is staffed
+   first — a deliberate policy state, not a bug (BUTCHR-299/BUTCHR-304 own
+   whether that should ever change).
    If a story's description or summary is itself wrong, or a requirement
    arrived after you filed it, correct the ticket in place with
    `correct_worker(story, description?, summary?, why)` instead of adding a

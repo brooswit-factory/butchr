@@ -2384,3 +2384,20 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
     expect(pageComments.length).toBe(1);
   });
 });
+
+// BUTCHR-336: backstop for the MECHANISM sentence — a lightweight guard so
+// deleting the sentence from a tool description also fails something, not
+// just the reader's trust. The REAL pin is the ordering behaviour itself,
+// in test/unit/admission.test.ts's "priority is not an admission-order
+// input" describe block; this only proves the boss-facing prose is present,
+// not that the mechanism it describes is true.
+describe("BUTCHR-336: every boss-facing priority surface states the admission mechanism", () => {
+  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+
+  test("prioritize_worker, new_worker, file_where_it_belongs, jira_create_issue and jira_set_priority all carry the mechanism sentence", () => {
+    const { tools } = rig();
+    for (const name of ["prioritize_worker", "new_worker", "file_where_it_belongs", "jira_create_issue", "jira_set_priority"] as const) {
+      expect(tools[name]!.description).toContain(MECHANISM_CLAUSE);
+    }
+  });
+});

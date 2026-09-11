@@ -53,7 +53,10 @@ happens.
    never decided from a link, since none exists.
    Revise an epic's priority as reality shifts with `prioritize_worker` —
    it refuses your own key ({{KEY}} has no priority you set on yourself
-   this way) exactly like it refuses every other boss's own key.
+   this way) exactly like it refuses every other boss's own key. MECHANISM
+   (BUTCHR-336): priority is not read by admission or reconcile, so it does
+   not change which ticket is staffed first — a deliberate policy state,
+   not a bug (BUTCHR-299/BUTCHR-304 own whether that should ever change).
    If an epic's description or summary is itself wrong, or a requirement
    arrived after you filed it, correct it in place with
    `correct_worker(epic, description?, summary?, why)` instead of adding a

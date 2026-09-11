@@ -59,6 +59,53 @@ describe("orderByWait (pure, BUTCHR-297)", () => {
   });
 });
 
+// BUTCHR-336: the executable half of the MECHANISM sentence duplicated
+// across src/tools/defs.ts (prioritize_worker, new_worker,
+// file_where_it_belongs, jira_create_issue, jira_set_priority) and
+// briefs/{story,epic,project}.md — "priority is not read by admission or
+// reconcile, so it does not change which ticket is staffed first." At this
+// commit `orderByWait`/`admit()` take bare ticket keys (`readonly
+// string[]`); there is no priority field to vary, so this does NOT assert
+// "order is unchanged when only priority differs" (not expressible here) —
+// it asserts the STRONGER, executable claim that (wait DESC, key ASC) is
+// the WHOLE order, full stop, for a fixture chosen so ANY plausible
+// priority scheme (a tie-break below aging, a weight added to the aging
+// term, or a strict override) would reorder it and fail one of these
+// tests. THIS FAILING IS THE INTENDED BEHAVIOUR THE DAY PRIORITY BECOMES AN
+// ORDERING INPUT — it forces whoever makes that change to update the
+// MECHANISM sentence in the same change, at every location listed above.
+// Do not "fix" this test by deleting it or loosening the fixture; if
+// priority genuinely becomes an input, update the sentence AND this test
+// together.
+describe("BUTCHR-336 — priority is not an admission-order input (pin)", () => {
+  // Fixture per the ticket's own instruction: equal waits, and the
+  // lexicographically-LATER key is the one a reader would call "higher
+  // priority" (BUTCHR-URGENT). A fixture where key order and "priority"
+  // order already agree would pin nothing — this one doesn't.
+  test("orderByWait: equal waits keep key-ascending order even when the later key reads as higher priority", () => {
+    expect(orderByWait(["BUTCHR-URGENT", "BUTCHR-LOW"], new Map())).toEqual(["BUTCHR-LOW", "BUTCHR-URGENT"]);
+  });
+
+  test("orderByWait: accumulated wait still beats a 'higher priority' key at every nonzero wait value", () => {
+    const waits = new Map([["BUTCHR-LOW", 3], ["BUTCHR-URGENT", 1]]);
+    // BUTCHR-LOW has waited longer — it goes first regardless of which key
+    // a priority scheme would call "urgent".
+    expect(orderByWait(["BUTCHR-URGENT", "BUTCHR-LOW"], waits)).toEqual(["BUTCHR-LOW", "BUTCHR-URGENT"]);
+  });
+
+  test("admit(): end-to-end order through the real controller follows (wait DESC, key ASC) only, never a 'higher priority' key", async () => {
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => [] });
+    // Poll 1: equal wait (0) — key-ascending admits BUTCHR-LOW despite the
+    // other candidate's name reading as "urgent".
+    expect(await ctrl.admit(["BUTCHR-URGENT", "BUTCHR-LOW"], [])).toEqual(["BUTCHR-LOW"]);
+    // Poll 2: BUTCHR-URGENT was withheld last poll (wait=1) and now
+    // outranks BUTCHR-LOW (wait=0) on ACCUMULATED WAIT — the only thing
+    // that ever reorders a candidate here, never anything resembling
+    // priority.
+    expect(await ctrl.admit(["BUTCHR-URGENT", "BUTCHR-LOW"], [])).toEqual(["BUTCHR-URGENT"]);
+  });
+});
+
 describe("ImplausibleZeroGuard", () => {
   test("stays untrusted (true) for maxPolls consecutive records, then flips to accept (false) and resets", () => {
     const g = new ImplausibleZeroGuard(3);
