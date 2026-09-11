@@ -61,8 +61,8 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       if (!page) throw new Error(`fake world: no such page ${p.id}`);
       page.body = p.body;
       if (p.title) page.title = p.title;
-      page.version += 1;
-      return { ok: true };
+      page.version++;
+      return { ok: true, version: page.version };
     },
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
@@ -405,11 +405,11 @@ describe("docs.ts: the provisional body's ASSIST pointer", () => {
 // fresh per-ticket page, already has a real title from provisioning).
 // ---------------------------------------------------------------------------
 describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Contract 1)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>, id: string, title: string, body: string) {
+  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
     // A project's root doc is provisioned AHEAD OF TIME (BUTCHR-62's doc: six
     // product projects + ASSIST already carry one) — seeded directly here,
     // never via ensureDoc, matching that reality.
-    pages.set(id, { parentId: "", title, body, labels: [] });
+    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
   }
 
   test("resolves the project's root doc via the EXISTING entity-property reader — same shape ensureDoc already reads, no second reader", async () => {
