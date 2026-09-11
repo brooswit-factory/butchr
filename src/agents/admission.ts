@@ -219,6 +219,44 @@
 export const MAX_IMPLAUSIBLE_POLLS = 4;
 
 /**
+ * BUTCHR-320 criterion (D) — a LEGIBLE DISCONTINUITY against TWO prior
+ * formats, both still `[admission]`-tagged and both guarded on
+ * `withheld > 0` (never fired at `withheld = 0`):
+ *
+ *   Format 1 (the build in production as of BUTCHR-320's own writing,
+ *   `0fa49429`): `[admission] cap=13 residency=13 withheld 2/2 wanted:
+ *   BUTCHR-307, BUTCHR-308` — a bare comma-separated id list.
+ *
+ *   Format 2 (main since BUTCHR-297's aging merge, and this file's own emit
+ *   immediately below before this ticket): `[admission] cap=13 residency=13
+ *   withheld 2/2 wanted: BUTCHR-307(4), BUTCHR-308(2)` — each id carries a
+ *   `(count)` wait suffix.
+ *
+ * Once (B) makes the line fire on `withheld = 0` polls too, a before/after
+ * comparison spanning this deploy would show an apparent RISE in admissions
+ * that is purely the instrument gaining sight of polls it could not observe
+ * before — indistinguishable from a real change unless the reader can tell,
+ * from the line's own shape, which instrument produced it. A DISTINCT TAG
+ * (not a version marker appended to the same `[admission]` tag) was chosen
+ * deliberately: `startsWith("[admission]")` — the exact test both
+ * `admission.test.ts` and any external reader would reach for first — must
+ * never accidentally match the new line, and a trailing marker (e.g.
+ * `[admission] v2 ...`) still starts with the literal substring
+ * `"[admission]"` only if a space follows immediately after "admission",
+ * which it does NOT here (`[admission] v2` has `[admission]` as an exact
+ * prefix) — a hazard a same-tag marker cannot help but risk. A wholly
+ * different tag has no such trap. THIS IS NOT BACKWARD COMPATIBILITY (the
+ * ticket's own words): the old tag is retired outright, not kept parseable
+ * alongside the new one — see `test/unit/admission.test.ts`'s six-direction
+ * discontinuity test for the mechanical proof against both prior formats.
+ *
+ * BEFORE/AFTER COMPARISONS OF ADMISSIONS ACROSS THIS CHANGE MUST BE
+ * RE-BASELINED — restated here because this is the module that changed, not
+ * only on the ticket's own doc.
+ */
+export const ADMISSION2_TAG = "[admission2]";
+
+/**
  * BUTCHR-297 (§B2): how many `admit()` calls (counted across BOTH tiers
  * sharing this one controller instance — see this file's own top-comment
  * addendum for why a call, not a poll of either tier alone, is the unit) a
@@ -360,6 +398,26 @@ export function orderByWait(candidates: readonly string[], waits: ReadonlyMap<st
   });
 }
 
+/**
+ * BUTCHR-320 (B/D): the self-describing admission line, built once here so
+ * `admit()`'s one call site and any test constructing an expected sample
+ * (see the discontinuity test) share the exact same formatting — never two
+ * independent string templates that could drift. Fires unconditionally
+ * whenever the caller reaches it (i.e. `candidates.length > 0` — the
+ * `candidates.length === 0` short-circuit in `admit()` never calls this at
+ * all, and that silence is documented at that call site, not here). Carries
+ * `admittedCount` even when it's 0 (a fully-saturated poll) and the withheld
+ * id list only when there's something withheld — `withheld 0/N` with no
+ * trailing `wanted:` clause is exactly as parseable as the withheld-nonzero
+ * case, just shorter.
+ */
+export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>): string {
+  const base = `${ADMISSION2_TAG} cap=${cap} residency=${residency} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
+  if (withheld.length === 0) return base;
+  const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
+  return `${base} wanted: ${withheldDesc}`;
+}
+
 /** Builds the shared, fleet-wide admission controller wired into BOTH `runResourceLoop` call sites (src/daemon/index.ts) via `ReconcileOptions.admission` (src/daemon/loop.ts). */
 export function createAdmissionController(deps: AdmissionControllerDeps): AdmissionController {
   const log = (line: string) => deps.log?.(line);
@@ -459,15 +517,16 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       }
     }
     lastWithheld = withheld;
-    if (withheld.length > 0) {
-      // §E: each withheld candidate's CURRENT wait count, not just its id —
-      // this is the legibility the epic accepted losing determinism-from-
-      // the-key-alone for. The existing tokens (`cap=`, `residency=`,
-      // `withheld N/M wanted:`) are unchanged and still parseable; only the
-      // trailing id list gained a `(count)` suffix per id.
-      const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
-      log(`[admission] cap=${deps.cap} residency=${observed} withheld ${withheld.length}/${candidates.length} wanted: ${withheldDesc}`);
-    }
+    // BUTCHR-320 (B/D): fires on EVERY poll that reaches this point — i.e.
+    // every poll with at least one candidate, including `withheld = 0` —
+    // unlike the old `[admission]` line this replaces, which only ever fired
+    // behind `withheld.length > 0` (confirmed at this commit: any admissions
+    // total summed from the old line was a floor, never a count, biased low
+    // by exactly the polls where spawning proceeded freely). Carries the
+    // ADMITTED count too, not only withheld — see `ADMISSION2_TAG`'s own doc
+    // comment for why the tag itself changed (criterion D) rather than
+    // reusing `[admission]` with a wider firing condition.
+    log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits));
     return admitted;
   }
 

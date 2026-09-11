@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrError } from "@brooswit/herdr-sdk";
-import { HerdrHerd, agentNameFor, issueOfAgentName, PANE_BUSY_MAX_RETRIES } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, issueOfAgentName, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
+import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 
 /** One foreground process, as herdr's `pane.process_info` reports it. */
 interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
@@ -145,6 +146,136 @@ describe("spawn failure", () => {
     const herd = new HerdrHerd(f as any, "http://x/mcp");
     await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
     expect(closed).toEqual(["wX:p1"]);
+  });
+});
+
+// BUTCHR-320 (A): one SPAWN_TAG outcome line per spawn attempt — success,
+// failure, or the no-op early return — all from this one place. Falsifier 1
+// (mutation test): deleting any one of the three `this.log?.(...)` calls in
+// `HerdrHerd.spawn()` must fail exactly the corresponding test below BY NAME
+// — verified by hand while writing this ticket's PR (see its own body for
+// which test failed for which deleted line), not merely asserted here.
+describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
+  test("success line names the issue and the pane it started on, written only after verifyKickoff — not right after agent.start", async () => {
+    const lines: string[] = [];
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant, (l) => lines.push(l));
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-7 succeeded — pane w9:p1`]);
+  });
+
+  test("failure line names the issue and the rejection's own message, from the SAME tag as success", async () => {
+    const lines: string[] = [];
+    const f = {
+      agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+      pane: { close: async () => {} },
+    };
+    const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-9 failed — boom`]);
+  });
+
+  // A failure is logged whatever the complaint/latch state (hard constraint
+  // on the ticket) — this method never consults reconcile-failure.ts's
+  // ReconcileFailureTracker.isSpoken latch at all, so there is nothing here
+  // that COULD gate this line on it; this test pins that by simply repeating
+  // the same failure twice and expecting two identical lines, exactly what a
+  // latched complaint tracker would NOT produce for its own comment.
+  test("a failure is logged every time it recurs — never latched, unlike the reconcile-failure complaint", async () => {
+    const lines: string[] = [];
+    const f = {
+      agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+      pane: { close: async () => {} },
+    };
+    const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(lines.filter((l) => l === `${SPAWN_TAG} KAN-9 failed — boom`).length).toBe(2);
+  });
+
+  // THE TRAP: an issue that already has a live agent attempts nothing — not
+  // a success, not a failure. It gets its own third outcome under the same
+  // tag rather than silence, so (A)'s total can still be reconciled against
+  // (B)'s admitted count (see admission.test.ts's cross-instrument check).
+  test("the no-op early return (already running) logs a THIRD outcome, never 'succeeded'", async () => {
+    const lines: string[] = [];
+    const f2 = fakeHerdr([{ name: "butchr-kan-7", pane_id: "w1:p1" }]);
+    const herd = new HerdrHerd(f2.client, "u", instant, (l) => lines.push(l));
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-7 noop — already has a live agent`]);
+  });
+
+  test("omitting the log dependency entirely is a no-op — every existing caller/test before this ticket is unaffected", async () => {
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant); // no 4th arg
+    await expect(herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null })).resolves.toBeUndefined();
+  });
+});
+
+// BUTCHR-320 falsifier 2 — CROSS-INSTRUMENT CONSISTENCY: for the same poll,
+// the number of attempts derivable from (A)'s SPAWN_TAG must equal the
+// admitted count from (B)'s ADMISSION2_TAG line — independent emissions of
+// the same fact, run here through the REAL reconcileNow + a REAL
+// createAdmissionController + a REAL HerdrHerd (never the plain `Herd` test
+// fakes elsewhere in this codebase, which never emit either line at all).
+describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same poll", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+
+  test("ordinary case (no race): one success + one failure — attempts(2) == admitted(2)", async () => {
+    const spawnLines: string[] = [];
+    const admissionLines: string[] = [];
+    const client = {
+      agent: {
+        list: async () => ({ agents: [] }), // never running — no residency race in this test
+        start: async (p: any) => { if (p.name === "butchr-kan-3") throw new Error("boom"); },
+      },
+      pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
+      workspace: { create: async (p: any) => ({ root_pane: { pane_id: `pane-${p.label}` } }) },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => spawnLines.push(l));
+    const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
+    const desired = new Map([["KAN-2", spec("KAN-2")], ["KAN-3", spec("KAN-3")]]);
+    await reconcileNow(herd, desired, { admission: admission.admit, onAdmitted: admission.recordSpawned });
+
+    expect(spawnLines.filter((l) => l.startsWith(SPAWN_TAG)).length).toBe(2); // 1 success + 1 failure, 0 noop
+    const admissionLine = admissionLines.find((l) => l.startsWith(ADMISSION2_TAG))!;
+    expect(admissionLine).toContain("admitted=2");
+  });
+
+  // THE TRAP, exercised end to end: `reconcileNow`'s own `running` snapshot
+  // and `admission`'s own `residency()` read both see KAN-1 as NOT running
+  // (agent.list() calls 1-2), but by the time `herd.spawn()` makes its own
+  // fresh `byIssue()` read (agent.list() call 3), a concurrent respawn
+  // elsewhere has registered it — the exact TOCTOU gap `spawn()`'s own doc
+  // comment names. (A)'s total must include the noop as an ATTEMPT for the
+  // arithmetic to close: attempts(1 noop) == admitted(1).
+  test("the no-op race: attempts(1 noop) == admitted(1) — the reconciliation rule for THE TRAP", async () => {
+    const spawnLines: string[] = [];
+    const admissionLines: string[] = [];
+    let calls = 0;
+    const client = {
+      agent: {
+        list: async () => {
+          calls++;
+          return calls <= 2 ? { agents: [] } : { agents: [{ name: "butchr-kan-1", pane_id: "raced-in-pane" }] };
+        },
+        start: async () => {},
+      },
+      pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
+      workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => spawnLines.push(l));
+    const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
+    const desired = new Map([["KAN-1", spec("KAN-1")]]);
+    await reconcileNow(herd, desired, { admission: admission.admit, onAdmitted: admission.recordSpawned });
+
+    const attempts = spawnLines.filter((l) => l.startsWith(SPAWN_TAG));
+    expect(attempts).toEqual([`${SPAWN_TAG} KAN-1 noop — already has a live agent`]);
+    const admissionLine = admissionLines.find((l) => l.startsWith(ADMISSION2_TAG))!;
+    expect(admissionLine).toContain("admitted=1");
+    expect(attempts.length).toBe(1); // reconciliation rule: attempts (success+failure+noop) == admitted, here 1 == 1
   });
 });
 

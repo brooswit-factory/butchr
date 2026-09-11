@@ -129,6 +129,15 @@ export const PANE_READY_WAIT_MS = 200;
  */
 export const PANE_BUSY_MAX_RETRIES = 4;
 
+/**
+ * BUTCHR-320: the single tag every spawn-attempt outcome line is emitted
+ * under, whatever the outcome — success, failure, or the no-op early return
+ * (see `spawn()`'s own doc comment for why all three share it). A window's
+ * spawn attempt count is `count of lines under this tag`, with no
+ * reconstruction from any other signal.
+ */
+export const SPAWN_TAG = "[spawn]";
+
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   constructor(
@@ -137,6 +146,15 @@ export class HerdrHerd implements Herd {
     private readonly mcpUrl: string,
     /** Injectable wait, for tests. */
     private readonly wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    /**
+     * BUTCHR-320: emits exactly one `SPAWN_TAG` outcome line per `spawn()`
+     * call — see that method's own doc comment. Optional, following this
+     * codebase's existing `log?: (line: string) => void` convention (e.g.
+     * `AdmissionControllerDeps`, `ReconcileFailureDetectorDeps`); omitted,
+     * spawn attempts are simply never logged (every caller/test before this
+     * ticket).
+     */
+    private readonly log?: (line: string) => void,
   ) {}
 
   private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
@@ -180,37 +198,96 @@ export class HerdrHerd implements Herd {
     return out;
   }
 
+  /**
+   * BUTCHR-320 — one `SPAWN_TAG` outcome line per attempt, whatever the
+   * outcome, from THIS one place (the design note on the ticket: the pane id
+   * is known only here, and both the ordinary spawn loop and the respawn
+   * loop in `reconcileNow` call this same method, so a single emit here
+   * covers both by construction).
+   *
+   * THREE OUTCOMES, not two — the no-op early return below (an issue that
+   * already has a live agent) is neither a success nor a failure: it
+   * attempted nothing. Logging it as a success would inflate the attempt
+   * count against (B)'s admitted count for no real work done; logging
+   * nothing would make (A)'s total legitimately fall short of (B)'s whenever
+   * this races (see below) — so it gets its OWN outcome, "noop", under the
+   * SAME tag, and the cross-instrument check (falsifier 2) counts all three
+   * outcomes as "attempts". Re-derived at this commit: BUTCHR-287's own
+   * residency guard (residency-guard.ts) filters an already-resident
+   * candidate out of `plan.spawn` BEFORE admission — but it consults a
+   * DIFFERENT signal (a live process in the issue's own workspace directory)
+   * than this check (`byIssue()`, i.e. `agent.list()`), and `plan.spawn`
+   * itself is computed from an `agent.list()` snapshot taken once at the top
+   * of `reconcileNow` — so a TOCTOU gap between that snapshot and this
+   * method's own fresh `byIssue()` read (e.g. a concurrent respawn of the
+   * same issue elsewhere) can still reach this early return. Neither guard
+   * makes it unreachable; both are independent lines of defense.
+   *
+   * "SUCCESS" MEANS SUCCESS, not "attempted": the success line is written
+   * only at the very end, after `verifyKickoff` — never right after
+   * `agent.start` resolves. `agent.start` resolving only means herdr
+   * accepted the start call; it is not proof a claude process is actually
+   * alive (that is exactly why `PANE_READY_WAIT_MS`/`agent_pane_busy`
+   * retries and `verifyKickoff`'s own wait-then-check exist at all).
+   * `verifyKickoff` is the point where this method has actually waited
+   * `KICKOFF_VERIFY_MS` and inspected the agent's real status — either the
+   * kickoff already landed (status moved off idle/done: a genuinely running
+   * turn) or a best-effort recovery nudge was sent. That is the strongest
+   * confirmation this call chain affords, so the success line's wording
+   * claims exactly that ("spawned", not "kickoff confirmed running") and no
+   * more.
+   *
+   * FAILURE IS LOGGED WHATEVER THE COMPLAINT/LATCH STATE (hard constraint on
+   * the ticket): this method's own `log` call is the ONLY place a failure is
+   * recorded to the journal, entirely independent of
+   * `reconcile-failure.ts`'s `ReconcileFailureTracker.isSpoken` latch (that
+   * latch only ever gates whether a JIRA COMMENT is posted — see that
+   * module's own doc comment, confirmed at this commit: `check()` calls
+   * `isSpoken` before its own "not yet posting" log line, so a latched
+   * episode produces no journal line there at all). This method never
+   * consults that latch, so a failure is logged here every single time,
+   * complaint-latched or not.
+   */
   async spawn(spec: SpawnSpec): Promise<void> {
     const issue = spec.key;
-    if ((await this.byIssue()).has(issue)) return;
-    // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
-    // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
-    // which cascades into the brief.
-    const dir = buildWorkspace(spec, this.mcpUrl);
-    // herdr needs a pane: create a workspace WITH that cwd, start the agent in
-    // its root pane, with the model for this issue type.
-    const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
-    const rp = (created as { root_pane?: unknown }).root_pane;
-    const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
-    if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
-    const name = nameFor(issue);
+    if ((await this.byIssue()).has(issue)) {
+      this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent`);
+      return;
+    }
     try {
-      await this.startWithReadinessRetry({
-        pane_id: paneId,
-        name,
-        kind: "claude",
-        // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
-        // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
-        // single source the staleness check compares a restored pane against.
-        args: spawnArgs(spec, dir),
-      } as Parameters<HerdrClient["agent"]["start"]>[0]);
+      // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
+      // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
+      // which cascades into the brief.
+      const dir = buildWorkspace(spec, this.mcpUrl);
+      // herdr needs a pane: create a workspace WITH that cwd, start the agent in
+      // its root pane, with the model for this issue type.
+      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
+      const rp = (created as { root_pane?: unknown }).root_pane;
+      const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
+      if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
+      const name = nameFor(issue);
+      try {
+        await this.startWithReadinessRetry({
+          pane_id: paneId,
+          name,
+          kind: "claude",
+          // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
+          // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
+          // single source the staleness check compares a restored pane against.
+          args: spawnArgs(spec, dir),
+        } as Parameters<HerdrClient["agent"]["start"]>[0]);
+      } catch (e) {
+        // A failed start must not leak the workspace we just created: the next
+        // reconcile would create another, forever (measured: 7 in 2 minutes).
+        await this.herdr.pane.close(paneId).catch(() => {});
+        throw e;
+      }
+      await this.verifyKickoff(issue);
+      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId}`);
     } catch (e) {
-      // A failed start must not leak the workspace we just created: the next
-      // reconcile would create another, forever (measured: 7 in 2 minutes).
-      await this.herdr.pane.close(paneId).catch(() => {});
+      this.log?.(`${SPAWN_TAG} ${issue} failed — ${(e as Error)?.message ?? e}`);
       throw e;
     }
-    await this.verifyKickoff(issue);
   }
 
   /**
