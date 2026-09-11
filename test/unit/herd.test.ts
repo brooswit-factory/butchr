@@ -212,6 +212,23 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant); // no 4th arg
     await expect(herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null })).resolves.toBeUndefined();
   });
+
+  // BUTCHR-320 review fix (round 1): the no-op check's OWN `byIssue()` read
+  // (`agent.list()`) used to sit OUTSIDE the try — a rejecting `agent.list()`
+  // rejected `spawn()` having logged nothing at all, a silent failure
+  // surviving inside the fix for silent failures. Pinned here: a rejecting
+  // `agent.list()` must still produce exactly one `failed` line.
+  test("a rejecting agent.list() (the no-op check's own read) still logs a failed line — never silent", async () => {
+    const lines: string[] = [];
+    const client = {
+      agent: { list: async () => { throw new Error("herdr socket closed"); }, start: async () => {} },
+      pane: { close: async () => {} },
+      workspace: { create: async () => ({ root_pane: "w1:p1" }) },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await expect(herd.spawn({ key: "KAN-42", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("herdr socket closed");
+    expect(lines).toEqual([`${SPAWN_TAG} KAN-42 failed — herdr socket closed`]);
+  });
 });
 
 // BUTCHR-320 falsifier 2 — CROSS-INSTRUMENT CONSISTENCY: for the same poll,

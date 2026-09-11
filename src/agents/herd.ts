@@ -247,14 +247,38 @@ export class HerdrHerd implements Herd {
    * episode produces no journal line there at all). This method never
    * consults that latch, so a failure is logged here every single time,
    * complaint-latched or not.
+   *
+   * BUTCHR-320 review fix (round 1): the no-op check's OWN `byIssue()` read
+   * is inside the `try` below, not before it — see that line's own comment.
+   * A rejecting `agent.list()` there used to reject `spawn()` having emitted
+   * NO line at all, which is exactly the silent-failure defect this whole
+   * ticket exists to close, surviving inside the fix for it: `attempts =
+   * successes + failures + noops` did not hold whenever this raced, and a
+   * `[spawn]`-derived failure count was a floor, not a count, the same shape
+   * as finding (3)'s latched-complaint undercount. Measured to actually
+   * reach zero lines on a rejecting `agent.list()`, at this method's
+   * pre-fix shape, before this fix landed.
    */
   async spawn(spec: SpawnSpec): Promise<void> {
     const issue = spec.key;
-    if ((await this.byIssue()).has(issue)) {
-      this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent`);
-      return;
-    }
     try {
+      // BUTCHR-320 review fix (round 1): the no-op check itself is inside
+      // the try now, not before it. `byIssue()` is `agent.list()` with no
+      // error handling of its own, and it is the THIRD OR LATER
+      // `agent.list()` call of the poll (after `reconcileNow`'s own snapshot
+      // and admission's `residency()` read), so a transient herdr hiccup
+      // reaching exactly here — a first-class expected event in this
+      // codebase, see `staleIssues()`'s own "herdr hiccup / pane gone —
+      // unknown, not stale" and `MAX_IMPLAUSIBLE_POLLS`'s own doc comment —
+      // used to reject `spawn()` having emitted NO line at all: a silent
+      // failure surviving inside the very fix for silent failures. `return`
+      // still exits the no-op path before the `catch` below, so the three
+      // outcomes are unchanged; only a REJECTING `byIssue()` now falls
+      // through to the same `failed` line every other failure gets.
+      if ((await this.byIssue()).has(issue)) {
+        this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent`);
+        return;
+      }
       // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
       // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
       // which cascades into the brief.
