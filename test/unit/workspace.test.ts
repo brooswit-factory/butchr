@@ -54,6 +54,18 @@ describe("briefFor / modelFor", () => {
     expect(brief).toContain("three wake axes");
     expect(brief).toContain("the VERSION axis");
   });
+  // BUTCHR-337 defect 1: the VERSION axis parenthetical claimed "epics have
+  // been told to put load-bearing directives in the page body" — false, and
+  // self-contradicting within the same paragraph, which later says an epic
+  // overwriting the root doc body is destructive and not a channel, never a
+  // way for an epic to talk to the project. The VERSION axis itself stays
+  // real; only the false justification is dropped.
+  test("project brief drops the false 'epics have been told' claim from the VERSION axis parenthetical, while the axis itself remains", () => {
+    const brief = briefFor("project");
+    expect(brief).not.toContain("epics have been told");
+    expect(brief).toContain("three wake axes");
+    expect(brief).toContain("the VERSION axis");
+  });
   // BUTCHR-335 defect 1: "an epic has no verb that edits or comments on your
   // root doc" was FALSE — confluence_update_page is an unguarded full-body
   // replace with no check on whose page it is, so an epic CAN overwrite a
@@ -254,7 +266,7 @@ describe("briefFor / modelFor", () => {
   // BUTCHR-318: the blocked-dialog escalation passage must state the
   // Epic→Project conditionality (an In Progress epic's report_to_boss wakes
   // nobody) and must say submit_to_boss is not a doorbell, plus what an
-  // In Progress epic should do instead (escalate to a human immediately).
+  // In Progress epic should do instead (call report_to_boss anyway).
   test("epic brief's blocked-dialog section states the Epic→Project conditionality and that submit_to_boss is not a doorbell", () => {
     const brief = briefFor("Epic");
     expect(brief).toContain("your boss is a");
