@@ -1,0 +1,11 @@
+
+⏺ Called jira_get_issue(BUTCHR-261) (ctrl+o to expand)
+  ⎿  You've hit your session limit · resets 9:50pm (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+     That is the exact banner text from the incident, quoted verbatim for the record.
+     … +8 lines (ctrl+o to expand)
+
+✻ Rested for 4s · done 2:03 PM
+
+────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ⌘P for agents        /rc
