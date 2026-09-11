@@ -320,6 +320,28 @@ export interface ReconcileOptions {
    * below is `plan.spawn` itself, unchanged — today's exact behaviour.
    */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
+  /**
+   * BUTCHR-297 (§B4): reports which of THIS poll's admitted candidates
+   * actually SUCCEEDED their spawn — see src/agents/admission.ts's own top-
+   * comment B4 addendum for why admission and running are different events
+   * and why the admission controller must never clear a wait counter on
+   * admission itself. Called ONCE per poll, AFTER the spawn `Promise.all`
+   * below has settled, with `admitted` minus the ids `failures` recorded at
+   * `stage: "spawn"` (a `"respawn"`-staged failure is a different code path
+   * and can never appear here). A SIBLING optional hook to `admission`
+   * above, deliberately, rather than a change to `admission`'s own
+   * signature — widening that signature would churn every existing caller
+   * and test that already builds a bare `(candidates, stopping) =>
+   * Promise<readonly string[]>` (this file's own admission.test.ts
+   * included), matching the house pattern (`checkCrashLoop`,
+   * `checkReconcileFailure`, `checkReap`, `onRespawn`, `onSuppressed` are
+   * all separate optional callbacks on this same interface, not parameters
+   * threaded onto an existing one). Optional, independent of `admission`
+   * above (checked separately, same as every other hook in this
+   * interface); omitted, no success signal is reported (every caller before
+   * this ticket, and any caller with nothing to clear).
+   */
+  onAdmitted?: (succeeded: readonly string[]) => void;
 }
 
 /**
@@ -462,6 +484,17 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       failures.push({ id: issue, stage: "spawn", error: e });
     }
   }));
+  // BUTCHR-297 (§B4): report which of THIS poll's admitted candidates
+  // actually succeeded their spawn — see ReconcileOptions.onAdmitted's own
+  // doc comment for why this must be `admitted` minus only the `"spawn"`-
+  // staged failures just collected above (never a `"respawn"`-staged one,
+  // which is a different code path entirely, appended to `failures` further
+  // below). Only computed when `opts.onAdmitted` is actually present —
+  // there is no ledger anywhere to report to otherwise.
+  if (opts.onAdmitted) {
+    const failedSpawnIds = new Set(failures.filter((f) => f.stage === "spawn").map((f) => f.id));
+    opts.onAdmitted(admitted.filter((id) => !failedSpawnIds.has(id)));
+  }
   // BUTCHR-147: sequential, same as before (stop has no documented wait to
   // parallelize against) — but each iteration's rejection is now caught so
   // one bad `herd.stop` no longer aborts the REST of this loop (every other
@@ -679,6 +712,8 @@ export interface GenericLoopDeps<T> {
   checkReap?: () => Promise<void>;
   /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
+  /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
+  onAdmitted?: (succeeded: readonly string[]) => void;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -766,6 +801,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
+        ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
         atRest,
       });
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...desired.keys()]) : [];

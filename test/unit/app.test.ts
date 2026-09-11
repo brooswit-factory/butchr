@@ -522,7 +522,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
     try {
       const res = await fetch(`http://localhost:${app.server!.port}/health`);
       const body = (await res.json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: 3 });
+      expect(body.admission).toEqual({ cap: 8, residency: 3, longestWait: null });
       // Never folded into components[] — components stays exactly the liveness list.
       expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
       expect(body.components.some((c) => "cap" in c || "residency" in c)).toBe(false);
@@ -550,7 +550,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
     app.listen(0);
     try {
       const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: null });
+      expect(body.admission).toEqual({ cap: 8, residency: null, longestWait: null });
     } finally {
       health.stop();
       await mcp.closeAll();
