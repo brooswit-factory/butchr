@@ -1,4 +1,4 @@
-import type { HerdrClient, results } from "@brooswit/herdr-sdk";
+import { HerdrError, type HerdrClient, type results } from "@brooswit/herdr-sdk";
 import { buildWorkspace, workspaceRoot, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
@@ -99,6 +99,36 @@ const NUDGE_VERIFY_MS = 8_000;
  */
 const KICKOFF_VERIFY_MS = 12_000;
 
+/**
+ * BUTCHR-268: `workspace.create`'s own just-returned root pane is not
+ * reliably ready for `agent.start` — herdr rejects it with `agent_pane_busy`
+ * ("not an available shell") on a race, measured (this branch's own commit,
+ * see PR) to resolve within roughly the low hundreds of ms on a loaded herd,
+ * but NOT bounded by any fixed wait: a repeated measurement still saw a
+ * single busy rejection out past 1s. Waiting this long before EVERY
+ * `agent.start` attempt (first attempt included) closes most of the gap
+ * cheaply — it's negligible next to `KICKOFF_VERIFY_MS`'s multi-second wait
+ * a few lines below — but per the measurement above a wait alone is not
+ * sufficient; see `PANE_BUSY_MAX_RETRIES`.
+ *
+ * Exported so `scripts/repro-pane-busy.ts`'s "fixed" measurement mode can
+ * exercise the SAME constants this file actually uses, rather than a copy
+ * that could silently drift from them.
+ */
+export const PANE_READY_WAIT_MS = 200;
+
+/**
+ * Sibling to `PANE_READY_WAIT_MS`: bounded retries specifically on
+ * `agent_pane_busy`, never on any other `agent.start` rejection (those must
+ * still reach `spawn()`'s own catch immediately, which closes the pane it
+ * just created — BUTCHR-111's leak-safety guarantee). At `PANE_READY_WAIT_MS`
+ * between attempts, this bounds the extra wait spawn() can spend retrying to
+ * `PANE_BUSY_MAX_RETRIES * PANE_READY_WAIT_MS` = 800ms in the worst case —
+ * still negligible next to `KICKOFF_VERIFY_MS`, and small next to the whole
+ * poll cycle a failed spawn used to cost before this existed.
+ */
+export const PANE_BUSY_MAX_RETRIES = 4;
+
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   constructor(
@@ -165,15 +195,15 @@ export class HerdrHerd implements Herd {
     if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
     const name = nameFor(issue);
     try {
-      await this.herdr.agent.start({
-      pane_id: paneId,
-      name,
-      kind: "claude",
-      // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
-      // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
-      // single source the staleness check compares a restored pane against.
-      args: spawnArgs(spec, dir),
-    } as Parameters<HerdrClient["agent"]["start"]>[0]);
+      await this.startWithReadinessRetry({
+        pane_id: paneId,
+        name,
+        kind: "claude",
+        // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
+        // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
+        // single source the staleness check compares a restored pane against.
+        args: spawnArgs(spec, dir),
+      } as Parameters<HerdrClient["agent"]["start"]>[0]);
     } catch (e) {
       // A failed start must not leak the workspace we just created: the next
       // reconcile would create another, forever (measured: 7 in 2 minutes).
@@ -181,6 +211,27 @@ export class HerdrHerd implements Herd {
       throw e;
     }
     await this.verifyKickoff(issue);
+  }
+
+  /**
+   * BUTCHR-268: waits `PANE_READY_WAIT_MS` before every attempt (including
+   * the first), and retries ONLY an `agent_pane_busy` rejection, up to
+   * `PANE_BUSY_MAX_RETRIES` extra times. Any other rejection — including a
+   * busy rejection that has exhausted its retries — propagates immediately,
+   * unchanged, so `spawn()`'s own catch above still sees it and closes the
+   * pane it just created.
+   */
+  private async startWithReadinessRetry(params: Parameters<HerdrClient["agent"]["start"]>[0]): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      await this.wait(PANE_READY_WAIT_MS);
+      try {
+        await this.herdr.agent.start(params);
+        return;
+      } catch (e) {
+        const busy = e instanceof HerdrError && e.code === "agent_pane_busy";
+        if (!busy || attempt >= PANE_BUSY_MAX_RETRIES) throw e;
+      }
+    }
   }
 
   /**

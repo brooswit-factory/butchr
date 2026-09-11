@@ -8,7 +8,7 @@ import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
-import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
+import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
 import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
@@ -308,12 +308,20 @@ const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comm
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
 // default cannot spam anything on day one — see this ticket's PR body for
 // why steady-state volume should NOT be assumed to stay zero.
+// BUTCHR-240: `todoWorkers` closes the To Do gap — see abandoned.ts's own
+// "FORMER KNOWN LIMITATION" doc comment. A separate, narrower query
+// (TODO_WORKER_JQL, src/resources/issue.ts) from `ISSUE_JQL` above,
+// deliberately not folded into it — see that constant's own doc comment for
+// why. Uses the raw `atlassian.search` call, not the `summaries`-recording
+// wrapper `issueResourceType` below is given: a To Do worker has no running
+// agent, so there is nothing here for that side-effect to usefully feed.
 const abandonedDetector = createAbandonedDetector({
   now: () => Date.now(),
   minutes: config.abandonedMinutes,
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
+  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
@@ -549,6 +557,11 @@ runResourceLoop(issueResourceType, {
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal — see
+  // admissionController's own construction comment above and
+  // src/agents/admission.ts's own B4 addendum for why this must be one
+  // ledger, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -640,6 +653,10 @@ runResourceLoop(projectResourceType, {
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal the
+  // issue loop above also uses — see that call site's own comment for why
+  // this must be one instance, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
