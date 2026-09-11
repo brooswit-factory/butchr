@@ -108,15 +108,31 @@ than this repository's own source. `node_modules` was not audited.
 
 ## 2. What pulls, and what restarts? One external sweep does both.
 
-**The pull and the restart are a single action.** On the daemon whose
-journal was readable, **every** `pull -q --ff-only origin main` reflog
-timestamp has a systemd `Stopping`+`Started` pair **in the same second**.
-Those restarts appear as explicit `Stopping → Stopped → Started`
-sequences — what a commanded `systemctl restart` produces, not systemd's
-own `Scheduled restart job` wording.
+**The pull and the restart are a single action — for sweep events, with
+one measured exception.** On the daemon whose journal this author could
+read, **every** `pull -q --ff-only origin main` reflog timestamp has a
+systemd `Stopping`+`Started` pair **in the same second**. Those restarts
+appear as explicit `Stopping → Stopped → Started` sequences — what a
+commanded `systemctl restart` produces, not systemd's own `Scheduled
+restart job` wording.
+
+**The same holds on the other daemon, and this part was measured by epic
+BUTCHR-301 from that daemon's own user journal — a source this author's
+account could not read** (`journalctl --user -u butchr.service`, read
+2026-09-11 ~01:31Z; provenance stated because it is not this author's
+measurement):
+
+- **15 of the 16** pulls in that daemon's `main` reflog between
+  2026-08-30 and 2026-09-10 have a unit restart **within one second**.
+  The only non-same-second pair is its 12:24:20 pull against a 12:24:21
+  restart.
+- **The exception that qualifies the claim: 2026-09-02 22:26:47 is a pull
+  with NO restart at all** on that daemon. So "one action" is true of
+  *sweep* events; a **pull-without-restart also genuinely occurred**, and
+  its consequence is measured below.
 
 **It sweeps both daemons in sequence, the other user's first.** Pairing
-the two checkouts' `main` reflogs gives **13 paired pull events**, the
+the two checkouts' `main` reflogs gives **13 reflog-visible pairs**, the
 other user's always first, deltas **+1s to +16s**, ordering never
 reversed (09-01 13:31, 15:43, 16:43, 17:43, 18:43, 20:43, 21:43; 09-02
 07:21, 07:58, 10:21, 12:24; 09-10 10:36, 13:09).
@@ -125,14 +141,48 @@ The falsifier pre-registered for this — *if earlier pairs are minutes
 apart, it is a person typing two commands rather than one script* — **did
 not fire on a single pair.**
 
-**Exceptions, stated rather than smoothed over.** Four pulls are
-*unpaired*: 09-02 13:21:04, 21:22:50, 21:51:25 on one daemon and 09-02
-22:26:47 on the other, so that evening the two were acted on
-**independently** — what individual intervention looks like. The other
-checkout's pulls before 2026-08-30 19:43:49 are unpairable because the
-second clone did not exist yet; that is expected, not an anomaly. And the
-procedure itself changed once: entries read `pull -q` up to 2026-08-28
-17:08:11 and `pull -q --ff-only origin main` from 2026-08-28 18:22:14.
+**Sweep count, spelled out so that two different sixteens in this
+document are never read as one.** 13 sweeps are visible as a pull in
+*both* reflogs. **Three more** — 09-02 13:21:04, 21:22:50, 21:51:25 — are
+sweeps in which the other daemon restarted with no reflog entry,
+established in review from its journal: **16 sweep events in total.**
+Separately, and coincidentally sharing the number, that daemon's own
+`main` reflog holds **16 pulls** between 2026-08-30 and 2026-09-10, of
+which 15 restart within one second. **The two counts measure different
+things.**
+
+**Four pulls look unpaired in the reflogs — and for three of them that
+appearance is WRONG. Corrected in review, by the trap this very document
+names one section below.** The three are 09-02 13:21:04, 21:22:50 and
+21:51:25. Epic BUTCHR-301, reading the *other* daemon's own user journal
+(unreadable from this author's account), found that at **each** of those
+three timestamps that daemon has a `Stopping → Stopped → Started`
+sequence **in the same second**, with **no entry in its `main` reflog**.
+By this document's own rule — *a pull that finds nothing new writes no
+reflog entry yet still restarts* — those three are **joint sweeps whose
+other-side pull was a no-op**, not independent actions.
+
+**An earlier draft of this document inferred "the two daemons were acted
+on independently — what individual intervention looks like" from that
+reflog silence. That inference is retracted.** It is the same
+not-yet-versus-never error this document warns about, committed against
+its own warning, and it is recorded rather than quietly deleted because
+the inference was *evidence about what invokes the sweep* — the hinge of
+the epic's decision. Removing it makes the single-driver reading
+**stronger**, not weaker: there is now less sign of per-daemon manual
+action than this document first claimed.
+
+**The one genuinely independent event is 2026-09-02 22:26:47 on the other
+daemon — a pull with NO restart.** Its next unit start is the 2026-09-10
+10:24:36 boot. **So that daemon pulled new code and then ran the OLD code
+for the following week** — the "HEAD is not necessarily what a long-lived
+process loaded" case, measured rather than hypothesised.
+
+The other checkout's pulls before 2026-08-30 19:43:49 are unpairable
+because the second clone did not exist yet; that is expected, not an
+anomaly. And the procedure itself changed once: entries read `pull -q` up
+to 2026-08-28 17:08:11 and `pull -q --ff-only origin main` from
+2026-08-28 18:22:14.
 
 **The hourly `:43` driver was real, and its end can be dated.**
 Restart-confirmed sweeps at 09-01 15:43, 16:43, 17:43, 18:43, 20:43,
@@ -142,10 +192,15 @@ that pull found nothing new and wrote no reflog entry. Sweeps continued
 at irregular times through **2026-09-02 21:51:25** and then stopped, with
 **zero restarts of any kind** until **2026-09-09 18:10:13**.
 
-**Restart-without-pull is a real, separate thing** (09-09 18:10:13;
-09-10 11:12:40, 11:12:55, 11:27:48, 11:51:52) — recovery restarts that
-reload the *same* code. A pull without a restart leaves old code running;
-a restart without a pull reloads the same code. Both halves matter.
+**Both halves occur separately, and both are now measured.**
+*Restart-without-pull*, on the daemon whose journal this author read:
+09-09 18:10:13; 09-10 11:12:40, 11:12:55, 11:27:48, 11:51:52 — recovery
+restarts that reload the *same* code. *Pull-without-restart*, on the
+other daemon, measured by the epic: **09-02 22:26:47**, after which that
+daemon kept running its previously-loaded code until the 09-10 10:24:36
+boot. A pull without a restart leaves old code running; a restart without
+a pull reloads the same code. **Neither half implies the other, and this
+fleet has produced both.**
 
 **One honest exception to "every restart was externally commanded":** the
 journal does contain 4 systemd `Scheduled restart job` events, **all**
@@ -296,9 +351,16 @@ cases.
    freshness.** (b) makes them independent: a PR-sha fetch moves one and
    not the other, so a fresh `FETCH_HEAD` beside a stale `origin/main`
    can produce a **false CURRENT** verdict.
-3. A gate that must be right should compare against the **real remote**
-   (e.g. `git ls-remote`) or report its own staleness as *unknown*,
-   rather than trusting a local mtime.
+3. A local mtime cannot answer "is `origin/main` current". Comparing
+   against the **real remote** (e.g. `git ls-remote`) would, but **that is
+   a network call, and the build-currency path forbids network work
+   because it runs on the agent-spawn path and a hang there hangs a
+   spawn** — so this is **an input to BUTCHR-163's design decision, not a
+   recommendation from here**. The alternative that needs no network is to
+   derive freshness from `FETCH_HEAD`'s **contents** rather than its
+   mtime, which is the direction BUTCHR-163's own first PR already takes.
+   Either way, the signal should report *unknown* rather than imply
+   currency it cannot establish.
 
 ## 4. Latency: until a person acts, and unbounded by construction
 
@@ -313,8 +375,13 @@ does only one half has *infinite* latency for the other.
 `0fa49429` while its own `origin/main` stood **75 commits** ahead, with
 `main` demonstrably moving throughout that window — so this is **not**
 the not-yet-versus-never error; something was continuously available to
-pull. **Worst gap actually observed: 2026-09-02 21:51:25 → 2026-09-09
-18:10:13, seven days with no restart whatsoever.**
+pull. **Worst gaps actually observed, attributed per daemon** — the
+figures differ, so neither should be quoted as "the fleet's":
+**2026-09-02 21:51:25 → 2026-09-09 18:10:13 (~6.9 days)** on the daemon
+this author measured, and **2026-09-02 21:51:25 → 2026-09-10 10:24:36
+(~7.5 days, ending in a boot rather than a deploy)** on the other, as
+measured by the epic from that daemon's own journal — it has **no**
+09-09 18:10:13 restart at all.
 
 **Falsifier:** a cron in the unreadable `/var/spool/cron/crontabs/` still
 firing would make this "bounded in design but currently broken" rather
@@ -333,12 +400,20 @@ way, and in both cases nothing in this repository performs the deploy.
   reflogs **are readable by exact path**. Note carefully: its home
   directory could not be *listed*, but traversal into known paths was
   permitted, so **a denied `ls` is not proof a checkout is unreadable**.
-  Its pull times, the 13-event pairing, the spelling change and the
-  multi-day gaps are therefore **measured** for it. **Not readable:** its
-  user journal (hence its restart history), its unit properties, its
-  `/proc/<pid>/cwd`, its crontab. **So "it pulled at T" is measured,
-  while "it restarted at T" is INFERRED** from the same-second pairing
-  observed on the readable daemon.
+  Its pull times, the pairing, the spelling change and the
+  multi-day gaps are therefore **measured** for it. **Not readable from
+  this author's account:** its user journal (hence its restart history),
+  its unit properties, its `/proc/<pid>/cwd`, its crontab.
+
+  **That restart history is no longer inferred — it was MEASURED in
+  review by epic BUTCHR-301, which could read that daemon's own journal.**
+  An earlier draft of this document said "it restarted at T is INFERRED
+  from the same-second pairing"; for this daemon that is now superseded by
+  direct measurement (15 of 16 pulls restart within one second; the
+  2026-09-02 22:26:47 pull has no restart; there is no 09-09 18:10:13
+  restart). **The provenance is stated wherever those figures appear,
+  because they are not this author's measurements** — a later reader
+  checking them must know whose journal to open.
 
 Nothing here is generalised to "the fleet" beyond what each bullet
 states.
