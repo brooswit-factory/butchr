@@ -18,6 +18,33 @@ const MAX_TITLE_LEN = 200;
 const MAX_BOSS_DEPTH = 20;
 
 /**
+ * `get_doc`'s default `limit`, in characters, when the caller omits one (BUTCHR-270).
+ * (a) 20,000 characters.
+ * (b) Reasoning: the margin here is NOT about JSON-serialization overhead — two
+ *     independent measurements (a sibling story's real root-doc read at 81,032
+ *     result chars vs 80,743 body chars, ~0.36%; and a real storage-format XHTML
+ *     file in this repo inflating from 7,761 to 7,828 chars under
+ *     `JSON.stringify`, ~0.86%) put that overhead well under 1%, not the doubling
+ *     an earlier draft of this ticket wrongly assumed from `"` -> `\"` escaping.
+ *     The margin that actually matters is the THRESHOLD'S OWN UNCERTAINTY: the
+ *     measured oversize bracket is (56,239, 61,376] characters, from one
+ *     controlled experiment on one host/CLI build/day (docs/tool-result-size-cap.md)
+ *     — an order of magnitude to stay well clear of, not a constant to shave
+ *     against. 20,000 characters, plus a sub-1% serialization tax and a few
+ *     hundred envelope-field characters (id, url, title, size, slice, next,
+ *     warning), lands under a third of the bracket's own low end.
+ * (c) This is a CONSERVATIVE GUESS about the calling harness's environment, not a
+ *     measured property of butchr's own transport or of any specific caller's
+ *     budget — re-derive docs/tool-result-size-cap.md's bracket against whatever
+ *     CLI build is current before trusting this number long-term.
+ * (d) FALSIFIED BY: a live `get_doc` call with `limit` omitted whose JSON-serialized
+ *     MCP result still gets spooled (preview or error shape) by the calling harness
+ *     — that would mean this default is not conservative enough for the harness
+ *     actually in use, and it should come down.
+ */
+export const DEFAULT_GET_DOC_LIMIT_CHARS = 20000;
+
+/**
  * Character budget for a doc's full body on the WRITE path (BUTCHR-250).
  * "Characters" here means `.length` — JS UTF-16 code units, matching the
  * unit the MCP harness cap itself compares against (docs/tool-result-size-cap.md
@@ -302,7 +329,229 @@ export interface DocResult {
   body: string;
 }
 
-export type GetDocResult = { found: false } | ({ found: true } & DocResult);
+/**
+ * `DocResult` plus the page's own Confluence version number — a strict
+ * additive widening, never a replacement: everywhere `DocResult` is the
+ * declared contract (`ensureDoc`, `setDoc`, `setProjectDoc`, and every
+ * non-tool caller of `projectRootDoc` — see docs.ts's own module doc for the
+ * grep), a value of this shape satisfies it unchanged, so this stays purely
+ * additive for THOSE callers. Exists so `get_doc`'s tool-facing layer
+ * (BUTCHR-270) can report `version` on a hit "for free" — the page read
+ * `readLinkedPage`/`projectRootDoc` already perform includes it — WITHOUT
+ * widening the write path's own `DocResult` contract, which BUTCHR-235 owns
+ * and this ticket must not touch.
+ */
+interface VersionedDocResult extends DocResult {
+  /** The page's own Confluence version number, or `null` when the read didn't carry one (e.g. a fake/test double). Never guessed. */
+  version: number | null;
+}
+
+/** `{ chars, bytes }` — the vocabulary BUTCHR-235 (the write-side receipt) already uses, kept identical here rather than inventing a second one. `chars` is the JS string `.length` (UTF-16 code units) — equal to the Unicode codepoint count for this corpus's Basic-Multilingual-Plane content, and the unit `offset`/`limit` are also expressed in, so the two stay mutually consistent. `bytes` is the UTF-8 byte length, carried alongside because it's nearly free and protects a reader on a different, byte-governed path (see docs/tool-result-size-cap.md's scope note) without this path depending on it. */
+export interface DocSize {
+  chars: number;
+  bytes: number;
+}
+
+/** Where a partial slice starts and how much it actually carries, in the same `{chars, bytes}` unit as `size` — `chars` is the ACTUAL returned length (it can be one shorter than the requested `limit` when a surrogate-pair boundary was nudged), not an echo of the request. */
+export interface GetDocSlice {
+  offset: number;
+  chars: number;
+  bytes: number;
+}
+
+/** Present iff characters remain after this slice. Its `offset` is exactly what the caller passes back next; absence is how a caller knows pagination is finished — never `complete`, which stays `false` on every slice of a partial read, including the last one. */
+export interface GetDocNext {
+  offset: number;
+}
+
+export type GetDocResult =
+  | { found: false }
+  | {
+      found: true;
+      /** `true` iff `body` is present iff the request started at offset 0 and reached the end of the stored body. */
+      complete: true;
+      id: string;
+      url: string;
+      title: string;
+      version: number | null;
+      size: DocSize;
+      /** The ENTIRE stored body. Present only on this arm — see `complete`'s own doc comment. */
+      body: string;
+    }
+  | {
+      found: true;
+      complete: false;
+      id: string;
+      url: string;
+      title: string;
+      version: number | null;
+      size: DocSize;
+      slice: GetDocSlice;
+      next?: GetDocNext;
+      /**
+       * THE SAFETY-CRITICAL FIELD NAME (BUTCHR-270): a partial's content
+       * lives under `chunk`, NEVER under `body`. `set_doc` is a full-body
+       * replace, and the taught workflow is "call get_doc, edit the body you
+       * got back, write the whole thing" — if a partial populated `body`, a
+       * caller that never heard of pagination would read a truncated body,
+       * write it back, and permanently destroy the rest of the document in a
+       * corpus where nothing is ever archived. With `body` absent on this
+       * arm, that same caller gets `undefined` and fails loudly instead.
+       * Never rename this to make the two arms look more similar — the
+       * asymmetry is the entire point.
+       */
+      chunk: string;
+      /** Human-readable courtesy, not the machine-readable signal — the shape (this arm existing, `body`'s absence) is that. */
+      warning: string;
+    };
+
+/**
+ * The one line every partial `get_doc` result carries under `warning`. A
+ * courtesy for a human skimming a transcript, never the mechanism a caller
+ * should branch on — branch on `complete`/`body`/`next` instead, which are
+ * structural and can't be missed the way prose can.
+ */
+const PARTIAL_READ_WARNING =
+  "This is a PARTIAL read, not the whole document: `body` is deliberately absent so this result can never be mistaken for the whole page and fed to set_doc as a full-body replace. " +
+  "TO READ THE REST: call get_doc again with the SAME key, offset=<next.offset>, AND expectVersion=<the `version` of THIS result>, until `next` is absent; then concatenate every `chunk` in offset order. " +
+  "expectVersion IS REQUIRED on every call with offset > 0 and it is not bookkeeping: if the page is edited mid-read, the call REFUSES rather than handing you a slice from a different version. " +
+  "NEVER concatenate chunks that came from different versions — the result would be a body that never existed at any point in time, and feeding that to set_doc (a full-body replace) destroys the real page just as surely as a truncated body would. " +
+  "If a call refuses for version drift, DISCARD every chunk you have collected and restart from offset 0.";
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * Never split a surrogate pair (BUTCHR-270): JS `.slice()` cuts on UTF-16
+ * code units, and a cut landing between a high and low surrogate emits two
+ * lone surrogates that do not survive UTF-8/JSON cleanly. Nudges `end`
+ * backward one code unit when it lands mid-pair, EXCEPT when that would
+ * make the slice empty (`end - 1 === start`, i.e. the pair starts exactly at
+ * `start` and a 1-character `limit` asked to stop inside it) — there, it
+ * nudges forward instead, past the whole pair, so a slice can never regress
+ * to zero-length and stall pagination. Either way `slice.chars` reports
+ * whatever length actually resulted, never the raw requested `limit`.
+ */
+function nudgeSurrogateBoundary(body: string, start: number, end: number): number {
+  if (end > start && end < body.length && isHighSurrogate(body.charCodeAt(end - 1)) && isLowSurrogate(body.charCodeAt(end))) {
+    return end - 1 === start ? end + 1 : end - 1;
+  }
+  return end;
+}
+
+function utf8ByteLength(s: string): number {
+  return Buffer.byteLength(s, "utf8");
+}
+
+function sizeOf(body: string): DocSize {
+  return { chars: body.length, bytes: utf8ByteLength(body) };
+}
+
+/**
+ * The one place `get_doc`'s three-arm shape (BUTCHR-270) is assembled, shared
+ * by both dispatch branches (`getDoc`/`getProjectDoc`) so the arm logic exists
+ * exactly once. `offset`/`limit` are ASSUMED ALREADY VALIDATED for shape
+ * (non-negative/positive integers) by `validateRange` — this function's own
+ * job is the ONE check that needs the body's actual length to evaluate:
+ * `offset` past the end.
+ */
+function buildGetDocResult(who: string, doc: VersionedDocResult, offset: number, limit: number): GetDocResult {
+  const { body } = doc;
+  const total = body.length;
+  if (offset > total) {
+    throw new Error(`${who}: offset ${offset} is past the end of "${doc.title || doc.id}" (${total} characters) — refusing rather than silently clamping to the end`);
+  }
+  const rawEnd = Math.min(offset + limit, total);
+  const end = nudgeSurrogateBoundary(body, offset, rawEnd);
+  const chunk = body.slice(offset, end);
+  const size = sizeOf(body);
+  const complete = offset === 0 && end === total;
+
+  if (complete) {
+    return { found: true, complete: true, id: doc.id, url: doc.url, title: doc.title, version: doc.version, size, body };
+  }
+
+  const sliceChars = chunk.length;
+  const nextOffset = offset + sliceChars;
+  return {
+    found: true,
+    complete: false,
+    id: doc.id,
+    url: doc.url,
+    title: doc.title,
+    version: doc.version,
+    size,
+    slice: { offset, chars: sliceChars, bytes: utf8ByteLength(chunk) },
+    ...(nextOffset < total ? { next: { offset: nextOffset } } : {}),
+    chunk,
+    warning: PARTIAL_READ_WARNING,
+  };
+}
+
+/** Validates `offset`/`limit` SHAPE only (integer-ness, sign) — everything that needs the body's actual length (offset past the end) is `buildGetDocResult`'s job, since the body isn't fetched yet when this runs. */
+/**
+ * Validates `offset`/`limit` SHAPE only (integer-ness, sign), plus the ONE
+ * cross-argument rule that makes a spliced read unrepresentable rather than
+ * merely discouraged (BUTCHR-230 review): **`expectVersion` is REQUIRED
+ * whenever `offset > 0`.**
+ *
+ * Why a refusal rather than an instruction. `set_doc` is a full-body replace
+ * and the taught workflow is "read, edit, write the whole thing back." A
+ * document edited between two slices of one paginated read yields a
+ * concatenation that never existed at any point in time — and handing THAT to
+ * `set_doc` destroys the real page exactly as thoroughly as the truncated
+ * `body` this design already made unrepresentable, while being much harder to
+ * notice. Telling callers to compare `version` themselves is prose, and prose
+ * is what this whole contract exists to stop relying on.
+ *
+ * Costs nothing in compatibility: `offset` did not exist before this change,
+ * so no caller can already be passing one without a version.
+ *
+ * The version equality check itself needs the page, so it lives in
+ * `assertVersionMatches`, called once the read has happened.
+ */
+function validateRange(who: string, offset: number | undefined, limit: number | undefined, expectVersion: number | undefined): { offset: number; limit: number; expectVersion?: number } {
+  const o = offset ?? 0;
+  if (!Number.isInteger(o) || o < 0) {
+    throw new Error(`${who}: offset must be a non-negative integer — got ${JSON.stringify(offset)}`);
+  }
+  const l = limit ?? DEFAULT_GET_DOC_LIMIT_CHARS;
+  if (!Number.isInteger(l) || l < 1) {
+    throw new Error(`${who}: limit must be a positive integer — got ${JSON.stringify(limit)}`);
+  }
+  if (expectVersion !== undefined && (!Number.isInteger(expectVersion) || expectVersion < 1)) {
+    throw new Error(`${who}: expectVersion must be a positive integer — got ${JSON.stringify(expectVersion)}`);
+  }
+  if (o > 0 && expectVersion === undefined) {
+    throw new Error(
+      `${who}: expectVersion is required when offset > 0 — pass the \`version\` from the first slice of this read, so a mid-read edit REFUSES instead of silently splicing two versions into a body that never existed. Start again at offset 0 if you no longer have it.`,
+    );
+  }
+  return { offset: o, limit: l, ...(expectVersion !== undefined ? { expectVersion } : {}) };
+}
+
+/**
+ * The version gate itself (BUTCHR-230 review). Refuses rather than guessing in
+ * BOTH failure directions: a version that differs from the caller's, and a page
+ * whose version could not be read at all — an unverifiable pin is not a
+ * satisfied pin, and silently accepting one would reopen the exact hole
+ * `expectVersion` exists to close.
+ */
+function assertVersionMatches(who: string, doc: VersionedDocResult, expectVersion: number | undefined): void {
+  if (expectVersion === undefined) return;
+  if (doc.version === null) {
+    throw new Error(`${who}: cannot honour expectVersion=${expectVersion} — this page read carried no version, so the pin is unverifiable. Refusing rather than assuming the document did not change under a multi-call read.`);
+  }
+  if (doc.version !== expectVersion) {
+    throw new Error(
+      `${who}: the document changed mid-read — you pinned expectVersion=${expectVersion} but "${doc.title || doc.id}" is now version ${doc.version}. DISCARD every chunk collected so far and restart from offset 0; concatenating across versions would produce a body that never existed.`,
+    );
+  }
+}
 
 /** `chars` is string length (UTF-16 code units, i.e. what `.length` reports); `bytes` is UTF-8 byte length — carried separately because the incident this contract exists to fix reported "characters" while naming a "token" limit, and this project has already paid once for that unit ambiguity. */
 export interface WriteDigest {
@@ -387,18 +636,19 @@ async function buildReceipt(ops: AtlassianOps, id: string, url: string, title: s
   }
 }
 
-async function readLinkedPage(ops: AtlassianOps, key: string): Promise<DocResult | null> {
+async function readLinkedPage(ops: AtlassianOps, key: string): Promise<VersionedDocResult | null> {
   const link = await ops.getRemoteLink(key, DOC_LINK_GLOBAL_ID);
   const url = link?.object?.url;
   if (!url) return null;
   const id = pageIdFromUrl(url);
   if (!id) return null;
-  const page = (await ops.getPage(id)) as { title?: string; body?: { storage?: { value?: string } } } | undefined;
+  const page = (await ops.getPage(id)) as { title?: string; body?: { storage?: { value?: string } }; version?: { number?: number } } | undefined;
   return {
     id,
     url,
     title: page?.title ?? link?.object?.title ?? "",
     body: page?.body?.storage?.value ?? "",
+    version: page?.version?.number ?? null,
   };
 }
 
@@ -410,11 +660,23 @@ async function readLinkedPage(ops: AtlassianOps, key: string): Promise<DocResult
  * ticket's original draft, which had the arg-less form create lazily; the
  * settled spec — https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/12484678
  * — makes get_doc the one verb here that writes nothing at all.)
+ *
+ * BOUNDED, CALLER-CONTROLLABLE RANGE READ (BUTCHR-270): `offset`/`limit` let
+ * a caller page through a body too large for one MCP result — see
+ * `GetDocResult`'s own doc comment for the three-arm shape this returns.
+ * The bound lives HERE, in the TOOL-FACING layer, deliberately NOT inside
+ * `readLinkedPage` — that shared resolver is also reached by internal,
+ * non-tool code paths (verify at your own commit; docs.ts's own imports are
+ * the grep) that only ever use the returned `id`, never the body, and
+ * bounding it there would slice bodies for callers that never asked.
  */
-export async function getDoc(ops: AtlassianOps, key: string): Promise<GetDocResult> {
+export async function getDoc(ops: AtlassianOps, key: string, offset?: number, limit?: number, expectVersion?: number): Promise<GetDocResult> {
   assertValidKey(key, "get_doc");
+  const { offset: o, limit: l, expectVersion: v } = validateRange("get_doc", offset, limit, expectVersion);
   const doc = await readLinkedPage(ops, key);
-  return doc ? { found: true, ...doc } : { found: false };
+  if (!doc) return { found: false };
+  assertVersionMatches("get_doc", doc, v);
+  return buildGetDocResult("get_doc", doc, o, l);
 }
 
 /**
@@ -430,7 +692,7 @@ export async function getDoc(ops: AtlassianOps, key: string): Promise<GetDocResu
  * creating a page or to a space default — creating a stray page here would
  * be unrecoverable in a corpus where nothing is ever archived.
  */
-export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Promise<DocResult> {
+export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Promise<VersionedDocResult> {
   let prop: { rootDoc?: { id?: string } } | undefined;
   try {
     prop = (await ops.getProjectProperty(projectKey, "butchr")) as typeof prop;
@@ -441,19 +703,30 @@ export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Pro
   if (!rootDocId) {
     throw new Error(`project ${projectKey}: "butchr" entity property is missing rootDoc.id — refusing rather than falling back to a space default`);
   }
-  const page = (await ops.getPage(rootDocId)) as { title?: string; body?: { storage?: { value?: string } }; _links?: { base?: string; webui?: string } } | undefined;
+  const page = (await ops.getPage(rootDocId)) as { title?: string; body?: { storage?: { value?: string } }; _links?: { base?: string; webui?: string }; version?: { number?: number } } | undefined;
   return {
     id: rootDocId,
     url: `${page?._links?.base ?? ""}${page?._links?.webui ?? ""}`,
     title: page?.title ?? "",
     body: page?.body?.storage?.value ?? "",
+    version: page?.version?.number ?? null,
   };
 }
 
-/** Pure read of a PROJECT's root doc — the project-caller counterpart to `getDoc`. Never creates one; see `projectRootDoc`'s own doc comment. */
-export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Promise<GetDocResult> {
+/**
+ * Pure read of a PROJECT's root doc — the project-caller counterpart to
+ * `getDoc`. Never creates one; see `projectRootDoc`'s own doc comment.
+ * BOUNDED the same way and for the same reason as `getDoc` (BUTCHR-270) —
+ * see that function's own doc comment for the three-arm shape and why the
+ * bound lives here rather than inside `projectRootDoc` itself. THE PROJECT
+ * ROOT DOC IS THE LARGEST DOCUMENT ON THIS SURFACE and the reason this
+ * bound exists at all — this dispatch branch is not an afterthought.
+ */
+export async function getProjectDoc(ops: AtlassianOps, projectKey: string, offset?: number, limit?: number, expectVersion?: number): Promise<GetDocResult> {
+  const { offset: o, limit: l, expectVersion: v } = validateRange("get_doc", offset, limit, expectVersion);
   const doc = await projectRootDoc(ops, projectKey);
-  return { found: true, ...doc };
+  assertVersionMatches("get_doc", doc, v);
+  return buildGetDocResult("get_doc", doc, o, l);
 }
 
 /**

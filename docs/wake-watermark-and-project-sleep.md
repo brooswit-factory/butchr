@@ -628,3 +628,109 @@ Pane contention not investigated (BUTCHR-111). Comment ordering filed, not fixed
 is the whole remaining question for demonstration 6, and it is now a narrow one:
 the exit step alone, with the verdict, the guard and the bound all confirmed
 working around it.
+
+# The ACTIVE-and-idle row: a project-tier pinned-active backstop (BUTCHR-305, implementing BUTCHR-238)
+
+BUTCHR-238 asked a narrower, adjacent question to everything above: not
+whether a project can get STUCK asleep (this page's own subject), but
+whether a project can get **stuck ACTIVE** — pinned by a verdict that never
+clears because the only actor who can clear it (the agent, via `check_in`)
+has stopped acting. This section documents what shipped for that row.
+Separated into OBSERVED / MEANING, per this page's own convention.
+
+## OBSERVED
+
+- `reconcileNow`'s plan (`src/reconcile/plan.ts`) never touches a resource id
+  that is `desired` (verdict `"active"`), `running` (agent up), and not
+  argv-stale — not in `spawn`, `stop`, or `respawn`, on any poll, forever.
+  Correct while the agent is genuinely working; structurally identical to a
+  pinned, non-acting agent from the plan's own point of view.
+- Of every hook `ReconcileOptions` (`src/daemon/loop.ts`) already exposed,
+  none had a candidate set that could ever contain this shape:
+  `checkFrozenAsleep`/`checkDeclaredDone` only ever see `atRest`, which an
+  `"active"` verdict is never a member of; `checkCrashLoop`/`admission` only
+  ever see `plan.spawn`; `checkReconcileFailure` only ever sees a rejected
+  operation; `checkReap` only ever sees ids with no agent at all.
+- The issue tier already had a mechanism that CAN see this shape —
+  `src/agents/stalled.ts` (the idle-streak floor) paired with
+  `src/agents/stall-remediation.ts` (the debounced wake) — but it is
+  reachable only through `syncLabels`, wired into the issue-tier
+  `runResourceLoop` call in `src/daemon/index.ts` alone. The project-tier
+  call never received `syncLabels`, and could not: `stall-remediation.ts`
+  gates on the `agent:stalled` **Jira label**, and a project key carries no
+  Jira issue to label at all (`GET /rest/api/3/issue/<PROJECT>` -> 404,
+  measured in `src/tools/speak.ts`).
+- What shipped: `src/agents/pinned-active.ts`, a new module wired into the
+  project-tier `runResourceLoop` call ONLY, via a new optional
+  `ReconcileOptions.checkPinnedActive` hook on `src/daemon/loop.ts`, called
+  with `desired ∩ running` and its `void` return discarded.
+
+## MEANING
+
+**This is a project-tier, observe-and-speak backstop for the ACTIVE-and-idle
+row — never a reap, never a gate.** It reuses `StalledTracker`
+(`src/agents/stalled.ts`) for the idle/done streak floor (re-armed the
+instant `working`/`blocked` is observed — never fires on elapsed-ACTIVE time
+alone) and `findMarked`/`RateCap` (`src/agents/escalation-helper.ts`) for the
+same dedupe/rate-cap house mechanism every sibling detector uses. It posts
+through `speakOnOwnChannel` (never `ops.addComment`/`ops.commentOnPage`
+directly) and reads back through `createOwnChannelComments`, the same
+project-aware seams `frozen-asleep.ts` already relies on — so its own
+complaint self-watermarks and never becomes a fresh wake trigger on the
+project it is complaining about (proved by assertion, not by citation, in
+`test/unit/pinned-active-e2e.test.ts`: the project's `unseenCommentIds` is
+asserted unchanged by the complaint itself).
+
+**One deliberate departure from its siblings, stated because it is a real
+design decision and not an oversight:** `frozen-asleep.ts` and
+`stall-remediation.ts` both dedupe on a bare per-id fingerprint, with no
+episode component — `stall-remediation.ts` posts at most once per issue for
+the ticket's entire lifetime, by explicit design. This module instead needs a
+LATER, genuinely fresh idle episode (agent worked, then stalled again) to be
+able to complain again, rather than being latched shut forever by an earlier,
+closed episode's complaint. It tracks, in memory, when a spoken-for episode
+closes (`closedBefore`), and only treats an existing channel comment as
+"already handled" when it was NOT posted before that closure. The bounded
+cost this trades away: a daemon restart landing in the narrow window between
+a closed episode and a fresh one starting could, in the rare case, fail to
+adopt a genuinely-current complaint and produce one extra (still truthful,
+still rate-capped) comment. This is a delay, never a fabrication, and never a
+permanent loss of coverage — the module's own top comment in
+`src/agents/pinned-active.ts` records the reasoning in full.
+
+**Idle does not mean stuck, and this module cannot tell the difference.** An
+agent correctly waiting on a review or a queued admission slot is, from the
+outside, indistinguishable from one that is genuinely stuck — there is no
+signal available to build an "is it correctly waiting?" predicate from, and
+this module does not attempt one. It will sometimes speak to a healthy agent.
+That is a property of this design, not a defect in it: the same limit is why
+constraint 1 (never reap on this signal) is non-negotiable, and the cost of
+speaking wrongly (one observational comment) is asymmetric with the cost of
+reaping wrongly (a killed working agent and its whole ticket's lost work).
+
+## Division of labour, not a gap
+
+The specimen that originally motivated this whole story was a project agent
+parked at a Claude session-limit banner — and constraint 6 of this ticket
+means a correctly-built version of this backstop stays **silent** on exactly
+that specimen: a quota-blocked agent cannot act on a wake comment, and
+posting into it would burn the very session quota whose return ends the
+outage. That case is not this module's to cover.
+
+**It does not need to be, because a different, independently-shipped path
+already covers it: BUTCHR-259's session-limit recognition.** Before that fix,
+recognition of a real session-limit banner was 0-for-many on live captures
+(the anchored pattern could not match a `⎿`-prefixed banner); it is now
+handled, and reached `main` and a running daemon build well before this
+story was staffed (see this ticket's own PR description for the exact
+verification and timestamps, in UTC).
+
+**The two halves compose, and together they leave nothing on the
+ACTIVE-and-idle row unattended:** the session-limit path correctly recovers
+(or at least surfaces) an agent parked at a quota refusal; this module
+correctly stays silent on that same agent (constraint 6) and instead covers
+the case the session-limit path does NOT reach — an agent that is running,
+idle, and NOT quota-blocked, simply not acting, for any other reason (parked,
+hung, or a turn that ended without ever calling `check_in`). Neither
+mechanism substitutes for the other, and neither one's silence on the other's
+case is a hole — it is the intended division.

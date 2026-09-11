@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bossKeyFrom, ISSUE_SPAWN_CONFIG } from "../../src/resources/issue.js";
+import { bossKeyFrom, ISSUE_SPAWN_CONFIG, createTodoWorkersFetch, TODO_WORKER_JQL } from "../../src/resources/issue.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const issue = (over: Partial<JiraIssue> = {}): JiraIssue => ({
@@ -49,5 +49,47 @@ describe("ISSUE_SPAWN_CONFIG.specFor", () => {
   test("a genuinely top-level ticket spawns with parent: null", () => {
     const spec = ISSUE_SPAWN_CONFIG.specFor(issue({ issuelinks: [] }));
     expect(spec.parent).toBeNull();
+  });
+});
+
+// BUTCHR-240: the `todoWorkers` fetch seam `createAbandonedDetector`
+// (src/agents/abandoned.ts) optionally takes — a single `deps.search(...)`
+// call over TODO_WORKER_JQL, the house pattern `createRelated` (same file,
+// untested at this level for the same reason: a thin I/O adapter) uses for
+// its own batched extra query.
+describe("createTodoWorkersFetch", () => {
+  test("calls search with exactly TODO_WORKER_JQL and returns its result", async () => {
+    const calls: string[] = [];
+    const worker = issue({ key: "WORK-1", status: "To Do" });
+    const fetch = createTodoWorkersFetch({
+      search: async (jql) => { calls.push(jql); return [worker]; },
+    });
+    expect(await fetch()).toEqual([worker]);
+    expect(calls).toEqual([TODO_WORKER_JQL]);
+  });
+
+  // Deliberate, not just an equality check: TODO_WORKER_JQL must filter
+  // status = "To Do" and must NOT be folded into ISSUE_JQL's own active-set
+  // filter (see both constants' own doc comments for why widening ISSUE_JQL
+  // is out of scope).
+  test("TODO_WORKER_JQL filters status = \"To Do\" for the current user, distinct from ISSUE_JQL", () => {
+    expect(TODO_WORKER_JQL).toContain('status = "To Do"');
+    expect(TODO_WORKER_JQL).toContain("assignee = currentUser()");
+  });
+
+  // BUTCHR-251: `search()` (src/atlassian/client.ts) caps at maxResults = 100
+  // and never paginates, so an ORDER BY-less query has no ordering contract
+  // at all — which rows survive the cap is decided by a property Jira never
+  // promised. Pins the clause to the exact immutable-key ordering rather
+  // than a bare `toContain("ORDER BY")`, which any garbage clause would
+  // satisfy: this fails BY NAME if the clause is dropped (no match) and
+  // fails BY NAME if the key is swapped for a mutable one such as `updated`
+  // (ISSUE_JQL's own `ORDER BY updated DESC`, deliberately NOT copied here
+  // — see TODO_WORKER_JQL's doc comment for why that would reintroduce a
+  // differently-unstable set rather than a stable one). Mutation-tested by
+  // hand against both failures before this landed.
+  test("TODO_WORKER_JQL orders by the immutable (created ASC, key ASC), not the mutable `updated`", () => {
+    const match = TODO_WORKER_JQL.match(/ ORDER BY (.+)$/);
+    expect(match?.[1]).toBe("created ASC, key ASC");
   });
 });
