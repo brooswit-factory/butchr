@@ -95,6 +95,14 @@ export interface CurrencyGit {
    * narrow question answerable at all. Implementation in
    * `realCurrencyGit`.
    *
+   * `baseSha` is what `refs/remotes/origin/main` currently holds, and a
+   * record counts only if it names that same sha — see
+   * `fetchHeadRecordsBaseSha` for why URL and branch alone were not enough
+   * (a fetch BY URL writes an origin-looking record without moving the ref).
+   * That makes the answer narrower still, and precise: *when did this clone
+   * last fetch this branch from this remote in a way that provably bounds
+   * how stale `baseSha` is?*
+   *
    * When no evidence qualifies — a clone that never fetched this branch
    * from this remote, or one whose records cannot be read — this MUST
    * report `ok: false` with the reason, so the caller renders
@@ -102,7 +110,7 @@ export interface CurrencyGit {
    * a number that is confidently wrong here is worse than no number,
    * because a reader cannot tell it is wrong.
    */
-  lastFetchedAt(remote: string, branch: string): GitOpResult<{ iso: string }>;
+  lastFetchedAt(remote: string, branch: string, baseSha: string): GitOpResult<{ iso: string }>;
   /** Count of commits reachable from `to` but not from `from` (`git rev-list --count from..to`) — supplementary evidence only, see module doc comment. */
   commitsBetween(from: string, to: string): GitOpResult<{ count: number }>;
 }
@@ -178,7 +186,8 @@ export function normaliseRemoteUrl(url: string): string {
 }
 
 /**
- * Does this `FETCH_HEAD` body record `branch` fetched from `wantUrl`?
+ * Does this `FETCH_HEAD` body record `branch` fetched from `wantUrl`, **at
+ * exactly `baseSha`** — the sha the tracking ref currently holds?
  *
  * Line format, both shapes measured in this repo's own file:
  *   `<sha>\t\tbranch 'BUTCHR-144' of https://github.com/owner/repo`
@@ -187,15 +196,56 @@ export function normaliseRemoteUrl(url: string): string {
  * tolerate an empty column — splitting on whitespace mis-parses both.
  *
  * A clone fetches many branches, so most lines legitimately name something
- * other than `branch`. Filtering them out is the correct behaviour, never an
+ * other than `branch`. Filtering them out is correct behaviour, never an
  * error condition.
+ *
+ * WHY THE SHA CONDITION EXISTS (BUTCHR-163, found in review — the URL and
+ * branch alone were NOT enough, and the gap was a live false green):
+ * `git fetch <url> main` — a fetch **by URL** rather than by remote NAME —
+ * writes a record naming origin's own URL and `main`, but git updates
+ * `refs/remotes/origin/main` only for a fetch that goes through the
+ * configured remote. Measured on a fixture shaped like a real daemon
+ * checkout:
+ *
+ *   origin/main = 3385921 (STALE)   real main = 04014a4
+ *   FETCH_HEAD  = 04014a4 ... branch 'main' of <origin's url>
+ *
+ * The record looked like origin/main freshness while the ref stayed behind,
+ * and the gate walked to `CURRENT`.
+ *
+ * THE CONDITION IS SOUND, NOT MERELY CONSERVATIVE, and that distinction is
+ * the point: a `FETCH_HEAD` line records the sha the fetch actually SAW for
+ * that branch. If that equals what the tracking ref holds now, then the ref
+ * is provably at least as fresh as that fetch — whatever route the fetch
+ * took. So this does not merely exclude the bad case, it accepts exactly the
+ * cases where the evidence genuinely bounds the base's staleness:
+ *  - an ordinary `git fetch origin` records the sha it sets the ref to, so it
+ *    counts — including a NO-OP fetch that changed nothing, which is the most
+ *    important freshness case of all (the ref did not move because the remote
+ *    did not, and we checked moments ago);
+ *  - a fetch inside a linked worktree moves the SHARED ref and records that
+ *    same sha, so defect 1's case still counts;
+ *  - an explicit-URL fetch counts only when it saw exactly what the ref
+ *    already holds — in which case the ref really is that fresh.
+ *
+ * FALSIFIER: if a plain `git fetch origin` were to record a sha OTHER than
+ * the one it moves `refs/remotes/origin/main` to, this condition would
+ * wrongly reject the ordinary case and degrade every verdict to `unknown`.
+ * Pinned by the real-git tests, which run actual fetches rather than
+ * hand-written records.
+ *
+ * The residual direction is the accepted one: a ref moved by a fetch whose
+ * record has since been overwritten renders `unknown`, never a false
+ * `current`.
  */
-export function fetchHeadNames(content: string, wantUrl: string, branch: string): boolean {
+export function fetchHeadRecordsBaseSha(content: string, wantUrl: string, branch: string, baseSha: string): boolean {
+  const want = baseSha.trim().toLowerCase();
   for (const line of content.split("\n")) {
     const fields = line.split("\t");
     if (fields.length < 3) continue;
     const m = /^branch '(.+)' of (.+)$/.exec(fields[2]!.trim());
-    if (m && m[1] === branch && normaliseRemoteUrl(m[2]!) === wantUrl) return true;
+    if (!m || m[1] !== branch || normaliseRemoteUrl(m[2]!) !== wantUrl) continue;
+    if (fields[0]!.trim().toLowerCase() === want) return true;
   }
   return false;
 }
@@ -227,7 +277,7 @@ export function realCurrencyGit(dir: string): CurrencyGit {
       }
       return { ok: false, error: `no reflog file or loose ref file found for ${ref} under ${gitDir.path} (likely packed, with reflogs disabled) — cannot determine when its value last changed without guessing` };
     },
-    lastFetchedAt(remote, branch) {
+    lastFetchedAt(remote, branch, baseSha) {
       const gitDir = resolveGitCommonDir(dir);
       if (!gitDir.ok) return { ok: false, error: `could not resolve the git directory to check FETCH_HEAD: ${gitDir.error}` };
 
@@ -263,7 +313,7 @@ export function realCurrencyGit(dir: string): CurrencyGit {
         // fetch that WROTE it recorded that branch from that URL. The file is
         // overwritten wholesale on every fetch, so its mtime describes only
         // its current content — which is exactly what makes this check sound.
-        if (fetchHeadNames(content, wantUrl, branch) && (newest === null || mtimeMs > newest)) newest = mtimeMs;
+        if (fetchHeadRecordsBaseSha(content, wantUrl, branch, baseSha) && (newest === null || mtimeMs > newest)) newest = mtimeMs;
       }
 
       if (newest === null) {
@@ -272,7 +322,7 @@ export function realCurrencyGit(dir: string): CurrencyGit {
           error:
             scanned === 0
               ? `no readable FETCH_HEAD in ${gitDir.path} or any of its worktrees — this clone has apparently never fetched from a remote`
-              : `scanned ${scanned} FETCH_HEAD record(s) under ${gitDir.path} and none recorded branch '${branch}' from ${wantUrl} — this clone's most recent fetches were of something else, so none of them bounds how stale ${remote}/${branch} is here`,
+              : `scanned ${scanned} FETCH_HEAD record(s) under ${gitDir.path} and none recorded branch '${branch}' from ${wantUrl} at ${baseSha} — this clone's most recent fetches were of something else, or saw a different sha than ${remote}/${branch} now holds, so none of them bounds how stale it is here`,
         };
       }
       return { ok: true, iso: new Date(newest).toISOString() };
@@ -380,7 +430,7 @@ export function resolveCurrency(running: RunningBuild, git: CurrencyGit): Curren
   if (!baseTree.ok) return { status: "unknown", reason: `${BASE_REF} (${baseSha}) has no readable tree: ${baseTree.error}` };
 
   const changedAt = git.refChangedAt(BASE_REF);
-  const fetchedAt = git.lastFetchedAt(BASE_REMOTE, BASE_BRANCH);
+  const fetchedAt = git.lastFetchedAt(BASE_REMOTE, BASE_BRANCH, baseSha);
   const base: ResolvedBase = {
     ref: BASE_REF,
     sha: baseSha,

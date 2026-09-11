@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   computeBuildCurrency,
-  fetchHeadNames,
+  fetchHeadRecordsBaseSha,
   normaliseRemoteUrl,
   realCurrencyGit,
   renderBuildCurrencyLines,
@@ -294,7 +294,7 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
       expect(g.treeOf("HEAD").ok).toBe(false);
       expect(g.commitsBetween("a", "b").ok).toBe(false);
       expect(g.refChangedAt("refs/remotes/origin/main").ok).toBe(false);
-      expect(g.lastFetchedAt("origin", "main").ok).toBe(false);
+      expect(g.lastFetchedAt("origin", "main", "a".repeat(40)).ok).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -320,7 +320,7 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
       // DIFFERENT honest failure — so the fixture would no longer be testing
       // "never fetched" at all.
       execFileSync("git", ["remote", "add", "origin", "https://example.invalid/o/r.git"], { cwd: dir });
-      const r = realCurrencyGit(dir).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(dir).lastFetchedAt("origin", "main", "a".repeat(40));
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain("never fetched");
     } finally {
@@ -331,7 +331,7 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
   test("lastFetchedAt: no origin remote at all is its own honest failure, distinct from never-fetched", () => {
     const dir = initRepo();
     try {
-      const r = realCurrencyGit(dir).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(dir).lastFetchedAt("origin", "main", "a".repeat(40));
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain("remote.origin.url");
     } finally {
@@ -363,11 +363,11 @@ describe("realCurrencyGit — real git, real temp repo, no mocking", () => {
       gitIn(remote, "commit", "-q", "-m", "first");
 
       gitIn(tmpdir(), "clone", "-q", remote, clone);
-      const before = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const before = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(before.ok).toBe(false);
 
       gitIn(clone, "fetch", "-q", "origin"); // a real, even no-op, fetch
-      const after = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const after = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(after.ok).toBe(true);
     } finally {
       rmSync(remote, { recursive: true, force: true });
@@ -514,6 +514,16 @@ describe("every git call fails: the currency section still RENDERS, never vanish
 // appear) must not be rebuilt in a fixture.
 // ---------------------------------------------------------------------------
 
+/**
+ * What `refs/remotes/origin/main` currently holds in `dir` — the sha
+ * `lastFetchedAt` now requires a FETCH_HEAD record to name. Reading it from
+ * the repo rather than hard-coding it is deliberate: a hard-coded sha would
+ * make these fixtures pass for the wrong reason.
+ */
+function baseShaOf(dir: string): string {
+  return execFileSync("git", ["rev-parse", "refs/remotes/origin/main"], { cwd: dir, encoding: "utf8" }).trim();
+}
+
 describe("BUTCHR-163 — normaliseRemoteUrl", () => {
   // MEASURED on this repo: remote.origin.url carries `.git`, and 0 of 273
   // FETCH_HEAD lines do. Exact equality therefore matches NOTHING, degrading
@@ -532,7 +542,7 @@ describe("BUTCHR-163 — normaliseRemoteUrl", () => {
   });
 });
 
-describe("BUTCHR-163 — fetchHeadNames parses the real FETCH_HEAD shapes", () => {
+describe("BUTCHR-163 — fetchHeadRecordsBaseSha parses the real FETCH_HEAD shapes", () => {
   const URL_NO_SUFFIX = "https://github.com/o/r";
   // Both shapes are present in this repo's own FETCH_HEAD: the for-merge line
   // has an EMPTY middle field, the rest carry `not-for-merge`.
@@ -540,31 +550,42 @@ describe("BUTCHR-163 — fetchHeadNames parses the real FETCH_HEAD shapes", () =
   const NOT_FOR_MERGE = `${"b".repeat(40)}\tnot-for-merge\tbranch 'main' of ${URL_NO_SUFFIX}`;
 
   test("matches the for-merge line, whose middle tab-separated field is EMPTY", () => {
-    expect(fetchHeadNames(FOR_MERGE, URL_NO_SUFFIX, "main")).toBe(true);
+    expect(fetchHeadRecordsBaseSha(FOR_MERGE, URL_NO_SUFFIX, "main", "a".repeat(40))).toBe(true);
   });
 
   test("matches a not-for-merge line", () => {
-    expect(fetchHeadNames(NOT_FOR_MERGE, URL_NO_SUFFIX, "main")).toBe(true);
+    expect(fetchHeadRecordsBaseSha(NOT_FOR_MERGE, URL_NO_SUFFIX, "main", "b".repeat(40))).toBe(true);
   });
 
   test("matches when the CONFIGURED url carries .git but the record does not — the measured mismatch", () => {
-    expect(fetchHeadNames(NOT_FOR_MERGE, normaliseRemoteUrl("https://github.com/o/r.git"), "main")).toBe(true);
+    expect(fetchHeadRecordsBaseSha(NOT_FOR_MERGE, normaliseRemoteUrl("https://github.com/o/r.git"), "main", "b".repeat(40))).toBe(true);
   });
 
   test("a record for ANOTHER BRANCH of the right remote is not evidence about main", () => {
     const other = `${"c".repeat(40)}\tnot-for-merge\tbranch 'BUTCHR-144' of ${URL_NO_SUFFIX}`;
-    expect(fetchHeadNames(other, URL_NO_SUFFIX, "main")).toBe(false);
+    expect(fetchHeadRecordsBaseSha(other, URL_NO_SUFFIX, "main", "c".repeat(40))).toBe(false);
   });
 
   test("DEFECT 2: a record for another REMOTE is not evidence, even for the right branch", () => {
     const otherRemote = `${"d".repeat(40)}\tnot-for-merge\tbranch 'main' of https://github.com/o/ELSEWHERE`;
-    expect(fetchHeadNames(otherRemote, URL_NO_SUFFIX, "main")).toBe(false);
+    expect(fetchHeadRecordsBaseSha(otherRemote, URL_NO_SUFFIX, "main", "d".repeat(40))).toBe(false);
+  });
+
+  // THE REVIEW FINDING, at the unit layer. A record can name origin's own URL
+  // and the base branch and STILL not be evidence about the base, because a
+  // fetch BY URL writes exactly that line without moving the tracking ref.
+  test("a record naming the right remote and branch but a DIFFERENT sha is NOT evidence", () => {
+    expect(fetchHeadRecordsBaseSha(NOT_FOR_MERGE, URL_NO_SUFFIX, "main", "e".repeat(40))).toBe(false);
+  });
+
+  test("the sha comparison is case-insensitive, since git's own output casing is not a contract", () => {
+    expect(fetchHeadRecordsBaseSha(NOT_FOR_MERGE, URL_NO_SUFFIX, "main", "B".repeat(40))).toBe(true);
   });
 
   test("garbage and empty input are false, never a throw", () => {
-    expect(() => fetchHeadNames("", URL_NO_SUFFIX, "main")).not.toThrow();
-    expect(fetchHeadNames("", URL_NO_SUFFIX, "main")).toBe(false);
-    expect(fetchHeadNames("no tabs here at all", URL_NO_SUFFIX, "main")).toBe(false);
+    expect(() => fetchHeadRecordsBaseSha("", URL_NO_SUFFIX, "main", "a".repeat(40))).not.toThrow();
+    expect(fetchHeadRecordsBaseSha("", URL_NO_SUFFIX, "main", "a".repeat(40))).toBe(false);
+    expect(fetchHeadRecordsBaseSha("no tabs here at all", URL_NO_SUFFIX, "main", "a".repeat(40))).toBe(false);
   });
 });
 
@@ -590,7 +611,7 @@ describe("BUTCHR-163 — realCurrencyGit.lastFetchedAt against real git", () => 
     const { clone, cleanup } = cloneWithRemote();
     try {
       execFileSync("git", ["fetch", "-q", "origin"], { cwd: clone });
-      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(r.ok).toBe(true);
       if (r.ok) expect(Number.isNaN(Date.parse(r.iso))).toBe(false);
     } finally {
@@ -612,7 +633,7 @@ describe("BUTCHR-163 — realCurrencyGit.lastFetchedAt against real git", () => 
       rmSync(join(clone, ".git", "FETCH_HEAD"), { force: true });
       execFileSync("git", ["fetch", "-q", "origin"], { cwd: wt });
       expect(existsSync(join(clone, ".git", "FETCH_HEAD"))).toBe(false); // the asymmetry, pinned
-      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(r.ok).toBe(true);
     } finally {
       cleanup();
@@ -635,7 +656,7 @@ describe("BUTCHR-163 — realCurrencyGit.lastFetchedAt against real git", () => 
       execFileSync("git", ["fetch", "-q", "other"], { cwd: clone });
       // The bare mtime is fresh — the pre-fix code returned ok:true here.
       expect(existsSync(join(clone, ".git", "FETCH_HEAD"))).toBe(true);
-      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain("none recorded branch 'main'");
     } finally {
@@ -648,9 +669,60 @@ describe("BUTCHR-163 — realCurrencyGit.lastFetchedAt against real git", () => 
     const { clone, cleanup } = cloneWithRemote();
     try {
       rmSync(join(clone, ".git", "FETCH_HEAD"), { force: true });
-      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main");
+      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error.length).toBeGreaterThan(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // DEFECT 4 — found IN REVIEW of the fix for defects 1 and 2, and the reason
+  // naming the URL and branch was not enough on its own.
+  //
+  // `git fetch <url> main` — by URL, not by remote NAME — writes a record
+  // naming origin's own URL and `main`, but git updates
+  // refs/remotes/origin/main only for a fetch that goes through the
+  // configured remote. So the record read as origin/main freshness while the
+  // ref stayed behind, and the gate walked to a false CURRENT.
+  //
+  // THE FIXTURE'S STARTING STATE DIFFERS FROM THE STATE UNDER TEST, and here
+  // that is not a formality — it is why the earlier tests missed this:
+  // origin/main must have a REAL REFLOG, created by an actual ref-moving
+  // `git fetch origin`. Without one, `refChangedAt` fails and the verdict
+  // stops at `unknown` for an unrelated reason, so the test would pass
+  // against the broken code and prove nothing.
+  test("DEFECT 4: a fetch BY URL freshens FETCH_HEAD without moving the ref, and must not count", () => {
+    const { clone, remote, cleanup } = cloneWithRemote();
+    const g = (cwd: string, ...a: string[]) => execFileSync("git", a, { cwd, encoding: "utf8" });
+    try {
+      const seed = join(remote, "..", "seed");
+      // A real, ref-moving fetch first: this is what gives origin/main a reflog.
+      g(seed, "commit", "-q", "--allow-empty", "-m", "second");
+      g(seed, "push", "-q", "origin", "HEAD:main");
+      g(clone, "fetch", "-q", "origin");
+      const refAfterRealFetch = baseShaOf(clone);
+
+      // Now the remote advances AGAIN, and the clone fetches BY URL.
+      g(seed, "commit", "-q", "--allow-empty", "-m", "third");
+      g(seed, "push", "-q", "origin", "HEAD:main");
+      const url = g(clone, "config", "--get", "remote.origin.url").trim();
+      g(clone, "fetch", "-q", url, "main");
+
+      // The preconditions this test depends on — asserted, not assumed.
+      expect(baseShaOf(clone)).toBe(refAfterRealFetch); // the ref did NOT move
+      const record = readFileSync(join(clone, ".git", "FETCH_HEAD"), "utf8");
+      expect(record).toContain("branch 'main' of"); // it DOES look like origin/main
+      expect(record).not.toContain(refAfterRealFetch); // recording a newer sha
+
+      // The verdict must not claim freshness the ref does not have.
+      const r = realCurrencyGit(clone).lastFetchedAt("origin", "main", baseShaOf(clone));
+      expect(r.ok).toBe(false);
+
+      // And end-to-end: a build matching the STALE ref must not render current.
+      const v = resolveCurrency({ sha: baseShaOf(clone), shaDirty: false, shaUnknownReason: null }, realCurrencyGit(clone));
+      expect(v.status).toBe("unknown");
+      expect(renderBuildCurrencyLines({ sha: baseShaOf(clone), shaProvenance: "git-at-start", shaDirty: false, version: "0" }, v).join("\n")).not.toContain("CURRENT");
     } finally {
       cleanup();
     }
@@ -660,8 +732,8 @@ describe("BUTCHR-163 — realCurrencyGit.lastFetchedAt against real git", () => 
     const { clone, cleanup } = cloneWithRemote();
     try {
       const g = realCurrencyGit(clone);
-      expect(() => g.lastFetchedAt("nosuchremote", "main")).not.toThrow();
-      expect(g.lastFetchedAt("nosuchremote", "main").ok).toBe(false);
+      expect(() => g.lastFetchedAt("nosuchremote", "main", baseShaOf(clone))).not.toThrow();
+      expect(g.lastFetchedAt("nosuchremote", "main", baseShaOf(clone)).ok).toBe(false);
     } finally {
       cleanup();
     }
