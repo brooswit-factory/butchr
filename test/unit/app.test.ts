@@ -13,6 +13,7 @@ import type { JiraIssue } from "../../src/atlassian/types.js";
 import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
+import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
 // DashboardResponse literal below that predates the admission view and isn't
@@ -99,6 +100,38 @@ describe("butchr daemon app", () => {
     expect(await a.nextFrame()).toMatchObject({ content: "hello", meta: { issue: "KAN-9" } });
     expect((await notifyIssue(mcp, "KAN-000", "x")).sent).toEqual([]);
     await a.disconnect(); await Bun.sleep(30);
+  });
+});
+
+// BUTCHR-341 (B): a connection refused for missing `x-issue` produces
+// exactly one [tools2] record — before this ticket, @brooswit/thatch
+// returned the 401 with no log line of any kind (see src/tools/outcome.ts's
+// own doc comment for where that was confirmed) and nothing else observed
+// it either, so this path left NO record at all.
+describe("BUTCHR-341 (B): a pre-identity connection refusal is recorded", () => {
+  test("a connection with no x-issue header logs exactly one [tools2] outcome=refused line with the explicit unknown-caller marker", async () => {
+    const lines: string[] = [];
+    const { app: appB, mcp: mcpB } = buildApp(view, {}, (l) => lines.push(l));
+    appB.listen(0);
+    const baseB = `http://localhost:${appB.server!.port}`;
+    try {
+      await expect(FakeConnection.connect(baseB, { headers: {} })).rejects.toThrow();
+      const outcomeLines = lines.filter((l) => l.includes(OUTCOME_TAG));
+      expect(outcomeLines).toHaveLength(1);
+      expect(outcomeLines[0]).toBe(preIdentityRefusalLine());
+      expect(outcomeLines[0]).toContain(`caller=${UNKNOWN_CALLER}`);
+      expect(outcomeLines[0]).toContain("outcome=refused");
+      expect(outcomeLines[0]).not.toContain("verb=");
+      expect(outcomeLines[0]).not.toContain("target=");
+
+      // a SUCCESSFUL connect, on the same app, must NOT add another one.
+      const a = await FakeConnection.connect(baseB, { headers: { "x-issue": "KAN-1" } });
+      await a.disconnect(); await Bun.sleep(30);
+      expect(lines.filter((l) => l.includes(OUTCOME_TAG))).toHaveLength(1);
+    } finally {
+      await mcpB.closeAll();
+      appB.stop();
+    }
   });
 });
 

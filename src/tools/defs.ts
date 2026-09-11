@@ -12,6 +12,7 @@ import {
 import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 import { unwrapStorageParagraph } from "./speak.js";
+import { Refusal, withOutcomeRecording } from "./outcome.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -39,7 +40,7 @@ const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 
 /** Every one of BUTCHR-35's ten relationship verbs refuses a connection with no `x-issue`, in the same shape get_doc/set_doc already use — refusing beats resolving to an unknown caller. */
 function requireCaller(c: { headers: Record<string, string> }, verb: string): string {
   const who = c.headers["x-issue"];
-  if (!who) throw new Error(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
+  if (!who) throw new Refusal(`${verb}: this connection has no x-issue — refusing rather than resolving to an unknown caller`);
   return who;
 }
 
@@ -68,7 +69,7 @@ function requireCaller(c: { headers: Record<string, string> }, verb: string): st
 function refuseProjectCaller(c: { headers: Record<string, string> }, verb: string, why: string): void {
   const who = c.headers["x-issue"];
   if (who && isProjectId(who)) {
-    throw new Error(`${verb}: refusing a project caller — ${why}`);
+    throw new Refusal(`${verb}: refusing a project caller — ${why}`);
   }
 }
 
@@ -89,7 +90,7 @@ function requireProjectCaller(
 ): string {
   const who = requireCaller(c, verb);
   if (!isProjectId(who)) {
-    throw new Error(`${verb}: refusing an issue caller — ${why}`);
+    throw new Refusal(`${verb}: refusing an issue caller — ${why}`);
   }
   return who;
 }
@@ -112,7 +113,7 @@ function requireIssueCaller(
 ): string {
   const who = requireCaller(c, verb);
   if (isProjectId(who)) {
-    throw new Error(`${verb}: refusing a project caller — ${why}`);
+    throw new Refusal(`${verb}: refusing a project caller — ${why}`);
   }
   return who;
 }
@@ -231,7 +232,7 @@ export function atlassianTools(
     const writer = c.headers["x-issue"];
     if (writer) onWrite?.(keys, writer);
   };
-  return {
+  const tools: Record<string, ToolDef<any>> = {
     jira_get_issue: {
       description: "Read a Jira issue (fields incl. description, status, parent, labels).",
       input: { key: z.string() },
@@ -311,7 +312,7 @@ export function atlassianTools(
           if (!assignee) {
             const envVar = p.issuetype === "Story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
             audit(c, `create ${p.issuetype} under ${p.parent ?? "(none)"} REFUSED: no assignee (${envVar} unset) [deprecated alias; use new_worker] ${clsTag}`);
-            throw new Error(noAssigneeMsg(p.issuetype));
+            throw new Refusal(noAssigneeMsg(p.issuetype));
           }
         }
 
@@ -328,7 +329,7 @@ export function atlassianTools(
             target = p.parent;
           } else {
             audit(c, `create ${p.issuetype} under (none) REFUSED: no implements target [deprecated alias; use new_worker] ${clsTag}`);
-            throw new Error(noTargetMsg(p.issuetype));
+            throw new Refusal(noTargetMsg(p.issuetype));
           }
         }
 
@@ -411,7 +412,7 @@ export function atlassianTools(
           if (!resolved) {
             const envVar = role === "story" ? "BUTCHR_ASSIGNEE_STORY" : "BUTCHR_ASSIGNEE_TASK";
             audit(c, `assign ${key} → ${role} REFUSED: no assignee (${envVar} unset) [deprecated alias; use adopt_worker] ${aliasTag("jira_assign", "ambiguous")}`);
-            throw new Error(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
+            throw new Refusal(`jira_assign: no assignee for role "${role}" — set ${envVar} (an Atlassian accountId) on this daemon, or pass an explicit accountId`);
           }
           accountId = resolved;
           label = role;
@@ -456,7 +457,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const p = a as { titleContains?: string; cql?: string; spaceId?: string; spaceKey?: string; limit?: number };
         if (!p.titleContains && !p.cql) {
-          throw new Error("confluence_search_pages: pass `titleContains` or `cql` — at least one is required");
+          throw new Refusal("confluence_search_pages: pass `titleContains` or `cql` — at least one is required");
         }
         const escape = (s: string) => s.replace(/"/g, '\\"');
         let cql: string;
@@ -472,7 +473,7 @@ export function atlassianTools(
             // rather than emit a clause that would silently match nothing.
             const spaces = (await ops.listSpaces()) as { results?: Array<{ id?: string; key?: string }> };
             const match = spaces?.results?.find((s) => s.id === p.spaceId);
-            if (!match?.key) throw new Error(`confluence_search_pages: no space found with id ${p.spaceId}`);
+            if (!match?.key) throw new Refusal(`confluence_search_pages: no space found with id ${p.spaceId}`);
             clauses.push(`space = "${escape(match.key)}"`);
           }
           cql = clauses.join(" AND ");
@@ -508,7 +509,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const { key, offset, limit, expectVersion } = a as { key?: string; offset?: number; limit?: number; expectVersion?: number };
         const who = c.headers["x-issue"];
-        if (!who) throw new Error("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        if (!who) throw new Refusal("get_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         const target = key ?? who;
         audit(c, `get_doc ${target}${key ? "" : " (self)"}`);
         // Dispatch is on the TARGET's own shape, never the caller's — this is
@@ -526,7 +527,7 @@ export function atlassianTools(
       handler: async (a, c) => {
         const { body, title } = a as { body: string; title?: string };
         const who = c.headers["x-issue"];
-        if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
+        if (!who) throw new Refusal("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
         const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title, log) : await setDoc(ops, who, body, title);
         noted(c, [who]); // the remote-link upsert (issue) / page update (project) bumps the doc's own `updated`
@@ -988,4 +989,8 @@ export function atlassianTools(
       },
     },
   };
+  // BUTCHR-341: the ONE place `tools` is assembled — see `withOutcomeRecording`'s
+  // own doc comment (src/tools/outcome.ts) for why wrapping happens exactly
+  // here rather than at each of the 34 definitions above.
+  return withOutcomeRecording(tools, log);
 }

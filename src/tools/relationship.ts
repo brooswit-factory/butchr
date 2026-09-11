@@ -9,6 +9,7 @@ import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 import { AGENT_PREFIX } from "../labels/plan.js";
+import { Refusal } from "./outcome.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
@@ -88,7 +89,7 @@ export function guardShortProse(verb: string, argName: string, raw: string): voi
     m[1] !== undefined
       ? `what looks like a premature closing tag naming \`${name}\``
       : `what looks like the wrapper that opens the NEXT tool-call argument (naming \`${name}\`)`;
-  throw new Error(
+  throw new Refusal(
     `${verb}: \`${argName}\` contains ${what}, partway through its own text — the exact seam a malformed tool call leaves when the harness's argument parser folds a LATER argument into this one instead of starting it separately (measured twice in this corpus: BUTCHR-127, BUTCHR-164). ` +
       `Length alone is not the problem — a long, honest \`${argName}\` is fine on its own. Rewrite the call so \`${argName}\` holds only its own value, and check that every other argument you meant to send is still its own separate argument rather than text trapped inside this one. If you genuinely need literal tag syntax inside \`${argName}\`, describe it in words instead of the raw characters — the same discipline this defect's own tickets use when they have to talk about it. This call was refused before anything was written or posted.`,
   );
@@ -355,17 +356,17 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
   if (isProjectId(callerKey)) {
     const project = projectKeyOf(issue);
     if (project !== callerKey) {
-      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
+      throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
     }
     const type = issuetypeOf(issue);
     if (type !== "Epic") {
-      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
+      throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
     }
     return issue;
   }
   const boss = findBossKey(issue);
   if (boss !== callerKey) {
-    throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
+    throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
   return issue;
 }
@@ -577,7 +578,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
 
   const { disposition } = input;
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   guardShortProse("new_worker", "summary", input.summary);
   if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
@@ -608,12 +609,12 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     const msg = callerType === "Task"
       ? `new_worker: ${callerKey} is a Task — a Task is the bottom of this hierarchy and has no worker beneath it; new_worker can only be called by an Epic or a Story`
       : `new_worker: ${callerKey}'s issue type ("${callerType ?? "unknown"}") has no defined child type — new_worker can only be called by an Epic or a Story`;
-    throw new Error(msg);
+    throw new Refusal(msg);
   }
   const role = childType === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("new_worker", childType));
+  if (!role) throw new Refusal(noRoleMsg("new_worker", childType));
   const projectKey = projectKeyOf(callerIssue);
-  if (!projectKey) throw new Error(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
+  if (!projectKey) throw new Refusal(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
   // (1) create — irreversible; the shelve label, if any, lands HERE.
   const created = (await ops.createIssue({
@@ -626,7 +627,7 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to link or transition against nothing");
+  if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to link or transition against nothing");
 
   // Rollback for steps 2/3 only (see the function comment for why step 4
   // never rolls back). Attempts the delete unconditionally — see
@@ -743,12 +744,12 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
 async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   guardShortProse("new_worker", "summary", input.summary);
   if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
   const role = roles.epic;
-  if (!role) throw new Error(noRoleMsg("new_worker", "Epic"));
+  if (!role) throw new Refusal(noRoleMsg("new_worker", "Epic"));
 
   // (1) create — irreversible; the shelve label, if any, lands HERE.
   // Membership in `projectKey` is already real the instant this returns.
@@ -762,7 +763,7 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("new_worker: create response carried no issue key — refusing to transition against nothing");
+  if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to transition against nothing");
 
   const rollback = makeRollback(ops, "new_worker", key);
 
@@ -1001,7 +1002,7 @@ export async function checkWorker(
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("finish_worker", workerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_worker", workerKey, open));
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
@@ -1015,7 +1016,7 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
  * workers, and refuses an empty reason.
  */
 export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerKey: string, reason: string): Promise<void> {
-  if (!reason.trim()) throw new Error("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+  if (!reason.trim()) throw new Refusal("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   guardShortProse("shelve_worker", "reason", reason);
   await assertOwnWorker(ops, "shelve_worker", callerKey, workerKey);
   // LABEL BEFORE TRANSITION, on purpose (order the writes by how bad it is to
@@ -1103,7 +1104,7 @@ export interface AdoptWorkerResult {
  */
 export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
   if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Error("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
+    throw new Refusal("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
   }
   if (disposition.kind === "shelve") guardShortProse("adopt_worker", "reason", disposition.reason);
   if (isProjectId(callerKey)) return adoptProjectWorker(ops, roles, callerKey, workerKey, disposition);
@@ -1111,15 +1112,15 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const issue = await ops.getIssue(workerKey);
   const existingBoss = findBossKey(issue);
   if (existingBoss && existingBoss !== callerKey) {
-    throw new Error(`adopt_worker: ${workerKey} is already linked to a different boss (${existingBoss}) — stealing another boss's worker must be an explicit act, not a side effect of a mistyped key; use jira_link_issues only if this is deliberate`);
+    throw new Refusal(`adopt_worker: ${workerKey} is already linked to a different boss (${existingBoss}) — stealing another boss's worker must be an explicit act, not a side effect of a mistyped key; use jira_link_issues only if this is deliberate`);
   }
 
   const issuetype = issuetypeOf(issue) as "Story" | "Task" | undefined;
   if (issuetype !== "Story" && issuetype !== "Task") {
-    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
+    throw new Refusal(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted as a worker — only a Story or a Task can be`);
   }
   const role = issuetype === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("adopt_worker", issuetype));
+  if (!role) throw new Refusal(noRoleMsg("adopt_worker", issuetype));
 
   const labels = labelsOf(issue);
   const linkedCorrectly = existingBoss === callerKey;
@@ -1296,15 +1297,15 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   const issue = await ops.getIssue(workerKey);
   const existingProject = projectKeyOf(issue);
   if (existingProject !== projectKey) {
-    throw new Error(`adopt_worker: ${workerKey} belongs to project ${existingProject ?? "an unreadable project"}, not ${projectKey} — stealing another project's epic must be an explicit act, not a side effect of a mistyped key`);
+    throw new Refusal(`adopt_worker: ${workerKey} belongs to project ${existingProject ?? "an unreadable project"}, not ${projectKey} — stealing another project's epic must be an explicit act, not a side effect of a mistyped key`);
   }
 
   const issuetype = issuetypeOf(issue);
   if (issuetype !== "Epic") {
-    throw new Error(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted by a project caller — only an Epic can be`);
+    throw new Refusal(`adopt_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") cannot be adopted by a project caller — only an Epic can be`);
   }
   const role = roles.epic;
-  if (!role) throw new Error(noRoleMsg("adopt_worker", "Epic"));
+  if (!role) throw new Refusal(noRoleMsg("adopt_worker", "Epic"));
 
   const labels = labelsOf(issue);
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
@@ -1392,7 +1393,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
 /** Revises a worker's priority. Refuses a key that is not one of the caller's own workers, AND refuses the caller's OWN key — your priority is your boss's judgment, never your own. */
 export async function prioritizeWorker(ops: AtlassianOps, callerKey: string, workerKey: string, priority: string): Promise<unknown> {
   if (workerKey === callerKey) {
-    throw new Error(`prioritize_worker: refusing to set ${callerKey}'s own priority — your priority is your boss's judgment, never your own`);
+    throw new Refusal(`prioritize_worker: refusing to set ${callerKey}'s own priority — your priority is your boss's judgment, never your own`);
   }
   await assertOwnWorker(ops, "prioritize_worker", callerKey, workerKey);
   return ops.setPriority(workerKey, priority);
@@ -1696,7 +1697,7 @@ async function postCorrectionArchive(
   const overhead = tagPrefixLen + CORRECTION_MARKER.length + 1 + PART_HEADER_RESERVED_LEN + CHAIN_SAFETY_MARGIN;
   const perPartBudget = JIRA_COMMENT_CHAR_LIMIT - overhead;
   if (perPartBudget <= 0) {
-    throw new Error(`correct_worker: cannot chain the archive comment on ${workerKey} — the identity tag and markers alone leave no room under Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap; ${workerKey} is UNCHANGED.`);
+    throw new Refusal(`correct_worker: cannot chain the archive comment on ${workerKey} — the identity tag and markers alone leave no room under Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap; ${workerKey} is UNCHANGED.`);
   }
   const chunks = splitPreservingSurrogates(body, perPartBudget);
   const n = chunks.length;
@@ -1721,7 +1722,7 @@ async function postCorrectionArchive(
         // the correct, already-established error thrown next — never a
         // secondary error about the annotation itself failing to post.
       }
-      throw new Error(
+      throw new Refusal(
         `correct_worker: the archive comment for ${workerKey} exceeded Jira's ${JIRA_COMMENT_CHAR_LIMIT}-character comment cap and had to be split into ${n} parts; part ${i} of ${n} failed to post (${postError}) — refusing to edit without a complete archive; ${workerKey} is UNCHANGED. Safe to retry.`,
       );
     }
@@ -1929,25 +1930,25 @@ function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace
  */
 export async function correctWorker(ops: AtlassianOps, callerKey: string, workerKey: string, input: CorrectWorkerInput): Promise<CorrectWorkerResult> {
   if (workerKey === callerKey) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing to correct ${callerKey}'s own description/summary — your own brief is your boss's judgment, never your own; an agent that can rewrite its own definition of done can launder a failure into a success, and the resulting ticket would be indistinguishable from one that was always right. Ask your own boss to correct it instead (ask_boss / report_to_boss) — it can correct you, you cannot correct yourself.`,
     );
   }
   if (input.description === undefined && input.summary === undefined) {
-    throw new Error("correct_worker: neither `description` nor `summary` was given — a correction that corrects nothing is a mistake, not a no-op");
+    throw new Refusal("correct_worker: neither `description` nor `summary` was given — a correction that corrects nothing is a mistake, not a no-op");
   }
   if (!input.why.trim()) {
-    throw new Error("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
+    throw new Refusal("correct_worker: `why` is required and must be non-empty — an intention nobody wrote down is indistinguishable six weeks later from a mistake");
   }
   guardShortProse("correct_worker", "why", input.why);
   if (input.summary !== undefined) guardShortProse("correct_worker", "summary", input.summary);
   if (input.description !== undefined && input.description.length > JIRA_DESCRIPTION_CHAR_LIMIT) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing — the new description is ${input.description.length} characters, over Jira's ${JIRA_DESCRIPTION_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
     );
   }
   if (input.summary !== undefined && input.summary.length > JIRA_SUMMARY_CHAR_LIMIT) {
-    throw new Error(
+    throw new Refusal(
       `correct_worker: refusing — the new summary is ${input.summary.length} characters, over Jira's ${JIRA_SUMMARY_CHAR_LIMIT}-character limit; ${workerKey} is untouched, no comment was posted. Cut it down and retry.`,
     );
   }
@@ -2267,20 +2268,20 @@ export async function tellPeer(
   intent: PeerIntent,
 ): Promise<TellPeerResult> {
   if (!PEER_INTENTS.includes(intent)) {
-    throw new Error(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
+    throw new Refusal(`tell_peer: intent must be exactly one of ${PEER_INTENTS.join(", ")} — got "${intent}"`);
   }
   if (peer === callerKey) {
-    throw new Error(
+    throw new Refusal(
       `tell_peer: ${callerKey} cannot send itself a peer message — a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer, which is a channel to OTHER projects only`,
     );
   }
   if (intent === "decline") {
     const trimmed = text.trim();
     if (!trimmed) {
-      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
+      throw new Refusal(`tell_peer: intent "decline" requires \`text\` to state a reason — refusing an empty or whitespace-only text; a channel with no way to say no produces silent non-compliance, not a recorded refusal`);
     }
     if (PEER_DECLINE_PLACEHOLDERS.has(normalizePeerDeclineText(trimmed))) {
-      throw new Error(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
+      throw new Refusal(`tell_peer: intent "decline" requires \`text\` to state a REAL reason — "${trimmed}" is a placeholder, not one`);
     }
   }
 
@@ -2291,7 +2292,7 @@ export async function tellPeer(
   const target = peers.find((p) => p.key === peer);
   if (!target) {
     const names = peers.length ? peers.map((p) => `${p.key} (${p.name})`).join(", ") : "none";
-    throw new Error(
+    throw new Refusal(
       `tell_peer: "${peer}" is not an eligible peer of ${callerKey} — unknown key, not live, not led by this credential, or missing a readable "butchr" entity property. Eligible peers: ${names}`,
     );
   }
@@ -2326,7 +2327,7 @@ export async function tellPeer(
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("submit_to_boss", callerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("submit_to_boss", callerKey, open));
   return ops.transition(callerKey, "In Review");
 }
 
@@ -2394,12 +2395,12 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
   const issue = await ops.getIssue(callerKey);
   const boss = findBossKey(issue);
   if (boss) {
-    throw new Error(
+    throw new Refusal(
       `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
   const open = await openWorkers(ops, issue);
-  if (open.length > 0) throw new Error(openWorkersRefusal("finish_without_a_boss", callerKey, open));
+  if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");
 }
 
@@ -2470,8 +2471,8 @@ function normalizeDestinationText(raw: string): string {
  * destination looks like, both accepted shapes, and WHY it's asked at all.
  * `reason` is the specific complaint, stated plainly and without scolding.
  */
-function destinationRefusal(reason: string): Error {
-  return new Error(
+function destinationRefusal(reason: string): Refusal {
+  return new Refusal(
     `file_where_it_belongs: ${reason} A destination is either an EXISTING EPIC KEY this work belongs under (e.g. "BUTCHR-25"), or a short REASON it needs a brand-new epic (e.g. "no epic covers observability tooling yet") — both are legitimate, neither is a fallback for the other. ` +
       "This is required, not bureaucracy: filing a ticket outside your own scope is only half the job — saying where it should live is the other half. An orphan with no stated destination is exactly the silent failure this verb exists to prevent.",
   );
@@ -2821,7 +2822,7 @@ async function topmostBoss(ops: AtlassianOps, startKey: string, startIssue: unkn
     key = boss;
     issue = await ops.getIssue(key);
   }
-  throw new Error(`file_where_it_belongs: ${startKey}'s own Implements chain is more than ${MAX_ORPHAN_CHAIN_DEPTH} hops deep — refusing rather than risking a cycle looping forever`);
+  throw new Refusal(`file_where_it_belongs: ${startKey}'s own Implements chain is more than ${MAX_ORPHAN_CHAIN_DEPTH} hops deep — refusing rather than risking a cycle looping forever`);
 }
 
 export interface FileWhereItBelongsInput {
@@ -2949,11 +2950,11 @@ export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, caller
   }
 
   const role = input.issuetype === "Story" ? roles.story : roles.task;
-  if (!role) throw new Error(noRoleMsg("file_where_it_belongs", input.issuetype));
+  if (!role) throw new Refusal(noRoleMsg("file_where_it_belongs", input.issuetype));
 
   const callerIssue = await ops.getIssue(callerKey);
   const projectKey = projectKeyOf(callerIssue);
-  if (!projectKey) throw new Error(`file_where_it_belongs: could not read ${callerKey}'s own project key — refusing rather than guessing`);
+  if (!projectKey) throw new Refusal(`file_where_it_belongs: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
   const header = orphanHeader(destination, callerKey);
   const description = input.description ? `${header}\n\n---\n\n${input.description}` : header;
@@ -2969,7 +2970,7 @@ export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, caller
     labels: [ORPHAN_LABEL],
   })) as { key?: string };
   const key = created.key;
-  if (!key) throw new Error("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
+  if (!key) throw new Refusal("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
 
   // (2) notice — best-effort, never a link.
   const noticeTarget = destination.kind === "epic" ? destination.key : await topmostBoss(ops, callerKey, callerIssue);
