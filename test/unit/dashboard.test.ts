@@ -133,13 +133,15 @@ describe("createDashboardFeed: the could-not-check decision, unit-tested directl
 
   test("repeated snapshot() reads never call list() again and never change confirmedAt", async () => {
     let calls = 0;
-    const f = feed(() => 1000);
+    let now = 1000;
+    const f = feed(() => now);
     await f.poll(async () => {
       calls++;
       return { agents: [agent("butchr-butchr-1", "working")] };
     });
     expect(calls).toBe(1);
 
+    now = 9000; // the clock moves between reads; only a poll may advance confirmedAt
     const first = f.snapshot();
     const second = f.snapshot();
     const third = f.snapshot();
