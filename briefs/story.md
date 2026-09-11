@@ -75,6 +75,15 @@ say — ticket craft is your main skill.
    work directly in it. Your branch is `{{KEY}}`, cut from main, in a
    **worktree** inside THIS directory
    (`git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/main`).
+   **If you are waking or being respawned rather than starting fresh** (from
+   `stand_down`, a crash, a session limit, or a `[butchr:respawn]` notice),
+   check first: the workspace builder rewrites only your brief/CLAUDE/mcp/
+   ENVIRONMENT files over an existing directory, so your worktree and its
+   uncommitted work survive — that is what makes waking safe. `worktree add`
+   fails on a branch/directory that already exists. If `"$PWD/<repo>"` is
+   already there, `cd` into it and keep working (`git status` to see where
+   you left off) instead of re-running `worktree add`; only run it the first
+   time.
    Tell each code task to branch from `{{KEY}}` and PR back into it.
 4. Review each task that reaches **In Review** against what its ticket asked
    — a green test gate is evidence about the gate, not about whether the

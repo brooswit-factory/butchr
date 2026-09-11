@@ -25,7 +25,18 @@ instead. If you ever doubt it, verify live with `jira_get_issue`'s
      `git fetch` is fine; no checkout/pull there). Work in a **worktree** inside
      THIS directory instead:
      `git -C ~/code/<owner>/<repo> worktree add "$PWD/<repo>" -b {{KEY}} origin/<parent-branch>`
-     (your ticket names the repo and the parent branch). Commit, push, PR into
+     (your ticket names the repo and the parent branch).
+     **If you are being respawned rather than starting fresh** (a crash, a
+     session limit, a `[butchr:respawn]` notice — `briefs/task.md` does not
+     currently teach `stand_down`, but every other respawn path already
+     lands you here): check first. The workspace builder rewrites only your
+     brief/CLAUDE/mcp/ENVIRONMENT files over an existing directory, so your
+     worktree and any uncommitted work survive a respawn — that is what
+     makes "no work lost" true. `worktree add` FAILS on a branch/directory
+     that already exists. If `"$PWD/<repo>"` is already there, `cd` into it
+     and pick up where you left off (`git status`/`git log` to see) instead
+     of re-running `worktree add`; only run it the first time.
+     Commit, push, PR into
      the parent's branch. If the repo gates releases with per-PR changelog
      fragments (check for a `changelog.d/` directory), add yours there instead
      of editing `CHANGELOG.md` or `package.json`'s version directly — the
