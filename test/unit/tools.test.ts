@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
@@ -2416,5 +2418,65 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
     const result = (await tools.tell_peer!.handler({ peer: "DROVR", text: "hi", intent: "notice" }, conn)) as { ok: boolean };
     expect(result.ok).toBe(true);
     expect(pageComments.length).toBe(1);
+  });
+});
+
+// BUTCHR-336: backstop for the MECHANISM sentence — a lightweight guard so
+// deleting the sentence from a tool description also fails something, not
+// just the reader's trust. The REAL pin is the ordering behaviour itself,
+// in test/unit/admission.test.ts's "priority is not an admission-order
+// input" describe block; this only proves the boss-facing prose is present,
+// not that the mechanism it describes is true.
+describe("BUTCHR-336: every boss-facing priority surface states the admission mechanism", () => {
+  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+
+  test("prioritize_worker, new_worker, file_where_it_belongs, jira_create_issue and jira_set_priority all carry the mechanism sentence", () => {
+    const { tools } = rig();
+    for (const name of ["prioritize_worker", "new_worker", "file_where_it_belongs", "jira_create_issue", "jira_set_priority"] as const) {
+      expect(tools[name]!.description).toContain(MECHANISM_CLAUSE);
+    }
+  });
+});
+
+// BUTCHR-299 (review of BUTCHR-336): the SAME backstop, extended to the
+// briefs — the copy every boss agent actually reads. The tool-description
+// guard above left a hole this fills: deleting the mechanism sentence from
+// a brief used to fail nothing, and a claim in prose that nothing executes
+// is exactly the defect this work exists to remove.
+//
+// The set of briefs is DERIVED, never hand-listed: any brief that tells a
+// boss to revise a worker's priority ("priority as reality shifts") must
+// also state that doing so does not change what gets staffed. That way a
+// brief which GAINS the guidance later is covered automatically, and
+// briefs/task.md — whose only mention is about WHO sets priority, not its
+// effect — is correctly excluded without naming it.
+//
+// Briefs HARD-WRAP, so both sides are matched on whitespace-collapsed text.
+// A line-naive match here reports a confident false negative: the sentence
+// is present but spans a line break. That mistake was actually made while
+// verifying this change, which is why the unwrapping is load-bearing
+// rather than incidental.
+describe("BUTCHR-299: every brief that tells a boss to revise priority also states the admission mechanism", () => {
+  const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
+  const GUIDANCE = "priority as reality shifts";
+  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+  const unwrapped = (file: string) => readFileSync(join(BRIEFS_DIR, file), "utf8").replace(/\s+/g, " ");
+
+  const briefs = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md"));
+  const withGuidance = briefs.filter((f) => unwrapped(f).includes(GUIDANCE));
+
+  // Positive control on the derivation itself. Without this, rewording the
+  // guidance would empty `withGuidance`, and a test.each over an empty list
+  // PASSES while pinning nothing — the silent-zero failure mode.
+  test("the derived set is non-empty, so the checks below are actually asserting something", () => {
+    expect(withGuidance.length).toBeGreaterThan(0);
+  });
+
+  test.each(withGuidance)("%s carries the mechanism sentence", (file) => {
+    expect(unwrapped(file)).toContain(MECHANISM_CLAUSE);
+  });
+
+  test("briefs/task.md is deliberately excluded — its mention is about WHO sets priority, not its effect", () => {
+    expect(withGuidance).not.toContain("task.md");
   });
 });
