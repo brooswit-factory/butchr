@@ -1550,8 +1550,9 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
   });
 
   // BUTCHR-81 (found at review): check_in must read epic comments via the
-  // SAME reader discovery uses (getIssueComments — newest-first, capped),
-  // never getIssue's embedded fields.comment block (measured ascending/
+  // SAME reader discovery uses (getIssueComments — newest-first, paginated
+  // to exhaustion as of BUTCHR-309, no longer capped at 20), never getIssue's
+  // embedded fields.comment block (measured ascending/
   // oldest-first with an unconfirmed cap) — otherwise the two readers could
   // disagree on which ids exist at all.
   //
