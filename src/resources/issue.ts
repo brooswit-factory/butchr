@@ -25,6 +25,7 @@ import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
+import type { StandDownRegistry } from "../agents/stand-down.js";
 import type {
   Activation,
   EventPoll,
@@ -69,17 +70,24 @@ export const issueIdOf = (issue: JiraIssue): string => issue.key;
  * ACTIVATION: delegates to the SHARED `isActive` (src/reconcile/plan.ts) —
  * see this module's top comment for why that predicate is not forked here.
  *
- * BUTCHR-66/83: issues do not sleep — this is acceptance criterion 3
- * expressed as the RANGE of this function rather than a flag anybody could
- * flip by accident. `isActive(issue.status)` is a boolean; mapping `true` to
- * `"active"` and `false` to `"inactive"` means `"asleep"` is not merely
- * unused here, it is UNREACHABLE — nothing this function can be handed ever
- * produces it. See test/unit/sleep.test.ts for the structural proof (every
- * `ACTIVE_STATUSES` member and a representative sample of non-active
- * statuses, asserting the literal return value is never `"asleep"`).
+ * BUTCHR-66/83 held that issues do not sleep at all — "asleep" was
+ * UNREACHABLE from this function, not merely unused, because `isActive`'s
+ * boolean had nowhere else to go. BUTCHR-307 narrows that claim rather than
+ * reversing it: `"asleep"` is still unreachable from STATUS ALONE (a
+ * `stand_down`'d issue's Jira status never changes — it stays "In Progress"
+ * the whole time, see that ticket's own design), but is now reachable
+ * through `issue.asleep`, a SYNTHETIC field (src/atlassian/types.ts's own
+ * doc comment) that only `createIssueResourceType`'s `discovery.search()`
+ * below ever stamps, from the in-memory stand-down registry
+ * (src/agents/stand-down.ts). This function itself stays a plain,
+ * synchronous read of `T` either way — no registry consulted here, no
+ * change to the pure/synchronous contract `runResourceLoop`'s two-pass
+ * correctness argument depends on (src/daemon/loop.ts). See
+ * test/unit/sleep.test.ts for both halves of the updated proof: status
+ * alone still never produces `"asleep"`, and `issue.asleep` now does.
  */
 export const ISSUE_ACTIVATION: Activation<JiraIssue> = {
-  verdictFor: (issue) => (isActive(issue.status) ? "active" : "inactive"),
+  verdictFor: (issue) => (issue.asleep ? "asleep" : isActive(issue.status) ? "active" : "inactive"),
 };
 
 /**
@@ -130,6 +138,17 @@ export interface IssueResourceDeps {
    * first-sighting baseline is ever seeded (see createIssueEventRules).
    */
   comments?: (key: string) => Promise<readonly JiraComment[]>;
+  /**
+   * BUTCHR-307: the issue tier's sleep/wake registry (src/agents/stand-down.ts)
+   * — optional so every existing caller/test built before this ticket keeps
+   * working unchanged (an issue tier with no `standDown` dep simply never
+   * sleeps, exactly as before). When present, `discovery.search()` below
+   * stamps `.asleep` onto each returned issue from `standDown.isAsleep`, and
+   * `createIssueEventRules`'s `decide()` consults it to decide whether a
+   * notify edge to a currently-asleep watcher is genuinely new (see that
+   * module's own top comment for the self-wake hazard this exists to close).
+   */
+  standDown?: StandDownRegistry;
 }
 
 /**
@@ -195,7 +214,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown">): EventRules<JiraIssue> {
   // Persists ACROSS polls (one instance per createIssueEventRules call, kept
   // alive for the resource type's lifetime — exactly as the old `commentCursor`
   // persisted for startLoop's lifetime): the last comment id observed per
@@ -218,15 +237,21 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // call), or `deps.comments` simply not being wired up, is never
       // treated as "no new comment" and never advances the cursor, so a
       // failed poll can never install a wrong baseline.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null } | { ok: false }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null } | { ok: false }> => {
+      // BUTCHR-307: widened from `{ok, newest}` to also carry `ids` — the
+      // FULL comment id list this same call already fetched, reused by the
+      // stand-down wake check below (`wakeIfAsleepAndUnseen`) instead of a
+      // second `deps.comments(key)` call for the same key/poll. Every
+      // existing consumer here only ever destructured `ok`/`newest`, so
+      // adding a field changes nothing for them.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }> => {
         let p = commentsCache.get(key);
         if (!p) {
           p = (async () => {
             if (!deps.comments) return { ok: false as const };
             try {
               const comments = await deps.comments(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null };
+              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
             } catch {
               return { ok: false as const };
             }
@@ -385,6 +410,69 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         return crossDaemonSuppressed(key, before, after);
       };
 
+      // BUTCHR-307 — THE STAND-DOWN GATE. Every `decide()` return below that
+      // means "deliver" is routed through here instead of returned directly,
+      // so there is exactly ONE place that can turn a computed "deliver"
+      // into an actual wake for a sleeping watcher — see
+      // src/agents/stand-down.ts's own top comment for why a second,
+      // drifting definition of "this agent needs to hear about this" is
+      // exactly the failure this ticket must not introduce.
+      //
+      // A watcher that is not currently asleep (the overwhelmingly common
+      // case — every existing caller/test with no `standDown` dep wired,
+      // and every awake issue even when one is) is untouched: `verdict` is
+      // returned exactly as computed, unchanged from before this ticket.
+      //
+      // For a SLEEPING watcher, the split is between a STRUCTURAL reason
+      // (appeared/disappeared/status/label/pr/summary) and everything else
+      // (no `reason` at all — the ordinary "a new comment landed" case — or
+      // `{ comment: true }` — the daemon-label-race case). A structural
+      // reason always wakes unconditionally: none of `stand_down`'s own
+      // last-act writes (report_to_boss/tell_worker, both plain comments)
+      // can ever PRODUCE a status/label/pr/summary change, so there is
+      // nothing for a self-wake hazard to hide inside there. The other two
+      // reason shapes are exactly the ones a self-authored comment CAN
+      // produce (see this module's own decide() comments above on why a
+      // pure comment diff falls through to the honest "no reason"
+      // fallback), so those are compared against `watcher`'s recorded
+      // seen-comment-ids for `key` by SET MEMBERSHIP (BUTCHR-227's rule,
+      // reused via `unseenIds` — see stand-down.ts) before being allowed to
+      // wake anything. A watcher with NO recorded baseline for `key` (e.g.
+      // a worker created after `watcher` stood down — `hasBaseline` false)
+      // fails TOWARD waking rather than silently swallowing a ticket the
+      // stand-down snapshot never covered.
+      const finalize = async (key: string, watcher: string, verdict: EventVerdict): Promise<EventVerdict> => {
+        if (!verdict.deliver) return verdict;
+        const sd = deps.standDown;
+        if (!sd?.isAsleep(watcher)) return verdict;
+        const structural = Boolean(verdict.reason) && !("comment" in verdict.reason!);
+        if (structural) {
+          await sd.wake(watcher, "edge");
+          return verdict;
+        }
+        if (!sd.hasBaseline(watcher, key)) {
+          await sd.wake(watcher, "edge");
+          return verdict;
+        }
+        // FAIL TOWARD WAKING, never toward silently staying asleep: a
+        // rejected comments() call here means "cannot verify whether this
+        // is genuinely new", not "verified nothing new" — the same
+        // fail-open discipline `crossDaemonSuppressed`/`ledgerHitSuppressed`
+        // above already apply to their own comments() calls. Collapsing an
+        // unreadable fetch into "nothing unseen" would be exactly the
+        // silent-lost-wake failure mode this ticket's own doc names as
+        // strictly worse than the defect it fixes.
+        const result = await fetchComments(key);
+        if (!result.ok) {
+          await sd.wake(watcher, "edge");
+          return verdict;
+        }
+        const unseen = sd.unseenFor(watcher, key, result.ids);
+        if (unseen.length === 0) return { deliver: false };
+        await sd.wake(watcher, "edge");
+        return verdict;
+      };
+
       return {
         changedPrimary: changedKeys(prev.primary, next.primary),
         changedRelated: changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)),
@@ -437,7 +525,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // removal; daemonLabelTransition deliberately does not).
           if (space === "primary" && watcher === key) {
             const transition = before && after ? prTransition(before, after) : null;
-            if (transition) return { deliver: true, reason: { pr: transition } };
+            if (transition) return finalize(key, watcher, { deliver: true, reason: { pr: transition } });
           }
           // Appear/disappear (no `before` or no `after` to diff at all) is
           // still a real change and is still always delivered, unchecked —
@@ -445,8 +533,8 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // comment above) — now also NAMED, since the poll can establish it
           // outright: there is nothing to look up, only a key's presence on
           // either side of the snapshot pair.
-          if (!before) return { deliver: true, reason: { appeared: true } };
-          if (!after) return { deliver: true, reason: { disappeared: true } };
+          if (!before) return finalize(key, watcher, { deliver: true, reason: { appeared: true } });
+          if (!after) return finalize(key, watcher, { deliver: true, reason: { disappeared: true } });
           const verdict = await suppressed(key, before, after, watcher);
           if (verdict.suppressed) return { deliver: false };
           // BUTCHR-87: a delivery that escaped suppression BECAUSE the
@@ -458,7 +546,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // swallowed. Checked before the structural classifier below on
           // purpose, so the label change that would otherwise have been
           // suppressed never shadows the actual cause of delivery.
-          if (verdict.becauseComment) return { deliver: true, reason: { comment: true } };
+          if (verdict.becauseComment) return finalize(key, watcher, { deliver: true, reason: { comment: true } });
           // The general classifier: every remaining diff the poll can name
           // from the (before, after) `JiraIssue` pair alone, no I/O. Order
           // is a deliberate, documented precedence (more than one can be
@@ -472,22 +560,45 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // JiraIssue does not carry at all) falls through to the honest
           // "looked, could not tell" fallback: no `reason` at all, exactly
           // as it explained the "why".
-          if (before.status !== after.status) return { deliver: true, reason: { status: { from: before.status, to: after.status } } };
+          if (before.status !== after.status) return finalize(key, watcher, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
           const labelTransition = daemonLabelTransition(before, after);
-          if (labelTransition) return { deliver: true, reason: { label: labelTransition } };
-          if (before.summary !== after.summary) return { deliver: true, reason: { summary: true } };
-          return { deliver: true };
+          if (labelTransition) return finalize(key, watcher, { deliver: true, reason: { label: labelTransition } });
+          if (before.summary !== after.summary) return finalize(key, watcher, { deliver: true, reason: { summary: true } });
+          return finalize(key, watcher, { deliver: true });
         },
       };
     },
   };
 }
 
+/**
+ * BUTCHR-307: `discovery.search()`'s own stand-down wiring — the ONE place
+ * that stamps `.asleep` onto the resource `T`, per this module's `verdictFor`
+ * doc comment (the flag enters through the snapshot, never through
+ * `verdictFor` consulting a registry). Also where the lost-wake bound
+ * (`tickMaxSleep`) and the seen-set memory bound (`forgetMissing`) actually
+ * run — both need I/O-adjacent, once-per-poll placement, and this is the
+ * only function in this module called exactly once per poll before either
+ * `verdictFor` pass. A `standDown` dep that force-wakes an id via
+ * `tickMaxSleep` here does so BEFORE that same id's `.asleep` is computed
+ * for this poll's snapshot, so a bound-expired issue already reads awake
+ * this same poll, not one poll later.
+ */
+async function stampSleep(sd: StandDownRegistry, issues: readonly JiraIssue[]): Promise<JiraIssue[]> {
+  const keys = new Set(issues.map((i) => i.key));
+  sd.forgetMissing(keys);
+  await Promise.all(issues.map((i) => sd.tickMaxSleep(i.key)));
+  return issues.map((i) => (sd.isAsleep(i.key) ? { ...i, asleep: true } : i));
+}
+
 export function createIssueResourceType(deps: IssueResourceDeps): ResourceType<JiraIssue> {
   return {
     discovery: {
       idOf: issueIdOf,
-      search: () => deps.search(ISSUE_JQL),
+      search: async () => {
+        const issues = await deps.search(ISSUE_JQL);
+        return deps.standDown ? stampSleep(deps.standDown, issues) : issues;
+      },
       related: createRelated(deps),
     },
     activation: ISSUE_ACTIVATION,
