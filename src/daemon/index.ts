@@ -5,10 +5,12 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
+import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
+import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
 import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
@@ -186,6 +188,14 @@ const projectNotifyHealth = createLoopHealth({
 // the rest of the declining set and why it's not all wired yet.
 const coverage = createCoverageTracker();
 
+// BUTCHR-329: this daemon's own build-currency verdict, reported as a
+// /health sibling — see src/daemon/currency.ts's own header for why it must
+// be cached (computeBuildCurrency is expensive) rather than recomputed per
+// poll, and why the cache is lazy (on `/health` access) rather than a
+// background timer. `buildIdentity` satisfies `RunningBuild` structurally
+// (a superset), so no adapter is needed here.
+const currency = createCurrencyTracker({ compute: () => computeBuildCurrency(buildIdentity) });
+
 /**
  * BUTCHR-244: `check_worker`'s live staffing probe — the narrow seam
  * `atlassianTools` takes rather than the whole `herd`, so `defs.ts` (and
@@ -278,7 +288,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
