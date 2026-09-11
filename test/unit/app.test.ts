@@ -733,6 +733,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -762,6 +763,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -784,6 +786,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -806,6 +809,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -833,6 +837,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
@@ -854,6 +859,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       health: () => combineHealth([health]),
+      dashboard: noDashboard,
     });
     app.listen(0);
     try {
