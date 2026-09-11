@@ -238,4 +238,17 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("projectAllowlist=EMPTY — project tier staffs nothing");
     expect(describeConfig(loadConfig({ ...base, BUTCHR_PROJECT_ALLOWLIST: "ACME" }, noRead))).toContain("projectAllowlist=ACME");
   });
+
+  test("maxAgents (BUTCHR-284) defaults to 8, honours BUTCHR_MAX_AGENTS, and rejects a non-positive or non-integer value", () => {
+    expect(loadConfig(base, noRead).maxAgents).toBe(8);
+    expect(loadConfig({ ...base, BUTCHR_MAX_AGENTS: "20" }, noRead).maxAgents).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_MAX_AGENTS: "0" }, noRead)).toThrow(/BUTCHR_MAX_AGENTS/);
+    expect(() => loadConfig({ ...base, BUTCHR_MAX_AGENTS: "-1" }, noRead)).toThrow(/BUTCHR_MAX_AGENTS/);
+    expect(() => loadConfig({ ...base, BUTCHR_MAX_AGENTS: "nope" }, noRead)).toThrow(/BUTCHR_MAX_AGENTS/);
+    // a count, unlike the *_MINUTES knobs above — a fractional value is rejected, not merely a non-positive one.
+    expect(() => loadConfig({ ...base, BUTCHR_MAX_AGENTS: "3.5" }, noRead)).toThrow(/BUTCHR_MAX_AGENTS/);
+  });
+  test("describeConfig includes maxAgents", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("maxAgents=8");
+  });
 });

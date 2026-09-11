@@ -1,10 +1,39 @@
 
-● Bash(claude --model sonnet --permission-mode bypassPermissions --mcp-config mcp.json --dangerously-load-development-channels server:butchr "follow your CLAUDE.md")
-  ⎿  Running…
+  trigger, so "active" is not correct behaviour) and 0 [butchr:frozen] comments across 12
+  footer comments on the root doc. FAILED stands, and the mechanism holds.
 
-You've hit your session limit · resets 9:50pm
+  My pre-committed gate has fired. Reading the new comment, then stopping BUTCHR-190.
 
-───────────────────────────────────────────────────────────────────────────────────────────────
+  Ran 1 shell command
+
+● BUTCHR-195 has just handed me something that could overturn my own story's verdict. The
+  get_doc_comments tool description was advising agents to sort footer comments by numeric id
+  — and BUTCHR-119's FAILED verdict rests on "newest footer comment id = 17760259, so the
+  watermark is caught up." If the true newest by creation time is a different comment, a
+  trigger is pending and the verdict is UNOBSERVABLE, not FAILED. Checking now.
+
+  Ran 1 shell command
+
+● This overturns nothing — but it changes what the evidence says, and there's a live instance
+  of the defect biting right now. Getting the content of that comment before I write.
+
+  Ran 2 shell commands
+
+● That comment is from the assistant, and it says a new deploy landed on all three daemons
+  minutes before 17:21:45Z — inside my story's measurement window. Checking immediately.
+
+  Ran 1 shell command
+
+● A deploy landed inside my story's measurement window — and the notice of it could never have
+  reached the project. Sending this before BUTCHR-119 commits its write-up.
+
+  Called butchr
+  ⎿  You've hit your session limit · resets 12:10pm (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+
+✻ Worked for 3m 37s · done 10:30 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────
 ❯
-───────────────────────────────────────────────────────────────────────────────────────────────────
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents        /rc
+──────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                           /rc

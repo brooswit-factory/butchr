@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
 import { isApiError } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
+import { advanceProjectWatermark } from "../resources/project.js";
+import { HTML4_NAMED_ENTITIES } from "./html4-named-entities.generated.js";
 
 /** The fixed remote-link globalId that carries the ticket -> doc binding. */
 export const DOC_LINK_GLOBAL_ID = "butchr:doc";
@@ -13,6 +16,143 @@ const MAX_TITLE_LEN = 200;
 // A depth cap, not a visited-set: a genuine Implements cycle would recurse forever without one,
 // and any real boss chain in this fleet is a handful of hops (task -> story -> epic).
 const MAX_BOSS_DEPTH = 20;
+
+/**
+ * Character budget for a doc's full body on the WRITE path (BUTCHR-250).
+ * "Characters" here means `.length` — JS UTF-16 code units, matching the
+ * unit the MCP harness cap itself compares against (docs/tool-result-size-cap.md
+ * Q2: the harness reports "N characters" and N is a codepoint/UTF-16-unit
+ * count, not a UTF-8 byte count — the two diverge measurably in this corpus'
+ * em-dash-heavy prose, so do not swap this for `Buffer.byteLength`).
+ *
+ * METHOD, not a present-tense fact: this must sit BELOW the low end of the
+ * measured PREVIEW-to-ERROR boundary for the MCP result cap — the (56,239,
+ * 61,376] character bracket docs/tool-result-size-cap.md's Q2 cites from
+ * BUTCHR-216's controlled experiment — with margin for three things that are
+ * not constants, so re-derive them rather than trusting this comment:
+ *   (1) the cap bounds the WHOLE MCP result (JSON envelope + HTML escaping
+ *       around the body), not the body alone, and that envelope is NOT a
+ *       fixed subtraction — read back live on the BUTCHR root doc, it
+ *       measured ~289 characters on 2026-09-02 and ~303 on 2026-09-10 (the
+ *       same page), i.e. it grows with the body's own escaping;
+ *   (2) the 56,239-61,376 bracket comes from one experiment of undetermined
+ *       precision, not a spec;
+ *   (3) a body sitting exactly at the boundary is one comment away from
+ *       crossing it.
+ * 50,000 leaves >6,000 characters (>10%) of margin over all three combined.
+ * Re-measure the bracket (docs/tool-result-size-cap.md) before trusting this
+ * is still conservative enough — it is a snapshot, not a proof.
+ */
+export const DOC_BODY_CHAR_BUDGET = 50_000;
+
+/**
+ * The MEASURED RULE, corrected once already (BUTCHR-250 PR #299's third
+ * review round): Confluence's storage layer re-encodes a NON-ASCII character
+ * into a longer named XML entity IF AND ONLY IF that character has a
+ * standard HTML 4 named character reference — confirmed by a 37-character
+ * live probe with no exception either direction. The SECOND round's own
+ * probe was, by its own author's later correction, entirely non-ASCII (every
+ * character tested was above U+007F) and over-generalised the rule to ALL
+ * 252 HTML4 named entities, including 4 that are themselves Confluence's
+ * OWN STORAGE-FORMAT SYNTAX rather than content it re-encodes: `"` (quot),
+ * `&` (amp), `<` (lt), `>` (gt) — the quotes around an attribute value, the
+ * angle brackets of a tag, the leading `&` of an entity reference already
+ * present. Those four are measurably left alone (a 54,824-character real
+ * stored body containing 160 literal `&`, 953 literal `<`, 953 literal `>`
+ * and 30 literal `"` round-tripped byte-identical), so `HTML4_NAMED_ENTITIES`
+ * (`src/tools/html4-named-entities.generated.ts`, vendored from the W3C
+ * HTML 4.01 spec itself, not hand-typed — see `scripts/vendor/html4-entities.ts`,
+ * whose own header names the 4-codepoint exclusion and why) EXCLUDES those
+ * four by construction: it is the spec's 252 minus exactly those 4 = 248.
+ * The remaining 248 were checked for the same kind of storage-syntax
+ * significance and found clean (that generator's header comment has the
+ * detail). A character outside this 248-entry table is, by the same
+ * measured rule, one Confluence's storage layer does NOT re-encode — so
+ * this is not a residual to be widened later; the measured boundary IS the
+ * table's boundary. (BUTCHR-235's own, separate, unresolved caution about
+ * attribute ordering/whitespace/self-closing-tag normalisation still stands
+ * — this closes the CHARACTER-SUBSTITUTION residual specifically, not every
+ * possible way Confluence's storage layer could change a body.)
+ */
+const HTML4_ENTITY_BY_CODEPOINT: ReadonlyMap<number, string> = new Map(HTML4_NAMED_ENTITIES);
+
+/**
+ * Estimates what `body` will look like once Confluence's storage layer has
+ * round-tripped it, by replacing every character with an HTML4 named entity
+ * (per `HTML4_ENTITY_BY_CODEPOINT`, which deliberately excludes the 4
+ * storage-syntax codepoints — see its own doc comment) with that entity.
+ * Used to bring a not-yet-stored `proposed` body into the SAME
+ * representation `stored` is already in (whatever
+ * `get_doc`/`confluence_get_page` returned is already post-transform) and
+ * that `DOC_BODY_CHAR_BUDGET` was itself calibrated against
+ * (docs/tool-result-size-cap.md's cap is measured on the STORED/returned
+ * body, not on what a caller sends).
+ *
+ * BOTH DIRECTIONS OF ERROR ARE REAL, AND EQUALLY WORTH GUARDING AGAINST —
+ * an earlier version of this comment claimed only under-estimating was a
+ * risk, which is wrong: OVER-estimating is not "safe" here, it is the
+ * OPPOSITE failure this bound exists to avoid — a body this function scores
+ * as over budget when its real stored size is not locks the writing tier
+ * out of a page it is entitled to write (measured live: exactly this
+ * happened when this table still counted the 4 storage-syntax codepoints,
+ * inflating a genuinely under-budget real page by ~14% and scoring it
+ * over). Correctness here means neither direction of error, not merely
+ * "never shrinks" — hence excluding the 4 codepoints above rather than
+ * treating their inclusion as a harmless conservative bias.
+ */
+function estimateStoredLength(body: string): number {
+  let total = 0;
+  for (const ch of body) {
+    const entity = HTML4_ENTITY_BY_CODEPOINT.get(ch.codePointAt(0)!);
+    total += entity ? entity.length + 2 : ch.length; // +2 for "&" and ";"
+  }
+  return total;
+}
+
+/**
+ * Refuses a doc write IFF it would both exceed `budget` AND grow the page
+ * (estimated-stored `proposed` length > `stored.length`) — BUTCHR-250's
+ * anti-bricking design. `stored` MUST be read from the page BEFORE the
+ * write being adjudicated: a post-write measurement can't do this job,
+ * because the anti-bricking clause needs "what's on the page right now",
+ * not "what this write would produce". Both `setProjectDoc` and `setDoc`
+ * already do that pre-write read (via `projectRootDoc`/`ensureDoc`) to
+ * resolve the page id, so this reuses it — no second fetch.
+ *
+ * Deliberately allows `proposed === stored` (equal size is not growth — a
+ * same-size rewrite is a correction, not an expansion) and `proposed ===
+ * budget` (the budget line itself is not "over" it). Both edge cases are
+ * pinned by the boundary test arms in test/unit/docs.test.ts, so a later
+ * edit that flips either `>` to `>=` fails loudly rather than silently.
+ *
+ * A SIZE comparison, not a content one — this never inspects WHAT changed,
+ * only how large the two bodies are once both are expressed in the same
+ * (estimated-stored) representation via `estimateStoredLength`. That
+ * normalisation closes the MEASURED character-substitution residual exactly
+ * (see `HTML4_ENTITY_BY_CODEPOINT`'s own comment) but is NOT a claim that
+ * every way Confluence's storage layer could change a body is covered —
+ * BUTCHR-235's separate, unresolved caution about attribute ordering,
+ * whitespace and self-closing-tag normalisation still stands. Prior to
+ * BUTCHR-250's review, this compared raw (un-normalised) lengths and was
+ * measurably unsound in the permissive direction — a write that swapped
+ * stored entities for their literal, longer-when-re-encoded characters
+ * could score as a shrink while the stored page did not shrink at all. See
+ * docs/root-doc-write-budget.md for the measurement and
+ * test/unit/docs.test.ts for the regression arm.
+ */
+function refuseIfGrowingOverBudget(who: string, stored: string, proposed: string, budget: number): void {
+  const storedLen = stored.length;
+  const proposedLen = estimateStoredLength(proposed);
+  if (proposedLen > budget && proposedLen > storedLen) {
+    throw new Error(
+      `${who}: refusing this write — proposed body is an estimated ${proposedLen} characters once stored ` +
+        `(${proposed.length} as sent), over the ${budget}-character budget and larger than what's currently ` +
+        `stored (${storedLen} characters). This would grow an already-oversized page. Move the excess into a ` +
+        `child page linked from this doc's index, then retry with a body no larger than what's stored now — ` +
+        `an over-budget page can always be corrected or shrunk, it just cannot be grown further.`,
+    );
+  }
+}
 
 /** `[A-Z][A-Z0-9_]*-[0-9]+` — any valid Jira key. The lowercase round-trip (KEY -> label -> KEY) is lossless only for keys shaped like this. */
 export const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]*-[0-9]+$/;
@@ -164,6 +304,89 @@ export interface DocResult {
 
 export type GetDocResult = { found: false } | ({ found: true } & DocResult);
 
+/** `chars` is string length (UTF-16 code units, i.e. what `.length` reports); `bytes` is UTF-8 byte length — carried separately because the incident this contract exists to fix reported "characters" while naming a "token" limit, and this project has already paid once for that unit ambiguity. */
+export interface WriteDigest {
+  chars: number;
+  bytes: number;
+  sha256: string;
+}
+
+/**
+ * `set_doc`'s new write receipt (BUTCHR-236, story BUTCHR-235). Replaces the
+ * old `DocResult`-shaped echo — which returned the caller's own input `body`
+ * back at it, proving nothing about what actually landed, and which scaled
+ * with document size (an oversize doc turned a SUCCESSFUL write into an
+ * error indistinguishable from a failed one). This type is bounded — a few
+ * hundred bytes — AT EVERY ARM, for any document size: no body, no preview,
+ * no excerpt, ever.
+ *
+ * `landed` is the deliverable: `"confirmed"` means the page was re-read
+ * after the write and returned a body — the write landed. `"unconfirmed"`
+ * means the update call itself succeeded but the read-back did not; almost
+ * certainly landed, but "I could not check" is not "I checked and it
+ * differed" — keep the two apart.
+ *
+ * Byte-for-byte equality is NOT achievable on this surface (MEASURED:
+ * Confluence's storage-format normalisation rewrites ordinary prose on
+ * write — a literal em dash reads back as `&mdash;`), so `identical` is a
+ * convenience only, and MUST NOT be the only thing a caller reads:
+ * `identical: false` is the ORDINARY case on a healthy write, not an error.
+ * The numbers (`wrote` vs `stored`) are the primary, machine-readable
+ * signal — normalisation makes `stored` slightly LARGER than `wrote`, while
+ * truncation or mangling makes it dramatically SMALLER, so a caller can
+ * apply its own threshold instead of being taught how to read a boolean.
+ *
+ * `version` is the page's version number as reported on the read-back, or
+ * `null` when unavailable (e.g. `landed: "unconfirmed"`) — bounded,
+ * server-authoritative, and monotonic evidence that the write took effect.
+ *
+ * Nothing about this type can be produced by a throw except a genuinely
+ * failed write: `landed: "unconfirmed"` and `identical: false` are both
+ * ordinary, resolved results, never rejections.
+ */
+export interface SetDocResult {
+  id: string;
+  url: string;
+  title: string;
+  version: number | null;
+  wrote: WriteDigest;
+  stored: WriteDigest | null;
+  landed: "confirmed" | "unconfirmed";
+  identical: boolean | null;
+}
+
+function digest(body: string): WriteDigest {
+  const buf = Buffer.from(body, "utf8");
+  return { chars: body.length, bytes: buf.byteLength, sha256: createHash("sha256").update(buf).digest("hex") };
+}
+
+/**
+ * Builds the write receipt shared by `setDoc` and `setProjectDoc`: re-reads
+ * the page AFTER `updatePage` has already resolved, rather than trusting
+ * anything `updatePage` itself returned — a read-back is the only thing
+ * that can tell "landed" from "looked like it landed". The read-back is
+ * NEVER allowed to throw out of this function: a failed confirmation read
+ * is `landed: "unconfirmed"`, not a rejection, because a caller must be
+ * able to tell "the write failed" (a thrown error, from `updatePage`
+ * itself, above this call) apart from "the write very likely succeeded but
+ * this call couldn't confirm it" (this catch branch).
+ */
+async function buildReceipt(ops: AtlassianOps, id: string, url: string, title: string, body: string): Promise<SetDocResult> {
+  const wrote = digest(body);
+  try {
+    const page = (await ops.getPage(id)) as { version?: { number?: number }; body?: { storage?: { value?: string } } } | undefined;
+    const storedBody = page?.body?.storage?.value;
+    const version = page?.version?.number ?? null;
+    if (storedBody === undefined) {
+      return { id, url, title, version, wrote, stored: null, landed: "unconfirmed", identical: null };
+    }
+    const stored = digest(storedBody);
+    return { id, url, title, version, wrote, stored, landed: "confirmed", identical: stored.sha256 === wrote.sha256 };
+  } catch {
+    return { id, url, title, version: null, wrote, stored: null, landed: "unconfirmed", identical: null };
+  }
+}
+
 async function readLinkedPage(ops: AtlassianOps, key: string): Promise<DocResult | null> {
   const link = await ops.getRemoteLink(key, DOC_LINK_GLOBAL_ID);
   const url = link?.object?.url;
@@ -242,11 +465,62 @@ export async function getProjectDoc(ops: AtlassianOps, projectKey: string): Prom
  * concept (a freshly created per-ticket page needs a real title before it
  * can stop looking unwritten) — a root doc is provisioned ahead of time with
  * a real title already, so there is no provisional state to graduate out of.
+ *
+ * DEFECT 2 CLOSED HERE (BUTCHR-214/226) — the project wake predicate's
+ * VERSION axis (src/resources/project.ts's `projectVerdict`) had NO
+ * suppression at all: every root-doc body edit bumps Confluence's own page
+ * version, and nothing but the project agent's own `check_in` ever advanced
+ * the stored `wake.version` watermark to match — so a project that keeps its
+ * doc current (every agent's explicit instruction) woke itself
+ * deterministically, on every `set_doc` call, forever. Fixed with the SAME
+ * identity-of-write shape `speakOnOwnChannel` already uses for the comment
+ * axis (src/tools/speak.ts): immediately after `ops.updatePage` succeeds,
+ * this advances THIS project's `wake.version` watermark to the version THAT
+ * CALL'S OWN write produced (`updatePage`'s now-normalized `version` field —
+ * see its own doc comment on `AtlassianOps` for why this is deliberately NOT
+ * a read-back-after-write). A FOREIGN edit — any `updatePage` call this
+ * function did not make — never runs this advance, so it is never
+ * watermarked here and still wakes the project on the next poll, the same
+ * failure condition `speakOnOwnChannel`'s own suppression must not swallow.
+ *
+ * Fail-open and logged, not fatal — copied from `speakOnOwnChannel`'s own
+ * shape and its BUTCHR-105 reasoning (see that function's header comment):
+ * the doc write already succeeded by the time this runs, and a secondary
+ * bookkeeping failure must never surface as a failed `set_doc` call. A
+ * rejected write here also feeds `advanceProjectWatermark`'s own in-process
+ * fallback (DEFECT 1b, src/resources/project.ts) exactly like the comment
+ * axis does, so a persistent failure on THIS axis gets the same protection
+ * against waking the project on the very edit that failed to persist.
+ *
+ * ONLY the project root-doc path: `setDoc` (an issue's own doc, below) is a
+ * different surface with no project watermark at all — it never calls this
+ * function and nothing here reaches it.
+ *
+ * Returns a `SetDocResult` (BUTCHR-236) — a bounded receipt, never the body
+ * it just wrote — built by `buildReceipt`'s own post-write read-back. That
+ * read-back is independent of, and never feeds, the watermark advance
+ * above: the watermark is deliberately identity-of-write (this call's own
+ * `updatePage` version), while the receipt's `version` field is deliberately
+ * a separate read-back (see `buildReceipt`'s own doc comment for why a
+ * receipt needs "did it land", a different question from "what did THIS
+ * write produce").
  */
-export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string): Promise<DocResult> {
+export async function setProjectDoc(ops: AtlassianOps, projectKey: string, body: string, title?: string, log: (line: string) => void = console.error): Promise<SetDocResult> {
   const doc = await projectRootDoc(ops, projectKey);
-  await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
-  return { id: doc.id, url: doc.url, title: title ?? doc.title, body };
+  // BUTCHR-250's budget refusal runs BEFORE the write (same order as `setDoc`
+  // above), so a refused write never happens — and therefore never advances a
+  // watermark for a version that was never produced.
+  refuseIfGrowingOverBudget(`setProjectDoc(${projectKey})`, doc.body, body, DOC_BODY_CHAR_BUDGET);
+  // BUTCHR-214/226 defect 2: the watermark advance takes the version THIS
+  // write produced (identity-of-write), never a value read back afterward — a
+  // read-back would absorb a foreign bump racing into the gap and silently
+  // swallow the operator's emergency wake channel. Pinned by
+  // test/unit/project-resource-type.test.ts's identity-of-write test.
+  const updated = await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
+  await advanceProjectWatermark(ops, projectKey, { version: updated.version }, log).catch((e) =>
+    log(`  WARNING: [setProjectDoc] self-wake version watermark advance failed for ${projectKey} (version ${updated.version}): ${(e as Error)?.message ?? e} — doc write succeeded; project may nudge itself on its own version bump next poll`),
+  );
+  return buildReceipt(ops, doc.id, doc.url, title ?? doc.title, body);
 }
 
 /**
@@ -436,16 +710,20 @@ export async function ensureDoc(ops: AtlassianOps, key: string, depth = 0): Prom
  * Only do this when the title actually changed: a body-only write touches
  * nothing the link displays, and an unconditional upsert would bump the
  * ticket's `updated` on every doc write, waking a boss for a non-event.
+ *
+ * Returns a `SetDocResult` (BUTCHR-236) — a bounded receipt, never the body
+ * it just wrote — built by `buildReceipt`'s own post-write read-back.
  */
-export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<DocResult> {
+export async function setDoc(ops: AtlassianOps, key: string, body: string, title?: string): Promise<SetDocResult> {
   const doc = await ensureDoc(ops, key);
   if (isProvisional(doc.title) && !title) {
     throw new Error(`set_doc: ${key}'s doc still has its provisional title ("${doc.title}") — pass \`title\` with a real, outcome-shaped title. You cannot write real content and leave the page reading as unwritten.`);
   }
+  refuseIfGrowingOverBudget(`setDoc(${key})`, doc.body, body, DOC_BODY_CHAR_BUDGET);
   await ops.updatePage({ id: doc.id, body, ...(title ? { title } : {}) });
   const finalTitle = title ?? doc.title;
   if (title && title !== doc.title) {
     await ops.upsertRemoteLink(key, DOC_LINK_GLOBAL_ID, "documented by", { title: finalTitle, url: doc.url });
   }
-  return { id: doc.id, url: doc.url, title: finalTitle, body };
+  return buildReceipt(ops, doc.id, doc.url, finalTitle, body);
 }
