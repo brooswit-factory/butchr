@@ -105,6 +105,52 @@ export interface Config {
    */
   crashLoopWindowMinutes: number;
   /**
+   * BUTCHR-307: the maximum minutes an issue-tier agent may stay asleep
+   * (`stand_down`, src/agents/stand-down.ts) before being force-woken as a
+   * LOST-WAKE RESCUE — the same shape `atRestMinutes` gives `atRest`, for a
+   * different race: a missed or wrongly-suppressed notify edge would
+   * otherwise leave a ticket In Progress, with no agent, silently, forever
+   * (worse than the defect `stand_down` fixes). Default 60: long enough
+   * that an ordinary, legitimate long wait for a slow worker never trips
+   * it — the ticket's own hazard analysis notes a boss woken by ordinary
+   * chatter several times an HOUR is normal — while still turning a
+   * potential permanent silent stall into a bounded, one-hour-at-most delay.
+   * A wake by this bound is logged distinctly from a wake by a real edge
+   * (src/agents/stand-down.ts's `wake`) — an operator seeing one knows an
+   * edge was likely missed, not that this is routine.
+   */
+  standDownMaxSleepMinutes: number;
+  /**
+   * BUTCHR-307: edge-driven wakes of the SAME issue within
+   * `yieldLoopWindowMinutes` before the yield-loop detector
+   * (src/agents/stand-down.ts) posts its own `[butchr:yieldloop]` complaint
+   * — a DIFFERENT fault from crash-loop's `[butchr:crashloop]` (nothing is
+   * dying; the agent keeps waking, apparently for a real reason, and
+   * immediately standing down again), so it gets its own count/window pair
+   * rather than reusing `crashLoopCount`/`crashLoopWindowMinutes`.
+   * Deliberately a SHORTER window than crash-loop's default 60 minutes (see
+   * `yieldLoopWindowMinutes`'s own doc comment) — reused verbatim from that
+   * default would false-positive on ordinary chatter, which this ticket's
+   * own hazard analysis states can legitimately wake a boss several times
+   * an hour. Default 5: five wake/stand-down cycles is far beyond anything
+   * a real turn (re-reading a ticket, acting, reporting, standing down
+   * again) can produce inside the short window below, but is easily reached
+   * by a bug re-triggering every ~15s issue-tier poll.
+   */
+  yieldLoopCount: number;
+  /**
+   * BUTCHR-307: the yield-loop rolling window, in minutes — see
+   * `yieldLoopCount`'s own doc comment for why this is deliberately far
+   * shorter than crash-loop's 60-minute window. Default 5: a genuine
+   * wake-stand_down cycle involves a fresh Claude session re-reading its
+   * ticket, reasoning, and acting — tens of seconds at an absolute minimum
+   * — so five such cycles cannot complete inside 5 minutes without either a
+   * spurious edge source or a `stand_down` firing with something still
+   * unhandled, which is exactly the bug class this detector exists to make
+   * audible.
+   */
+  yieldLoopWindowMinutes: number;
+  /**
    * BUTCHR-124: minutes a pane must be reported blocked, with text that does
    * not parse as a recognized dialog, CONTINUOUSLY, before the
    * sustained-blocked-and-unparseable alarm fires (see
@@ -250,6 +296,9 @@ export interface ConfigEnv {
   BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_CRASHLOOP_COUNT?: string | undefined;
   BUTCHR_CRASHLOOP_WINDOW_MINUTES?: string | undefined;
+  BUTCHR_STANDDOWN_MAX_MINUTES?: string | undefined;
+  BUTCHR_YIELDLOOP_COUNT?: string | undefined;
+  BUTCHR_YIELDLOOP_WINDOW_MINUTES?: string | undefined;
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
@@ -294,6 +343,14 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const crashLoopWindowMinutes = env.BUTCHR_CRASHLOOP_WINDOW_MINUTES ? Number(env.BUTCHR_CRASHLOOP_WINDOW_MINUTES) : 60;
   if (!Number.isFinite(crashLoopWindowMinutes) || crashLoopWindowMinutes <= 0) throw new Error(`BUTCHR_CRASHLOOP_WINDOW_MINUTES is not a positive number: ${env.BUTCHR_CRASHLOOP_WINDOW_MINUTES}`);
 
+  const standDownMaxSleepMinutes = env.BUTCHR_STANDDOWN_MAX_MINUTES ? Number(env.BUTCHR_STANDDOWN_MAX_MINUTES) : 60;
+  if (!Number.isFinite(standDownMaxSleepMinutes) || standDownMaxSleepMinutes <= 0) throw new Error(`BUTCHR_STANDDOWN_MAX_MINUTES is not a positive number: ${env.BUTCHR_STANDDOWN_MAX_MINUTES}`);
+
+  const yieldLoopCount = env.BUTCHR_YIELDLOOP_COUNT ? Number(env.BUTCHR_YIELDLOOP_COUNT) : 5;
+  if (!Number.isFinite(yieldLoopCount) || yieldLoopCount <= 0) throw new Error(`BUTCHR_YIELDLOOP_COUNT is not a positive number: ${env.BUTCHR_YIELDLOOP_COUNT}`);
+  const yieldLoopWindowMinutes = env.BUTCHR_YIELDLOOP_WINDOW_MINUTES ? Number(env.BUTCHR_YIELDLOOP_WINDOW_MINUTES) : 5;
+  if (!Number.isFinite(yieldLoopWindowMinutes) || yieldLoopWindowMinutes <= 0) throw new Error(`BUTCHR_YIELDLOOP_WINDOW_MINUTES is not a positive number: ${env.BUTCHR_YIELDLOOP_WINDOW_MINUTES}`);
+
   const unresponsiveMinutes = env.BUTCHR_UNRESPONSIVE_MINUTES ? Number(env.BUTCHR_UNRESPONSIVE_MINUTES) : 5;
   if (!Number.isFinite(unresponsiveMinutes) || unresponsiveMinutes <= 0) throw new Error(`BUTCHR_UNRESPONSIVE_MINUTES is not a positive number: ${env.BUTCHR_UNRESPONSIVE_MINUTES}`);
 
@@ -325,6 +382,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     atRestMinutes,
     crashLoopCount,
     crashLoopWindowMinutes,
+    standDownMaxSleepMinutes,
+    yieldLoopCount,
+    yieldLoopWindowMinutes,
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
@@ -440,7 +500,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} ` +

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admitWithinBudget, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
+import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -96,39 +96,115 @@ describe("createAdmissionController", () => {
     expect(await ctrl.admit(["A", "B"], [])).toEqual([]);
   });
 
-  test("over the cap: withholds the excess, admits the front of the deterministic order, and logs a ratio naming the cap/residency/withheld ids", async () => {
+  test("over the cap: withholds the excess, admits the front of the deterministic order, and logs a ratio naming the cap/residency/admitted/withheld ids (BUTCHR-320 B/D: now under ADMISSION2_TAG, unconditionally)", async () => {
     const lines: string[] = [];
     const ctrl = createAdmissionController({ cap: 2, residency: async () => ["R1"], log: (l) => lines.push(l) });
     expect(await ctrl.admit(["A", "B", "C"], [])).toEqual(["A"]);
-    const line = lines.find((l) => l.startsWith("[admission]"));
+    const line = lines.find((l) => l.startsWith(ADMISSION2_TAG));
     expect(line).toBeDefined();
     expect(line).toContain("cap=2");
     expect(line).toContain("residency=1");
+    expect(line).toContain("admitted=1");
     expect(line).toContain("withheld 2/3");
-    // BUTCHR-297 §E: the withheld id list now carries each one's current
-    // wait count (`id(count)`) rather than a bare comma list — the existing
-    // tokens (`cap=`, `residency=`, `withheld N/M wanted:`) this test checks
-    // above are unchanged and still parseable.
+    // BUTCHR-297 §E, carried into the new line: the withheld id list still
+    // carries each one's current wait count (`id(count)`).
     expect(line).toContain("B(1), C(1)");
+    // Never under the OLD tag — this replaces it outright (not backward compat).
+    expect(lines.some((l) => l.startsWith("[admission] "))).toBe(false);
   });
 
-  test("empty candidates: nothing to admit, no [admission] withheld line even when residency is at/above cap", async () => {
+  // BUTCHR-320 (B): the whole point of the change — a poll that admits
+  // everything (withheld = 0) used to log NOTHING under the old `[admission]`
+  // line (guarded on `withheld.length > 0`, confirmed at BUTCHR-297's own
+  // commit); any admissions total summed from it was therefore a floor, not
+  // a count. It now fires every time there's at least one candidate.
+  test("BUTCHR-320 (B): withheld=0 still logs — carries the admitted count, no trailing wanted: clause", async () => {
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1"], log: (l) => lines.push(l) });
+    expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
+    const line = lines.find((l) => l.startsWith(ADMISSION2_TAG));
+    expect(line).toBeDefined();
+    expect(line).toBe(`${ADMISSION2_TAG} cap=5 residency=1 admitted=2 withheld 0/2`);
+  });
+
+  test("empty candidates: still nothing to admit, no admission line at all — the zero-candidate short-circuit's side effect (BUTCHR-297's finding 2) is preserved even after (B)", async () => {
     const lines: string[] = [];
     const ctrl = createAdmissionController({ cap: 1, residency: async () => ["R1", "R2"], log: (l) => lines.push(l) });
     expect(await ctrl.admit([], [])).toEqual([]);
+    expect(lines.some((l) => l.startsWith(ADMISSION2_TAG))).toBe(false);
     expect(lines.some((l) => l.startsWith("[admission]"))).toBe(false);
   });
 
+  // BUTCHR-320 (D) — mechanical, six-direction discontinuity: a reader of
+  // mixed journal history must be able to tell which instrument produced any
+  // given admission line WITHOUT knowing the deploy date. Verbatim samples of
+  // both prior formats, re-derived from the ticket's own text (format 1: the
+  // build in production as of this writing, 0fa49429; format 2: this file's
+  // own emit at BUTCHR-297's commit, before this ticket) against the new
+  // line this file now actually emits.
+  describe("BUTCHR-320 (D): the new admission line is mechanically distinguishable from BOTH prior [admission] formats", () => {
+    const FORMAT1_SAMPLE = "[admission] cap=13 residency=13 withheld 2/2 wanted: BUTCHR-307, BUTCHR-308";
+    const FORMAT2_SAMPLE = "[admission] cap=13 residency=13 withheld 2/2 wanted: BUTCHR-307(4), BUTCHR-308(2)";
+    const FORMAT1_PATTERN = /^\[admission\] cap=\d+ residency=\d+ withheld \d+\/\d+ wanted: [A-Z]+-\d+(?:, [A-Z]+-\d+)*$/;
+    const FORMAT2_PATTERN = /^\[admission\] cap=\d+ residency=\d+ withheld \d+\/\d+ wanted: [A-Z]+-\d+\(\d+\)(?:, [A-Z]+-\d+\(\d+\))*$/;
+    const FORMAT3_PATTERN = /^\[admission2\] cap=\d+ residency=\d+ admitted=\d+ withheld \d+\/\d+(?: wanted: .+)?$/;
+    const FORMAT3_SAMPLE = admissionLine(13, 13, 0, 2, ["BUTCHR-307", "BUTCHR-308"], new Map([["BUTCHR-307", 4], ["BUTCHR-308", 2]]));
+    // BUTCHR-334 (finding 1): the fail-safe sub-format — same tag, no
+    // `residency=` field, a `fail-safe=` marker instead. Must be
+    // mechanically distinguishable from all three formats above too.
+    const FORMAT4_PATTERN = /^\[admission2\] cap=\d+ admitted=0 withheld \d+\/\d+ fail-safe=[a-z-]+ wanted: .+$/;
+    const FORMAT4_SAMPLE = admissionFailSafeLine(13, "census-threw", ["BUTCHR-307", "BUTCHR-308"]);
+
+    test("sanity: each sample matches its OWN pattern", () => {
+      expect(FORMAT1_SAMPLE).toMatch(FORMAT1_PATTERN);
+      expect(FORMAT2_SAMPLE).toMatch(FORMAT2_PATTERN);
+      expect(FORMAT3_SAMPLE).toMatch(FORMAT3_PATTERN);
+      expect(FORMAT4_SAMPLE).toMatch(FORMAT4_PATTERN);
+    });
+
+    // 4 formats × 2 directions each = twelve ordered pairs; every one must miss.
+    const samples = { 1: FORMAT1_SAMPLE, 2: FORMAT2_SAMPLE, 3: FORMAT3_SAMPLE, 4: FORMAT4_SAMPLE };
+    const patterns = { 1: FORMAT1_PATTERN, 2: FORMAT2_PATTERN, 3: FORMAT3_PATTERN, 4: FORMAT4_PATTERN };
+    for (const from of [1, 2, 3, 4] as const) {
+      for (const to of [1, 2, 3, 4] as const) {
+        if (from === to) continue;
+        test(`format ${from}'s sample does NOT match format ${to}'s pattern`, () => {
+          expect(samples[from]).not.toMatch(patterns[to]);
+        });
+      }
+    }
+
+    test("the controller's ACTUAL live emit (not a hand-built sample) also clears both old patterns", async () => {
+      const lines: string[] = [];
+      const ctrl = createAdmissionController({ cap: 2, residency: async () => ["R1"], log: (l) => lines.push(l) });
+      await ctrl.admit(["A", "B", "C"], []);
+      const line = lines.find((l) => l.startsWith(ADMISSION2_TAG))!;
+      expect(line).not.toMatch(FORMAT1_PATTERN);
+      expect(line).not.toMatch(FORMAT2_PATTERN);
+      expect(line).toMatch(FORMAT3_PATTERN);
+    });
+  });
+
   describe("Trap 2 — untrusted census", () => {
-    test("(1) residency() throws: withholds every candidate, fail-safe, and logs — never touches the trusted snapshot", async () => {
+    // BUTCHR-334 finding 1 — the required test: drive a census rejection
+    // WITH at least one candidate and assert what the journal shows. Before
+    // this ticket, this path withheld everything but returned before
+    // `admissionLine` was ever reached, so it produced NO [admission2] line
+    // at all — "no line means zero candidates" was false right here. Both
+    // the WARNING (already pinned above) and a same-tag [admission2] line
+    // are now required.
+    test("(1) residency() throws: withholds every candidate, fail-safe, and logs — never touches the trusted snapshot — AND now also logs an [admission2] line naming the fail-safe (BUTCHR-334 finding 1)", async () => {
       const lines: string[] = [];
       const ctrl = createAdmissionController({ cap: 5, residency: async () => { throw new Error("herdr down"); }, log: (l) => lines.push(l) });
       expect(await ctrl.admit(["A", "B"], [])).toEqual([]);
       expect(ctrl.snapshot()).toEqual({ cap: 5, residency: null, longestWait: null }); // still no trusted observation
       expect(lines.some((l) => l.includes("WARNING") && l.includes("threw"))).toBe(true);
+      const admLine = lines.find((l) => l.startsWith(ADMISSION2_TAG));
+      expect(admLine).toBe(admissionFailSafeLine(5, "census-threw", ["A", "B"]));
+      expect(admLine).toBe(`${ADMISSION2_TAG} cap=5 admitted=0 withheld 2/2 fail-safe=census-threw wanted: A, B`);
     });
 
-    test("a throw with zero candidates logs nothing (nothing was withheld)", async () => {
+    test("a throw with zero candidates logs nothing (nothing was withheld) — no WARNING and no [admission2] line either, symmetric with the ordinary empty-candidates short-circuit", async () => {
       const lines: string[] = [];
       const ctrl = createAdmissionController({ cap: 5, residency: async () => { throw new Error("boom"); }, log: (l) => lines.push(l) });
       expect(await ctrl.admit([], [])).toEqual([]);
@@ -141,7 +217,9 @@ describe("createAdmissionController", () => {
       expect(ctrl.snapshot()).toEqual({ cap: 3, residency: 0, longestWait: null });
     });
 
-    test("(2) readable-but-implausible zero: previously trusted at R>0, this poll's own plan stops fewer than R, census now reads 0 — withheld, trusted snapshot unchanged", async () => {
+    // BUTCHR-334 finding 1 — the required test's second half: same drill for
+    // the implausible-zero path.
+    test("(2) readable-but-implausible zero: previously trusted at R>0, this poll's own plan stops fewer than R, census now reads 0 — withheld, trusted snapshot unchanged — AND now also logs an [admission2] line naming the fail-safe (BUTCHR-334 finding 1)", async () => {
       let reads = ["A1", "A2", "A3"]; // first call establishes trust at 3
       const lines: string[] = [];
       const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, log: (l) => lines.push(l) });
@@ -152,6 +230,9 @@ describe("createAdmissionController", () => {
       expect(await ctrl.admit(["NEW"], [])).toEqual([]); // withheld — stopping.length (0) < lastTrusted (3)
       expect(ctrl.snapshot().residency).toBe(3); // unchanged — the implausible read was never trusted
       expect(lines.some((l) => l.includes("untrustworthy read"))).toBe(true);
+      const admLine = lines.find((l) => l.startsWith(ADMISSION2_TAG));
+      expect(admLine).toBe(admissionFailSafeLine(5, "implausible-zero", ["NEW"]));
+      expect(admLine).toBe(`${ADMISSION2_TAG} cap=5 admitted=0 withheld 1/1 fail-safe=implausible-zero wanted: NEW`);
     });
 
     test("a legitimate full drain is trusted directly: this poll's own plan.stop covers every previously-trusted resident, so the drop to 0 is explained, not implausible", async () => {
@@ -176,6 +257,15 @@ describe("createAdmissionController", () => {
       expect(await ctrl.admit(["A", "B", "C"], [])).toEqual(["A", "B", "C"]);
       expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 0, longestWait: null });
       expect(lines.some((l) => l.includes("bound exceeded"))).toBe(true);
+      // BUTCHR-334: this path is NOT one of the two fail-safe early returns —
+      // it falls through to the ORDINARY admission line (with a real,
+      // trusted `residency=0`), never `admissionFailSafeLine`'s shape. Pins
+      // the three-way distinction: fail-safe lines only ever come from the
+      // two paths that `return []` before this point.
+      const admLines = lines.filter((l) => l.startsWith(ADMISSION2_TAG));
+      const admLine = admLines[admLines.length - 1]!; // the FINAL admit() call — the one that actually accepted the zero
+      expect(admLine).toContain("residency=0");
+      expect(admLine).not.toContain("fail-safe=");
     });
 
     test("an implausible episode that resolves (a later plausible read) clears the streak — a LATER, unrelated implausible episode gets its own full window", async () => {

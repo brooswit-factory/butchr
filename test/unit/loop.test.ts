@@ -66,6 +66,30 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
     const scoped = scopedHerd(real, (id) => id.startsWith("TASK"));
     expect(await scoped.runningIssues()).toEqual(["TASK-1"]);
   });
+
+  // BUTCHR-334: `scopedHerd`'s `spawn` delegation is the ONE wrapper every
+  // production reconcile call actually passes through (runResourceLoop calls
+  // `reconcileNow(scopedHerd(deps.herd, deps.ownsId), ...)`) — a delegation
+  // written as `(spec) => herd.spawn(spec)` would silently DROP the respawn
+  // loop's own `"respawn"` origin argument in production while every test
+  // that talks to a bare `herd` object directly (bypassing this wrapper)
+  // kept passing. Pinned directly: the origin actually reaching the wrapped
+  // herd's own `spawn` must be exactly what was passed to the scoped one.
+  test("scopedHerd's spawn delegation threads the origin argument through unchanged — regression guard for finding 2(b)", async () => {
+    const received: Array<[string, unknown]> = [];
+    const inner: Herd = {
+      runningIssues: async () => [],
+      staleIssues: async () => [],
+      spawn: async (spec, origin) => { received.push([spec.key, origin]); },
+      stop: async () => {},
+      paneFor: async () => null,
+      nudge: async () => ({ delivered: false }),
+    };
+    const scoped = scopedHerd(inner, () => true);
+    await scoped.spawn({ key: "KAN-1", issuetype: "Task", summary: "s", parent: null }, "respawn");
+    await scoped.spawn({ key: "KAN-2", issuetype: "Task", summary: "s", parent: null });
+    expect(received).toEqual([["KAN-1", "respawn"], ["KAN-2", undefined]]);
+  });
 });
 
 describe("reconcileNow", () => {

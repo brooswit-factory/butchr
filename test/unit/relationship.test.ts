@@ -2343,6 +2343,56 @@ describe("start_worker / finish_worker / shelve_worker / prioritize_worker / tel
     expect(issues.get("BUTCHR-9")!.comments).toEqual(["[BUTCHR] [review] APPROVED https://example/pr/1 @ deadbeef"]);
   });
 
+  // BUTCHR-292/BUTCHR-328: the epic-axis self-wake suppression write, at
+  // this file's own ownership-focused fixture level (the end-to-end
+  // discovery/predicate proof lives in
+  // test/unit/project-self-wake-loop.test.ts). `makeWorld`'s own `addComment`
+  // fake returns no `id` (see the earlier test above, whose epic defaults to
+  // "To Do" anyway), so these three tests spy in a real id where the write
+  // path needs one to exercise.
+  test("tell_worker to an In-Review epic also watermarks the project's own epic-axis seen set with the id it just posted", async () => {
+    const { ops, issues, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", status: "In Review" });
+    let written: unknown;
+    const spied: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { await ops.addComment(key, text); return { ok: true, id: "777" }; },
+      setProjectProperty: async (key: string, propertyKey: string, value: unknown) => { written = value; return ops.setProjectProperty(key, propertyKey, value); },
+    };
+    await tellWorker(spied, "BUTCHR", "BUTCHR-9", "[review] APPROVED https://example/pr/1 @ deadbeef");
+    expect(issues.get("BUTCHR-9")!.comments).toEqual(["[BUTCHR] [review] APPROVED https://example/pr/1 @ deadbeef"]);
+    expect((written as { wake: { epicsSeen: Record<string, readonly string[]> } }).wake.epicsSeen).toEqual({ "BUTCHR-9": ["777"] });
+  });
+
+  test("tell_worker to an epic that is NOT In Review posts the comment but never touches the project watermark at all", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-9", { issuetype: "Epic", project: "BUTCHR", status: "To Do" });
+    let setProjectPropertyCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { await ops.addComment(key, text); return { ok: true, id: "777" }; },
+      setProjectProperty: async (...a: Parameters<AtlassianOps["setProjectProperty"]>) => { setProjectPropertyCalls++; return ops.setProjectProperty(...a); },
+    };
+    await tellWorker(spied, "BUTCHR", "BUTCHR-9", "heads up, not ready for review yet");
+    expect(setProjectPropertyCalls).toBe(0);
+  });
+
+  test("tell_worker from an ISSUE caller never touches the project watermark, even when addComment returns an id and the target reads In Review", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    let setProjectPropertyCalls = 0;
+    const spied: AtlassianOps = {
+      ...ops,
+      addComment: async (key: string, text: string) => { await ops.addComment(key, text); return { ok: true, id: "777" }; },
+      setProjectProperty: async (...a: Parameters<AtlassianOps["setProjectProperty"]>) => { setProjectPropertyCalls++; return ops.setProjectProperty(...a); },
+    };
+    await tellWorker(spied, "BUTCHR-1", "BUTCHR-2", "[review] APPROVED https://example/pr/1 @ deadbeef");
+    expect(setProjectPropertyCalls).toBe(0);
+  });
+
   test("start_worker / shelve_worker / prioritize_worker all work on the caller's own epic too", async () => {
     const { ops, issues, addIssue, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
