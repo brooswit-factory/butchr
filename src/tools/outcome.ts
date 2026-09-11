@@ -326,53 +326,64 @@ export interface ParsedOutcomeLine {
   message: string | null;
 }
 
-const OUTCOME_LINE_RE = /\[tools2\]\s+caller=(\S+)(?:\s+verb=(\S+))?(?:\s+target=(\S+))?\s+outcome=(ok|refused|error)(?:\s+msg=(.*))?/;
-
 /**
- * BUTCHR-343 blocker 2: the OLD `[tools]` line (`defs.ts`'s own `audit`
- * helper) echoes caller-supplied free text verbatim (`jira_search`'s `jql`,
- * `confluence_search_pages`'s `cql`, page titles, a `why`, a `destination`,
- * …) with no attempt to bound or escape it beyond a length slice. Since
- * `OUTCOME_LINE_RE` matches ANYWHERE in a line rather than only at its own
- * start (needed because a real journald prefix precedes every genuine
- * `[tools2]` line too — see this function's own doc comment), any OLD line
- * whose echoed free text happens to CONTAIN a well-formed
- * `[tools2] … outcome=ok` fragment parsed, before this guard, as a genuine
- * outcome record for a call that never happened — see
- * `test/unit/butchr-343-forged-embedded-tags.test.ts` for a fragment
- * produced by the real `jira_search` handler itself, not a hand fixture.
+ * BUTCHR-343 blocker 2, ROUND 2 (BUTCHR-316's own review of #348): an
+ * earlier version of this fix rejected a `[tools2]` match only when an OLD
+ * `[tools]` tag preceded it on the same line — closing the specific OLD-line
+ * vector the ticket demonstrated, but not the ticket's actual REQUIREMENT
+ * ("`[tools2]` only when it is the LINE'S OWN TAG, never text embedded
+ * inside another record"). The reviewer's own counter-example: any OTHER
+ * daemon line carrying free text with no `[tools]` tag at all still forged a
+ * record — e.g. `src/agents/escalation-loop.ts`'s
+ * `` `${paneId} blocked with no parseable dialog: "${text.slice(0, 60)}"` ``
+ * logs CAPTURED PANE TEXT, which the daemon does not control, verbatim.
  *
- * THE FIX, AND WHY THIS SHAPE: a genuine `[tools2]` line is always written
- * by `buildLine` (above) as the FIRST thing on the line — nothing this
- * code controls ever puts an OLD `[tools]` tag before it. The OLD line, by
- * contrast, is always written by `defs.ts`'s own `audit` helper as
- * `  [tools] <issue> → <what>` — its `[tools]` tag is always the line's own
- * first token, so any embedded `[tools2]` fragment inside `<what>` can only
- * ever appear AFTER that `[tools]` tag, never before it. So: if an OLD
- * `[tools]` tag appears anywhere before this match's own `[tools2]`, the
- * match is embedded free text inside someone else's record, not this
- * line's own tag — reject it. This is the anchor-by-precedence option the
- * PR#347 reviewer named, chosen over a positional regex anchor tied to
- * journald's own prefix shape (timestamp/host/pid), which this module does
- * not own and should not have to model.
+ * THE FIX: a real structural anchor, not a precedence check against one
+ * specific other tag. A genuine `[tools2]` line is always written by
+ * `buildLine` (above) as the ENTIRE argument to `log` (production wires this
+ * straight to `console.error`, unwrapped — see `atlassianTools`'s own `log`
+ * default and its one production call site) — so `OUTCOME_TAG` is always the
+ * very first thing on its own application-emitted line, and `msg=`'s value
+ * (already newline-flattened, see `boundMessage`) is always the very LAST
+ * thing, with nothing following it. The only thing legitimately allowed
+ * BEFORE that first token is `journalctl`'s own transport prefix — this repo
+ * invokes it with no `-o` flag anywhere (re-grep `journalctl` yourself before
+ * trusting that at your own commit), so its output is always the default
+ * "short" format: `<mon> <day> <HH:MM:SS> <host> <ident>[<pid>]: `.
+ * `JOURNALD_SHORT_PREFIX_SRC` matches exactly that, and ONLY that — this
+ * module still does not depend on, validate, or otherwise own journald's
+ * format, it merely knows enough of its fixed shape to skip past it. Anchor
+ * BOTH ends: `^` (optional journald prefix, then `[tools2]` immediately, no
+ * other tag/prose allowed to precede it) and `$` (nothing may follow `msg=`,
+ * or `outcome=` when there is no message). A fragment embedded ANYWHERE
+ * inside another line's own fixed framing text — before it (an escalation
+ * log's own prefix, a `WARNING:` label, the OLD `[tools]` tag, …) or after
+ * it (a closing quote, trailing prose) — now fails to match at all, rather
+ * than merely failing a precedence check against one named tag. See
+ * `test/unit/butchr-343-forged-embedded-tags.test.ts` for pins built on the
+ * real `jira_search` handler AND the real `createEscalator().onNoPrompt`
+ * path, not hand fixtures.
  */
-const OLD_TOOLS_TAG = "[tools]";
+const JOURNALD_SHORT_PREFIX_SRC = String.raw`(?:[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+?(?:\[\d+\])?:\s*)?`;
+
+const OUTCOME_LINE_RE = new RegExp(
+  `^${JOURNALD_SHORT_PREFIX_SRC}\\[tools2\\]\\s+caller=(\\S+)(?:\\s+verb=(\\S+))?(?:\\s+target=(\\S+))?\\s+outcome=(ok|refused|error)(?:\\s+msg=(.*))?$`,
+);
 
 /**
  * Parses ONE line of text (typically a `journalctl` line, journald prefix
- * and all — matches ANYWHERE in the line, never anchored to its start, same
- * as `parseAliasAuditLine`) into a `ParsedOutcomeLine`, or `null` when the
- * line is not a `[tools2]` outcome record at all — including every OLD
+ * and all — see `OUTCOME_LINE_RE`'s own doc comment for exactly what prefix
+ * is tolerated and why) into a `ParsedOutcomeLine`, or `null` when the line
+ * is not GENUINELY a `[tools2]` outcome record — including every OLD
  * `[tools]` line, verbatim or otherwise (see `OUTCOME_TAG`'s own doc comment
- * and `test/unit/outcome.test.ts`'s bidirectional pin), AND every line where
- * a `[tools2]`-shaped fragment is merely embedded inside an OLD line's own
- * echoed free text (see this function's own doc comment above, and
+ * and `test/unit/outcome.test.ts`'s bidirectional pin), and every line where
+ * a `[tools2]`-shaped fragment is merely embedded inside ANY other line's own
+ * free text, OLD-format or not (see `OUTCOME_LINE_RE`'s own doc comment, and
  * `test/unit/butchr-343-forged-embedded-tags.test.ts`).
  */
 export function parseOutcomeLine(line: string): ParsedOutcomeLine | null {
   const m = line.match(OUTCOME_LINE_RE);
   if (!m) return null;
-  if (line.slice(0, m.index).includes(OLD_TOOLS_TAG)) return null;
   return {
     caller: m[1]!,
     verb: m[2] ?? null,
