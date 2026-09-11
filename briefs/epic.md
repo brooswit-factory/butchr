@@ -257,8 +257,11 @@ Task, whose boss watches their ticket regardless of status.
 moving there just to be heard is a status change, not a message, and it puts
 unfinished work in front of your project as if it were done. If you are In
 Progress and genuinely need your project, there is no verb that reaches it
-directly, so do not wait on one: escalate to a human immediately, the same
-moment you recognize you're blocked, rather than counting on `report_to_boss`
-to be read while you sit In Progress. The human is the fallback, not the
-first responder — but for an In Progress epic with no safe option, the human
-is the only responder this channel can reach.
+directly, so do not wait on one. There is also no verb that reaches a human
+directly — saying "escalate to a human" names no mechanism unless you say
+what it concretely means: call `report_to_boss` anyway, the same moment you
+recognize you're blocked. It still posts on your own ticket; no agent is
+watching that ticket while you remain In Progress, so only a PERSON READING YOUR TICKET DIRECTLY will ever see it, and no agent will answer it. Post it
+and do not wait as though one will — a human happening to read the ticket is
+the only responder this channel can reach for an In Progress epic with no
+safe option.

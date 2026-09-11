@@ -836,7 +836,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(d).toMatch(/boss is a PROJECT/);
     expect(d).toMatch(/only while that epic is In Review/);
     expect(d).toMatch(/nobody is woken by it/);
-    expect(d).toMatch(/STORY or TASK caller this always reaches its boss/);
+    expect(d).toMatch(/STORY or TASK caller this lands on a surface its boss actually watches, whatever the ticket's status/);
+    // BUTCHR-331 defect 4: the wiring guarantees the comment lands on a
+    // watched surface, never that it is actually delivered/read — the boss
+    // itself can be withheld at the agent cap or blocked by quota (measured
+    // on BUTCHR-318 itself). "always reaches" claims delivery; drop it.
+    expect(d).not.toMatch(/always reaches its boss/);
   });
 
   test("ask_boss's description states the same Epic→Project conditionality for its [ask] marker, without weakening Story/Task", () => {
@@ -846,7 +851,12 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(d).toMatch(/boss is a PROJECT/);
     expect(d).toMatch(/only while you are In Review/);
     expect(d).toMatch(/no agent is woken by it/);
-    expect(d).toMatch(/STORY or TASK caller that marker is always eventually found/);
+    expect(d).toMatch(/STORY or TASK caller that marker lands on a surface your boss actually watches, whatever your ticket's status/);
+    // BUTCHR-331 defect 4: same DELIVERY overclaim as report_to_boss's own
+    // fix, on this verb's "always eventually found" phrasing — the wiring
+    // only guarantees the marker lands where the boss watches, not that a
+    // (possibly withheld/quota-blocked) boss ever actually finds it.
+    expect(d).not.toMatch(/always eventually found/);
   });
 
   test("submit_to_boss takes NO arguments at all", () => {

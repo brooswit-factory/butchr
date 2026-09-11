@@ -30,6 +30,31 @@ describe("briefFor / modelFor", () => {
     expect(brief).toContain("You hear a running epic only by reading its ticket yourself");
     expect(brief).toContain("the epic's own ticket, never on your root doc");
   });
+  // BUTCHR-331 defect 1: an ISSUE caller's report_to_boss/ask_boss can NEVER
+  // write a root-doc comment (src/tools/speak.ts's project-id branch is the
+  // only path to one) — the brief must name the real writers (the project's
+  // own report_to_boss/ask_boss, a peer's tell_peer, a person or agent
+  // commenting directly) instead of the false "any caller's".
+  test("project brief names the real writers of root-doc comments, not 'any caller's report_to_boss/ask_boss'", () => {
+    const brief = briefFor("project");
+    expect(brief).not.toContain("any caller's `report_to_boss`");
+    expect(brief).toContain("written by YOUR OWN `report_to_boss`/`ask_boss`");
+    expect(brief).toContain("a peer project's `tell_peer`");
+    expect(brief).toContain("a person or agent commenting on the page directly");
+    expect(brief).toContain("never by an issue caller's `report_to_boss`/`ask_boss`");
+  });
+  // BUTCHR-331 defect 2: the project's activation verdict ORs THREE axes
+  // (src/resources/project.ts: versionBehind || commentBehind || epicsBehind)
+  // — a root-doc BODY edit (the version axis) also wakes the project. The
+  // brief previously said "exactly two ... full stop", omitting it.
+  test("project brief names all three wake axes, including the root-doc version/body-edit axis, and drops the false 'exactly two ... full stop' precision", () => {
+    const brief = briefFor("project");
+    expect(brief).not.toContain("exactly two");
+    expect(brief).not.toContain("full stop");
+    expect(brief).toContain("three wake axes");
+    expect(brief).toContain("the VERSION axis");
+    expect(brief).toContain("an epic has no verb that edits or comments on your root doc");
+  });
   test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
@@ -224,7 +249,18 @@ describe("briefFor / modelFor", () => {
     expect(brief).toContain('it does NOT "escalate to');
     expect(brief).toContain("whoever watches you\" the way the same call genuinely does for a Story or a");
     expect(brief).toContain("`submit_to_boss` is not a doorbell.");
-    expect(brief).toContain("escalate to a human immediately");
+    expect(brief).toContain("call `report_to_boss` anyway");
+  });
+
+  // BUTCHR-331 defect 3(a): "escalate to a human immediately" named no
+  // mechanism — no verb reaches a human. The brief must instead say the
+  // concrete substance: call report_to_boss anyway, only a person reading
+  // the ticket directly will see it, and no agent will answer.
+  test("epic brief's submit_to_boss-is-not-a-doorbell passage names the concrete mechanism instead of the undefined 'escalate to a human immediately' phrase", () => {
+    const brief = briefFor("Epic");
+    expect(brief).toContain("only a PERSON READING YOUR TICKET DIRECTLY will ever see it");
+    expect(brief).toContain("no agent will answer it");
+    expect(brief).not.toContain("escalate to a human immediately");
   });
   // BUTCHR-42: GAP 2 — jira_get_issue, jira_search, jira_add_comment,
   // confluence_search_pages and confluence_list_spaces are retained

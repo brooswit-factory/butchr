@@ -463,8 +463,26 @@ describe("createEscalator — 15-minute follow-up", () => {
 
     expect(text).toMatch(/Story's or Task's boss reads that ticket regardless of status/);
     expect(text).toMatch(/an Epic's project boss reads it only while the epic is In Review/);
-    expect(text).toMatch(/an In Progress epic reaches nobody this way and should escalate to a human directly instead/);
+    expect(text).toMatch(/an In Progress epic reaches nobody this way/);
     expect(text).not.toMatch(/escalates to whoever watches you/);
+  });
+
+  // BUTCHR-331 defect 3(b): "escalate to a human directly instead" named no
+  // mechanism — no verb reaches a human. The follow-up must instead say the
+  // concrete substance: post anyway, only a person reading the ticket
+  // directly will ever see it, and no agent will answer.
+  test("the follow-up names the concrete mechanism (post on your own ticket; only a human reading it directly will see it; no agent answers) instead of the undefined 'escalate to a human directly' phrase", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt); // escalates at clock=0
+    h.setClock(15 * 60_000);
+    await h.poll("p1", "KAN-1", prompt); // follow-up fires
+    const text = h.posted[1]!.text;
+
+    expect(text).toMatch(/only a PERSON READING THIS TICKET DIRECTLY will see it/);
+    expect(text).toMatch(/no agent will answer/);
+    expect(text).not.toMatch(/escalate to a human directly instead/);
   });
 });
 
