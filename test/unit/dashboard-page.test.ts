@@ -85,11 +85,16 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
 // VISIBLE text on every agent row — not merely present somewhere in the HTML
 // (it was already present, inside the terminal link's href, which is exactly
 // the bug this ticket fixes). `elementText`, scoped to the dedicated `.pane`
-// element, is what makes this assertion fail on the pre-fix code: a page-wide
-// `toContain("w1:p3")` would still pass today, because the href already
-// contains it — confirmed by running this test against the pre-fix render
-// (the href-only version, before the `.pane` span was added) and watching it
-// fail with "expected to find an element with class=\"pane\"".
+// element, is what makes this assertion fail on the pre-fix code regardless
+// of the pane's spelling: the href is built with `encodeURIComponent`, so a
+// pane containing a character that needs escaping (e.g. the colon in
+// "w1:p3") never appears as a raw substring pre-fix — but a pane with no
+// such characters (e.g. "p1") DOES survive unescaped inside the href, so an
+// unscoped `toContain(pane)` can still pass on the unfixed code for those
+// panes. Scoping to the `.pane` element removes that dependence on spelling:
+// confirmed by running this test against the pre-fix render (the href-only
+// version, before the `.pane` span was added) and watching it fail with
+// "expected to find an element with class=\"pane\"".
 // ---------------------------------------------------------------------------
 describe("renderDashboard: the pane is visible text on every agent row (BUTCHR-342)", () => {
   test("an agent row renders its pane as its own visible element, escaped, distinct from the terminal link's href", () => {
