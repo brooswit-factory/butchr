@@ -441,7 +441,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
   // genuine last page. FALSIFIER: if this ever returns fewer than 125
   // results, or stops after 1 call, the yardstick has regressed back to
   // "requested size" instead of "server-reported size".
-  test("REVIEW FIX ROUND 2: a server that caps `maxResults` below what was requested (but reports its own effective size and a `total`) still paginates to exhaustion", async () => {
+  test("REVIEW FIX ROUND 2 (rule 1 path): a server that caps `maxResults` below what was requested, WITH a `total` reported, still paginates to exhaustion — note this exercises rule 1 (`startAt >= total`), NOT the round-2 yardstick; the rule-2 case is the test below", async () => {
     const calls: unknown[] = [];
     mock.module("jira.js", () => ({
       createCloudClient: () => ({
@@ -471,6 +471,52 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
     const got = await ops.getIssueComments("KAN-9");
     expect(calls.length).toBe(3); // 50 + 50 + 25, not stopped after the first capped-at-50 page
     expect(got.results.length).toBe(125); // the FULL 125, not just the first capped page of 50
+  });
+
+  // REVIEW GAP FOUND BY BUTCHR-208 AT REVIEW OF THE STORY PR ("M5"): the two
+  // tests above BOTH leave rule 2 unexercised, so reverting the round-2
+  // yardstick (`responseMaxResults` -> `PAGE_SIZE`) survived the entire suite —
+  // reintroducing the exact round-2 regression (50 of 125, silently) with no
+  // test failing. Why neither covers it: the test above reports a `total`, so
+  // after round 3's restructuring it terminates via rule 1 and never reaches
+  // rule 2; and the no-`total` test has the server HONOUR the requested 100, so
+  // `responseMaxResults === PAGE_SIZE` and the two yardsticks are
+  // indistinguishable. Rule 2 is reached ONLY when there is no `total`, and it
+  // is only DISTINGUISHABLE from the requested size when the server reports a
+  // `maxResults` BELOW what was asked for. That is this test, and it is the
+  // one shape no earlier round covered.
+  //
+  // FALSIFIER, stated before it was run: change the comparison back to
+  // `batch.length < PAGE_SIZE` and this test must fail (50 returned, 1 call).
+  // Verified: it does.
+  test("REVIEW FIX ROUND 2 (rule 2 path, the one that actually pins the yardstick): NO `total`, and the server reports a `maxResults` BELOW the requested 100 and caps to it — a full-from-the-server page must not read as short", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            // Server honours only 50 of the requested 100 and says so via its
+            // own `maxResults`. NO `total` anywhere, so rule 1 cannot apply and
+            // termination rests entirely on rule 2's yardstick.
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining);
+            return Promise.resolve({
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              startAt,
+              maxResults: 50,
+            });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // 50 + 50 + 25 — a 50-comment page is FULL here, not short
+    expect(got.results.length).toBe(125); // the FULL 125; under the pre-round-2 yardstick this is 50
   });
 
   // BUTCHR-309 REVIEW ROUND 3 (measured against the round-2 fix, case "C" of
