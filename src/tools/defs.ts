@@ -682,7 +682,7 @@ export function atlassianTools(
         const { key, text } = a as { key: string; text: string };
         const who = requireCaller(c, "tell_worker");
         audit(c, `tell_worker ${key}`);
-        const r = await tellWorker(ops, who, key, text);
+        const r = await tellWorker(ops, who, key, text, log);
         noted(c, [key]);
         return r;
       },
