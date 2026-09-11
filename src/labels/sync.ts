@@ -250,7 +250,19 @@ export function createLabelSync(deps: SyncDeps) {
         // uncollapsed so the module can distinguish "could not verify" from
         // "stabilizing" from "nothing going on" for its own log lines,
         // without any of those ever gating whether it acts.
-        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null);
+        //
+        // BUTCHR-353: this ticket's own outward `Implements` links ARE its
+        // workers — already hydrated on `issue.issuelinks` by `search()`'s
+        // own `fields` param (src/atlassian/client.ts), the SAME payload
+        // this whole function already iterates, so this costs ZERO extra
+        // Jira calls (never a second Implements-link walker — see
+        // WorkerLink's own doc comment, stall-remediation.ts, for the two
+        // OTHER existing walkers this deliberately does not reuse instead,
+        // and why). `status` is exactly what that stub hydrates (BUTCHR-200)
+        // — `undefined` only when Jira genuinely didn't hydrate it, treated
+        // as "not Done" by gatherWorkerSignals, never fabricated.
+        const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
       }
       // KAN-824: epics never have a branch, so a search for one can only ever
       // miss — skip the call entirely rather than let it burn a GitHub search.
