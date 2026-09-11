@@ -82,11 +82,11 @@ export const MARKER = "[butchr:abandoned]";
  * module) — enforce where there is an exit, make audible where there is
  * not. This module is the audible half.
  *
- * In practice this rarely bites on the label itself: `IssueLink`'s hydrated
- * field set (`issuetype, priority, status, summary` — MEASURED, BUTCHR-192)
- * never includes `labels`, so this predicate could not see `butchr:shelved`
- * on the boss even if it wanted to. It reads the WORKER's own labels (which
- * `issues` already carries in full), not the boss's.
+ * `IssueLink`'s hydrated field set (`issuetype, priority, status, summary` —
+ * MEASURED, BUTCHR-192) never includes `labels`, so this predicate could
+ * never see `butchr:shelved` on the boss even if it wanted to. It reads the
+ * WORKER's own labels (which `issues` already carries in full), not the
+ * boss's.
  *
  * BEFORE BUTCHR-240, that worker-label read was where this decision mostly
  * stopped mattering in practice: a shelved worker is, by `shelve_worker`'s
