@@ -491,6 +491,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // wake anything. A watcher with NO recorded baseline for `key` (e.g.
       // a worker created after `watcher` stood down — `hasBaseline` false)
       // fails TOWARD waking rather than silently swallowing a ticket the
+      // stand-down snapshot never covered.
       //
       // APPEARED/DISAPPEARED IS STRUCTURAL FOR A DIFFERENT REASON THAN THE
       // OTHER FOUR, AND IT MATTERS (PR #322 review round 1): status/label/
@@ -509,7 +510,6 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // it trusts its caller (`runResourceLoop`) to hand it a `related`
       // snapshot that only ever reflects Jira, never the loop's own
       // bookkeeping — see that fix's own comment for the measurement.
-      // stand-down snapshot never covered.
       const finalize = async (key: string, watcher: string, verdict: EventVerdict): Promise<EventVerdict> => {
         if (!verdict.deliver) return verdict;
         const sd = deps.standDown;

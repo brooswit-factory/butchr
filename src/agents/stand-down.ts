@@ -68,6 +68,18 @@ import { unseenIds } from "../resources/project.js";
  * `maxResults` cap (20, src/atlassian/client.ts) comment ids. So one
  * episode's seen-set is bounded by `20 * (1 + number of the caller's current
  * workers)` — small in practice, and it cannot grow further while asleep: a
+ * ONE ACCEPTED IMPRECISION IN THE SEEN-SET, NAMED RATHER THAN LEFT TO BE
+ * DISCOVERED (BUTCHR-298 review of this ticket's PR): the snapshot and the
+ * later comparison both read the NEWEST 20 comment ids (`orderBy: -created,
+ * maxResults: 20` — the same window on both sides, which is what makes the
+ * comparison meaningful at all). If a comment is DELETED while an agent is
+ * asleep, that window slides onto an older id the snapshot never recorded,
+ * and the next edge on that ticket reads as unseen — one spurious wake. That
+ * is the CHEAP direction (a wake with nothing new costs one spawn; the
+ * expensive direction is silence), it is rare, and it is bounded by the
+ * yield-loop accounting below like any other spurious wake. Not worth code:
+ * worth knowing, so nobody debugs it twice.
+ *
  * standing episode never re-snapshots. `forgetMissing` (called every poll
  * from `createIssueResourceType`'s `discovery.search()`, src/resources/
  * issue.ts) drops the whole record the moment the ticket leaves the active
