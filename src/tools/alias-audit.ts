@@ -1,3 +1,5 @@
+import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
+
 /**
  * HALF B of BUTCHR-49/BUTCHR-63: a per-call classification for a deprecated
  * alias's audit line, machine-readable enough for scripts/audit-alias-calls.ts
@@ -157,20 +159,22 @@ export interface ParsedAliasCall {
  * THE FIX: mirrors `OUTCOME_LINE_RE`'s own doc comment exactly (`src/tools/
  * outcome.ts`) — `[tools]` is always the very first thing `defs.ts`'s
  * `audit` helper puts on its own line (`  [tools] <issue> → <what>`, mod
- * `journalctl`'s own fixed, `-o`-flag-free "short" transport prefix, which
- * this repo never overrides — re-grep before trusting that at your own
- * commit). Anchor the identity match to the START of the line (that prefix
- * optionally aside) instead of searching for it anywhere. Deliberately NOT
- * anchored at the END, unlike `OUTCOME_LINE_RE`: an OLD line's trailing
- * content is genuinely free-form and verb-specific (`get <key>`, `search
- * <jql>`, `transition <key> → <status> [deprecated alias; …] [alias …]`, …)
- * with no single fixed shape to anchor against — the START anchor alone is
- * what "is the line's own tag" requires; requiring a fixed tail shape that
- * does not exist would just make this function reject real lines.
+ * `journalctl`'s own transport prefix). `JOURNALD_PREFIX_SRC`
+ * (`src/tools/journald-prefix.ts`, shared with `parseOutcomeLine`) matches
+ * every single-line `journalctl --output=` mode, not only the default one —
+ * see that module's own doc comment for why (a human/agent reader is
+ * explicitly sent to run `journalctl` by hand, not only this repo's own
+ * programmatic callers) and for real captured samples of each mode. Anchor
+ * the identity match to the START of the line (that prefix optionally
+ * aside) instead of searching for it anywhere. Deliberately NOT anchored at
+ * the END, unlike `OUTCOME_LINE_RE`: an OLD line's trailing content is
+ * genuinely free-form and verb-specific (`get <key>`, `search <jql>`,
+ * `transition <key> → <status> [deprecated alias; …] [alias …]`, …) with no
+ * single fixed shape to anchor against — the START anchor alone is what "is
+ * the line's own tag" requires; requiring a fixed tail shape that does not
+ * exist would just make this function reject real lines.
  */
-const JOURNALD_SHORT_PREFIX_SRC = String.raw`(?:[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+?(?:\[\d+\])?:\s*)?`;
-
-const TOOLS_LINE = new RegExp(`^${JOURNALD_SHORT_PREFIX_SRC}\\s*\\[tools\\]\\s+(\\S+)\\s+→`);
+const TOOLS_LINE = new RegExp(`^${JOURNALD_PREFIX_SRC}\\s*\\[tools\\]\\s+(\\S+)\\s+→`);
 const NEW_ALIAS_TAG = /\[alias tool=([A-Za-z_]+) class=(drift|sanctioned|ambiguous)\]/;
 const OLD_ALIAS_MARKER = "[deprecated alias;";
 

@@ -1,4 +1,5 @@
 import type { ToolDef } from "@brooswit/thatch";
+import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
 
 /**
  * BUTCHR-341 (implementing BUTCHR-316): marks a thrown Error as a DELIBERATE
@@ -346,28 +347,27 @@ export interface ParsedOutcomeLine {
  * very first thing on its own application-emitted line, and `msg=`'s value
  * (already newline-flattened, see `boundMessage`) is always the very LAST
  * thing, with nothing following it. The only thing legitimately allowed
- * BEFORE that first token is `journalctl`'s own transport prefix — this repo
- * invokes it with no `-o` flag anywhere (re-grep `journalctl` yourself before
- * trusting that at your own commit), so its output is always the default
- * "short" format: `<mon> <day> <HH:MM:SS> <host> <ident>[<pid>]: `.
- * `JOURNALD_SHORT_PREFIX_SRC` matches exactly that, and ONLY that — this
- * module still does not depend on, validate, or otherwise own journald's
- * format, it merely knows enough of its fixed shape to skip past it. Anchor
- * BOTH ends: `^` (optional journald prefix, then `[tools2]` immediately, no
- * other tag/prose allowed to precede it) and `$` (nothing may follow `msg=`,
- * or `outcome=` when there is no message). A fragment embedded ANYWHERE
- * inside another line's own fixed framing text — before it (an escalation
- * log's own prefix, a `WARNING:` label, the OLD `[tools]` tag, …) or after
- * it (a closing quote, trailing prose) — now fails to match at all, rather
- * than merely failing a precedence check against one named tag. See
- * `test/unit/butchr-343-forged-embedded-tags.test.ts` for pins built on the
- * real `jira_search` handler AND the real `createEscalator().onNoPrompt`
- * path, not hand fixtures.
+ * BEFORE that first token is `journalctl`'s own transport prefix —
+ * `JOURNALD_PREFIX_SRC` (`src/tools/journald-prefix.ts`, shared with
+ * `parseAliasAuditLine`) matches every single-line `journalctl --output=`
+ * mode, not only the default one a ROUND 2 of this fix wrongly assumed was
+ * the only one in play — see that module's own doc comment for why (a
+ * human/agent reader is explicitly sent to run `journalctl` by hand, not
+ * only this repo's own programmatic callers) and for real captured samples
+ * of each mode. Anchor BOTH ends: `^` (optional journald prefix, then
+ * `[tools2]` immediately, no other tag/prose allowed to precede it) and `$`
+ * (nothing may follow `msg=`, or `outcome=` when there is no message). A
+ * fragment embedded ANYWHERE inside another line's own fixed framing text —
+ * before it (an escalation log's own prefix, a `WARNING:` label, the OLD
+ * `[tools]` tag, …) or after it (a closing quote, trailing prose) — now
+ * fails to match at all, rather than merely failing a precedence check
+ * against one named tag. See `test/unit/butchr-343-forged-embedded-tags.test.ts`
+ * for pins built on the real `jira_search` handler AND the real
+ * `createEscalator().onNoPrompt` path, not hand fixtures, plus one test per
+ * `journalctl --output=` mode against a real captured sample of each.
  */
-const JOURNALD_SHORT_PREFIX_SRC = String.raw`(?:[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+?(?:\[\d+\])?:\s*)?`;
-
 const OUTCOME_LINE_RE = new RegExp(
-  `^${JOURNALD_SHORT_PREFIX_SRC}\\[tools2\\]\\s+caller=(\\S+)(?:\\s+verb=(\\S+))?(?:\\s+target=(\\S+))?\\s+outcome=(ok|refused|error)(?:\\s+msg=(.*))?$`,
+  `^${JOURNALD_PREFIX_SRC}\\[tools2\\]\\s+caller=(\\S+)(?:\\s+verb=(\\S+))?(?:\\s+target=(\\S+))?\\s+outcome=(ok|refused|error)(?:\\s+msg=(.*))?$`,
 );
 
 /**

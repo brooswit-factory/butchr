@@ -6,20 +6,24 @@ import { parseAliasAuditLine } from "../../src/tools/alias-audit.js";
 import { createEscalator } from "../../src/agents/escalation-loop.js";
 
 /**
- * BUTCHR-343 (closing PR #347's review blockers 2 and 3): both readers below
- * originally matched ANYWHERE in a line, never anchored to a line's start.
- * That is exactly what let a caller-supplied (or, per the round-2 review
- * below, a daemon-CAPTURED) free-text field that happens to CONTAIN the
+ * BUTCHR-343 (closing PR #347's review blockers 2 and 3, across three review
+ * rounds): both readers below originally matched ANYWHERE in a line, never
+ * anchored to a line's start. That is exactly what let a caller-supplied (or,
+ * per round 2, a daemon-CAPTURED) free-text field that happens to CONTAIN the
  * other reader's tag get parsed as a genuine record of a call that never
  * happened. Both readers are now anchored (see `OUTCOME_LINE_RE`'s and
  * `TOOLS_LINE`'s own doc comments in `src/tools/outcome.ts` /
  * `src/tools/alias-audit.ts`) to require the tag be the LINE'S OWN first
- * token, tolerating only `journalctl`'s own fixed default transport prefix —
- * never merely "no other named tag precedes it," which is what round 1 of
- * this fix got wrong (see BUTCHR-316's review of #348). Every ops/audit fake
- * below is a minimal stand-in — only the methods these verbs actually reach
- * are given real behaviour; every other `AtlassianOps` method is a stub that
- * is never called by any test in this file.
+ * token, tolerating only `journalctl`'s own transport prefix, in EVERY
+ * single-line `--output=` mode (`src/tools/journald-prefix.ts`) — never
+ * merely "no other named tag precedes it" (round 1's mistake), and never
+ * only the default mode (round 2's mistake, real per BUTCHR-316's own
+ * review: a human/agent reader is explicitly sent to run `journalctl` by
+ * hand with whatever flags they like, not only this repo's own programmatic
+ * callers). Every ops/audit fake below is a minimal stand-in — only the
+ * methods these verbs actually reach are given real behaviour; every other
+ * `AtlassianOps` method is a stub that is never called by any test in this
+ * file.
  */
 function stubOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
   const unused = () => { throw new Error("not used by this test"); };
@@ -147,8 +151,57 @@ describe("BUTCHR-343 blocker 2, round 2 (BUTCHR-316's review of #348): parseOutc
     expect(parseOutcomeLine(line)).toBeNull();
   });
 
-  test("a genuine journalctl-formatted [tools2] line (default short format, the only format this repo ever invokes journalctl in) still parses — the anchor must not reject real lines", () => {
+  test("a genuine journalctl-formatted [tools2] line (default short format) still parses — the anchor must not reject real lines", () => {
     const genuineLine = `Sep 10 12:00:01 servyboi bun[123456]: ${OUTCOME_TAG} caller=BUTCHR-9 verb=jira_get_issue target=BUTCHR-1 outcome=ok`;
     expect(parseOutcomeLine(genuineLine)).toEqual({ caller: "BUTCHR-9", verb: "jira_get_issue", target: "BUTCHR-1", outcome: "ok", message: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-343 blocker 2/3, round 3 (BUTCHR-316's SECOND review of #348): round
+// 2's anchor modelled only journalctl's DEFAULT (`-o short`) transport prefix
+// — true of this repo's own PROGRAMMATIC callers (scripts/audit-alias-calls.ts
+// never passes `-o`), but not of the human/agent reader BUTCHR-316's own doc
+// explicitly sends to run `journalctl` themselves with whatever flags they
+// like. A genuine record read with any OTHER single-line `-o` mode silently
+// returned null — indistinguishable from "not a record", the exact confusion
+// this whole story exists to keep apart. Every prefix string below is a REAL
+// captured sample from this daemon's own `journalctl --user -o <mode> -q`,
+// not invented (see src/tools/journald-prefix.ts's own doc comment for how
+// each was captured, and re-capture your own before trusting these are still
+// accurate at your commit — journald's own format is not this repo's to
+// control). This is the same seam `parseAliasAuditLine` shares
+// (JOURNALD_PREFIX_SRC), so one representative pair of formats is pinned for
+// it too, rather than the full matrix a second time.
+// ---------------------------------------------------------------------------
+describe("BUTCHR-343 blocker 2/3, round 3 (BUTCHR-316's 2nd review of #348): both readers must accept every single-line journalctl --output= mode, not only the default", () => {
+  const REAL_CAPTURED_PREFIXES: Array<[string, string]> = [
+    ["short", "Sep 11 03:25:21 servyboi bun[641076]: "],
+    ["short --utc", "Sep 11 10:25:48 servyboi bun[641076]: "],
+    ["short-precise", "Sep 11 03:25:21.756106 servyboi bun[641076]: "],
+    ["short-iso", "2026-09-11T03:25:21-07:00 servyboi bun[641076]: "],
+    ["short-iso-precise", "2026-09-11T03:25:21.756106-07:00 servyboi bun[641076]: "],
+    ["short-full", "Fri 2026-09-11 03:25:21 PDT servyboi bun[641076]: "],
+    ["short-full --utc", "Fri 2026-09-11 10:25:48 UTC servyboi bun[641076]: "],
+    ["short-unix", "1789122321.756106 servyboi bun[641076]: "],
+    ["short-monotonic", "[58397.767905] servyboi bun[641076]: "],
+    ["with-unit", "Fri 2026-09-11 03:25:48 PDT servyboi user@1001.service/butchr.service[641076]: "],
+  ];
+
+  for (const [mode, prefix] of REAL_CAPTURED_PREFIXES) {
+    test(`parseOutcomeLine accepts a genuine [tools2] line under journalctl -o ${mode}`, () => {
+      const line = `${prefix}${OUTCOME_TAG} caller=BUTCHR-9 verb=jira_get_issue target=BUTCHR-1 outcome=ok`;
+      expect(parseOutcomeLine(line)).toEqual({ caller: "BUTCHR-9", verb: "jira_get_issue", target: "BUTCHR-1", outcome: "ok", message: null });
+    });
+  }
+
+  test("parseAliasAuditLine accepts a genuine OLD [tools] line under journalctl -o short-iso (representative of the shared anchor — same JOURNALD_PREFIX_SRC as parseOutcomeLine)", () => {
+    const line = "2026-09-11T03:25:21-07:00 servyboi bun[641076]:   [tools] BUTCHR-63 → transition KAN-1 → Done [deprecated alias; use finish_worker] [alias tool=jira_transition class=drift]";
+    expect(parseAliasAuditLine(line)).toEqual({ identity: "BUTCHR-63", tool: "jira_transition", classification: "drift" });
+  });
+
+  test("parseAliasAuditLine accepts a genuine OLD [tools] line under journalctl -o with-unit (its own ident field carries a slash, e.g. a templated unit name — the shared tail pattern must tolerate that)", () => {
+    const line = "Fri 2026-09-11 03:25:48 PDT servyboi user@1001.service/butchr.service[641076]:   [tools] BUTCHR-63 → transition KAN-1 → Done [deprecated alias; use finish_worker] [alias tool=jira_transition class=drift]";
+    expect(parseAliasAuditLine(line)).toEqual({ identity: "BUTCHR-63", tool: "jira_transition", classification: "drift" });
   });
 });
