@@ -28,9 +28,38 @@ import { JOURNALD_PREFIX_SRC } from "../tools/journald-prefix.js";
  * at each of the two OMITTED arms' call sites, and this ticket's own
  * Confluence doc, for the exact, honest statement of what "no
  * `[notify-suppressed]` line" does and does not prove for those two classes.
- * For the two classes THIS module logs, "no line" is unambiguous: that
- * suppression did not happen — see each emitter's own doc comment for why
- * (both fire unconditionally on their trigger, no sampling, no aggregation).
+ *
+ * For the two classes THIS module logs, "no line" is NOT unambiguous proof
+ * that nothing was suppressed — that overclaim was this comment's own
+ * defect (BUTCHR-350 PR #352 review round 1) and is corrected here. Each
+ * emitter fires unconditionally on ITS OWN trigger condition, no sampling,
+ * no aggregation — but each trigger condition is itself a DETECTOR, and a
+ * detector can have blind spots a real instance still falls into:
+ *
+ * - `stand-down`: the trigger (`unseen.length === 0`, inside
+ *   `createIssueEventRules`'s `finalize`) is unconditional and total for
+ *   what it covers — no known blind spot. "No `arm=stand-down` line for a
+ *   poll where the gate ran" genuinely means it did not suppress there.
+ *
+ * - `agent-fold`: the trigger is `idx >= 2` (see `agentFoldSuppressedLine`'s
+ *   own doc comment for why 2, not any change) — a DELIBERATE
+ *   under-approximation of "a fold happened", not a total one. A real fold
+ *   (a foreign comment genuinely swallowed by this arm) produces NO LINE in
+ *   at least four situations: (1) the position-1 case that doc comment
+ *   already names — the agent's own write was not itself a comment and
+ *   exactly one foreign comment landed in the window; (2) the recorded
+ *   baseline id is not present at all in the fetched page (`idx === -1`) —
+ *   `AtlassianClient.comments()`'s own page size can leave an older
+ *   baseline off the page on a busy ticket; (3) no baseline was recorded
+ *   for this key yet (`!hadBaseline`, or a `null` baseline — the ticket's
+ *   very first comment); (4) the `fetchComments` call itself failed
+ *   (`!result.ok` — fail-open leaves the cursor untouched, and whatever
+ *   happened in that window is simply unobserved). "No `arm=agent-fold`
+ *   line" therefore means "no fold this detector could positively
+ *   establish" — evidence of no DETECTED fold, never proof of no fold. It
+ *   never FALSE-POSITIVES (see `agentFoldSuppressedLine`'s own doc comment
+ *   for why `idx >= 2` cannot fire without a genuine second mover), so a
+ *   line that DOES appear is trustworthy; the absence of one is not.
  */
 
 /** The one tag every line this module emits carries — a NEW class, never previously written, so no existing reader can be confused by it (see AC4's own reasoning in the PR for why no *separate* tag per arm is warranted here either). */
@@ -48,6 +77,19 @@ export type SuppressedArm = "agent-fold" | "stand-down";
  * agent and never will be (see `ledgerHitSuppressed`'s own doc comment for
  * why the cursor advance makes this permanent, not merely delayed —
  * KAN-838/BUTCHR-350(C)). `baseline`/`newest` are comment IDS, never bodies.
+ *
+ * THE `newCount >= 2` GUARD NEVER FALSE-POSITIVES, BUT IT DOES
+ * FALSE-NEGATIVE (BUTCHR-350 PR #352 review round 1 — stated here, not only
+ * at this module's top comment, since a reader who lands on this function
+ * directly should not have to go find that): a genuine fold with exactly
+ * ONE comment newer than the baseline (the agent's own round-trip write was
+ * NOT itself a comment, and exactly one foreign comment landed in the same
+ * window) is indistinguishable, by this signal alone, from the ordinary
+ * "only the agent's own new comment landed" case — no line. So is a fold
+ * whose baseline has aged off the fetched page entirely (a busy ticket
+ * under `AtlassianClient.comments()`'s own page size). Neither is claimed
+ * away: "no line" from this function's caller means "no fold this detector
+ * could POSITIVELY establish", never "no fold happened".
  */
 export function agentFoldSuppressedLine(key: string, baseline: string, newest: string, newCount: number): string {
   return (
