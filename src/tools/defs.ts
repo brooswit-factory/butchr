@@ -720,7 +720,7 @@ export function atlassianTools(
         const { key, text } = a as { key: string; text: string };
         const who = requireCaller(c, "tell_worker");
         audit(c, `tell_worker ${key}`);
-        const r = await tellWorker(ops, who, key, text);
+        const r = await tellWorker(ops, who, key, text, log);
         noted(c, [key]);
         return r;
       },
@@ -799,12 +799,15 @@ export function atlassianTools(
         // premise. BUTCHR-227 removes the dependence on that premise
         // entirely rather than measuring it: the value recorded below is
         // the FULL observed id SET, and "seen" is set membership, not
-        // "equal to the newest id by any ordering". `getIssueComments`'s
-        // own doc comment on `AtlassianOps` states its `maxResults` cap —
-        // that cap is a still-live pagination blind spot (an id outside
-        // the window is never observed, so never seen, so never wakes
-        // anything), unchanged and unfixed by this ticket; it is not the
-        // id-monotonicity defect this ticket does fix.
+        // "equal to the newest id by any ordering". BUTCHR-309: `getIssueComments`
+        // used to cap at `maxResults: 20` with no pagination — a still-live
+        // blind spot at the time BUTCHR-227 shipped (an id outside that
+        // window was never observed, so never seen, so never woke anything).
+        // BUTCHR-309 fixed that separately: `getIssueComments` now paginates
+        // to exhaustion (see its own doc comment on `AtlassianOps`), so this
+        // read is the FULL observed id set, not a 20-item window — the
+        // pagination blind spot named above is closed, distinct from (and
+        // fixed after) the id-monotonicity defect BUTCHR-227 fixed here.
         const epics: Record<string, readonly string[]> = {};
         for (const epic of epicsRaw?.issues ?? []) {
           epics[epic.key] = (await ops.getIssueComments(epic.key)).results.map((c) => c.id);
@@ -898,7 +901,7 @@ export function atlassianTools(
     },
     tell_peer: {
       description:
-        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). The WAKE this comment can trigger is still BEST EFFORT, but for a DIFFERENT, honest reason: the recipient\'s reader has a page-window/pagination bound (see `getPageComments`\'s own doc comment on AtlassianOps) — a comment that never appears inside that window is never observed, therefore never wakes anything, regardless of its id. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
+        'PROJECT CALLER ONLY (refuses an issue caller): peers are a relationship BETWEEN PROJECTS — an issue already has tell_worker down and report_to_boss/ask_boss up; sideways is a relationship only the project tier has. Posts ONE footer comment on the NAMED PEER\'s root doc — that is what this verb does, and ALL it does: it does NOT deliver, notify, wake, or guarantee the peer sees anything. The comment is durable (it is never lost, and `peer` will read it whenever it next reads its own root doc\'s comments). CORRECTED (BUTCHR-227): this used to warn that the recipient\'s MAX-id watermark comparison could silently fail to notice a comment landing below its current max — that comparison no longer exists (the comment axis is now a SEEN SET, compared by membership, never by magnitude; see src/resources/project.ts). CORRECTED AGAIN (BUTCHR-309): this then warned the recipient\'s reader had a page-window/pagination bound — that is also no longer true, `getPageComments` now paginates to exhaustion (see its own doc comment on AtlassianOps), so a comment is observed on the recipient\'s very next successful poll regardless of how many comments its root doc holds. The WAKE this comment can trigger is still BEST EFFORT, for the narrower, still-honest reason that is left once both of those are fixed: this is a POLLED read, not a push — the recipient observes it at most once every poll interval (`PROJECT_POLL_INTERVAL_MS`, src/resources/project.ts), and a read failure on a given poll (a timeout, a malformed pagination cursor) fails that WHOLE poll rather than recording a partial observation, so it delays being seen rather than losing it — the comment sits on a durable page and is picked up the next time that project polls successfully. This verb does not bump the peer\'s root-doc page VERSION either, so the version axis is not a second delivery path for a `tell_peer` message. ' +
         'The posted comment always reads `[butchr:peer from=<caller> to=<peer> intent=<intent>] <text>` — the bracketed prefix is authored by THIS TOOL, unconditionally, and leads the text on its one line; no caller input (including text that itself starts with `[butchr:peer …]`, or leading whitespace/newlines) can suppress or displace it. `intent` is REQUIRED, exactly one of `request`, `accept`, `decline`, `notice` — no default, no fifth value. `intent: "decline"` additionally requires `text` to state a real reason (refused when empty, whitespace-only, or a placeholder like "n/a"/"tbd"/"no") — a channel with no way to say no produces silent non-compliance, not a recorded refusal. ' +
         'Refuses sending to yourself (a project speaks on its own root doc with report_to_boss/ask_boss, not tell_peer), and refuses a `peer` that is not an ELIGIBLE peer — unknown key, not live, not led by this credential, or missing a readable `butchr` property — naming the peers that DO exist, from the SAME `resolveEligibleProjects` resolver `list_peers` uses (never a second eligibility rule, never the staffing allowlist, which is a rollout gate, not eligibility). An eligible-but-currently-unstaffed peer is a valid destination: the message waits on a durable page, it does not vanish. The peer\'s root doc is resolved FRESH at send time, never a page id cached from an earlier `list_peers` call. Deliberately does NOT advance any watermark, for either the caller or the recipient — advancing the recipient\'s would mark this comment already-seen before it ever wakes the recipient, silently breaking the one thing this verb exists to do.',
       input: { peer: z.string(), text: z.string(), intent: z.enum(["request", "accept", "decline", "notice"]) },

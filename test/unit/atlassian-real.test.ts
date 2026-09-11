@@ -1,4 +1,6 @@
 import { describe, expect, test, mock } from "bun:test";
+import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
+import type { ProjectResourceDeps } from "../../src/resources/project.js";
 
 describe("realAtlassian confluence page ops", () => {
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {
@@ -240,5 +242,434 @@ describe("realAtlassian correctText (BUTCHR-60)", () => {
 
     await ops.correctText("KAN-9", { summary: "" });
     expect(editIssueCalls[0]).toEqual({ issueIdOrKey: "KAN-9", fields: { summary: "" } });
+  });
+});
+
+// ===========================================================================
+// BUTCHR-309 — both project-tier comment readers paginated to exhaustion.
+// A fixture that only ever returns one page proves nothing (the ticket's own
+// words) — every describe below drives a fake transport that GENUINELY
+// returns more than one page, and asserts the ACTUAL PARAMETERS passed on
+// each call, not just the final aggregated list: a misspelled parameter key
+// (e.g. `limitt`/`nextCursor`) is not a type error or a runtime error here —
+// confluence.js/jira.js pick parameters by exact name and `wiki`/`jira` are
+// typed `any` in atlassian-real.ts, so a typo is silently dropped and the
+// endpoint returns its default first page, behaviourally identical to the
+// unfixed bug (see this ticket's pre-start addendum). Only a parameter-level
+// assertion, not a count-based one, can catch that.
+// ===========================================================================
+describe("realAtlassian getPageComments pagination (BUTCHR-309)", () => {
+  test("first call carries limit and no cursor; the follow-up carries the cursor parsed from _links.next — captures the ACTUAL parameters, not just the final list", async () => {
+    const calls: unknown[] = [];
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          getPageFooterComments: (parameters: unknown) => {
+            calls.push(parameters);
+            if (calls.length === 1) {
+              return Promise.resolve({
+                results: [{ id: "1", body: { storage: { value: "a" } }, version: {} }],
+                _links: { next: "/wiki/api/v2/pages/42/footer-comments?cursor=CURSOR_ABC&limit=250" },
+              });
+            }
+            return Promise.resolve({ results: [{ id: "2", body: { storage: { value: "b" } }, version: {} }] }); // no _links.next -> stop
+          },
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getPageComments("42");
+    expect(calls).toEqual([
+      { id: "42", bodyFormat: "storage", limit: 250 }, // first call: no cursor
+      { id: "42", bodyFormat: "storage", limit: 250, cursor: "CURSOR_ABC" }, // follow-up: the PARSED cursor, not the raw URL
+    ]);
+    expect(got).toEqual({ results: [{ id: "1", body: "a" }, { id: "2", body: "b" }] }); // both pages' comments, aggregated
+  });
+
+  test("a comment that exists ONLY on page 2 is still returned — a fixture that only ever returns one page would not exercise this", async () => {
+    let call = 0;
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          getPageFooterComments: () => {
+            call++;
+            if (call === 1) return Promise.resolve({ results: [{ id: "1", body: { storage: { value: "" } }, version: {} }], _links: { next: "/x?cursor=NEXT" } });
+            return Promise.resolve({ results: [{ id: "2", body: { storage: { value: "" } }, version: {} }] });
+          },
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getPageComments("42");
+    expect(got.results.map((r) => r.id)).toEqual(["1", "2"]);
+  });
+
+  test("MAX_COMMENT_PAGES guards a malformed, never-terminating cursor: THROWS rather than returning a silently truncated list (DoD 5)", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          // ALWAYS returns another cursor — a malformed/never-terminating walk.
+          getPageFooterComments: () =>
+            Promise.resolve({ results: [{ id: "x", body: { storage: { value: "" } }, version: {} }], _links: { next: "/x?cursor=LOOP" } }),
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getPageComments("42")).rejects.toThrow(/exceeded 100 pages/);
+  });
+
+  // BUTCHR-309 REVIEW ROUND 1 (measured against the pre-fix code): a
+  // `_links.next` that IS present but whose `cursor` query parameter does
+  // not parse (an API change, or a next-link shape this parse misses) used
+  // to collapse to the SAME `cursor = undefined` as "no next link at all",
+  // so the walk silently stopped and returned one page as if it were
+  // complete. FALSIFIER: if this ever resolves instead of rejecting, or
+  // resolves having silently returned only the first page's results, the
+  // present-but-unparseable case has regressed back to "treated as done".
+  test("REVIEW FIX: a `next` link present but with NO parseable `cursor` THROWS — 'more data exists' must never read as 'pagination complete'", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: {},
+        comment: {
+          // `_links.next` IS present, but its query string carries no
+          // `cursor` param at all — an unparseable-for-our-purposes next link.
+          getPageFooterComments: () =>
+            Promise.resolve({
+              results: [{ id: "1", body: { storage: { value: "" } }, version: {} }],
+              _links: { next: "/wiki/api/v2/pages/42/footer-comments?limit=250" },
+            }),
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getPageComments("42")).rejects.toThrow(/no `cursor` query parameter could be parsed/);
+  });
+});
+
+describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
+  test("paginates via startAt/maxResults, bounded by the response's own `total` — captures the ACTUAL parameters passed on each page", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            if (calls.length === 1) {
+              return Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 1) })), total: 125, startAt: 0, maxResults: 100 });
+            }
+            return Promise.resolve({ comments: Array.from({ length: 25 }, (_, i) => ({ id: String(i + 101) })), total: 125, startAt: 100, maxResults: 100 });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls).toEqual([
+      { issueIdOrKey: "KAN-9", orderBy: "-created", startAt: 0, maxResults: 100 },
+      { issueIdOrKey: "KAN-9", orderBy: "-created", startAt: 100, maxResults: 100 },
+    ]);
+    expect(got.results.length).toBe(125); // past the OLD 20-item cap, and past a single 100-item page
+    expect(got.results.map((r) => r.id)).toContain("125");
+  });
+
+  test("MAX_COMMENT_PAGES guards a `total` that never gets reached: THROWS rather than returning a silently truncated list (DoD 5)", async () => {
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        // ALWAYS a full (100-item) page, so the short-page stop never fires
+        // — and a `total` far beyond what any page ever delivers, so the
+        // startAt < total loop condition never naturally terminates either.
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })), total: 100_000 }) },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getIssueComments("KAN-9")).rejects.toThrow(/exceeded 100 pages/);
+  });
+
+  // BUTCHR-309 REVIEW ROUND 1 (measured against the pre-fix code, not
+  // reasoned out of the source): a response with NO numeric `total` field
+  // used to make the loop set `total = results.length` as a fallback, which
+  // made `startAt < total` false on the very next check — so a 250-comment
+  // issue, paginated in pages of 100/100/50 with `total` NEVER reported (but
+  // `maxResults` reported and honoured, rule 2), silently returned only the
+  // first 100. FALSIFIER: if this ever regresses to fewer than 250 results
+  // (or fewer than 3 calls), the no-`total` fallback has broken again.
+  test("REVIEW FIX: a response with no `total` field (but a reported, honoured `maxResults`) still paginates to exhaustion, stopping on the first SHORT page (not the immediate next check)", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            const sizes = [100, 100, 50];
+            const size = sizes[calls.length - 1] ?? 0;
+            // NO `total` field anywhere in any of these responses — but
+            // `maxResults` IS reported and genuinely honoured, so rule 2
+            // (short against the server's own reported page size) applies.
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })), maxResults: 100 });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // did NOT stop after page 1
+    expect(got.results.length).toBe(250); // the full 100+100+50, not just the first 100
+  });
+
+  // BUTCHR-309 REVIEW ROUND 2 (measured against the round-1 fix, not
+  // reasoned out of the source): Jira caps `maxResults` SERVER-SIDE and
+  // reports the effective value back in the response's own `maxResults`
+  // field — a page measured "short" against the REQUESTED size (PAGE_SIZE)
+  // rather than the size the server actually honoured looks identical to a
+  // genuine last page. FALSIFIER: if this ever returns fewer than 125
+  // results, or stops after 1 call, the yardstick has regressed back to
+  // "requested size" instead of "server-reported size".
+  test("REVIEW FIX ROUND 2 (rule 1 path): a server that caps `maxResults` below what was requested, WITH a `total` reported, still paginates to exhaustion — note this exercises rule 1 (`startAt >= total`), NOT the round-2 yardstick; the rule-2 case is the test below", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            // The server honours only 50 per page regardless of the
+            // requested `maxResults: 100`, and says so via its own
+            // `maxResults` in the response — the same shape jira.js's
+            // PageOfCommentsSchema declares.
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining);
+            return Promise.resolve({
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              total: 125,
+              startAt,
+              maxResults: 50,
+            });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // 50 + 50 + 25, not stopped after the first capped-at-50 page
+    expect(got.results.length).toBe(125); // the FULL 125, not just the first capped page of 50
+  });
+
+  // REVIEW GAP FOUND BY BUTCHR-208 AT REVIEW OF THE STORY PR ("M5"): the two
+  // tests above BOTH leave rule 2 unexercised, so reverting the round-2
+  // yardstick (`responseMaxResults` -> `PAGE_SIZE`) survived the entire suite —
+  // reintroducing the exact round-2 regression (50 of 125, silently) with no
+  // test failing. Why neither covers it: the test above reports a `total`, so
+  // after round 3's restructuring it terminates via rule 1 and never reaches
+  // rule 2; and the no-`total` test has the server HONOUR the requested 100, so
+  // `responseMaxResults === PAGE_SIZE` and the two yardsticks are
+  // indistinguishable. Rule 2 is reached ONLY when there is no `total`, and it
+  // is only DISTINGUISHABLE from the requested size when the server reports a
+  // `maxResults` BELOW what was asked for. That is this test, and it is the
+  // one shape no earlier round covered.
+  //
+  // FALSIFIER, stated before it was run: change the comparison back to
+  // `batch.length < PAGE_SIZE` and this test must fail (50 returned, 1 call).
+  // Verified: it does.
+  test("REVIEW FIX ROUND 2 (rule 2 path, the one that actually pins the yardstick): NO `total`, and the server reports a `maxResults` BELOW the requested 100 and caps to it — a full-from-the-server page must not read as short", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            // Server honours only 50 of the requested 100 and says so via its
+            // own `maxResults`. NO `total` anywhere, so rule 1 cannot apply and
+            // termination rests entirely on rule 2's yardstick.
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining);
+            return Promise.resolve({
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              startAt,
+              maxResults: 50,
+            });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    expect(calls.length).toBe(3); // 50 + 50 + 25 — a 50-comment page is FULL here, not short
+    expect(got.results.length).toBe(125); // the FULL 125; under the pre-round-2 yardstick this is 50
+  });
+
+  // BUTCHR-309 REVIEW ROUND 3 (measured against the round-2 fix, case "C" of
+  // the reviewer's own enumerated matrix — total✗ x maxResults✗ x capping):
+  // a response carrying NEITHER `total` NOR `maxResults` fell back to
+  // comparing against the REQUESTED `PAGE_SIZE`, so a server-capped page
+  // (100 requested, 50 delivered) looked short against 100 and silently
+  // terminated the walk — the same defect round 2 fixed, reachable by a
+  // response shape neither round 1 nor round 2's tests cover. FALSIFIER: if
+  // this ever returns fewer than 125 results, rule 3 (only a genuinely
+  // EMPTY page may end the walk when neither field is reported) has broken.
+  test("REVIEW FIX ROUND 3: a server that reports NEITHER `total` NOR `maxResults`, while still capping below the request, only stops on a genuinely EMPTY page", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining); // capped to 50 despite maxResults: 100 requested
+            // NEITHER `total` NOR `maxResults` anywhere in this response.
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })) });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    // 50 + 50 + 25 + one final EMPTY page — a page of 25 is short against
+    // the requested 100, but with neither `total` nor `maxResults` reported,
+    // rule 3 correctly refuses to treat that shortness as proof of
+    // completeness, and only the trailing empty page ends the walk.
+    expect(calls.length).toBe(4);
+    expect(got.results.length).toBe(125); // the FULL 125, not just the first silently-capped page of 50
+  });
+});
+
+// ===========================================================================
+// DoD 6(a) — the RECOMMENDED shape: drive the REAL `realAtlassian` ops (over
+// a mocked multi-page transport) into `createProjectResourceType`'s deps, so
+// one test exercises both the real pagination AND the real verdict/decision
+// path, not a fake reader standing in for either.
+// ===========================================================================
+describe("realAtlassian pagination wired into the real project-tier decision path (BUTCHR-309 DoD 6a)", () => {
+  function rigMultiPageWorld(opts: { commentsSeen: string[] }) {
+    let footerCall = 0;
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: { getPages: () => Promise.resolve({ results: [] }) }, // version axis untouched by this ticket; absent is fine (observedVersion -> null)
+        comment: {
+          getPageFooterComments: () => {
+            footerCall++;
+            if (footerCall === 1) {
+              return Promise.resolve({ results: [{ id: "100", body: { storage: { value: "" } }, version: {} }], _links: { next: "/x?cursor=NEXT" } });
+            }
+            return Promise.resolve({ results: [{ id: "200", body: { storage: { value: "" } }, version: {} }] }); // exists ONLY on page 2
+          },
+        },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        projects: { searchProjects: () => Promise.resolve({ values: [{ key: "ACME", name: "Acme", lead: { accountId: "acct-A" } }] }) },
+        myself: { getCurrentUser: () => Promise.resolve({ accountId: "acct-A" }) },
+        projectProperties: {
+          getProjectProperty: () =>
+            Promise.resolve({ value: { space: { key: "ACME" }, rootDoc: { id: "doc-A" }, wake: { commentsSeen: opts.commentsSeen, epicsSeen: {} } } }),
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    return () => footerCall;
+  }
+
+  test("(a) a comment that exists ONLY on page 2 wakes the project, through the REAL decision path (realAtlassian's pagination + the real projectVerdict)", async () => {
+    rigMultiPageWorld({ commentsSeen: ["100"] }); // "100" (page 1) already seen; "200" only exists on page 2
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const deps: ProjectResourceDeps = { ops, search: async () => [], allowlist: new Set(["ACME"]) };
+    const [acme] = await createProjectResourceType(deps).discovery.search();
+    expect([...acme!.observedCommentIds].sort()).toEqual(["100", "200"]); // BOTH pages observed
+    expect(acme!.unseenCommentIds).toEqual(["200"]); // only the page-2-only comment is unseen
+    expect(projectVerdict(acme!)).toBe("active"); // and it wakes the REAL verdict function
+  });
+
+  test("(c) re-observing already-seen ids across BOTH pages does NOT wake — the mechanism is genuinely membership-based, not \"any page-2 read wakes\"", async () => {
+    rigMultiPageWorld({ commentsSeen: ["100", "200"] }); // BOTH already seen, including the page-2-only one
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const deps: ProjectResourceDeps = { ops, search: async () => [], allowlist: new Set(["ACME"]) };
+    const [acme] = await createProjectResourceType(deps).discovery.search();
+    expect([...acme!.observedCommentIds].sort()).toEqual(["100", "200"]);
+    expect(acme!.unseenCommentIds).toEqual([]);
+    expect(projectVerdict(acme!)).toBe("asleep");
+  });
+});
+
+describe("realAtlassian epic-axis pagination wired into the real project-tier decision path (BUTCHR-309 DoD 6d)", () => {
+  function rigEpicWorld(opts: { epicCommentsSeen: readonly string[] }) {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({
+        page: { getPages: () => Promise.resolve({ results: [] }) },
+        comment: { getPageFooterComments: () => Promise.resolve({ results: [] }) },
+      }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        projects: { searchProjects: () => Promise.resolve({ values: [{ key: "ACME", name: "Acme", lead: { accountId: "acct-A" } }] }) },
+        myself: { getCurrentUser: () => Promise.resolve({ accountId: "acct-A" }) },
+        projectProperties: {
+          getProjectProperty: () =>
+            Promise.resolve({ value: { space: { key: "ACME" }, rootDoc: { id: "doc-A" }, wake: { commentsSeen: [], epicsSeen: { "ACME-1": opts.epicCommentsSeen } } } }),
+        },
+        // 21 comments — one MORE than the pre-BUTCHR-309 20-item cap — all
+        // returned on a SINGLE Jira page (maxResults: 100 now), `total: 21`
+        // stops the loop after page 1.
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1) })), total: 21 }) },
+      }),
+      isNotFoundError: () => false,
+    }));
+  }
+
+  test("(d) the 21st (past the OLD 20-item newest-first cap) epic comment is observed and wakes the real verdict, once seen it does not", async () => {
+    rigEpicWorld({ epicCommentsSeen: [] });
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const deps: ProjectResourceDeps = {
+      ops,
+      search: async () => [{ key: "ACME-1", summary: "e", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] }],
+      allowlist: new Set(["ACME"]),
+    };
+    const [acme] = await createProjectResourceType(deps).discovery.search();
+    expect(acme!.observedEpics[0]!.commentIds.length).toBe(21);
+    expect(acme!.unseenEpicCommentIds["ACME-1"]).toEqual(expect.arrayContaining(Array.from({ length: 21 }, (_, i) => String(i + 1))));
+    expect(projectVerdict(acme!)).toBe("active");
+  });
+
+  test("(d continued) all 21 already seen -> asleep, proving this is genuine membership, not a page-count heuristic", async () => {
+    rigEpicWorld({ epicCommentsSeen: Array.from({ length: 21 }, (_, i) => String(i + 1)) });
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const deps: ProjectResourceDeps = {
+      ops,
+      search: async () => [{ key: "ACME-1", summary: "e", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] }],
+      allowlist: new Set(["ACME"]),
+    };
+    const [acme] = await createProjectResourceType(deps).discovery.search();
+    expect(acme!.unseenEpicCommentIds["ACME-1"]).toEqual([]);
+    expect(projectVerdict(acme!)).toBe("asleep");
   });
 });

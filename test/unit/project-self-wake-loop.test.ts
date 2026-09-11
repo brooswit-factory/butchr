@@ -8,9 +8,11 @@ import {
 } from "../../src/resources/project.js";
 import { speakOnOwnChannel } from "../../src/tools/speak.js";
 import { setProjectDoc } from "../../src/tools/docs.js";
+import { tellWorker } from "../../src/tools/relationship.js";
 import { desiredFrom } from "../../src/daemon/loop.js";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import type { JiraIssue } from "../../src/atlassian/types.js";
 
 // BUTCHR-226: `pendingWatermarkFallback` (src/resources/project.ts) is
 // process-lifetime state shared across every test in this process, and this
@@ -73,6 +75,8 @@ interface World {
   deps: ProjectResourceDeps;
   pageComments: Array<{ id: string; body: string }>;
   setProjectPropertyCalls: number;
+  /** BUTCHR-292/BUTCHR-328: epic key -> its comments, so a test can inspect what a real `tellWorker`/`ops.addComment(epicKey, ...)` call actually posted without re-deriving it from `ProjectResource.observedEpics`. */
+  epicComments: (epicKey: string) => readonly { id: string; body: string }[];
 }
 
 function world(opts: {
@@ -86,6 +90,20 @@ function world(opts: {
   failWatermarkWrite?: boolean;
   /** The root doc's starting Confluence page version (`version.number`) — `updatePage` (the REAL write `set_doc`/`setProjectDoc` makes) bumps it by 1 per call, exactly like Confluence does, so `getPageVersions` reflects a genuine body edit rather than a hand-set number. */
   initialPageVersion?: number;
+  /**
+   * BUTCHR-292/BUTCHR-328 — epics this project's `tellWorker`/`check_in` can
+   * see, keyed by epic key. Wires `ops.getIssue` (so `assertOwnWorker` can
+   * resolve membership + status with no extra call, exactly like the real
+   * daemon), `ops.addComment` (so a real `tellWorker` call can post to one),
+   * `ops.getIssueComments` (the SAME reader `loadProjects`'/`check_in`'s own
+   * epic-comment observation uses), and `deps.search` (so discovery's own
+   * `project IN (...) AND issuetype = Epic AND status = "In Review"` JQL —
+   * never actually parsed by this fake, same as every other fixture in this
+   * suite — resolves to exactly the epics currently `status: "In Review"`).
+   */
+  epics?: Record<string, { status?: string; comments?: Array<{ id: string; body: string }> }>;
+  /** Queue of ids `addComment` returns for an EPIC, in call order — the epic-axis twin of `nextCommentIds`. */
+  nextEpicCommentIds?: string[];
 }): World {
   const pageComments = [...(opts.initialComments ?? [])];
   const idQueue = [...(opts.nextCommentIds ?? [])];
@@ -102,15 +120,30 @@ function world(opts: {
       },
     ],
   ]);
+  const epicIssues = new Map<string, { status: string; comments: Array<{ id: string; body: string }> }>(
+    Object.entries(opts.epics ?? {}).map(([key, e]) => [key, { status: e.status ?? "In Review", comments: [...(e.comments ?? [])] }]),
+  );
+  const epicIdQueue = [...(opts.nextEpicCommentIds ?? [])];
+  let nextAutoEpicId = 7000;
 
   const unimplemented = (name: string) => async (..._a: unknown[]) => {
     throw new Error(`fake ops: ${name} not used by this test`);
   };
 
   const ops: AtlassianOps = {
-    getIssue: unimplemented("getIssue"),
+    getIssue: async (key: string) => {
+      const e = epicIssues.get(key);
+      if (!e) throw new Error(`fake: no such epic issue ${key}`);
+      return { fields: { project: { key: opts.projectKey }, issuetype: { name: "Epic" }, status: { name: e.status } } };
+    },
     search: unimplemented("search"),
-    addComment: unimplemented("addComment"),
+    addComment: async (key: string, text: string) => {
+      const e = epicIssues.get(key);
+      if (!e) throw new Error(`fake: no such epic issue ${key}`);
+      const id = epicIdQueue.length ? epicIdQueue.shift()! : String(nextAutoEpicId++);
+      e.comments.push({ id, body: text });
+      return { ok: true, id };
+    },
     linkIssues: unimplemented("linkIssues"),
     transition: unimplemented("transition"),
     createIssue: unimplemented("createIssue"),
@@ -136,7 +169,7 @@ function world(opts: {
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
     correctText: unimplemented("correctText"),
-    getIssueComments: async () => ({ results: [] }),
+    getIssueComments: async (key: string) => ({ results: (epicIssues.get(key)?.comments ?? []).map((c) => ({ id: c.id })) }),
 
     getMyself: async () => ({ accountId: "acct-project-agent" }),
     searchProjects: async () => ({
@@ -175,11 +208,20 @@ function world(opts: {
 
   const deps: ProjectResourceDeps = {
     ops,
-    search: async () => [],
+    search: async () =>
+      [...epicIssues.entries()]
+        .filter(([, e]) => e.status === "In Review")
+        .map(([key, e]): JiraIssue => ({ key, summary: `${key} summary`, status: e.status, issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] })),
     allowlist: new Set([opts.projectKey]),
   };
 
-  return { ops, deps, pageComments, get setProjectPropertyCalls() { return setProjectPropertyCalls; } };
+  return {
+    ops,
+    deps,
+    pageComments,
+    get setProjectPropertyCalls() { return setProjectPropertyCalls; },
+    epicComments: (epicKey: string) => epicIssues.get(epicKey)?.comments ?? [],
+  };
 }
 
 async function verdictOf(deps: ProjectResourceDeps, key: string) {
@@ -537,5 +579,188 @@ describe("DoD 5 — the human-quotes-a-marker case: the wake predicate is conten
     await w.ops.commentOnPage("doc-1", "<p>Someone please explain this: [butchr:frozen] ACME has read \"asleep\"...</p>");
     const { verdict } = await verdictOf(w.deps, "ACME");
     expect(verdict).toBe("active");
+  });
+});
+
+describe("BUTCHR-292/BUTCHR-328 — THE EPIC AXIS: tell_worker's own comment to one of the project's In-Review epics, watermarked as a PARTIAL (union-only) write, never the check_in-shaped key-set replace", () => {
+  // Positive evidence, required before touching any code (per this ticket's
+  // own instruction): the plain comparison this whole fix rests on, with no
+  // tell_worker/advanceProjectWatermark call shape involved yet — an
+  // In-Review epic carrying exactly one id absent from its own seen set
+  // reads "active"; recording that id (the shape ANY successful watermark
+  // write, of either writer, produces) reads "asleep". Failure condition: if
+  // this does not flip active -> asleep on exactly that one recorded id, the
+  // epic axis's own membership comparison (unchanged by this ticket) is
+  // broken, and nothing downstream in this describe block can be trusted.
+  test("positive evidence: an In-Review epic with one unseen comment id reads active; recording that id (the shape a real watermark write produces) reads asleep", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialComments: [{ id: "100", body: "<p>seed</p>" }],
+      initialWake: { version: 1, comment: "100", epics: { "ACME-1": "50" } }, // ACME-1 caught up through "50" only (legacy scalar -> migrated to one-member seen set)
+      epics: { "ACME-1": { status: "In Review", comments: [{ id: "50", body: "seed" }, { id: "60", body: "a new comment, unseen" }] } },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // "60" is unseen on ACME-1
+
+    await advanceProjectWatermark(w.ops, "ACME", { epicsPartial: { "ACME-1": ["60"] } });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep");
+  });
+
+  // DoD 1 — the ticket's central claim, end to end through the REAL
+  // tellWorker (src/tools/relationship.ts) and the REAL discovery/predicate
+  // read. Failure condition: a project's own review comment to its own
+  // In-Review epic reading "active" on the very next poll is the self-wake
+  // this ticket exists to close, still live.
+  test("DoD 1: a project's own tell_worker to its own In-Review epic does not wake the project on the next poll", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: {} },
+      epics: { "ACME-1": { status: "In Review", comments: [] } },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: ACME-1 never checked in (absent key -> active)
+
+    await tellWorker(w.ops, "ACME", "ACME-1", "[review] APPROVED https://example/pr/1 @ deadbeef");
+
+    expect(w.epicComments("ACME-1").map((c) => c.body)).toEqual(["[ACME] [review] APPROVED https://example/pr/1 @ deadbeef"]);
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.unseenEpicCommentIds["ACME-1"]).toEqual([]);
+    expect(verdict).toBe("asleep");
+  });
+
+  // DoD 3 — the property that must not break, worth more than the fix
+  // itself per the ticket. Failure condition: a comment on the SAME epic
+  // that never went through tell_worker reading "asleep" means the
+  // suppression is swallowing real inbound messages.
+  test("DoD 3: a foreign comment on the same In-Review epic (never routed through tell_worker) still wakes the project", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: { "ACME-1": "50" } },
+      epics: { "ACME-1": { status: "In Review", comments: [{ id: "50", body: "seed" }] } },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: caught up before the foreign comment
+
+    // A human/boss comment straight on the epic ticket — never through
+    // tell_worker, so never suppressed.
+    await w.ops.addComment("ACME-1", "please prioritize this differently");
+
+    const { verdict } = await verdictOf(w.deps, "ACME");
+    expect(verdict).toBe("active");
+  });
+
+  // DoD 6(i) — the trap this ticket's own brief warns about, proven absent:
+  // a suppression write on ONE epic must never touch any OTHER In-Review
+  // epic's stored seen set. Failure condition: epic F's seen set changing at
+  // all as a side effect of a tell_worker call that never mentioned it.
+  test("DoD 6(i): a tell_worker suppression write on epic E leaves epic F's stored seen set fully intact", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: { "ACME-1": "10", "ACME-2": "20" } },
+      epics: {
+        "ACME-1": { status: "In Review", comments: [{ id: "10", body: "seed" }] },
+        "ACME-2": { status: "In Review", comments: [{ id: "20", body: "seed" }] },
+      },
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("asleep"); // sanity: both epics caught up
+
+    await tellWorker(w.ops, "ACME", "ACME-1", "[review] APPROVED https://example/pr/1 @ deadbeef");
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(new Set(resource.watermark.epicsSeen["ACME-2"])).toEqual(new Set(["20"])); // byte-for-byte untouched
+    expect(verdict).toBe("asleep"); // ACME-1's own new comment was suppressed, ACME-2 was never behind to begin with
+  });
+
+  // THE MUTATION CHECK the ticket explicitly asks for: prove the DoD 6(i)
+  // test above actually discriminates between the two patch shapes by
+  // showing the WRONG shape (the check_in-only key-set REPLACE, `epics`)
+  // fails it — reported here rather than just claimed, per the ticket's own
+  // "report that you ran this check" instruction.
+  test("MUTATION CHECK for DoD 6(i): routing the identical suppression fact through the REPLACING `epics` patch instead of `epicsPartial` DOES wipe epic F's stored seen set", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: { "ACME-1": "10", "ACME-2": "20" } },
+      epics: {
+        "ACME-1": { status: "In Review", comments: [{ id: "10", body: "seed" }] },
+        "ACME-2": { status: "In Review", comments: [{ id: "20", body: "seed" }] },
+      },
+    });
+
+    // The WRONG shape a naive implementation might reach for: `patch.epics`,
+    // the complete-observation key-set REPLACE `check_in` uses, given only
+    // the ONE epic this write actually knows about.
+    await advanceProjectWatermark(w.ops, "ACME", { epics: { "ACME-1": ["11"] } });
+
+    const { resource } = await verdictOf(w.deps, "ACME");
+    // ACME-2's key is gone entirely — the exact hazard this ticket's brief
+    // names ("you would fix one self-wake by manufacturing many"). This is
+    // what confirms the DoD 6(i) test above is not vacuously passing: it
+    // WOULD fail if tellWorker used this shape instead of `epicsPartial`.
+    expect(resource.watermark.epicsSeen["ACME-2"]).toBeUndefined();
+  });
+
+  // DoD 6(ii), local to this describe block's own fixtures (already proven,
+  // unmodified, in test/unit/project-resource-type.test.ts's "BUTCHR-81
+  // regression" test and this file's own "BUTCHR-260" describe block via the
+  // REAL check_in handler) — repeated here narrowly to show `epicsPartial`'s
+  // addition changes nothing about `epics`'s own replace behaviour.
+  test("DoD 6(ii): check_in's own complete-observation write still drops an epic that has left In Review, unaffected by epicsPartial's addition", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: { "ACME-1": "10" } },
+      epics: {}, // ACME-1 no longer in review at all
+    });
+    await advanceProjectWatermark(w.ops, "ACME", { epics: {} }); // check_in's own shape: a complete (empty) observation
+    const { resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.watermark.epicsSeen).toEqual({}); // pruned
+  });
+
+  // The consequence section's own decision, pinned: seeding a watermark key
+  // for an epic that is NOT currently In Review would consume a FUTURE
+  // episode's fresh-entry signal before that episode begins — worse than the
+  // hazard this ticket fixes. The comment itself is still unconditional.
+  test("tell_worker to an epic that is NOT currently In Review posts the comment but seeds no watermark key at all", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: {} },
+      epics: { "ACME-1": { status: "To Do", comments: [] } }, // not In Review -> absent from discovery's own epic search too
+    });
+
+    await tellWorker(w.ops, "ACME", "ACME-1", "heads up, not ready for review yet");
+
+    expect(w.epicComments("ACME-1").length).toBe(1); // the comment is unconditional
+    const { resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.watermark.epicsSeen["ACME-1"]).toBeUndefined(); // no key created
+    expect(resource.observedEpics.length).toBe(0); // not In Review -> not even observed this poll
+  });
+
+  // DoD 5 — the epic axis reuses the SAME in-process pending-watermark
+  // fallback (DEFECT 1b) the version/comment axes already have, extended
+  // rather than duplicated. Failure condition: the verdict still reading
+  // "active" after a rejected persisted write (the fallback isn't wired into
+  // the epic axis) or the WARNING line disappearing (silent failure again).
+  test("DoD 5: the epic-axis suppression write also uses the in-process pending-watermark fallback when persistence fails — the project still reads asleep off its own unpersisted write", async () => {
+    const w = world({
+      projectKey: "ACME",
+      rootDocId: "doc-1",
+      initialWake: { version: 1, comment: null, epics: {} },
+      epics: { "ACME-1": { status: "In Review", comments: [] } },
+      failWatermarkWrite: true,
+    });
+    expect((await verdictOf(w.deps, "ACME")).verdict).toBe("active"); // sanity: never checked in
+
+    const lines: string[] = [];
+    await tellWorker(w.ops, "ACME", "ACME-1", "[review] APPROVED https://example/pr/1 @ deadbeef", (l) => lines.push(l));
+
+    expect(lines.some((l) => l.includes("WARNING") && l.includes("[tellWorker]") && l.includes("epic-axis"))).toBe(true);
+    expect(lines.some((l) => l.includes("WARNING") && l.includes("[advanceProjectWatermark]") && l.includes("DEFECT 1b"))).toBe(true);
+
+    const { verdict, resource } = await verdictOf(w.deps, "ACME");
+    expect(resource.unseenEpicCommentIds["ACME-1"]).toEqual([]); // absorbed via the in-process fallback, even though the persisted property was never written
+    expect(verdict).toBe("asleep");
   });
 });
