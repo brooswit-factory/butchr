@@ -1,4 +1,5 @@
 import type { ToolDef } from "@brooswit/thatch";
+import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
 
 /**
  * BUTCHR-341 (implementing BUTCHR-316): marks a thrown Error as a DELIBERATE
@@ -326,15 +327,59 @@ export interface ParsedOutcomeLine {
   message: string | null;
 }
 
-const OUTCOME_LINE_RE = /\[tools2\]\s+caller=(\S+)(?:\s+verb=(\S+))?(?:\s+target=(\S+))?\s+outcome=(ok|refused|error)(?:\s+msg=(.*))?/;
+/**
+ * BUTCHR-343 blocker 2, ROUND 2 (BUTCHR-316's own review of #348): an
+ * earlier version of this fix rejected a `[tools2]` match only when an OLD
+ * `[tools]` tag preceded it on the same line — closing the specific OLD-line
+ * vector the ticket demonstrated, but not the ticket's actual REQUIREMENT
+ * ("`[tools2]` only when it is the LINE'S OWN TAG, never text embedded
+ * inside another record"). The reviewer's own counter-example: any OTHER
+ * daemon line carrying free text with no `[tools]` tag at all still forged a
+ * record — e.g. `src/agents/escalation-loop.ts`'s
+ * `` `${paneId} blocked with no parseable dialog: "${text.slice(0, 60)}"` ``
+ * logs CAPTURED PANE TEXT, which the daemon does not control, verbatim.
+ *
+ * THE FIX: a real structural anchor, not a precedence check against one
+ * specific other tag. A genuine `[tools2]` line is always written by
+ * `buildLine` (above) as the ENTIRE argument to `log` (production wires this
+ * straight to `console.error`, unwrapped — see `atlassianTools`'s own `log`
+ * default and its one production call site) — so `OUTCOME_TAG` is always the
+ * very first thing on its own application-emitted line, and `msg=`'s value
+ * (already newline-flattened, see `boundMessage`) is always the very LAST
+ * thing, with nothing following it. The only thing legitimately allowed
+ * BEFORE that first token is `journalctl`'s own transport prefix —
+ * `JOURNALD_PREFIX_SRC` (`src/tools/journald-prefix.ts`, shared with
+ * `parseAliasAuditLine`) matches every single-line `journalctl --output=`
+ * mode, not only the default one a ROUND 2 of this fix wrongly assumed was
+ * the only one in play — see that module's own doc comment for why (a
+ * human/agent reader is explicitly sent to run `journalctl` by hand, not
+ * only this repo's own programmatic callers) and for real captured samples
+ * of each mode. Anchor BOTH ends: `^` (optional journald prefix, then
+ * `[tools2]` immediately, no other tag/prose allowed to precede it) and `$`
+ * (nothing may follow `msg=`, or `outcome=` when there is no message). A
+ * fragment embedded ANYWHERE inside another line's own fixed framing text —
+ * before it (an escalation log's own prefix, a `WARNING:` label, the OLD
+ * `[tools]` tag, …) or after it (a closing quote, trailing prose) — now
+ * fails to match at all, rather than merely failing a precedence check
+ * against one named tag. See `test/unit/butchr-343-forged-embedded-tags.test.ts`
+ * for pins built on the real `jira_search` handler AND the real
+ * `createEscalator().onNoPrompt` path, not hand fixtures, plus one test per
+ * `journalctl --output=` mode against a real captured sample of each.
+ */
+const OUTCOME_LINE_RE = new RegExp(
+  `^${JOURNALD_PREFIX_SRC}\\[tools2\\]\\s+caller=(\\S+)(?:\\s+verb=(\\S+))?(?:\\s+target=(\\S+))?\\s+outcome=(ok|refused|error)(?:\\s+msg=(.*))?$`,
+);
 
 /**
  * Parses ONE line of text (typically a `journalctl` line, journald prefix
- * and all — matches ANYWHERE in the line, never anchored to its start, same
- * as `parseAliasAuditLine`) into a `ParsedOutcomeLine`, or `null` when the
- * line is not a `[tools2]` outcome record at all — including every OLD
+ * and all — see `OUTCOME_LINE_RE`'s own doc comment for exactly what prefix
+ * is tolerated and why) into a `ParsedOutcomeLine`, or `null` when the line
+ * is not GENUINELY a `[tools2]` outcome record — including every OLD
  * `[tools]` line, verbatim or otherwise (see `OUTCOME_TAG`'s own doc comment
- * and `test/unit/outcome.test.ts`'s bidirectional pin).
+ * and `test/unit/outcome.test.ts`'s bidirectional pin), and every line where
+ * a `[tools2]`-shaped fragment is merely embedded inside ANY other line's own
+ * free text, OLD-format or not (see `OUTCOME_LINE_RE`'s own doc comment, and
+ * `test/unit/butchr-343-forged-embedded-tags.test.ts`).
  */
 export function parseOutcomeLine(line: string): ParsedOutcomeLine | null {
   const m = line.match(OUTCOME_LINE_RE);
