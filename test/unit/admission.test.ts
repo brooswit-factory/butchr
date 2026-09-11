@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
+import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -583,5 +583,132 @@ describe("the boss/worker inversion (BUTCHR-294's own motivating case)", () => {
     desired = new Map([["BOSS-2", spec("BOSS-2")], ["WORKER-9", spec("WORKER-9")], ["AAA-1", spec("AAA-1")]]);
     await reconcileNow(herd, desired, { admission: admission.admit });
     expect(herd.spawned).toEqual(["WORKER-9"]); // the withheld worker eventually starts, not the fresher arrival
+  });
+});
+
+// BUTCHR-332: the per-source residency census — `census()` — additive
+// alongside `snapshot()` (untouched by every test above). Every test below
+// drives the real `createAdmissionController`, never hand-assembles an
+// `AdmissionCensus`.
+describe("createAdmissionController.census() — per-source residency census (BUTCHR-332)", () => {
+  test("every declared source has a bucket from CONSTRUCTION, checked:false reason:never-reported, before any admit() call at all (mutation 11: no vacuous 'checked, nothing withheld')", () => {
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [], sources: ["issue", "project"], now: () => 1000 });
+    expect(ctrl.census()).toEqual({
+      cap: 5,
+      residency: null,
+      buckets: [
+        { source: "issue", checked: false, declinedAt: new Date(1000).toISOString(), reason: "never-reported" },
+        { source: "project", checked: false, declinedAt: new Date(1000).toISOString(), reason: "never-reported" },
+      ],
+    });
+  });
+
+  test("a source that has reported does not vouch for a sibling source that never has (mutation 12)", async () => {
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [], sources: ["issue", "project"], now: () => 0 });
+    await ctrl.admit(["A"], [], "issue");
+    const buckets = ctrl.census().buckets;
+    const issue = buckets.find((b) => b.source === "issue")!;
+    const project = buckets.find((b) => b.source === "project")!;
+    expect(issue.checked).toBe(true);
+    expect(project.checked).toBe(false);
+    if (project.checked) throw new Error("expected checked:false");
+    expect(project.reason).toBe("never-reported");
+  });
+
+  test("an undeclared source (no `sources` dep at all) still records its own bucket once admit() is called with it", async () => {
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [] });
+    expect(ctrl.census().buckets).toEqual([]); // nothing declared, nothing pre-seeded
+    await ctrl.admit(["A"], [], "adhoc");
+    expect(ctrl.census().buckets).toEqual([{ source: "adhoc", checked: true, confirmedAt: expect.any(String), withheld: [] }]);
+  });
+
+  test("admit() called with no source name at all records under DEFAULT_ADMISSION_SOURCE — every existing 2-arg caller still compiles and still records", async () => {
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [] });
+    await ctrl.admit(["A"], []); // 2-arg call, exactly like every pre-BUTCHR-332 caller/test
+    expect(ctrl.census().buckets).toEqual([{ source: DEFAULT_ADMISSION_SOURCE, checked: true, confirmedAt: expect.any(String), withheld: [] }]);
+  });
+
+  test("C1, structurally: many admit() calls naming only ONE source never touch a DIFFERENT declared source's bucket", async () => {
+    const ctrl = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue", "project"] });
+    for (let i = 0; i < 20; i++) await ctrl.admit(["ISSUE-1"], [], "issue"); // 20 calls, "project" never named
+    const project = ctrl.census().buckets.find((b) => b.source === "project")!;
+    expect(project).toEqual({ source: "project", checked: false, declinedAt: expect.any(String), reason: "never-reported" }); // untouched — still exactly its construction-time bucket
+  });
+
+  test("the empty-candidates early return records a TRUSTED bucket with withheld:[] and a real confirmedAt — a real observation, not a decline", async () => {
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1"], sources: ["issue"], now: () => 4242 });
+    await ctrl.admit([], [], "issue");
+    expect(ctrl.census().buckets).toEqual([{ source: "issue", checked: true, confirmedAt: new Date(4242).toISOString(), withheld: [] }]);
+  });
+
+  test("residency() throws records checked:false reason:census-threw for the CALLING source only (mutations 2/3/4)", async () => {
+    let now = 0;
+    let broken = false;
+    const ctrl = createAdmissionController({
+      cap: 5,
+      residency: async () => { if (broken) throw new Error("herdr down"); return []; },
+      sources: ["issue", "project"],
+      now: () => now,
+    });
+    await ctrl.admit(["I1"], [], "issue");
+    await ctrl.admit(["P1"], [], "project");
+    const trustedProjectBucket = ctrl.census().buckets.find((b) => b.source === "project")!;
+
+    broken = true;
+    now = 9000;
+    expect(await ctrl.admit(["I1"], [], "issue")).toEqual([]); // fail-safe: withholds everything for this call
+    const buckets = ctrl.census().buckets;
+    const issue = buckets.find((b) => b.source === "issue")!;
+    const project = buckets.find((b) => b.source === "project")!;
+    expect(issue).toEqual({ source: "issue", checked: false, declinedAt: new Date(9000).toISOString(), reason: "census-threw" });
+    // Mutation 4's own target: the OTHER source's bucket is untouched, byte-identical, not even re-stamped.
+    expect(project).toEqual(trustedProjectBucket);
+  });
+
+  test("an untrusted implausible-zero read records checked:false reason:census-untrusted for the calling source only, without touching a sibling source", async () => {
+    let now = 0;
+    let reads = ["A1", "A2"];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, sources: ["issue", "project"], now: () => now });
+    await ctrl.admit([], [], "issue"); // lastTrusted = 2
+    await ctrl.admit(["P1"], [], "project");
+    const trustedProjectBucket = ctrl.census().buckets.find((b) => b.source === "project")!;
+
+    reads = []; // implausible: drop from trusted 2 to 0, nothing in `stopping` explains it
+    now = 5000;
+    expect(await ctrl.admit(["I1"], [], "issue")).toEqual([]);
+    const buckets = ctrl.census().buckets;
+    const issue = buckets.find((b) => b.source === "issue")!;
+    const project = buckets.find((b) => b.source === "project")!;
+    expect(issue).toEqual({ source: "issue", checked: false, declinedAt: new Date(5000).toISOString(), reason: "census-untrusted" });
+    expect(project).toEqual(trustedProjectBucket); // untouched
+  });
+
+  test("a trusted, over-cap admit() records the withheld list and a confirmedAt taken from the injected clock — never re-stamped by a later census() read alone", async () => {
+    let now = 1000;
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => [], sources: ["issue"], now: () => now });
+    await ctrl.admit(["A", "B"], [], "issue"); // A admitted, B withheld
+    const first = ctrl.census().buckets[0]!;
+    expect(first).toEqual({ source: "issue", checked: true, confirmedAt: new Date(1000).toISOString(), withheld: ["B"] });
+
+    now = 9000; // the clock moves — a bare re-read must not pick this up
+    expect(ctrl.census().buckets[0]).toEqual(first);
+
+    // Only a fresh admit() call for this source may advance its confirmedAt.
+    await ctrl.admit(["A", "B"], [], "issue");
+    const third = ctrl.census().buckets[0]!;
+    if (!third.checked) throw new Error("expected checked:true");
+    expect(third.confirmedAt).toBe(new Date(9000).toISOString());
+  });
+
+  test("neither fail-safe path touches the wait ledger, lastTrusted, or lastWithheld (§B3) — the census bucket write sits BESIDE that promise, not instead of it", async () => {
+    let broken = false;
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => { if (broken) throw new Error("down"); return []; }, sources: ["issue"] });
+    expect(await ctrl.admit(["A", "B"], [], "issue")).toEqual(["A"]); // B withheld -> wait 1
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "B", polls: 1 });
+
+    broken = true;
+    expect(await ctrl.admit(["A", "B"], [], "issue")).toEqual([]);
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "B", polls: 1 }); // unchanged — §B3 still holds with the census write added beside it
+    expect(ctrl.census().buckets.find((b) => b.source === "issue")!.checked).toBe(false);
   });
 });
