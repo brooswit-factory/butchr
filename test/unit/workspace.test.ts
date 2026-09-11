@@ -53,7 +53,21 @@ describe("briefFor / modelFor", () => {
     expect(brief).not.toContain("full stop");
     expect(brief).toContain("three wake axes");
     expect(brief).toContain("the VERSION axis");
-    expect(brief).toContain("an epic has no verb that edits or comments on your root doc");
+  });
+  // BUTCHR-335 defect 1: "an epic has no verb that edits or comments on your
+  // root doc" was FALSE — confluence_update_page is an unguarded full-body
+  // replace with no check on whose page it is, so an epic CAN overwrite a
+  // project's root doc body with it (src/tools/defs.ts). Only the "comments"
+  // half was ever true. The brief must say so without presenting
+  // confluence_update_page as a usable backchannel to the project.
+  test("project brief no longer claims an epic has no verb that EDITS the root doc, and does not offer confluence_update_page as a backchannel", () => {
+    const brief = briefFor("project");
+    expect(brief).not.toContain("an epic has no verb that edits or comments on your root doc");
+    expect(brief).not.toContain("no verb that edits");
+    expect(brief).toContain("no verb that\n   comments on your root doc");
+    expect(brief).toContain("confluence_update_page");
+    expect(brief).toContain("not a message reaching you");
+    expect(brief).toContain("not a way for an epic to talk to you");
   });
   test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
