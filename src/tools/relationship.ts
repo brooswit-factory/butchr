@@ -6,7 +6,7 @@ import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
-import { resolveEligibleProjects } from "../resources/project.js";
+import { readProjectTierProperty, resolveEligibleProjects } from "../resources/project.js";
 import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
 import { AGENT_PREFIX } from "../labels/plan.js";
 
@@ -2317,23 +2317,34 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  * THE TIER ABOVE EPICS HAS NOW ARRIVED (BUTCHR-326), NARROWING THIS VERB
  * TOWARD OBSOLETE RATHER THAN LEAVING IT THERE. A "boss" for a caller with
  * no `Implements` link is no longer only "nobody" — it is ALSO "the project
- * that caller is a member of, if that project is ELIGIBLE" (an Epic's
- * project boss reviews its Epics exactly as every other boss reviews its
- * workers; see `isEpicMemberOfProject` and `assertOwnWorker`'s own doc
- * comment for why membership alone is deliberately not enough — this reuses
- * that exact predicate, not a looser one). Concretely: an Epic in an
- * eligible project HAS a boss now and is refused here, pointed at
- * `submit_to_boss` → that project's own `finish_worker`, same as branch (a).
- * This verb keeps exactly one caller shape it still serves without
- * refusing: a bossless top-level ticket whose project has no project tier
- * at all (not yet eligible, or not staffed) — the narrow exception the
- * headline above names. As projects come online and become eligible, this
- * narrows further on its own, with no removal needed — the same shrinking
- * property the pre-BUTCHR-326 version of this comment predicted, just now
- * gated on eligibility instead of on the tier's mere existence.
+ * that caller is a member of, if that project carries a project-tier root
+ * doc" (an Epic's project boss reviews its Epics exactly as every other
+ * boss reviews its workers; see `isEpicMemberOfProject` and
+ * `assertOwnWorker`'s own doc comment for why membership alone is
+ * deliberately not enough — this reuses that exact predicate, not a looser
+ * one). Concretely: an Epic whose own project carries that property HAS a
+ * boss now and is refused here, pointed at `submit_to_boss` → that
+ * project's own `finish_worker`, same as branch (a). THIS TEST IS
+ * CREDENTIAL-INVARIANT (BUTCHR-333, fixing a defect in the original
+ * BUTCHR-326 shape of this branch): it reads `projectKey`'s OWN property
+ * directly via `readProjectTierProperty`, never `resolveEligibleProjects`'s
+ * lead-filtered search — nothing about which daemon's credential handles
+ * this call may change the verdict; contrast `resolveEligibleProjects`,
+ * which is right for its OWN callers ("who is a peer FOR ME") but was
+ * wrong here, because it silently reduced to "does the CALLER's own
+ * credential happen to lead this project" (see this function's own
+ * `readProjectTierProperty` call below). This verb keeps exactly one
+ * caller shape it still serves without refusing: a bossless top-level
+ * ticket whose project carries no project-tier root doc at all — the
+ * narrow exception the headline above names. As projects come online and
+ * start carrying that property, this narrows further on its own, with no
+ * removal needed — the same shrinking property the pre-BUTCHR-326 version
+ * of this comment predicted, just now gated on the property directly
+ * instead of on the tier's mere existence, and no longer on eligibility
+ * either.
  *
  * A GAP THIS DOES NOT CLOSE, NAMED RATHER THAN HIDDEN (BUTCHR-326, out of
- * scope for that ticket): a bossless STORY or TASK sharing an eligible
+ * scope for that ticket): a bossless STORY or TASK sharing a project-tier
  * project (not an Epic) is NOT caught by branch (b) — it keeps today's
  * behaviour and still self-closes here. That is deliberate, not an
  * oversight: `assertOwnWorker`'s project branch refuses a non-Epic target
@@ -2342,6 +2353,17 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  * no exit — worse than today's gap, not better. Orphans of this shape are
  * not staffed until `adopt_worker` gives them an `Implements` link, and
  * branch (a) catches them from that point on.
+ *
+ * A CONSEQUENCE NAMED, NOT FIXED (BUTCHR-333): the property test above is
+ * purely about the PROJECT — it says nothing about whether any daemon is
+ * currently running with a credential that leads it. A project can carry
+ * the property while nobody staffs it; an Epic there is refused here just
+ * the same and waits, visibly, In Review, with nobody around to call
+ * `finish_worker` on it. That is intended (BUTCHR-189's "make audible where
+ * there is no exit"), not a bug this verb should route around with a
+ * staffing check — a silent self-close is the failure this whole story
+ * exists to prevent, and a visible wait is the deliberate, safe alternative
+ * to it.
  *
  * OPEN QUESTION THIS DOES NOT SETTLE, AND IS NOT THIS VERB'S TO SETTLE:
  * whether a top-level ticket with truly no boss anywhere SHOULD be able to
@@ -2371,39 +2393,39 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
     );
   }
 
-  // Branch (b) (BUTCHR-326): an Epic that is a member of an ELIGIBLE
-  // project also has a boss — that project. Cheap, I/O-free check first
-  // (issuetype + own project key, via the SAME predicate assertOwnWorker's
-  // project branch uses) so a non-Epic bossless caller — out of scope here,
-  // see this function's own doc comment — never pays for the eligibility
-  // read at all and is never at risk of the fail-closed refusal below.
+  // Branch (b) (BUTCHR-326/BUTCHR-333): an Epic that is a member of a
+  // project carrying a project-tier root doc also has a boss — that
+  // project. Cheap, I/O-free check first (issuetype + own project key, via
+  // the SAME predicate assertOwnWorker's project branch uses) so a non-Epic
+  // bossless caller — out of scope here, see this function's own doc
+  // comment — never pays for the property read at all and is never at risk
+  // of the fail-closed refusal below.
   const projectKey = projectKeyOf(issue);
   if (projectKey && isEpicMemberOfProject(issue, projectKey)) {
-    // Eligibility, never BUTCHR_PROJECT_ALLOWLIST — see
-    // resolveEligibleProjects's own doc comment and
-    // ProjectResourceDeps.allowlist's: the allowlist is a ROLLOUT GATE, not
-    // an eligibility rule, and different daemons on this host carry
-    // different allowlists, so an allowlist-based verdict would differ by
-    // which daemon handled the call. Eligibility is a Jira fact every
-    // daemon reads the same way. NO preFilter, exactly like
-    // list_peers/tell_peer.
-    let eligible: Awaited<ReturnType<typeof resolveEligibleProjects>>["eligible"];
+    // CREDENTIAL-INVARIANT (BUTCHR-333): read projectKey's OWN
+    // project-tier property directly — never resolveEligibleProjects, whose
+    // lead filter makes its verdict depend on which daemon's credential
+    // handled this call (see this function's own doc comment above, and
+    // readProjectTierProperty's, for why that resolver is right for ITS
+    // callers and wrong for this one). No getMyself, no project search, no
+    // allowlist — nothing about the calling credential enters this read.
+    let tier: Awaited<ReturnType<typeof readProjectTierProperty>>;
     try {
-      ({ eligible } = await resolveEligibleProjects(ops));
+      tier = await readProjectTierProperty(ops, projectKey);
     } catch (e) {
-      // FAIL CLOSED: an eligibility read we could not complete must never
+      // FAIL CLOSED: a project-tier read we could not complete must never
       // be read as "no boss" — that would let exactly the six-epic
       // self-close defect this ticket exists to close back in through a
       // transient error instead of a design gap. Distinguishable from both
       // the has-a-boss refusals above and the open-workers refusal below —
       // a test asserts on that.
       throw new Error(
-        `finish_without_a_boss: could not determine whether ${callerKey} has a boss — reading project eligibility for ${projectKey} failed (${(e as Error).message}). Refusing rather than treating "could not look" as "no boss".`,
+        `finish_without_a_boss: could not determine whether ${callerKey} has a boss — reading the project tier for ${projectKey} failed (${(e as Error).message}). Refusing rather than treating "could not look" as "no boss".`,
       );
     }
-    if (eligible.some((p) => p.key === projectKey)) {
+    if (tier) {
       throw new Error(
-        `finish_without_a_boss: ${callerKey} has a boss — its project ${projectKey} is an eligible project tier and reviews its own Epics — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${projectKey} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
+        `finish_without_a_boss: ${callerKey} has a boss — its project ${projectKey} carries a project-tier root doc and reviews its own Epics — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${projectKey} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
       );
     }
   }

@@ -1955,39 +1955,54 @@ describe("finishWithoutABoss", () => {
 });
 
 // ---------------------------------------------------------------------------
-// BUTCHR-326: finishWithoutABoss's branch (b) — an Epic that is a member of
-// an ELIGIBLE project also has a boss (that project), even with no
-// `Implements` link at all. Eligibility here always goes through the fake
-// world's own searchProjects/getMyself/getProjectPropertyOrNull — the same
-// three ops resolveEligibleProjects reads — never a second, hand-rolled
-// eligibility rule.
+// BUTCHR-326/BUTCHR-333: finishWithoutABoss's branch (b) — an Epic whose own
+// project carries a project-tier `butchr` root-doc property also has a boss
+// (that project), even with no `Implements` link at all. BUTCHR-333: this
+// verdict is CREDENTIAL-INVARIANT — it reads `getProjectPropertyOrNull`
+// directly for the caller's own project key ONLY, never `searchProjects` or
+// `getMyself` (the ops `resolveEligibleProjects` uses for ITS OWN, different,
+// lead-filtered purpose). Tests below deliberately do NOT default the fake
+// world's project lead to the caller's own credential — doing that would
+// silently launder the exact defect this ticket fixes back into the suite.
 // ---------------------------------------------------------------------------
 
-describe("BUTCHR-326: finishWithoutABoss branch (b) — Epic-in-eligible-project has a boss", () => {
-  // makeWorld's default ops: searchProjects() -> no projects at all, so
-  // `eligible` is always empty unless a test overrides it below.
-  function eligibleOps(ops: AtlassianOps, projectKey: string): AtlassianOps {
+describe("BUTCHR-326/BUTCHR-333: finishWithoutABoss branch (b) — Epic in a project-tier project has a boss, credential-invariantly", () => {
+  // Sets ONLY the property read — no searchProjects/getMyself override at
+  // all, so a test using this is a direct proof the verdict never consults
+  // either.
+  function projectTierOps(ops: AtlassianOps, projectKey: string): AtlassianOps {
     return {
       ...ops,
-      searchProjects: async () => ({ values: [{ key: projectKey, name: projectKey, lead: { accountId: "test-account" } }] }), // "test-account" matches makeWorld's default getMyself()
       getProjectPropertyOrNull: async (key: string) => (key === projectKey ? { rootDoc: { id: "1" } } : null),
     };
   }
 
-  test("1. an Epic in an ELIGIBLE project is refused — the message names the project key AND submit_to_boss", async () => {
+  test("1. THE DEFECT-1 REGRESSION PIN — an Epic whose project carries a project-tier root doc is refused even when that project is LED BY A DIFFERENT CREDENTIAL than the caller's own getMyself(): the verdict must not depend on which daemon's account leads the project", async () => {
     const { ops, addIssue, issues } = makeWorld();
-    addIssue("ELIG-1", { issuetype: "Epic", project: "ELIG" }); // no Implements link
-    const eligible = eligibleOps(ops, "ELIG");
-    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/ELIG-1 has a boss/);
-    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/\bELIG\b/); // the project key, not just the caller's own key
-    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/submit_to_boss/);
-    expect(issues.get("ELIG-1")!.status).toBe("To Do"); // never transitioned by the refused call
+    addIssue("TIER-1", { issuetype: "Epic", project: "TIER" }); // no Implements link
+    // makeWorld's default getMyself() -> "test-account". This project is led
+    // by a DIFFERENT account entirely, on purpose: the pre-BUTCHR-333 branch
+    // (b) called resolveEligibleProjects, which filters by
+    // `lead.accountId === me.accountId` BEFORE ever reading the property —
+    // under that old gate this project would not be "led by me", `eligible`
+    // would come back empty, and the call would wrongly transition instead
+    // of refusing. The current gate must refuse regardless.
+    const otherCredential: AtlassianOps = {
+      ...ops,
+      searchProjects: async () => ({ values: [{ key: "TIER", name: "TIER", lead: { accountId: "some-other-account" } }] }),
+      getProjectPropertyOrNull: async (key: string) => (key === "TIER" ? { rootDoc: { id: "1" } } : null),
+    };
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/TIER-1 has a boss/);
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/\bTIER\b/); // the project key, not just the caller's own key
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/submit_to_boss/);
+    expect(issues.get("TIER-1")!.status).toBe("To Do"); // never transitioned by the refused call
   });
 
-  test("2. an Epic in a NON-eligible project still transitions to Done — the case that must keep working", async () => {
+  test("2. an Epic whose project carries NO butchr property still transitions to Done — no project tier at all, the case that must keep working", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
-    // makeWorld's default ops: no project is ever eligible (searchProjects -> []).
+    // makeWorld's default getProjectPropertyOrNull -> null for every key: a
+    // clean not-found, never fail-closed.
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
   });
@@ -2000,12 +2015,12 @@ describe("BUTCHR-326: finishWithoutABoss branch (b) — Epic-in-eligible-project
     expect(issues.get("BUTCHR-2")!.status).toBe("To Do");
   });
 
-  test("4. an eligibility-read FAILURE (not a 404) refuses with a DISTINCT fail-closed message naming the error — 'could not look' never becomes 'no boss'", async () => {
+  test("4. a project-tier read FAILURE (not a clean not-found) refuses with a DISTINCT fail-closed message naming the error — 'could not look' never becomes 'no boss'", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
-    const broken: AtlassianOps = { ...ops, searchProjects: async () => { throw new Error("jira search down"); } };
+    const broken: AtlassianOps = { ...ops, getProjectPropertyOrNull: async () => { throw new Error("jira property read down"); } };
     await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/could not determine whether BUTCHR-1 has a boss/);
-    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/jira search down/);
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/jira property read down/);
     // distinguishable from both other refusal shapes:
     await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.not.toThrow(/still has open worker/);
     expect(issues.get("BUTCHR-1")!.status).toBe("To Do"); // refused, not silently treated as bossless
@@ -2017,12 +2032,12 @@ describe("BUTCHR-326: finishWithoutABoss branch (b) — Epic-in-eligible-project
   // relationship.ts's finishWithoutABoss is ever reached, so it neither
   // knows nor cares that branch (b) now exists below it).
 
-  test("6. a bossless STORY (or Task) in an ELIGIBLE project is NOT refused by branch (b) — it transitions, pinning the Epic-only narrowing from 1b", async () => {
+  test("6. a bossless STORY (or Task) whose project carries a project-tier root doc is NOT refused by branch (b) — it transitions, pinning the Epic-only narrowing from 1b", async () => {
     const { ops, addIssue, issues } = makeWorld();
-    addIssue("ELIG-1", { issuetype: "Story", project: "ELIG" }); // no Implements link, shares the eligible project, but is not an Epic
-    const eligible = eligibleOps(ops, "ELIG");
-    await finishWithoutABoss(eligible, "ELIG-1");
-    expect(issues.get("ELIG-1")!.status).toBe("Done");
+    addIssue("TIER-1", { issuetype: "Story", project: "TIER" }); // no Implements link, shares the project-tier project, but is not an Epic
+    const tiered = projectTierOps(ops, "TIER");
+    await finishWithoutABoss(tiered, "TIER-1");
+    expect(issues.get("TIER-1")!.status).toBe("Done");
   });
 });
 
