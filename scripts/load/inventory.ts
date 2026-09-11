@@ -23,6 +23,11 @@ export const RUNS_ON_IMPORT = new Set([
   "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/collate.ts",
   "scripts/release/notes.ts", "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
   "scripts/verify-spawn-effort.ts", "scripts/verify-workspace-ground-truth.ts", "scripts/verify-review-commit-immutability.ts", "src/daemon/index.ts",
+  // BUTCHR-250: a one-off vendoring script that fetches a live URL and
+  // writes src/tools/html4-named-entities.generated.ts as a side effect of
+  // being run — importing it must not actually hit the network or rewrite
+  // a committed generated file as a side effect of a "does this load" check.
+  "scripts/vendor/html4-entities.ts",
   // BUTCHR-245: calls main() unconditionally at import time — real herdr I/O
   // (workspace.list/pane.list/agent.list, and workspace.close under
   // --execute). Importing it during `bun test` must not do any of that.
@@ -31,6 +36,11 @@ export const RUNS_ON_IMPORT = new Set([
   // `dist/`) — importing it must not actually run all that as a side effect
   // of a "does this load" check.
   "scripts/build/build.ts",
+  // BUTCHR-268: calls main() unconditionally at import time — real herdr I/O
+  // (agent.list, workspace.list/create/close, agent.start, pane.close), and
+  // with no `argv[2]` under `bun test` its default mode runs the full `gaps`
+  // sweep. Importing it during `bun test` must not do any of that.
+  "scripts/repro-pane-busy.ts",
 ]);
 
 export function loadTestSource(file: string): string {
