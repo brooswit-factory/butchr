@@ -105,10 +105,9 @@ export const MARKER = "[butchr:abandoned]";
  * Review, and a shelved worker moved to To Do is no longer outside this
  * detector's candidate set — it is an ORDINARY candidate. The anomalous
  * case this decision was originally written for is no longer the only one
- * it bites on: it is now the largest population this detector reaches. The
- * no-exemption decision itself does not change (see above) — the new facts
- * are stronger support for it, not weaker, since a worker shelved under a
- * Done boss can never be reactivated by anyone.
+ * it bites on. The no-exemption decision itself does not change (see
+ * above) — the new facts are stronger support for it, not weaker, since a
+ * worker shelved under a Done boss can never be reactivated by anyone.
  */
 
 export interface AbandonedCandidate {
