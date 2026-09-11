@@ -135,6 +135,18 @@ export interface Activation<T> {
  * `reason` at all (the project tier, or any future resource type) is
  * unaffected: `reason: undefined` still renders the original bare fallback
  * (see notifyReasonTag's own doc comment).
+ *
+ * BUTCHR-351 widened `comment` again, to `string | null`: `null` carries
+ * the SAME positive evidence of movement as a string id — a suppression
+ * arm's own comments() fetch showed the ticket's newest comment id
+ * changed — but the mover was a DELETION, not an addition: the ticket's
+ * comment list went from non-empty to empty, so there is no id to report.
+ * Mirrors the pre-BUTCHR-350 bare `{ comment: true }` on this one edge
+ * exactly (see src/resources/issue.ts's `SuppressionVerdict` doc comment)
+ * — restoring the classification a BUTCHR-350 regression had turned
+ * structural: a daemon-label-only diff coinciding with this edge used to
+ * wake a sleeping watcher unconditionally instead of going through the
+ * `unseenFor` gate like every other comment-caused delivery does.
  */
 export type NotifyReason =
   | { pr: { from: string | null; to: string } }
@@ -143,7 +155,7 @@ export type NotifyReason =
   | { status: { from: string; to: string } }
   | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
   | { summary: true }
-  | { comment: string }
+  | { comment: string | null }
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" };
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };

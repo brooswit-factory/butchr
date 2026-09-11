@@ -159,3 +159,51 @@ describe("parseSuppressedLine: msg= boundary — free text is never mistaken for
     expect(parseSuppressedLine(line)).toBeNull();
   });
 });
+
+describe("parseSuppressedLine: pinned against the REAL production emitter path — the two-space indent every `log:` dep applies (BUTCHR-351)", () => {
+  // BUTCHR-351: the trap named in this ticket. `src/daemon/index.ts` never
+  // hands `agentFoldSuppressedLine`/`standDownSuppressedLine`'s bare return
+  // value to console.error directly — every `log:` dep in that file,
+  // including the one wired to `createIssueEventRules`, is
+  // `(line) => console.error(\`  ${line}\`)`: an UNCONDITIONAL two-space
+  // indent, prefix or no prefix. The tests above (and BUTCHR-350's own)
+  // feed the emitter's return value straight to `parseSuppressedLine`,
+  // which never exercises that indenting wiring at all — this closure
+  // reproduces it exactly, so a regression here is caught the way the
+  // production defect actually manifested: a genuine line, indented the
+  // way production always indents it, failing to parse.
+  const productionLog = (line: string) => `  ${line}`;
+
+  test("a genuine line, indented via the production log closure, parses under journalctl -o cat (no transport prefix at all)", () => {
+    const raw = productionLog(agentFoldSuppressedLine("K", "c1", "f1", 2));
+    // `-o cat` strips journalctl's own transport prefix entirely — what a
+    // caller reads back is exactly what the process wrote to stderr, indent
+    // included. This is the exact case that returned `null` before this
+    // ticket's fix.
+    const parsed = parseSuppressedLine(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.arm).toBe("agent-fold");
+    expect(parsed).toEqual({
+      key: "K",
+      watcher: "K",
+      arm: "agent-fold",
+      fields: { baseline: "c1", newest: "f1", new_comments: "2" },
+      message: "a foreign comment was folded into this agent's own-write suppression and was not delivered this poll (KAN-838)",
+    });
+  });
+
+  test("a genuine stand-down line, indented via the production log closure, parses under journalctl -o cat", () => {
+    const raw = productionLog(standDownSuppressedLine("K", "W", 3));
+    const parsed = parseSuppressedLine(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.arm).toBe("stand-down");
+  });
+
+  test("a genuine line, indented via the production log closure, ALSO parses under a real captured journald prefix (-o short) — the indent lands between the prefix's own colon and the tag", () => {
+    const journaldPrefix = "Sep 11 03:25:21 servyboi bun[641076]: ";
+    const raw = `${journaldPrefix}${productionLog(agentFoldSuppressedLine("K", "c1", "f1", 2))}`;
+    const parsed = parseSuppressedLine(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.arm).toBe("agent-fold");
+  });
+});

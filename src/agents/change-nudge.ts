@@ -58,7 +58,10 @@ function reasonClause(reason: NotifyReason | undefined): string {
     return `changed its ${prefix}:* label from ${prefix}:${from ?? "none"} to ${prefix}:${to ?? "none"}`;
   }
   if ("summary" in reason) return "had its summary edited";
-  return "got a new comment"; // "comment" in reason
+  // BUTCHR-351: `reason.comment === null` means the mover was a comment
+  // DELETION, not an addition (see NotifyReason's own doc comment) —
+  // "got a new comment" would be actively wrong there.
+  return reason.comment === null ? "had a comment removed" : "got a new comment"; // "comment" in reason
 }
 
 /**
@@ -127,5 +130,11 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
     if (reason.undetermined === "checked-unchanged") return " (reason: not determinable — checked comments, unchanged)";
     return " (reason: not determinable — comments not checked this poll)"; // "unchecked"
   }
-  return ` (comment:${reason.comment})`; // "comment" in reason
+  // BUTCHR-351: `reason.comment` can now be `null` (the comment-deletion
+  // edge — see NotifyReason's own doc comment) — rendered as the honest
+  // `comment:deleted`, never the literal string "null" a bare template
+  // would produce. Still a `(comment:` PREFIX, so AC4's own reasoning for
+  // why no distinct tag is warranted (this module's top comment) still
+  // holds: additive, not a meaning change to the existing shape.
+  return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`; // "comment" in reason
 }

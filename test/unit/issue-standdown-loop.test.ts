@@ -493,3 +493,72 @@ describe("BUTCHR-307 DoD 4: a wake-from-stand_down spawn must never reach the cr
     expect(posted.length).toBe(1);
   });
 });
+
+describe("BUTCHR-351: the comment-deletion edge stays NON-STRUCTURAL — restores the pre-BUTCHR-350 classification (BUTCHR-322 §4 OUT forbids changing what's suppressed)", () => {
+  test("a daemon-label-only diff coinciding with the ticket's comments going from non-empty to empty does not wake a sleeping watcher with nothing unseen", async () => {
+    // BUTCHR-350 regression: `result.newest` reads back `null` when a
+    // ticket's SOLE comment is deleted between polls (not added, a
+    // deletion) — the suppression arm that observes this used to omit
+    // `commentId` entirely on that one edge, so decide() fell through to
+    // the general classifier, which named the coinciding label-only diff as
+    // a STRUCTURAL `label` reason instead of the non-structural `comment`
+    // reason the movement actually is. A structural reason wakes a sleeping
+    // watcher UNCONDITIONALLY (see `finalize`'s own doc comment in
+    // src/resources/issue.ts) — this test reproduces BUTCHR-351's own
+    // executed repro: a sleeping watcher, `unseenFor` returning empty, a
+    // label-only diff, and comments going `["100"]` -> `[]`.
+    const store = commentStore({ "KAN-1": ["100"] });
+    const sd = newRegistry();
+    const rules = createIssueEventRules({ comments: store.comments, standDown: sd });
+
+    // Poll 1: seed the per-key comment cursor at "100" — no structural or
+    // label change, decide() never consulted. `commentCursor` persists
+    // across polls on this ONE `rules` instance, exactly as production's
+    // one-instance-per-resource-type-lifetime does — a key's first-ever
+    // poll can never itself be the "moved" poll (see createIssueEventRules's
+    // own baseline-seeding comment), so this must be a SEPARATE, earlier
+    // poll from the one that observes the deletion.
+    const seed = issue({ labels: ["agent:working"] });
+    await rules.poll({ primary: [seed], related: [] }, { primary: [seed], related: [] });
+
+    // The watcher stands down having already seen comment "100" — the only
+    // comment that will ever exist on this ticket.
+    sd.standDown("KAN-1", new Map([["KAN-1", ["100"]]]));
+
+    // Poll 2: the ticket's sole comment is deleted (comments -> []) in the
+    // SAME poll as a routine daemon-label flip (agent:working -> agent:idle)
+    // — the exact coincidence BUTCHR-351 §2 describes.
+    store.set("KAN-1", []);
+    const before = issue({ labels: ["agent:working"] });
+    const after = issue({ labels: ["agent:idle"], updated: "2026-01-01T00:05:00.000Z" });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    expect(poll.changedPrimary).toEqual(["KAN-1"]); // `updated` moved -> a real change
+
+    expect(sd.isAsleep("KAN-1")).toBe(true); // sanity: still asleep before this decide()
+    const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
+    // Pre-BUTCHR-350 behaviour, restored: nothing unseen for this sleeping
+    // watcher -> gated, suppressed, never woken. Before this ticket's fix,
+    // `verdict.deliver` was `true` and the watcher was woken unconditionally
+    // (the defect: a `{ label: ... }` structural reason).
+    expect(verdict.deliver).toBe(false);
+    expect(sd.isAsleep("KAN-1")).toBe(true); // never woken
+  });
+
+  test("the SAME edge, with no stand-down watcher involved at all, still delivers — with a non-structural `comment: null` reason, never a bare `commentId` string that lies about an id existing", async () => {
+    // Contrast case: the movement itself is real and must still be
+    // reported — this ticket restores the CLASSIFICATION (non-structural),
+    // not the delivery outcome for an ordinary awake watcher.
+    const store = commentStore({ "KAN-1": ["100"] });
+    const rules = createIssueEventRules({ comments: store.comments });
+
+    const seed = issue({ labels: ["agent:working"] });
+    await rules.poll({ primary: [seed], related: [] }, { primary: [seed], related: [] });
+
+    store.set("KAN-1", []);
+    const before = issue({ labels: ["agent:working"] });
+    const after = issue({ labels: ["agent:idle"], updated: "2026-01-01T00:05:00.000Z" });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
+    expect(verdict).toEqual({ deliver: true, reason: { comment: null } });
+  });
+});
