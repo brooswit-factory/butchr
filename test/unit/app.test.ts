@@ -10,13 +10,18 @@ import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import type { DashboardResponse } from "../../src/agents/dashboard.js";
+import type { AdmissionView, DashboardResponse } from "../../src/agents/dashboard.js";
+
+// BUTCHR-332: a trivial, empty-sources fixture for every existing
+// DashboardResponse literal below that predates the admission view and isn't
+// exercising it.
+const noAdmissionView: AdmissionView = { cap: 0, residency: null, sources: [] };
 
 // BUTCHR-269: a trivial, always-checked-empty fixture for every existing
 // ViewDeps literal below that predates /dashboard and isn't exercising it —
 // the real row-shape/could-not-check contract gets its own dedicated
 // describe block (and its own dedicated fixtures) further down this file.
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -118,7 +123,7 @@ describe("butchr webapp + open action", () => {
 // not an artifact of a fixture that fakes freshness some other way.
 describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request path", () => {
   test("smoke: the shared fixture app's /dashboard reflects its dashboard() fixture verbatim", async () => {
-    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
+    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
   });
 
   test("a bare re-request does NOT advance confirmedAt (row-level or response-level) — only a new poll does", async () => {
@@ -126,6 +131,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       checked: true,
       confirmedAt: new Date(1000).toISOString(),
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
+      admission: noAdmissionView,
     };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
     app.listen(0);
@@ -139,7 +145,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       expect(second.confirmedAt).toBe(first.confirmedAt);
 
       // Now simulate a poll: the daemon's own tee reassigns `snapshot`, never the route.
-      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
+      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }], admission: noAdmissionView };
       const third = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       if (!third.checked) throw new Error("expected checked:true");
       expect(third.rows[0]!.confirmedAt).not.toBe(first.rows[0]!.confirmedAt);
@@ -153,13 +159,13 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("could-not-check (case 1: the agent.list() read itself fails) is distinguishable from a genuinely empty fleet — never {checked:true, rows:[]}", async () => {
     // A genuine finding: the poll succeeded and there really are no agents.
-    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [] };
+    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [], admission: noAdmissionView };
     // A declined poll: the whole-response shape carries checked:false and a
     // declinedAt, distinct at the type level from the empty-but-checked case
     // above — this is the assertion that fails if the two were ever
     // collapsed (e.g. both serializing to `{rows: []}` with `checked`
     // dropped, or a declined poll silently reusing `checked:true`).
-    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [] };
+    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [], admission: noAdmissionView };
 
     let snapshot: DashboardResponse = genuinelyEmpty;
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
@@ -186,7 +192,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
-    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow] };
+    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow], admission: noAdmissionView };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot });
     app.listen(0);
     try {
@@ -195,7 +201,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       // own tee) carries `rows` forward unchanged, only flipping the
       // top-level checked/declinedAt — this test pins that CHOICE, not just
       // that a value exists.
-      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows };
+      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows, admission: noAdmissionView };
       const body = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       expect(body.checked).toBe(false);
       expect(body.rows).toEqual([staleRow]);

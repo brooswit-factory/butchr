@@ -361,6 +361,61 @@ export interface AdmissionControllerDeps {
   /** Poll-count bound for a readable-but-implausible zero — see `ImplausibleZeroGuard`. Optional; defaults to `MAX_IMPLAUSIBLE_POLLS`. */
   maxImplausiblePolls?: number;
   log?: (line: string) => void;
+  /**
+   * BUTCHR-332: clock for `census()`'s per-bucket `confirmedAt`/`declinedAt`
+   * timestamps — injected so a test can move time rather than asserting
+   * against a frozen `Date.now()`. Optional; defaults to `Date.now`.
+   */
+  now?: () => number;
+  /**
+   * BUTCHR-332: every source that will ever call `admit(..., source)` —
+   * taken up front, not discovered lazily, so "this tier has not reported
+   * yet" is expressible from the very first `census()` read. A bucket for
+   * each name here is created at CONSTRUCTION time, `{checked: false,
+   * reason: "never-reported"}` — a lazily-created bucket set cannot
+   * distinguish "never reported" from "does not exist", which is the same
+   * collapse this whole feature exists to close (BUTCHR-332's own mutations
+   * 11/12: a vacuous "every bucket that has reported is trusted" reads as
+   * checked with zero buckets ever having reported at all). Optional;
+   * defaults to empty — a caller that never names its sources up front
+   * simply gets no pre-seeded buckets, and `admit`'s own default source
+   * name (see `DEFAULT_ADMISSION_SOURCE`) still records correctly once
+   * called.
+   */
+  sources?: readonly string[];
+}
+
+/** `admit`'s `source` name when the caller omits it — every existing 2-arg caller/test (this file's own, `reconcileNow`'s `ReconcileOptions.admission`) still compiles and records under one shared bucket rather than losing its census entirely. */
+export const DEFAULT_ADMISSION_SOURCE = "default";
+
+/**
+ * BUTCHR-332: one calling tier's residency-census bucket — see `AdmissionCensus`.
+ * A `checked: false` bucket's `reason` distinguishes three distinct declines:
+ * `"census-threw"` (§Trap 2 shape 1), `"census-untrusted"` (shape 2, still
+ * within `ImplausibleZeroGuard`'s bound), and `"never-reported"` (this source
+ * has never once called `admit` — the construction-time default, see
+ * `AdmissionControllerDeps.sources`). None of the three may ever be
+ * conflated with `AgentDashboardRow`'s own "not applicable" state
+ * (src/agents/dashboard.ts) — this is "could not check", a different thing.
+ */
+export type AdmissionCensusBucket =
+  | { source: string; checked: true; confirmedAt: string; withheld: readonly string[] }
+  | { source: string; checked: false; declinedAt: string; reason: "census-threw" | "census-untrusted" | "never-reported" };
+
+/**
+ * BUTCHR-332: the full per-source residency census — `cap`/`residency` are
+ * the SAME values `AdmissionSnapshot` already exposes (never a second
+ * source), `buckets` is ONE ENTRY PER SOURCE THAT HAS EVER BEEN DECLARED OR
+ * CALLED, deliberately with NO aggregate "is everything fine" boolean
+ * anywhere on this shape: a single flag would let one source's trusted
+ * bucket vouch for a DIFFERENT source that failed or never reported (the
+ * exact smear BUTCHR-332's own review bar names as mutations 3/4/11/12) —
+ * a consumer must look at the specific bucket(s) it cares about.
+ */
+export interface AdmissionCensus {
+  cap: number;
+  residency: number | null;
+  buckets: readonly AdmissionCensusBucket[];
 }
 
 export interface AdmissionController {
@@ -371,9 +426,17 @@ export interface AdmissionController {
    * the cold-start/implausible-zero discriminator — see this module's own
    * top comment, Trap 2). Never throws.
    */
-  admit(candidates: readonly string[], stopping: readonly string[]): Promise<readonly string[]>;
+  admit(candidates: readonly string[], stopping: readonly string[], source?: string): Promise<readonly string[]>;
   /** Current snapshot for `/health` — see AdmissionSnapshot. Synchronous: reads the last TRUSTED census `admit()` itself already took, never makes a fresh call. */
   snapshot(): AdmissionSnapshot;
+  /**
+   * BUTCHR-332: the per-source census — see `AdmissionCensus`. Synchronous,
+   * like `snapshot()`: reads state `admit()` calls already recorded, never
+   * makes a fresh call of its own. Additive alongside `snapshot()`, which
+   * keeps its own existing contract untouched (both read the same
+   * `cap`/`lastTrusted` internals — never a second source).
+   */
+  census(): AdmissionCensus;
   /**
    * BUTCHR-297 (§B4): clear the accumulated wait for candidates whose spawn
    * ACTUALLY SUCCEEDED this poll — see this file's own top-comment B4
@@ -473,6 +536,7 @@ export function admissionFailSafeLine(cap: number, reason: AdmissionFailSafe, ca
 /** Builds the shared, fleet-wide admission controller wired into BOTH `runResourceLoop` call sites (src/daemon/index.ts) via `ReconcileOptions.admission` (src/daemon/loop.ts). */
 export function createAdmissionController(deps: AdmissionControllerDeps): AdmissionController {
   const log = (line: string) => deps.log?.(line);
+  const now = deps.now ?? Date.now;
   const guard = new ImplausibleZeroGuard(deps.maxImplausiblePolls);
   /** Last TRUSTED residency — null means no trusted observation yet (cold start: the very next zero is trusted, not treated as implausible). */
   let lastTrusted: number | null = null;
@@ -484,8 +548,23 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   let callCount = 0;
   /** BUTCHR-297: the withheld set from the last TRUSTED, non-empty `admit()` call — `/health`'s `longestWait` (see AdmissionSnapshot) reads its FIRST element, which is already the longest-waiting (or equal-longest, lexicographically-first) candidate, since `withheld` is itself a suffix of `orderByWait`'s fully-sorted order. */
   let lastWithheld: readonly string[] = [];
+  // BUTCHR-332: one bucket per source, keyed by the `source` name `admit`
+  // was called with — pre-seeded here, at CONSTRUCTION time, for every name
+  // in `deps.sources`, so a tier that has not polled yet is expressible as
+  // "never-reported" from the very first `census()` read rather than simply
+  // absent (mutations 11/12 on the ticket — a lazily-created bucket set has
+  // nothing to quantify over, so "no source has reported" and "one of two
+  // hasn't" would both silently read as an empty, vacuously-trusted set).
+  // NEVER written to except by the single `setBucket(source, ...)` call
+  // inside `admit` below, keyed by the exact `source` string that call
+  // received — this is what makes C1 (one tier's call can never clear
+  // another's bucket) structural rather than a discipline to remember.
+  const buckets = new Map<string, AdmissionCensusBucket>(
+    (deps.sources ?? []).map((source) => [source, { source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "never-reported" }]),
+  );
+  const setBucket = (bucket: AdmissionCensusBucket) => buckets.set(bucket.source, bucket);
 
-  async function admit(candidates: readonly string[], stopping: readonly string[]): Promise<readonly string[]> {
+  async function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
     let resident: readonly string[];
     try {
       resident = await deps.residency();
@@ -497,6 +576,10 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
         log(`WARNING: [admission] residency census threw (${(e as Error)?.message ?? e}) — withholding all ${candidates.length} wanted this poll (fail-safe): ${candidates.join(", ")}`);
         log(admissionFailSafeLine(deps.cap, "census-threw", candidates));
       }
+      // BUTCHR-332: a bucket WRITE beside the existing fail-safe `return []`
+      // — never a change to it (§B3: the wait ledger/lastTrusted/lastWithheld
+      // are all still untouched below, exactly as before this ticket).
+      setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-threw" });
       return [];
     }
     const observed = resident.length;
@@ -513,6 +596,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
           log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only stops ${stopping.length} of that — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${candidates.length} wanted this poll`);
           log(admissionFailSafeLine(deps.cap, "implausible-zero", candidates));
         }
+        setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-untrusted" });
         return [];
       }
       // Trap 2(d): the bound is exceeded — accept the zero as real rather
@@ -536,7 +620,15 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // `callCount` are untouched below, same as before) and does not
     // violate B3 — B3 is about the ledger, and both fail-safe paths return
     // earlier than this line already.
-    if (candidates.length === 0) { lastWithheld = []; return candidates; }
+    if (candidates.length === 0) {
+      lastWithheld = [];
+      // BUTCHR-332: a real, TRUSTED observation — "checked: nothing wanted
+      // this poll" — not a decline and not silence (the ticket's own
+      // explicit correction: an empty shape carrying no timestamp reopens
+      // the exact gap BUTCHR-264 closed, one level down).
+      setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld: [] });
+      return candidates;
+    }
     callCount++;
     // BUTCHR-297: order BEFORE slicing — see this file's own top-comment
     // addendum for why aging lives here and why the tie-break reproduces
@@ -581,6 +673,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // comment for why the tag itself changed (criterion D) rather than
     // reusing `[admission]` with a wider firing condition.
     log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits));
+    setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
     return admitted;
   }
 
@@ -599,5 +692,9 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       const longestWait = longestId !== undefined ? { id: longestId, polls: waits.get(longestId) ?? 0 } : null;
       return { cap: deps.cap, residency: lastTrusted, longestWait };
     },
+    // BUTCHR-332: reads the SAME `cap`/`lastTrusted` `snapshot()` already
+    // reads (never a second source) plus the per-source `buckets` map —
+    // synchronous, no fresh call of its own.
+    census: () => ({ cap: deps.cap, residency: lastTrusted, buckets: [...buckets.values()] }),
   };
 }
