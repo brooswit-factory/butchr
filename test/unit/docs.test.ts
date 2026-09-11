@@ -226,7 +226,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
     let reconstructed = "";
     let calls = 0;
     for (;;) {
-      const result = await getDoc(ops, "BUTCHR-5", offset, 5);
+      const result = await getDoc(ops, "BUTCHR-5", offset, 5, offset === 0 ? undefined : 1);
       calls++;
       if (result.found && result.complete) {
         reconstructed += result.body;
@@ -263,7 +263,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
     let offset = first.next!.offset;
     let reconstructed = first.chunk;
     for (;;) {
-      const result = await getDoc(ops, "BUTCHR-6", offset, 3);
+      const result = await getDoc(ops, "BUTCHR-6", offset, 3, offset === 0 ? undefined : 1);
       if (result.found && result.complete) {
         reconstructed += result.body;
         break;
@@ -278,7 +278,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
     // The OTHER nudge direction: a limit of 1 starting exactly AT the high
     // surrogate (offset 2) would shrink to a zero-length slice — nudged
     // FORWARD past the whole pair instead, so pagination can never stall.
-    const atPairStart = await getDoc(ops, "BUTCHR-6", 2, 1);
+    const atPairStart = await getDoc(ops, "BUTCHR-6", 2, 1, 1);
     if (!atPairStart.found || atPairStart.complete) throw new Error("expected a partial result");
     expect(atPairStart.chunk).toBe("\u{1F600}");
     expect(atPairStart.slice.chars).toBe(2); // actual length, not the requested limit of 1
@@ -301,7 +301,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
     const body = "0123456789";
     addIssue("BUTCHR-8", "offset at end");
     seedIssueDoc("BUTCHR-8", "905", "offset at end", body);
-    const result = await getDoc(ops, "BUTCHR-8", 10, 5);
+    const result = await getDoc(ops, "BUTCHR-8", 10, 5, 1);
     expect(result).toMatchObject({ found: true, complete: false, slice: { offset: 10, chars: 0 }, chunk: "" });
     if (!result.found || result.complete) throw new Error("unreachable");
     expect(result.next).toBeUndefined();
@@ -313,7 +313,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
       const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-9", "short doc");
       seedIssueDoc("BUTCHR-9", "906", "short doc", "0123456789");
-      await expect(getDoc(ops, "BUTCHR-9", 11)).rejects.toThrow(/10 characters/);
+      await expect(getDoc(ops, "BUTCHR-9", 11, undefined, 1)).rejects.toThrow(/10 characters/);
     });
     test("negative offset refuses", async () => {
       const { ops, addIssue, seedIssueDoc } = makeWorld();
@@ -331,7 +331,7 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
       const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-120", "doc");
       seedIssueDoc("BUTCHR-120", "909", "doc", "0123456789");
-      await expect(getDoc(ops, "BUTCHR-120", 0, 0)).rejects.toThrow(/positive integer/);
+      await expect(getDoc(ops, "BUTCHR-120", 0, 0, 1)).rejects.toThrow(/positive integer/);
       await expect(getDoc(ops, "BUTCHR-120", 0, -5)).rejects.toThrow(/positive integer/);
     });
     test("non-integer limit refuses", async () => {
@@ -341,6 +341,85 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
       await expect(getDoc(ops, "BUTCHR-130", 0, 2.5)).rejects.toThrow(/positive integer/);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // BUTCHR-230 review: version drift across a multi-call read. The hazard is
+  // the mirror of the one `body`-only-when-`complete` closes — there a caller
+  // writes back TOO LITTLE, here it writes back a body that never existed at
+  // any point in time. Both end at `set_doc`, a full-body replace. Closed the
+  // same way: the bad state is made unreachable, not documented.
+  describe("version drift (BUTCHR-230 review)", () => {
+    test("THE RULE IS IN THE WARNING ITSELF — a partial tells the caller to pin expectVersion and to discard-and-restart on drift", async () => {
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
+      addIssue("BUTCHR-40", "big doc");
+      seedIssueDoc("BUTCHR-40", "940", "big doc", "x".repeat(100));
+      const r: any = await getDoc(ops, "BUTCHR-40", 0, 10);
+      expect(r.complete).toBe(false);
+      // Would fail if a later edit drops the rule from the warning text — which
+      // is the whole reason this asserts on prose rather than trusting it.
+      expect(r.warning).toMatch(/expectVersion/);
+      expect(r.warning).toMatch(/REQUIRED on every call with offset > 0/);
+      expect(r.warning).toMatch(/NEVER concatenate chunks that came from different versions/);
+      expect(r.warning).toMatch(/DISCARD every chunk/i);
+      expect(r.warning).toMatch(/restart from offset 0/i);
+    });
+
+    test("expectVersion is REQUIRED once offset > 0 — the splice is unrepresentable, not merely discouraged", async () => {
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
+      addIssue("BUTCHR-41", "big doc");
+      seedIssueDoc("BUTCHR-41", "941", "big doc", "x".repeat(100));
+      await expect(getDoc(ops, "BUTCHR-41", 10, 10)).rejects.toThrow(/expectVersion is required when offset > 0/);
+      // offset 0 still needs nothing: a first slice has no earlier version to agree with.
+      await expect(getDoc(ops, "BUTCHR-41", 0, 10)).resolves.toBeDefined();
+    });
+
+    test("a page edited mid-read REFUSES the continuation instead of splicing two versions", async () => {
+      const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
+      addIssue("BUTCHR-42", "edited doc");
+      seedIssueDoc("BUTCHR-42", "942", "edited doc", "x".repeat(100), 3);
+      const first: any = await getDoc(ops, "BUTCHR-42", 0, 10);
+      expect(first.version).toBe(3);
+      // somebody writes the page between slice 1 and slice 2
+      pages.set("942", { ...pages.get("942")!, body: "y".repeat(100), version: 4 });
+      await expect(getDoc(ops, "BUTCHR-42", first.next.offset, 10, first.version)).rejects.toThrow(/changed mid-read/);
+      await expect(getDoc(ops, "BUTCHR-42", first.next.offset, 10, first.version)).rejects.toThrow(/restart from offset 0/);
+    });
+
+    test("an UNVERIFIABLE pin refuses too — a version that could not be read is not a satisfied pin", async () => {
+      const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
+      addIssue("BUTCHR-43", "versionless doc");
+      seedIssueDoc("BUTCHR-43", "943", "versionless doc", "x".repeat(100));
+      pages.set("943", { ...pages.get("943")!, version: undefined as any });
+      await expect(getDoc(ops, "BUTCHR-43", 10, 10, 1)).rejects.toThrow(/unverifiable/);
+    });
+
+    test("a matching pin reads through, and the full paginated round trip still reconstructs exactly", async () => {
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
+      const body = "a—b—c—d—e—f—g—h—i—j";
+      addIssue("BUTCHR-44", "pinned doc");
+      seedIssueDoc("BUTCHR-44", "944", "pinned doc", body, 9);
+      const first: any = await getDoc(ops, "BUTCHR-44", 0, 5);
+      expect(first.version).toBe(9);
+      let offset = first.next.offset, out = first.chunk, guard = 0;
+      for (;;) {
+        const r: any = await getDoc(ops, "BUTCHR-44", offset, 5, first.version);
+        out += r.chunk;
+        if (!r.next) break;
+        offset = r.next.offset;
+        if (++guard > 20) throw new Error("pagination did not terminate");
+      }
+      expect(out).toBe(body);
+    });
+
+    test("expectVersion shape is validated: non-integer and non-positive refuse", async () => {
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
+      addIssue("BUTCHR-45", "doc");
+      seedIssueDoc("BUTCHR-45", "945", "doc", "x".repeat(100));
+      await expect(getDoc(ops, "BUTCHR-45", 10, 10, 2.5)).rejects.toThrow(/expectVersion must be a positive integer/);
+      await expect(getDoc(ops, "BUTCHR-45", 10, 10, 0)).rejects.toThrow(/expectVersion must be a positive integer/);
+    });
+  });
+
 });
 
 describe("docs.ts: ensureDoc — lazy nested creation", () => {
@@ -731,7 +810,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
     let reconstructed = "";
     let calls = 0;
     for (;;) {
-      const result = await getProjectDoc(ops, "CATA", offset, 5);
+      const result = await getProjectDoc(ops, "CATA", offset, 5, offset === 0 ? undefined : 1);
       calls++;
       if (result.found && result.complete) {
         reconstructed += result.body;
@@ -763,7 +842,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
     let offset = first.next!.offset;
     let reconstructed = first.chunk;
     for (;;) {
-      const result = await getProjectDoc(ops, "CATA", offset, 3);
+      const result = await getProjectDoc(ops, "CATA", offset, 3, offset === 0 ? undefined : 1);
       if (result.found && result.complete) {
         reconstructed += result.body;
         break;
@@ -778,7 +857,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
     // The OTHER nudge direction: a limit of 1 starting exactly AT the high
     // surrogate would shrink to a zero-length slice — nudged FORWARD past
     // the whole pair instead.
-    const atPairStart = await getProjectDoc(ops, "CATA", 2, 1);
+    const atPairStart = await getProjectDoc(ops, "CATA", 2, 1, 1);
     if (!atPairStart.found || atPairStart.complete) throw new Error("expected a partial result");
     expect(atPairStart.chunk).toBe("\u{1F600}");
     expect(atPairStart.slice.chars).toBe(2);
@@ -801,7 +880,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
     const body = "0123456789";
     seedRootDoc(pages, "955", "root doc", body);
     setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "955" } });
-    const result = await getProjectDoc(ops, "CATA", 10, 5);
+    const result = await getProjectDoc(ops, "CATA", 10, 5, 1);
     expect(result).toMatchObject({ found: true, complete: false, slice: { offset: 10, chars: 0 }, chunk: "" });
     if (!result.found || result.complete) throw new Error("unreachable");
     expect(result.next).toBeUndefined();
@@ -813,7 +892,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
       const { ops, pages, setProjectProperty } = makeWorld();
       seedRootDoc(pages, "956", "root doc", "0123456789");
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "956" } });
-      await expect(getProjectDoc(ops, "CATA", 11)).rejects.toThrow(/10 characters/);
+      await expect(getProjectDoc(ops, "CATA", 11, undefined, 1)).rejects.toThrow(/10 characters/);
     });
     test("negative offset refuses", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
@@ -831,7 +910,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
       const { ops, pages, setProjectProperty } = makeWorld();
       seedRootDoc(pages, "959", "root doc", "0123456789");
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "959" } });
-      await expect(getProjectDoc(ops, "CATA", 0, 0)).rejects.toThrow(/positive integer/);
+      await expect(getProjectDoc(ops, "CATA", 0, 0, 1)).rejects.toThrow(/positive integer/);
     });
     test("non-integer limit refuses", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
@@ -840,6 +919,85 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
       await expect(getProjectDoc(ops, "CATA", 0, 2.5)).rejects.toThrow(/positive integer/);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // BUTCHR-230 review: version drift across a multi-call read. The hazard is
+  // the mirror of the one `body`-only-when-`complete` closes — there a caller
+  // writes back TOO LITTLE, here it writes back a body that never existed at
+  // any point in time. Both end at `set_doc`, a full-body replace. Closed the
+  // same way: the bad state is made unreachable, not documented.
+  describe("version drift (BUTCHR-230 review)", () => {
+    test("THE RULE IS IN THE WARNING ITSELF — a partial tells the caller to pin expectVersion and to discard-and-restart on drift", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      pages.set("940", { parentId: "", title: "big doc", body: "x".repeat(100), labels: [], version: 1 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "940" } });
+      const r: any = await getProjectDoc(ops, "CATA", 0, 10);
+      expect(r.complete).toBe(false);
+      // Would fail if a later edit drops the rule from the warning text — which
+      // is the whole reason this asserts on prose rather than trusting it.
+      expect(r.warning).toMatch(/expectVersion/);
+      expect(r.warning).toMatch(/REQUIRED on every call with offset > 0/);
+      expect(r.warning).toMatch(/NEVER concatenate chunks that came from different versions/);
+      expect(r.warning).toMatch(/DISCARD every chunk/i);
+      expect(r.warning).toMatch(/restart from offset 0/i);
+    });
+
+    test("expectVersion is REQUIRED once offset > 0 — the splice is unrepresentable, not merely discouraged", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      pages.set("941", { parentId: "", title: "big doc", body: "x".repeat(100), labels: [], version: 1 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "941" } });
+      await expect(getProjectDoc(ops, "CATA", 10, 10)).rejects.toThrow(/expectVersion is required when offset > 0/);
+      // offset 0 still needs nothing: a first slice has no earlier version to agree with.
+      await expect(getProjectDoc(ops, "CATA", 0, 10)).resolves.toBeDefined();
+    });
+
+    test("a page edited mid-read REFUSES the continuation instead of splicing two versions", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      pages.set("942", { parentId: "", title: "edited doc", body: "x".repeat(100), labels: [], version: 3 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "942" } });
+      const first: any = await getProjectDoc(ops, "CATA", 0, 10);
+      expect(first.version).toBe(3);
+      // somebody writes the page between slice 1 and slice 2
+      pages.set("942", { ...pages.get("942")!, body: "y".repeat(100), version: 4 });
+      await expect(getProjectDoc(ops, "CATA", first.next.offset, 10, first.version)).rejects.toThrow(/changed mid-read/);
+      await expect(getProjectDoc(ops, "CATA", first.next.offset, 10, first.version)).rejects.toThrow(/restart from offset 0/);
+    });
+
+    test("an UNVERIFIABLE pin refuses too — a version that could not be read is not a satisfied pin", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      pages.set("943", { parentId: "", title: "versionless doc", body: "x".repeat(100), labels: [], version: 1 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "943" } });
+      pages.set("943", { ...pages.get("943")!, version: undefined as any });
+      await expect(getProjectDoc(ops, "CATA", 10, 10, 1)).rejects.toThrow(/unverifiable/);
+    });
+
+    test("a matching pin reads through, and the full paginated round trip still reconstructs exactly", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      const body = "a—b—c—d—e—f—g—h—i—j";
+      pages.set("944", { parentId: "", title: "pinned doc", body, labels: [], version: 9 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "944" } });
+      const first: any = await getProjectDoc(ops, "CATA", 0, 5);
+      expect(first.version).toBe(9);
+      let offset = first.next.offset, out = first.chunk, guard = 0;
+      for (;;) {
+        const r: any = await getProjectDoc(ops, "CATA", offset, 5, first.version);
+        out += r.chunk;
+        if (!r.next) break;
+        offset = r.next.offset;
+        if (++guard > 20) throw new Error("pagination did not terminate");
+      }
+      expect(out).toBe(body);
+    });
+
+    test("expectVersion shape is validated: non-integer and non-positive refuse", async () => {
+      const { ops, pages, setProjectProperty } = makeWorld();
+      pages.set("945", { parentId: "", title: "doc", body: "x".repeat(100), labels: [], version: 1 });
+      setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "945" } });
+      await expect(getProjectDoc(ops, "CATA", 10, 10, 2.5)).rejects.toThrow(/expectVersion must be a positive integer/);
+      await expect(getProjectDoc(ops, "CATA", 10, 10, 0)).rejects.toThrow(/expectVersion must be a positive integer/);
+    });
+  });
+
 });
 
 // ---------------------------------------------------------------------------

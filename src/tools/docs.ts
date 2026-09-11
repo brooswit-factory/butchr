@@ -411,7 +411,11 @@ export type GetDocResult =
  * structural and can't be missed the way prose can.
  */
 const PARTIAL_READ_WARNING =
-  "This is a PARTIAL read, not the whole document: `body` is deliberately absent so this result can never be mistaken for the whole page and fed to set_doc as a full-body replace. Call get_doc again with the SAME key and offset=<next.offset> until `next` is absent, then concatenate every `chunk` in offset order to reconstruct the full body.";
+  "This is a PARTIAL read, not the whole document: `body` is deliberately absent so this result can never be mistaken for the whole page and fed to set_doc as a full-body replace. " +
+  "TO READ THE REST: call get_doc again with the SAME key, offset=<next.offset>, AND expectVersion=<the `version` of THIS result>, until `next` is absent; then concatenate every `chunk` in offset order. " +
+  "expectVersion IS REQUIRED on every call with offset > 0 and it is not bookkeeping: if the page is edited mid-read, the call REFUSES rather than handing you a slice from a different version. " +
+  "NEVER concatenate chunks that came from different versions — the result would be a body that never existed at any point in time, and feeding that to set_doc (a full-body replace) destroys the real page just as surely as a truncated body would. " +
+  "If a call refuses for version drift, DISCARD every chunk you have collected and restart from offset 0.";
 
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
@@ -488,7 +492,28 @@ function buildGetDocResult(who: string, doc: VersionedDocResult, offset: number,
 }
 
 /** Validates `offset`/`limit` SHAPE only (integer-ness, sign) — everything that needs the body's actual length (offset past the end) is `buildGetDocResult`'s job, since the body isn't fetched yet when this runs. */
-function validateRange(who: string, offset: number | undefined, limit: number | undefined): { offset: number; limit: number } {
+/**
+ * Validates `offset`/`limit` SHAPE only (integer-ness, sign), plus the ONE
+ * cross-argument rule that makes a spliced read unrepresentable rather than
+ * merely discouraged (BUTCHR-230 review): **`expectVersion` is REQUIRED
+ * whenever `offset > 0`.**
+ *
+ * Why a refusal rather than an instruction. `set_doc` is a full-body replace
+ * and the taught workflow is "read, edit, write the whole thing back." A
+ * document edited between two slices of one paginated read yields a
+ * concatenation that never existed at any point in time — and handing THAT to
+ * `set_doc` destroys the real page exactly as thoroughly as the truncated
+ * `body` this design already made unrepresentable, while being much harder to
+ * notice. Telling callers to compare `version` themselves is prose, and prose
+ * is what this whole contract exists to stop relying on.
+ *
+ * Costs nothing in compatibility: `offset` did not exist before this change,
+ * so no caller can already be passing one without a version.
+ *
+ * The version equality check itself needs the page, so it lives in
+ * `assertVersionMatches`, called once the read has happened.
+ */
+function validateRange(who: string, offset: number | undefined, limit: number | undefined, expectVersion: number | undefined): { offset: number; limit: number; expectVersion?: number } {
   const o = offset ?? 0;
   if (!Number.isInteger(o) || o < 0) {
     throw new Error(`${who}: offset must be a non-negative integer — got ${JSON.stringify(offset)}`);
@@ -497,7 +522,34 @@ function validateRange(who: string, offset: number | undefined, limit: number | 
   if (!Number.isInteger(l) || l < 1) {
     throw new Error(`${who}: limit must be a positive integer — got ${JSON.stringify(limit)}`);
   }
-  return { offset: o, limit: l };
+  if (expectVersion !== undefined && (!Number.isInteger(expectVersion) || expectVersion < 1)) {
+    throw new Error(`${who}: expectVersion must be a positive integer — got ${JSON.stringify(expectVersion)}`);
+  }
+  if (o > 0 && expectVersion === undefined) {
+    throw new Error(
+      `${who}: expectVersion is required when offset > 0 — pass the \`version\` from the first slice of this read, so a mid-read edit REFUSES instead of silently splicing two versions into a body that never existed. Start again at offset 0 if you no longer have it.`,
+    );
+  }
+  return { offset: o, limit: l, ...(expectVersion !== undefined ? { expectVersion } : {}) };
+}
+
+/**
+ * The version gate itself (BUTCHR-230 review). Refuses rather than guessing in
+ * BOTH failure directions: a version that differs from the caller's, and a page
+ * whose version could not be read at all — an unverifiable pin is not a
+ * satisfied pin, and silently accepting one would reopen the exact hole
+ * `expectVersion` exists to close.
+ */
+function assertVersionMatches(who: string, doc: VersionedDocResult, expectVersion: number | undefined): void {
+  if (expectVersion === undefined) return;
+  if (doc.version === null) {
+    throw new Error(`${who}: cannot honour expectVersion=${expectVersion} — this page read carried no version, so the pin is unverifiable. Refusing rather than assuming the document did not change under a multi-call read.`);
+  }
+  if (doc.version !== expectVersion) {
+    throw new Error(
+      `${who}: the document changed mid-read — you pinned expectVersion=${expectVersion} but "${doc.title || doc.id}" is now version ${doc.version}. DISCARD every chunk collected so far and restart from offset 0; concatenating across versions would produce a body that never existed.`,
+    );
+  }
 }
 
 /** `chars` is string length (UTF-16 code units, i.e. what `.length` reports); `bytes` is UTF-8 byte length — carried separately because the incident this contract exists to fix reported "characters" while naming a "token" limit, and this project has already paid once for that unit ambiguity. */
@@ -617,11 +669,13 @@ async function readLinkedPage(ops: AtlassianOps, key: string): Promise<Versioned
  * the grep) that only ever use the returned `id`, never the body, and
  * bounding it there would slice bodies for callers that never asked.
  */
-export async function getDoc(ops: AtlassianOps, key: string, offset?: number, limit?: number): Promise<GetDocResult> {
+export async function getDoc(ops: AtlassianOps, key: string, offset?: number, limit?: number, expectVersion?: number): Promise<GetDocResult> {
   assertValidKey(key, "get_doc");
-  const { offset: o, limit: l } = validateRange("get_doc", offset, limit);
+  const { offset: o, limit: l, expectVersion: v } = validateRange("get_doc", offset, limit, expectVersion);
   const doc = await readLinkedPage(ops, key);
-  return doc ? buildGetDocResult("get_doc", doc, o, l) : { found: false };
+  if (!doc) return { found: false };
+  assertVersionMatches("get_doc", doc, v);
+  return buildGetDocResult("get_doc", doc, o, l);
 }
 
 /**
@@ -667,9 +721,10 @@ export async function projectRootDoc(ops: AtlassianOps, projectKey: string): Pro
  * ROOT DOC IS THE LARGEST DOCUMENT ON THIS SURFACE and the reason this
  * bound exists at all — this dispatch branch is not an afterthought.
  */
-export async function getProjectDoc(ops: AtlassianOps, projectKey: string, offset?: number, limit?: number): Promise<GetDocResult> {
-  const { offset: o, limit: l } = validateRange("get_doc", offset, limit);
+export async function getProjectDoc(ops: AtlassianOps, projectKey: string, offset?: number, limit?: number, expectVersion?: number): Promise<GetDocResult> {
+  const { offset: o, limit: l, expectVersion: v } = validateRange("get_doc", offset, limit, expectVersion);
   const doc = await projectRootDoc(ops, projectKey);
+  assertVersionMatches("get_doc", doc, v);
   return buildGetDocResult("get_doc", doc, o, l);
 }
 
