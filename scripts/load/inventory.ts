@@ -36,6 +36,11 @@ export const RUNS_ON_IMPORT = new Set([
   // `dist/`) — importing it must not actually run all that as a side effect
   // of a "does this load" check.
   "scripts/build/build.ts",
+  // BUTCHR-268: calls main() unconditionally at import time — real herdr I/O
+  // (agent.list, workspace.list/create/close, agent.start, pane.close), and
+  // with no `argv[2]` under `bun test` its default mode runs the full `gaps`
+  // sweep. Importing it during `bun test` must not do any of that.
+  "scripts/repro-pane-busy.ts",
 ]);
 
 export function loadTestSource(file: string): string {

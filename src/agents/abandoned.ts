@@ -82,21 +82,32 @@ export const MARKER = "[butchr:abandoned]";
  * module) — enforce where there is an exit, make audible where there is
  * not. This module is the audible half.
  *
- * In practice this rarely bites on the label itself: `IssueLink`'s hydrated
- * field set (`issuetype, priority, status, summary` — MEASURED, BUTCHR-192)
- * never includes `labels`, so this predicate could not see `butchr:shelved`
- * on the boss even if it wanted to. It reads the WORKER's own labels (which
- * `issues` already carries in full), not the boss's — but a shelved worker
- * is, by `shelve_worker`'s own contract, moved to To Do, which is outside
- * `ISSUE_JQL` and therefore outside this detector's candidate set entirely
- * (see the `KNOWN LIMITATION` on `abandonedCandidates` below). The no-
- * exemption decision is recorded and tested here anyway, deliberately,
- * for the anomalous case a worker reaches this detector's candidate set
- * (In Progress/In Review) while still carrying a stale `butchr:shelved`
- * label — e.g. a labelling bug, or a hand-added label that was never
- * withdrawn — so a future reader does not have to re-derive the decision
- * from first principles, and so a future change to `shelve_worker`'s own
- * status contract does not silently resurrect the exemption question.
+ * `IssueLink`'s hydrated field set (`issuetype, priority, status, summary` —
+ * MEASURED, BUTCHR-192) never includes `labels`, so this predicate could
+ * never see `butchr:shelved` on the boss even if it wanted to. It reads the
+ * WORKER's own labels (which `issues` already carries in full), not the
+ * boss's.
+ *
+ * BEFORE BUTCHR-240, that worker-label read was where this decision mostly
+ * stopped mattering in practice: a shelved worker is, by `shelve_worker`'s
+ * own contract, moved to To Do, which was outside `ISSUE_JQL` and therefore
+ * outside this detector's candidate set entirely — so the no-exemption
+ * decision only ever bit on an anomalous case (a stale `butchr:shelved`
+ * label surviving on an In Progress/In Review worker, e.g. a labelling bug
+ * or a hand-added label that was never withdrawn).
+ *
+ * BUTCHR-240 changed that at the INPUT layer, not this predicate: a second
+ * JQL search (`TODO_WORKER_JQL`, src/resources/issue.ts) now feeds this
+ * daemon's own To Do workers into `check()`'s candidate list, concatenated
+ * with `issues` BEFORE `abandonedCandidates` ever runs (see the `FORMER
+ * KNOWN LIMITATION` on `abandonedCandidates` below). The worker's own
+ * labels are therefore now reachable in To Do too, not only In Progress/In
+ * Review, and a shelved worker moved to To Do is no longer outside this
+ * detector's candidate set — it is an ORDINARY candidate. The anomalous
+ * case this decision was originally written for is no longer the only one
+ * it bites on. The no-exemption decision itself does not change (see
+ * above) — the new facts are stronger support for it, not weaker, since a
+ * worker shelved under a Done boss can never be reactivated by anyone.
  */
 
 export interface AbandonedCandidate {
@@ -128,24 +139,32 @@ export interface AbandonedCandidate {
  * independently: a worker with one Done boss-link and one live boss-link
  * IS a candidate for the Done one, regardless of the live one.
  *
- * KNOWN LIMITATION, stated rather than silently accepted, and the ARCHETYPE
- * of this whole failure family, not its low-value remainder: `ISSUE_JQL`
- * (`status IN ("In Progress", "In Review")`, `assignee = currentUser()`)
- * means a To Do worker under a Done boss is INVISIBLE here — it is in
- * neither `issues` nor (since `related` is not even consulted) anywhere
- * else this module looks. `parked.ts` cannot see it either (it requires the
- * boss to be In Progress), and the orphan machinery cannot see it (the link
- * is intact). "Inert" — nothing burning, nothing complaining — is why this
- * is WORSE than the covered (In Progress/In Review) population, not better:
- * a live worker at least has a running agent and a pane a person can
- * notice; a To Do one is silent forever. BUTCHR-13 exists because BUTCHR-1
- * closed leaving four stories stranded exactly this way. This module
- * deliberately does NOT cover it (`ISSUE_JQL` is shared by every consumer
- * of the poll — widening it is far out of scope here), and deliberately
- * leaves no dead configuration or hooks aimed at it (`parked.ts`'s own
- * precedent for an out-of-scope adjacent state). The concrete cost of
- * covering it is reported separately, non-blocking, in this ticket's PR
- * body / a report to BUTCHR-192 — not built here.
+ * FORMER KNOWN LIMITATION, closed by BUTCHR-240 at the INPUT layer, not
+ * here: `ISSUE_JQL` (`status IN ("In Progress", "In Review")`, `assignee =
+ * currentUser()`) means a To Do worker under a Done boss is invisible to
+ * `issues` alone — it is in neither `issues` nor (since `related` is not
+ * even consulted) anywhere else this predicate looks. `parked.ts` cannot see
+ * it either (it requires the boss to be In Progress), and the orphan
+ * machinery cannot see it (the link is intact). "Inert" — nothing burning,
+ * nothing complaining — is why this was WORSE than the covered (In
+ * Progress/In Review) population, not better: a live worker at least has a
+ * running agent and a pane a person can notice; a To Do one is silent
+ * forever. BUTCHR-13 exists because BUTCHR-1 closed leaving four stories
+ * stranded exactly this way.
+ *
+ * This predicate itself needed NO widening to close the gap — it was already
+ * total over "any To Do worker with a Done inward Implements stub", proven
+ * by the tests below carrying a `"To Do"` worker status. The blindness was
+ * entirely that a To Do worker never reached this function's `issues`
+ * argument in the first place (`ISSUE_JQL` never returns one, and widening
+ * `ISSUE_JQL` itself is deliberately out of scope — it is the fleet's ACTIVE
+ * SET, read by spawning/stall detection/labels/reconcile, not just this
+ * detector). `createAbandonedDetector`'s optional `todoWorkers` dep (below)
+ * is what actually closes it: a second, narrower JQL search
+ * (`TODO_WORKER_JQL`, src/resources/issue.ts), concatenated with `issues`
+ * BEFORE this pure predicate ever runs — so the predicate stays exactly as
+ * total and I/O-free as it always was, and the network call lives entirely
+ * outside it.
  *
  * SECOND KNOWN LIMITATION, same class as `parked.ts`'s own: a worker
  * staffed by a DIFFERENT credential (a different daemon/machine) never
@@ -326,6 +345,32 @@ export interface AbandonedDetectorDeps {
   comments: (issue: string) => Promise<readonly CommentRow[]>;
   /** A ticket's issue links — called ONLY at stage 3, to resolve the boss's own boss (inward Implements). The one extra Jira call in this whole feature, same as `parked.ts`. */
   links: (issue: string) => Promise<readonly IssueLink[]>;
+  /**
+   * BUTCHR-240: an extra fetch for To Do workers this daemon's credential
+   * owns — see `abandonedCandidates`'s "FORMER KNOWN LIMITATION" doc comment
+   * above for the gap this closes. Optional and OFF by default (omitted,
+   * `check` runs exactly as it always did, over `issues` alone) so the
+   * detector stays unit-testable without a live Jira and every existing
+   * caller/test is unaffected. Wired in production from
+   * `createTodoWorkersFetch` (src/resources/issue.ts), a single
+   * `deps.search(TODO_WORKER_JQL)` call — the house pattern `createRelated`
+   * (same file) already uses for a batched extra query.
+   *
+   * Deliberately a fetch SEAM, not a widening of `abandonedCandidates`
+   * itself: the pure predicate must never gain a network call, so this
+   * result is concatenated with `issues` here, in `check`, before the
+   * predicate ever runs. Called once per poll, unconditionally when wired
+   * (not merely once stage 1 is already reached) — the whole point is
+   * making a to-do worker's abandonment observable from `firstObservedAt`
+   * onward, the same as an In Progress/In Review one already is.
+   *
+   * FAIL OPEN: a rejection here must never take down the rest of this poll's
+   * detection — `check` catches it itself (not this module's OUTER
+   * try/catch, which would otherwise also skip the already-working In
+   * Progress/In Review coverage over `issues`) and proceeds with `issues`
+   * alone, logging a WARNING.
+   */
+  todoWorkers?: () => Promise<readonly JiraIssue[]>;
   log?: (line: string) => void;
 }
 
@@ -421,7 +466,25 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
 
   async function check(issues: readonly JiraIssue[]): Promise<void> {
     try {
-      const candidates = abandonedCandidates(issues);
+      // BUTCHR-240: fetch-stage failure handled HERE, deliberately not left
+      // to the outer try/catch below — a rejection reaching that catch would
+      // skip candidate detection over `issues` too, silently taking down the
+      // In Progress/In Review coverage that already works over a mere
+      // hiccup in this brand-new query. Fail OPEN on the query itself
+      // (proceed with `issues` alone) — the opposite direction from, and not
+      // in tension with, the detector's existing fail-CLOSED rule for an
+      // unknown status on a link stub (see `abandonedCandidates`'s own doc
+      // comment): one is "can't reach the query, so don't lose what already
+      // works"; the other is "can't confirm Done, so don't claim it".
+      let allIssues = issues;
+      if (deps.todoWorkers) {
+        const todo = await deps.todoWorkers().catch((e) => {
+          log(`WARNING: [abandoned] todoWorkers fetch failed: ${(e as Error)?.message ?? e}`);
+          return null;
+        });
+        if (todo !== null) allIssues = [...issues, ...todo];
+      }
+      const candidates = abandonedCandidates(allIssues);
       tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.worker.key, c.boss))));
 
       for (const { worker, boss } of candidates) {
