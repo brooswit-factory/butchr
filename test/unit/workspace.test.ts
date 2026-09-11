@@ -16,6 +16,20 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("project")).toContain("You own a **product**, not a ticket");
     expect(briefFor("Project")).toBe(briefFor("project")); // same case-insensitivity every other entry gets
   });
+  // BUTCHR-318: project.md must name its inbound surfaces precisely (root
+  // doc comments, plus In-Review epics' ticket comments), say an In
+  // Progress epic cannot reach it, say it hears a running epic only on its
+  // own initiative, and correct the misconception (BUTCHR-277's own doc
+  // asserted this wrongly) that an epic's report_to_boss lands on the root doc.
+  test("project brief names its inbound surfaces precisely and corrects the report_to_boss-lands-on-root-doc misconception", () => {
+    const brief = briefFor("project");
+    expect(brief).toContain("Name your inbound surfaces precisely");
+    expect(brief).toContain("the ticket comments of any epic");
+    expect(brief).toContain("In Progress is not in that result set");
+    expect(brief).toContain("it cannot reach you this way");
+    expect(brief).toContain("You hear a running epic only by reading its ticket yourself");
+    expect(brief).toContain("the epic's own ticket, never on your root doc");
+  });
   test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
@@ -187,6 +201,30 @@ describe("briefFor / modelFor", () => {
     const brief = briefFor("Epic");
     expect(brief).toContain("ask_boss");
     expect(brief).toContain("too vague to decompose");
+  });
+  // BUTCHR-318: an epic's boss is a project, which reads the epic's ticket
+  // comments only while the epic is In Review — the too-vague-to-decompose
+  // ask_boss call above happens while the epic is still In Progress, so
+  // epic.md must say plainly that nothing automated is reading it yet.
+  test("epic brief's too-vague-to-decompose passage states ask_boss is unread while the epic is still In Progress", () => {
+    const brief = briefFor("Epic");
+    expect(brief).toContain("if you do have a project boss, it");
+    expect(brief).toContain("reads your ticket's comments only while you are In Review");
+    expect(brief).toContain("nothing automated is reading it at");
+  });
+  // BUTCHR-318: the blocked-dialog escalation passage must state the
+  // Epic→Project conditionality (an In Progress epic's report_to_boss wakes
+  // nobody) and must say submit_to_boss is not a doorbell, plus what an
+  // In Progress epic should do instead (escalate to a human immediately).
+  test("epic brief's blocked-dialog section states the Epic→Project conditionality and that submit_to_boss is not a doorbell", () => {
+    const brief = briefFor("Epic");
+    expect(brief).toContain("your boss is a");
+    expect(brief).toContain("project, and a project reads an epic's ticket comments only while that epic");
+    expect(brief).toContain("is In Review");
+    expect(brief).toContain('it does NOT "escalate to');
+    expect(brief).toContain("whoever watches you\" the way the same call genuinely does for a Story or a");
+    expect(brief).toContain("`submit_to_boss` is not a doorbell.");
+    expect(brief).toContain("escalate to a human immediately");
   });
   // BUTCHR-42: GAP 2 — jira_get_issue, jira_search, jira_add_comment,
   // confluence_search_pages and confluence_list_spaces are retained
