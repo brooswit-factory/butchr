@@ -48,11 +48,49 @@ import type { results } from "@brooswit/herdr-sdk";
  * in the fleet — a rejection that fires with nothing to collide with is
  * not evidence something was there to collide with. DO NOT READ INTENT
  * INTO AN ERROR STRING: it says what the callee refused, not what the
- * callee knew. This module's design does not depend on the falsifier
- * landing either way — a cwd string and a `pane.processInfo` process-table
- * read cannot themselves be projections of an agent registry, which is
- * what makes them independent regardless of the answer — but a caller
- * should not repeat the withdrawn inference as if it were still standing.
+ * callee knew.
+ *
+ * THIS IS TWO SEPARATE QUESTIONS, NOT ONE — CONFLATING THEM OVERSTATES
+ * WHAT THIS MODULE CLOSES (review finding, PR #297 round 1):
+ *   1. Can `pane.processInfo`'s VERDICT about a given pane be a projection
+ *      of the agent registry? No — it is a process-table read, and this
+ *      codebase already trusts it as the reaper's own decisive layer. This
+ *      half is genuinely independent of `agent.list()`, regardless of how
+ *      question 2 lands.
+ *   2. Can `pane.list()` fail to ENUMERATE a pane that exists — go blind
+ *      the way `agent.list()` demonstrably did? UNVERIFIED, and THIS
+ *      GUARD'S COLD-START COVERAGE DEPENDS ON THE ANSWER. If `pane.list()`
+ *      returns successfully but omits a live issue's panes, `panesFor`
+ *      returns `[]`, `aggregateVerdict([])` returns `"vacant"` BY DESIGN
+ *      (correctly — see that function's own doc comment: a pre-first-spawn
+ *      issue must read vacant, or this guard would withhold every issue's
+ *      very first spawn), and the guard spawns. THE ORIGINAL DEFECT
+ *      REPRODUCES — silently, because `"vacant"` is a confident answer,
+ *      never an `"unknown"` the fleet-wide branch (residency-guard.ts)
+ *      could withhold on.
+ *
+ * SO: this guard closes the cold-start case PROVIDED `pane.list()` still
+ * enumerates panes when `agent.list()` is blind. That precondition is
+ * unverified. If herdr's pane enumeration goes blind at the same instant
+ * as its agent registry, every affected candidate reads `"vacant"` and
+ * this guard degrades SILENTLY to today's behaviour rather than failing
+ * loudly — the "looks complete and is not" failure this ticket exists to
+ * avoid, now stated rather than glossed over. Closing THAT case would need
+ * either a herdr-side signal distinguishing "no panes here" from "cannot
+ * enumerate panes right now", or a residency source outside herdr
+ * entirely — this module does not attempt either.
+ *
+ * THE ASYMMETRY THIS CREATES, RESOLVED DELIBERATELY: `HerdrHerd.residentIssues()`
+ * (herd.ts) THROWS rather than returning `[]` on a `pane.list()` failure —
+ * its own doc comment names why: a bare `[]` would be indistinguishable
+ * from "genuinely nothing is resident," the same confident-zero hazard
+ * this whole ticket exists to close. `HerdrHerd.residency(candidates)`
+ * resolves the identical hazard the OTHER way, on purpose: a caught
+ * `pane.list()` failure there reports every candidate `"unknown"`, not
+ * `[]`/vacant, so residency-guard.ts's fleet-wide branch can still
+ * withhold on it. Both are correct for what they promise; neither one
+ * closes the gap above, which is about `pane.list()` SUCCEEDING with an
+ * incomplete answer, not about it failing outright.
  */
 
 export type PaneVerdict = "live" | "dead" | "unknown";
