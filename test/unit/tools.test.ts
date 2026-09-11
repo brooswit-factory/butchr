@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
+import { OUTCOME_TAG } from "../../src/tools/outcome.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -95,7 +96,15 @@ describe("atlassianTools", () => {
     expect(calls[6]![0]).toBe("linkIssues");
     expect(calls[6]![1]).toEqual(["KAN-2", "KAN-9", "Implements"]);               // the explicit jira_link_issues call; default type applied
     expect(audits.every((a) => a.includes("KAN-7"))).toBe(true);
-    expect(audits.length).toBe(12);
+    // BUTCHR-341: each of the 12 calls above now produces TWO lines on this
+    // same `log` stream — the pre-existing `[tools]` line (unchanged, fires
+    // before the verb runs) AND a NEW `[tools2]` outcome record (fires after
+    // it resolves) — see src/tools/outcome.ts's own doc comment for why both
+    // are kept. 12 calls × 2 lines = 24.
+    expect(audits.length).toBe(24);
+    expect(audits.filter((a) => a.startsWith("  [tools] ")).length).toBe(12);
+    expect(audits.filter((a) => a.includes(OUTCOME_TAG)).length).toBe(12);
+    expect(audits.filter((a) => a.includes(OUTCOME_TAG))).toSatisfy((lines: string[]) => lines.every((l) => l.includes("outcome=ok")));
   });
   test("search defaults maxResults when omitted", async () => {
     const { tools, calls, conn } = rig();
