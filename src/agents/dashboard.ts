@@ -46,6 +46,7 @@
 import { isProjectId } from "../resources/id.js";
 import { issueOfAgentName } from "./herd.js";
 import { StatusFloorTracker, type StatusFloor } from "./status-floor.js";
+import type { AdmissionCensus } from "./admission.js";
 
 /** The name this endpoint registers itself under in the shared coverage tracker (src/daemon/coverage.ts) — see this module's own header for why the recordChecked/recordDeclined calls themselves live in src/daemon/index.ts instead. */
 export const DASHBOARD_DETECTOR = "dashboard";
@@ -100,17 +101,53 @@ export interface AgentDashboardRow {
 }
 
 /**
- * A type ALIAS, not an interface, on purpose: today `AgentDashboardRow` is
- * the only member, but writing this as a union (of one, for now) rather than
- * an interface means BUTCHR-288 adding `AgentDashboardRow | WithheldDashboardRow`
- * later is a pure addition to this line — `AgentDashboardRow` itself never
- * changes shape, and existing code that already narrows on `kind` (or never
- * needed to, because only one kind existed) keeps compiling. Consumers
- * should still match on `row.kind` rather than assuming `AgentDashboardRow`
- * is the only possibility, so that a future second member is a compile-time
- * prompt to handle it, not a silent gap.
+ * BUTCHR-332: one row per ticket the fleet-wide admission cap is currently
+ * withholding (src/agents/admission.ts) — a `resourceKey` and `tier`, same
+ * semantics as an agent row, but structurally NO `pane` and NO `agentStatus`:
+ * there is no agent for this ticket, so there is nothing for those fields to
+ * report. See `DashboardRow`'s own doc comment for why that absence is a
+ * THIRD thing, distinct from "known" and from `IssuetypeField`'s
+ * checked/declined "could not check" — and why `agentFields` below exists
+ * beside the structural absence rather than instead of it.
  */
-export type DashboardRow = AgentDashboardRow;
+export interface WithheldDashboardRow {
+  kind: "withheld";
+  resourceKey: string;
+  tier: TierField;
+  /** Which admission-census source (e.g. the issue or project tier) produced this row — see src/agents/admission.ts's `AdmissionCensusBucket`. Lets a consumer (and a test) tie a row to the specific census that produced it, which is what makes "only the project tier's rows went could-not-check" checkable rather than merely asserted. */
+  source: string;
+  /** A floor on how long this ticket has been withheld — reuses `StatusFloorTracker`/`StatusFloor` verbatim (same provenance/`exact` contract as an agent row's `timeInStatus`; see that field's own doc comment). Never the admission controller's own internal poll-count wait ledger, which is counted in polls across two differently-paced tiers and is not a time. */
+  waiting: StatusFloor;
+  /** ISO timestamp of the POLL THAT OBSERVED this ticket withheld — its census bucket's own `confirmedAt` (src/agents/admission.ts), not the dashboard poll's clock. Never re-stamped by a dashboard poll that merely re-read the same bucket, and never re-stamped by `snapshot()`. */
+  confirmedAt: string;
+  /**
+   * The explicit positive marker `DashboardRow`'s own doc comment calls
+   * for: structural absence of `pane`/`agentStatus` on this variant is
+   * necessary but not sufficient for a JSON consumer, who cannot otherwise
+   * tell "absent because not applicable" from "absent because the producer
+   * broke". This field's shape is deliberately NOT `IssuetypeField`'s
+   * `{checked: false, declinedAt}` — a reader must be able to tell the two
+   * apart without reading this ticket.
+   */
+  agentFields: { applicable: false; reason: string };
+}
+
+/**
+ * `WithheldDashboardRow`'s `agentFields` value — one constant, reused
+ * everywhere a withheld row is built, so every withheld row states the
+ * identical reason rather than each call site inventing its own wording.
+ */
+const WITHHELD_AGENT_FIELDS = { applicable: false as const, reason: "no agent: withheld by the admission cap" };
+
+/**
+ * `AgentDashboardRow | WithheldDashboardRow` (BUTCHR-332) — a pure addition
+ * to what was a one-member alias, exactly as this type's own prior doc
+ * comment anticipated. `AgentDashboardRow` itself does not change shape.
+ * Consumers should match on `row.kind` rather than assuming one member is
+ * the only possibility, so a future third member is a compile-time prompt
+ * to handle it, not a silent gap.
+ */
+export type DashboardRow = AgentDashboardRow | WithheldDashboardRow;
 
 /**
  * The whole-response shape. Both members carry `rows` (never split into a
@@ -135,7 +172,44 @@ export type DashboardRow = AgentDashboardRow;
  * The declined shape is deliberately NOT given the same field — it already
  * carries `declinedAt`, which is its own answer to "as of when".
  */
-export type DashboardResponse = { checked: true; confirmedAt: string; rows: DashboardRow[] } | { checked: false; declinedAt: string; rows: DashboardRow[] };
+export type DashboardResponse =
+  | { checked: true; confirmedAt: string; rows: DashboardRow[]; admission: AdmissionView }
+  | { checked: false; declinedAt: string; rows: DashboardRow[]; admission: AdmissionView };
+
+/** One source's residency-census state, as the response reports it — see `AdmissionCensusBucket` (src/agents/admission.ts), whose `withheld`/`source` are not repeated here (a consumer reads those off the withheld rows themselves via `WithheldDashboardRow.source`, not off this field). */
+export type AdmissionCensusField = { checked: true; confirmedAt: string } | { checked: false; declinedAt: string; reason: string };
+
+/**
+ * BUTCHR-332: the admission view carried on BOTH `DashboardResponse`
+ * variants (additive — no existing field changes meaning). `sources` is ONE
+ * ENTRY PER SOURCE, deliberately with no single aggregate "is the census
+ * fine" boolean anywhere on this shape — see `AdmissionCensus`'s own doc
+ * comment (src/agents/admission.ts) for why a single flag would let one
+ * source's trusted bucket vouch for a different, failed or never-reported
+ * one. Note the two different `checked` flags in play and keep them
+ * distinguishable: `DashboardResponse.checked` is about THIS poll's
+ * `agent.list()`; a source's own `census.checked` here is about THAT tier's
+ * residency census. They are independent — either can fail alone.
+ */
+export interface AdmissionView {
+  /** Same value `/health` already reads via `AdmissionSnapshot.cap` — not a second source. */
+  cap: number;
+  /** Same value `/health` already reads via `AdmissionSnapshot.residency` — not a second source. */
+  residency: number | null;
+  sources: readonly { source: string; census: AdmissionCensusField }[];
+}
+
+/** `AdmissionCensus` (src/agents/admission.ts) → this module's own `AdmissionView` — the one place that translation happens, so `createDashboardFeed`/`initialDashboardSnapshot` below never duplicate it. */
+export function buildAdmissionView(census: AdmissionCensus): AdmissionView {
+  return {
+    cap: census.cap,
+    residency: census.residency,
+    sources: census.buckets.map((b) => ({
+      source: b.source,
+      census: b.checked ? { checked: true as const, confirmedAt: b.confirmedAt } : { checked: false as const, declinedAt: b.declinedAt, reason: b.reason },
+    })),
+  };
+}
 
 /** The subset of `AgentInfo` this module actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardAgent {
@@ -186,6 +260,80 @@ function buildTier(resourceKey: string, issueMeta: (key: string) => IssueMeta | 
   return { kind: "issue", issuetype: meta ? { checked: true, value: meta.issuetype } : { checked: false, declinedAt } };
 }
 
+/** Per-source withheld rows, as retained across polls — see `updateWithheldRows`. */
+export type WithheldRowsBySource = ReadonlyMap<string, readonly WithheldDashboardRow[]>;
+
+export interface UpdateWithheldRowsDeps {
+  /** Same per-key metadata `buildDashboardRows`/`buildTier` already read — `undefined` means genuinely unavailable, never "no tier". */
+  issueMeta: (key: string) => IssueMeta | undefined;
+  /** A SECOND, dedicated `StatusFloorTracker` instance — never the agent rows' own `tracker` (that one is keyed by `agentStatus` transitions; this one by "withheld" duration, and sharing one would let each `forgetMissing` evict the other's entries). */
+  tracker: StatusFloorTracker;
+  /** Resource keys with an agent row THIS poll — agent wins (see `DashboardRow`'s own doc comment): a key here is dropped from every source's withheld rows, freshly-observed or carried forward alike. */
+  agentKeys: ReadonlySet<string>;
+}
+
+/**
+ * BUTCHR-332: the per-source "carry forward on decline" decision — what
+ * `/dashboard`'s withheld rows look like after a poll's admission census
+ * reports each source checked or declined. Pure and synchronous, driven
+ * directly by `test/unit/dashboard.test.ts` against the real
+ * `AdmissionCensus` shape, same discipline `createDashboardFeed`'s own
+ * could-not-check decision already follows (BUTCHR-308).
+ *
+ * For a bucket that reported `checked: true` THIS call, that source's rows
+ * are rebuilt fresh from `bucket.withheld` (each carrying `bucket.confirmedAt`
+ * — the poll that observed it, never re-stamped by a later read). For a
+ * bucket that `checked: false` (threw, untrusted, or never-reported), that
+ * source's entry in `prior` is carried forward BYTE-IDENTICAL — never
+ * dropped, never re-stamped, never invented — which is exactly what makes a
+ * decline in ONE source leave every OTHER source's rows untouched (the
+ * per-source isolation the epic's own correction demands).
+ *
+ * "Agent wins" (row identity) is enforced across BOTH freshly-built and
+ * carried-forward rows alike: a key admitted since a source last reported is
+ * removed from that source's retained rows too, not only from a fresh
+ * rebuild — the census read that produced a carried-forward row is from an
+ * EARLIER poll and is the staler of the two by construction.
+ *
+ * `tracker.forgetMissing` runs once, over the FULL retained withheld set
+ * (fresh ∪ carried-forward, post agent-wins filtering) — never only the
+ * freshly-observed subset, or a carried-forward row's floor would be evicted
+ * merely because ITS OWN source didn't report this poll, surfacing as a
+ * spurious "fresh, inexact" floor the moment that source recovers even
+ * though nothing about that ticket's own wait actually changed.
+ */
+export function updateWithheldRows(census: AdmissionCensus, prior: WithheldRowsBySource, deps: UpdateWithheldRowsDeps): WithheldRowsBySource {
+  const next = new Map<string, readonly WithheldDashboardRow[]>(prior);
+  for (const bucket of census.buckets) {
+    if (!bucket.checked) continue; // could-not-check: leave this source's prior rows exactly as they are
+    const rows: WithheldDashboardRow[] = [];
+    for (const key of bucket.withheld) {
+      if (deps.agentKeys.has(key)) continue; // agent wins — this key has a live agent row this same poll
+      rows.push({
+        kind: "withheld",
+        resourceKey: key,
+        tier: buildTier(key, deps.issueMeta, bucket.confirmedAt),
+        source: bucket.source,
+        waiting: deps.tracker.observe(key, "withheld"),
+        confirmedAt: bucket.confirmedAt,
+        agentFields: WITHHELD_AGENT_FIELDS,
+      });
+    }
+    next.set(bucket.source, rows);
+  }
+  // Agent wins even for a row carried forward from a DECLINED source's prior
+  // report — that source doesn't know this poll's agent list at all, but the
+  // agent list is independently authoritative regardless of which poll last
+  // refreshed a given source's own census.
+  for (const [source, rows] of next) {
+    if (rows.some((r) => deps.agentKeys.has(r.resourceKey))) next.set(source, rows.filter((r) => !deps.agentKeys.has(r.resourceKey)));
+  }
+  const stillWithheld = new Set<string>();
+  for (const rows of next.values()) for (const r of rows) stillWithheld.add(r.resourceKey);
+  deps.tracker.forgetMissing(stillWithheld);
+  return next;
+}
+
 /**
  * BUTCHR-308: the "could not check" decision — what `/dashboard`'s snapshot
  * looks like after a poll succeeds or fails — moved OUT of
@@ -232,13 +380,32 @@ export interface DashboardFeed {
  * reason to exist: those two must never collapse into one shape). Exported
  * so both `createDashboardFeed`'s own initial state and any caller that
  * needs to reason about "never polled yet" read the same literal.
+ *
+ * BUTCHR-332: takes the initial `AdmissionCensus` too (every declared source
+ * pre-seeded `checked: false, reason: "never-reported"` at construction —
+ * see `AdmissionControllerDeps.sources`), so the admission view is ALSO
+ * "could not check" before the first poll, on the identical terms the rest
+ * of this response already uses — never a vacuous "checked, nothing
+ * withheld" just because no source has reported yet (mutations 11/12 on the
+ * ticket).
  */
-export function initialDashboardSnapshot(now: () => number): DashboardResponse {
-  return { checked: false, declinedAt: new Date(now()).toISOString(), rows: [] };
+export function initialDashboardSnapshot(now: () => number, census: AdmissionCensus): DashboardResponse {
+  return { checked: false, declinedAt: new Date(now()).toISOString(), rows: [], admission: buildAdmissionView(census) };
 }
 
-export function createDashboardFeed(deps: BuildDashboardRowsDeps): DashboardFeed {
-  let current: DashboardResponse = initialDashboardSnapshot(deps.now);
+export interface CreateDashboardFeedDeps extends BuildDashboardRowsDeps {
+  /** BUTCHR-332: synchronous read of the current per-source admission census (src/agents/admission.ts) — reads state the poll that just ran (via `reconcileNow`'s `opts.admission`) already recorded; never a fresh call, never new I/O. */
+  admission: () => AdmissionCensus;
+  /** BUTCHR-332: a SECOND, dedicated `StatusFloorTracker` instance for the withheld set — see `UpdateWithheldRowsDeps.tracker`'s own doc comment for why this must not be the agent rows' `tracker` above. */
+  withheldTracker: StatusFloorTracker;
+}
+
+export function createDashboardFeed(deps: CreateDashboardFeedDeps): DashboardFeed {
+  let current: DashboardResponse = initialDashboardSnapshot(deps.now, deps.admission());
+  // BUTCHR-332: retained across polls — see `updateWithheldRows`'s own doc
+  // comment for why a per-source decline must carry forward exactly this
+  // state rather than being recomputed from scratch each poll.
+  let withheldRowsBySource: WithheldRowsBySource = new Map();
   return {
     snapshot: () => current,
     async poll(list) {
@@ -248,10 +415,13 @@ export function createDashboardFeed(deps: BuildDashboardRowsDeps): DashboardFeed
       } catch (e) {
         // Stale rows, honestly labeled, beat either discarding them or
         // re-serving them as freshly confirmed (the ticket's own ruling on
-        // this exact case) — so `rows` carries forward unchanged; only the
-        // top-level `checked`/`declinedAt` move, and no row's own
-        // `confirmedAt` is touched.
-        current = { checked: false, declinedAt: new Date(deps.now()).toISOString(), rows: current.rows };
+        // this exact case) — so `rows` (agent AND withheld alike) carries
+        // forward unchanged; only the top-level `checked`/`declinedAt` move,
+        // and no row's own `confirmedAt` is touched. `admission` also carries
+        // forward unchanged — this failure is agent.list()'s, not the
+        // admission census's, and `deps.admission()` is deliberately not
+        // even called on this path.
+        current = { checked: false, declinedAt: new Date(deps.now()).toISOString(), rows: current.rows, admission: current.admission };
         throw e;
       }
       // Captured once so the response-level `confirmedAt` and every row's
@@ -259,10 +429,20 @@ export function createDashboardFeed(deps: BuildDashboardRowsDeps): DashboardFeed
       // => nowMs` override below) are the literal same value, not merely two
       // separate reads of a clock that could in principle disagree.
       const nowMs = deps.now();
+      const agentRows = buildDashboardRows(agents, { ...deps, now: () => nowMs });
+      const agentKeys = new Set(agentRows.map((r) => r.resourceKey));
+      const census = deps.admission();
+      withheldRowsBySource = updateWithheldRows(census, withheldRowsBySource, {
+        issueMeta: deps.issueMeta,
+        tracker: deps.withheldTracker,
+        agentKeys,
+      });
+      const withheldRows = [...withheldRowsBySource.values()].flat();
       current = {
         checked: true,
         confirmedAt: new Date(nowMs).toISOString(),
-        rows: buildDashboardRows(agents, { ...deps, now: () => nowMs }),
+        rows: [...agentRows, ...withheldRows],
+        admission: buildAdmissionView(census),
       };
       return agents;
     },

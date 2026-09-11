@@ -75,10 +75,21 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
 // `HerdrHerd` instance, before either loop's own `scopedHerd` wrapping),
 // which is the one seam that can see every `butchr-*` agent regardless of
 // which loop desired it.
+// BUTCHR-332: the two tiers' own names on the admission census — declared up
+// front (not discovered lazily) and passed as `sources` below, so
+// `admissionController.census()` can report "this tier has not reported
+// yet" from construction (see AdmissionControllerDeps.sources's own doc
+// comment). The two thin wrappers further down (`admission:` at each
+// `runResourceLoop` call site) are what actually name a call's own tier —
+// this daemon never calls `admissionController.admit` directly.
+const ADMISSION_SOURCE_ISSUE = "issue";
+const ADMISSION_SOURCE_PROJECT = "project";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
+  now: () => Date.now(),
+  sources: [ADMISSION_SOURCE_ISSUE, ADMISSION_SOURCE_PROJECT],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -98,6 +109,10 @@ const issueMeta = new Map<string, IssueMeta>();
 // (see the `agentStatuses` tee below) — a floor must persist across polls to
 // mean anything.
 const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
+// BUTCHR-332: a SECOND, dedicated StatusFloorTracker for the withheld set —
+// see src/agents/dashboard.ts's `UpdateWithheldRowsDeps.tracker` doc comment
+// for why this must not be the agent rows' own tracker above.
+const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 // BUTCHR-269/BUTCHR-308: the poll-fed snapshot `/dashboard` serves. The fetch
 // itself stays here (only this daemon knows whether THIS poll's
 // `agent.list()` succeeded, and only it also needs the raw `agents` array to
@@ -106,7 +121,19 @@ const dashboardStatusFloor = new StatusFloorTracker(() => Date.now());
 // vs. failure — lives in `createDashboardFeed` (src/agents/dashboard.ts),
 // unit-tested there directly. This daemon is wiring only: call `.poll()`
 // with the real fetch, record coverage, serve `.snapshot()`.
-const dashboardFeed = createDashboardFeed({ now: () => Date.now(), issueMeta: (key) => issueMeta.get(key), tracker: dashboardStatusFloor });
+//
+// BUTCHR-332: `admission` reads `admissionController.census()` — the SAME
+// controller instance both `runResourceLoop` calls below share — never a
+// fresh call of its own; the census was already computed earlier in this
+// same poll (see admission.ts's own top comment and this ticket's own
+// falsifier for the ordering proof).
+const dashboardFeed = createDashboardFeed({
+  now: () => Date.now(),
+  issueMeta: (key) => issueMeta.get(key),
+  tracker: dashboardStatusFloor,
+  withheldTracker: dashboardWithheldStatusFloor,
+  admission: () => admissionController.census(),
+});
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
@@ -671,7 +698,9 @@ runResourceLoop(issueResourceType, {
   // BUTCHR-284: the SAME shared controller instance the project loop below
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
-  admission: admissionController.admit,
+  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
+  // the recording itself lives in admission.ts's `admit`.
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
   // BUTCHR-297: the SAME shared controller instance's success signal — see
   // admissionController's own construction comment above and
   // src/agents/admission.ts's own B4 addendum for why this must be one
@@ -772,7 +801,9 @@ runResourceLoop(projectResourceType, {
   // BUTCHR-284: the SAME shared controller instance the issue loop above
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
-  admission: admissionController.admit,
+  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
+  // the recording itself lives in admission.ts's `admit`.
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_PROJECT),
   // BUTCHR-297: the SAME shared controller instance's success signal the
   // issue loop above also uses — see that call site's own comment for why
   // this must be one instance, not one per tier.
