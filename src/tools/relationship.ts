@@ -2393,12 +2393,13 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
     );
   }
 
-  // Branch (b) (BUTCHR-326): an Epic that is a member of an ELIGIBLE
-  // project also has a boss — that project. Cheap, I/O-free check first
-  // (issuetype + own project key, via the SAME predicate assertOwnWorker's
-  // project branch uses) so a non-Epic bossless caller — out of scope here,
-  // see this function's own doc comment — never pays for the eligibility
-  // read at all and is never at risk of the fail-closed refusal below.
+  // Branch (b) (BUTCHR-326/BUTCHR-333): an Epic that is a member of a
+  // project carrying a project-tier root doc also has a boss — that
+  // project. Cheap, I/O-free check first (issuetype + own project key, via
+  // the SAME predicate assertOwnWorker's project branch uses) so a non-Epic
+  // bossless caller — out of scope here, see this function's own doc
+  // comment — never pays for the property read at all and is never at risk
+  // of the fail-closed refusal below.
   const projectKey = projectKeyOf(issue);
   if (projectKey && isEpicMemberOfProject(issue, projectKey)) {
     // CREDENTIAL-INVARIANT (BUTCHR-333): read projectKey's OWN
