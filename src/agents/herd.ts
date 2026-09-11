@@ -60,8 +60,14 @@ export interface Herd {
    * all is NOT stale (unknown ≠ stale).
    */
   staleIssues(): Promise<StaleAgent[]>;
-  /** Start an agent for an issue (idempotent — a no-op if one is already running). */
-  spawn(spec: SpawnSpec): Promise<void>;
+  /**
+   * Start an agent for an issue (idempotent — a no-op if one is already
+   * running). `origin` — see `SpawnOrigin` — names which reconcile loop is
+   * calling; optional and defaults to `"spawn"` (every caller before
+   * BUTCHR-334, and the ordinary plan-spawn loop today), so no existing
+   * caller needs to change.
+   */
+  spawn(spec: SpawnSpec, origin?: SpawnOrigin): Promise<void>;
   /** Shut off the agent for an issue (idempotent). */
   stop(issue: string): Promise<void>;
   /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
@@ -134,9 +140,47 @@ export const PANE_BUSY_MAX_RETRIES = 4;
  * under, whatever the outcome — success, failure, or the no-op early return
  * (see `spawn()`'s own doc comment for why all three share it). A window's
  * spawn attempt count is `count of lines under this tag`, with no
- * reconstruction from any other signal.
+ * reconstruction from any other signal. `attempts = successes + failures +
+ * noops` holds on its own, as a count of lines under this tag — that bare
+ * rule is unaffected by anything below.
+ *
+ * BUTCHR-334 — THE CROSS-INSTRUMENT RULE, WITH ITS RESPAWN TERM: comparing
+ * this tag's count against `[admission2]`'s own `admitted=` field (BUTCHR-320
+ * falsifier 2) is a DIFFERENT, narrower claim than the bare rule above, and
+ * "attempts == admitted" is FALSE on any poll containing a respawn.
+ * `herd.spawn()` is called from TWO places in `reconcileNow`
+ * (src/daemon/loop.ts): the ordinary plan-spawn loop, whose candidates ARE
+ * admission-controlled, and the respawn loop, which is NOT —
+ * `ReconcileOptions.admission`'s own doc comment says so explicitly:
+ * "`plan.stop`/`plan.respawn` are never touched: only the spawn candidate
+ * list is admission-controlled." The TRUE rule, for one poll:
+ *
+ *   attempts under [spawn]  ==  admitted from [admission2]'s `admitted=`
+ *                              +  respawn attempts this same poll
+ *
+ * Every outcome line under this tag now carries `origin=spawn` or
+ * `origin=respawn` (the `SpawnOrigin` param `spawn()` takes below) so BOTH
+ * terms are countable from the journal alone — `respawn attempts = count of
+ * [spawn] lines with origin=respawn`, whatever their outcome, INCLUDING a
+ * FAILED respawn attempt: before this, a failed respawn's only OTHER trace
+ * (the `[reconcile] <KEY> respawned:` line, loop.ts) is written only on
+ * SUCCESS, so a failed respawn was indistinguishable, by tag, from a failed
+ * plan spawn. `origin=` closes that gap without touching that line at all.
+ * This is a FORMAT CHANGE to every line under this tag (every document that
+ * quotes it needs updating to match) — never a behaviour change: `spec` and
+ * the three outcomes are exactly as before, `origin` only labels which
+ * caller produced the attempt.
  */
 export const SPAWN_TAG = "[spawn]";
+
+/**
+ * BUTCHR-334: which reconcile loop produced a given `spawn()` attempt — see
+ * `SPAWN_TAG`'s own doc comment for the cross-instrument rule this exists to
+ * close. `spawn()` itself cannot know this (both loops call the same
+ * method); the caller does, so it is threaded in as a parameter rather than
+ * inferred. Defaults to `"spawn"` — see `Herd.spawn`'s own doc comment.
+ */
+export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
@@ -259,7 +303,7 @@ export class HerdrHerd implements Herd {
    * reach zero lines on a rejecting `agent.list()`, at this method's
    * pre-fix shape, before this fix landed.
    */
-  async spawn(spec: SpawnSpec): Promise<void> {
+  async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
     const issue = spec.key;
     try {
       // BUTCHR-320 review fix (round 1): the no-op check itself is inside
@@ -276,7 +320,7 @@ export class HerdrHerd implements Herd {
       // outcomes are unchanged; only a REJECTING `byIssue()` now falls
       // through to the same `failed` line every other failure gets.
       if ((await this.byIssue()).has(issue)) {
-        this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent`);
+        this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
       // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
@@ -307,9 +351,9 @@ export class HerdrHerd implements Herd {
         throw e;
       }
       await this.verifyKickoff(issue);
-      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId}`);
+      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId} origin=${origin}`);
     } catch (e) {
-      this.log?.(`${SPAWN_TAG} ${issue} failed — ${(e as Error)?.message ?? e}`);
+      this.log?.(`${SPAWN_TAG} ${issue} failed — ${(e as Error)?.message ?? e} origin=${origin}`);
       throw e;
     }
   }
