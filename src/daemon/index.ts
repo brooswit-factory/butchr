@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { HerdrClient } from "@brooswit/herdr-sdk";
+import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
@@ -48,6 +49,15 @@ import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 import { createStandDownRegistry } from "../agents/stand-down.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
+
+// BUTCHR-346: installed before anything else in this file ever logs — every
+// `log:`/`deps.log` seam below that defaults to or directly calls
+// `console.error` resolves that reference at CALL time, so this single
+// install covers all of them, including the config-load error path
+// immediately below and every closure defined later in this file. See
+// `log-sink.ts`'s own doc comment for why this is the sink and why it is
+// installed here rather than at any individual call site.
+installLogSink();
 
 let config;
 try {
