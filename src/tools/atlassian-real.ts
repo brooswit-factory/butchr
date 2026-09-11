@@ -456,42 +456,47 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // by the response's own `total` (jira.js's `PageOfCommentsSchema` — see
     // that op's doc comment on AtlassianOps for why this reader no longer
     // shares a cap with `src/atlassian/client.ts`'s own, differently-tiered
-    // reader). `PAGE_SIZE` is a page-size choice, not a completeness bound —
-    // the loop keeps requesting pages until it has read `total` comments,
-    // when a `total` is actually reported. REVIEW ROUND 1 FIX: an earlier
-    // version, when `total` was ABSENT from the response, set `total` to
-    // `results.length` (what had already been read) as a fallback — that
-    // made `startAt < total` false on the very next check, so a response
-    // with no `total` field silently stopped after ONE page (MEASURED at
-    // review: 250 comments across pages of 100/100/50 with no `total` field
-    // returned only the first 100). It also made the "or a page comes back
-    // empty" safety net this comment used to claim UNREACHABLE on that same
-    // path — a doc comment asserting a safety net that doesn't fire is
-    // exactly the stale-and-wrong-authoritative-claim shape this ticket's
-    // own DoD 8 exists to close, so shipping a second one here would have
-    // been the same defect one level up. Fixed: `total` is left `undefined`
-    // when the response doesn't carry a number, and the ONLY termination
-    // signal in that case is a page shorter than what the server actually
-    // honoured (including empty) — a full page can never safely be assumed
-    // to be the last one without a `total` to compare against. This also
-    // covers the case where `total` WAS reported but the server runs out of
-    // comments before `startAt` reaches it (e.g. a concurrent deletion
-    // mid-walk): a short page still stops the loop cleanly rather than
-    // re-requesting an empty range until the runaway guard fires. REVIEW
-    // ROUND 2 FIX: "shorter than what we asked for" (`PAGE_SIZE`) is NOT the
-    // same claim as "shorter than what the server actually returned" —
-    // Jira caps `maxResults` server-side and reports the effective value
-    // back in the response's own `maxResults` field. MEASURED at review: a
-    // server honouring only 50 of a requested 100 (with `total: 125` sitting
-    // right there in the same response) silently returned just that first
-    // 50 under a `batch.length < PAGE_SIZE` comparison, because 50 looks
-    // short against 100 even though it was the FULL page the server was
-    // willing to give — a regression round 1 introduced and round 2 closes.
-    // The comparison now measures shortness against `r.maxResults` when the
-    // server reports one, falling back to `PAGE_SIZE` only when it doesn't.
+    // reader). `PAGE_SIZE` is a page-size choice, not a completeness bound.
+    //
+    // THE TERMINATION RULE (settled over three review rounds, each closing a
+    // silent truncation the previous round's fix didn't cover) picks its
+    // signal from what the SERVER actually told this call, never from what
+    // was merely requested — in this priority order, per response:
+    //   1. a numeric `total` -> `startAt >= total` ends it (an empty page is
+    //      still checked too, as a safety net — see case 2 below for why
+    //      that alone isn't enough when `total` is ABSENT);
+    //   2. else a numeric `maxResults` -> a page shorter than THAT (the
+    //      server's own effective page size, which it can cap below what
+    //      was requested) ends it;
+    //   3. else (neither field present) -> ONLY a genuinely EMPTY page ends
+    //      it — a merely-short page proves nothing when there is no
+    //      server-reported number to compare it against.
+    // ROUND 1 (measured at review): an earlier version set `total` to
+    // `results.length` (what had already been read) whenever the response
+    // omitted it — that made `startAt < total` false on the very next check,
+    // so 250 comments across pages of 100/100/50 with no `total` field
+    // silently returned only the first 100. It also made an "empty page"
+    // safety net this comment used to claim unreachable on that same path —
+    // an authoritative-and-wrong doc comment being exactly the shape this
+    // ticket's own DoD 8 exists to close. Fixed by leaving `total` genuinely
+    // `undefined` until a real number arrives.
+    // ROUND 2 (measured at review): with `total` fixed, the next version
+    // measured "short" against `PAGE_SIZE` (what was REQUESTED) rather than
+    // what the server actually returned — Jira caps `maxResults`
+    // server-side and reports the effective value back, so a server
+    // honouring only 50 of a requested 100 (with `total: 125` sitting right
+    // there) silently returned just that 50, because 50 looks short against
+    // 100 even though it was the FULL page offered. Fixed by comparing
+    // against the response's own `maxResults` instead.
+    // ROUND 3 (measured at review): with rounds 1 and 2 fixed, a response
+    // carrying NEITHER `total` NOR `maxResults` still fell back to
+    // `PAGE_SIZE` for the "short" comparison — the same round-2 defect,
+    // reachable by a rarer response shape. Fixed by rule 3 above: absent
+    // BOTH server-reported numbers, nothing but a truly empty page may ever
+    // be read as "done" — one extra call in the ordinary case (an exact
+    // multiple of the page size with no `total`), cheap and never silent.
     // Runaway protection: `MAX_COMMENT_PAGES` throws rather than returning a
-    // silently partial list if neither a short page nor the reported `total`
-    // is ever reached.
+    // silently partial list if none of the three signals above is ever hit.
     getIssueComments: async (key) => {
       const results: Array<{ id: string }> = [];
       let startAt = 0;
@@ -506,20 +511,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
         const batch: any[] = r?.comments ?? [];
         for (const c of batch) results.push({ id: c.id });
-        if (typeof r?.total === "number") total = r.total;
+        const responseTotal = typeof r?.total === "number" ? r.total : undefined;
+        const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
+        if (responseTotal !== undefined) total = responseTotal;
         startAt += batch.length;
-        // REVIEW ROUND 2: the yardstick for "short page" must be what the
-        // SERVER actually honoured, never the `PAGE_SIZE` we merely asked
-        // for — Jira caps `maxResults` server-side and reports the effective
-        // value back in `r.maxResults`. MEASURED at review: a server capping
-        // the request to 50 (while `total: 125` sits right there in the same
-        // response) silently returned only that first 50 under a `< PAGE_SIZE`
-        // comparison, because 50 looked "short" against a 100 we asked for
-        // but never got — a regression this round 2 fix closes. A page is
-        // only genuinely short when it's shorter than what the server itself
-        // says it was willing to return.
-        const effectivePageSize = typeof r?.maxResults === "number" ? r.maxResults : PAGE_SIZE;
-        if (batch.length < effectivePageSize) break; // short (including empty) page: nothing more to fetch, whether or not `total` was ever reported
+        if (responseTotal !== undefined) {
+          if (batch.length === 0) break; // safety net even when `total` is known — see this op's own doc comment
+        } else if (responseMaxResults !== undefined) {
+          if (batch.length < responseMaxResults) break; // short against what the server actually honoured
+        } else if (batch.length === 0) {
+          break; // neither field reported: only a genuinely empty page may end the walk
+        }
       }
       return { results };
     },

@@ -404,11 +404,11 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
   // reasoned out of the source): a response with NO numeric `total` field
   // used to make the loop set `total = results.length` as a fallback, which
   // made `startAt < total` false on the very next check — so a 250-comment
-  // issue, paginated in pages of 100/100/50 with `total` NEVER reported,
-  // silently returned only the first 100. FALSIFIER: if this ever regresses
-  // to fewer than 250 results (or fewer than 3 calls), the no-`total`
-  // fallback has broken again.
-  test("REVIEW FIX: a response with no `total` field still paginates to exhaustion, stopping on the first SHORT page (not the immediate next check)", async () => {
+  // issue, paginated in pages of 100/100/50 with `total` NEVER reported (but
+  // `maxResults` reported and honoured, rule 2), silently returned only the
+  // first 100. FALSIFIER: if this ever regresses to fewer than 250 results
+  // (or fewer than 3 calls), the no-`total` fallback has broken again.
+  test("REVIEW FIX: a response with no `total` field (but a reported, honoured `maxResults`) still paginates to exhaustion, stopping on the first SHORT page (not the immediate next check)", async () => {
     const calls: unknown[] = [];
     mock.module("jira.js", () => ({
       createCloudClient: () => ({
@@ -417,8 +417,10 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             calls.push(parameters);
             const sizes = [100, 100, 50];
             const size = sizes[calls.length - 1] ?? 0;
-            // NO `total` field anywhere in any of these responses.
-            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })) });
+            // NO `total` field anywhere in any of these responses — but
+            // `maxResults` IS reported and genuinely honoured, so rule 2
+            // (short against the server's own reported page size) applies.
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })), maxResults: 100 });
           },
         },
       }),
@@ -469,6 +471,43 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
     const got = await ops.getIssueComments("KAN-9");
     expect(calls.length).toBe(3); // 50 + 50 + 25, not stopped after the first capped-at-50 page
     expect(got.results.length).toBe(125); // the FULL 125, not just the first capped page of 50
+  });
+
+  // BUTCHR-309 REVIEW ROUND 3 (measured against the round-2 fix, case "C" of
+  // the reviewer's own enumerated matrix — total✗ x maxResults✗ x capping):
+  // a response carrying NEITHER `total` NOR `maxResults` fell back to
+  // comparing against the REQUESTED `PAGE_SIZE`, so a server-capped page
+  // (100 requested, 50 delivered) looked short against 100 and silently
+  // terminated the walk — the same defect round 2 fixed, reachable by a
+  // response shape neither round 1 nor round 2's tests cover. FALSIFIER: if
+  // this ever returns fewer than 125 results, rule 3 (only a genuinely
+  // EMPTY page may end the walk when neither field is reported) has broken.
+  test("REVIEW FIX ROUND 3: a server that reports NEITHER `total` NOR `maxResults`, while still capping below the request, only stops on a genuinely EMPTY page", async () => {
+    const calls: unknown[] = [];
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({
+        issueComments: {
+          getComments: (parameters: unknown) => {
+            calls.push(parameters);
+            const startAt = (parameters as { startAt: number }).startAt;
+            const remaining = Math.max(0, 125 - startAt);
+            const size = Math.min(50, remaining); // capped to 50 despite maxResults: 100 requested
+            // NEITHER `total` NOR `maxResults` anywhere in this response.
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })) });
+          },
+        },
+      }),
+      isNotFoundError: () => false,
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    const got = await ops.getIssueComments("KAN-9");
+    // 50 + 50 + 25 + one final EMPTY page — a page of 25 is short against
+    // the requested 100, but with neither `total` nor `maxResults` reported,
+    // rule 3 correctly refuses to treat that shortness as proof of
+    // completeness, and only the trailing empty page ends the walk.
+    expect(calls.length).toBe(4);
+    expect(got.results.length).toBe(125); // the FULL 125, not just the first silently-capped page of 50
   });
 });
 
