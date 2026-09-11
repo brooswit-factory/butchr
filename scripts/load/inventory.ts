@@ -28,6 +28,10 @@ export const RUNS_ON_IMPORT = new Set([
   // being run — importing it must not actually hit the network or rewrite
   // a committed generated file as a side effect of a "does this load" check.
   "scripts/vendor/html4-entities.ts",
+  // BUTCHR-245: calls main() unconditionally at import time — real herdr I/O
+  // (workspace.list/pane.list/agent.list, and workspace.close under
+  // --execute). Importing it during `bun test` must not do any of that.
+  "scripts/reap-dry-run.ts",
   // BUTCHR-54: a real build step (spawns `git`, invokes `Bun.build`, writes
   // `dist/`) — importing it must not actually run all that as a side effect
   // of a "does this load" check.

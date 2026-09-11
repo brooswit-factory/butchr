@@ -78,8 +78,9 @@ export interface DesiredInput {
   currentLabels?: readonly string[];
   /**
    * True when this ticket's agent has been idle/done continuously since it
-   * was first observed running, with zero comments from the daemon's own
-   * account, for at least the configured stall window (see
+   * LAST STOPPED WORKING (BUTCHR-279 — a worked-then-idle agent qualifies
+   * too, not only one that never worked), with zero comments from the
+   * daemon's own account, for at least the configured stall window (see
    * src/agents/stalled.ts). Only meaningful when the mapped agent label would
    * otherwise be "idle" — stalled takes precedence over idle so a swallowed
    * kickoff can never look like a completed agent (KAN-804/807).

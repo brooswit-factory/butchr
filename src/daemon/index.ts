@@ -24,8 +24,10 @@ import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
+import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -36,6 +38,9 @@ import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
+import { createReaper } from "../agents/reap.js";
+import { createAdmissionController } from "../agents/admission.js";
+import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
 
 let config;
 try {
@@ -56,6 +61,21 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+// BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
+// the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
+// below, which are deliberately two SEPARATE instances) wired into BOTH
+// `runResourceLoop` calls below: the cap must bound the HOST, not each tier
+// independently (see that module's own top comment, Trap 1) — a per-tier
+// instance here would silently reintroduce exactly the bug this ticket
+// exists to close. `residency` reads the RAW `herd` above (the unscoped
+// `HerdrHerd` instance, before either loop's own `scopedHerd` wrapping),
+// which is the one seam that can see every `butchr-*` agent regardless of
+// which loop desired it.
+const admissionController = createAdmissionController({
+  cap: config.maxAgents,
+  residency: () => herd.runningIssues(),
+  log: (line) => console.error(`  ${line}`),
+});
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 const summaries = new Map<string, string>();
 
@@ -136,6 +156,38 @@ const projectNotifyHealth = createLoopHealth({
 // the rest of the declining set and why it's not all wired yet.
 const coverage = createCoverageTracker();
 
+/**
+ * BUTCHR-244: `check_worker`'s live staffing probe — the narrow seam
+ * `atlassianTools` takes rather than the whole `herd`, so `defs.ts` (and
+ * `relationship.ts`'s `checkWorker`, which actually calls this) stays pure
+ * over its dependencies. Resolves `true`/`false` from `herd.runningIssues()`
+ * (this daemon's own live agent registry); `null` when that read itself
+ * failed. Deliberately does NOT attempt to determine "is this worker even
+ * one this daemon's herd could cover" here — `checkWorker` already does
+ * that (AC-5: comparing the worker's own Jira assignee against this
+ * credential's own identity, both of which it has independently, without
+ * this probe's help) before ever calling this function, so this stays a
+ * simple, honest "what does MY herd currently say" — see relationship.ts's
+ * `probeCoversWorker` for that scope check and the incident it fixes.
+ */
+const isStaffed = async (key: string): Promise<boolean | null> => {
+  try {
+    const running = await herd.runningIssues();
+    return running.includes(key);
+  } catch {
+    return null;
+  }
+};
+
+// BUTCHR-275: the project agent's own positive "I have checked in" exit
+// signal — see src/agents/check-in-exit.ts's own top comment for the full
+// mechanism and why it is a separate registry from frozenAsleepDetector
+// below rather than folded into it. One instance, shared between the
+// `check_in` tool handler (which declares) and the project loop's
+// `checkDeclaredDone` hook (which consumes) — declared here, ahead of both,
+// same "shared, not duplicated" discipline as `ownChannelComments` below.
+const checkInExit = createCheckInExitRegistry();
+
 const { app, mcp } = buildApp({
   state: async () => {
     const { agents } = await herdr.agent.list();
@@ -151,8 +203,8 @@ const { app, mcp } = buildApp({
     Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot()),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite));
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -162,14 +214,46 @@ const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: pan
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
-// KAN-804/807: "idle since spawn, never spoke" — comments are only fetched
+// KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
   comments: (issue) => atlassian.comments(issue),
-  accountEmail: config.atlassian.email,
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-221 criterion 10: a synchronous "is this issue quota-blocked right
+// now" predicate, built by teeing the SAME list()/read() calls handed to
+// watchSessionLimits below — through the SAME session-limit.ts recogniser —
+// rather than a second detection path. See src/agents/quota-gate.ts's own
+// top comment. Constructed here, ahead of stallRemediation, so its
+// `isBlocked` can be wired straight into StallRemediationDeps; its
+// `list`/`read` are wired into watchSessionLimits further down this file in
+// place of the underlying functions, so this taps exactly the reads that
+// watcher already performs — no extra pane I/O.
+const quotaGate = createQuotaGate(
+  async () => (await herdr.agent.list()).agents.map((a) => ({
+    pane_id: a.pane_id,
+    agent_status: a.agent_status ?? "",
+    issue: issueOfAgentName((a as { name?: string }).name),
+  })),
+  readPane,
+  () => Date.now(),
+);
+// BUTCHR-221/BUTCHR-210: the stall deadlock-breaker's remediation half —
+// posts one debounced wake comment on a ticket once agent:stalled is
+// actually applied (never on the raw per-poll signal — see
+// src/agents/stall-remediation.ts's own top comment for the gating
+// rationale and the own-write ledger hazard it avoids by construction).
+// Always an issue key (syncLabels below is never wired into the project
+// loop further down this file), so `ops.addComment` is the right seam —
+// same one parked.ts uses, no second Atlassian writer.
+const stallRemediation = createStallRemediator({
+  now: () => Date.now(),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  quotaBlocked: quotaGate.isBlocked,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
@@ -268,6 +352,33 @@ const projectReconcileFailureDetector = createReconcileFailureDetector({
   comments: ownChannelComments,
   log: (line) => console.error(`  ${line}`),
 });
+// BUTCHR-245: per-poll reclamation of a workspace whose agent exited on its
+// own — see src/agents/reap.ts for the full mechanism (the ownership join,
+// the grace period, the per-poll cap). TWO SEPARATE INSTANCES, same
+// reasoning as issueCrashLoopDetector/projectCrashLoopDetector above: each
+// `runResourceLoop` call needs its own `ReapGuard` (grace-period state),
+// same "one instance per loop" discipline `RespawnGuard` already follows.
+// Both operate on the SAME shared herd namespace (there is no per-loop
+// scoping here — reclamation is scoped to the WORKSPACE, never to an issue
+// key, so `scopedHerd`'s ownsId filtering does not apply and is not used):
+// whichever loop's poll observes a candidate clear its grace period first
+// closes it; the other loop's own tracker simply stops seeing that
+// workspace in its next `workspace.list()` snapshot and never attempts a
+// second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
+// wrapper) is used directly — `strandedCandidates`/`closeStranded` are
+// HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+const issueReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
+const projectReaper = createReaper({
+  now: () => Date.now(),
+  candidates: () => herd.strandedCandidates(),
+  close: (c) => herd.closeStranded(c),
+  log: (line) => console.error(`  ${line}`),
+});
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: async () => {
@@ -281,6 +392,7 @@ const syncLabels = createLabelSync({
   },
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
+  stallRemediation,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
@@ -292,13 +404,13 @@ const syncLabels = createLabelSync({
 // the refusal and close it once past its printed reset time plus margin so
 // the reconciler respawns with a fresh kickoff. Nothing persisted; a restart
 // re-reads the same pane and reaches the same decision.
+// list/read wired through quotaGate (created above) rather than straight to
+// herdr.agent.list()/readPane — same rows, same pane text, same recogniser,
+// just tee'd so BUTCHR-221's quotaBlocked predicate stays current off this
+// exact poll. watchSessionLimits itself is unmodified and unaware.
 watchSessionLimits({
-  list: async () => (await herdr.agent.list()).agents.map((a) => ({
-    pane_id: a.pane_id,
-    agent_status: a.agent_status ?? "",
-    issue: issueOfAgentName((a as { name?: string }).name),
-  })),
-  read: readPane,
+  list: quotaGate.list,
+  read: quotaGate.read,
   close: (issue) => herd.stop(issue),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
@@ -383,6 +495,14 @@ runResourceLoop(issueResourceType, {
   checkCrashLoop: issueCrashLoopDetector.check,
   // BUTCHR-147: see src/agents/reconcile-failure.ts.
   checkReconcileFailure: issueReconcileFailureDetector.check,
+  // BUTCHR-245: the issue tier is the fast, high-volume loop (15s) — the
+  // one most likely to actually clear a stranded workspace's grace period
+  // quickly. See src/agents/reap.ts.
+  checkReap: issueReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the project loop below
+  // also uses — see admissionController's own construction comment above
+  // for why this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -445,6 +565,16 @@ runResourceLoop(projectResourceType, {
   // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
   // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
   checkFrozenAsleep: frozenAsleepDetector.check,
+  // BUTCHR-275: wired here only, same reasoning as checkFrozenAsleep just
+  // above — only the project tier ever produces a candidate (the issue tier
+  // never sleeps, so `check_in` doesn't exist for it and never declares
+  // anything here). See src/agents/check-in-exit.ts.
+  checkDeclaredDone: checkInExit.check,
+  // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
+  // see ReconcileOptions.invalidateDeclaredDone's own doc comment
+  // (src/daemon/loop.ts) and src/agents/check-in-exit.ts's "PER-EPISODE
+  // INVALIDATION" for the hazard this closes.
+  invalidateDeclaredDone: checkInExit.invalidateActive,
   // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
   // single-tier restriction, and the project tier is the slower loop where a
   // real crash loop still needs to reach the threshold well inside the
@@ -452,6 +582,15 @@ runResourceLoop(projectResourceType, {
   checkCrashLoop: projectCrashLoopDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
+  // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
+  // single-tier restriction, and this loop's own `workspace.list()` poll
+  // (5min cadence) is still a valid independent chance to catch a candidate
+  // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
+  checkReap: projectReaper.check,
+  // BUTCHR-284: the SAME shared controller instance the issue loop above
+  // also uses — see admissionController's own construction comment for why
+  // this must be one instance, not one per loop.
+  admission: admissionController.admit,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),

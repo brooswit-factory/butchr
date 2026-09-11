@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -47,7 +48,7 @@ describe("atlassianTools", () => {
     const { tools } = rig();
     expect(Object.keys(tools).sort()).toEqual([
       "adopt_worker", "ask_boss",
-      "check_in",
+      "check_in", "check_worker",
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
@@ -1366,11 +1367,14 @@ describe("BUTCHR-71: a PROJECT-keyed caller (x-issue: \"BUTCHR\", no hyphen) acr
     expect(result).toEqual({ found: true, id: "1", url: expect.any(String), title: "BUTCHR — product brief", body: "<p>hi</p>" });
   });
 
-  test("set_doc() replaces the PROJECT's root doc, title optional", async () => {
+  test("set_doc() replaces the PROJECT's root doc, title optional, and returns a bounded receipt — never the body (BUTCHR-236)", async () => {
     const { tools, conn } = projectRig();
     const result = await tools.set_doc!.handler({ body: "<p>new</p>" }, conn);
     expect((result as any).id).toBe("1");
-    expect((result as any).body).toBe("<p>new</p>");
+    expect((result as any).body).toBeUndefined(); // the old echo is gone — pinning the defect this replaces
+    expect((result as any).landed).toBe("confirmed"); // this rig's getPage always resolves with a body
+    expect(typeof (result as any).wrote.chars).toBe("number");
+    expect((result as any).wrote.chars).toBe("<p>new</p>".length);
   });
 
   test("new_worker creates an EPIC, member of BUTCHR, no implements field, staffed by roles.epic", async () => {
@@ -1450,6 +1454,12 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     epicComments?: Record<string, Array<{ id: string }>>;
     rootDocComments?: Array<{ id: string; body: string }>;
     rootDocVersion?: number;
+    // BUTCHR-275: the exit-declaration seam under test below — omitted in
+    // every pre-existing test above (unaffected, same as any other optional
+    // atlassianTools dependency), threaded in only by the new block that
+    // follows this rig.
+    declareCheckInDone?: (key: string) => void;
+    failSetProjectProperty?: boolean;
   } = {}) {
     const properties = new Map<string, unknown>([["BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" } }]]);
     const setPropertyCalls: unknown[] = [];
@@ -1496,13 +1506,14 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       },
       getProjectPropertyOrNull: async (key: string) => properties.get(key) ?? null,
       setProjectProperty: async (key: string, _propertyKey: string, value: unknown) => {
+        if (opts.failSetProjectProperty) throw new Error("setProjectProperty: simulated write failure");
         setPropertyCalls.push(value);
         properties.set(key, value);
         return { ok: true };
       },
       getPageVersions: async () => ({ "1": opts.rootDocVersion ?? 3 }),
     };
-    const tools = atlassianTools(ops, () => {});
+    const tools = atlassianTools(ops, () => {}, {}, undefined, undefined, opts.declareCheckInDone);
     return { tools, properties, setPropertyCalls, searchCalls, getIssueCommentsCalls };
   }
 
@@ -1518,31 +1529,47 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing/);
   });
 
-  test("with nothing in review: watermarks version and comment, and REPLACES epics with {} (pruning any stale entries)", async () => {
-    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }] });
+  // BUTCHR-227: this assertion's SHAPE changed (from a `comment`/`epics`
+  // scalar echo to a `seenComments`/`epics` SET echo) because check_in's
+  // own return/write shape changed — the property under test (nothing in
+  // review prunes any stale epic KEY; the observed root-doc comment ends up
+  // recorded) is unchanged, not weakened.
+  // BUTCHR-227 THE LOOP-VS-BATCH FALSIFIER (BUTCHR-208, via BUTCHR-195):
+  // THREE root-doc comments, deliberately not in id order — a mutation
+  // that records only the max, only the first, or only the last would pass
+  // a single-comment fixture but must fail this one. Failure condition: any
+  // of "99"/"5"/"777" missing from `seenComments` below.
+  test("with nothing in review: watermarks version and records EVERY observed comment id as seen (not a max, not a subset), and REPLACES epicsSeen with {} (pruning any stale entries)", async () => {
+    const { tools, properties } = checkInRig({ rootDocVersion: 5, rootDocComments: [{ id: "99", body: "hi" }, { id: "5", body: "lo" }, { id: "777", body: "mid" }] });
     // Seed a stale epic entry, as if watermarked during a PRIOR review episode.
-    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: null, epics: { "BUTCHR-9": "50" } } });
+    properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, commentsSeen: [], epicsSeen: { "BUTCHR-9": ["50"] } } });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     const result = await tools.check_in!.handler({}, conn);
-    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, comment: "99", epics: {} });
-    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, comment: "99", epics: {} }); // BUTCHR-9 pruned
+    expect(result).toEqual({ ok: true, key: "BUTCHR", version: 5, seenComments: ["99", "5", "777"], epics: {} });
+    expect((properties.get("BUTCHR") as any).wake).toEqual({ version: 5, commentsSeen: ["99", "5", "777"], epicsSeen: {} }); // BUTCHR-9 pruned
   });
 
   // BUTCHR-81 (found at review): check_in must read epic comments via the
   // SAME reader discovery uses (getIssueComments — newest-first, capped),
   // never getIssue's embedded fields.comment block (measured ascending/
   // oldest-first with an unconfirmed cap) — otherwise the two readers could
-  // disagree on "newest" and the watermark would never catch up.
-  test("with an epic in review: fetches ITS comments via getIssueComments (the SAME reader discovery uses, not getIssue's embedded block), and watermarks it", async () => {
+  // disagree on which ids exist at all.
+  //
+  // BUTCHR-227: this assertion's SHAPE changed (from "newest by numeric
+  // value" to "every observed id, as a set") because check_in no longer
+  // derives or stores a "newest" scalar at all — the property under test
+  // (check_in reads via getIssueComments, and its result ends up recorded)
+  // is unchanged, not weakened.
+  test("with an epic in review: fetches ITS comments via getIssueComments (the SAME reader discovery uses, not getIssue's embedded block), and records EVERY observed id as seen", async () => {
     const { tools, properties, getIssueCommentsCalls } = checkInRig({
       epicsInReview: [{ key: "BUTCHR-9" }],
       epicComments: { "BUTCHR-9": [{ id: "101" }, { id: "202" }] },
     });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
-    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string> };
-    expect(result.epics).toEqual({ "BUTCHR-9": "202" }); // newest by numeric value
+    const result = (await tools.check_in!.handler({}, conn)) as { epics: Record<string, string[]> };
+    expect(result.epics).toEqual({ "BUTCHR-9": ["101", "202"] }); // every observed id, not just the numeric max
     expect(getIssueCommentsCalls).toEqual(["BUTCHR-9"]);
-    expect((properties.get("BUTCHR") as any).wake.epics).toEqual({ "BUTCHR-9": "202" });
+    expect((properties.get("BUTCHR") as any).wake.epicsSeen).toEqual({ "BUTCHR-9": ["101", "202"] });
   });
 
   test("no epics in review at all -> zero getIssueComments calls (the usual case)", async () => {
@@ -1552,12 +1579,62 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
     expect(getIssueCommentsCalls).toEqual([]);
   });
 
-  test("no root-doc comments yet -> comment watermark stays unadvanced (null), not clobbered to null over a real prior value", async () => {
+  // BUTCHR-227: this assertion's SHAPE changed — the legacy scalar write
+  // path this test exercised (a `null`-safety guard on `advanceProjectWatermark`'s
+  // old `comment ?? wake.comment ?? null` composition) no longer exists;
+  // `seenComments` is now always a UNION, so an empty observed set simply
+  // unions nothing in. The property under test survives: a project's
+  // ALREADY-SEEN state (here, a legacy `comment` scalar) is never lost when
+  // this poll observes zero comments. This ALSO proves the migration
+  // composes correctly with the writer: the legacy scalar seeds
+  // `commentsSeen` on read, and that seeded id survives the write below —
+  // see `normalizeWake`'s own doc comment for why the union must run
+  // against the MIGRATED value, not the raw stored JSON.
+  test("no root-doc comments yet -> nothing new to union in; a legacy `comment` scalar survives untouched AND its id is migrated into commentsSeen", async () => {
     const { tools, properties } = checkInRig({ rootDocComments: [] });
     properties.set("BUTCHR", { space: { key: "BUTCHR" }, rootDoc: { id: "1" }, wake: { version: 1, comment: "42", epics: {} } });
     const conn = { headers: { "x-issue": "BUTCHR" } } as any;
     await tools.check_in!.handler({}, conn);
-    expect((properties.get("BUTCHR") as any).wake.comment).toBe("42"); // untouched — omitted from the patch, not overwritten with null
+    const wake = (properties.get("BUTCHR") as any).wake;
+    expect(wake.comment).toBe("42"); // legacy scalar untouched — forensic, never deleted
+    expect(wake.commentsSeen).toEqual(["42"]); // migrated in, not lost, even though this poll observed nothing new
+  });
+
+  // BUTCHR-275: the exit signal check_in now emits, on top of the watermark
+  // write BUTCHR-67/BUTCHR-81 already covers above. Failure conditions
+  // stated first, per test, same discipline as the rest of this block.
+  describe("check_in's own exit declaration (BUTCHR-275, implementing BUTCHR-271)", () => {
+    test("a successful check_in declares its own key AFTER the watermark write — the ordering DoD requires structurally, not by convention", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key) });
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      await tools.check_in!.handler({}, conn);
+      expect(declared).toEqual(["BUTCHR"]); // declared exactly once, for the caller's own key
+    });
+
+    test("a rejecting watermark write means NOTHING is declared — a caller that dies mid-check_in must never unprotect its own atRest slot", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key), failSetProjectProperty: true });
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/simulated write failure/);
+      expect(declared).toEqual([]); // never reached — the throw happens before this line
+    });
+
+    test("omitting declareCheckInDone entirely leaves check_in's own watermark behaviour completely unaffected — every test above this block keeps passing unmodified", async () => {
+      const { tools, properties } = checkInRig({ rootDocVersion: 7 }); // no declareCheckInDone at all
+      const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+      const result = await tools.check_in!.handler({}, conn);
+      expect(result).toEqual({ ok: true, key: "BUTCHR", version: 7, seenComments: [], epics: {} });
+      expect((properties.get("BUTCHR") as any).wake.version).toBe(7);
+    });
+
+    test("an ISSUE caller's refusal happens before any declaration could occur — requireProjectCaller's throw pre-empts everything below it", async () => {
+      const declared: string[] = [];
+      const { tools } = checkInRig({ declareCheckInDone: (key) => declared.push(key) });
+      const conn = { headers: { "x-issue": "BUTCHR-1" } } as any;
+      await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
+      expect(declared).toEqual([]);
+    });
   });
 });
 
@@ -1676,6 +1753,79 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
     const { tools } = docCommentsRig({ "1": [{ id: "10", body: "hello from a reviewer", author: "712020:abc" }] });
     const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
     expect(result.results).toEqual([{ id: "10", body: "hello from a reviewer", author: "712020:abc" }]);
+  });
+
+  // BUTCHR-239: this defect already passed two reviews because the fixture
+  // above (`"hello from a reviewer"`) hands back PLAIN TEXT — a reader that
+  // never unwraps storage-format XHTML is indistinguishable from one that
+  // does, against that fixture. Every test below builds its body the way
+  // the REAL writer (`tell_peer`/`speakOnOwnChannel`, src/tools/relationship.ts
+  // and src/tools/speak.ts) actually produces one — `<p>${escapeStorageText
+  // (text)}</p>` — using the SAME exported `escapeStorageText`, so the
+  // fixture cannot drift from what production writes.
+  //
+  // Falsifier stated before writing these: with `unwrapStorageParagraph`
+  // removed from get_doc_comments' handler, the marker test below MUST fail
+  // — if it stays green, the fixture is still effectively plain text and
+  // this is the same mistake BUTCHR-129 already made once.
+  describe("BUTCHR-239: body comes back unwrapped and unescaped, using the real writer's shape", () => {
+    test("a tell_peer-shaped body reads back so body.startsWith('[butchr:peer ') is true and '<->' is literal, not entity-escaped", async () => {
+      const prefix = "[butchr:peer from=BUTCHR to=DROVR intent=notice] ";
+      const text = "The butchr <-> DROVR sideways channel is live.";
+      const written = `<p>${escapeStorageText(prefix + text)}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "10", body: written, author: "712020:abc" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      const body = result.results[0]!.body;
+      expect(body.startsWith("[butchr:peer ")).toBe(true);
+      expect(body).toBe(prefix + text);
+      expect(body).not.toContain("&lt;");
+      expect(body).not.toContain("&gt;");
+    });
+
+    test("round-trip identity: unwrapping what the real writer wrote returns the original text exactly", () => {
+      const original = "A & B < C > D — all three escapes in one string";
+      const written = `<p>${escapeStorageText(original)}</p>`;
+      expect(unwrapStorageParagraph(written)).toBe(original);
+    });
+
+    test("tolerant path: a body that is NOT <p>-wrapped (a human's foreign comment) comes back sensibly rather than mangled or dropped", async () => {
+      const humanBody = "just a note left by a person, no tool wrapping here";
+      const { tools } = docCommentsRig({ "1": [{ id: "11", body: humanBody, author: "712020:human" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results[0]!.body).toBe(humanBody);
+    });
+
+    test("id and author still arrive intact, and author is still absent (not a placeholder) when the source has none", async () => {
+      const prefix = "[butchr:peer from=BUTCHR to=DROVR intent=notice] ";
+      const written = `<p>${escapeStorageText(prefix + "no author on this row")}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "12", body: written }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results).toEqual([{ id: "12", body: prefix + "no author on this row" }]);
+      expect("author" in result.results[0]!).toBe(false);
+    });
+
+    // BUTCHR-239 [correction]: `unwrapStorageParagraph` must be applied to a
+    // row's body EXACTLY ONCE, in get_doc_comments' own handler — never in
+    // the shared op (getPageComments/atlassian-real.ts), because
+    // `createOwnChannelComments` (src/tools/speak.ts) already maps every row
+    // through this same inverse for its own caller, and unwrapping twice is
+    // not a harmless no-op: a sender whose PLAIN TEXT itself contains an
+    // entity-looking literal like "&gt;" would have that literal silently
+    // rewritten to ">" on the second pass, with no error on either side.
+    // This test's fixture's original text contains exactly that literal, so
+    // it can tell "unwrapped once" apart from "unwrapped twice" — a fixture
+    // without it could not.
+    test("exactly-once unwrap: a body whose ORIGINAL plain text itself contains an entity-looking literal ('&gt;') survives the round trip unchanged", async () => {
+      const original = "the arrow renders as &gt; in storage";
+      const written = `<p>${escapeStorageText(original)}</p>`;
+      const { tools } = docCommentsRig({ "1": [{ id: "13", body: written, author: "712020:abc" }] });
+      const result = (await tools.get_doc_comments!.handler({}, PROJECT_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+      expect(result.results[0]!.body).toBe(original);
+      // Documents the failure this test exists to catch: unwrapping the
+      // ALREADY-unwrapped result a second time corrupts exactly this input.
+      expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).not.toBe(original);
+      expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).toBe("the arrow renders as > in storage");
+    });
   });
 });
 
