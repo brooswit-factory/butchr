@@ -490,7 +490,7 @@ export function atlassianTools(
         const who = c.headers["x-issue"];
         if (!who) throw new Error("set_doc: this connection has no x-issue — refusing rather than resolving to an unknown caller");
         audit(c, `set_doc ${who}${title ? ` (retitle "${title}")` : ""}`);
-        const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title) : await setDoc(ops, who, body, title);
+        const result = isProjectId(who) ? await setProjectDoc(ops, who, body, title, log) : await setDoc(ops, who, body, title);
         noted(c, [who]); // the remote-link upsert (issue) / page update (project) bumps the doc's own `updated`
         return result;
       },
@@ -772,6 +772,18 @@ export function atlassianTools(
           epics[epic.key] = (await ops.getIssueComments(epic.key)).results.map((c) => c.id);
         }
         audit(c, `check_in (version=${version ?? "?"}, comments seen=${seenComments.length}, epics in review=${Object.keys(epics).length})`);
+        // BUTCHR-260: this used to also pass `reconcile: true` (BUTCHR-214/226
+        // review round 1) — the ONLY caller that ever did — telling
+        // `advanceProjectWatermark` that this write is a COMPLETE observation
+        // over everything currently on the page and may set the watermark
+        // authoritatively, INCLUDING DOWNWARD. That flag is dropped, not
+        // adapted: see `advanceProjectWatermark`'s own doc comment
+        // (src/resources/project.ts) for the evidence that the axis it
+        // existed to let this call correct downward (the old comment-scalar
+        // watermark) is gone under BUTCHR-227's seen-set, and `version` never
+        // had a legitimate downward case to begin with. Removing it changes
+        // nothing else about this call: `seenComments`/`epics` were already a
+        // plain union/replace regardless of the flag.
         await advanceProjectWatermark(ops, who, {
           ...(version !== undefined ? { version } : {}),
           seenComments,

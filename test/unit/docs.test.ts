@@ -61,8 +61,8 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       if (!page) throw new Error(`fake world: no such page ${p.id}`);
       page.body = p.body;
       if (p.title) page.title = p.title;
-      page.version += 1;
-      return { ok: true };
+      page.version++;
+      return { ok: true, version: page.version };
     },
     searchPages: async () => ({ results: [] }),
     listSpaces: async () => ({}),
