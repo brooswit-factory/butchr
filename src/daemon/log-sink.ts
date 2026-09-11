@@ -1,3 +1,5 @@
+import { format } from "node:util";
+
 /**
  * BUTCHR-346 (implementing BUTCHR-316's own (C)): the daemon's LOG SINK — the
  * one seam every application log line passes through immediately before it
@@ -55,13 +57,31 @@ export function flattenNewlines(raw: string): string {
 }
 
 /**
- * Wraps `target.error` (default: the real global `console`) so every
- * argument that is itself a string is run through `flattenNewlines` before
- * reaching the original writer — non-string arguments (an `Error`, an
- * object logged for its own `util.inspect` rendering) pass through
- * unmodified, since only a STRING can carry a raw newline into a line this
- * daemon's own journal readers parse; nothing in `src/` calls `console.error`
- * with a non-string first argument for anything a reader is meant to parse.
+ * Wraps `target.error` (default: the real global `console`).
+ *
+ * When every argument is a string, each one is run through `flattenNewlines`
+ * independently and passed straight through to the original writer — this
+ * is byte-for-byte the pre-BUTCHR-349 behaviour, unchanged, so any existing
+ * multi-arg log line (e.g. a `%s`-style call whose specifier is consumed by
+ * the original writer's own formatting) renders exactly as it did before.
+ *
+ * When ANY argument is not a string — an `Error`, an object logged for its
+ * own `util.inspect` rendering — this now renders the WHOLE argument list to
+ * text with `util.format(...args)` (the same primitive the original,
+ * unwrapped `console.error` already uses internally to combine/format its
+ * arguments) and flattens the single resulting string, rather than letting
+ * a non-string argument reach the original writer unformatted. That closes
+ * a real gap the previous version's own doc comment claimed away: an
+ * `Error`'s message (or its default-rendered stack) carries raw newlines
+ * with it, and only a string was ever flattened — `console.error(err)` on a
+ * multi-line `Error` produced a second physical journal line that could
+ * forge a record (BUTCHR-349). `util.format` is used here specifically
+ * because it is what makes this equivalent to the original writer's own
+ * combining behaviour for the mixed-argument case (verified: an escaped
+ * `%%` only collapses when a later argument is present to substitute,
+ * exactly like today's plain `console.error`; a lone `%`-bearing string
+ * with no other arguments is never scanned for specifiers at all — a
+ * literal percentage in a one-argument log message is unaffected).
  *
  * MUST be installed before anything else logs — every `log:`/`deps.log`
  * parameter across `src/` that defaults to `console.error` resolves that
@@ -74,6 +94,19 @@ export function flattenNewlines(raw: string): string {
  * `src/daemon/index.ts` calls this as its very first executable statement,
  * before even its own config-load error path, for exactly that reason.
  *
+ * STATED LIMIT — NOT FIXED HERE (BUTCHR-349): this wraps `console.error`
+ * only. The runtime's own printer for an UNCAUGHT EXCEPTION or an UNHANDLED
+ * REJECTION writes the crash's stack/message straight to `stderr` itself,
+ * bypassing this wrap entirely — a crash whose message carries
+ * uncontrolled, attacker-influenced text can still forge a physical line
+ * the same way a pre-fix `console.error(err)` could. A reader parsing
+ * journal lines near a process crash/restart should treat that window as
+ * UNTRUSTED for outcome/alias-audit purposes — do not take a record found
+ * there at face value; corroborate it against another source (e.g. the
+ * issue's own Jira history) before acting on it. Deliberately not addressed
+ * by this change: adding crash handlers is a different change with its own
+ * risk, tracked separately rather than folded in here.
+ *
  * Returns a restore function — production never calls it (the wrap lives
  * for the process's whole lifetime); it exists so a test can install onto a
  * throwaway stand-in, assert, and clean up without leaking a patched
@@ -83,7 +116,11 @@ export function installLogSink(target: Pick<Console, "error"> = console): () => 
   const original = target.error;
   const wrapped = target as { error: Console["error"] };
   wrapped.error = ((...args: unknown[]) => {
-    original.apply(target, args.map((a) => (typeof a === "string" ? flattenNewlines(a) : a)));
+    if (args.every((a) => typeof a === "string")) {
+      original.apply(target, args.map((a) => flattenNewlines(a as string)));
+    } else {
+      original.apply(target, [flattenNewlines(format(...args))]);
+    }
   }) as Console["error"];
   return () => {
     wrapped.error = original;
