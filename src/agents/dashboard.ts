@@ -372,6 +372,57 @@ export interface DashboardFeed {
   poll(list: () => Promise<{ agents: readonly DashboardAgent[] }>): Promise<readonly DashboardAgent[]>;
   /** The current snapshot. No I/O of its own: never calls `list`, never advances `confirmedAt` — a request-time read is exactly that, a read. */
   snapshot(): DashboardResponse;
+  /**
+   * BUTCHR-354: call at the very start of each fetch tick — loop.ts's own
+   * step 1 (`resourceType.discovery.search()`), before `reconcileNow`/
+   * `related`/`syncLabels` ever run — to reset this tick's "already
+   * touched" bookkeeping, which `declineUpstream` below reads so it never
+   * double-records the one poll whose OWN `poll()` call (via `syncLabels`'s
+   * `agentStatuses` dep, step 4) already recorded its own outcome. Safe to
+   * call more than once per tick (e.g. `related`'s own secondary `search()`
+   * call, src/resources/issue.ts's `createRelated`, which runs AFTER step 1
+   * but still strictly BEFORE step 4) — this is a plain reset, not a
+   * counter, so an extra call before `poll`/`declineUpstream` ever run this
+   * tick is a no-op by construction.
+   */
+  beginPoll(): void;
+  /**
+   * BUTCHR-354: the "could not check" decision for a poll that never
+   * reached THIS feed's own fetch at all — an upstream rejection
+   * (`search`/`reconcileNow`/`related`, loop.ts steps 1-3, aborting the
+   * fetch stage before it ever reaches `syncLabels`, so `poll` above is
+   * never called this tick). Flips the snapshot to `{checked: false,
+   * declinedAt}` the same way `poll`'s own catch branch does —
+   * `declinedAt` from `deps.now`, `rows`/`admission` carried forward
+   * BYTE-IDENTICAL from whatever the snapshot held before this call, same
+   * "stale rows, honestly labeled" ruling `poll` already follows.
+   *
+   * A NO-OP whenever `poll` already ran THIS tick (successfully or not) —
+   * `poll` already decided this tick's snapshot, and, on its own decline
+   * path, already told its caller to record its own coverage decline;
+   * calling this too would double-count the ONE failure mode
+   * (`agent.list()` itself rejecting, step 4) that already counted
+   * correctly before this ticket (BUTCHR-308). Returns whether it actually
+   * recorded a decline, so the caller knows whether to ALSO call its own
+   * `coverage.recordDeclined` — never call that unconditionally alongside
+   * this, or the double-count this method exists to prevent reappears one
+   * layer out, in the caller instead of here.
+   *
+   * EVIDENCE RANKING (epic rule 6): after this fires, the response carries
+   * a LIVE per-poll observation (`checked: false`, `declinedAt` — THIS
+   * poll's own answer to "can we currently confirm anything") alongside
+   * whatever CARRIED-FORWARD rows survive from an earlier successful poll,
+   * each still stamped with ITS OWN, now-older, `confirmedAt`. The two
+   * answer different questions and neither is promoted to answer the
+   * other's: the response-level `checked`/`declinedAt` outranks every row's
+   * `confirmedAt` for "is this view current right now" — a fresh-looking
+   * row timestamp must never be read as current when the response-level
+   * flag says otherwise. Conversely, a row's own `confirmedAt` outranks the
+   * response-level `declinedAt` for "when was THIS row's content last
+   * actually gathered" — `declinedAt` only says when the check failed, and
+   * never stands in for a row's own provenance.
+   */
+  declineUpstream(): boolean;
 }
 
 /**
@@ -406,9 +457,22 @@ export function createDashboardFeed(deps: CreateDashboardFeedDeps): DashboardFee
   // comment for why a per-source decline must carry forward exactly this
   // state rather than being recomputed from scratch each poll.
   let withheldRowsBySource: WithheldRowsBySource = new Map();
+  // BUTCHR-354: tick-scoped, reset by `beginPoll` — see `DashboardFeed.declineUpstream`'s
+  // own doc comment for the double-recording hazard this guards against.
+  let touchedThisTick = false;
   return {
     snapshot: () => current,
+    beginPoll() {
+      touchedThisTick = false;
+    },
+    declineUpstream() {
+      if (touchedThisTick) return false;
+      touchedThisTick = true;
+      current = { checked: false, declinedAt: new Date(deps.now()).toISOString(), rows: current.rows, admission: current.admission };
+      return true;
+    },
     async poll(list) {
+      touchedThisTick = true;
       let agents: readonly DashboardAgent[];
       try {
         ({ agents } = await list());
