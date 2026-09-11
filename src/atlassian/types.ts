@@ -29,6 +29,25 @@ export interface JiraIssue {
    * field's values obey identically.
    */
   issuelinks?: readonly IssueLink[];
+  /**
+   * BUTCHR-307: whether this issue is currently "asleep" (stood down) —
+   * SYNTHETIC, never present on the raw Jira API response and never set by
+   * `mapIssue` (src/atlassian/client.ts). Only `createIssueResourceType`'s
+   * `discovery.search()` (src/resources/issue.ts) stamps this, once per
+   * poll, from the in-memory stand-down registry (src/agents/stand-down.ts)
+   * — the same "carry the flag on `T` itself" shape `ProjectResource`
+   * (this file's sibling in src/resources/project.ts) already uses for its
+   * own watermark, chosen here over widening `T` to a wrapper struct because
+   * every other consumer of `JiraIssue` in this codebase (labels, workspace
+   * building, parked/abandoned detection, every existing test fixture) can
+   * and does ignore an extra optional field with zero changes required,
+   * where a wrapper struct would have forced type changes at every one of
+   * those call sites for a flag none of them need. `ISSUE_ACTIVATION.verdictFor`
+   * (src/resources/issue.ts) reads this directly — a plain, synchronous
+   * field read, keeping that function pure over `T` as `runResourceLoop`'s
+   * two-pass correctness argument requires (src/daemon/loop.ts).
+   */
+  asleep?: boolean;
 }
 
 export interface IssueLink {

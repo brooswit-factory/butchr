@@ -162,6 +162,7 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
   report_to_boss: { taught: true },
   ask_boss: { taught: true },
   check_in: { taught: true },
+  stand_down: { taught: true },
   get_doc_comments: { taught: true },
   list_peers: { taught: true },
   tell_peer: { taught: true },
