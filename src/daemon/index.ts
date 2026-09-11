@@ -549,6 +549,11 @@ runResourceLoop(issueResourceType, {
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal — see
+  // admissionController's own construction comment above and
+  // src/agents/admission.ts's own B4 addendum for why this must be one
+  // ledger, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -640,6 +645,10 @@ runResourceLoop(projectResourceType, {
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal the
+  // issue loop above also uses — see that call site's own comment for why
+  // this must be one instance, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
