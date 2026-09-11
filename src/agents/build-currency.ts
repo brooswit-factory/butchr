@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,15 +73,36 @@ export interface CurrencyGit {
    */
   refChangedAt(ref: string): GitOpResult<{ iso: string }>;
   /**
-   * Best-effort: when THIS checkout last talked to the network at all
-   * (`FETCH_HEAD`'s mtime — updated on every `git fetch`, including a
-   * no-op one that changes no ref). Answers the question `refChangedAt`
-   * cannot: whether the comparison base could even in principle be newer
-   * than what's recorded. Absent in a repository that has never fetched
-   * (e.g. a ref set by `git update-ref` with no real remote) — that must
-   * render as `unknown, because X`, never an omitted signal or a guess.
+   * Best-effort: when this CLONE last fetched `branch` FROM `remote` —
+   * deliberately NOT "when did this checkout last fetch anything".
+   *
+   * BUTCHR-163 — the narrower question is the whole point, because the
+   * broad one is wrong in BOTH directions and one of them is dangerous:
+   *
+   *  - UNDERSTATES (safe): `FETCH_HEAD` is PER-WORKTREE, so a fetch in a
+   *    linked worktree never touches the common dir's copy. Reading only
+   *    the common dir missed real fetches. See `resolveGitCommonDir`.
+   *  - OVERSTATES (DANGEROUS, and this shipped): `FETCH_HEAD`'s mtime moves
+   *    for ANY fetch — a different remote, an explicit URL — while
+   *    `refs/remotes/origin/main` stays put. Measured: after `git fetch
+   *    other`, the mtime was fresh while origin/main was genuinely stale.
+   *    A content match against that stale base then walked the gate to a
+   *    false `current`, with "fetched moments ago" rendered beside it.
+   *    **That is precisely the bug the freshness gate exists to prevent.**
+   *
+   * So this must be derived, never read as a bare mtime: `FETCH_HEAD`'s
+   * CONTENT records the source of every line, which is what makes the
+   * narrow question answerable at all. Implementation in
+   * `realCurrencyGit`.
+   *
+   * When no evidence qualifies — a clone that never fetched this branch
+   * from this remote, or one whose records cannot be read — this MUST
+   * report `ok: false` with the reason, so the caller renders
+   * `unknown, because X`. **Never a bare mtime, never a guessed figure:**
+   * a number that is confidently wrong here is worse than no number,
+   * because a reader cannot tell it is wrong.
    */
-  lastFetchedAt(): GitOpResult<{ iso: string }>;
+  lastFetchedAt(remote: string, branch: string): GitOpResult<{ iso: string }>;
   /** Count of commits reachable from `to` but not from `from` (`git rev-list --count from..to`) — supplementary evidence only, see module doc comment. */
   commitsBetween(from: string, to: string): GitOpResult<{ count: number }>;
 }
@@ -107,19 +128,76 @@ function run(dir: string, args: string[]): GitOpResult<{ out: string }> {
  * anywhere above it.
  */
 /**
- * The git-common-dir (shared across worktrees) — where `refs/remotes/...`,
- * their reflogs, AND `FETCH_HEAD` all actually live. VERIFIED, not assumed:
- * in a real `git worktree add` checkout (this repo's own worktree layout,
- * per every agent's brief), `FETCH_HEAD` was measured living under
- * `--git-common-dir`, NOT the per-worktree `--git-dir` — a `git fetch` run
- * in one worktree updates `FETCH_HEAD` for every worktree sharing this
- * common dir, which is exactly the semantics `lastFetchedAt` wants (it asks
- * "did THIS CLONE fetch", not "did this specific worktree checkout fetch").
+ * The git-common-dir — where `refs/remotes/...` and their reflogs actually
+ * live, SHARED across every worktree of this clone.
+ *
+ * CORRECTION (BUTCHR-163). An earlier version of this comment claimed, as
+ * measured, that `FETCH_HEAD` also lives here, so that "a `git fetch` run in
+ * one worktree updates `FETCH_HEAD` for every worktree sharing this common
+ * dir". **That is FALSE.** Re-measured by controlled experiment on git
+ * 2.43.0, and independently reproduced: a `git fetch` run inside a linked
+ * worktree CREATES `<common-dir>/worktrees/<name>/FETCH_HEAD` and leaves the
+ * common-dir `FETCH_HEAD` untouched. In a fresh clone the common-dir
+ * `FETCH_HEAD` does not exist at all.
+ *
+ * The likeliest origin of the wrong claim: it was measured in a MAIN
+ * checkout, where `--git-dir` and `--git-common-dir` are the same path — so
+ * the very distinction it meant to test could not appear. A fixture whose
+ * starting state cannot express the thing under test proves nothing.
+ *
+ * THE ASYMMETRY IS THE BUG, and it is why `lastFetchedAt` below cannot be a
+ * bare mtime of this directory's `FETCH_HEAD`:
+ *   - `logs/refs/remotes/origin/main`  -> COMMON dir    (shared)
+ *   - `FETCH_HEAD`                     -> PER-WORKTREE  (not shared)
+ * So `refChangedAt` sees a worktree's fetch and `lastFetchedAt` did not —
+ * understating fetch recency without bound. Measured live on this fleet:
+ * agents routinely fetch inside their own linked worktrees.
  */
 function resolveGitCommonDir(dir: string): GitOpResult<{ path: string }> {
   const r = run(dir, ["rev-parse", "--git-common-dir"]);
   if (!r.ok) return r;
   return { ok: true, path: isAbsolute(r.out) ? r.out : join(dir, r.out) };
+}
+
+/**
+ * Compare remote URLs by content, not by spelling.
+ *
+ * MEASURED, BUTCHR-163 — this is not defensive tidying, it is load-bearing:
+ * git STRIPS a trailing `.git` when it records a fetch source in
+ * `FETCH_HEAD`. On this repo, `remote.origin.url` is
+ * `https://github.com/brooswit-factory/butchr.git` while **0 of 273**
+ * `FETCH_HEAD` lines carry that suffix. So a naive string equality matches
+ * NOTHING and every verdict degrades to `unknown` —
+ * **and that failure is invisible**, because it renders as a principled
+ * "could not check", indistinguishable from the honest one this module
+ * exists to produce. A permanent false `unknown` is not an improvement on a
+ * false `current`; it is the same disease with better manners.
+ */
+export function normaliseRemoteUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+}
+
+/**
+ * Does this `FETCH_HEAD` body record `branch` fetched from `wantUrl`?
+ *
+ * Line format, both shapes measured in this repo's own file:
+ *   `<sha>\t\tbranch 'BUTCHR-144' of https://github.com/owner/repo`
+ *   `<sha>\tnot-for-merge\tbranch 'main' of https://github.com/owner/repo`
+ * The middle field is EMPTY for the for-merge line, so split on tabs and
+ * tolerate an empty column — splitting on whitespace mis-parses both.
+ *
+ * A clone fetches many branches, so most lines legitimately name something
+ * other than `branch`. Filtering them out is the correct behaviour, never an
+ * error condition.
+ */
+export function fetchHeadNames(content: string, wantUrl: string, branch: string): boolean {
+  for (const line of content.split("\n")) {
+    const fields = line.split("\t");
+    if (fields.length < 3) continue;
+    const m = /^branch '(.+)' of (.+)$/.exec(fields[2]!.trim());
+    if (m && m[1] === branch && normaliseRemoteUrl(m[2]!) === wantUrl) return true;
+  }
+  return false;
 }
 
 export function realCurrencyGit(dir: string): CurrencyGit {
@@ -149,15 +227,55 @@ export function realCurrencyGit(dir: string): CurrencyGit {
       }
       return { ok: false, error: `no reflog file or loose ref file found for ${ref} under ${gitDir.path} (likely packed, with reflogs disabled) — cannot determine when its value last changed without guessing` };
     },
-    lastFetchedAt() {
+    lastFetchedAt(remote, branch) {
       const gitDir = resolveGitCommonDir(dir);
       if (!gitDir.ok) return { ok: false, error: `could not resolve the git directory to check FETCH_HEAD: ${gitDir.error}` };
-      const fetchHead = join(gitDir.path, "FETCH_HEAD");
+
+      const configured = run(dir, ["config", "--get", `remote.${remote}.url`]);
+      if (!configured.ok) return { ok: false, error: `could not read remote.${remote}.url, so no FETCH_HEAD record can be attributed to ${remote}: ${configured.error}` };
+      const wantUrl = normaliseRemoteUrl(configured.out);
+
+      // Candidates: the common dir AND every linked worktree's git-dir.
+      // Read from the filesystem rather than `git worktree list` on purpose —
+      // this runs on the agent-spawn path, and this clone has been measured
+      // with 78 linked worktrees; that is 78 file reads, never 78 subprocesses.
+      const candidates = [join(gitDir.path, "FETCH_HEAD")];
       try {
-        return { ok: true, iso: statSync(fetchHead).mtime.toISOString() };
-      } catch (e) {
-        return { ok: false, error: `no FETCH_HEAD under ${gitDir.path} — this checkout has apparently never fetched from a remote: ${(e as Error).message.split("\n")[0]}` };
+        for (const name of readdirSync(join(gitDir.path, "worktrees"))) candidates.push(join(gitDir.path, "worktrees", name, "FETCH_HEAD"));
+      } catch {
+        // No `worktrees/` directory: a clone with no linked worktrees. Not an
+        // error — the common dir's own FETCH_HEAD is still a valid candidate.
       }
+
+      let newest: number | null = null;
+      let scanned = 0;
+      for (const candidate of candidates) {
+        let content: string;
+        let mtimeMs: number;
+        try {
+          content = readFileSync(candidate, "utf8");
+          mtimeMs = statSync(candidate).mtimeMs;
+        } catch {
+          continue; // this worktree never fetched; absence is not an error
+        }
+        scanned++;
+        // A FETCH_HEAD is evidence about `branch` from `remote` only if the
+        // fetch that WROTE it recorded that branch from that URL. The file is
+        // overwritten wholesale on every fetch, so its mtime describes only
+        // its current content — which is exactly what makes this check sound.
+        if (fetchHeadNames(content, wantUrl, branch) && (newest === null || mtimeMs > newest)) newest = mtimeMs;
+      }
+
+      if (newest === null) {
+        return {
+          ok: false,
+          error:
+            scanned === 0
+              ? `no readable FETCH_HEAD in ${gitDir.path} or any of its worktrees — this clone has apparently never fetched from a remote`
+              : `scanned ${scanned} FETCH_HEAD record(s) under ${gitDir.path} and none recorded branch '${branch}' from ${wantUrl} — this clone's most recent fetches were of something else, so none of them bounds how stale ${remote}/${branch} is here`,
+        };
+      }
+      return { ok: true, iso: new Date(newest).toISOString() };
     },
     commitsBetween(from, to) {
       const r = run(dir, ["rev-list", "--count", `${from}..${to}`]);
@@ -170,6 +288,14 @@ export function realCurrencyGit(dir: string): CurrencyGit {
 
 /** The local remote-tracking ref this module compares the running build against. Never fetched — see module doc comment. */
 export const BASE_REF = "refs/remotes/origin/main";
+
+/**
+ * `BASE_REF`'s two halves, named separately because `lastFetchedAt` has to
+ * ask about them individually: "did this clone fetch BRANCH from REMOTE".
+ * Kept beside `BASE_REF` so the three can never drift apart.
+ */
+export const BASE_REMOTE = "origin";
+export const BASE_BRANCH = "main";
 
 /** What `resolveCurrency` needs to know about the running build — a structural SUBSET of `build-identity.ts`'s `BuildIdentity`, declared locally (not imported) so this module has zero runtime dependency on that one. */
 export interface RunningBuild {
@@ -198,7 +324,21 @@ export interface ResolvedBase {
   /** Best-effort ISO timestamp of when `ref`'s VALUE last changed — `null` (with a reason, never a guess) when undeterminable. NOT "when this host last fetched" — see the interface doc comment. */
   changedAt: string | null;
   changedAtUnknownReason: string | null;
-  /** Best-effort ISO timestamp of when this checkout last fetched from a remote AT ALL (`FETCH_HEAD`'s mtime) — `null` (with a reason, never a guess) when undeterminable, e.g. a checkout that has never fetched. */
+  /**
+   * Best-effort ISO timestamp of when this clone last fetched **`ref`'s own
+   * branch from its own remote** — NOT "when it last fetched anything".
+   *
+   * BUTCHR-163 narrowed this deliberately. It was the mtime of a single
+   * `FETCH_HEAD`, which answered the broad question and was wrong in both
+   * directions: it missed fetches made in linked worktrees (that file is
+   * per-worktree), and it counted a fetch of an unrelated remote as freshness
+   * for this base — which walked the gate to a false `current`. See
+   * `CurrencyGit.lastFetchedAt` for the derivation that replaced it.
+   *
+   * `null` (with a reason, never a guess) when undeterminable — including the
+   * now-ordinary case of a clone whose recent fetches were all of something
+   * else. That is a genuine could-not-check, not a defect.
+   */
   fetchedAt: string | null;
   fetchedAtUnknownReason: string | null;
 }
@@ -240,7 +380,7 @@ export function resolveCurrency(running: RunningBuild, git: CurrencyGit): Curren
   if (!baseTree.ok) return { status: "unknown", reason: `${BASE_REF} (${baseSha}) has no readable tree: ${baseTree.error}` };
 
   const changedAt = git.refChangedAt(BASE_REF);
-  const fetchedAt = git.lastFetchedAt();
+  const fetchedAt = git.lastFetchedAt(BASE_REMOTE, BASE_BRANCH);
   const base: ResolvedBase = {
     ref: BASE_REF,
     sha: baseSha,
@@ -354,14 +494,38 @@ export function renderBuildCurrencyLines(build: BuildSummary, currency: Currency
   const dirtyQualifier = currency.dirtyUndeterminable ? " (the running tree's dirty flag could not be determined)" : "";
   const baseTag = `${currency.base.ref} (${shortSha(currency.base.sha)})`;
 
+  // BUTCHR-163, decision (i): the base's own age goes ON THE VERDICT LINE,
+  // inseparable from the verdict itself.
+  //
+  // The gate below only checks that the two freshness signals can be READ,
+  // never that they are RECENT — nothing compares either age to anything. So
+  // a clone that last fetched the base a week ago still renders `CURRENT`.
+  // That is deliberate, and the alternative was considered and DECLINED:
+  //
+  //   A staleness THRESHOLD would be a judgement about whether being behind
+  //   is a FAULT, and being behind is not always a fault — a deliberate pin,
+  //   a paused deploy during an incident, and a rollback are all legitimate
+  //   states in which a daemon SHOULD be behind. A check that cannot tell
+  //   "behind because the deploy broke" from "behind on purpose" is a
+  //   crying-wolf alert, and this estate has already paid for one. The right
+  //   threshold would also depend on the deploy cadence, which was measured
+  //   (BUTCHR-274) as "whenever a person acts" — there is no number to pick.
+  //
+  // So: report what was OBSERVED, and leave what it MEANS to the reader —
+  // but put the observation where a reader skimming for the word `CURRENT`
+  // cannot miss it. Rendering it only in the trailing `comparison base:`
+  // sentence (as this module did before) is not enough: that sentence is
+  // after the verdict, and the skimming reader never reaches it.
+  const baseAge = currency.base.fetchedAt ? `base last fetched ${currency.base.fetchedAt}` : `BASE FRESHNESS UNKNOWN (${currency.base.fetchedAtUnknownReason})`;
+
   if (currency.status === "current") {
-    lines.push(`- currency: CURRENT — matches ${baseTag} content-for-content${dirtyQualifier}`);
+    lines.push(`- currency: CURRENT — matches ${baseTag} content-for-content, ${baseAge}${dirtyQualifier}`);
   } else if (currency.commitsAhead === 0) {
-    lines.push(`- currency: STALE — behind ${baseTag} by ${currency.commitsBehind ?? "an unknown number of"} commit(s)${dirtyQualifier}`);
+    lines.push(`- currency: STALE — behind ${baseTag} by ${currency.commitsBehind ?? "an unknown number of"} commit(s), ${baseAge}${dirtyQualifier}`);
   } else if (currency.commitsAhead !== null && currency.commitsAhead > 0) {
-    lines.push(`- currency: DIVERGED from ${baseTag} — ahead by ${currency.commitsAhead}, behind by ${currency.commitsBehind ?? "an unknown number of"} commit(s)${dirtyQualifier}`);
+    lines.push(`- currency: DIVERGED from ${baseTag} — ahead by ${currency.commitsAhead}, behind by ${currency.commitsBehind ?? "an unknown number of"} commit(s), ${baseAge}${dirtyQualifier}`);
   } else {
-    lines.push(`- currency: STALE relative to ${baseTag} — content differs; ahead/behind commit counts unavailable${dirtyQualifier}`);
+    lines.push(`- currency: STALE relative to ${baseTag} — content differs; ahead/behind commit counts unavailable, ${baseAge}${dirtyQualifier}`);
   }
 
   // Two DISTINCT signals, worded so neither can be misread as the other —
@@ -370,8 +534,8 @@ export function renderBuildCurrencyLines(build: BuildSummary, currency: Currency
   // whether this checkout is actually keeping up.
   const changedText = currency.base.changedAt ? `its value last changed ${currency.base.changedAt}` : `its value's last-change time is unknown (${currency.base.changedAtUnknownReason})`;
   const fetchedText = currency.base.fetchedAt
-    ? `this checkout last fetched from a remote at all ${currency.base.fetchedAt}`
-    : `this checkout's last-fetch time is unknown (${currency.base.fetchedAtUnknownReason})`;
+    ? `this checkout last fetched that base branch from its remote ${currency.base.fetchedAt}`
+    : `this checkout's last-fetch time FOR THAT BASE BRANCH is unknown (${currency.base.fetchedAtUnknownReason})`;
   lines.push(
     `- comparison base: ${currency.base.ref} — ${changedText}; ${fetchedText}. Both read from THIS DAEMON's own local checkout, never fetched over the network for this check, and never a claim about any other daemon that may also be running on this host. The verdict above reflects only what this daemon's checkout of main already had, not main right now.`,
   );
