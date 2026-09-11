@@ -969,7 +969,13 @@ async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boo
  * whose `agent:*` label is anything else is trusted at face value — an
  * `admission:withheld` marker under any other `agent:*` value is stale or
  * contradictory (admission only ever withholds a candidate with no running
- * agent) and is deliberately ignored rather than asserted.
+ * agent) and is deliberately ignored rather than asserted. This rule
+ * (`staffingFromAgentLabel` below) is the SAME rule on BOTH paths that can
+ * reach it — the label branch, and the `probed === false` herd branch when
+ * the marker is present — never two independently-drifting versions of it
+ * (review round 1 caught exactly that: the herd branch once hardcoded
+ * `observedLabel: "agent:none"` without reading it, reachable via the
+ * stranded-marker shape described below).
  *
  * WHY A SEPARATE LABEL, NOT A NEW `agent:*` VALUE (the mixed-build hazard):
  * this fleet's daemons deploy INDEPENDENTLY, and the restart-that-pulls new
@@ -988,6 +994,33 @@ async function probeCoversWorker(ops: AtlassianOps, issue: unknown): Promise<boo
  * confident wrong one. This is the same discipline this whole verdict type
  * exists to enforce, applied to the carrier itself, not only to the value.
  */
+/**
+ * BUTCHR-352 (review round 1 fix): THE single rule for turning an OBSERVED
+ * `agent:*` label (or its genuine absence) plus whether the
+ * `admission:withheld` marker is present into a staffing verdict — shared by
+ * BOTH the `probed === false` herd-branch and the label branch below, so the
+ * two can never independently drift on the same ticket state again. (Round
+ * 1's defect: the herd-branch hardcoded `observedLabel: "agent:none"` without
+ * reading it, and applied a narrower rule than the label branch for the
+ * identical labels — reachable via the exact stranded-ticket shape this
+ * file's own doc describes, an `admission:withheld` marker surviving on a
+ * ticket whose `agent:*` label an old-build sweep never touched.)
+ *
+ * No `agent:*` label at all -> `could-not-look`, regardless of the marker: a
+ * stray marker with no `agent:*` label is not itself evidence of a running
+ * (or not-running) agent. Any `agent:*` value other than `none` -> `staffed`,
+ * and the marker is deliberately ignored — a stale/contradictory combination
+ * (admission only ever withholds a candidate with no running agent), never
+ * asserted. `agent:none` -> `withheld` if the marker is present, else
+ * `not-staffed`. `observedLabel` in the result is always the REAL value read,
+ * never a literal — absent only when no `agent:*` label was found at all.
+ */
+function staffingFromAgentLabel(observedLabel: string | undefined, withheldMarker: boolean): { staffing: StaffingVerdict; observedLabel?: string } {
+  if (observedLabel === undefined) return { staffing: "could-not-look" };
+  if (observedLabel !== `${AGENT_PREFIX}none`) return { staffing: "staffed", observedLabel };
+  return { staffing: withheldMarker ? "withheld" : "not-staffed", observedLabel };
+}
+
 export async function checkWorker(
   ops: AtlassianOps,
   callerKey: string,
@@ -1018,12 +1051,18 @@ export async function checkWorker(
         // one" trap named on this ticket: a worker withheld on the CALLER's
         // OWN daemon takes exactly this path, so it must be checked here,
         // not only in the label branch below (which a `probed === true`/
-        // `false` result never reaches). Narrowly checking for the withheld
-        // marker (rather than falling through to the full label branch)
-        // keeps every OTHER probed===false case — including "no agent:*
-        // label at all" — returning exactly what it always has.
+        // `false` result never reaches). Checked ONLY when the marker is
+        // present, via the SAME rule (`staffingFromAgentLabel`) the label
+        // branch uses below — reading the REAL agent:* label rather than
+        // assuming it, so this ordering can never disagree with the label
+        // branch's own answer for the identical ticket state. A ticket with
+        // no marker at all is untouched here — it keeps returning exactly
+        // what it always has (`not-staffed`, sourced from the herd read
+        // itself, not the label).
         if (labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`)) {
-          return { key: workerKey, status, staffing: "withheld", source: "label", observedLabel: `${AGENT_PREFIX}none` };
+          const observedLabel = labelsOf(issue).find((l) => l.startsWith(AGENT_PREFIX));
+          const result = staffingFromAgentLabel(observedLabel, true);
+          return { key: workerKey, status, source: "label", staffing: result.staffing, ...(result.observedLabel !== undefined ? { observedLabel: result.observedLabel } : {}) };
         }
         return { key: workerKey, status, staffing: "not-staffed", source: "herd" };
       }
@@ -1034,21 +1073,11 @@ export async function checkWorker(
   }
 
   const observedLabel = labelsOf(issue).find((l) => l.startsWith(AGENT_PREFIX));
-  if (observedLabel === undefined) {
-    return { key: workerKey, status, staffing: "could-not-look", source: "label", ...(outOfScope ? { probeOutOfScope: true } : {}) };
-  }
-  if (observedLabel !== `${AGENT_PREFIX}none`) {
-    // BUTCHR-352: any OTHER agent:* value is trusted at face value — an
-    // admission:withheld marker alongside it would be stale/contradictory
-    // (admission only ever withholds a candidate with no running agent) and
-    // is deliberately ignored here rather than asserted; see this
-    // function's own doc comment.
-    return { key: workerKey, status, source: "label", observedLabel, staffing: "staffed", ...(outOfScope ? { probeOutOfScope: true } : {}) };
-  }
-  const withheld = labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`);
+  const withheldMarker = labelsOf(issue).includes(`${ADMISSION_PREFIX}withheld`);
+  const result = staffingFromAgentLabel(observedLabel, withheldMarker);
   return {
-    key: workerKey, status, source: "label", observedLabel,
-    staffing: withheld ? "withheld" : "not-staffed",
+    key: workerKey, status, source: "label", staffing: result.staffing,
+    ...(result.observedLabel !== undefined ? { observedLabel: result.observedLabel } : {}),
     ...(outOfScope ? { probeOutOfScope: true } : {}),
   };
 }
