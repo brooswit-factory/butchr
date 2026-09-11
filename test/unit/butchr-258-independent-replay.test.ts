@@ -752,105 +752,97 @@ describe("SECTION 6b — THE check_in SEAM: the REAL handler (src/tools/defs.ts)
 });
 
 // ===========================================================================
-// SECTION 7 — THE BLIND SPOT, CONSTRUCTED: a comment/epic-comment outside
-// the reader's page window is never observed, therefore never seen,
-// therefore never wakes anything — and the admission's WINDOW SIZE is
-// checked against what is actually findable in this codebase, per axis.
+// SECTION 7 — THE PAGINATION BLIND SPOT, FIXED (BUTCHR-309): this section
+// used to construct the blind spot (a comment/epic-comment outside the
+// reader's page window was never observed, therefore never seen, therefore
+// never woke anything) and separately verdict that `getPageComments` had no
+// findable numeric window at all. BUTCHR-309 closes both readers' windows by
+// paginating each to exhaustion — this section is REWRITTEN, not deleted, to
+// assert the post-fix truth per the ticket's own instruction ("update it
+// deliberately, do not just delete its assertions"; "a green test whose
+// prose now describes a defect that no longer exists is exactly the
+// staleness failure mode this fleet rejects").
 // ===========================================================================
-describe("SECTION 7 — the pagination blind spot, constructed per axis", () => {
-  // EPICS AXIS — the window size IS a findable, coded constant:
-  // `AtlassianOps.getIssueComments`'s own doc comment (src/tools/atlassian.ts)
-  // states "NEWEST FIRST, capped — the SAME ordering and cap as
-  // src/atlassian/client.ts's AtlassianClient.comments() (orderBy: "-created",
-  // maxResults: 20)", and the real implementation
-  // (src/tools/atlassian-real.ts, getIssueComments) passes
-  // `maxResults: 20` explicitly. This test constructs exactly the admitted
-  // blind spot: an epic whose OLDEST never-seen comment sits beyond a
-  // 20-item newest-first window, and confirms the mechanism stays silent —
-  // not merely asserts the admission's prose, but exercises it against a
-  // fake reader that actually enforces the cap the same way.
+describe("SECTION 7 — the pagination blind spot, CLOSED per axis (BUTCHR-309)", () => {
+  // EPICS AXIS — REWRITTEN: the old test constructed a FAKE reader that
+  // itself enforced the real 20-item cap, to demonstrate that discovery adds
+  // no second cap of its own on top of whatever the reader returns. That
+  // property of discovery (it trusts its reader completely, never
+  // re-filters or re-thresholds what comes back — DoD 3, "observe first,
+  // classify second") is UNCHANGED and still worth demonstrating; what
+  // changed is that the REAL reader (src/tools/atlassian-real.ts,
+  // getIssueComments) no longer caps at 20 at all — it paginates to
+  // exhaustion (see that op's own doc comment on AtlassianOps). This fixture
+  // now stands in for the FIXED reader: it returns MORE than 20 comments,
+  // including one that would have sat beyond the old cap, and asserts it
+  // IS observed and IS classified unseen — the exact opposite outcome from
+  // the pre-fix version of this test.
   //
-  // FALSIFIER: if `unseenEpicCommentIds` ever contained the id this fixture
-  // places beyond the window, that would mean discovery has some way to see
-  // past a capped reader's own return value — which would be a surprise
-  // worth reporting on its own (a hidden second read path), not a pass.
-  test("EPICS AXIS: a never-seen comment beyond the reader's own 20-item newest-first cap is never observed, therefore never wakes anything", async () => {
+  // FALSIFIER: if `unseenEpicCommentIds` did NOT contain the id this fixture
+  // places beyond the old 20-item boundary, that would mean something in
+  // this module (not the reader) is silently re-introducing a cap of its
+  // own — a regression this test exists to catch now that the real reader's
+  // cap is gone.
+  test("EPICS AXIS: a comment beyond the OLD 20-item newest-first boundary is observed and classified unseen — the reader no longer caps (BUTCHR-309), and discovery still adds no cap of its own", async () => {
     // 21 comments total; ids "1".."21" by creation order, id "1" oldest,
-    // NEVER previously seen. A newest-first, maxResults:20 reader returns
-    // ids "21".."2" — "1" is the one the cap excludes, exactly BUTCHR-199's
-    // admitted shape ("a comment that never appears inside the reader's page
-    // window is never observed").
+    // NEVER previously seen. Unlike the pre-fix fixture (which reversed and
+    // sliced to 20 to mimic the old capped reader), this fixture returns ALL
+    // 21 — standing in for the real, now-exhaustively-paginated reader.
     const allIds = Array.from({ length: 21 }, (_, i) => String(i + 1));
-    const cappedNewestFirst = [...allIds].reverse().slice(0, 20); // "21".."2" — excludes "1"
     const w = fakeWorld({
       properties: { ACME: PROPERTY_A },
       pageVersions: { "doc-A": 1 },
       pageComments: { "doc-A": [] },
       epicsInReview: [{ key: "ACME-1", summary: "e", status: "In Review", issuetype: "Epic", assignee: null, parent: null, updated: "", labels: [] }],
-      epicComments: { "ACME-1": cappedNewestFirst.map((id) => ({ id })) }, // the fake READER already enforces the real cap
+      epicComments: { "ACME-1": allIds.map((id) => ({ id })) }, // the fake READER stands in for the fixed, uncapped one
     });
     const [acme] = await createProjectResourceType(w.deps).discovery.search();
-    expect(acme!.observedEpics[0]!.commentIds).not.toContain("1"); // the reader itself never returned it
-    expect(acme!.unseenEpicCommentIds["ACME-1"]).not.toContain("1"); // and so it can never be classified as unseen either
-    // The mechanism is SILENT on it, exactly as admitted — not merely
-    // "eventually consistent": nothing in this module retries with a
-    // different page or notices the gap.
+    expect(acme!.observedEpics[0]!.commentIds).toContain("1"); // the id the OLD cap would have excluded is now returned
+    expect(acme!.unseenEpicCommentIds["ACME-1"]).toContain("1"); // and correctly classified unseen — discovery adds no cap of its own
   });
 
-  // ROOT-DOC (COMMENT) AXIS — ⚠ A VERDICT, NOT A CONSTRUCTED REPRODUCTION:
-  // unlike the epics axis, this file did NOT find a coded, numeric window
-  // size for `getPageComments` anywhere in this repository. Checked:
-  // `AtlassianOps.getPageComments`'s own doc comment (src/tools/atlassian.ts)
-  // documents author/created semantics and the batch-call trap at length,
-  // but states NO numeric cap. The real implementation
-  // (src/tools/atlassian-real.ts, `getPageComments`) calls
-  // `wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" })`
-  // with NO `limit` parameter — confluence.js's own `getPageFooterComments`
-  // (v2 API) accepts an optional `limit` (its request builder forwards
-  // `parameters.limit` verbatim; see that package's own
-  // `dist/v2/api/comment.js`), so an omitted `limit` falls through to
-  // whatever the Confluence Cloud REST API's OWN server-side default is for
-  // `GET /wiki/api/v2/pages/{id}/footer-comments` — a number this file
-  // cannot measure (issue-tier, no live Confluence access) and did not find
-  // asserted anywhere in this codebase's comments, tests, or docs/.
+  // ROOT-DOC (COMMENT) AXIS — REWRITTEN: the old test read
+  // `atlassian-real.ts`'s source and asserted the ABSENCE of `limit`,
+  // `_links` and `cursor` in `getPageComments`'s own body — its own stated
+  // falsifier was exactly this ticket's change ("if getPageComments's call
+  // site ever gains a limit argument or a _links.next/cursor follow … this
+  // test must fail"). It has now failed for the correct reason, and is
+  // rewritten here to assert the new truth from the same real source text,
+  // never a hand-typed `expect(true).toBe(true)` (that shape was already
+  // rejected once at review — see git history on this exact test).
   //
-  // THE VERDICT, per the ticket's DoD item 9 ("the admission checked against
-  // the real boundary including the measured window size per axis"): the
-  // blind-spot ADMISSION itself (`ProjectResource.observedCommentIds`'s own
-  // doc comment, and BUTCHR-199's doc) is TRUE in shape (a page-window bound
-  // exists and is unfixed) but UNDERSTATES on this specific point — it names
-  // the epics axis's window as findable (this file confirms it: 20) while
-  // never stating the comment axis's own window size, and neither does this
-  // module's source. That asymmetry is itself worth reporting: one axis's
-  // blind spot is a quantified, testable boundary; the other axis's is
-  // qualitatively admitted but not quantified anywhere in-repo.
-  // A REAL, BREAKABLE check — reads src/tools/atlassian-real.ts's own source
-  // rather than asserting a hand-typed boolean (the prior version of this
-  // test was `expect(true).toBe(true)`, flagged in review as reporting its
-  // own conclusion rather than reading for it — exactly the staleness
-  // failure mode this ticket exists to catch, inside its own artefact).
-  // FALSIFIER, stated before this version was run: if `getPageComments`'s
-  // call site ever gains a `limit` argument or a `_links.next`/cursor
-  // follow, OR if the sibling `getChildPages` in the same file ever LOSES
-  // its own pagination follow, this test must fail — either change would
-  // mean the asymmetry this section reports no longer holds.
-  test("ROOT-DOC AXIS: getPageComments passes no limit and follows no cursor, unlike the sibling getChildPages in the same file — the asymmetry itself, read from source", () => {
+  // FALSIFIER: if `getPageComments`'s call site ever LOSES its `limit`
+  // argument or its `_links.next`/cursor follow, OR if the sibling
+  // `getChildPages` in the same file ever loses its own pagination follow,
+  // this test must fail — either change would mean the fix this ticket made
+  // has regressed.
+  test("ROOT-DOC AXIS: getPageComments now passes a `limit` and follows `_links.next`'s cursor, matching the sibling getChildPages in the same file — the asymmetry this section used to report is gone", () => {
     const source = readFileSync(join(import.meta.dir, "..", "..", "src", "tools", "atlassian-real.ts"), "utf8");
-    const getPageCommentsBody = source.slice(source.indexOf("getPageComments:"), source.indexOf("getPageComments:") + 400);
-    // (1) no `limit` argument on the root-doc comment read's own call site.
-    expect(getPageCommentsBody).toContain('wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" })');
-    expect(getPageCommentsBody).not.toMatch(/getPageFooterComments\([^)]*limit/s);
-    // (2) no `_links.next` / cursor follow anywhere in that call's own body.
-    expect(getPageCommentsBody).not.toContain("_links");
-    expect(getPageCommentsBody).not.toContain("cursor");
-    // (3) the sibling getChildPages, in the SAME file, DOES paginate — the
-    // asymmetry DoD item 9 asks to be checked, not just the comment-axis gap
-    // alone.
+    const getPageCommentsBody = source.slice(source.indexOf("getPageComments:"), source.indexOf("searchProjects:"));
+    // (1) a `limit` argument is now present on the root-doc comment read's
+    // own call site.
+    expect(getPageCommentsBody).toMatch(/getPageFooterComments\(\{[^}]*limit/s);
+    // (2) a `_links.next` / cursor follow is now present in that call's own
+    // body.
+    expect(getPageCommentsBody).toContain("_links");
+    expect(getPageCommentsBody).toContain("cursor");
+    // (3) the sibling getChildPages, in the SAME file, still paginates the
+    // same way — the two are no longer asymmetric.
     const getChildPagesBody = source.slice(source.indexOf("getChildPages:"), source.indexOf("getChildPages:") + 400);
     expect(getChildPagesBody).toContain("limit: 50");
     expect(getChildPagesBody).toContain("_links?.next");
     expect(getChildPagesBody).toContain("cursor");
   });
+
+  // MUTATION CHECK (DoD 6(b)): this is the source-reading half's own
+  // mutation check, distinct from the transport-level ones in
+  // atlassian-real.test.ts. Actually run: temporarily revert
+  // `getPageComments` to the pre-fix, single-call body (no limit, no
+  // cursor) and confirm the ROOT-DOC AXIS test above fails. Observed output,
+  // pasted verbatim into the PR per DoD 6(b) — do not re-run this by
+  // uncommenting code in this file, that would be the "claim, not a check"
+  // the ticket warns against; the observed failure is recorded in the PR
+  // description instead.
 });
 
 // ===========================================================================
