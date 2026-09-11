@@ -677,6 +677,31 @@ describe("renderDashboard: the currency line carries its own age, never a bare '
 });
 
 // ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (Y2): a DECLINED census source's own entry must
+// carry the could-not-check CLASS, never the known one — the page's own
+// stylesheet carries BOTH `.admsrc.cnc{color:#f0b429}` (amber) and
+// `.admsrc.known{color:#3fb950}` (GREEN), so swapping just the class (text
+// left untouched) paints a could-not-check source in the success colour.
+// This is the exact inverse of a mutation that keeps the class and changes
+// the text: here the words still say "COULD NOT CHECK" but the colour lies.
+// A sibling assertion that a CHECKED source still carries `known` guards
+// against the swap going the other way too.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a declined census source's own entry carries the could-not-check class, never the known class (BUTCHR-344 [correction], review item Y2)", () => {
+  test("a declined source renders admsrc cnc (never admsrc known); a checked source renders admsrc known (never admsrc cnc)", async () => {
+    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue", "project"] });
+    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked; "project" never reports -> declined
+    const census = controller.census();
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    expect(html).toMatch(/class="admsrc cnc" data-source="project"/);
+    expect(html).not.toMatch(/class="admsrc known" data-source="project"/);
+    expect(html).toMatch(/class="admsrc known" data-source="issue"/);
+    expect(html).not.toMatch(/class="admsrc cnc" data-source="issue"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BUTCHR-344 (L5): the hint's own wording — nothing else on this page reads
 // it, so a mutation that quietly over-claims ("opens a terminal window for
 // that agent", stated as a plain fact) survives unless something is scoped
