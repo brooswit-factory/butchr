@@ -782,6 +782,15 @@ describe("createEscalator — escalated state survives a flicker (KAN-756 PR #40
     await h.poll("p1", "KAN-1", prompt);
     expect(h.posted.length).toBe(2); // exactly one follow-up
     expect(h.posted[1]!.text).toMatch(/still waiting on the decision/);
+    // BUTCHR-318: this follow-up is posted on ANY blocked issue — Epic,
+    // Story or Task — so its own promise must be true for all three at
+    // once (tier-neutral wording, since issue type isn't cheaply available
+    // here) rather than the old unconditional "escalates to whoever watches
+    // you", which was false for an In Progress epic.
+    expect(h.posted[1]!.text).toMatch(/Story's or Task's boss reads that ticket regardless of status/);
+    expect(h.posted[1]!.text).toMatch(/an Epic's project boss reads it only while the epic is In Review/);
+    expect(h.posted[1]!.text).toMatch(/an In Progress epic reaches nobody this way and should escalate to a human directly instead/);
+    expect(h.posted[1]!.text).not.toMatch(/escalates to whoever watches you/);
 
     // Three more flickers past the follow-up: still exactly one, not a
     // second.

@@ -703,7 +703,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       } else {
         await deps.addComment(
           issue,
-          `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket so it escalates to whoever watches you. ${FOLLOWUP_STAGE}`,
+          `${MARKER} ${issue} still waiting on the decision above (fingerprint ${s.fp}) — answer it, or if you cannot decide, say so ON YOUR OWN ticket: a Story's or Task's boss reads that ticket regardless of status, but an Epic's project boss reads it only while the epic is In Review — an In Progress epic reaches nobody this way and should escalate to a human directly instead. ${FOLLOWUP_STAGE}`,
         );
         s.followedUpAt = deps.now();
         log(`follow-up posted ${issue} fp=${s.fp}`);

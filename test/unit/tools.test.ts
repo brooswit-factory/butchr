@@ -825,6 +825,30 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(Object.keys(tools.ask_boss!.input).sort()).toEqual(["text"]);
   });
 
+  // BUTCHR-318: report_to_boss/ask_boss's own descriptions must state, for
+  // an EPIC caller specifically, that the boss is a project which reads an
+  // epic's ticket comments only while that epic is In Review — and must
+  // NOT weaken the unconditional Story/Task promise while doing it.
+  test("report_to_boss's description states the Epic→Project conditionality without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.report_to_boss!.description;
+    expect(d).toMatch(/EPIC caller/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while that epic is In Review/);
+    expect(d).toMatch(/nobody is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller this always reaches its boss/);
+  });
+
+  test("ask_boss's description states the same Epic→Project conditionality for its [ask] marker, without weakening Story/Task", () => {
+    const tools = rigNoOp();
+    const d = tools.ask_boss!.description;
+    expect(d).toMatch(/EPIC caller it is conditional/);
+    expect(d).toMatch(/boss is a PROJECT/);
+    expect(d).toMatch(/only while you are In Review/);
+    expect(d).toMatch(/no agent is woken by it/);
+    expect(d).toMatch(/STORY or TASK caller that marker is always eventually found/);
+  });
+
   test("submit_to_boss takes NO arguments at all", () => {
     const tools = rigNoOp();
     expect(Object.keys(tools.submit_to_boss!.input)).toEqual([]);
