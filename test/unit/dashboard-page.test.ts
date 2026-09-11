@@ -577,6 +577,56 @@ describe("renderDashboard: residency's could-not-check case is never rendered as
 });
 
 // ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (X6): the OPPOSITE gap from K5 — a KNOWN, non-null
+// residency must actually appear in the .admcap line at all. Dropping the
+// whole " · residency: ..." segment leaves the rest of the suite green,
+// because K5 only asserts on the could-not-check wording, never that a real,
+// trusted residency count is rendered anywhere. Driven by a REAL
+// createAdmissionController with an actual admit() call, so `census().residency`
+// is a genuine trusted number, never a hand-typed one.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a known, non-null residency actually appears in .admcap — dropping the whole segment must fail (BUTCHR-344 [correction], review item X6)", () => {
+  test("a trusted residency count renders in the admission cap line", async () => {
+    const controller = createAdmissionController({ cap: 10, residency: async () => ["a", "b", "c"] });
+    await controller.admit([], [], "issue");
+    const census = controller.census();
+    expect(census.residency).toBe(3); // sanity: a real, known, non-null residency
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const admcapText = elementText(html, 'class="admcap"', "</div>");
+    expect(admcapText).toContain("residency:");
+    expect(admcapText).toContain("3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-344 [correction] (X2): the not-applicable marker's own TITLE must
+// carry the row's REAL reason, never a generic string. Deliberately scoped
+// down from an earlier (wrong) characterization: `renderNotApplicable`'s
+// VISIBLE text ("no agent — n/a") is unconditional and is not itself part of
+// this assertion — only the tooltip (`title` attribute) is under test here.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the not-applicable marker's own title carries its real reason (BUTCHR-344 [correction], review item X2)", () => {
+  test("a withheld row's .na title attribute is its own agentFields.reason, not a generic string", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
+    await controller.admit(["BUTCHR-3"], [], "issue");
+    const census = controller.census();
+    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
+    expect(withheldRows).toHaveLength(1);
+    const reason = withheldRows[0]!.agentFields.reason;
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts());
+    const titleMatch = html.match(/<span class="na" title="([^"]+)">/);
+    if (!titleMatch) throw new Error("expected a .na element with a title attribute");
+    expect(titleMatch[1]).toBe(reason);
+    expect(titleMatch[1]).not.toBe("could not check");
+    // deliberately NOT a conflation test (BUTCHR-344 [correction]): the
+    // visible text stays unconditional regardless of the title's content.
+    expect(elementText(html, 'class="na"', "</span>")).toBe("no agent — n/a");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BUTCHR-344 (L5): the hint's own wording — nothing else on this page reads
 // it, so a mutation that quietly over-claims ("opens a terminal window for
 // that agent", stated as a plain fact) survives unless something is scoped
