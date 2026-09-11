@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admitWithinBudget, createAdmissionController, ImplausibleZeroGuard, MAX_IMPLAUSIBLE_POLLS } from "../../src/agents/admission.js";
+import { admitWithinBudget, createAdmissionController, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -36,6 +36,29 @@ describe("admitWithinBudget (pure)", () => {
   });
 });
 
+describe("orderByWait (pure, BUTCHR-297)", () => {
+  test("equal waits (an empty ledger) reproduce today's exact lexicographic order byte-for-byte", () => {
+    expect(orderByWait(["C", "A", "B"], new Map())).toEqual(["A", "B", "C"]);
+  });
+  test("a higher wait beats a lexicographically-earlier key", () => {
+    const waits = new Map([["Z", 3]]);
+    expect(orderByWait(["A", "Z"], waits)).toEqual(["Z", "A"]);
+  });
+  test("ties among equal NONZERO waits break lexicographically, same rule as the zero case", () => {
+    const waits = new Map([["B", 2], ["A", 2], ["C", 2]]);
+    expect(orderByWait(["C", "A", "B"], waits)).toEqual(["A", "B", "C"]);
+  });
+  test("a candidate absent from the wait map is treated as wait 0, same as one never withheld", () => {
+    const waits = new Map([["A", 1]]);
+    expect(orderByWait(["A", "B"], waits)).toEqual(["A", "B"]);
+  });
+  test("does not mutate its input array", () => {
+    const input = ["B", "A"];
+    orderByWait(input, new Map());
+    expect(input).toEqual(["B", "A"]);
+  });
+});
+
 describe("ImplausibleZeroGuard", () => {
   test("stays untrusted (true) for maxPolls consecutive records, then flips to accept (false) and resets", () => {
     const g = new ImplausibleZeroGuard(3);
@@ -65,7 +88,7 @@ describe("createAdmissionController", () => {
   test("budget below the cap admits everything", async () => {
     const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1", "R2"] });
     expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
-    expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 2 });
+    expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 2, longestWait: null });
   });
 
   test("budget exactly consumed by residency admits nothing new", async () => {
@@ -82,7 +105,11 @@ describe("createAdmissionController", () => {
     expect(line).toContain("cap=2");
     expect(line).toContain("residency=1");
     expect(line).toContain("withheld 2/3");
-    expect(line).toContain("B, C");
+    // BUTCHR-297 §E: the withheld id list now carries each one's current
+    // wait count (`id(count)`) rather than a bare comma list — the existing
+    // tokens (`cap=`, `residency=`, `withheld N/M wanted:`) this test checks
+    // above are unchanged and still parseable.
+    expect(line).toContain("B(1), C(1)");
   });
 
   test("empty candidates: nothing to admit, no [admission] withheld line even when residency is at/above cap", async () => {
@@ -97,7 +124,7 @@ describe("createAdmissionController", () => {
       const lines: string[] = [];
       const ctrl = createAdmissionController({ cap: 5, residency: async () => { throw new Error("herdr down"); }, log: (l) => lines.push(l) });
       expect(await ctrl.admit(["A", "B"], [])).toEqual([]);
-      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: null }); // still no trusted observation
+      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: null, longestWait: null }); // still no trusted observation
       expect(lines.some((l) => l.includes("WARNING") && l.includes("threw"))).toBe(true);
     });
 
@@ -111,7 +138,7 @@ describe("createAdmissionController", () => {
     test("cold start: no prior trusted observation, residency reads 0 — trusted immediately, NOT withheld (this is the legitimate boot case, not the BUTCHR-282 shape)", async () => {
       const ctrl = createAdmissionController({ cap: 3, residency: async () => [] });
       expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
-      expect(ctrl.snapshot()).toEqual({ cap: 3, residency: 0 });
+      expect(ctrl.snapshot()).toEqual({ cap: 3, residency: 0, longestWait: null });
     });
 
     test("(2) readable-but-implausible zero: previously trusted at R>0, this poll's own plan stops fewer than R, census now reads 0 — withheld, trusted snapshot unchanged", async () => {
@@ -147,7 +174,7 @@ describe("createAdmissionController", () => {
       expect(await ctrl.admit(["X"], [])).toEqual([]); // implausible streak 2/2 — withheld
       // third consecutive implausible read exceeds the bound of 2 — accepted
       expect(await ctrl.admit(["A", "B", "C"], [])).toEqual(["A", "B", "C"]);
-      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 0 });
+      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 0, longestWait: null });
       expect(lines.some((l) => l.includes("bound exceeded"))).toBe(true);
     });
 
@@ -167,6 +194,145 @@ describe("createAdmissionController", () => {
       await ctrl.admit([], []); // 2/2
       expect(ctrl.snapshot().residency).toBe(1); // still not accepted — bound not yet exceeded
     });
+  });
+});
+
+describe("whole-project starvation (BUTCHR-297 regression — fails on today's bare lexicographic `.sort()`)", () => {
+  test("a later-sorting project's candidate is withheld across many polls behind a saturated cap, then wins the freed slot itself — never the lexicographically-first fresh arrival", async () => {
+    let residents = ["BUTCHR-1", "BUTCHR-2"]; // fills the cap for the whole starvation window
+    const ctrl = createAdmissionController({ cap: 2, residency: async () => residents });
+
+    // 10 polls: the cap stays fully saturated by two long-resident BUTCHR
+    // tickets that never leave — CATA-1 and a second cross-project
+    // candidate sit withheld every single poll, exactly like the ticket's
+    // own measured tail (ten tickets across six projects, all excluded
+    // because every one of them sorts after "BUTCHR").
+    for (let i = 0; i < 10; i++) {
+      expect(await ctrl.admit(["CATA-1", "DROVR-1"], [])).toEqual([]);
+    }
+    // Tied waits break lexicographically ("CATA-1" < "DROVR-1"), same rule
+    // as the wait-0 case.
+    expect(ctrl.snapshot()).toEqual({ cap: 2, residency: 2, longestWait: { id: "CATA-1", polls: 10 } });
+
+    // A slot frees (BUTCHR-1 finishes) at the exact poll a FRESH,
+    // lexicographically-first BUTCHR candidate reappears wanting it — the
+    // project that dominated the cap the whole time refilling itself,
+    // exactly like the ticket's own measured tail. Bare lexicographic order
+    // would hand BUTCHR-3 the slot yet again; aging must hand it to
+    // CATA-1 instead.
+    residents = ["BUTCHR-2"];
+    expect(await ctrl.admit(["BUTCHR-3", "CATA-1", "DROVR-1"], [])).toEqual(["CATA-1"]);
+  });
+});
+
+describe("B1 — one shared ledger, two tiers with disjoint candidate sets", () => {
+  test("many calls naming only a DISJOINT candidate never disturb another candidate's own accumulated wait", async () => {
+    // cap 0: budget is always 0, so every candidate is withheld on every
+    // call — isolates pure ledger bookkeeping from residency/budget noise.
+    // `cap` is read live off this object each call, so mutating it below
+    // (to observe an ordering outcome) doesn't require a second instance.
+    const depsObj = { cap: 0, residency: async () => [] as readonly string[] };
+    const ctrl = createAdmissionController(depsObj);
+    await ctrl.admit(["ISSUE-1"], []); // ISSUE-1's wait -> 1
+
+    // The project tier's own disjoint candidate set, interleaved ~20 calls
+    // for every one of the issue tier's — matching the two tiers' real
+    // cadence ratio (15s vs. PROJECT_POLL_INTERVAL_MS's 5min,
+    // src/resources/project.ts). None of these 20 calls ever name
+    // "ISSUE-1" — a "clear what's absent this call" ledger (the B1 bug)
+    // would zero it out roughly this many times per real project poll.
+    for (let i = 0; i < 20; i++) await ctrl.admit(["PROJECT-1"], []);
+
+    // If ISSUE-1's wait had been wiped back to 0 by the interleaving, it
+    // would now tie with a lexicographically-EARLIER, never-before-seen
+    // candidate and LOSE the tie-break. It must win instead, proving its
+    // wait of 1 survived 20 unrelated calls untouched.
+    depsObj.cap = 1; // open exactly one slot to observe the outcome
+    const admitted = await ctrl.admit(["AAA-NEW", "ISSUE-1"], []);
+    expect(admitted).toEqual(["ISSUE-1"]);
+  });
+});
+
+describe("B3 — the two fail-safe paths never touch the wait ledger either", () => {
+  test("a residency() throw leaves accumulated waits and the /health longestWait untouched", async () => {
+    let broken = false;
+    const depsObj = { cap: 1, residency: async (): Promise<readonly string[]> => { if (broken) throw new Error("herdr down"); return []; } };
+    const ctrl = createAdmissionController(depsObj);
+    // budget is always 1 (cap 1, nothing ever actually "runs" in this
+    // synthetic residency source) — every call admits exactly the front of
+    // the order.
+    expect(await ctrl.admit(["A", "B"], [])).toEqual(["A"]); // tie at wait 0 — lex-first wins, B withheld -> wait 1
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "B", polls: 1 });
+
+    broken = true;
+    expect(await ctrl.admit(["A", "B"], [])).toEqual([]); // fail-safe: withholds everything
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "B", polls: 1 }); // unchanged — not incremented, not cleared
+
+    broken = false;
+    // B's wait of 1 (unaffected by the broken call) now beats A's wait of 0.
+    expect(await ctrl.admit(["A", "B"], [])).toEqual(["B"]);
+  });
+
+  test("an untrusted implausible-zero read leaves accumulated waits and the /health longestWait untouched", async () => {
+    let reads = ["R1", "R2"];
+    const depsObj = { cap: 2, residency: async () => reads };
+    const ctrl = createAdmissionController(depsObj);
+    await ctrl.admit([], []); // establishes lastTrusted = 2
+    expect(await ctrl.admit(["A", "B", "C"], [])).toEqual([]); // budget 0 — all withheld, tied at wait 1
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "A", polls: 1 }); // tie, lex-first
+
+    reads = []; // implausible: drop from trusted 2 to 0, nothing in `stopping` explains it
+    expect(await ctrl.admit(["A", "B", "C"], [])).toEqual([]); // withheld fail-safe, ledger untouched
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "A", polls: 1 }); // still 1, not 2
+  });
+});
+
+describe("/health's longestWait must not go stale (review round 1 finding)", () => {
+  test("a withheld candidate that leaves `desired` WITHOUT ever being admitted (ticket closed mid-withholding) is no longer reported as waiting once the candidate list goes empty", async () => {
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["R1"] }); // saturated — nothing is ever actually admitted from an empty residency drop
+    await ctrl.admit(["A"], []); // A withheld -> wait 1
+    await ctrl.admit(["A"], []); // A withheld again -> wait 2
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "A", polls: 2 });
+
+    // A's ticket closes (or leaves the active statuses) before it was ever
+    // admitted — it simply stops appearing in ANY candidate list at all.
+    await ctrl.admit([], []);
+    // An empty candidate list means nothing is withheld, full stop — the
+    // wait ledger itself is untouched (A's entry still exists, same as any
+    // other unseen-but-not-yet-evicted key — see B2), but `/health` must
+    // not go on reporting a candidate nobody is even asking about anymore.
+    expect(ctrl.snapshot().longestWait).toBeNull();
+  });
+});
+
+describe("B2 — the ledger is bounded, but not so tightly it can expire an entry between spawn retries (BUTCHR-297)", () => {
+  test("unseen for fewer calls than the bound: the accumulated wait survives intact", async () => {
+    const depsObj = { cap: 0, residency: async () => [] as readonly string[] };
+    const ctrl = createAdmissionController(depsObj);
+    await ctrl.admit(["A"], []); // A's wait -> 1
+
+    // A goes unseen for a while — some OTHER candidate is the only one
+    // appearing — but comfortably within the bound.
+    for (let i = 0; i < LEDGER_UNSEEN_EVICTION_CALLS - 1; i++) await ctrl.admit(["OTHER"], []);
+
+    depsObj.cap = 1;
+    // A's wait of 1 still beats a lexicographically-earlier fresh arrival.
+    expect(await ctrl.admit(["1-FRESH", "A"], [])).toEqual(["A"]);
+  });
+
+  test("unseen for longer than the bound: the entry is reclaimed — a later reappearance starts fresh, not resuming its old count", async () => {
+    const depsObj = { cap: 0, residency: async () => [] as readonly string[] };
+    const ctrl = createAdmissionController(depsObj);
+    await ctrl.admit(["A"], []); // A's wait -> 1
+
+    // A goes unseen for longer than the bound this time.
+    for (let i = 0; i < LEDGER_UNSEEN_EVICTION_CALLS + 1; i++) await ctrl.admit(["OTHER"], []);
+
+    depsObj.cap = 1;
+    // A's old wait is gone — a lexicographically-EARLIER fresh arrival now
+    // wins the tie at wait 0, proving A did NOT retain its wait of 1
+    // (which would have beaten it outright regardless of lex order).
+    expect(await ctrl.admit(["1-FRESH", "A"], [])).toEqual(["1-FRESH"]);
   });
 });
 
@@ -246,5 +412,86 @@ describe("reconcileNow + admission (BUTCHR-284 integration)", () => {
     broken = false;
     await reconcileNow(herd, desired, { admission: admission.admit });
     expect(herd.spawned.sort()).toEqual(["A", "B"]);
+  });
+});
+
+describe("B4 — wait clears only on a SUCCEEDED spawn, never on admission (BUTCHR-297)", () => {
+  test("a candidate's accumulated wait survives a failed spawn, and clears only once a later attempt actually succeeds", async () => {
+    const running = new Set<string>();
+    const spawned: string[] = [];
+    let shouldFail = true;
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(sp) {
+        spawned.push(sp.key);
+        if (shouldFail) throw new Error("agent_pane_busy");
+        running.add(sp.key);
+      },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    // A residency source fully decoupled from `herd` (a pure occupant-count
+    // stand-in, never claimed to be in `desired`/`running`/`stopping`) so
+    // this test can move the cap up and down without tripping the
+    // ImplausibleZeroGuard's own drop-to-zero check — that guard's own
+    // behaviour is covered separately above and is not this test's concern.
+    let residents = ["O1", "O2"];
+    const admission = createAdmissionController({ cap: 2, residency: async () => residents });
+    const desired = new Map([["A", spec("A")]]);
+    const opts = { admission: admission.admit, onAdmitted: admission.recordSpawned };
+
+    // 3 polls: the cap is fully consumed by two unrelated occupants — A is
+    // withheld every time, accumulating wait.
+    for (let i = 0; i < 3; i++) await reconcileNow(herd, desired, opts);
+    expect(spawned).toEqual([]);
+    expect(admission.snapshot().longestWait).toEqual({ id: "A", polls: 3 });
+
+    // A slot opens — A is admitted, but its spawn FAILS.
+    residents = ["O1"];
+    await reconcileNow(herd, desired, opts);
+    expect(spawned).toEqual(["A"]);
+    expect([...running]).toEqual([]); // spawn failed, never actually running
+
+    // §B4's own point, reproduced here rather than only asserted: A's
+    // accumulated wait of 3 SURVIVES this failed admission — a naive
+    // "clear on admission" design (this ticket's own original A4, corrected
+    // before it shipped) would have reset it to 0 right here, exactly as it
+    // did on this ticket's own first two spawn attempts. Confirm by
+    // withholding A once more and checking it resumes at 3+1, never 0+1.
+    residents = ["O1", "O2"];
+    await reconcileNow(herd, desired, opts);
+    expect(admission.snapshot().longestWait).toEqual({ id: "A", polls: 4 });
+
+    // Now A's spawn actually succeeds.
+    shouldFail = false;
+    residents = ["O1"];
+    await reconcileNow(herd, desired, opts);
+    expect([...running]).toEqual(["A"]);
+    expect(admission.snapshot().longestWait).toBeNull(); // cleared on success — nothing left waiting
+  });
+});
+
+describe("the boss/worker inversion (BUTCHR-294's own motivating case)", () => {
+  test("idle-but-resident bosses occupy the cap while their own worker is withheld; aging admits the worker ahead of a fresher, lexicographically-earlier arrival once a slot frees", async () => {
+    const herd = fakeHerd(["BOSS-1", "BOSS-2"]); // already running, holding the entire cap
+    const admission = createAdmissionController({ cap: 2, residency: () => herd.runningIssues() });
+    let desired = new Map([["BOSS-1", spec("BOSS-1")], ["BOSS-2", spec("BOSS-2")], ["WORKER-9", spec("WORKER-9")]]);
+
+    // 5 polls: the bosses sit resident and idle, never freeing a slot —
+    // WORKER-9 is withheld every single time.
+    for (let i = 0; i < 5; i++) await reconcileNow(herd, desired, { admission: admission.admit });
+    expect(herd.spawned).toEqual([]); // WORKER-9 never got in
+    expect(admission.snapshot().longestWait).toEqual({ id: "WORKER-9", polls: 5 });
+
+    // A slot frees (BOSS-1 finishes) at the exact poll a fresh,
+    // lexicographically-EARLIER candidate ("AAA-1") also shows up. Bare
+    // lexicographic order would hand AAA-1 the slot; aging must hand the
+    // long-withheld worker its overdue turn instead.
+    herd.running.delete("BOSS-1");
+    desired = new Map([["BOSS-2", spec("BOSS-2")], ["WORKER-9", spec("WORKER-9")], ["AAA-1", spec("AAA-1")]]);
+    await reconcileNow(herd, desired, { admission: admission.admit });
+    expect(herd.spawned).toEqual(["WORKER-9"]); // the withheld worker eventually starts, not the fresher arrival
   });
 });

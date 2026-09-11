@@ -8,7 +8,7 @@ import { createCoverageTracker } from "./coverage.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
 import { runResourceLoop } from "./loop.js";
-import { createIssueResourceType, ISSUE_JQL } from "../resources/issue.js";
+import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
 import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
@@ -42,6 +42,7 @@ import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 
 let config;
 try {
@@ -236,6 +237,21 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
+// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
+// `pinnedActiveDetector` further down (project loop only) share the SAME
+// herdr.agent.list() read rather than each defining its own — "wire from the
+// existing seam, do not add a second reader". Behaviour-preserving: this is
+// the exact closure `syncLabels` was already given, moved to a name instead
+// of an inline argument.
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
+  const { agents } = await herdr.agent.list();
+  const m = new Map<string, string>();
+  for (const a of agents) {
+    const issue = issueOfAgentName((a as { name?: string }).name);
+    if (issue) m.set(issue, a.agent_status ?? "unknown");
+  }
+  return m;
+};
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
@@ -308,12 +324,20 @@ const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comm
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
 // default cannot spam anything on day one — see this ticket's PR body for
 // why steady-state volume should NOT be assumed to stay zero.
+// BUTCHR-240: `todoWorkers` closes the To Do gap — see abandoned.ts's own
+// "FORMER KNOWN LIMITATION" doc comment. A separate, narrower query
+// (TODO_WORKER_JQL, src/resources/issue.ts) from `ISSUE_JQL` above,
+// deliberately not folded into it — see that constant's own doc comment for
+// why. Uses the raw `atlassian.search` call, not the `summaries`-recording
+// wrapper `issueResourceType` below is given: a To Do worker has no running
+// agent, so there is nothing here for that side-effect to usefully feed.
 const abandonedDetector = createAbandonedDetector({
   now: () => Date.now(),
   minutes: config.abandonedMinutes,
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
+  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
@@ -325,6 +349,39 @@ const frozenAsleepDetector = createFrozenAsleepDetector({
   minutes: config.atRestMinutes,
   addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
   comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-305/BUTCHR-238: audible-only detection of a PROJECT pinned "active"
+// by an agent that has stopped acting — see src/agents/pinned-active.ts for
+// the full mechanism. Wired into the project loop ONLY (see that call site
+// below): the issue tier already covers this same shape via
+// `syncLabels`/`stallRemediation` above. Reuses `agentStatuses` (this file's
+// existing herdr.agent.list() seam), the SAME `speakOnOwnChannel`/
+// `ownChannelComments` seams every sibling detector uses, and the SAME
+// `quotaGate.isBlocked` predicate `stallRemediation` above already wires
+// (constraint 6 — a quota-blocked agent is the session-limit path's case,
+// not this one's). `comments` is wrapped to report BUTCHR-179 coverage
+// (`/health`) the same way `stalled`'s own check does in src/labels/sync.ts:
+// `recordChecked` for a resolved fetch (found an adoption target or not),
+// `recordDeclined` for a rejected one — never invoked for a poll that never
+// reached the fetch at all (nothing stalled, already spoken, or
+// quota-blocked this poll).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
+  comments: async (id) => {
+    try {
+      const rows = await ownChannelComments(id);
+      coverage.recordChecked("pinned-active");
+      return rows;
+    } catch (e) {
+      coverage.recordDeclined("pinned-active");
+      throw e;
+    }
+  },
+  quotaBlocked: quotaGate.isBlocked,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
@@ -422,15 +479,7 @@ const projectResidencyGuard = createResidencyGuard({
 });
 const syncLabels = createLabelSync({
   jira: labelWriter,
-  agentStatuses: async () => {
-    const { agents } = await herdr.agent.list();
-    const m = new Map<string, string>();
-    for (const a of agents) {
-      const issue = issueOfAgentName((a as { name?: string }).name);
-      if (issue) m.set(issue, a.agent_status ?? "unknown");
-    }
-    return m;
-  },
+  agentStatuses,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
@@ -549,6 +598,11 @@ runResourceLoop(issueResourceType, {
   // also uses — see admissionController's own construction comment above
   // for why this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal — see
+  // admissionController's own construction comment above and
+  // src/agents/admission.ts's own B4 addendum for why this must be one
+  // ledger, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -626,6 +680,11 @@ runResourceLoop(projectResourceType, {
   // real crash loop still needs to reach the threshold well inside the
   // configured window (see crashLoopCount's own doc comment, config.ts).
   checkCrashLoop: projectCrashLoopDetector.check,
+  // BUTCHR-305/BUTCHR-238: wired here ONLY — the issue tier already covers
+  // this same "active+running+idle" shape via `syncLabels`/`stallRemediation`
+  // above (see src/agents/pinned-active.ts's own top comment for why wiring
+  // both would double-post).
+  checkPinnedActive: pinnedActiveDetector.check,
   // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
   checkReconcileFailure: projectReconcileFailureDetector.check,
   // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
@@ -640,6 +699,10 @@ runResourceLoop(projectResourceType, {
   // also uses — see admissionController's own construction comment for why
   // this must be one instance, not one per loop.
   admission: admissionController.admit,
+  // BUTCHR-297: the SAME shared controller instance's success signal the
+  // issue loop above also uses — see that call site's own comment for why
+  // this must be one instance, not one per tier.
+  onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
   intervalMs: PROJECT_POLL_INTERVAL_MS,
   onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
