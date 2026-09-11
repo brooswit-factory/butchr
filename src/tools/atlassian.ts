@@ -193,6 +193,28 @@ export interface AtlassianOps {
    * this file's `getIssueComments` doc comment states the same rule for the
    * issue-comments axis).
    *
+   * PAGINATED TO EXHAUSTION (BUTCHR-309): earlier, this op requested no
+   * `limit` and followed no cursor, so it silently returned only Confluence's
+   * default first page (25 comments) — MEASURED live against the BUTCHR
+   * project's own root doc, which already held 39 (see `atlassian-real.ts`'s
+   * implementation for the full measurement and the specimen comment id).
+   * The real implementation now follows the endpoint's own `_links.next`
+   * opaque cursor in a loop, requesting the documented MAX page size (250)
+   * each call to minimize round trips, until no `next` link remains — so
+   * this op's return is now the FULL comment list, not a bounded window. The
+   * `limit` chosen is a page-SIZE decision only, never a completeness bound:
+   * nothing about correctness depends on how many comments arrive per call.
+   * Deliberately requests no `sort` (the spec documents no default for it,
+   * and this op's own callers already compare ids as a SET rather than by
+   * order — see `src/resources/project.ts`'s `changed()`), so correctness
+   * here never depends on which page a given comment lands on. A malformed
+   * or never-terminating cursor is bounded by a runaway guard that THROWS
+   * rather than returning a silently truncated list (`MAX_COMMENT_PAGES` in
+   * the real implementation) — a partial read must surface as a failure,
+   * never as "here is the complete list" (see `ProjectResource.
+   * observedCommentIds`'s own doc comment for what a caller does with a
+   * failed read versus an empty one).
+   *
    * NEVER THE BATCH `GET /wiki/api/v2/footer-comments?id=A&id=B` SHAPED FORM:
    * MEASURED live TWICE now (BUTCHR-107, once at this ticket's filing and
    * again by its reviewer on 2026-09-02) — a batch-shaped call asking for 2
@@ -323,12 +345,39 @@ export interface AtlassianOps {
   getPageVersions(pageIds: readonly string[]): Promise<Record<string, number>>;
 
   /**
-   * A Jira issue's own comments, NEWEST FIRST, capped — the SAME ordering
-   * and cap as `src/atlassian/client.ts`'s `AtlassianClient.comments()`
-   * (`orderBy: "-created", maxResults: 20`), deliberately, not a second
-   * independent reader.
+   * A Jira issue's own comments — see below for what "one reader, not two"
+   * actually means here, since BUTCHR-309 makes stating it correctly matter.
    *
-   * WHY THIS EXISTS (BUTCHR-81, found at review): the `check_in` tool
+   * PAGINATED TO EXHAUSTION (BUTCHR-309): earlier, this op requested a flat
+   * `maxResults: 20` and never paginated, so an issue with more than 20
+   * comments silently lost every comment past the newest 20 to both of this
+   * op's callers. The real implementation now loops on `startAt`/`maxResults`
+   * until it has read the response's own reported `total` (jira.js's
+   * `PageOfCommentsSchema`), bounded by a runaway guard shared with
+   * `getPageComments` that THROWS rather than returning a silently partial
+   * list if `total` is ever unreliable. `maxResults` is now a page-SIZE
+   * choice only, never a completeness bound — this op's return is the FULL
+   * comment list.
+   *
+   * CORRECTED (BUTCHR-309): this doc comment used to assert this op has "the
+   * SAME ordering and cap as `src/atlassian/client.ts`'s `AtlassianClient.
+   * comments()` (`orderBy: "-created", maxResults: 20`), deliberately, not a
+   * second independent reader." That sentence is now FALSE on the cap —
+   * this op no longer caps at 20, and `client.ts`'s reader is untouched (see
+   * BOUNDARIES in BUTCHR-309's ticket: that reader is a DIFFERENT tier, filed
+   * separately as BUTCHR-312, and explicitly not this ticket's to change).
+   * "One reader, not two" was never about matching `client.ts` — it is about
+   * the PROJECT TIER's own two consumers, discovery (`src/resources/
+   * project.ts`) and `check_in` (`src/tools/defs.ts`), sharing exactly ONE
+   * reader for an in-review epic's comments rather than each building its
+   * own. That guarantee is UNCHANGED by this ticket: both still call this
+   * same op, so they still cannot disagree by construction. `client.ts`'s
+   * `AtlassianClient.comments()` remains a separate mechanism entirely,
+   * serving the issue tier, still capped at `maxResults = 20`
+   * (caller-overridable) — a fact about a different reader, not a claim this
+   * op ever needs to match again.
+   *
+   * WHY THIS OP EXISTS (BUTCHR-81, found at review): the `check_in` tool
    * (src/tools/defs.ts) originally read an in-review epic's comments via
    * plain `getIssue`'s EMBEDDED `fields.comment` block, which is
    * ASCENDING/oldest-first (MEASURED live) with an unconfirmed cap — if

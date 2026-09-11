@@ -24,6 +24,20 @@ export const adf = (text: string) => ({
 const adfForCorrection = (text: string) => (text === "" ? { type: "doc", version: 1, content: [{ type: "paragraph" }] } : adf(text));
 
 /**
+ * BUTCHR-309: shared runaway guard for the two comment-pagination loops
+ * below (`getPageComments`, `getIssueComments`). Each page observed is
+ * strictly more comments than the last real-world root doc ever measured to
+ * hold (39, see those ops' own doc comments) at the smallest page size
+ * either loop uses, so hitting this is a malformed/never-terminating cursor
+ * or an API contract change, never a legitimately large comment thread.
+ * FAILS LOUDLY (throws) rather than returning whatever was accumulated so
+ * far — DoD 4/5 (BUTCHR-309): a partial list must never be mistaken for a
+ * complete one, and a silently-truncated return here would be exactly that,
+ * committed by the very guard meant to prevent it.
+ */
+const MAX_COMMENT_PAGES = 100;
+
+/**
  * The real Atlassian operations, over the de-facto SDKs (jira.js 6, confluence.js 3).
  * NOTE the 6.x config shape is `auth: { type: "basic", email, apiToken }` — the
  * older `authentication: { basic: … }` shape is silently ignored (no header sent,
@@ -337,15 +351,49 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Deliberately NOT `?? deps.now()` or any other synthesis: an
     // unavailable `created` must read as unavailable (`undefined`), never
     // as "just now" — see this op's doc comment on AtlassianOps.
-    getPageComments: (pageId) =>
-      wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage" }).then((r: any) => ({
-        results: (r?.results ?? []).map((c: any) => ({
-          id: c.id,
-          body: c?.body?.storage?.value ?? "",
-          author: c?.version?.authorId,
-          created: c?.version?.createdAt instanceof Date ? c.version.createdAt.toISOString() : undefined,
-        })),
-      })),
+    // BUTCHR-309: paginated to exhaustion via `_links.next`'s opaque `cursor`
+    // — the SAME shape `getChildPages` above already follows, confirmed to
+    // reach this call's own parsed response too (not just the raw wire
+    // response): confluence.js 3.2.0's `PageFooterCommentsSchema` DECLARES
+    // `_links: MultiEntityLinksSchema.optional()` and that schema declares
+    // `next: z.string().optional()` (read from the installed package's own
+    // `dist/v2/models/{pageFooterComments,multiEntityLinks}.js` — re-verify
+    // against YOUR installed version before trusting this). `limit: 250` is
+    // the endpoint's documented MAX page size, chosen to minimize call count
+    // — it bounds a single page's size only, never the completeness of the
+    // walk, which is what the `do…while` loop (not the limit) guarantees.
+    // No `sort` is requested: the spec documents no default for it, this
+    // reader's own callers already compare observed ids as a SET rather than
+    // relying on any order (BUTCHR-227's seen-set design; see
+    // `src/resources/project.ts`'s `changed()`), and not pinning one keeps
+    // this op's only behavior change the pagination itself. Runaway
+    // protection: `MAX_COMMENT_PAGES` throws rather than returning a
+    // silently partial list if a malformed cursor never resolves to
+    // `undefined` — see that constant's own doc comment.
+    getPageComments: async (pageId) => {
+      const results: Array<{ id: string; body: string; author?: string; created?: string }> = [];
+      let cursor: string | undefined;
+      for (let page = 0; ; page++) {
+        if (page >= MAX_COMMENT_PAGES) {
+          throw new Error(
+            `getPageComments(${pageId}): exceeded ${MAX_COMMENT_PAGES} pages without the cursor running out — refusing to return a silently partial list; likely a malformed/never-terminating _links.next cursor`,
+          );
+        }
+        const r: any = await wiki.comment.getPageFooterComments({ id: pageId, bodyFormat: "storage", limit: 250, ...(cursor ? { cursor } : {}) });
+        for (const c of r?.results ?? []) {
+          results.push({
+            id: c.id,
+            body: c?.body?.storage?.value ?? "",
+            author: c?.version?.authorId,
+            created: c?.version?.createdAt instanceof Date ? c.version.createdAt.toISOString() : undefined,
+          });
+        }
+        const nextUrl: string | undefined = r?._links?.next;
+        cursor = nextUrl ? (new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor") ?? undefined) : undefined;
+        if (!cursor) break;
+      }
+      return { results };
+    },
 
     // MEASURED live (2026-09-01, re-confirmed after an initial "null" read
     // turned out to understate it): `expand: "lead"` is REQUIRED for
@@ -387,12 +435,34 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return out;
     },
 
-    // Same endpoint, same ordering/cap as src/atlassian/client.ts's own
-    // `comments()` — see this op's doc comment on AtlassianOps for why that
-    // match is load-bearing rather than incidental.
-    getIssueComments: (key) =>
-      jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", maxResults: 20 }).then((r: any) => ({
-        results: (r?.comments ?? []).map((c: any) => ({ id: c.id })),
-      })),
+    // BUTCHR-309: paginated to exhaustion via `startAt`/`maxResults`, bounded
+    // by the response's own `total` (jira.js's `PageOfCommentsSchema` — see
+    // that op's doc comment on AtlassianOps for why this reader no longer
+    // shares a cap with `src/atlassian/client.ts`'s own, differently-tiered
+    // reader). `maxResults: 100` is a page-size choice, not a completeness
+    // bound — the loop keeps requesting pages until it has read `total`
+    // comments (or a page comes back empty, which stops it even if `total`
+    // is ever absent/unreliable). Runaway protection: `MAX_COMMENT_PAGES`
+    // throws rather than returning a silently partial list if `total` is
+    // ever wrong in a way that makes the loop never naturally terminate.
+    getIssueComments: async (key) => {
+      const results: Array<{ id: string }> = [];
+      let startAt = 0;
+      let total: number | undefined;
+      for (let page = 0; total === undefined || startAt < total; page++) {
+        if (page >= MAX_COMMENT_PAGES) {
+          throw new Error(
+            `getIssueComments(${key}): exceeded ${MAX_COMMENT_PAGES} pages without reaching the reported total (${total ?? "unknown"}) — refusing to return a silently partial list`,
+          );
+        }
+        const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: 100 });
+        const batch: any[] = r?.comments ?? [];
+        for (const c of batch) results.push({ id: c.id });
+        total = typeof r?.total === "number" ? r.total : results.length;
+        if (batch.length === 0) break;
+        startAt += batch.length;
+      }
+      return { results };
+    },
   };
 }
