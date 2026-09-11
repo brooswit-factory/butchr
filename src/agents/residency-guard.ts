@@ -57,12 +57,35 @@ export interface ResidencyGuard {
   filter: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
 }
 
-/** Builds the residency guard wired into `reconcileNow`'s `ReconcileOptions.checkResidency` (src/daemon/loop.ts), called after `checkReap` and before the spawn loop. */
+/** Builds the residency guard wired into `reconcileNow`'s `ReconcileOptions.checkResidency` (src/daemon/loop.ts), called immediately after `planReconcile` — BEFORE `opts.admission`, `checkCrashLoop`, `checkReap` and the spawn loop, all of which see its output rather than `plan.spawn`. (Read the call order off loop.ts itself, not off this line: an earlier version of this comment said "after `checkReap`", which loop.test.ts's own ordering assertion already contradicted.) */
 export function createResidencyGuard(deps: ResidencyGuardDeps): ResidencyGuard {
   const unknownStreak = new Map<string, number>();
   const log = (line: string) => deps.log?.(line);
 
   async function filter(spawning: readonly string[], desired: readonly string[]): Promise<readonly string[]> {
+    // PRUNE FIRST (review finding, PR #310): every tracked id that is NOT a
+    // candidate this poll. Without this, an id withheld at streak 1..N-1 that
+    // then leaves `desired` — its ticket finished, or it was spawned — keeps a
+    // stale entry forever, and if that key ever returns during a later
+    // fleet-wide-unknown episode it resumes from the stale count and decays
+    // early. Bounded by ticket count and it errs toward spawning rather than
+    // withholding, so this is a leak and a weakening of a deliberately-bounded
+    // mitigation rather than a safety hole — but neither belongs in a guard
+    // whose whole contract is "withhold for a BOUNDED number of CONSECUTIVE
+    // polls".
+    //
+    // PRUNING ON `spawning` IS CORRECT HERE, AND IS DELIBERATELY NOT WHAT
+    // crash-loop.ts's `forgetMissing` DOES (that one prunes on `desired`, and
+    // its own top comment explains why pruning on plan.spawn absence would
+    // silently reset its counter and disable the alarm). The difference is
+    // what each counter means: this streak counts CONSECUTIVE polls in which
+    // this candidate was withheld as unknown-under-suspicion, and a withheld
+    // candidate necessarily reappears in the next poll's `plan.spawn` (it was
+    // never spawned, and `desired` is never shrunk — see `filter`'s own doc
+    // comment). So absence from `spawning` means the run genuinely ended:
+    // either it got spawned, or its ticket left the active statuses. Resetting
+    // there is the semantics, not merely the cleanup.
+    for (const id of [...unknownStreak.keys()]) if (!spawning.includes(id)) unknownStreak.delete(id);
     if (!spawning.length) return spawning;
     // FAIL-OPEN, DELIBERATELY: a guard that itself fails must never become
     // a liveness hazard bigger than the duplicate-spawn hazard it exists to

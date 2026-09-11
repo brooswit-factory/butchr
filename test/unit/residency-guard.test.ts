@@ -95,6 +95,33 @@ describe("createResidencyGuard.filter (BUTCHR-287)", () => {
     expect(out2).toEqual(["B"]); // B now exceeds the bound (streak 4) and decays; A freshly at 1/3, still withheld
   });
 
+  test("REVIEW FINDING, PR #310: a candidate that LEAVES the spawn list mid-streak is pruned, so a later return starts from zero rather than resuming a stale count and decaying early", async () => {
+    // GONE-1 accrues a withhold streak, then vanishes from `spawning` (its
+    // ticket finished, or it was spawned) — and later comes back. Without the
+    // prune its stale count survives and the second episode decays early.
+    // NEGATIVE CONTROL is the assertion at the end: a candidate that never
+    // leaves keeps accruing, so this test fails if the prune is over-eager and
+    // resets everything every poll.
+    const f = fakeCensus({ "GONE-1": "unknown", "STAYS-1": "unknown" });
+    const guard = createResidencyGuard({ census: f.census });
+    const both = ["GONE-1", "STAYS-1"];
+    // two fleet-wide-unknown polls: both withheld, both at streak 2
+    expect(await guard.filter(both, both)).toEqual([]);
+    expect(await guard.filter(both, both)).toEqual([]);
+    // GONE-1 is absent for a poll — its run has genuinely ended
+    expect(await guard.filter(["STAYS-1"], ["STAYS-1", "OTHER"])).toEqual(["STAYS-1"]);
+    // GONE-1 returns. A stale streak of 2 would put it one poll from decay;
+    // pruned, it starts over and is withheld for the full bound again.
+    expect(await guard.filter(both, both)).toEqual([]);
+    expect(await guard.filter(both, both)).toEqual([]);
+    expect(await guard.filter(both, both)).toEqual([]);
+    // fourth consecutive poll of the NEW episode: GONE-1 decays and spawns.
+    // STAYS-1 never left, so it decayed earlier and is spawning too — that is
+    // the control proving the prune is scoped to absent ids, not blanket.
+    const out = await guard.filter(both, both);
+    expect(out).toContain("GONE-1");
+  });
+
   test("never shrinks the desired set — filter only ever returns a subset of `spawning`, and callers are responsible for `desired` staying untouched (this guard has no way to touch it at all)", async () => {
     const f = fakeCensus({ "A": "resident" });
     const guard = createResidencyGuard({ census: f.census });
