@@ -109,6 +109,21 @@ function issuetypeOf(issue: unknown): string | undefined {
 function projectKeyOf(issue: unknown): string | undefined {
   return (issue as { fields?: { project?: { key?: string } } })?.fields?.project?.key;
 }
+
+/**
+ * BUTCHR-326: THE SHARED "member Epic" PREDICATE — is `issue` a member of
+ * project `projectKey` AND an Epic? Reused by `assertOwnWorker`'s
+ * project-caller branch (its own doc comment explains why membership alone
+ * is deliberately not enough) AND `finishWithoutABoss`'s branch (b) (its own
+ * doc comment explains why that branch is gated on Epic specifically). ONE
+ * predicate, not two copies of `=== "Epic"`, so the two call sites can never
+ * drift apart: a future change to what "is a project's own worker" means
+ * changes both at once, or neither.
+ */
+function isEpicMemberOfProject(issue: unknown, projectKey: string): boolean {
+  return projectKeyOf(issue) === projectKey && issuetypeOf(issue) === "Epic";
+}
+
 function statusOf(issue: unknown): string | undefined {
   return (issue as { fields?: { status?: { name?: string } } })?.fields?.status?.name;
 }
@@ -353,12 +368,16 @@ async function resolveCollisionSide<T>(read: () => Promise<T>, whatFailed: strin
 async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(workerKey);
   if (isProjectId(callerKey)) {
-    const project = projectKeyOf(issue);
-    if (project !== callerKey) {
-      throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
-    }
-    const type = issuetypeOf(issue);
-    if (type !== "Epic") {
+    // Same two conditions, same messages, same order as before this was
+    // factored through the shared `isEpicMemberOfProject` predicate
+    // (BUTCHR-326) — only reached when that predicate is false, so exactly
+    // one of the two throws below fires.
+    if (!isEpicMemberOfProject(issue, callerKey)) {
+      const project = projectKeyOf(issue);
+      if (project !== callerKey) {
+        throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it belongs to project ${project ?? "an unreadable project"}, not ${callerKey}) — refusing`);
+      }
+      const type = issuetypeOf(issue);
       throw new Error(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (it is a ${type ?? "unknown type"} in project ${callerKey}, not an Epic — a project boss's own workers are its Epics only, one tier down, same as every other boss/worker pair) — refusing`);
     }
     return issue;
@@ -2295,36 +2314,53 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  * (`submit_to_boss`, then its boss's `finish_worker`), so it is refused here
  * and pointed at the path that actually gets its work reviewed.
  *
- * DESIGNED TO BECOME OBSOLETE, NOT ABANDONED. This system's design decisions
- * record a planned tier ABOVE epics (a "project" level) that does not exist
- * yet. If it did, an epic would have a boss like everything else, would call
- * `submit_to_boss` and let that boss call `finish_worker` on it, and this
- * verb would simply have no caller left — a ticket with a boss can never use
- * it, so the day every top-level ticket has one, this narrows to nothing ON
- * ITS OWN, with no removal needed. A future reader who finds this verb with
- * zero callers should read that as the tier having arrived, not as dead code
- * nobody cleaned up.
+ * THE TIER ABOVE EPICS HAS NOW ARRIVED (BUTCHR-326), NARROWING THIS VERB
+ * TOWARD OBSOLETE RATHER THAN LEAVING IT THERE. A "boss" for a caller with
+ * no `Implements` link is no longer only "nobody" — it is ALSO "the project
+ * that caller is a member of, if that project is ELIGIBLE" (an Epic's
+ * project boss reviews its Epics exactly as every other boss reviews its
+ * workers; see `isEpicMemberOfProject` and `assertOwnWorker`'s own doc
+ * comment for why membership alone is deliberately not enough — this reuses
+ * that exact predicate, not a looser one). Concretely: an Epic in an
+ * eligible project HAS a boss now and is refused here, pointed at
+ * `submit_to_boss` → that project's own `finish_worker`, same as branch (a).
+ * This verb keeps exactly one caller shape it still serves without
+ * refusing: a bossless top-level ticket whose project has no project tier
+ * at all (not yet eligible, or not staffed) — the narrow exception the
+ * headline above names. As projects come online and become eligible, this
+ * narrows further on its own, with no removal needed — the same shrinking
+ * property the pre-BUTCHR-326 version of this comment predicted, just now
+ * gated on eligibility instead of on the tier's mere existence.
+ *
+ * A GAP THIS DOES NOT CLOSE, NAMED RATHER THAN HIDDEN (BUTCHR-326, out of
+ * scope for that ticket): a bossless STORY or TASK sharing an eligible
+ * project (not an Epic) is NOT caught by branch (b) — it keeps today's
+ * behaviour and still self-closes here. That is deliberate, not an
+ * oversight: `assertOwnWorker`'s project branch refuses a non-Epic target
+ * even from its own project, so pointing a bossless non-Epic at
+ * `submit_to_boss` → project `finish_worker` would strand it In Review with
+ * no exit — worse than today's gap, not better. Orphans of this shape are
+ * not staffed until `adopt_worker` gives them an `Implements` link, and
+ * branch (a) catches them from that point on.
  *
  * OPEN QUESTION THIS DOES NOT SETTLE, AND IS NOT THIS VERB'S TO SETTLE:
- * whether a top-level ticket SHOULD be able to close itself at all, with no
- * second identity ever looking, is a real question — every other Done here
- * requires a review hop, and a bossless ticket's self-close has none. This
- * verb only formalizes what `jira_transition` already lets happen today; it
- * takes no position on whether that's the right end state, and that
- * question belongs to whoever decides if and when the project tier above
- * epics gets built — a human call, not an agent's to make by building or
- * not building this.
+ * whether a top-level ticket with truly no boss anywhere SHOULD be able to
+ * close itself, with no second identity ever looking, is a real question —
+ * every other Done here requires a review hop, and this one narrow
+ * remaining case has none. This verb only formalizes what `jira_transition`
+ * already lets happen today for that case; it takes no position on whether
+ * that's the right end state.
  *
  * BUTCHR-193: ALSO REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS
- * OWN — ADDITIVE AND ORTHOGONAL to the has-a-boss refusal above, which this
- * leaves byte-identical (condition, message, and position): that refusal
- * narrows the UPWARD precondition (BUTCHR-92's still-shelved narrowing,
- * refuse a caller that HAS a boss); this adds a DOWNWARD one (refuse a
- * caller that HAS OPEN WORKERS). They compose without touching each other.
- * See `openWorkers` for what "open" means and its cost, and this ticket's
- * PR body for why this does not reproduce BUTCHR-92's circle: that circle
- * had no exit for ANY caller; this refusal always has one — finish_worker
- * the worker for real, or shelve_worker it with a reason.
+ * OWN — ADDITIVE AND ORTHOGONAL to the has-a-boss refusals above (both (a)
+ * and (b)), which this leaves byte-identical (conditions, messages, and
+ * position): those refusals narrow the UPWARD precondition (refuse a
+ * caller that HAS a boss); this adds a DOWNWARD one (refuse a caller that
+ * HAS OPEN WORKERS). They compose without touching each other. See
+ * `openWorkers` for what "open" means and its cost, and this ticket's PR
+ * body for why this does not reproduce a circle with no exit: every
+ * refusal here always has one — finish_worker the worker for real,
+ * shelve_worker it with a reason, or (for branch (b)) submit_to_boss.
  */
 export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
@@ -2334,6 +2370,44 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
       `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
+
+  // Branch (b) (BUTCHR-326): an Epic that is a member of an ELIGIBLE
+  // project also has a boss — that project. Cheap, I/O-free check first
+  // (issuetype + own project key, via the SAME predicate assertOwnWorker's
+  // project branch uses) so a non-Epic bossless caller — out of scope here,
+  // see this function's own doc comment — never pays for the eligibility
+  // read at all and is never at risk of the fail-closed refusal below.
+  const projectKey = projectKeyOf(issue);
+  if (projectKey && isEpicMemberOfProject(issue, projectKey)) {
+    // Eligibility, never BUTCHR_PROJECT_ALLOWLIST — see
+    // resolveEligibleProjects's own doc comment and
+    // ProjectResourceDeps.allowlist's: the allowlist is a ROLLOUT GATE, not
+    // an eligibility rule, and different daemons on this host carry
+    // different allowlists, so an allowlist-based verdict would differ by
+    // which daemon handled the call. Eligibility is a Jira fact every
+    // daemon reads the same way. NO preFilter, exactly like
+    // list_peers/tell_peer.
+    let eligible: Awaited<ReturnType<typeof resolveEligibleProjects>>["eligible"];
+    try {
+      ({ eligible } = await resolveEligibleProjects(ops));
+    } catch (e) {
+      // FAIL CLOSED: an eligibility read we could not complete must never
+      // be read as "no boss" — that would let exactly the six-epic
+      // self-close defect this ticket exists to close back in through a
+      // transient error instead of a design gap. Distinguishable from both
+      // the has-a-boss refusals above and the open-workers refusal below —
+      // a test asserts on that.
+      throw new Error(
+        `finish_without_a_boss: could not determine whether ${callerKey} has a boss — reading project eligibility for ${projectKey} failed (${(e as Error).message}). Refusing rather than treating "could not look" as "no boss".`,
+      );
+    }
+    if (eligible.some((p) => p.key === projectKey)) {
+      throw new Error(
+        `finish_without_a_boss: ${callerKey} has a boss — its project ${projectKey} is an eligible project tier and reviews its own Epics — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${projectKey} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
+      );
+    }
+  }
+
   const open = await openWorkers(ops, issue);
   if (open.length > 0) throw new Error(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");

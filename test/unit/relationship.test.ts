@@ -1954,6 +1954,78 @@ describe("finishWithoutABoss", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BUTCHR-326: finishWithoutABoss's branch (b) — an Epic that is a member of
+// an ELIGIBLE project also has a boss (that project), even with no
+// `Implements` link at all. Eligibility here always goes through the fake
+// world's own searchProjects/getMyself/getProjectPropertyOrNull — the same
+// three ops resolveEligibleProjects reads — never a second, hand-rolled
+// eligibility rule.
+// ---------------------------------------------------------------------------
+
+describe("BUTCHR-326: finishWithoutABoss branch (b) — Epic-in-eligible-project has a boss", () => {
+  // makeWorld's default ops: searchProjects() -> no projects at all, so
+  // `eligible` is always empty unless a test overrides it below.
+  function eligibleOps(ops: AtlassianOps, projectKey: string): AtlassianOps {
+    return {
+      ...ops,
+      searchProjects: async () => ({ values: [{ key: projectKey, name: projectKey, lead: { accountId: "test-account" } }] }), // "test-account" matches makeWorld's default getMyself()
+      getProjectPropertyOrNull: async (key: string) => (key === projectKey ? { rootDoc: { id: "1" } } : null),
+    };
+  }
+
+  test("1. an Epic in an ELIGIBLE project is refused — the message names the project key AND submit_to_boss", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("ELIG-1", { issuetype: "Epic", project: "ELIG" }); // no Implements link
+    const eligible = eligibleOps(ops, "ELIG");
+    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/ELIG-1 has a boss/);
+    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/\bELIG\b/); // the project key, not just the caller's own key
+    await expect(finishWithoutABoss(eligible, "ELIG-1")).rejects.toThrow(/submit_to_boss/);
+    expect(issues.get("ELIG-1")!.status).toBe("To Do"); // never transitioned by the refused call
+  });
+
+  test("2. an Epic in a NON-eligible project still transitions to Done — the case that must keep working", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // makeWorld's default ops: no project is ever eligible (searchProjects -> []).
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+
+  test("3. a ticket with an Implements link is refused as today, with today's byte-identical message — branch (a), unaffected by branch (b)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/has a boss \(BUTCHR-1\)/);
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do");
+  });
+
+  test("4. an eligibility-read FAILURE (not a 404) refuses with a DISTINCT fail-closed message naming the error — 'could not look' never becomes 'no boss'", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const broken: AtlassianOps = { ...ops, searchProjects: async () => { throw new Error("jira search down"); } };
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/could not determine whether BUTCHR-1 has a boss/);
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/jira search down/);
+    // distinguishable from both other refusal shapes:
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.not.toThrow(/still has open worker/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do"); // refused, not silently treated as bossless
+  });
+
+  // 5. A project caller is still refused at tool registration — that's
+  // tools.test.ts's "finish_without_a_boss REFUSES a project caller at the
+  // gate" test (unaffected by this branch: refuseProjectCaller runs before
+  // relationship.ts's finishWithoutABoss is ever reached, so it neither
+  // knows nor cares that branch (b) now exists below it).
+
+  test("6. a bossless STORY (or Task) in an ELIGIBLE project is NOT refused by branch (b) — it transitions, pinning the Epic-only narrowing from 1b", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("ELIG-1", { issuetype: "Story", project: "ELIG" }); // no Implements link, shares the eligible project, but is not an Epic
+    const eligible = eligibleOps(ops, "ELIG");
+    await finishWithoutABoss(eligible, "ELIG-1");
+    expect(issues.get("ELIG-1")!.status).toBe("Done");
+  });
+});
+
 // ===========================================================================
 // BUTCHR-193: the three closing doors (finish_worker, finish_without_a_boss,
 // submit_to_boss) refuse when the caller (or, for finish_worker, the WORKER

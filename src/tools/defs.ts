@@ -50,11 +50,12 @@ function requireCaller(c: { headers: Record<string, string> }, verb: string): st
  * implementation in relationship.ts. Three verbs use this:
  *   - `submit_to_boss` — a project has nothing to submit to; it never
  *     reaches a terminal state (BUTCHR-62's design).
- *   - `finish_without_a_boss` — OUT OF SCOPE for this ticket, its
- *     implementation must NOT be edited (see relationship.ts's own doc
- *     comment on it). Refusing HERE, before it ever runs, is how that
- *     constraint is honoured: `finishWithoutABoss`'s body is unaffected —
- *     for a project caller it is simply never reached.
+ *   - `finish_without_a_boss` — a project is never "done" (BUTCHR-62's
+ *     design keeps it sleeping/waking on events indefinitely, never
+ *     reaching a terminal state). Refusing HERE, before it ever runs, means
+ *     `finishWithoutABoss`'s own boss-check logic (BUTCHR-92/BUTCHR-326) is
+ *     simply never reached for a project caller — this gate and that
+ *     function's internal refusals are independent, not layered.
  *   - `file_where_it_belongs` — its case-B notice target walks the
  *     CALLER's own Implements chain to find a human-watched ticket to
  *     notify; a project has no boss and no links at all, so there is no
@@ -865,12 +866,14 @@ export function atlassianTools(
     },
     finish_without_a_boss: {
       description:
-        "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
-        "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. The refusal names the boss, says to use submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that has nobody to submit to and nobody who will ever call finish_worker on it. " +
-        "ALSO REFUSES when the caller still has an open worker of its own (BUTCHR-193) — additive and orthogonal to the has-a-boss refusal above, which this leaves untouched: naming the open worker, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. " +
+        "Move the CALLER'S OWN ticket to Done — but ONLY when the caller has NO BOSS at all (today, in practice, an Epic in a project that is not an ELIGIBLE project tier). TAKES NO ARGUMENTS AT ALL, same reasoning as submit_to_boss: the only ticket this can ever act on is the caller's own, so there is nothing to get wrong. " +
+        "REFUSES any caller that HAS a boss — that refusal IS this verb's entire purpose, not a guard bolted onto it: a worker never finishes itself (see finish_worker), and a caller with a boss already has the review hop that guarantee depends on waiting for it — submit_to_boss, then that boss's own finish_worker. \"Has a boss\" now means EITHER of two things (BUTCHR-92/BUTCHR-326): an `Implements` inward link (checked first, no extra Jira call), OR being an Epic that is a member of an ELIGIBLE project (an eligible project reviews its own Epics exactly as any other boss reviews its workers) — either refusal names the boss (the linked ticket, or the project key) and points at submit_to_boss instead, and says why: every Done in this system requires a second identity to have looked at the work first, except this one deliberate, narrow exception for a ticket that truly has nobody to submit to and nobody who will ever call finish_worker on it. " +
+        "FAILS CLOSED on the eligible-project check: if reading project eligibility errors out, this refuses with a message that names the underlying error rather than ever treating \"could not look\" as \"no boss\". " +
+        "A bossless Story or Task that merely SHARES a project with an Epic is NOT caught by the eligible-project half — a project boss's own workers are its Epics only (same as assertOwnWorker's own project-caller check), so gating this on issuetype is what keeps a refusal here from ever pointing a ticket at a submit_to_boss/finish_worker path with no exit. That is a known, accepted narrow gap, not an oversight. " +
+        "ALSO REFUSES when the caller still has an open worker of its own (BUTCHR-193) — additive and orthogonal to the has-a-boss refusals above, which this leaves untouched: naming the open worker, its status, and both discharge paths (finish_worker it for real, or shelve_worker it with a reason); a status other than Done is open unless the worker carries butchr:shelved. " +
         "Replaces jira_transition(my_own_key, \"Done\") for the top-level, bossless case ONLY — jira_transition remains an alias for every other transition it can still make. " +
-        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: a planned tier above epics does not exist yet; if it did, every top-level ticket would have a boss and this verb would simply stop having callers, with no removal needed — a ticket with a boss can never use it. Whether a top-level ticket SHOULD be able to close itself at all, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle — that belongs to whoever decides if and when that tier gets built. " +
-        "REFUSES A PROJECT CALLER (BUTCHR-71) — that tier above epics has now arrived: a project is never \"done\" (BUTCHR-62's design keeps it sleeping/waking on events indefinitely, never reaching a terminal state), refused at the tool-registration layer here, WITHOUT this verb's own implementation being touched at all.",
+        "DESIGNED TO NARROW TO NOTHING ON ITS OWN, NOT TO BE REMOVED: the tier above epics (a \"project\" level) has now arrived, and this verb narrows toward zero callers as more projects become eligible — a ticket with a boss can never use it. Whether a top-level ticket with truly no boss anywhere SHOULD be able to close itself, with no second identity ever looking, is an open question this verb does not settle and is not its call to settle. " +
+        "REFUSES A PROJECT CALLER (BUTCHR-71) at the tool-registration layer here, independently of the boss-check logic above: a project is never \"done\" (BUTCHR-62's design keeps it sleeping/waking on events indefinitely, never reaching a terminal state).",
       input: {},
       handler: async (_a, c) => {
         refuseProjectCaller(c, "finish_without_a_boss", "a project is never \"done\" — it has no ticket to transition at all, and BUTCHR-62's design keeps it sleeping/waking on events indefinitely rather than reaching a terminal state");

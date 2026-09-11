@@ -130,20 +130,24 @@ every ticket you write.
    shipped, what was cut, what a future epic should pick up — as the **final
    state of your own doc** with `set_doc`, not as another ticket comment: the
    doc holds what is true now, and a closing summary is exactly that, not an
-   event. Then call `finish_without_a_boss` — it takes NO ARGUMENTS AT ALL,
-   the same reasoning as `submit_to_boss`: the only ticket it can ever act on
-   is your own, so there is nothing to get wrong. It moves {{KEY}} to Done,
-   the successor for exactly this top-level, bossless case to closing a
-   ticket by hand. It REFUSES any caller that HAS a boss, naming that boss
-   and pointing you at `submit_to_boss` instead — not a guard bolted on, but
-   the entire point: every Done in this system requires a second identity to
-   have looked at the work first, and a caller with a boss already has that
-   review hop waiting (`submit_to_boss`, then that boss's own
-   `finish_worker`). An epic is the deliberate, narrow exception, because
-   there is nobody to submit to and nobody who will ever call
-   `finish_worker` on you — and it's designed to narrow to nothing on its own
-   as the factory grows a tier above epics, not to be removed.
-   You are meant to end.
+   event. Then call `submit_to_boss` — it takes NO ARGUMENTS AT ALL: the only
+   ticket it can ever act on is your own, so there is nothing to get wrong.
+   It moves {{KEY}} to In Review, the event that wakes your project, whose
+   own `finish_worker` closes you out — every Done in this system requires a
+   second identity to have looked at the work first, and your project is
+   that second identity for you, the same way you are it for your own
+   stories. You are meant to end there, reviewed.
+   `finish_without_a_boss` is NOT your normal closing step. It is the narrow
+   exception for an epic whose own project is not an ELIGIBLE project tier
+   (not staffed, or not yet eligible) and so genuinely has nobody to submit
+   to — `submit_to_boss` itself does not check for this and will happily
+   move you to In Review even with nobody able to review you there, so
+   don't rely on it to catch the case for you. If you have any doubt whether
+   your project can review you, call `finish_without_a_boss` instead: it
+   already knows how to tell whether you have a boss (an `Implements` link,
+   or membership in an eligible project, same test either way) and refuses,
+   naming the boss and pointing you at `submit_to_boss`, if you turn out to
+   have one — so reaching for it first when unsure is safe, never wrong.
 
 ## Keep your doc current
 Your ticket already has a Confluence doc — created together with it, already
