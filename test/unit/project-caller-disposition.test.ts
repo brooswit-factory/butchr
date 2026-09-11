@@ -93,6 +93,12 @@ const DISPOSITIONS: Record<string, Disposition> = {
   submit_to_boss: "refuses",
   finish_without_a_boss: "refuses",
   file_where_it_belongs: "refuses",
+  // BUTCHR-307: an issue-only sleep/wake verb — a project already has
+  // `check_in` for this same last-act purpose (its own "project-only"
+  // entry below), so `stand_down` refuses a project caller the opposite
+  // direction (`requireIssueCaller`, defs.ts — same shape as
+  // `refuseProjectCaller`, just a mirrored gate function).
+  stand_down: "refuses",
 
   // Exists ONLY for a project caller; refuses an issue caller instead
   // (`requireProjectCaller`, defs.ts — the gate runs in the opposite
@@ -310,15 +316,16 @@ describe('project-caller disposition enumeration (BUTCHR-82) — "refuses" and "
   // Sanity on the buckets themselves — if a future edit to DISPOSITIONS
   // leaves one of these empty, the loops below would silently assert
   // nothing and this file would look green while checking less than it
-  // claims to. Pinned to the counts this ticket found: 3 "refuses" verbs
-  // (submit_to_boss, finish_without_a_boss, file_where_it_belongs) and, as of
-  // BUTCHR-185/BUTCHR-215, 4 "project-only" verbs (check_in, get_doc_comments,
-  // list_peers, tell_peer). If a FUTURE verb is legitimately added to either
+  // claims to. Pinned to the counts this ticket found: as of BUTCHR-307,
+  // 4 "refuses" verbs (submit_to_boss, finish_without_a_boss,
+  // file_where_it_belongs, stand_down) and, as of BUTCHR-185/BUTCHR-215,
+  // 4 "project-only" verbs (check_in, get_doc_comments, list_peers,
+  // tell_peer). If a FUTURE verb is legitimately added to either
   // bucket, this assertion SHOULD go red — that is correct, not a bug: update
   // the expected count here to match the new, deliberate total. Do not delete
   // this assertion to get green; update the number.
   test("both buckets are non-empty (guards the loops below against silently checking nothing)", () => {
-    expect(refusesVerbs.length).toBe(3);
+    expect(refusesVerbs.length).toBe(4);
     expect(projectOnlyVerbs.length).toBe(4);
   });
 

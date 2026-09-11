@@ -522,8 +522,22 @@ export const projectIdOf = (p: ProjectResource): string => p.key;
 
 const EMPTY_WATERMARK: ProjectWatermark = { version: null, commentsSeen: [], epicsSeen: {} };
 
-/** Set membership only — no ordering, no magnitude, no `Number()` (BUTCHR-227's hard rule). Exported for this module's own reuse between `projectVerdict`, `loadProjects`' unseen-field computation, and their tests; not part of this module's public API surface (not re-exported from an index). */
-function unseenIds(observed: readonly string[], seen: readonly string[]): readonly string[] {
+/**
+ * Set membership only — no ordering, no magnitude, no `Number()` (BUTCHR-227's
+ * hard rule). Used within this module by `projectVerdict` and `loadProjects`'
+ * unseen-field computation, and their tests.
+ *
+ * BUTCHR-307: also exported for reuse by the issue tier's stand-down
+ * registry (src/agents/stand-down.ts), which needs the exact same
+ * seen-comment-id comparison for its own self-wake hazard — per the owning
+ * epic's explicit instruction, that registry imports this function rather
+ * than re-implementing the rule: two independent implementations of one
+ * comparison rule drift, and the one that drifts silently is the one that
+ * decides whether an agent exists. Still not part of a public barrel/index
+ * (this codebase has none) — every caller, in or out of this module, imports
+ * it directly from this file.
+ */
+export function unseenIds(observed: readonly string[], seen: readonly string[]): readonly string[] {
   if (observed.length === 0) return observed;
   const seenSet = new Set(seen);
   return observed.filter((id) => !seenSet.has(id));
@@ -682,7 +696,34 @@ export const PROJECT_POLL_INTERVAL_MS = 5 * 60 * 1000;
  *   the key-set replace: `getIssueComments` is CAPPED (see that op's own
  *   doc comment on `AtlassianOps` for the exact number) — a value-level
  *   replace could drop an id a truncated read simply didn't return this
- *   particular poll, even though an earlier poll genuinely saw it.
+ *   particular poll, even though an earlier poll genuinely saw it. THIS IS
+ *   WRITER A's shape (`check_in`, src/tools/defs.ts) ONLY — a COMPLETE
+ *   observation over every epic currently In Review, entitled to prune a key
+ *   that fell out of review. No other caller may pass `epics`.
+ * - `epicsPartial` (BUTCHR-292/BUTCHR-328), when PROVIDED, is the opposite
+ *   shape on purpose: a PARTIAL fact about ONE epic ("this caller just wrote
+ *   comment C to epic E"), never a complete observation, so it must NEVER go
+ *   through the key-set-replace path above — doing so would wipe every
+ *   OTHER In-Review epic's stored seen set on every suppression write, fixing
+ *   one self-wake by manufacturing many (see this ticket's own trap warning,
+ *   preserved in its changelog entry). Instead, for each key PRESENT in
+ *   `epicsPartial`, the VALUE is unioned into whatever is already stored for
+ *   that key — CREATING the key if it was absent — and every key NOT present
+ *   in `epicsPartial` is left byte-for-byte untouched, whether or not `epics`
+ *   was ALSO given in the same call (in practice, no caller passes both;
+ *   `check_in` passes `epics` alone, `tellWorker`'s suppression write
+ *   — src/tools/relationship.ts — passes `epicsPartial` alone). THIS IS
+ *   WRITER C for the epic axis, the exact structural counterpart of WRITER B
+ *   above (`speakOnOwnChannel`'s `seenComments: [created.id]` single-id
+ *   union) but keyed one level deeper, per epic rather than per project.
+ *   Creating an absent key is deliberate, not an oversight: `projectVerdict`
+ *   treats an absent key as "never acted on this review episode", and a
+ *   suppression write recording a comment against that key is exactly this
+ *   project demonstrably having just acted on it — see `tellWorker`'s own
+ *   doc comment (src/tools/relationship.ts) for why the caller only ever
+ *   passes `epicsPartial` when the target is CURRENTLY In Review, never
+ *   otherwise (seeding a key for a not-yet-in-review epic would consume its
+ *   later fresh-episode signal before that episode has even begun).
  * - Both unions read against `normalizeWake`'s OUTPUT, never the raw stored
  *   JSON directly — see that function's own doc comment for why: reading
  *   raw JSON here would silently drop a legacy scalar's already-seen id on
@@ -814,8 +855,32 @@ function monotonicMax(stored: number | null | undefined, incoming: number | unde
  * a restart before its write ever succeeds will resume waking the project
  * until then — a real gap, and the reason the WARNING log line below stays
  * loud rather than being treated as fully closed.
+ *
+ * BUTCHR-292/BUTCHR-328 — EXTENDED TO COVER THE PER-EPIC AXIS, THE SAME
+ * MECHANISM, NOT A SECOND ONE: `epicsSeen` below was, until this ticket,
+ * deliberately absent — this fallback covered only `version`/`seenComments`,
+ * and a failed epic-axis write (WRITER A's `epics`, or WRITER C's
+ * `epicsPartial`) had no in-process recovery at all. Stored the SAME way
+ * `commentsSeen` already is: the FULL post-union per-epic map this call just
+ * computed (already incorporating whatever was persisted plus any prior
+ * still-pending fallback — see `normalized` at this function's own call
+ * site), never just this one call's own patch — so a later successful write,
+ * from ANY caller, durably absorbs the whole accumulated picture, not only
+ * the most recent failure. `mergePendingFallback` below merges it into the
+ * next read/write by PER-KEY UNION ONLY, exactly `epicsPartial`'s own shape
+ * — never a key-set replace — so a pending fallback entry can only ever ADD
+ * seen ids to an epic already known about (creating its key if absent), the
+ * same fail-open direction every other axis in this fallback already uses.
+ * One accepted imprecision, stated rather than hidden: because the fallback
+ * never prunes a key, an epic that left review while its OWN complete
+ * `check_in` observation was still unpersisted can appear to keep a stored
+ * key one write cycle longer than the persisted property alone would show —
+ * this can only ever delay that epic reading as a fresh episode on re-entry,
+ * never fabricate an unseen id or hide a genuinely foreign comment, and it
+ * clears itself the moment any subsequent watermark write for this project
+ * succeeds (the fallback entry is deleted outright on success, below).
  */
-const pendingWatermarkFallback = new Map<string, { version: number | null; seenComments: readonly string[] }>();
+const pendingWatermarkFallback = new Map<string, { version: number | null; seenComments: readonly string[]; epicsSeen?: Readonly<Record<string, readonly string[]>> }>();
 
 /** Test-only: `pendingWatermarkFallback` is process-lifetime state shared across every caller in this module, so a test suite that reuses a project key across tests (as this file's own fixtures do) must reset it between tests to avoid one test's failed write leaking into another's assertions. */
 export function resetPendingWatermarkFallbackForTests(): void {
@@ -825,8 +890,7 @@ export function resetPendingWatermarkFallbackForTests(): void {
 /**
  * `loadProjects`' own merge of a persisted watermark with any still-pending
  * in-memory fallback for the same project — see `pendingWatermarkFallback`'s
- * doc comment. Never touches `epicsSeen` (out of this fallback's scope; see
- * that doc comment).
+ * doc comment.
  *
  * BUTCHR-260: this used to branch on a `pending.reconcile` flag (a pending
  * value from `check_in`'s reconciling write was used DIRECTLY, bypassing
@@ -836,14 +900,30 @@ export function resetPendingWatermarkFallbackForTests(): void {
  * comment axis this existed to protect is now `commentsSeen`, a plain
  * union with no "stale ceiling" a reconciling write would ever need to
  * override, so every pending value merges the same way.
+ *
+ * BUTCHR-292/BUTCHR-328 — `epicsSeen` NOW MERGED TOO, PER-KEY UNION ONLY:
+ * every key already in `persisted.epicsSeen` is kept (the spread below), and
+ * every key in `pending.epicsSeen` has its ids unioned in, creating the key
+ * if `persisted` didn't have it. This can only ever GROW a per-epic set or
+ * add a key — never drop one — so it cannot reintroduce the key-set-replace
+ * hazard `epicsPartial` itself was built to avoid (see
+ * `advanceProjectWatermark`'s own doc comment). See
+ * `pendingWatermarkFallback`'s doc comment for the one accepted imprecision
+ * this merge carries (a key can outlive its epic's own review episode by up
+ * to one more watermark-write cycle when the write that would have dropped
+ * it failed to persist).
  */
 function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): ProjectWatermark {
   const pending = pendingWatermarkFallback.get(projectKey);
   if (!pending) return persisted;
+  const epicsSeen: Record<string, readonly string[]> = { ...persisted.epicsSeen };
+  for (const [key, ids] of Object.entries(pending.epicsSeen ?? {})) {
+    epicsSeen[key] = Array.from(new Set([...(persisted.epicsSeen[key] ?? []), ...ids]));
+  }
   return {
     version: monotonicMax(persisted.version, pending.version ?? undefined),
     commentsSeen: Array.from(new Set([...persisted.commentsSeen, ...pending.seenComments])),
-    epicsSeen: persisted.epicsSeen,
+    epicsSeen,
   };
 }
 
@@ -885,7 +965,7 @@ function mergePendingFallback(projectKey: string, persisted: ProjectWatermark): 
 export async function advanceProjectWatermark(
   ops: AtlassianOps,
   projectKey: string,
-  patch: { version?: number; seenComments?: readonly string[]; epics?: Readonly<Record<string, readonly string[]>> },
+  patch: { version?: number; seenComments?: readonly string[]; epics?: Readonly<Record<string, readonly string[]>>; epicsPartial?: Readonly<Record<string, readonly string[]>> },
   log: (line: string) => void = console.error,
 ): Promise<void> {
   // BUTCHR-105: uses `getProjectPropertyOrNull`, NOT the bare-catch
@@ -927,6 +1007,19 @@ export async function advanceProjectWatermark(
     }
     epicsSeen = nextEpicsSeen;
   }
+  // BUTCHR-292/BUTCHR-328 — WRITER C: a per-key UNION applied on top of
+  // whatever `epicsSeen` is at this point (either `normalized.epicsSeen`
+  // unchanged, or `patch.epics`'s fresh full-replace map, in the
+  // never-expected case both are given in one call) — see this function's
+  // own doc comment for why this must never route through the key-set
+  // replace above.
+  if (patch.epicsPartial !== undefined) {
+    const nextEpicsSeen: Record<string, readonly string[]> = { ...epicsSeen };
+    for (const [key, ids] of Object.entries(patch.epicsPartial)) {
+      nextEpicsSeen[key] = Array.from(new Set([...(epicsSeen[key] ?? []), ...ids]));
+    }
+    epicsSeen = nextEpicsSeen;
+  }
 
   const nextWake: StoredWake = {
     ...wake, // preserves the legacy `comment`/`epics` scalars VERBATIM — see this function's own doc comment.
@@ -944,8 +1037,8 @@ export async function advanceProjectWatermark(
     // correct.
     pendingWatermarkFallback.delete(projectKey);
   } catch (e) {
-    pendingWatermarkFallback.set(projectKey, { version: nextWake.version ?? null, seenComments: commentsSeen });
-    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, commentsSeen=${commentsSeen.length}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
+    pendingWatermarkFallback.set(projectKey, { version: nextWake.version ?? null, seenComments: commentsSeen, epicsSeen });
+    log(`  WARNING: [advanceProjectWatermark] persisted write failed for ${projectKey} (would-be version=${nextWake.version ?? "null"}, commentsSeen=${commentsSeen.length}, epics tracked=${Object.keys(epicsSeen).length}): ${(e as Error)?.message ?? e} — held in this process's in-memory fallback only (DEFECT 1b; resets on restart) so a poll does not wake on the very write that just failed to persist; the caller's own catch (if any) logs its own failure shape separately`);
     throw e;
   }
 }

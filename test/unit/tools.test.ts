@@ -57,7 +57,7 @@ describe("atlassianTools", () => {
       "jira_set_priority", "jira_transition",
       "list_peers",
       "new_worker", "prioritize_worker", "report_to_boss",
-      "set_doc", "shelve_worker", "start_worker", "submit_to_boss",
+      "set_doc", "shelve_worker", "stand_down", "start_worker", "submit_to_boss",
       "tell_peer", "tell_worker",
     ]);
   });
@@ -1679,6 +1679,112 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       await expect(tools.check_in!.handler({}, conn)).rejects.toThrow(/refusing an issue caller/);
       expect(declared).toEqual([]);
     });
+  });
+});
+
+describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaration)", () => {
+  function standDownRig(opts: {
+    issue?: unknown;
+    commentsByKey?: Record<string, Array<{ id: string }>>;
+    onStandDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void;
+  } = {}) {
+    const getIssueCommentsCalls: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => opts.issue ?? { key: "KAN-7" },
+      getIssueComments: async (key: string) => {
+        getIssueCommentsCalls.push(key);
+        return { results: opts.commentsByKey?.[key] ?? [] };
+      },
+      search: async () => ({ ok: true }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      getPage: async () => ({ ok: true }),
+      updatePage: async () => ({ version: 1 }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async () => ({ results: [] }),
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
+      getProjectPropertyOrNull: async () => null,
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+    };
+    const audits: string[] = [];
+    const tools = atlassianTools(ops, (l) => audits.push(l), {}, undefined, undefined, undefined, opts.onStandDown);
+    return { tools, audits, getIssueCommentsCalls };
+  }
+
+  test("refuses a PROJECT caller, before any Atlassian call, pointing it at check_in", async () => {
+    const { tools } = standDownRig();
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.stand_down!.handler({}, conn)).rejects.toThrow(/refusing a project caller/);
+    await expect(tools.stand_down!.handler({}, conn)).rejects.toThrow(/check_in/);
+  });
+
+  test("refuses a connection with no x-issue", async () => {
+    const { tools } = standDownRig();
+    const conn = { headers: {} } as any;
+    await expect(tools.stand_down!.handler({}, conn)).rejects.toThrow(/refusing/);
+  });
+
+  test("an ISSUE caller succeeds: reads its own ticket's comments (no workers), calls the standDown effect with the observed seen-set, and returns it", async () => {
+    const observed: Array<[string, ReadonlyMap<string, readonly string[]>]> = [];
+    const { tools, getIssueCommentsCalls, audits } = standDownRig({
+      issue: { key: "KAN-7", fields: { issuelinks: [] } },
+      commentsByKey: { "KAN-7": [{ id: "100" }, { id: "101" }] },
+      onStandDown: (key, seen) => observed.push([key, seen]),
+    });
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const result = await tools.stand_down!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7"] });
+    expect(getIssueCommentsCalls).toEqual(["KAN-7"]);
+    expect(observed.length).toBe(1);
+    expect(observed[0]![0]).toBe("KAN-7");
+    expect(observed[0]![1].get("KAN-7")).toEqual(["100", "101"]);
+    expect(audits.some((l) => l.includes("stand_down") && l.includes("KAN-7"))).toBe(true);
+  });
+
+  test("watches every current worker too — via findWorkers' own outward-Implements read of the fetched issue, not a second link fetch", async () => {
+    const observed: Array<[string, ReadonlyMap<string, readonly string[]>]> = [];
+    const { tools } = standDownRig({
+      issue: {
+        key: "KAN-7",
+        fields: {
+          issuelinks: [
+            { type: { name: "Implements" }, outwardIssue: { key: "KAN-8", fields: { status: { name: "In Progress" }, summary: "s" } } },
+          ],
+        },
+      },
+      commentsByKey: { "KAN-7": [{ id: "100" }], "KAN-8": [{ id: "200" }] },
+      onStandDown: (key, seen) => observed.push([key, seen]),
+    });
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const result = await tools.stand_down!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7", "KAN-8"] });
+    expect(observed[0]![1].get("KAN-8")).toEqual(["200"]);
+  });
+
+  test("the standDown effect is optional — omitting it still reads and returns the snapshot, it just never sleeps or releases a pane", async () => {
+    const { tools } = standDownRig({ issue: { key: "KAN-7", fields: { issuelinks: [] } }, commentsByKey: { "KAN-7": [] } });
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const result = await tools.stand_down!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7"] });
   });
 });
 

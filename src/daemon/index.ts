@@ -5,10 +5,12 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
+import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
+import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
 import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
@@ -44,6 +46,7 @@ import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
+import { createStandDownRegistry } from "../agents/stand-down.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 
 let config;
@@ -185,6 +188,14 @@ const projectNotifyHealth = createLoopHealth({
 // the rest of the declining set and why it's not all wired yet.
 const coverage = createCoverageTracker();
 
+// BUTCHR-329: this daemon's own build-currency verdict, reported as a
+// /health sibling — see src/daemon/currency.ts's own header for why it must
+// be cached (computeBuildCurrency is expensive) rather than recomputed per
+// poll, and why the cache is lazy (on `/health` access) rather than a
+// background timer. `buildIdentity` satisfies `RunningBuild` structurally
+// (a superset), so no adapter is needed here.
+const currency = createCurrencyTracker({ compute: () => computeBuildCurrency(buildIdentity) });
+
 /**
  * BUTCHR-244: `check_worker`'s live staffing probe — the narrow seam
  * `atlassianTools` takes rather than the whole `herd`, so `defs.ts` (and
@@ -216,6 +227,33 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
 // `checkDeclaredDone` hook (which consumes) — declared here, ahead of both,
 // same "shared, not duplicated" discipline as `ownChannelComments` below.
 const checkInExit = createCheckInExitRegistry();
+// BUTCHR-307: the issue tier's own pane-release signal — a SECOND, separate
+// `CheckInExitRegistry` instance (never the project tier's `checkInExit`
+// above — see that module's own top comment: it is generic over an opaque
+// id, but one instance per LOOP, same "one instance per runResourceLoop
+// call" discipline `RespawnGuard`/`ReapGuard` already follow elsewhere in
+// this file). `stand_down`'s tool handler below declares into this instance
+// (composed alongside `issueStandDown.standDown` — see the `standDown`
+// callback passed to `atlassianTools`), and the issue loop's own
+// `checkDeclaredDone`/`invalidateDeclaredDone` hooks consume it.
+const issueCheckInExit = createCheckInExitRegistry();
+// BUTCHR-307: the issue tier's own sleep/wake registry — see
+// src/agents/stand-down.ts's own top comment for the full mechanism (the
+// self-wake hazard it closes, the seen-set bound, the two new failure modes
+// it bounds). `comments`/`addComment` are the plain issue-only seams
+// (`stalled`/`parkedDetector` above already use the same shape) rather than
+// the tier-aware `ownChannelComments` reader below: every id this registry
+// ever sees is an issue key, never a project id, so there is no second
+// resource shape to route around here.
+const issueStandDown = createStandDownRegistry({
+  now: () => Date.now(),
+  maxSleepMinutes: config.standDownMaxSleepMinutes,
+  yieldLoopCount: config.yieldLoopCount,
+  yieldLoopWindowMinutes: config.yieldLoopWindowMinutes,
+  addComment: async (id, text) => { await ops.addComment(id, text); },
+  comments: (id) => atlassian.comments(id),
+  log: (line) => console.error(`  ${line}`),
+});
 
 const { app, mcp } = buildApp({
   state: async () => {
@@ -250,14 +288,22 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot()),
+  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare));
+}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare, (key, seen) => {
+  // BUTCHR-307: `stand_down`'s effect is composed from TWO registries — see
+  // `issueCheckInExit`/`issueStandDown`'s own construction comments above
+  // for why pane release (a `CheckInExitRegistry` instance) is a separate
+  // signal from sleep/wake itself (`StandDownRegistry`), same reasoning
+  // `check_in`/`checkInExit` already keep separate for the project tier.
+  issueStandDown.standDown(key, seen);
+  issueCheckInExit.declare(key);
+}));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
@@ -423,6 +469,22 @@ const frozenAsleepDetector = createFrozenAsleepDetector({
   minutes: config.atRestMinutes,
   addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
   comments: ownChannelComments,
+  log: (line) => console.error(`  ${line}`),
+});
+// BUTCHR-307: a SECOND, issue-tier instance of the SAME generic detector —
+// `ISSUE_ACTIVATION.verdictFor` (src/resources/issue.ts) can now read
+// "asleep" too (via `stand_down`), so the issue loop needs its own
+// `atRest`-in-time bound for the exact same advance-then-exit race this
+// module's own top comment describes, same "one instance per loop"
+// discipline `frozenAsleepDetector` above already follows for the project
+// tier. The complaint text (`frozenComment`, frozen-asleep.ts) is already
+// tier-agnostic — it names `id` and never says "project" — so it needs no
+// issue-tier rewording.
+const issueFrozenAsleepDetector = createFrozenAsleepDetector({
+  now: () => Date.now(),
+  minutes: config.atRestMinutes,
+  addComment: async (id, text) => { await ops.addComment(id, text); },
+  comments: (id) => atlassian.comments(id),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-305/BUTCHR-238: audible-only detection of a PROJECT pinned "active"
@@ -606,6 +668,10 @@ const issueResourceType = createIssueResourceType({
   links: (key) => atlassian.links(key),
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
+  // BUTCHR-307: wires `.asleep` stamping (discovery.search()) and the
+  // stand-down gate (createIssueEventRules's decide()) to the SAME registry
+  // `stand_down`'s tool handler declares into above.
+  standDown: issueStandDown,
 });
 
 runResourceLoop(issueResourceType, {
@@ -656,9 +722,22 @@ runResourceLoop(issueResourceType, {
   checkAbandoned: abandonedDetector.check,
   // BUTCHR-141: the issue tier is the fast, high-volume loop (15s) — the one
   // most likely to actually observe a crash loop reach its threshold quickly.
-  checkCrashLoop: issueCrashLoopDetector.check,
+  // BUTCHR-307: `spawning` is filtered through `issueStandDown.consumeCrashLoopExemptions`
+  // FIRST — a spawn that is a wake from a declared stand_down is an ORDERLY
+  // exit, not an undeclared crash, so it must never reach this detector's
+  // own candidate list at all (see stand-down.ts's own top comment for why
+  // this is a call-site change, not a change to the detector's definition).
+  checkCrashLoop: (spawning, desired) => issueCrashLoopDetector.check(issueStandDown.consumeCrashLoopExemptions(spawning), desired),
   // BUTCHR-147: see src/agents/reconcile-failure.ts.
   checkReconcileFailure: issueReconcileFailureDetector.check,
+  // BUTCHR-307: `ISSUE_ACTIVATION.verdictFor` can now read "asleep" (via
+  // `stand_down`), so the issue loop needs the same `atRest` machinery the
+  // project tier already had — see issueFrozenAsleepDetector/issueCheckInExit's
+  // own construction comments above for why each is a SEPARATE instance from
+  // the project tier's.
+  checkFrozenAsleep: issueFrozenAsleepDetector.check,
+  checkDeclaredDone: issueCheckInExit.check,
+  invalidateDeclaredDone: issueCheckInExit.invalidateActive,
   // BUTCHR-245: the issue tier is the fast, high-volume loop (15s) — the
   // one most likely to actually clear a stranded workspace's grace period
   // quickly. See src/agents/reap.ts.
@@ -735,14 +814,18 @@ runResourceLoop(projectResourceType, {
       : outcome.delivered ? "delivered" : "refused/absent";
     console.error(`  [notify] ${project} ← ${about}: channel pushed, prompt ${promptState}`);
   },
-  // BUTCHR-95/123: only the project tier can ever produce a non-empty
-  // `atRest` (the issue tier never sleeps — ISSUE_ACTIVATION never returns
-  // "asleep"), so this is wired here only. See ReconcileOptions.checkFrozenAsleep's doc comment (src/daemon/loop.ts).
+  // BUTCHR-95/123: the project tier's own instance — see ReconcileOptions.checkFrozenAsleep's
+  // doc comment (src/daemon/loop.ts). BUTCHR-307 UPDATE: this is no longer
+  // the only tier that can produce a non-empty `atRest` — `ISSUE_ACTIVATION.verdictFor`
+  // can now read "asleep" too (via `stand_down`) — but each tier keeps its
+  // OWN detector instance regardless (see `issueFrozenAsleepDetector` at the
+  // issue loop's own wiring above), same "one instance per loop" discipline
+  // every other per-loop detector in this file already follows.
   checkFrozenAsleep: frozenAsleepDetector.check,
-  // BUTCHR-275: wired here only, same reasoning as checkFrozenAsleep just
-  // above — only the project tier ever produces a candidate (the issue tier
-  // never sleeps, so `check_in` doesn't exist for it and never declares
-  // anything here). See src/agents/check-in-exit.ts.
+  // BUTCHR-275: the project tier's own instance. BUTCHR-307 UPDATE: the
+  // issue tier now has its own `check_in`-equivalent (`stand_down`) and its
+  // own `checkInExit`-equivalent instance (`issueCheckInExit`, wired at the
+  // issue loop's own call site above) — this one stays project-only.
   checkDeclaredDone: checkInExit.check,
   // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
   // see ReconcileOptions.invalidateDeclaredDone's own doc comment
