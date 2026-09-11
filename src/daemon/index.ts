@@ -9,7 +9,7 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
-import { buildIdentity, toBuildReport } from "../agents/build-identity.js";
+import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
@@ -67,7 +67,11 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`);
+// BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
+// per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
+// comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
+// wait; only `log` is being threaded through here.
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`));
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH
@@ -306,6 +310,11 @@ const { app, mcp } = buildApp({
 }));
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
+// BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
+// daemon's own /health `build` field serves (see `health` above) — never a
+// second derivation — so a journal window can be attributed to a BUILD, not
+// only a pid (journald's pid only bounds one daemon generation).
+console.error(`  ${describeBuild(toBuildReport(buildIdentity))}`);
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
