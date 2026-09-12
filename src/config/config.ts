@@ -321,16 +321,16 @@ export interface ConfigEnv {
 /** `readFile` is injected so config parsing stays pure and testable. */
 export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): Config {
   const provider = env.BUTCHR_AGENT_PROVIDER?.trim() ?? "claude";
-  if (provider !== "claude" && provider !== "codex") throw new Error("BUTCHR_AGENT_PROVIDER must be claude or codex");
-  const parseOrder = (value: string, name: string): Array<"claude" | "codex"> => {
+  if (provider !== "claude" && provider !== "codex" && provider !== "agy") throw new Error("BUTCHR_AGENT_PROVIDER must be claude, codex, or agy");
+  const parseOrder = (value: string, name: string): Array<"claude" | "codex" | "agy"> => {
     const entries = value.split(",").map((entry) => entry.trim());
-    if (entries.some((entry) => entry !== "claude" && entry !== "codex") || new Set(entries).size !== entries.length) {
+    if (entries.some((entry) => entry !== "claude" && entry !== "codex" && entry !== "agy") || new Set(entries).size !== entries.length) {
       throw new Error(`${name} must be an ordered list of distinct supported providers`);
     }
-    return entries as Array<"claude" | "codex">;
+    return entries as Array<"claude" | "codex" | "agy">;
   };
   const providers = env.BUTCHR_AGENT_PROVIDERS === undefined ? undefined : parseOrder(env.BUTCHR_AGENT_PROVIDERS, "BUTCHR_AGENT_PROVIDERS");
-  const roleProviders: Partial<Record<"project" | "epic" | "story" | "task", Array<"claude" | "codex">>> = {};
+  const roleProviders: Partial<Record<"project" | "epic" | "story" | "task", Array<"claude" | "codex" | "agy">>> = {};
   for (const role of ["project", "epic", "story", "task"] as const) {
     const key = `BUTCHR_AGENT_PROVIDERS_${role.toUpperCase()}` as keyof ConfigEnv;
     const value = env[key];

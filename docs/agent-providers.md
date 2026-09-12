@@ -24,13 +24,72 @@ times allow retry; unknown reset times require confirmed recovery or an
 operator reset. Exhaustion leaves work waiting. The old Claude reset watcher
 does not compete with the ordered recovery path.
 
-Antigravity has a Drovr launch adapter, but is not selectable in Butchr until
-its per-worker MCP identity configuration is verified. Codex and Claude are
-the supported factory providers in this iteration.
+Antigravity is selected as `agy`, including in ordered preferences such as
+`claude,codex,agy`. It has no quota classifier: only a demonstrated Claude
+quota refusal moves to the next provider. An AGY launch error remains an error.
+
+## Antigravity registration
+
+Build the package first. It includes `dist/butchr-mcp.js`, a Bun-source stdio
+bridge, separately from the daemon. For the Unix account running Butchr and
+Herdr, configure the global Antigravity file `~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "butchr": {
+      "command": "/absolute/install/dist/butchr-mcp.js",
+      "args": ["--workspace-root", "/absolute/factory-workspaces"]
+    }
+  }
+}
+```
+
+Use the bridge alongside the installed Butchr build and the actual
+`BUTCHR_WORKSPACES` root (default `~/butchr-workspaces`). An explicit Bun
+executable with the bridge script as the first argument is also supported.
+The daemon validates the exact registration once at startup. Missing, disabled,
+wrong-root, or wrong-build registrations block new AGY workers without stopping
+management of existing agents. The daemon never edits global MCP configuration.
+
+AGY 1.2.2 was observed starting stdio children in each of two separate session
+workspaces and reporting those same directories through MCP roots. Each AGY
+workspace receives `.butchr-agy.json` with its own issue and MCP URL. The bridge
+requires its current directory to be a direct child of the configured root,
+checks the metadata identity against that directory's name, and attaches
+`x-issue` and `x-butchr-provider=agy` to the HTTP connection. There is no shared
+mutable issue header. Missing or mismatched metadata fails closed.
+
+Unlike Codex, AGY has no verified per-launch MCP configuration override.
+Factory readiness therefore rejects other enabled global MCP registrations:
+use a dedicated factory Unix account rather than sharing USRR's personal MCP
+identity. Plugin-provided MCP servers are outside this check; deploy with no
+such plugins until their isolation is verified. Do not disable the operator's
+personal registrations merely to satisfy factory readiness.
+
+The bridge reuses Thatch's compatibility handling and the MCP SDK, with no
+duplicated tools. Tests cover concurrent identity isolation, initialization,
+tool calls, and bounded cleanup. Claude channel notifications are not sent to
+AGY; normal factory updates still use the managed agent prompt path.
+
+AGY's tool-permission flag does not dismiss new-workspace trust, and parent
+trust is not inherited. Before launching, Butchr asks Drovr to prepare the
+exact generated workspace for unattended use. Drovr adds only that directory
+to AGY's trusted-workspace settings, preserving other settings. Preparation
+failure stops the launch before replacing a refused worker. No home-wide
+trust is granted. Butchr asks Drovr for AGY's explicit unattended tool flag;
+the provider-specific setting and argument handling remain in Drovr.
+
+Live acceptance on AGY 1.2.2 used two fresh workspaces, the actual Drovr
+preparation helper, and the built bridge against a local identity tool.
+Both reached the interactive prompt with no trust approval and returned
+their own issue identity. Temporary settings and clients were removed after
+verification. This proves the local client/bridge path, not a deployed
+production factory task; service activation remains a separate operation.
 
 ## Single provider
 
-Set `BUTCHR_AGENT_PROVIDER=claude` (default) or `codex`. Optionally set
+Set `BUTCHR_AGENT_PROVIDER=claude` (default), `codex`, or `agy`. Optionally set
 `BUTCHR_AGENT_MODEL` to a model available to that provider's account. Invalid
 providers and empty explicit model values fail configuration loading.
 Without an override Claude retains opus for epic/story/project, sonnet for
@@ -79,7 +138,7 @@ must be installed and authenticated for the Unix account running Herdr.
 
 ## Delivery and deployment
 
-Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.3.0 GitHub
+Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.3.2 GitHub
 release, including its SDK error and type reexports. Drovr corrects supported
 Codex directory-trust dialogs from idle/done to blocked. Those corrected
 reports feed the existing status watchers and kickoff checks; nudges refuse
@@ -87,8 +146,8 @@ an already-blocked agent, report delivery as false when the prompt response
 is corrected to blocked, and never send recovery Enter while blocked.
 Drovr does not add a Codex quota classifier or confirm prompt completion.
 
-HTTP MCP tool access is separate from unsolicited notifications. Thatch 0.6.0
-uses Claude channel notifications; Butchr excludes Codex connections from
+HTTP MCP tool access is separate from unsolicited notifications. Thatch 0.6.3
+uses Claude channel notifications; Butchr excludes Codex and AGY connections from
 that path. Issue and project updates still use Herdr `agent.prompt`, including
 the existing idle/blocked safeguards. Acceptance of a prompt does not prove a
 turn completed. Claude session-limit detection is not a complete Codex quota

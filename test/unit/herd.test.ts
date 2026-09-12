@@ -6,6 +6,7 @@ import { HerdrHerd, agentNameFor, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../..
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
+import { spawnArgs } from "../../src/agents/argv.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 
 const clearQuota = () => {
@@ -612,6 +613,24 @@ describe("staleIssues", () => {
   }
   const instant = () => Promise.resolve();
   const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
+
+  test("AGY residents are checked using the Drovr launch contract", async () => {
+    const cwd = join(workspaceRoot(), "KAN-783");
+    const argv = ["agy", ...spawnArgs({ key: "KAN-783", issuetype: "Task", summary: "", parent: null }, cwd, { provider: "agy" })];
+    const { client, calls } = fakeHerdrWithCwd([{ pane_id: "agy-pane", cwd }], {
+      "agy-pane": ok([{ pid: 1, argv, name: "agy" }]),
+    });
+    expect(await new HerdrHerd(client, "http://x/mcp", instant).staleIssues()).toEqual([]);
+    expect(calls).toEqual(["agy-pane"]);
+  });
+
+  test("blocked AGY default skips stale reconciliation before inspecting residents", async () => {
+    const client = { agent: { list: async () => { throw new Error("must not inspect"); } } };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant, undefined, {
+      provider: "agy", agySpawnBlocked: "global bridge unavailable",
+    });
+    expect(await herd.staleIssues()).toEqual([]);
+  });
 
   test("a claude process at the reported pane with a bare `claude --resume` argv -> stale, naming the missing flags", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");

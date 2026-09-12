@@ -5,6 +5,7 @@ import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
+import { inventoryAgyMcp } from "../mcp/registration.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
@@ -72,6 +73,7 @@ try {
   process.exit(1);
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // Label writes must never silently 403: Jira only honours notifyUsers=false

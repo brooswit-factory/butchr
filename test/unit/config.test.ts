@@ -7,6 +7,21 @@ const noRead = () => { throw new Error("should not read"); };
 const base = { ATLASSIAN_SITE: "https://x.atlassian.net/", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "tok" };
 
 describe("loadConfig", () => {
+  test("accepts AGY as default and in every role's ordered provider list", () => {
+    const c = loadConfig({ ...base, BUTCHR_AGENT_PROVIDER: " agy ", BUTCHR_AGENT_PROVIDERS: "claude, agy, codex",
+      BUTCHR_AGENT_PROVIDERS_PROJECT: "agy,claude", BUTCHR_AGENT_PROVIDERS_EPIC: "agy,codex",
+      BUTCHR_AGENT_PROVIDERS_STORY: "codex,agy", BUTCHR_AGENT_PROVIDERS_TASK: "agy",
+    }, noRead);
+    expect(c.agent).toEqual({ provider: "agy", providers: ["claude", "agy", "codex"], roleProviders: {
+      project: ["agy", "claude"], epic: ["agy", "codex"], story: ["codex", "agy"], task: ["agy"],
+    } });
+    expect(describeConfig(c)).toContain("provider=agy");
+    for (const order of ["agy,agy", "agy,unknown", "agy,", ""]) {
+      expect(() => loadConfig({ ...base, BUTCHR_AGENT_PROVIDERS: order }, noRead)).toThrow("ordered list");
+      expect(() => loadConfig({ ...base, BUTCHR_AGENT_PROVIDERS_TASK: order }, noRead)).toThrow("ordered list");
+    }
+    expect(() => loadConfig({ ...base, BUTCHR_AGENT_PROVIDER: "unknown" }, noRead)).toThrow("BUTCHR_AGENT_PROVIDER");
+  });
   test("parses a full env; trims trailing slash; default port 7717", () => {
     const c = loadConfig(base, noRead);
     expect(c.atlassian).toEqual({ site: "https://x.atlassian.net", email: "a@b.c", token: "tok" });
