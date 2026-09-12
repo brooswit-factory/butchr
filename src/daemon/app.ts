@@ -36,5 +36,5 @@ export function buildApp(view: ViewDeps, tools: Record<string, ToolDef<any>> = {
 
 /** Push an update to whichever agent(s) say they are working `issueKey`. */
 export function notifyIssue(mcp: ReturnType<typeof buildApp>["mcp"], issueKey: string, content: string) {
-  return mcp.sendAll({ content, meta: { issue: issueKey } }, { where: (c) => c.headers["x-issue"] === issueKey });
+  return mcp.sendAll({ content, meta: { issue: issueKey } }, { where: (c) => c.headers["x-issue"] === issueKey && c.headers["x-butchr-provider"] !== "codex" });
 }

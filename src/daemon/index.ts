@@ -1,13 +1,15 @@
 import { readFileSync } from "node:fs";
-import { HerdrClient } from "@brooswit/herdr-sdk";
+import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
+import { inventoryCodexMcp } from "../agents/argv.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
-import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { issueOfWorkspacePath } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -69,6 +71,7 @@ try {
   console.error("See .env.example for the required configuration.");
   process.exit(1);
 }
+if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // Label writes must never silently 403: Jira only honours notifyUsers=false
@@ -78,12 +81,12 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
-const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 // BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`));
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent);
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH
@@ -300,11 +303,11 @@ const issueStandDown = createStandDownRegistry({
 
 const { app, mcp } = buildApp({
   state: async () => {
-    const { agents } = await herdr.agent.list();
-    return agents.flatMap((a) => {
-      const issue = issueOfAgentName((a as { name?: string }).name);
-      return issue ? [{ issue, status: a.agent_status, summary: issueMeta.get(issue)?.summary ?? "" }] : [];
-    });
+    return (await herd.managedAgents()).map(({ issue, status }) => ({
+      issue,
+      status,
+      summary: issueMeta.get(issue)?.summary ?? "",
+    }));
   },
   open: async (issue) => {
     const pane = await herd.paneFor(issue);
@@ -316,15 +319,12 @@ const { app, mcp } = buildApp({
   // BUTCHR-267: pane-keyed sibling of `open` above — the dashboard row link
   // target (BUTCHR-266 will build the link; BUTCHR-264 serves the pane in
   // the row data). "This daemon's own live agent registry" (criterion 4) is
-  // the SAME `issueOfAgentName`-filtered set `state` above already builds
+  // the same workspace-path-owned set `state` above already builds
   // from `herdr.agent.list()` — a pane belonging to some other, non-butchr
   // pane on this host is never in that set, so it's refused rather than
   // handed to `herdr agent attach`.
   openPane: async (pane) => {
-    const { agents } = await herdr.agent.list();
-    const livePanes = agents
-      .filter((a) => issueOfAgentName((a as { name?: string }).name))
-      .map((a) => a.pane_id);
+    const livePanes = (await herd.managedAgents()).map((agent) => agent.pane);
     const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
     const decision = resolveAttach(pane, livePanes, terminalPrefix ?? null, hasDisplay);
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
@@ -382,12 +382,15 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
   const m = new Map<string, string>();
   for (const a of agents) {
-    const issue = issueOfAgentName((a as { name?: string }).name);
+    const issue = a.resource_key ?? null;
     if (issue) m.set(issue, a.agent_status ?? "unknown");
   }
   return m;
 };
-const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMapFromAgents((await herdr.agent.list()).agents);
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
+  const { agents } = await herdr.agent.list();
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })));
+};
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
 // the SAME single `agent.list()` — not a second fetch, the same discipline
@@ -421,7 +424,10 @@ const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMa
 const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
   let agents: readonly DashboardAgent[];
   try {
-    agents = await dashboardFeed.poll(() => herdr.agent.list());
+    agents = await dashboardFeed.poll(async () => {
+      const { agents } = await herdr.agent.list();
+      return { agents: agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })) };
+    });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
     throw e;
@@ -448,7 +454,7 @@ const quotaGate = createQuotaGate(
   async () => (await herdr.agent.list()).agents.map((a) => ({
     pane_id: a.pane_id,
     agent_status: a.agent_status ?? "",
-    issue: issueOfAgentName((a as { name?: string }).name),
+    issue: issueOfWorkspacePath(a.cwd),
   })),
   readPane,
   () => Date.now(),
@@ -794,7 +800,7 @@ runResourceLoop(issueResourceType, {
     const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, about, reason);
     // Channel push renders mid-turn; the prompt is what STARTS a turn on an
     // idle agent (measured: an idle epic never woke on the push alone).
-    void notifyIssue(mcp, issue, msg);
+    void notifyIssue(mcp, issue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
     const outcome = await herd.nudge(issue, msg).catch((): NudgeResult => ({ delivered: false }));
     // BUTCHR-87: was `reason?.pr ? " (pr:from→to)" : ""` — every notify line
     // now carries a reason tag, never a silent "" for the 89% that used to
@@ -808,7 +814,7 @@ runResourceLoop(issueResourceType, {
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: channel pushed, prompt ${promptState}`);
+    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
   onRespawn: async (issue, reason, observedArgv) => {
     console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
@@ -908,12 +914,12 @@ runResourceLoop(projectResourceType, {
     // the issue loop's own notify closure above, not a call into it — the
     // issue loop's own call site above is left byte-for-byte untouched.
     const msg = changeNudge(project, about, reason);
-    void notifyIssue(mcp, project, msg);
+    void notifyIssue(mcp, project, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
     const outcome = await herd.nudge(project, msg).catch((): NudgeResult => ({ delivered: false }));
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${project} ← ${about}: channel pushed, prompt ${promptState}`);
+    console.error(`  [notify] ${project} ← ${about}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
   // BUTCHR-95/123: the project tier's own instance — see ReconcileOptions.checkFrozenAsleep's
   // doc comment (src/daemon/loop.ts). BUTCHR-307 UPDATE: this is no longer
@@ -1022,7 +1028,7 @@ const escalator = createEscalator({
 // both need it, and neither can assume the caller already has it.
 async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
-  return issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
+  return issueOfWorkspacePath(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes

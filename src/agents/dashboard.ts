@@ -44,7 +44,6 @@
  * inside a module that never sees it).
  */
 import { isProjectId } from "../resources/id.js";
-import { issueOfAgentName } from "./herd.js";
 import { StatusFloorTracker, type StatusFloor } from "./status-floor.js";
 import type { AdmissionCensus } from "./admission.js";
 
@@ -214,6 +213,7 @@ export function buildAdmissionView(census: AdmissionCensus): AdmissionView {
 /** The subset of `AgentInfo` this module actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardAgent {
   name?: string | null;
+  resource_key?: string | null;
   agent_status: string;
   pane_id: string;
 }
@@ -235,7 +235,7 @@ export function buildDashboardRows(agents: readonly DashboardAgent[], deps: Buil
 
   const resolved: { agent: DashboardAgent; resourceKey: string }[] = [];
   for (const agent of agents) {
-    const resourceKey = issueOfAgentName(agent.name);
+    const resourceKey = agent.resource_key;
     if (resourceKey) resolved.push({ agent, resourceKey });
   }
   // Same discipline as FrozenAsleepTracker.forgetMissing: an id absent from

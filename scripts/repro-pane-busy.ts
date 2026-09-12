@@ -6,7 +6,7 @@
  * workspaces is not something that gets approved here.
  *
  * Reproduces the create-then-start readiness race directly against
- * `HerdrClient` — `workspace.create` → (optional gap) → `agent.start` with
+ * `DrovrClient` — `workspace.create` → (optional gap) → `agent.start` with
  * `args: ["--version"]` (exits immediately; the point is only whether
  * `agent.start` gets past herdr's "available shell" precondition, never to
  * start a real agent) → close. Only an `agent_pane_busy`-coded HerdrError
@@ -55,7 +55,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HerdrClient, HerdrError, isTimeout } from "@brooswit/herdr-sdk";
+import { DrovrClient, HerdrError, isTimeout } from "@brooswit/drovr";
 import { PANE_READY_WAIT_MS, PANE_BUSY_MAX_RETRIES } from "../src/agents/herd.js";
 
 // Label prefixes this ticket's harness runs (this session's and prior ones)
@@ -65,7 +65,7 @@ import { PANE_READY_WAIT_MS, PANE_BUSY_MAX_RETRIES } from "../src/agents/herd.js
 const RESIDUE_LABEL_PREFIXES = ["repro-268", "err-check", "repro"];
 const HARNESS_LABEL_PREFIX = "repro-268";
 
-const herdr = new HerdrClient({});
+const herdr = new DrovrClient({});
 
 /**
  * "A herd you cannot see returns a confident zero, not an error." Confirm

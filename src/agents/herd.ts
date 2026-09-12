@@ -1,6 +1,7 @@
-import { HerdrError, type HerdrClient, type results } from "@brooswit/herdr-sdk";
-import { buildWorkspace, workspaceRoot, type SpawnSpec } from "./workspace.js";
-import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
+import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
+import { join } from "node:path";
+import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { agentStartParams, spawnArgs, checkArgv, type AgentConfig } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -8,17 +9,6 @@ export type { SpawnSpec } from "./workspace.js";
 export type { StrandedCandidate } from "./reap.js";
 export type { ResidencyVerdict } from "./residency-census.js";
 
-const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
-/**
- * Identifies the claude process among a pane's foreground processes. Checked
- * against BOTH argv[0] (tolerating a bun/node wrapper in front of the real
- * binary, same predicate proctable.ts used against /proc) and `name` (always
- * present on the wire, unlike `argv`) — so a process herdr identifies as
- * claude by name but couldn't report argv for is still recognized as THE
- * claude process, just one whose argv (and therefore its health) is unknown.
- */
-const isClaude = (p: { argv?: readonly string[] | null; name?: string | null }): boolean =>
-  basename(p.argv?.[0] ?? "") === "claude" || basename(p.name ?? "") === "claude";
 
 /**
  * What nudge() actually accomplished — plain "delivered: true" (KAN-829) hid
@@ -82,10 +72,15 @@ export interface Herd {
   nudge(issue: string, text: string): Promise<NudgeResult>;
 }
 
+export interface ManagedHerdAgent {
+  issue: string;
+  pane: string;
+  cwd: string;
+  status: string;
+}
+
 const AGENT_PREFIX = "butchr-";
 const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
-const issueOf = (name: string | null | undefined) =>
-  name && name.startsWith(AGENT_PREFIX) ? name.slice(AGENT_PREFIX.length).toUpperCase() : null;
 
 /**
  * How long nudge() waits after delivering a prompt before checking whether a
@@ -197,7 +192,7 @@ export type SpawnOrigin = "spawn" | "respawn";
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   constructor(
-    private readonly herdr: HerdrClient,
+    private readonly herdr: DrovrClient,
     /** Where the daemon serves its MCP endpoint, so spawned agents can connect back. */
     private readonly mcpUrl: string,
     /** Injectable wait, for tests. */
@@ -211,14 +206,25 @@ export class HerdrHerd implements Herd {
      * ticket).
      */
     private readonly log?: (line: string) => void,
+    private readonly agent: AgentConfig = { provider: "claude" },
   ) {}
 
-  private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
+  private async byIssue(): Promise<Map<string, { pane: string; cwd: string; status: string }>> {
     const { agents } = await this.herdr.agent.list();
-    const map = new Map<string, { pane: string; cwd: string | null }>();
+    const map = new Map<string, { pane: string; cwd: string; status: string }>();
+    const ambiguous = new Set<string>();
     for (const a of agents) {
-      const issue = issueOf((a as { name?: string }).name);
-      if (issue && a.pane_id) map.set(issue, { pane: a.pane_id, cwd: (a as { cwd?: string | null }).cwd ?? null });
+      const cwd = a.cwd ?? null;
+      const issue = issueOfWorkspacePath(cwd);
+      if (!cwd || !issue || !a.pane_id) continue;
+      // More than one live pane at one owned path is ambiguous. Do not let
+      // iteration order silently choose which process Butchr controls.
+      if (map.has(issue)) {
+        map.delete(issue);
+        ambiguous.add(issue);
+      } else if (!ambiguous.has(issue)) {
+        map.set(issue, { pane: a.pane_id, cwd, status: a.agent_status });
+      }
     }
     return map;
   }
@@ -227,7 +233,13 @@ export class HerdrHerd implements Herd {
     return [...(await this.byIssue()).keys()];
   }
 
+  async managedAgents(): Promise<ManagedHerdAgent[]> {
+    return [...(await this.byIssue())].map(([issue, agent]) => ({ issue, ...agent }));
+  }
+
   async staleIssues(): Promise<StaleAgent[]> {
+    // Reconciliation stops stale workers before spawning replacements.
+    if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
     const out: StaleAgent[] = [];
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
@@ -242,12 +254,18 @@ export class HerdrHerd implements Herd {
       // blocked on a dialog can all report none of this — every such gap is
       // UNKNOWN, never stale (a fresh respawn must never itself be
       // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
-      const proc = info?.foreground_processes?.find((p) => isClaude(p));
+      const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
       if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
       // issuetype/summary/parent don't matter here: --model and --effort
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd);
+      const provider = managedAgentProviderOfProcess(proc)!;
+      const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
+      if (provider === "codex" && disabledMcpServers === undefined) {
+        out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
+        continue;
+      }
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -335,27 +353,29 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
+      if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) throw new Error(this.agent.codexSpawnBlocked);
       // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
       // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
       // which cascades into the brief.
-      const dir = buildWorkspace(spec, this.mcpUrl);
+      const dir = buildWorkspace(spec, this.mcpUrl, this.agent.provider, this.agent.disabledMcpServers);
       // herdr needs a pane: create a workspace WITH that cwd, start the agent in
       // its root pane, with the model for this issue type.
-      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
+      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<DrovrClient["workspace"]["create"]>[0]);
       const rp = (created as { root_pane?: unknown }).root_pane;
       const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
       if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
       const name = nameFor(issue);
       try {
-        await this.startWithReadinessRetry({
-          pane_id: paneId,
+        // Butchr owns the workspace and selection policy. Drovr translates
+        // that intent into the provider-specific Herdr launch contract.
+        await this.startWithReadinessRetry(agentStartParams(
+          spec,
+          dir,
+          paneId,
           name,
-          kind: "claude",
-          // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
-          // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
-          // single source the staleness check compares a restored pane against.
-          args: spawnArgs(spec, dir),
-        } as Parameters<HerdrClient["agent"]["start"]>[0]);
+          this.agent,
+          this.mcpUrl,
+        ));
       } catch (e) {
         // A failed start must not leak the workspace we just created: the next
         // reconcile would create another, forever (measured: 7 in 2 minutes).
@@ -378,7 +398,7 @@ export class HerdrHerd implements Herd {
    * unchanged, so `spawn()`'s own catch above still sees it and closes the
    * pane it just created.
    */
-  private async startWithReadinessRetry(params: Parameters<HerdrClient["agent"]["start"]>[0]): Promise<void> {
+  private async startWithReadinessRetry(params: Parameters<DrovrClient["agent"]["start"]>[0]): Promise<void> {
     for (let attempt = 0; ; attempt++) {
       await this.wait(PANE_READY_WAIT_MS);
       try {
@@ -409,17 +429,16 @@ export class HerdrHerd implements Herd {
     if (!entry) return;
     const text = await this.readPane(entry.pane);
     if (detectSessionLimitRefusal(text, new Date())) return;
-    await this.nudge(issue, KICKOFF_PROMPT);
+    await this.nudge(issue, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
   }
 
   private async readPane(paneId: string): Promise<string> {
-    const r = await this.herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true } as Parameters<HerdrClient["pane"]["read"]>[0]);
+    const r = await this.herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true } as Parameters<DrovrClient["pane"]["read"]>[0]);
     return (r as { read: { text: string } }).read.text;
   }
 
   async stop(issue: string): Promise<void> {
-    const pane = (await this.byIssue()).get(issue)?.pane;
-    if (pane) await this.herdr.pane.close(pane);
+    await closeManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
   }
 
   async paneFor(issue: string): Promise<string | null> {
@@ -536,7 +555,7 @@ export class HerdrHerd implements Herd {
     try {
       const verdict = await this.workspaceVerdict(candidate.paneIds);
       if (verdict !== "dead") return false;
-      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<HerdrClient["workspace"]["close"]>[0]);
+      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<DrovrClient["workspace"]["close"]>[0]);
       return true;
     } catch {
       return false;
@@ -572,19 +591,22 @@ export class HerdrHerd implements Herd {
     }
     const procs = info?.foreground_processes;
     if (!procs || procs.length === 0) return "unknown";
-    return procs.some((p) => isClaude(p)) ? "live" : "dead";
+    return procs.some((p) => managedAgentProviderOfProcess(p)) ? "live" : "dead";
   }
 
   private async statusOf(issue: string): Promise<string | null> {
-    const { agents } = await this.herdr.agent.list();
-    for (const a of agents) if (issueOf((a as { name?: string }).name) === issue) return a.agent_status ?? null;
-    return null;
+    const resolved = await resolveManagedAgent(this.herdr, {
+      cwd: join(workspaceRoot(), issue),
+    });
+    return resolved.status === "found" ? resolved.agent.agent_status : null;
   }
 
   async nudge(issue: string, text: string): Promise<NudgeResult> {
-    if (!(await this.byIssue()).has(issue)) return { delivered: false };
     try {
-      await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<HerdrClient["agent"]["prompt"]>[0]);
+      const result = await promptManagedAgent(this.herdr, {
+        cwd: join(workspaceRoot(), issue),
+      }, text);
+      if (result.resolution.status !== "found" || result.prompted?.agent_status === "blocked") return { delivered: false };
     } catch {
       return { delivered: false }; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
     }
@@ -598,8 +620,10 @@ export class HerdrHerd implements Herd {
     // session accomplishes nothing and only muddies what actually happened.
     await this.wait(NUDGE_VERIFY_MS);
     if ((await this.statusOf(issue)) === "idle") {
-      const entry = (await this.byIssue()).get(issue); // re-resolve: panes renumber
-      if (entry) {
+      const resolved = await resolveManagedAgent(this.herdr, {
+        cwd: join(workspaceRoot(), issue),
+      });
+      if (resolved.status === "found") {
         // A transient herdr hiccup here must not propagate: before this
         // refusal check existed, nudge() could no longer throw once
         // agent.prompt succeeded (sendKeys below is already .catch(() => {})),
@@ -608,14 +632,14 @@ export class HerdrHerd implements Herd {
         // and skipping the stranded-composer enter (KAN-691's 2.5h stall,
         // reopened via an unrelated transient). Same treatment as
         // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
-        const text = await this.readPane(entry.pane).catch(() => "");
+        const text = await this.readPane(resolved.agent.pane_id).catch(() => "");
         const refusal = detectSessionLimitRefusal(text, new Date());
         if (refusal) return { delivered: true, refusal };
-        await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+        await this.herdr.pane.sendKeys({ pane_id: resolved.agent.pane_id, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
       }
     }
     return { delivered: true };
   }
 }
 
-export { nameFor as agentNameFor, issueOf as issueOfAgentName };
+export { nameFor as agentNameFor };

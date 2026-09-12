@@ -141,9 +141,9 @@ describe("the actual automatic check — this IS the falsifier, run for real aga
     expect(hits.some((h) => h.name === "PARENT" && h.file === "briefs/task.md")).toBe(true);
   });
 
-  test("{{GROUND_TRUTH}} is found ONLY in CLAUDE.md — the false half of correct_worker's old claim, fixed by this ticket", () => {
+  test("{{GROUND_TRUTH}} is found in both provider instruction templates", () => {
     const groundTruthHits = hits.filter((h) => h.name === "GROUND_TRUTH");
-    expect(groundTruthHits).toEqual([{ file: "briefs/CLAUDE.md", line: 12, name: "GROUND_TRUTH" }]);
+    expect(groundTruthHits).toEqual([{ file: "briefs/AGENTS.md", line: 12, name: "GROUND_TRUTH" }, { file: "briefs/CLAUDE.md", line: 12, name: "GROUND_TRUTH" }]);
   });
 
   test("{{TYPE}} appears in NO template today — matches WORKSPACE_REGISTRY.TYPE's own claim, re-verified here rather than trusted", () => {

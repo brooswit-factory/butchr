@@ -4,7 +4,7 @@
   "workspaces": {
     "": {
       "dependencies": {
-        "@brooswit/herdr-sdk": "^0.1.2",
+        "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.2.0/brooswit-drovr-0.2.0.tgz",
         "@brooswit/sundry": "^0.2.1",
         "@brooswit/thatch": "^0.6.0",
         "confluence.js": "^3.2.0",
@@ -20,7 +20,9 @@
   "packages": {
     "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, "sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ=="],
 
-    "@brooswit/herdr-sdk": ["@brooswit/herdr-sdk@0.1.2", "", {}, "sha512-iWpNAkPxcdqgF7PcQEKm/z1rQOvKvi4uMIHOBknmsNS7qXOPyYsEAJG2VSZUieHvv0+7Ldtsyir+QyeLEhGAPg=="],
+    "@brooswit/drovr": ["@brooswit/drovr@https://github.com/brooswit-factory/drovr/releases/download/v0.2.0/brooswit-drovr-0.2.0.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3" } }, "sha512-7oukBpJXAtNR2/Y37KCI1MhyTL8UlVn9j/JXGTqiv54FUYKeME+J2DqiJTvn7uqfG4svanAY0eO22cjZWaQuhw=="],
+
+    "@brooswit/herdr-sdk": ["@brooswit/herdr-sdk@0.1.3", "", {}, "sha512-mEwipLDaDGnUEtUhGBSjDUhFU3gB3HvkjyC9Q7OLJNugpU7Hk3romKnO1ZUna9WyZYq7lteqaLu5TmPvILkekQ=="],
 
     "@brooswit/sundry": ["@brooswit/sundry@0.2.1", "", {}, "sha512-ixeQZXmV0HG5zCz+KsIlgYa4EGUNXBW67G9SBYnIYKSBMbN3DKHd9sk83p4CpryEiwdrlfbtzCDg2kILDeopzQ=="],
 

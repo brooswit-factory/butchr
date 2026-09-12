@@ -133,7 +133,7 @@ export interface PinnedActiveDetectorDeps {
    * issue/project id -> raw herdr agent_status for every currently running
    * butchr agent. THE SAME closure src/daemon/index.ts already builds for
    * `createLabelSync`'s own `agentStatuses` dep (built by teeing
-   * `herdr.agent.list()` through `issueOfAgentName`) — wired here from that
+   * `herdr.agent.list()` through workspace-path identity) — wired here from that
    * existing seam, never a second reader.
    */
   agentStatuses: () => Promise<ReadonlyMap<string, string>>;

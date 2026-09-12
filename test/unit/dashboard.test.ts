@@ -4,7 +4,7 @@ import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 
 function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
-  return { name, agent_status: status, pane_id: pane };
+  return { name, resource_key: name.replace(/^butchr[-:]/, "").toUpperCase(), agent_status: status, pane_id: pane };
 }
 
 /** `buildDashboardRows` only ever produces "agent" rows — this narrows for the tests below rather than repeating the same `if (kind !== "agent") throw` at every call site. */
@@ -67,6 +67,16 @@ describe("buildDashboardRows: the row shape, for both an issue-tier row and a pr
       tracker: new StatusFloorTracker(() => 0),
     });
     expect(rows).toEqual([]);
+  });
+
+  test("path-derived resource identity works without a name and overrides a misleading name", () => {
+    const rows = buildDashboardRows([{ name: "butchr-wrong-1", resource_key: "KAN-42", agent_status: "working", pane_id: "p1" }], {
+      now: () => 0,
+      issueMeta: () => undefined,
+      tracker: new StatusFloorTracker(() => 0),
+    });
+    expect(rows).toHaveLength(1);
+    expect(asAgentRow(rows[0]!).resourceKey).toBe("KAN-42");
   });
 });
 

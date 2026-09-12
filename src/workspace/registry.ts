@@ -1,5 +1,10 @@
 import { WORKSPACE_PLACEHOLDERS, type WorkspacePlaceholder } from "../agents/workspace.js";
 
+// Provider support: references below to the CLAUDE.md instruction snapshot now
+// also apply to AGENTS.md for Codex. Both embed GROUND_TRUTH with the same
+// lifetime; neither instruction template embeds SUMMARY. Codex MCP identity
+// is supplied in launch argv instead of mcp.json, outside the placeholder scan.
+
 /**
  * BUTCHR-169: the workspace-file medium's analogue of
  * `src/headers/registry.ts` (itself modelled on `src/labels/registry.ts`) —

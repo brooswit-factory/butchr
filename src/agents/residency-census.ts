@@ -1,5 +1,5 @@
 import { join, dirname, basename } from "node:path";
-import type { results } from "@brooswit/herdr-sdk";
+import type { results } from "@brooswit/drovr";
 
 /**
  * BUTCHR-287 — the live second source of truth the spawn guard needs to

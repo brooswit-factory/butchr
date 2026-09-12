@@ -1,8 +1,10 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
 import CLAUDE_MD from "../../briefs/CLAUDE.md" with { type: "text" };
+import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
 import EPIC from "../../briefs/epic.md" with { type: "text" };
 import STORY from "../../briefs/story.md" with { type: "text" };
 import TASK from "../../briefs/task.md" with { type: "text" };
@@ -80,6 +82,11 @@ export const effortFor = (issuetype: string): string =>
 
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
+export function issueOfWorkspacePath(cwd: string | null | undefined): string | null {
+  if (!cwd || dirname(cwd) !== workspaceRoot()) return null;
+  return basename(cwd).toUpperCase();
+}
+
 /**
  * Create the agent's workspace: CLAUDE.md (generic pointer, interpolated so
  * it can carry ground truth), brief.md (type-specific, interpolated),
@@ -87,13 +94,23 @@ export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join
  * ENVIRONMENT.md (the same ground truth, standalone). Returns the
  * directory — the agent's cwd.
  */
-export function buildWorkspace(spec: SpawnSpec, mcpUrl: string): string {
+export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   const dir = join(workspaceRoot(), spec.key);
   mkdirSync(dir, { recursive: true });
+  if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
-  writeFileSync(join(dir, "CLAUDE.md"), interpolate(CLAUDE_MD, spec, groundTruth));
+  writeFileSync(join(dir, provider === "codex" ? "AGENTS.md" : "CLAUDE.md"), interpolate(provider === "codex" ? AGENTS_MD : CLAUDE_MD, spec, groundTruth));
   writeFileSync(join(dir, "brief.md"), interpolate(briefFor(spec.issuetype), spec));
-  writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: { "x-issue": spec.key } } } }, null, 2));
+  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: { "x-issue": spec.key } } } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
+}
+
+/** Non-secret launch inventory survives switching the daemon default back to Claude. */
+export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
+  try {
+    const value: unknown = JSON.parse(readFileSync(join(dir, ".butchr-codex-isolation.json"), "utf8"));
+    if (!Array.isArray(value) || value.some((s) => !s || typeof s.name !== "string" || !/^[A-Za-z0-9_-]+$/.test(s.name) || !["stdio", "streamable_http"].includes(s.transport))) return undefined;
+    return value;
+  } catch { return undefined; }
 }

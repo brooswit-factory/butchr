@@ -196,8 +196,8 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
     const rows = buildDashboardRows(
       [
-        { name: "butchr-butchr-1", agent_status: "working", pane_id: "w1:p3" }, // issue-tier row
-        { name: "butchr-butchr", agent_status: "idle", pane_id: "p2" }, // project-tier row
+        { resource_key: "BUTCHR-1", agent_status: "working", pane_id: "w1:p3" },
+        { resource_key: "BUTCHR", agent_status: "idle", pane_id: "p2" },
       ],
       { now: () => pollTime, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => pollTime) },
     );

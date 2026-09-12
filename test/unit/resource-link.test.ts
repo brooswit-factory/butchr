@@ -66,8 +66,8 @@ describe("resolveResourceLink: tier -> correct target (BUTCHR-339 mutation 7 —
   test("equivalence with tier.kind: a REAL issue-tier row (from buildDashboardRows) resolves to Jira, a REAL project-tier row resolves to Confluence — the key-shape decision and tier.kind never disagree", async () => {
     const rows = buildDashboardRows(
       [
-        { name: "butchr-kan-9", agent_status: "idle", pane_id: "p1" }, // issue tier (herdr agent name prefix is "butchr-", see src/agents/herd.ts)
-        { name: "butchr-kan", agent_status: "idle", pane_id: "p2" }, // project tier (no issue-number suffix)
+        { resource_key: "KAN-9", agent_status: "idle", pane_id: "p1" },
+        { resource_key: "KAN", agent_status: "idle", pane_id: "p2" },
       ],
       { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) },
     );

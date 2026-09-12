@@ -1,9 +1,12 @@
 # butchr
 
+Agents support selectable Claude (default) and Codex providers. See
+[provider configuration and deployment](docs/agent-providers.md).
+
 The software factory, rewritten. A single local daemon that:
 
 1. **Watches your Jira** — the tickets assigned to the account that owns the API token, and whatever those tickets implement (task→story→epic; the Jira parent field is membership only).
-2. **Runs an agent per active ticket** — when a ticket is In Progress or In Review, it spins up a [herdr](https://herdr.dev) agent (via [`@brooswit/herdr-sdk`](https://www.npmjs.com/package/@brooswit/herdr-sdk)).
+2. **Runs an agent per active ticket** — when a ticket is In Progress or In Review, it spins up a [herdr](https://herdr.dev) agent via [`@brooswit/drovr`](https://github.com/brooswit-factory/drovr), which corrects Herdr status reports.
 3. **Pushes updates to those agents** — over MCP ([`@brooswit/thatch`](https://www.npmjs.com/package/@brooswit/thatch)): agents connect to the daemon identifying which issue they work on, and the daemon channels ticket/comment/link changes up the Implements chain to the right one.
 4. **Shows a live view** — a webapp listing the active agents; click one and butchr opens a terminal window running `herdr agent attach` on it, so you drop straight into that agent's shell. No browser extension, no embedded terminal — terminals are real herdr terminals.
 

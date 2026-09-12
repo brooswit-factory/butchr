@@ -4,6 +4,7 @@ import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-wr
 import { agentFoldSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
+import { workspaceRoot } from "../../src/agents/workspace.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
 
 function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
@@ -63,7 +64,11 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
   });
 
   test("scopedHerd's filtering still applies: runningIssues()/staleIssues() are scoped to ownsId, even over a real HerdrHerd instance", async () => {
-    const real = new HerdrHerd({ agent: { list: async () => ({ agents: [{ name: "butchr-task-1", pane_id: "p1" }, { name: "butchr-proj1", pane_id: "p2" }] }) } } as never, "http://x/mcp");
+    const root = workspaceRoot();
+    const real = new HerdrHerd({ agent: { list: async () => ({ agents: [
+      { name: "butchr-task-1", pane_id: "p1", cwd: `${root}/TASK-1` },
+      { name: "butchr-proj1", pane_id: "p2", cwd: `${root}/PROJ1` },
+    ] }) } } as never, "http://x/mcp");
     const scoped = scopedHerd(real, (id) => id.startsWith("TASK"));
     expect(await scoped.runningIssues()).toEqual(["TASK-1"]);
   });

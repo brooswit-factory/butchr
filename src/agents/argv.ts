@@ -1,7 +1,84 @@
 import { effortFor, modelFor, type SpawnSpec } from "./workspace.js";
+import {
+  buildAgentStartParams,
+  checkManagedAgentArgv,
+  inventoryCodexMcpServers,
+  parseCodexMcpInventory,
+  type ManagedAgentProvider,
+  type ParamsOf,
+} from "@brooswit/drovr";
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
+export type AgentProvider = ManagedAgentProvider;
+export interface AgentConfig { provider: AgentProvider; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
+/** Read-only inventory: never log its raw output, which can contain credentials. */
+export function codexMcpServerNames(output: string): NonNullable<AgentConfig["disabledMcpServers"]> {
+  return parseCodexMcpInventory(output, ["butchr"]);
+}
+
+/** Probe once at startup; inventory failure must not stop management of existing agents. */
+export function inventoryCodexMcp(
+  agent: AgentConfig,
+  log: (line: string) => void,
+  probe: () => { exitCode: number; stdout: { toString(): string } } = () => Bun.spawnSync(["codex", "mcp", "list", "--json"], { stdout: "pipe", stderr: "pipe", timeout: 10_000 }),
+): AgentConfig {
+  if (agent.provider !== "codex") return agent;
+  const inventory = inventoryCodexMcpServers(["butchr"], probe);
+  if (inventory.ok) {
+    const ready = { ...agent, disabledMcpServers: inventory.servers };
+    delete ready.codexSpawnBlocked;
+    return ready;
+  }
+  const reason = "Codex MCP inventory unavailable or invalid; new Codex spawns disabled. Fix `codex mcp list --json` for the service user and restart Butchr. Existing workers remain managed; no automatic inventory retries.";
+  log(reason);
+  const blocked = { ...agent, codexSpawnBlocked: reason };
+  delete blocked.disabledMcpServers;
+  return blocked;
+}
+export const kickoffFor = (provider: AgentProvider): string => provider === "codex" ? "follow your AGENTS.md" : KICKOFF_PROMPT;
+
+/**
+ * Butchr supplies workspace intent; Drovr owns provider-specific process
+ * arguments and returns the complete Herdr start contract.
+ */
+export function agentStartParams(
+  spec: SpawnSpec,
+  dir: string,
+  paneId: string,
+  name: string,
+  agent: AgentConfig = { provider: "claude" },
+  mcpUrl = "http://localhost:7717/mcp",
+): ParamsOf<"agent.start"> {
+  if (agent.provider === "codex") {
+    return buildAgentStartParams({
+      provider: "codex",
+      name,
+      paneId,
+      cwd: dir,
+      prompt: kickoffFor(agent.provider),
+      ...(agent.model ? { model: agent.model } : {}),
+      mcpServers: [{
+        name: "butchr",
+        url: mcpUrl,
+        headers: { "x-issue": spec.key, "x-butchr-provider": "codex" },
+      }],
+      disabledMcpServers: agent.disabledMcpServers ?? [],
+    });
+  }
+
+  return buildAgentStartParams({
+    provider: "claude",
+    name,
+    paneId,
+    cwd: dir,
+    prompt: kickoffFor(agent.provider),
+    model: agent.model ?? modelFor(spec.issuetype),
+    effort: effortFor(spec.issuetype),
+    mcpConfigPath: dir + "/mcp.json",
+    developmentChannels: ["server:butchr"],
+  });
+}
 
 /**
  * The exact argv butchr spawns a claude agent with, for `spec` running in
@@ -12,45 +89,8 @@ export const KICKOFF_PROMPT = "follow your CLAUDE.md";
  * (and --mcp-config) are variadic and swallow a trailing positional as one of
  * their own entries (CHANGELOG 0.5.6).
  */
-export function spawnArgs(spec: SpawnSpec, dir: string): string[] {
-  return [
-    KICKOFF_PROMPT,
-    "--model", modelFor(spec.issuetype),
-    "--effort", effortFor(spec.issuetype),
-    "--permission-mode", "bypassPermissions",
-    "--mcp-config", dir + "/mcp.json",
-    "--dangerously-load-development-channels", "server:butchr",
-  ];
+export function spawnArgs(spec: SpawnSpec, dir: string, agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp"): string[] {
+  return agentStartParams(spec, dir, "butchr-argv-probe", "butchr-argv-probe", agent, mcpUrl).args ?? [];
 }
 
-export type ArgvCheck = { ok: true } | { ok: false; reason: string };
-
-/**
- * Flags that must survive a herdr restore verbatim. `--model`, `--effort`,
- * and the kickoff positional are startup-only and deliberately excluded: a
- * `modelFor()`/`effortFor()` change on deploy must not churn the whole fleet.
- */
-const REQUIRED_FLAGS = ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels"] as const;
-
-function flagValue(argv: readonly string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : undefined;
-}
-
-/**
- * Pure argv health check: does `observed` (a claude process's real argv, or
- * just its flags) carry the same butchr-owned flags as `expected` (built by
- * `spawnArgs`)? Missing/mismatched flags are named in `reason`, in
- * `REQUIRED_FLAGS` order, exactly as they'd appear on the command line —
- * that string doubles as the daemon's `[reconcile]` log line and the
- * `[butchr:respawn]` ticket notice.
- */
-export function checkArgv(expected: readonly string[], observed: readonly string[]): ArgvCheck {
-  const missing: string[] = [];
-  for (const flag of REQUIRED_FLAGS) {
-    const want = flagValue(expected, flag);
-    if (want === undefined) continue; // spawnArgs always sets these; nothing to compare against
-    if (flagValue(observed, flag) !== want) missing.push(`${flag} ${want}`);
-  }
-  return missing.length ? { ok: false, reason: `argv lacks ${missing.join(", ")}` } : { ok: true };
-}
+export { checkManagedAgentArgv as checkArgv };

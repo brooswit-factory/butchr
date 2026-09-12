@@ -15,13 +15,13 @@
  * actually close every candidate whose verdict is "dead" — never run that
  * flag before the dry-run output has been cross-checked and posted.
  */
-import { HerdrClient } from "@brooswit/herdr-sdk";
+import { DrovrClient } from "@brooswit/drovr";
 import { strandedCandidates } from "../src/agents/reap.js";
 import { workspaceRoot } from "../src/agents/workspace.js";
 import { HerdrHerd } from "../src/agents/herd.js";
 
 const execute = process.argv.includes("--execute");
-const herdr = new HerdrClient({});
+const herdr = new DrovrClient({});
 const herd = new HerdrHerd(herdr, "http://localhost:0/mcp"); // mcpUrl unused by strandedCandidates/closeStranded
 
 async function main() {
@@ -56,7 +56,7 @@ async function main() {
 }
 
 /** Mirrors HerdrHerd's private paneVerdict/workspaceVerdict exactly, for dry-run printing only (no close). */
-async function probeVerdict(herdr: HerdrClient, paneIds: readonly string[]): Promise<"live" | "dead" | "unknown"> {
+async function probeVerdict(herdr: DrovrClient, paneIds: readonly string[]): Promise<"live" | "dead" | "unknown"> {
   if (!paneIds.length) return "unknown";
   let allDead = true;
   for (const paneId of paneIds) {
