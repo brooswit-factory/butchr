@@ -442,6 +442,16 @@ export interface ReconcileOptions {
  * case is untouched by this reversal.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const failures: ReconcileFailure[] = [];
+  if (herd.recoverQuota) {
+    await Promise.all([...desired.values()].map(async (spec) => {
+      try {
+        await herd.recoverQuota!(spec);
+      } catch (error) {
+        failures.push({ id: spec.key, stage: "spawn", error });
+      }
+    }));
+  }
   const guard = opts.guard ?? new RespawnGuard();
   const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
@@ -557,7 +567,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // before this ticket. One resource's `workspace.create`/`agent.start`
   // failure is recorded into `failures` and never touches any other
   // resource's spawn this same `Promise.all`.
-  const failures: ReconcileFailure[] = [];
   await Promise.all(admitted.map(async (issue) => {
     try {
       await herd.spawn(desired.get(issue)!);
@@ -757,6 +766,7 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     stop: (issue) => herd.stop(issue),
     paneFor: (issue) => herd.paneFor(issue),
     nudge: (issue, text) => herd.nudge(issue, text),
+    ...(herd.recoverQuota ? { recoverQuota: (spec: SpawnSpec) => herd.recoverQuota!(spec) } : {}),
   };
 }
 

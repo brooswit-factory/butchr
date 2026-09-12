@@ -1,7 +1,7 @@
-import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
-import { agentStartParams, spawnArgs, checkArgv, type AgentConfig } from "./argv.js";
+import { agentStartParams, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -58,6 +58,8 @@ export interface Herd {
    * caller needs to change.
    */
   spawn(spec: SpawnSpec, origin?: SpawnOrigin): Promise<void>;
+  /** Observe a desired worker's quota state before reconciliation decides to spawn. */
+  recoverQuota?(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting">;
   /** Shut off the agent for an issue (idempotent). */
   stop(issue: string): Promise<void>;
   /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
@@ -191,6 +193,9 @@ export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
+  private readonly operations = new Map<string, Promise<unknown>>();
+  private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
+
   constructor(
     private readonly herdr: DrovrClient,
     /** Where the daemon serves its MCP endpoint, so spawned agents can connect back. */
@@ -207,13 +212,67 @@ export class HerdrHerd implements Herd {
      */
     private readonly log?: (line: string) => void,
     private readonly agent: AgentConfig = { provider: "claude" },
+    private readonly availability: ProviderAvailabilityRegistry = processProviderAvailability,
   ) {}
+
+  private async exclusive<T>(issue: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.operations.get(issue) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(action);
+    this.operations.set(issue, pending);
+    try { return await pending; }
+    finally { if (this.operations.get(issue) === pending) this.operations.delete(issue); }
+  }
+
+  quotaBlocked(issue: string): boolean { return this.refused.has(issue); }
+
+  async recoverQuota(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting"> {
+    if (!this.agent.providers && !this.agent.roleProviders) return "not-refused";
+    return this.exclusive(spec.key, async () => {
+      const resolved = await resolveManagedAgent(this.herdr, { cwd: join(workspaceRoot(), spec.key) });
+      if (resolved.status !== "found") {
+        if (resolved.status === "missing") this.refused.delete(spec.key);
+        return "not-refused";
+      }
+      const current = resolved.agent;
+      if (current.pane_id !== this.refused.get(spec.key)?.pane || current.agent !== "claude" || current.agent_status === "working") {
+        this.refused.delete(spec.key);
+      }
+      if (current.agent !== "claude" || (current.agent_status !== "idle" && current.agent_status !== "done")) return "not-refused";
+      const refusal = this.observeQuota(spec.key, current, await this.readPane(current.pane_id));
+      if (!refusal) return "not-refused";
+      const result = await this.startProviders(spec, current.pane_id);
+      if (result.status === "success") this.log?.(`[provider-fallback] ${spec.key} recovered provider=${result.account.provider} pane=${result.value}`);
+      return result.status === "success" ? "recovered" : "waiting";
+    });
+  }
+
+  private observeQuota(issue: string, current: results.AgentInfo, text: string): SessionLimitRefusal | null {
+    // Only Drovr's measured Claude classifier establishes pane quota. No
+    // inferred Codex/AGY banners or launch-error strings enter availability.
+    if (current.agent !== "claude" || (current.agent_status !== "idle" && current.agent_status !== "done")) return null;
+    const refusal = detectSessionLimitRefusal(text, new Date());
+    if (!refusal) { this.refused.delete(issue); return null; }
+    const previous = this.refused.get(issue);
+    // Pin the original reset for this refusal incarnation, otherwise a
+    // clock-only banner rolls into tomorrow as soon as its reset passes.
+    if (previous?.pane === current.pane_id && previous.refusal.raw === refusal.raw) return previous.refusal;
+    const account = { provider: current.agent, accountId: "default" } as const;
+    const outcome = this.availability.observeClaudePane(account, current.agent_status, text);
+    if (outcome.kind !== "recognised") return null;
+    const confirmed = { resetsAt: outcome.resetsAt, raw: outcome.raw };
+    this.refused.set(issue, { pane: current.pane_id, provider: account.provider, refusal: confirmed });
+    if (this.agent.providers || this.agent.roleProviders) {
+      this.log?.(`[provider-fallback] ${issue} provider=${account.provider} quota-blocked resetsAt=${confirmed.resetsAt ?? "unknown"}`);
+    }
+    return confirmed;
+  }
 
   private async byIssue(): Promise<Map<string, { pane: string; cwd: string; status: string }>> {
     const { agents } = await this.herdr.agent.list();
     const map = new Map<string, { pane: string; cwd: string; status: string }>();
     const ambiguous = new Set<string>();
     for (const a of agents) {
+      if (a.agent === "agy") continue;
       const cwd = a.cwd ?? null;
       const issue = issueOfWorkspacePath(cwd);
       if (!cwd || !issue || !a.pane_id) continue;
@@ -242,6 +301,7 @@ export class HerdrHerd implements Herd {
     if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
     const out: StaleAgent[] = [];
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
+      if (this.refused.has(issue)) continue;
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
       let info: results.PaneProcessInfo | undefined;
       try {
@@ -260,6 +320,7 @@ export class HerdrHerd implements Herd {
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
       const provider = managedAgentProviderOfProcess(proc)!;
+      if (provider === "agy") continue;
       const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
       if (provider === "codex" && disabledMcpServers === undefined) {
         out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
@@ -334,6 +395,10 @@ export class HerdrHerd implements Herd {
    * pre-fix shape, before this fix landed.
    */
   async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
+    return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
+  }
+
+  private async spawnExclusive(spec: SpawnSpec, origin: SpawnOrigin): Promise<void> {
     const issue = spec.key;
     try {
       // BUTCHR-320 review fix (round 1): the no-op check itself is inside
@@ -353,41 +418,61 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
-      if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) throw new Error(this.agent.codexSpawnBlocked);
-      // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
-      // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
-      // which cascades into the brief.
-      const dir = buildWorkspace(spec, this.mcpUrl, this.agent.provider, this.agent.disabledMcpServers);
-      // herdr needs a pane: create a workspace WITH that cwd, start the agent in
-      // its root pane, with the model for this issue type.
-      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<DrovrClient["workspace"]["create"]>[0]);
-      const rp = (created as { root_pane?: unknown }).root_pane;
-      const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
-      if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
-      const name = nameFor(issue);
-      try {
-        // Butchr owns the workspace and selection policy. Drovr translates
-        // that intent into the provider-specific Herdr launch contract.
-        await this.startWithReadinessRetry(agentStartParams(
-          spec,
-          dir,
-          paneId,
-          name,
-          this.agent,
-          this.mcpUrl,
-        ));
-      } catch (e) {
-        // A failed start must not leak the workspace we just created: the next
-        // reconcile would create another, forever (measured: 7 in 2 minutes).
-        await this.herdr.pane.close(paneId).catch(() => {});
-        throw e;
+      const result = await this.startProviders(spec);
+      if (result.status === "exhausted") {
+        this.log?.(`${SPAWN_TAG} ${issue} waiting - providers exhausted origin=${origin}`);
+        return;
       }
-      await this.verifyKickoff(issue);
-      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId} origin=${origin}`);
+      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}`);
     } catch (e) {
       this.log?.(`${SPAWN_TAG} ${issue} failed origin=${origin} — ${(e as Error)?.message ?? e}`);
       throw e;
     }
+  }
+
+  private async startProviders(spec: SpawnSpec, refusedPane?: string) {
+    return runWithProviderFallback({
+      priority: providerOrder(this.agent, spec.issuetype).map((provider) => ({ provider, accountId: "default" })),
+      availability: this.availability,
+      attempt: async ({ provider }) => {
+        if (provider === "agy") throw new Error("AGY factory MCP identity is not supported");
+        const selected = { ...this.agent, provider };
+        if (provider !== this.agent.provider) delete selected.model;
+        if (provider === "codex" && selected.codexSpawnBlocked) throw new Error(selected.codexSpawnBlocked);
+        const dir = buildWorkspace(spec, this.mcpUrl, provider, selected.disabledMcpServers);
+        // Validate the launch before replacing a refused worker. The same
+        // filesystem directory carries its work across provider sessions.
+        const launch = agentStartParams(spec, dir, "pending", nameFor(spec.key), selected, this.mcpUrl);
+        if (refusedPane) {
+          const current = await resolveManagedAgent(this.herdr, { cwd: dir });
+          if (current.status !== "found" || current.agent.pane_id !== refusedPane ||
+              (current.agent.agent_status !== "idle" && current.agent.agent_status !== "done")) {
+            throw new Error(`Quota recovery for ${spec.key}: refused worker changed before replacement`);
+          }
+          await this.herdr.pane.close(refusedPane);
+          this.refused.delete(spec.key);
+          refusedPane = undefined;
+        }
+        const created = await this.herdr.workspace.create({ label: spec.key, cwd: dir } as Parameters<DrovrClient["workspace"]["create"]>[0]);
+        const root = (created as { root_pane?: unknown }).root_pane;
+        const paneId = typeof root === "string" ? root : (root as { pane_id?: string })?.pane_id;
+        if (!paneId) throw new Error(`workspace.create for ${spec.key} returned no root pane`);
+        try {
+          await this.startWithReadinessRetry({ ...launch, pane_id: paneId });
+          const refusal = await this.verifyKickoff(spec.key);
+          if (refusal) {
+            refusedPane = paneId;
+            return { status: "quota-blocked" as const, refusal };
+          }
+          this.refused.delete(spec.key);
+          return { status: "success" as const, value: paneId };
+        } catch (error) {
+          await this.herdr.pane.close(paneId).catch(() => {});
+          this.refused.delete(spec.key);
+          throw error;
+        }
+      },
+    });
   }
 
   /**
@@ -421,15 +506,17 @@ export class HerdrHerd implements Herd {
    * refusal is a property of the CLI session, not of the composer) and is
    * instead handled by the level-triggered poll in session-limit-watch.ts.
    */
-  private async verifyKickoff(issue: string): Promise<void> {
+  private async verifyKickoff(issue: string): Promise<SessionLimitRefusal | null> {
     await this.wait(KICKOFF_VERIFY_MS);
     const status = await this.statusOf(issue);
-    if (status !== "idle" && status !== "done") return; // working/blocked: the kickoff landed
-    const entry = (await this.byIssue()).get(issue); // re-resolve: panes renumber
-    if (!entry) return;
-    const text = await this.readPane(entry.pane);
-    if (detectSessionLimitRefusal(text, new Date())) return;
-    await this.nudge(issue, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
+    if (status !== "idle" && status !== "done") return null; // working/blocked: the kickoff landed
+    const resolved = await resolveManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
+    if (resolved.status !== "found") return null;
+    const text = await this.readPane(resolved.agent.pane_id);
+    const refusal = this.observeQuota(issue, resolved.agent, text);
+    if (refusal) return refusal;
+    const result = await this.nudge(issue, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
+    return result.refusal ?? null;
   }
 
   private async readPane(paneId: string): Promise<string> {
@@ -438,7 +525,10 @@ export class HerdrHerd implements Herd {
   }
 
   async stop(issue: string): Promise<void> {
-    await closeManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
+    await this.exclusive(issue, async () => {
+      await closeManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
+      this.refused.delete(issue);
+    });
   }
 
   async paneFor(issue: string): Promise<string | null> {
@@ -633,7 +723,7 @@ export class HerdrHerd implements Herd {
         // reopened via an unrelated transient). Same treatment as
         // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
         const text = await this.readPane(resolved.agent.pane_id).catch(() => "");
-        const refusal = detectSessionLimitRefusal(text, new Date());
+        const refusal = this.observeQuota(issue, resolved.agent, text);
         if (refusal) return { delivered: true, refusal };
         await this.herdr.pane.sendKeys({ pane_id: resolved.agent.pane_id, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
       }

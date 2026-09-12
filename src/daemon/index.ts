@@ -471,7 +471,7 @@ const stallRemediation = createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
-  quotaBlocked: quotaGate.isBlocked,
+  quotaBlocked: (issue) => herd.quotaBlocked(issue) || quotaGate.isBlocked(issue),
   // BUTCHR-353: a worker's own labels, for the "withheld at the admission
   // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
   // never a herd/live probe: a boss's worker is staffed under a different
@@ -592,7 +592,7 @@ const pinnedActiveDetector = createPinnedActiveDetector({
       throw e;
     }
   },
-  quotaBlocked: quotaGate.isBlocked,
+  quotaBlocked: (issue) => herd.quotaBlocked(issue) || quotaGate.isBlocked(issue),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
@@ -737,6 +737,7 @@ watchSessionLimits({
   list: quotaGate.list,
   read: quotaGate.read,
   close: (issue) => herd.stop(issue),
+  skipRecovery: () => Boolean(config.agent?.providers || Object.keys(config.agent?.roleProviders ?? {}).length),
   now: () => Date.now(),
   log: (line) => console.error(`  ${line}`),
   captures: createCaptureStore(config.captureDir),
