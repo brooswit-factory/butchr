@@ -1,8 +1,13 @@
 import { effortFor, modelFor, type SpawnSpec } from "./workspace.js";
+import {
+  buildAgentStartParams,
+  type ManagedAgentProvider,
+  type ParamsOf,
+} from "@brooswit/drovr";
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
-export type AgentProvider = "claude" | "codex";
+export type AgentProvider = ManagedAgentProvider;
 export interface AgentConfig { provider: AgentProvider; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
 /** Read-only inventory: never log its raw output, which can contain credentials. */
 export function codexMcpServerNames(output: string): NonNullable<AgentConfig["disabledMcpServers"]> {
@@ -41,6 +46,48 @@ export function inventoryCodexMcp(
 export const kickoffFor = (provider: AgentProvider): string => provider === "codex" ? "follow your AGENTS.md" : KICKOFF_PROMPT;
 
 /**
+ * Butchr supplies workspace intent; Drovr owns provider-specific process
+ * arguments and returns the complete Herdr start contract.
+ */
+export function agentStartParams(
+  spec: SpawnSpec,
+  dir: string,
+  paneId: string,
+  name: string,
+  agent: AgentConfig = { provider: "claude" },
+  mcpUrl = "http://localhost:7717/mcp",
+): ParamsOf<"agent.start"> {
+  if (agent.provider === "codex") {
+    return buildAgentStartParams({
+      provider: "codex",
+      name,
+      paneId,
+      cwd: dir,
+      prompt: kickoffFor(agent.provider),
+      ...(agent.model ? { model: agent.model } : {}),
+      mcpServers: [{
+        name: "butchr",
+        url: mcpUrl,
+        headers: { "x-issue": spec.key, "x-butchr-provider": "codex" },
+      }],
+      disabledMcpServers: agent.disabledMcpServers ?? [],
+    });
+  }
+
+  return buildAgentStartParams({
+    provider: "claude",
+    name,
+    paneId,
+    cwd: dir,
+    prompt: kickoffFor(agent.provider),
+    model: agent.model ?? modelFor(spec.issuetype),
+    effort: effortFor(spec.issuetype),
+    mcpConfigPath: dir + "/mcp.json",
+    developmentChannels: ["server:butchr"],
+  });
+}
+
+/**
  * The exact argv butchr spawns a claude agent with, for `spec` running in
  * `dir`. The ONE place this array is built — HerdrHerd.spawn() and the
  * staleness check both call it, so they cannot drift apart.
@@ -50,22 +97,7 @@ export const kickoffFor = (provider: AgentProvider): string => provider === "cod
  * their own entries (CHANGELOG 0.5.6).
  */
 export function spawnArgs(spec: SpawnSpec, dir: string, agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp"): string[] {
-  if (agent.provider === "codex") return [
-    kickoffFor(agent.provider), ...(agent.model ? ["--model", agent.model] : []),
-    "--cd", dir, "--dangerously-bypass-approvals-and-sandbox",
-    "--config", `mcp_servers.butchr={ url = ${JSON.stringify(mcpUrl)}, http_headers = { "x-issue" = ${JSON.stringify(spec.key)}, "x-butchr-provider" = "codex" }, enabled = true }`,
-    "--config", `projects={${JSON.stringify(dir)}={trust_level="trusted"}}`,
-    ...(agent.disabledMcpServers ?? []).flatMap(({ name, transport }) => ["--config",
-      `mcp_servers.${name}={enabled=false,${transport === "stdio" ? 'command="false"' : 'url="http://127.0.0.1:9/disabled"'}}`]),
-  ];
-  return [
-    KICKOFF_PROMPT,
-    "--model", agent.model ?? modelFor(spec.issuetype),
-    "--effort", effortFor(spec.issuetype),
-    "--permission-mode", "bypassPermissions",
-    "--mcp-config", dir + "/mcp.json",
-    "--dangerously-load-development-channels", "server:butchr",
-  ];
+  return agentStartParams(spec, dir, "butchr-argv-probe", "butchr-argv-probe", agent, mcpUrl).args ?? [];
 }
 
 export type ArgvCheck = { ok: true } | { ok: false; reason: string };

@@ -1,6 +1,7 @@
-import { HerdrError, type DrovrClient, type results } from "@brooswit/drovr";
+import { HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
+import { join } from "node:path";
 import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
-import { spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
+import { agentStartParams, spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -359,15 +360,16 @@ export class HerdrHerd implements Herd {
       if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
       const name = nameFor(issue);
       try {
-        await this.startWithReadinessRetry({
-          pane_id: paneId,
+        // Butchr owns the workspace and selection policy. Drovr translates
+        // that intent into the provider-specific Herdr launch contract.
+        await this.startWithReadinessRetry(agentStartParams(
+          spec,
+          dir,
+          paneId,
           name,
-          kind: this.agent.provider,
-          // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
-          // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
-          // single source the staleness check compares a restored pane against.
-          args: spawnArgs(spec, dir, this.agent, this.mcpUrl),
-        } as Parameters<DrovrClient["agent"]["start"]>[0]);
+          this.agent,
+          this.mcpUrl,
+        ));
       } catch (e) {
         // A failed start must not leak the workspace we just created: the next
         // reconcile would create another, forever (measured: 7 in 2 minutes).
@@ -588,17 +590,18 @@ export class HerdrHerd implements Herd {
   }
 
   private async statusOf(issue: string): Promise<string | null> {
-    const { agents } = await this.herdr.agent.list();
-    for (const a of agents) if (issueOf((a as { name?: string }).name) === issue) return a.agent_status ?? null;
-    return null;
+    const resolved = await resolveManagedAgent(this.herdr, {
+      cwd: join(workspaceRoot(), issue),
+    });
+    return resolved.status === "found" ? resolved.agent.agent_status : null;
   }
 
   async nudge(issue: string, text: string): Promise<NudgeResult> {
-    if (!(await this.byIssue()).has(issue)) return { delivered: false };
-    if ((await this.statusOf(issue)) === "blocked") return { delivered: false };
     try {
-      const result = await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<DrovrClient["agent"]["prompt"]>[0]);
-      if (result?.agent?.agent_status === "blocked") return { delivered: false };
+      const result = await promptManagedAgent(this.herdr, {
+        cwd: join(workspaceRoot(), issue),
+      }, text);
+      if (result.resolution.status !== "found" || result.prompted?.agent_status === "blocked") return { delivered: false };
     } catch {
       return { delivered: false }; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
     }
@@ -612,8 +615,10 @@ export class HerdrHerd implements Herd {
     // session accomplishes nothing and only muddies what actually happened.
     await this.wait(NUDGE_VERIFY_MS);
     if ((await this.statusOf(issue)) === "idle") {
-      const entry = (await this.byIssue()).get(issue); // re-resolve: panes renumber
-      if (entry) {
+      const resolved = await resolveManagedAgent(this.herdr, {
+        cwd: join(workspaceRoot(), issue),
+      });
+      if (resolved.status === "found") {
         // A transient herdr hiccup here must not propagate: before this
         // refusal check existed, nudge() could no longer throw once
         // agent.prompt succeeded (sendKeys below is already .catch(() => {})),
@@ -622,10 +627,10 @@ export class HerdrHerd implements Herd {
         // and skipping the stranded-composer enter (KAN-691's 2.5h stall,
         // reopened via an unrelated transient). Same treatment as
         // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
-        const text = await this.readPane(entry.pane).catch(() => "");
+        const text = await this.readPane(resolved.agent.pane_id).catch(() => "");
         const refusal = detectSessionLimitRefusal(text, new Date());
         if (refusal) return { delivered: true, refusal };
-        await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+        await this.herdr.pane.sendKeys({ pane_id: resolved.agent.pane_id, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
       }
     }
     return { delivered: true };

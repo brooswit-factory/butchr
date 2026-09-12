@@ -56,7 +56,7 @@ describe("provider selection", () => {
     });
     const rows = ["claude", "codex"].map((provider, i) => {
       const key = `TEST-${i + 1}`;
-      return { name: `butchr-test-${i + 1}`, pane_id: `p${i}`, agent_status: "working", provider,
+      return { name: `butchr-test-${i + 1}`, pane_id: `p${i}`, agent_status: "working", agent: provider, provider,
         cwd: buildWorkspace({ ...spec, key }, url, provider as AgentProvider) };
     });
     const client = {
@@ -161,9 +161,9 @@ describe("provider selection", () => {
 
   test("Codex spawn recovers kickoff through generic prompt and stays idempotent", async () => {
     const started: any[] = [], prompts: any[] = [];
-    const agent = { name: "butchr-test-990", pane_id: "p", agent_status: "idle" };
+    const agent = { name: "butchr-test-990", pane_id: "p", agent: "codex", cwd: join(workspaceRoot(), spec.key), agent_status: "idle" };
     const client = {
-      agent: { list: async () => ({ agents: started.length ? [agent] : [] }), start: async (p: any) => { started.push(p); }, prompt: async (p: any) => { prompts.push(p); } },
+      agent: { list: async () => ({ agents: started.length ? [agent] : [] }), start: async (p: any) => { started.push(p); }, prompt: async (p: any) => { prompts.push(p); return { agent }; } },
       workspace: { create: async () => ({ root_pane: "p" }) },
       pane: { read: async () => ({ read: { text: "" } }), sendKeys: instant },
     };
@@ -202,7 +202,7 @@ describe("provider selection", () => {
   test("kickoff recovery uses shared instructions after changing the selected provider", async () => {
     const prompts: any[] = [];
     const client = {
-      agent: { list: async () => ({ agents: [{ name: "butchr-test-990", pane_id: "p", agent_status: "idle", kind: "claude" }] }), prompt: async (p: any) => { prompts.push(p); } },
+      agent: { list: async () => ({ agents: [{ name: "butchr-test-990", pane_id: "p", agent_status: "idle", agent: "codex", cwd: join(workspaceRoot(), spec.key) }] }), prompt: async (p: any) => { prompts.push(p); return { agent: { agent_status: "idle" } }; } },
       pane: { read: async () => ({ read: { text: "" } }), sendKeys: instant },
     };
     const herd = new HerdrHerd(client as any, url, instant, undefined, { provider: "codex" });

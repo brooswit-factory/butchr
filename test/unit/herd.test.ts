@@ -86,12 +86,12 @@ describe("spawn: kickoff verification (KAN-804/807)", () => {
   // (whose `agents` array is fixed at construction, before start() runs).
   function fakeHerdrWithLiveAgent(opts: { statusAfterStart: string; paneText?: string; fail?: boolean }) {
     const started: any[] = []; const closed: string[] = []; const prompts: any[] = []; const keys: any[] = [];
-    let agents: Array<{ name?: string; pane_id: string; agent_status?: string }> = [];
+    let agents: Array<{ name?: string; pane_id: string; agent_status?: string; agent?: string; cwd?: string }> = [];
     const client = {
       agent: {
         list: async () => ({ agents }),
-        start: async (p: any) => { started.push(p); agents = [{ name: p.name, pane_id: p.pane_id, agent_status: opts.statusAfterStart }]; },
-        prompt: async (p: any) => { if (opts.fail) throw new Error("blocked"); prompts.push(p); },
+        start: async (p: any) => { started.push(p); agents = [{ name: p.name, pane_id: p.pane_id, agent_status: opts.statusAfterStart, agent: p.kind, cwd: join(workspaceRoot(), "KAN-7") }]; },
+        prompt: async (p: any) => { if (opts.fail) throw new Error("blocked"); prompts.push(p); return { agent: agents[0] }; },
       },
       pane: {
         close: async (id: string) => { closed.push(id); },
@@ -115,7 +115,7 @@ describe("spawn: kickoff verification (KAN-804/807)", () => {
     const f = fakeHerdrWithLiveAgent({ statusAfterStart: "idle", paneText: "some ordinary idle pane, no refusal here" });
     const herd = new HerdrHerd(f.client, "u", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
-    expect(f.prompts).toEqual([{ target: "butchr-kan-7", text: "Read brief.md and ENVIRONMENT.md in your workspace and follow them." }]);
+    expect(f.prompts).toEqual([{ target: "w9:p1", text: "Read brief.md and ENVIRONMENT.md in your workspace and follow them." }]);
     expect(f.keys[0]).toEqual({ pane_id: "w9:p1", keys: ["enter"] }); // still idle after the nudge's own wait too
   });
 
@@ -471,9 +471,13 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
 describe("nudge", () => {
   const base = (prompts: any[], opts: { fail?: boolean; statusAfter?: string; keys?: any[] } = {}) => ({
     agent: {
-      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: prompts.length ? opts.statusAfter ?? "idle" : "idle" }] }),
+      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent: "claude", cwd: join(workspaceRoot(), "KAN-7"), agent_status: prompts.length ? opts.statusAfter ?? "idle" : "idle" }] }),
       start: async () => {},
-      prompt: async (p: any) => { if (opts.fail) throw new Error("pane is blocked"); prompts.push(p); },
+      prompt: async (p: any) => {
+        if (opts.fail) throw new Error("pane is blocked");
+        prompts.push(p);
+        return { agent: { name: "butchr-kan-7", pane_id: "w1:p1", agent: "claude", cwd: join(workspaceRoot(), "KAN-7"), agent_status: "idle" } };
+      },
     },
     workspace: { create: async () => ({ root_pane: "w1:p1" }) },
     pane: {
@@ -486,7 +490,7 @@ describe("nudge", () => {
     const prompts: any[] = []; const keys: any[] = [];
     const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-7", "[butchr] hi")).toEqual({ delivered: true });
-    expect(prompts[0]).toEqual({ target: "butchr-kan-7", text: "[butchr] hi" });
+    expect(prompts[0]).toEqual({ target: "w1:p1", text: "[butchr] hi" });
     expect(keys[0]).toEqual({ pane_id: "w1:p1", keys: ["enter"] });   // delivered ≠ turn started
   });
   test("agent went working → no enter is sent", async () => {
@@ -504,6 +508,20 @@ describe("nudge", () => {
   test("false when no agent runs for the issue", async () => {
     const herd = new HerdrHerd(base([]) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-999", "x")).toEqual({ delivered: false });
+  });
+  test("delivers by pane when Herdr has cleared the friendly name", async () => {
+    const prompts: any[] = [];
+    const fixture = base(prompts);
+    const client = {
+      ...fixture,
+      agent: {
+        ...fixture.agent,
+        list: async () => ({ agents: [{ name: null, pane_id: "w1:p1", agent: "claude", cwd: join(workspaceRoot(), "KAN-7"), agent_status: "working" }] }),
+      },
+    };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant);
+    expect(await herd.nudge("KAN-7", "continue")).toEqual({ delivered: true });
+    expect(prompts[0]).toEqual({ target: "w1:p1", text: "continue" });
   });
   test("a corrected blocked prompt result refuses delivery without recovery Enter", async () => {
     const keys: any[] = [];
