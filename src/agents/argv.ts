@@ -10,8 +10,12 @@ import {
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
-export type AgentProvider = ManagedAgentProvider;
-export interface AgentConfig { provider: AgentProvider; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
+export type AgentProvider = Exclude<ManagedAgentProvider, "agy">;
+export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
+
+export function providerOrder(agent: AgentConfig, role: string): AgentProvider[] {
+  return agent.roleProviders?.[role.toLowerCase() as "project" | "epic" | "story" | "task"] ?? agent.providers ?? [agent.provider];
+}
 /** Read-only inventory: never log its raw output, which can contain credentials. */
 export function codexMcpServerNames(output: string): NonNullable<AgentConfig["disabledMcpServers"]> {
   return parseCodexMcpInventory(output, ["butchr"]);
@@ -23,7 +27,7 @@ export function inventoryCodexMcp(
   log: (line: string) => void,
   probe: () => { exitCode: number; stdout: { toString(): string } } = () => Bun.spawnSync(["codex", "mcp", "list", "--json"], { stdout: "pipe", stderr: "pipe", timeout: 10_000 }),
 ): AgentConfig {
-  if (agent.provider !== "codex") return agent;
+  if (![agent.provider, ...(agent.providers ?? []), ...Object.values(agent.roleProviders ?? {}).flat()].includes("codex")) return agent;
   const inventory = inventoryCodexMcpServers(["butchr"], probe);
   if (inventory.ok) {
     const ready = { ...agent, disabledMcpServers: inventory.servers };

@@ -283,6 +283,11 @@ export interface Config {
 
 export interface ConfigEnv {
   BUTCHR_AGENT_PROVIDER?: string | undefined;
+  BUTCHR_AGENT_PROVIDERS?: string | undefined;
+  BUTCHR_AGENT_PROVIDERS_PROJECT?: string | undefined;
+  BUTCHR_AGENT_PROVIDERS_EPIC?: string | undefined;
+  BUTCHR_AGENT_PROVIDERS_STORY?: string | undefined;
+  BUTCHR_AGENT_PROVIDERS_TASK?: string | undefined;
   BUTCHR_AGENT_MODEL?: string | undefined;
   ATLASSIAN_SITE?: string | undefined;
   ATLASSIAN_EMAIL?: string | undefined;
@@ -317,6 +322,20 @@ export interface ConfigEnv {
 export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): Config {
   const provider = env.BUTCHR_AGENT_PROVIDER?.trim() ?? "claude";
   if (provider !== "claude" && provider !== "codex") throw new Error("BUTCHR_AGENT_PROVIDER must be claude or codex");
+  const parseOrder = (value: string, name: string): Array<"claude" | "codex"> => {
+    const entries = value.split(",").map((entry) => entry.trim());
+    if (entries.some((entry) => entry !== "claude" && entry !== "codex") || new Set(entries).size !== entries.length) {
+      throw new Error(`${name} must be an ordered list of distinct supported providers`);
+    }
+    return entries as Array<"claude" | "codex">;
+  };
+  const providers = env.BUTCHR_AGENT_PROVIDERS === undefined ? undefined : parseOrder(env.BUTCHR_AGENT_PROVIDERS, "BUTCHR_AGENT_PROVIDERS");
+  const roleProviders: Partial<Record<"project" | "epic" | "story" | "task", Array<"claude" | "codex">>> = {};
+  for (const role of ["project", "epic", "story", "task"] as const) {
+    const key = `BUTCHR_AGENT_PROVIDERS_${role.toUpperCase()}` as keyof ConfigEnv;
+    const value = env[key];
+    if (value !== undefined) roleProviders[role] = parseOrder(value, key);
+  }
   const model = env.BUTCHR_AGENT_MODEL === undefined ? undefined : required(env.BUTCHR_AGENT_MODEL, "BUTCHR_AGENT_MODEL");
   const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
   const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
@@ -381,7 +400,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   return {
     atlassian: { site, email, token },
-    agent: { provider, ...(model ? { model } : {}) },
+    agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}) },
     port,
     stalledMinutes,
     parkedMinutes,
@@ -506,6 +525,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 /** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
   `provider=${c.agent?.provider ?? "claude"} model=${c.agent?.model ?? "provider-default"} ` +
+  `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +

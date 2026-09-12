@@ -1,5 +1,35 @@
 # Agent providers
 
+## Ordered fallback
+
+`BUTCHR_AGENT_PROVIDERS=claude,codex` opts into ordered provider fallback.
+Optional `BUTCHR_AGENT_PROVIDERS_PROJECT`, `BUTCHR_AGENT_PROVIDERS_EPIC`,
+`BUTCHR_AGENT_PROVIDERS_STORY`, and `BUTCHR_AGENT_PROVIDERS_TASK` replace
+that order for the named role. For example, projects can prefer `codex,claude`
+while tasks inherit `claude,codex`. Entries must be distinct supported providers.
+Without ordered settings, the existing single-provider behavior is retained.
+
+Butchr supplies preferences; Drovr owns account availability and ordered
+attempts. Only demonstrated Claude quota refusals trigger automatic fallback.
+Arbitrary launch failures, authentication failures, and configuration errors
+remain errors. No Codex or Antigravity quota classifier is assumed.
+
+Fallback retains the filesystem workspace, but a different provider cannot
+inherit the previous provider's private conversation. The replacement starts
+from the workspace instructions and files. A model override applies only to
+the configured single provider, never to a different fallback provider.
+
+Quota state is shared by workers managed by the same runtime. Known reset
+times allow retry; unknown reset times require confirmed recovery or an
+operator reset. Exhaustion leaves work waiting. The old Claude reset watcher
+does not compete with the ordered recovery path.
+
+Antigravity has a Drovr launch adapter, but is not selectable in Butchr until
+its per-worker MCP identity configuration is verified. Codex and Claude are
+the supported factory providers in this iteration.
+
+## Single provider
+
 Set `BUTCHR_AGENT_PROVIDER=claude` (default) or `codex`. Optionally set
 `BUTCHR_AGENT_MODEL` to a model available to that provider's account. Invalid
 providers and empty explicit model values fail configuration loading.
@@ -49,7 +79,7 @@ must be installed and authenticated for the Unix account running Herdr.
 
 ## Delivery and deployment
 
-Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.2.0 GitHub
+Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.3.0 GitHub
 release, including its SDK error and type reexports. Drovr corrects supported
 Codex directory-trust dialogs from idle/done to blocked. Those corrected
 reports feed the existing status watchers and kickoff checks; nudges refuse

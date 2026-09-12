@@ -24,6 +24,8 @@ export interface SessionLimitWatchDeps {
   read: (paneId: string) => Promise<string>;
   /** Close the issue's agent pane; the existing reconciler respawns it with a fresh kickoff within one poll. */
   close: (issue: string) => Promise<void>;
+  /** Another runtime owns recovery for this resource. */
+  skipRecovery?: (issue: string) => boolean;
   now: () => number;
   log: (line: string) => void;
   /** Optional: when absent, the watcher behaves exactly as it did before BUTCHR-12 (no capture, ever). */
@@ -208,6 +210,11 @@ export function watchSessionLimits(deps: SessionLimitWatchDeps, intervalMs: numb
         if (stopped) return;
         if (row.agent_status !== "idle" && row.agent_status !== "done") continue;
         if (!row.issue) continue;
+        if (deps.skipRecovery?.(row.issue)) {
+          seen.delete(row.issue);
+          clearCaptured(captured, row.issue);
+          continue;
+        }
         const text = await deps.read(row.pane_id);
         const phrasePresent = CHEAP_PHRASE.test(text);
         if (!phrasePresent) clearCaptured(captured, row.issue);

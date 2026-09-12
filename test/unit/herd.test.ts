@@ -1,12 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { HerdrError } from "@brooswit/drovr";
+import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
+
+const clearQuota = () => {
+  processProviderAvailability.clear({ provider: "claude", accountId: "default" });
+  processProviderAvailability.clear({ provider: "codex", accountId: "default" });
+};
+beforeEach(clearQuota);
+afterEach(clearQuota);
 
 /** One foreground process, as herdr's `pane.process_info` reports it. */
 interface FakeProcess { pid: number; argv?: string[] | null; name?: string }

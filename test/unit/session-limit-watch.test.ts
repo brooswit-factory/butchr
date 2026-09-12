@@ -23,6 +23,21 @@ function fakeSink(seed: string[] = []) {
 }
 
 describe("watchSessionLimits", () => {
+  test("leaves recovery-owned resources untouched", async () => {
+    let reads = 0;
+    let closes = 0;
+    const stop = watchSessionLimits({
+      list: async () => [row("KAN-1", "idle")],
+      read: async () => { reads++; return "You've hit your session limit"; },
+      close: async () => { closes++; },
+      skipRecovery: () => true,
+      now: () => Date.now(),
+      log: () => {},
+    }, 5);
+    try { await wait(25); } finally { stop(); }
+    expect(reads).toBe(0);
+    expect(closes).toBe(0);
+  });
   test("cost gate: never reads the pane of a working or blocked agent", async () => {
     const reads: string[] = [];
     const stop = watchSessionLimits({
