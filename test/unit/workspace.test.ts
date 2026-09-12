@@ -1,11 +1,35 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, issueOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
 
 describe("workspace identity", () => {
+  test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "butchr-agy-workspace-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const spec = { key: "AGY-1", issuetype: "Task", summary: "bridge fixture", parent: null };
+      const dir = buildWorkspace(spec, "http://localhost:7717/mcp", "agy");
+      expect(dir).toBe(join(root, spec.key));
+      expect(JSON.parse(readFileSync(join(dir, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: "http://localhost:7717/mcp" });
+      expect(readFileSync(join(dir, "AGENTS.md"), "utf8")).toContain("Read `brief.md`");
+      expect(readFileSync(join(dir, "brief.md"), "utf8")).toContain(spec.key);
+      expect(existsSync(join(dir, "CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(dir, "mcp.json"))).toBe(false);
+      expect(existsSync(join(dir, "ENVIRONMENT.md"))).toBe(true);
+      writeFileSync(join(dir, "progress.txt"), "keep this work");
+      buildWorkspace(spec, "http://localhost:9000/mcp", "agy");
+      expect(JSON.parse(readFileSync(join(dir, ".butchr-agy.json"), "utf8")).mcpUrl).toBe("http://localhost:9000/mcp");
+      expect(readFileSync(join(dir, "progress.txt"), "utf8")).toBe("keep this work");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("derives identity only from a direct child of the configured workspace root", () => {
     const root = workspaceRoot();
     expect(issueOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");

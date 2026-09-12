@@ -10,8 +10,8 @@ import {
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
-export type AgentProvider = Exclude<ManagedAgentProvider, "agy">;
-export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
+export type AgentProvider = ManagedAgentProvider;
+export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string }
 
 export function providerOrder(agent: AgentConfig, role: string): AgentProvider[] {
   return agent.roleProviders?.[role.toLowerCase() as "project" | "epic" | "story" | "task"] ?? agent.providers ?? [agent.provider];
@@ -40,7 +40,7 @@ export function inventoryCodexMcp(
   delete blocked.disabledMcpServers;
   return blocked;
 }
-export const kickoffFor = (provider: AgentProvider): string => provider === "codex" ? "follow your AGENTS.md" : KICKOFF_PROMPT;
+export const kickoffFor = (provider: AgentProvider): string => provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
@@ -54,6 +54,17 @@ export function agentStartParams(
   agent: AgentConfig = { provider: "claude" },
   mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
+  if (agent.provider === "agy") {
+    return buildAgentStartParams({
+      provider: "agy",
+      skipPermissions: true,
+      name,
+      paneId,
+      cwd: dir,
+      prompt: kickoffFor(agent.provider),
+      ...(agent.model ? { model: agent.model } : {}),
+    });
+  }
   if (agent.provider === "codex") {
     return buildAgentStartParams({
       provider: "codex",

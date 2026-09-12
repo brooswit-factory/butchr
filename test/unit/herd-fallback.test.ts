@@ -72,6 +72,125 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(f.starts[0].args).not.toContain("opus");
   });
 
+  test("Claude quota falls back to AGY with workspace identity and no inherited Claude model", async () => {
+    const f = fixture({ refuseClaude: true });
+    const herd = new HerdrHerd(f.client, url, instant, undefined, {
+      provider: "claude", model: "opus", providers: ["claude", "agy"],
+    }, undefined, instant);
+    await herd.spawn(spec);
+    expect(f.starts.map(p => p.kind)).toEqual(["claude", "agy"]);
+    expect(f.starts[1].args).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
+    expect(f.closed).toEqual(["new-1"]);
+    expect(JSON.parse(readFileSync(join(f.creates[1].cwd, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: url });
+    expect(await herd.runningIssues()).toEqual([spec.key]);
+    expect(await herd.paneFor(spec.key)).toBe("new-2");
+    await herd.spawn(spec);
+    expect(f.starts).toHaveLength(2);
+  });
+
+  test("AGY role order and single-provider launches are supported", async () => {
+    for (const agent of [{ provider: "agy", model: "test-model" }, { ...config, roleProviders: { task: ["agy", "claude"] } }] satisfies AgentConfig[]) {
+      const f = fixture();
+      await new HerdrHerd(f.client, url, instant, undefined, agent, undefined, instant).spawn(spec);
+      expect(f.starts.map(p => p.kind)).toEqual(["agy"]);
+    }
+  });
+
+  test("awaits exact AGY workspace preparation before replacing a refused worker", async () => {
+    const f = fixture({ existing: [existing()] });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const calls: unknown[] = [];
+    const herd = new HerdrHerd(f.client, url, instant, undefined, {
+      provider: "claude", providers: ["claude", "agy"],
+    }, new ProviderAvailabilityRegistry(), async options => {
+      calls.push(options);
+      expect(JSON.parse(readFileSync(join(options.cwd, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: url });
+      entered();
+      await gate;
+    });
+    const recovery = herd.recoverQuota(spec);
+    try {
+      await preparing;
+      expect(calls).toEqual([{ provider: "agy", cwd: join(workspaceRoot(), spec.key), unattended: true }]);
+      expect(f.closed).toEqual([]);
+      expect(f.creates).toEqual([]);
+      expect(f.starts).toEqual([]);
+    } finally {
+      release();
+    }
+    expect(await recovery).toBe("recovered");
+    expect(f.closed).toEqual(["old"]);
+    expect(f.creates).toHaveLength(1);
+    expect(f.starts.map(p => p.kind)).toEqual(["agy"]);
+  });
+
+  test("preparation errors preserve a refused pane and never create or launch a replacement", async () => {
+    const f = fixture({ existing: [existing()] });
+    const error = new Error("workspace trust preparation failed");
+    const state = new ProviderAvailabilityRegistry();
+    const herd = new HerdrHerd(f.client, url, instant, undefined, {
+      provider: "claude", providers: ["claude", "agy"],
+    }, state, async options => {
+      expect(options).toEqual({ provider: "agy", cwd: join(workspaceRoot(), spec.key), unattended: true });
+      throw error;
+    });
+    await expect(herd.recoverQuota(spec)).rejects.toBe(error);
+    expect(f.closed).toEqual([]);
+    expect(f.creates).toEqual([]);
+    expect(f.starts).toEqual([]);
+    expect(f.rows()).toEqual([existing()]);
+    expect(herd.quotaBlocked(spec.key)).toBe(true);
+    expect(state.get({ provider: "agy", accountId: "default" }).status).toBe("available");
+  });
+
+  test("preparation errors on initial AGY spawn stop before Herdr workspace creation", async () => {
+    const f = fixture();
+    const error = new Error("cannot prepare trust");
+    const herd = new HerdrHerd(f.client, url, instant, undefined, {
+      provider: "agy", providers: ["agy", "claude"],
+    }, undefined, options => {
+      expect(options).toEqual({ provider: "agy", cwd: join(workspaceRoot(), spec.key), unattended: true });
+      throw error;
+    });
+    await expect(herd.spawn(spec)).rejects.toBe(error);
+    expect(f.creates).toEqual([]);
+    expect(f.starts).toEqual([]);
+    expect(f.closed).toEqual([]);
+  });
+
+  test("AGY bridge readiness blocks before creating a workspace or replacing a refused pane", async () => {
+    const state = new ProviderAvailabilityRegistry();
+    const f = fixture({ existing: [existing()] });
+    const herd = new HerdrHerd(f.client, url, instant, undefined, {
+      provider: "claude", providers: ["claude", "agy"], agySpawnBlocked: "global bridge missing",
+    }, state, instant);
+    await expect(herd.recoverQuota(spec)).rejects.toThrow("global bridge missing");
+    expect(f.closed).toEqual([]);
+    expect(f.creates).toEqual([]);
+    expect(state.get({ provider: "agy", accountId: "default" }).status).toBe("available");
+    const single = fixture();
+    await expect(new HerdrHerd(single.client, url, instant, undefined, {
+      provider: "agy", agySpawnBlocked: "global bridge missing",
+    }, undefined, instant).spawn(spec)).rejects.toThrow("global bridge missing");
+    expect(single.creates).toEqual([]);
+  });
+
+  test("AGY residents remain managed and quota-like text never establishes refusal", async () => {
+    const f = fixture({ existing: [existing("agy")] });
+    const herd = new HerdrHerd(f.client, url, instant, undefined, { provider: "agy", providers: ["agy", "claude"], agySpawnBlocked: "bridge unavailable" }, undefined, instant);
+    expect(await herd.runningIssues()).toEqual([spec.key]);
+    expect(await herd.managedAgents()).toEqual([{ issue: spec.key, pane: "old", cwd: existing().cwd, status: "idle" }]);
+    expect(await herd.recoverQuota(spec)).toBe("not-refused");
+    expect(herd.quotaBlocked(spec.key)).toBe(false);
+    await herd.spawn(spec);
+    expect(f.starts).toEqual([]);
+    await herd.stop(spec.key);
+    expect(f.closed).toEqual(["old"]);
+  });
+
   test("startup refusal falls back once, retains cwd and work files, and shares quota with other roles", async () => {
     const f = fixture({ refuseClaude: true });
     const dir = buildWorkspace(spec, url);

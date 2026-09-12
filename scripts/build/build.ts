@@ -55,3 +55,16 @@ writeFileSync(OUTFILE, `#!/usr/bin/env bun\n${readFileSync(OUTFILE, "utf8")}`);
 chmodSync(OUTFILE, 0o755);
 
 console.log(`built ${OUTFILE} (sha=${sha || "unknown"}${dirty === "1" ? ", dirty working tree" : ""})`);
+
+const bridge = await Bun.build({
+  entrypoints: ["src/mcp/entry.ts"], outdir: OUTDIR,
+  naming: "butchr-mcp.js", target: "bun",
+});
+if (!bridge.success) {
+  for (const log of bridge.logs) console.error(log);
+  process.exit(1);
+}
+const bridgeFile = `${OUTDIR}/butchr-mcp.js`;
+writeFileSync(bridgeFile, `#!/usr/bin/env bun\n${readFileSync(bridgeFile, "utf8")}`);
+chmodSync(bridgeFile, 0o755);
+console.log(`built ${bridgeFile}`);

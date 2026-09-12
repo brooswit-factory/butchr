@@ -1,9 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { spawnArgs, checkArgv } from "../../src/agents/argv.js";
+import { agentStartParams, spawnArgs, checkArgv, providerOrder } from "../../src/agents/argv.js";
+import { buildAgentStartParams } from "@brooswit/drovr";
 
 const spec = { key: "KAN-783", issuetype: "Task", summary: "s", parent: null };
 
 describe("spawnArgs", () => {
+  test("AGY uses Drovr's interactive launch with explicit AGENTS.md kickoff", () => {
+    const launch = agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy", model: "test-model" });
+    expect(launch).toEqual(buildAgentStartParams({
+      provider: "agy", cwd: "/w/KAN-783", paneId: "pane", name: "worker",
+      prompt: "follow your AGENTS.md", model: "test-model", skipPermissions: true,
+    }));
+    expect(launch.args).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--model", "test-model", "--dangerously-skip-permissions"]);
+    expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
+    expect(providerOrder({ provider: "agy", providers: ["claude", "agy"], roleProviders: { task: ["agy", "codex"] } }, "Task")).toEqual(["agy", "codex"]);
+  });
   test("builds the full flag set, kickoff positional first", () => {
     const args = spawnArgs(spec, "/w/KAN-783");
     expect(args[0]).toBe("follow your CLAUDE.md");

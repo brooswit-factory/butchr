@@ -98,8 +98,9 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   const dir = join(workspaceRoot(), spec.key);
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
+  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify({ issue: spec.key, mcpUrl }, null, 2));
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
-  writeFileSync(join(dir, provider === "codex" ? "AGENTS.md" : "CLAUDE.md"), interpolate(provider === "codex" ? AGENTS_MD : CLAUDE_MD, spec, groundTruth));
+  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, spec, groundTruth));
   writeFileSync(join(dir, "brief.md"), interpolate(briefFor(spec.issuetype), spec));
   if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: { "x-issue": spec.key } } } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);

@@ -1,4 +1,4 @@
-import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, prepareManagedAgentWorkspace, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
@@ -213,6 +213,7 @@ export class HerdrHerd implements Herd {
     private readonly log?: (line: string) => void,
     private readonly agent: AgentConfig = { provider: "claude" },
     private readonly availability: ProviderAvailabilityRegistry = processProviderAvailability,
+    private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareManagedAgentWorkspace,
   ) {}
 
   private async exclusive<T>(issue: string, action: () => Promise<T>): Promise<T> {
@@ -272,7 +273,6 @@ export class HerdrHerd implements Herd {
     const map = new Map<string, { pane: string; cwd: string; status: string }>();
     const ambiguous = new Set<string>();
     for (const a of agents) {
-      if (a.agent === "agy") continue;
       const cwd = a.cwd ?? null;
       const issue = issueOfWorkspacePath(cwd);
       if (!cwd || !issue || !a.pane_id) continue;
@@ -299,6 +299,7 @@ export class HerdrHerd implements Herd {
   async staleIssues(): Promise<StaleAgent[]> {
     // Reconciliation stops stale workers before spawning replacements.
     if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
+    if (this.agent.provider === "agy" && this.agent.agySpawnBlocked) return [];
     const out: StaleAgent[] = [];
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
       if (this.refused.has(issue)) continue;
@@ -320,7 +321,7 @@ export class HerdrHerd implements Herd {
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
       const provider = managedAgentProviderOfProcess(proc)!;
-      if (provider === "agy") continue;
+      if (provider === "agy" && this.agent.agySpawnBlocked) continue;
       const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
       if (provider === "codex" && disabledMcpServers === undefined) {
         out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
@@ -435,14 +436,15 @@ export class HerdrHerd implements Herd {
       priority: providerOrder(this.agent, spec.issuetype).map((provider) => ({ provider, accountId: "default" })),
       availability: this.availability,
       attempt: async ({ provider }) => {
-        if (provider === "agy") throw new Error("AGY factory MCP identity is not supported");
         const selected = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
         if (provider === "codex" && selected.codexSpawnBlocked) throw new Error(selected.codexSpawnBlocked);
+        if (provider === "agy" && selected.agySpawnBlocked) throw new Error(selected.agySpawnBlocked);
         const dir = buildWorkspace(spec, this.mcpUrl, provider, selected.disabledMcpServers);
         // Validate the launch before replacing a refused worker. The same
         // filesystem directory carries its work across provider sessions.
         const launch = agentStartParams(spec, dir, "pending", nameFor(spec.key), selected, this.mcpUrl);
+        await this.prepareWorkspace({ provider, cwd: dir, unattended: true });
         if (refusedPane) {
           const current = await resolveManagedAgent(this.herdr, { cwd: dir });
           if (current.status !== "found" || current.agent.pane_id !== refusedPane ||
