@@ -1,7 +1,7 @@
-import { closeManagedAgent, HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
-import { agentStartParams, spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
+import { agentStartParams, spawnArgs, checkArgv, type AgentConfig } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -9,19 +9,6 @@ export type { SpawnSpec } from "./workspace.js";
 export type { StrandedCandidate } from "./reap.js";
 export type { ResidencyVerdict } from "./residency-census.js";
 
-const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?? p;
-/**
- * Identifies the claude process among a pane's foreground processes. Checked
- * against BOTH argv[0] (tolerating a bun/node wrapper in front of the real
- * binary, same predicate proctable.ts used against /proc) and `name` (always
- * present on the wire, unlike `argv`) — so a process herdr identifies as
- * claude by name but couldn't report argv for is still recognized as THE
- * claude process, just one whose argv (and therefore its health) is unknown.
- */
-const isClaude = (p: { argv?: readonly string[] | null; name?: string | null }): boolean =>
-  basename(p.argv?.[0] ?? "") === "claude" || basename(p.name ?? "") === "claude";
-const providerOf = (p: { argv?: readonly string[] | null; name?: string | null }): AgentProvider | undefined =>
-  isClaude(p) ? "claude" : basename(p.argv?.[0] ?? "") === "codex" || basename(p.name ?? "") === "codex" ? "codex" : undefined;
 
 /**
  * What nudge() actually accomplished — plain "delivered: true" (KAN-829) hid
@@ -267,12 +254,12 @@ export class HerdrHerd implements Herd {
       // blocked on a dialog can all report none of this — every such gap is
       // UNKNOWN, never stale (a fresh respawn must never itself be
       // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
-      const proc = info?.foreground_processes?.find((p) => providerOf(p));
+      const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
       if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
       // issuetype/summary/parent don't matter here: --model and --effort
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
-      const provider = providerOf(proc)!;
+      const provider = managedAgentProviderOfProcess(proc)!;
       const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
       if (provider === "codex" && disabledMcpServers === undefined) {
         out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
@@ -604,7 +591,7 @@ export class HerdrHerd implements Herd {
     }
     const procs = info?.foreground_processes;
     if (!procs || procs.length === 0) return "unknown";
-    return procs.some((p) => providerOf(p)) ? "live" : "dead";
+    return procs.some((p) => managedAgentProviderOfProcess(p)) ? "live" : "dead";
   }
 
   private async statusOf(issue: string): Promise<string | null> {

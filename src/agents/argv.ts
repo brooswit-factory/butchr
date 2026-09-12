@@ -1,6 +1,7 @@
 import { effortFor, modelFor, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
+  checkManagedAgentArgv,
   type ManagedAgentProvider,
   type ParamsOf,
 } from "@brooswit/drovr";
@@ -100,42 +101,4 @@ export function spawnArgs(spec: SpawnSpec, dir: string, agent: AgentConfig = { p
   return agentStartParams(spec, dir, "butchr-argv-probe", "butchr-argv-probe", agent, mcpUrl).args ?? [];
 }
 
-export type ArgvCheck = { ok: true } | { ok: false; reason: string };
-
-/**
- * Flags that must survive a herdr restore verbatim. `--model`, `--effort`,
- * and the kickoff positional are startup-only and deliberately excluded: a
- * `modelFor()`/`effortFor()` change on deploy must not churn the whole fleet.
- */
-const REQUIRED_FLAGS = ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels"] as const;
-
-function flagValue(argv: readonly string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : undefined;
-}
-
-/**
- * Pure argv health check: does `observed` (a claude process's real argv, or
- * just its flags) carry the same butchr-owned flags as `expected` (built by
- * `spawnArgs`)? Missing/mismatched flags are named in `reason`, in
- * `REQUIRED_FLAGS` order, exactly as they'd appear on the command line —
- * that string doubles as the daemon's `[reconcile]` log line and the
- * `[butchr:respawn]` ticket notice.
- */
-export function checkArgv(expected: readonly string[], observed: readonly string[]): ArgvCheck {
-  const missing: string[] = [];
-  if (expected.includes("--dangerously-bypass-approvals-and-sandbox")) {
-    if (!observed.includes("--dangerously-bypass-approvals-and-sandbox")) missing.push("--dangerously-bypass-approvals-and-sandbox");
-    for (const flag of ["--cd", "--config"]) {
-      const wants = expected.flatMap((value, i) => value === flag ? [expected[i + 1]] : []);
-      const values = observed.flatMap((value, i) => value === flag ? [observed[i + 1]] : []);
-      for (const want of wants) if (!values.includes(want)) missing.push(`${flag} ${want}`);
-    }
-  }
-  for (const flag of REQUIRED_FLAGS) {
-    const want = flagValue(expected, flag);
-    if (want === undefined) continue; // spawnArgs always sets these; nothing to compare against
-    if (flagValue(observed, flag) !== want) missing.push(`${flag} ${want}`);
-  }
-  return missing.length ? { ok: false, reason: `argv lacks ${missing.join(", ")}` } : { ok: true };
-}
+export { checkManagedAgentArgv as checkArgv };
