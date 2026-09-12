@@ -6,7 +6,8 @@
       "dependencies": {
         "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.3.0/brooswit-drovr-0.3.0.tgz",
         "@brooswit/sundry": "^0.2.1",
-        "@brooswit/thatch": "^0.6.0",
+        "@brooswit/thatch": "0.6.3",
+        "@modelcontextprotocol/sdk": "^1.30.0",
         "confluence.js": "^3.2.0",
         "elysia": "^1.4.29",
         "jira.js": "^6.2.0",
@@ -26,7 +27,7 @@
 
     "@brooswit/sundry": ["@brooswit/sundry@0.2.1", "", {}, "sha512-ixeQZXmV0HG5zCz+KsIlgYa4EGUNXBW67G9SBYnIYKSBMbN3DKHd9sk83p4CpryEiwdrlfbtzCDg2kILDeopzQ=="],
 
-    "@brooswit/thatch": ["@brooswit/thatch@0.6.0", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-AG4+pTV5vqmPB0htGgDpI1FJIVMn45//NovigfPCgUuV7XkUUAT+Bo+c968WHNDHq/LUTNhXuoGgvBUmuZBn7A=="],
+    "@brooswit/thatch": ["@brooswit/thatch@0.6.3", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-SFEFxWL3gkNguFmacIs4IqAxAI209WvWY0TcPNb/IBLPU6oj4/DuqPuhkXXa4hnYcrQBCanjRZqanNn3LUYLKg=="],
 
     "@hono/node-server": ["@hono/node-server@2.1.1", "", { "peerDependencies": { "hono": "^4" } }, "sha512-ELuehkj5VCBdgEw9zs+ivkKwyzzUCSQuE96YmiPvn1ECBoZCczbFXJLeEGMTYjphP6gydh4pHMqEYPVMYUVgQg=="],
 

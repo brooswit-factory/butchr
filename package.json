@@ -30,7 +30,8 @@
   "dependencies": {
     "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.3.0/brooswit-drovr-0.3.0.tgz",
     "@brooswit/sundry": "^0.2.1",
-    "@brooswit/thatch": "^0.6.0",
+    "@brooswit/thatch": "0.6.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "confluence.js": "^3.2.0",
     "elysia": "^1.4.29",
     "jira.js": "^6.2.0"

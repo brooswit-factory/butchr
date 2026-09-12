@@ -28,6 +28,15 @@ Antigravity has a Drovr launch adapter, but is not selectable in Butchr until
 its per-worker MCP identity configuration is verified. Codex and Claude are
 the supported factory providers in this iteration.
 
+The import-safe `src/mcp/bridge.ts` relay accepts an explicit upstream URL
+and issue identity, attaches `x-issue` and `x-butchr-provider=agy`, and proxies
+stdio to Thatch HTTP MCP. Local tests verify concurrent identity isolation,
+initialization compatibility, tool calls, and bounded cleanup. This does not
+yet establish how an Antigravity worker supplies its own identity: isolated
+authenticated CLI probes listed the test server but did not initialize it.
+Do not register one shared static issue identity for multiple workers or
+enable factory AGY selection until that launch boundary is verified.
+
 ## Single provider
 
 Set `BUTCHR_AGENT_PROVIDER=claude` (default) or `codex`. Optionally set
@@ -87,8 +96,8 @@ an already-blocked agent, report delivery as false when the prompt response
 is corrected to blocked, and never send recovery Enter while blocked.
 Drovr does not add a Codex quota classifier or confirm prompt completion.
 
-HTTP MCP tool access is separate from unsolicited notifications. Thatch 0.6.0
-uses Claude channel notifications; Butchr excludes Codex connections from
+HTTP MCP tool access is separate from unsolicited notifications. Thatch 0.6.3
+uses Claude channel notifications; Butchr excludes Codex and AGY connections from
 that path. Issue and project updates still use Herdr `agent.prompt`, including
 the existing idle/blocked safeguards. Acceptance of a prompt does not prove a
 turn completed. Claude session-limit detection is not a complete Codex quota

@@ -183,6 +183,7 @@ describe("provider selection", () => {
     await notifyIssue({ sendAll: async (_: any, opts: any) => { filter = opts.where; } } as any, spec.key, "fixture");
     expect(filter({ headers: { "x-issue": spec.key } })).toBe(true);
     expect(filter({ headers: { "x-issue": spec.key, "x-butchr-provider": "codex" } })).toBe(false);
+    expect(filter({ headers: { "x-issue": spec.key, "x-butchr-provider": "agy" } })).toBe(false);
     expect(filter({ headers: { "x-issue": "OTHER-1" } })).toBe(false);
   });
 
