@@ -49,7 +49,7 @@ must be installed and authenticated for the Unix account running Herdr.
 
 ## Delivery and deployment
 
-Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.1.0 GitHub
+Butchr uses `DrovrClient` from the pinned `@brooswit/drovr` v0.2.0 GitHub
 release, including its SDK error and type reexports. Drovr corrects supported
 Codex directory-trust dialogs from idle/done to blocked. Those corrected
 reports feed the existing status watchers and kickoff checks; nudges refuse
@@ -68,11 +68,11 @@ before production rollout. No shared SDK or Thatch changes are included.
 
 Verified CLI surface: Herdr 0.8.2 lists both providers and accepts argument
 arrays; Codex 0.154.0-alpha.6.2 advertises the model, config, cd, and bypass
-flags used here. Drovr v0.1.0 uses SDK 0.1.3 and carries kind/args without a
+flags used here. Drovr v0.2.0 uses SDK 0.1.3 and carries kind/args without a
 local path dependency. The published release tarball is pinned in `bun.lock`.
-The deployment owner's named live smoke verified that released Drovr reports
-idle, done, and blocked states. A fresh Codex process's actual argv passed
-the production `checkArgv` check.
+The earlier isolated live smoke verified Drovr's idle, done, and blocked state
+corrections. The v0.2.0 package and Butchr integration pass their local gates;
+the combined release still requires a fresh deployment smoke before activation.
 Official references: [MCP](https://developers.openai.com/codex/mcp) and
 [AGENTS.md](https://developers.openai.com/codex/guides/agents-md).
 
