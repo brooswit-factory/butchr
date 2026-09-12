@@ -1,4 +1,4 @@
-import { HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
 import { dirname, join } from "node:path";
 import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
@@ -443,8 +443,7 @@ export class HerdrHerd implements Herd {
   }
 
   async stop(issue: string): Promise<void> {
-    const pane = (await this.byIssue()).get(issue)?.pane;
-    if (pane) await this.herdr.pane.close(pane);
+    await closeManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
   }
 
   async paneFor(issue: string): Promise<string | null> {
