@@ -115,7 +115,7 @@ describe("spawn: kickoff verification (KAN-804/807)", () => {
     const f = fakeHerdrWithLiveAgent({ statusAfterStart: "idle", paneText: "some ordinary idle pane, no refusal here" });
     const herd = new HerdrHerd(f.client, "u", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
-    expect(f.prompts).toEqual([{ target: "butchr-kan-7", text: "follow your CLAUDE.md" }]);
+    expect(f.prompts).toEqual([{ target: "butchr-kan-7", text: "Read brief.md and ENVIRONMENT.md in your workspace and follow them." }]);
     expect(f.keys[0]).toEqual({ pane_id: "w9:p1", keys: ["enter"] }); // still idle after the nudge's own wait too
   });
 

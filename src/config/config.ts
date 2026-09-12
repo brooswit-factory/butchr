@@ -10,6 +10,7 @@ import { workspaceRoot } from "../agents/workspace.js";
  * process environment or a shell history.
  */
 export interface Config {
+  agent?: import("../agents/argv.js").AgentConfig;
   atlassian: { site: string; email: string; token: string };
   /** Port the daemon serves the MCP endpoint and the live-view webapp on. */
   port: number;
@@ -281,6 +282,8 @@ export interface Config {
 }
 
 export interface ConfigEnv {
+  BUTCHR_AGENT_PROVIDER?: string | undefined;
+  BUTCHR_AGENT_MODEL?: string | undefined;
   ATLASSIAN_SITE?: string | undefined;
   ATLASSIAN_EMAIL?: string | undefined;
   ATLASSIAN_TOKEN?: string | undefined;
@@ -312,6 +315,9 @@ export interface ConfigEnv {
 
 /** `readFile` is injected so config parsing stays pure and testable. */
 export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): Config {
+  const provider = env.BUTCHR_AGENT_PROVIDER?.trim() ?? "claude";
+  if (provider !== "claude" && provider !== "codex") throw new Error("BUTCHR_AGENT_PROVIDER must be claude or codex");
+  const model = env.BUTCHR_AGENT_MODEL === undefined ? undefined : required(env.BUTCHR_AGENT_MODEL, "BUTCHR_AGENT_MODEL");
   const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
   const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
   const token = env.ATLASSIAN_TOKEN_FILE
@@ -375,6 +381,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   return {
     atlassian: { site, email, token },
+    agent: { provider, ...(model ? { model } : {}) },
     port,
     stalledMinutes,
     parkedMinutes,
@@ -498,6 +505,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 
 /** Never logs a token value; use this to describe a config safely. */
 export const describeConfig = (c: Config): string =>
+  `provider=${c.agent?.provider ?? "claude"} model=${c.agent?.model ?? "provider-default"} ` +
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +

@@ -1,6 +1,6 @@
 import { HerdrError, type HerdrClient, type results } from "@brooswit/herdr-sdk";
-import { buildWorkspace, workspaceRoot, type SpawnSpec } from "./workspace.js";
-import { spawnArgs, checkArgv, KICKOFF_PROMPT } from "./argv.js";
+import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -19,6 +19,8 @@ const basename = (p: string): string => p.replace(/\\/g, "/").split("/").pop() ?
  */
 const isClaude = (p: { argv?: readonly string[] | null; name?: string | null }): boolean =>
   basename(p.argv?.[0] ?? "") === "claude" || basename(p.name ?? "") === "claude";
+const providerOf = (p: { argv?: readonly string[] | null; name?: string | null }): AgentProvider | undefined =>
+  isClaude(p) ? "claude" : basename(p.argv?.[0] ?? "") === "codex" || basename(p.name ?? "") === "codex" ? "codex" : undefined;
 
 /**
  * What nudge() actually accomplished — plain "delivered: true" (KAN-829) hid
@@ -211,6 +213,7 @@ export class HerdrHerd implements Herd {
      * ticket).
      */
     private readonly log?: (line: string) => void,
+    private readonly agent: AgentConfig = { provider: "claude" },
   ) {}
 
   private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
@@ -242,12 +245,18 @@ export class HerdrHerd implements Herd {
       // blocked on a dialog can all report none of this — every such gap is
       // UNKNOWN, never stale (a fresh respawn must never itself be
       // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
-      const proc = info?.foreground_processes?.find((p) => isClaude(p));
+      const proc = info?.foreground_processes?.find((p) => providerOf(p));
       if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
       // issuetype/summary/parent don't matter here: --model and --effort
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd);
+      const provider = providerOf(proc)!;
+      const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
+      if (provider === "codex" && disabledMcpServers === undefined) {
+        out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
+        continue;
+      }
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -338,7 +347,7 @@ export class HerdrHerd implements Herd {
       // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
       // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
       // which cascades into the brief.
-      const dir = buildWorkspace(spec, this.mcpUrl);
+      const dir = buildWorkspace(spec, this.mcpUrl, this.agent.provider, this.agent.disabledMcpServers);
       // herdr needs a pane: create a workspace WITH that cwd, start the agent in
       // its root pane, with the model for this issue type.
       const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
@@ -350,11 +359,11 @@ export class HerdrHerd implements Herd {
         await this.startWithReadinessRetry({
           pane_id: paneId,
           name,
-          kind: "claude",
+          kind: this.agent.provider,
           // See spawnArgs() (argv.ts) for why: bypassPermissions (KAN-679), the
           // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
           // single source the staleness check compares a restored pane against.
-          args: spawnArgs(spec, dir),
+          args: spawnArgs(spec, dir, this.agent, this.mcpUrl),
         } as Parameters<HerdrClient["agent"]["start"]>[0]);
       } catch (e) {
         // A failed start must not leak the workspace we just created: the next
@@ -409,7 +418,7 @@ export class HerdrHerd implements Herd {
     if (!entry) return;
     const text = await this.readPane(entry.pane);
     if (detectSessionLimitRefusal(text, new Date())) return;
-    await this.nudge(issue, KICKOFF_PROMPT);
+    await this.nudge(issue, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
   }
 
   private async readPane(paneId: string): Promise<string> {
@@ -572,7 +581,7 @@ export class HerdrHerd implements Herd {
     }
     const procs = info?.foreground_processes;
     if (!procs || procs.length === 0) return "unknown";
-    return procs.some((p) => isClaude(p)) ? "live" : "dead";
+    return procs.some((p) => providerOf(p)) ? "live" : "dead";
   }
 
   private async statusOf(issue: string): Promise<string | null> {

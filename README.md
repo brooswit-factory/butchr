@@ -1,5 +1,8 @@
 # butchr
 
+Agents support selectable Claude (default) and Codex providers. See
+[provider configuration and deployment](docs/agent-providers.md).
+
 The software factory, rewritten. A single local daemon that:
 
 1. **Watches your Jira** — the tickets assigned to the account that owns the API token, and whatever those tickets implement (task→story→epic; the Jira parent field is membership only).

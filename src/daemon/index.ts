@@ -4,6 +4,7 @@ import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
+import { codexMcpServerNames } from "../agents/argv.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
@@ -64,6 +65,12 @@ installLogSink();
 let config;
 try {
   config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  if (config.agent?.provider === "codex") {
+    const inventory = Bun.spawnSync(["codex", "mcp", "list", "--json"], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+    if (inventory.exitCode !== 0) throw new Error("Cannot inventory Codex MCP servers; worker startup refused");
+    try { config.agent.disabledMcpServers = codexMcpServerNames(inventory.stdout.toString()); }
+    catch { throw new Error("Invalid Codex MCP inventory; worker startup refused"); }
+  }
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   console.error("See .env.example for the required configuration.");
@@ -83,7 +90,7 @@ const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSoc
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`));
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent);
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH
@@ -794,7 +801,7 @@ runResourceLoop(issueResourceType, {
     const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, about, reason);
     // Channel push renders mid-turn; the prompt is what STARTS a turn on an
     // idle agent (measured: an idle epic never woke on the push alone).
-    void notifyIssue(mcp, issue, msg);
+    void notifyIssue(mcp, issue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
     const outcome = await herd.nudge(issue, msg).catch((): NudgeResult => ({ delivered: false }));
     // BUTCHR-87: was `reason?.pr ? " (pr:from→to)" : ""` — every notify line
     // now carries a reason tag, never a silent "" for the 89% that used to
@@ -808,7 +815,7 @@ runResourceLoop(issueResourceType, {
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: channel pushed, prompt ${promptState}`);
+    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
   onRespawn: async (issue, reason, observedArgv) => {
     console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
@@ -908,12 +915,12 @@ runResourceLoop(projectResourceType, {
     // the issue loop's own notify closure above, not a call into it — the
     // issue loop's own call site above is left byte-for-byte untouched.
     const msg = changeNudge(project, about, reason);
-    void notifyIssue(mcp, project, msg);
+    void notifyIssue(mcp, project, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
     const outcome = await herd.nudge(project, msg).catch((): NudgeResult => ({ delivered: false }));
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${project} ← ${about}: channel pushed, prompt ${promptState}`);
+    console.error(`  [notify] ${project} ← ${about}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
   // BUTCHR-95/123: the project tier's own instance — see ReconcileOptions.checkFrozenAsleep's
   // doc comment (src/daemon/loop.ts). BUTCHR-307 UPDATE: this is no longer
