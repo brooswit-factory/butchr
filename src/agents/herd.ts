@@ -1,4 +1,4 @@
-import { HerdrError, type HerdrClient, type results } from "@brooswit/herdr-sdk";
+import { HerdrError, type DrovrClient, type results } from "@brooswit/drovr";
 import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
@@ -199,7 +199,7 @@ export type SpawnOrigin = "spawn" | "respawn";
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   constructor(
-    private readonly herdr: HerdrClient,
+    private readonly herdr: DrovrClient,
     /** Where the daemon serves its MCP endpoint, so spawned agents can connect back. */
     private readonly mcpUrl: string,
     /** Injectable wait, for tests. */
@@ -231,6 +231,8 @@ export class HerdrHerd implements Herd {
   }
 
   async staleIssues(): Promise<StaleAgent[]> {
+    // Reconciliation stops stale workers before spawning replacements.
+    if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
     const out: StaleAgent[] = [];
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
@@ -344,13 +346,14 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
+      if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) throw new Error(this.agent.codexSpawnBlocked);
       // The agent's filesystem workspace: CLAUDE.md + interpolated brief.md +
       // mcp.json (x-issue identity). Claude Code auto-reads CLAUDE.md from cwd,
       // which cascades into the brief.
       const dir = buildWorkspace(spec, this.mcpUrl, this.agent.provider, this.agent.disabledMcpServers);
       // herdr needs a pane: create a workspace WITH that cwd, start the agent in
       // its root pane, with the model for this issue type.
-      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<HerdrClient["workspace"]["create"]>[0]);
+      const created = await this.herdr.workspace.create({ label: issue, cwd: dir } as Parameters<DrovrClient["workspace"]["create"]>[0]);
       const rp = (created as { root_pane?: unknown }).root_pane;
       const paneId = typeof rp === "string" ? rp : (rp as { pane_id?: string })?.pane_id;
       if (!paneId) throw new Error(`workspace.create for ${issue} returned no root pane`);
@@ -364,7 +367,7 @@ export class HerdrHerd implements Herd {
           // positional-first ordering (KAN-681/CHANGELOG 0.5.6) — and it's the
           // single source the staleness check compares a restored pane against.
           args: spawnArgs(spec, dir, this.agent, this.mcpUrl),
-        } as Parameters<HerdrClient["agent"]["start"]>[0]);
+        } as Parameters<DrovrClient["agent"]["start"]>[0]);
       } catch (e) {
         // A failed start must not leak the workspace we just created: the next
         // reconcile would create another, forever (measured: 7 in 2 minutes).
@@ -387,7 +390,7 @@ export class HerdrHerd implements Herd {
    * unchanged, so `spawn()`'s own catch above still sees it and closes the
    * pane it just created.
    */
-  private async startWithReadinessRetry(params: Parameters<HerdrClient["agent"]["start"]>[0]): Promise<void> {
+  private async startWithReadinessRetry(params: Parameters<DrovrClient["agent"]["start"]>[0]): Promise<void> {
     for (let attempt = 0; ; attempt++) {
       await this.wait(PANE_READY_WAIT_MS);
       try {
@@ -422,7 +425,7 @@ export class HerdrHerd implements Herd {
   }
 
   private async readPane(paneId: string): Promise<string> {
-    const r = await this.herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true } as Parameters<HerdrClient["pane"]["read"]>[0]);
+    const r = await this.herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true } as Parameters<DrovrClient["pane"]["read"]>[0]);
     return (r as { read: { text: string } }).read.text;
   }
 
@@ -545,7 +548,7 @@ export class HerdrHerd implements Herd {
     try {
       const verdict = await this.workspaceVerdict(candidate.paneIds);
       if (verdict !== "dead") return false;
-      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<HerdrClient["workspace"]["close"]>[0]);
+      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<DrovrClient["workspace"]["close"]>[0]);
       return true;
     } catch {
       return false;
@@ -592,8 +595,10 @@ export class HerdrHerd implements Herd {
 
   async nudge(issue: string, text: string): Promise<NudgeResult> {
     if (!(await this.byIssue()).has(issue)) return { delivered: false };
+    if ((await this.statusOf(issue)) === "blocked") return { delivered: false };
     try {
-      await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<HerdrClient["agent"]["prompt"]>[0]);
+      const result = await this.herdr.agent.prompt({ target: nameFor(issue), text } as Parameters<DrovrClient["agent"]["prompt"]>[0]);
+      if (result?.agent?.agent_status === "blocked") return { delivered: false };
     } catch {
       return { delivered: false }; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
     }
@@ -620,7 +625,7 @@ export class HerdrHerd implements Herd {
         const text = await this.readPane(entry.pane).catch(() => "");
         const refusal = detectSessionLimitRefusal(text, new Date());
         if (refusal) return { delivered: true, refusal };
-        await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<HerdrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+        await this.herdr.pane.sendKeys({ pane_id: entry.pane, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
       }
     }
     return { delivered: true };

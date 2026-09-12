@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { results } from "@brooswit/herdr-sdk";
+import type { results } from "@brooswit/drovr";
 
 /**
  * BUTCHR-245 — reclaiming a workspace whose agent exited on its own (a

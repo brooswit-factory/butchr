@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { HerdrError } from "@brooswit/herdr-sdk";
+import { HerdrError } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, issueOfAgentName, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
@@ -471,7 +471,7 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
 describe("nudge", () => {
   const base = (prompts: any[], opts: { fail?: boolean; statusAfter?: string; keys?: any[] } = {}) => ({
     agent: {
-      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: opts.statusAfter ?? "idle" }] }),
+      list: async () => ({ agents: [{ name: "butchr-kan-7", pane_id: "w1:p1", agent_status: prompts.length ? opts.statusAfter ?? "idle" : "idle" }] }),
       start: async () => {},
       prompt: async (p: any) => { if (opts.fail) throw new Error("pane is blocked"); prompts.push(p); },
     },
@@ -504,6 +504,14 @@ describe("nudge", () => {
   test("false when no agent runs for the issue", async () => {
     const herd = new HerdrHerd(base([]) as any, "http://x/mcp", instant);
     expect(await herd.nudge("KAN-999", "x")).toEqual({ delivered: false });
+  });
+  test("a corrected blocked prompt result refuses delivery without recovery Enter", async () => {
+    const keys: any[] = [];
+    const fixture = base([], { keys });
+    const client = { ...fixture, agent: { ...fixture.agent, prompt: async () => ({ agent: { agent_status: "blocked" } }) } };
+    const herd = new HerdrHerd(client as any, "http://x/mcp", instant);
+    expect(await herd.nudge("KAN-7", "x")).toEqual({ delivered: false });
+    expect(keys).toEqual([]);
   });
   test("false when the pane refuses (blocked at prompt time)", async () => {
     const herd = new HerdrHerd(base([], { fail: true }) as any, "http://x/mcp", instant);

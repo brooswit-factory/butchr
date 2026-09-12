@@ -34,15 +34,18 @@ export function watchPrompts(deps: PromptWatchDeps): () => void {
   return deps.onBlocked(async (paneId, pollSeq) => {
     try {
       const text = await deps.read(paneId);
-      // Pure acknowledgment screens (first-run onboarding, update notices) have
-      // no options to choose — just press enter. Safe by construction: the
-      // pattern requires the literal continue wording, and a real selection
-      // dialog never uses it.
-      if (/Press Enter to continue/i.test(text)) {
+      // Codex uses a different cursor/footer for real selection menus. Adapt
+      // those lines to the shared parser so the normal choice policy applies.
+      const prompt = parsePrompt(text) ?? parsePrompt(text
+        .replace(/^(\s*)›(?=\s*\d+\.)/gm, "$1>")
+        .replace(/^\s*Press Enter to continue\s*\.?\s*$/gim, "Enter to confirm"));
+      const hasNumberedChoices = /^\s*[❯›>]?\s*\d+\.\s+\S/m.test(text);
+      // ACK-only startup screens retain their bare Enter behavior. A menu
+      // that fails parsing must be exposed as unparseable, never accepted.
+      if (!prompt && !hasNumberedChoices && /Press Enter to continue/i.test(text)) {
         await deps.send(paneId, "\r");
         return;
       }
-      const prompt = parsePrompt(text);
       if (!prompt) {
         deps.onUnparseable?.({ paneId, text, pollSeq });
         return;

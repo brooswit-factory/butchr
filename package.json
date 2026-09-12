@@ -28,7 +28,7 @@
     "build": "bun run scripts/build/build.ts"
   },
   "dependencies": {
-    "@brooswit/herdr-sdk": "^0.1.2",
+    "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.1.0/brooswit-drovr-0.1.0.tgz",
     "@brooswit/sundry": "^0.2.1",
     "@brooswit/thatch": "^0.6.0",
     "confluence.js": "^3.2.0",

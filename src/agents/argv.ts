@@ -3,7 +3,7 @@ import { effortFor, modelFor, type SpawnSpec } from "./workspace.js";
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
 export type AgentProvider = "claude" | "codex";
-export interface AgentConfig { provider: AgentProvider; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }> }
+export interface AgentConfig { provider: AgentProvider; model?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string }
 /** Read-only inventory: never log its raw output, which can contain credentials. */
 export function codexMcpServerNames(output: string): NonNullable<AgentConfig["disabledMcpServers"]> {
   const servers: unknown = JSON.parse(output);
@@ -15,6 +15,28 @@ export function codexMcpServerNames(output: string): NonNullable<AgentConfig["di
     if (transport !== "stdio" && transport !== "streamable_http") throw new Error("Unknown Codex MCP transport");
     return { name: s.name, transport };
   });
+}
+
+/** Probe once at startup; inventory failure must not stop management of existing agents. */
+export function inventoryCodexMcp(
+  agent: AgentConfig,
+  log: (line: string) => void,
+  probe: () => { exitCode: number; stdout: { toString(): string } } = () => Bun.spawnSync(["codex", "mcp", "list", "--json"], { stdout: "pipe", stderr: "pipe", timeout: 10_000 }),
+): AgentConfig {
+  if (agent.provider !== "codex") return agent;
+  try {
+    const result = probe();
+    if (result.exitCode !== 0) throw new Error("inventory failed");
+    const ready = { ...agent, disabledMcpServers: codexMcpServerNames(result.stdout.toString()) };
+    delete ready.codexSpawnBlocked;
+    return ready;
+  } catch {
+    const reason = "Codex MCP inventory unavailable or invalid; new Codex spawns disabled. Fix `codex mcp list --json` for the service user and restart Butchr. Existing workers remain managed; no automatic inventory retries.";
+    log(reason);
+    const blocked = { ...agent, codexSpawnBlocked: reason };
+    delete blocked.disabledMcpServers;
+    return blocked;
+  }
 }
 export const kickoffFor = (provider: AgentProvider): string => provider === "codex" ? "follow your AGENTS.md" : KICKOFF_PROMPT;
 
@@ -32,6 +54,7 @@ export function spawnArgs(spec: SpawnSpec, dir: string, agent: AgentConfig = { p
     kickoffFor(agent.provider), ...(agent.model ? ["--model", agent.model] : []),
     "--cd", dir, "--dangerously-bypass-approvals-and-sandbox",
     "--config", `mcp_servers.butchr={ url = ${JSON.stringify(mcpUrl)}, http_headers = { "x-issue" = ${JSON.stringify(spec.key)}, "x-butchr-provider" = "codex" }, enabled = true }`,
+    "--config", `projects={${JSON.stringify(dir)}={trust_level="trusted"}}`,
     ...(agent.disabledMcpServers ?? []).flatMap(({ name, transport }) => ["--config",
       `mcp_servers.${name}={enabled=false,${transport === "stdio" ? 'command="false"' : 'url="http://127.0.0.1:9/disabled"'}}`]),
   ];

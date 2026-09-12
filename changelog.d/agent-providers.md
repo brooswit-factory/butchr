@@ -8,3 +8,8 @@ bump: minor
   remain recognized by argv health, residency and reaper checks.
 - Codex updates use Herdr prompts; Claude channel notifications exclude Codex.
   Inherited MCP servers are disabled without modifying global configuration.
+- Trust each factory-created Codex workspace in launch arguments to avoid a
+  first-run directory prompt being misreported as idle by Herdr.
+- Keep the daemon and existing workers running when Codex MCP inventory fails;
+  block new Codex spawns and suspend stale replacements before stopping current
+  workers, with an actionable log and no inventory retries.

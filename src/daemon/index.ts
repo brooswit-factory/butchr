@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
-import { HerdrClient } from "@brooswit/herdr-sdk";
+import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyIssue } from "./app.js";
-import { codexMcpServerNames } from "../agents/argv.js";
+import { inventoryCodexMcp } from "../agents/argv.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
@@ -65,17 +65,12 @@ installLogSink();
 let config;
 try {
   config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
-  if (config.agent?.provider === "codex") {
-    const inventory = Bun.spawnSync(["codex", "mcp", "list", "--json"], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
-    if (inventory.exitCode !== 0) throw new Error("Cannot inventory Codex MCP servers; worker startup refused");
-    try { config.agent.disabledMcpServers = codexMcpServerNames(inventory.stdout.toString()); }
-    catch { throw new Error("Invalid Codex MCP inventory; worker startup refused"); }
-  }
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   console.error("See .env.example for the required configuration.");
   process.exit(1);
 }
+if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // Label writes must never silently 403: Jira only honours notifyUsers=false
@@ -85,7 +80,7 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
-const herdr = new HerdrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 // BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer

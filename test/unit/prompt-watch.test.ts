@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
+import { chooseStartupAnswer, type Prompt } from "../../src/agents/prompt.js";
 
 const MENU = "Trust this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm";
 
@@ -78,6 +79,41 @@ describe("unparseable blocked panes are never silently dropped (KAN-756, item C)
 });
 
 describe("continue screens", () => {
+  for (const selected of [1, 2]) {
+    test(`Codex trust with option ${selected} selected follows choice policy instead of footer`, async () => {
+      const text = `> You are in /tmp/probe\n\nDo you trust the contents of this directory?\nWorking with untrusted contents comes with higher risk of prompt injection.\nTrusting the directory allows project-local config, hooks, and exec policies to load.\n\n${selected === 1 ? "›" : " "} 1. Yes, continue\n${selected === 2 ? "›" : " "} 2. No, quit\n\nPress enter to continue`;
+      const r = rig(text);
+      const seen: Prompt[] = [];
+      watchPrompts(r.deps(({ prompt }: { prompt: Prompt }) => {
+        seen.push(prompt);
+        return chooseStartupAnswer(prompt);
+      }));
+      r.fire("p1"); await Bun.sleep(5);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.current).toBe(selected);
+      expect(seen[0]!.options).toEqual(["Yes, continue", "No, quit"]);
+      expect(r.sent).toEqual([]);
+      expect(r.exposed).toHaveLength(1);
+    });
+  }
+
+  test("continue-footer menu honors an explicit policy choice and current selection", async () => {
+    const r = rig("Choose mode\n  1. Continue\n› 2. Quit\nPress enter to continue");
+    watchPrompts(r.deps(() => 1));
+    r.fire("p1"); await Bun.sleep(5);
+    expect(r.sent).toEqual([{ pane: "p1", text: "\x1b[A\r" }]);
+    expect(r.exposed).toEqual([]);
+  });
+
+  test("unparseable choices with an Enter footer never fall back to ACK", async () => {
+    const r = rig("Trust directory?\n  1. Yes, continue\n  2. No, quit\nPress enter to continue");
+    const reported: unknown[] = [];
+    watchPrompts({ ...r.deps(() => { throw new Error("no parsed choice"); }), onUnparseable: e => reported.push(e) });
+    r.fire("p1"); await Bun.sleep(5);
+    expect(r.sent).toEqual([]);
+    expect(reported).toHaveLength(1);
+  });
+
   test("'Press Enter to continue' gets a bare enter, no parsing needed", async () => {
     const sent: Array<[string, string]> = [];
     let cb: (p: string, seq: number) => void = () => {};

@@ -18,7 +18,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HerdrClient } from "@brooswit/herdr-sdk";
+import { DrovrClient } from "@brooswit/drovr";
 import { buildWorkspace, type SpawnSpec } from "../src/agents/workspace.js";
 import { spawnArgs } from "../src/agents/argv.js";
 
@@ -27,7 +27,7 @@ import { spawnArgs } from "../src/agents/argv.js";
 const THROWAWAY_KEY = "EFFORTCHK";
 
 const socketPath = process.env.HERDR_SOCKET_PATH;
-const herdr = new HerdrClient(socketPath ? { socketPath } : {});
+const herdr = new DrovrClient(socketPath ? { socketPath } : {});
 
 const scratchRoot = mkdtempSync(join(tmpdir(), "butchr-verify-effort-"));
 let workspaceId: string | undefined;
