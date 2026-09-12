@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrError } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, issueOfAgentName, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, PANE_BUSY_MAX_RETRIES, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
@@ -15,7 +15,7 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
-      const issue = issueOfAgentName(a.name);
+      const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).toUpperCase() : null;
       return issue ? { ...a, agent: "claude", cwd: join(workspaceRoot(), issue) } : a;
     }) }), start: async (p: any) => { started.push(p); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
@@ -25,11 +25,8 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
 }
 
 describe("agent name convention", () => {
-  test("round-trips issue ↔ butchr:<issue>; foreign names are not ours", () => {
+  test("formats the optional display alias", () => {
     expect(agentNameFor("KAN-1")).toBe("butchr-kan-1");
-    expect(issueOfAgentName("butchr-kan-1")).toBe("KAN-1");
-    expect(issueOfAgentName("some-other-agent")).toBeNull();
-    expect(issueOfAgentName(null)).toBeNull();
   });
 });
 

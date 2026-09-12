@@ -94,8 +94,6 @@ export interface ManagedHerdAgent {
 
 const AGENT_PREFIX = "butchr-";
 const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
-const issueOf = (name: string | null | undefined) =>
-  name && name.startsWith(AGENT_PREFIX) ? name.slice(AGENT_PREFIX.length).toUpperCase() : null;
 
 /**
  * How long nudge() waits after delivering a prompt before checking whether a
@@ -657,4 +655,4 @@ export class HerdrHerd implements Herd {
   }
 }
 
-export { nameFor as agentNameFor, issueOf as issueOfAgentName };
+export { nameFor as agentNameFor };
