@@ -46,6 +46,16 @@ describe("HerdrHerd", () => {
     const herd = new HerdrHerd(client as any, "http://localhost:7717/mcp");
     expect(await herd.runningIssues()).toEqual(["KAN-2"]);
   });
+  test("managedAgents exposes path-derived dashboard identity when Herdr has cleared the name", async () => {
+    const client = { agent: { list: async () => ({ agents: [{ name: null, agent_status: "working", pane_id: "w1:p2", cwd: join(workspaceRoot(), "KAN-2") }] }) } };
+    const herd = new HerdrHerd(client as any, "http://localhost:7717/mcp");
+    expect(await herd.managedAgents()).toEqual([{
+      issue: "KAN-2",
+      pane: "w1:p2",
+      cwd: join(workspaceRoot(), "KAN-2"),
+      status: "working",
+    }]);
+  });
   test("spawn starts a claude agent with the channel flag + per-issue mcp config + kickoff prompt; is idempotent", async () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);

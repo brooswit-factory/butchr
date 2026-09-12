@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
@@ -81,6 +81,11 @@ export const effortFor = (issuetype: string): string =>
   ({ epic: "high", story: "high", task: "high", project: "high" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
 
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
+
+export function issueOfWorkspacePath(cwd: string | null | undefined): string | null {
+  if (!cwd || dirname(cwd) !== workspaceRoot()) return null;
+  return basename(cwd).toUpperCase();
+}
 
 /**
  * Create the agent's workspace: CLAUDE.md (generic pointer, interpolated so

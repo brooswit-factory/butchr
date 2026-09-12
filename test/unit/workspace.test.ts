@@ -3,7 +3,17 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, issueOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+
+describe("workspace identity", () => {
+  test("derives identity only from a direct child of the configured workspace root", () => {
+    const root = workspaceRoot();
+    expect(issueOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
+    expect(issueOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
+    expect(issueOfWorkspacePath("/tmp/KAN-42")).toBeNull();
+    expect(issueOfWorkspacePath(null)).toBeNull();
+  });
+});
 
 describe("briefFor / modelFor", () => {
   test("each type gets its brief; unknown gets default", () => {

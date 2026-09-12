@@ -8,7 +8,8 @@ import { inventoryCodexMcp } from "../agents/argv.js";
 import { combineHealth, createLoopHealth } from "./health.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
-import { HerdrHerd, issueOfAgentName, type NudgeResult } from "../agents/herd.js";
+import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { issueOfWorkspacePath } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -302,11 +303,11 @@ const issueStandDown = createStandDownRegistry({
 
 const { app, mcp } = buildApp({
   state: async () => {
-    const { agents } = await herdr.agent.list();
-    return agents.flatMap((a) => {
-      const issue = issueOfAgentName((a as { name?: string }).name);
-      return issue ? [{ issue, status: a.agent_status, summary: issueMeta.get(issue)?.summary ?? "" }] : [];
-    });
+    return (await herd.managedAgents()).map(({ issue, status }) => ({
+      issue,
+      status,
+      summary: issueMeta.get(issue)?.summary ?? "",
+    }));
   },
   open: async (issue) => {
     const pane = await herd.paneFor(issue);
@@ -318,15 +319,12 @@ const { app, mcp } = buildApp({
   // BUTCHR-267: pane-keyed sibling of `open` above — the dashboard row link
   // target (BUTCHR-266 will build the link; BUTCHR-264 serves the pane in
   // the row data). "This daemon's own live agent registry" (criterion 4) is
-  // the SAME `issueOfAgentName`-filtered set `state` above already builds
+  // the same workspace-path-owned set `state` above already builds
   // from `herdr.agent.list()` — a pane belonging to some other, non-butchr
   // pane on this host is never in that set, so it's refused rather than
   // handed to `herdr agent attach`.
   openPane: async (pane) => {
-    const { agents } = await herdr.agent.list();
-    const livePanes = agents
-      .filter((a) => issueOfAgentName((a as { name?: string }).name))
-      .map((a) => a.pane_id);
+    const livePanes = (await herd.managedAgents()).map((agent) => agent.pane);
     const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
     const decision = resolveAttach(pane, livePanes, terminalPrefix ?? null, hasDisplay);
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
@@ -384,12 +382,15 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
   const m = new Map<string, string>();
   for (const a of agents) {
-    const issue = issueOfAgentName((a as { name?: string }).name);
+    const issue = a.resource_key ?? null;
     if (issue) m.set(issue, a.agent_status ?? "unknown");
   }
   return m;
 };
-const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMapFromAgents((await herdr.agent.list()).agents);
+const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
+  const { agents } = await herdr.agent.list();
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })));
+};
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
 // the SAME single `agent.list()` — not a second fetch, the same discipline
@@ -423,7 +424,10 @@ const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => statusMa
 const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, string>> => {
   let agents: readonly DashboardAgent[];
   try {
-    agents = await dashboardFeed.poll(() => herdr.agent.list());
+    agents = await dashboardFeed.poll(async () => {
+      const { agents } = await herdr.agent.list();
+      return { agents: agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })) };
+    });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
     throw e;
@@ -450,7 +454,7 @@ const quotaGate = createQuotaGate(
   async () => (await herdr.agent.list()).agents.map((a) => ({
     pane_id: a.pane_id,
     agent_status: a.agent_status ?? "",
-    issue: issueOfAgentName((a as { name?: string }).name),
+    issue: issueOfWorkspacePath(a.cwd),
   })),
   readPane,
   () => Date.now(),
@@ -1024,7 +1028,7 @@ const escalator = createEscalator({
 // both need it, and neither can assume the caller already has it.
 async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
-  return issueOfAgentName(agents.find((a) => a.pane_id === paneId)?.name);
+  return issueOfWorkspacePath(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes

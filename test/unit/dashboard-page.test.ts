@@ -13,7 +13,7 @@ import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 
 function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
-  return { name, agent_status: status, pane_id: pane };
+  return { name, resource_key: name.replace(/^butchr[-:]/, "").toUpperCase(), agent_status: status, pane_id: pane };
 }
 
 const NO_ADMISSION = { cap: 0, residency: null, sources: [] as const };

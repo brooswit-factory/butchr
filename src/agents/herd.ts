@@ -1,6 +1,6 @@
 import { closeManagedAgent, HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
-import { dirname, join } from "node:path";
-import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { join } from "node:path";
+import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
@@ -83,6 +83,13 @@ export interface Herd {
    * but the pane shows a session-limit refusal rather than a started turn.
    */
   nudge(issue: string, text: string): Promise<NudgeResult>;
+}
+
+export interface ManagedHerdAgent {
+  issue: string;
+  pane: string;
+  cwd: string;
+  status: string;
 }
 
 const AGENT_PREFIX = "butchr-";
@@ -217,22 +224,21 @@ export class HerdrHerd implements Herd {
     private readonly agent: AgentConfig = { provider: "claude" },
   ) {}
 
-  private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
+  private async byIssue(): Promise<Map<string, { pane: string; cwd: string; status: string }>> {
     const { agents } = await this.herdr.agent.list();
-    const map = new Map<string, { pane: string; cwd: string | null }>();
+    const map = new Map<string, { pane: string; cwd: string; status: string }>();
     const ambiguous = new Set<string>();
-    const root = workspaceRoot();
     for (const a of agents) {
       const cwd = a.cwd ?? null;
-      if (!cwd || dirname(cwd) !== root || !a.pane_id) continue;
-      const issue = basename(cwd).toUpperCase();
+      const issue = issueOfWorkspacePath(cwd);
+      if (!cwd || !issue || !a.pane_id) continue;
       // More than one live pane at one owned path is ambiguous. Do not let
       // iteration order silently choose which process Butchr controls.
       if (map.has(issue)) {
         map.delete(issue);
         ambiguous.add(issue);
       } else if (!ambiguous.has(issue)) {
-        map.set(issue, { pane: a.pane_id, cwd });
+        map.set(issue, { pane: a.pane_id, cwd, status: a.agent_status });
       }
     }
     return map;
@@ -240,6 +246,10 @@ export class HerdrHerd implements Herd {
 
   async runningIssues(): Promise<string[]> {
     return [...(await this.byIssue()).keys()];
+  }
+
+  async managedAgents(): Promise<ManagedHerdAgent[]> {
+    return [...(await this.byIssue())].map(([issue, agent]) => ({ issue, ...agent }));
   }
 
   async staleIssues(): Promise<StaleAgent[]> {
