@@ -1,5 +1,5 @@
 import { HerdrError, promptManagedAgent, resolveManagedAgent, type DrovrClient, type results } from "@brooswit/drovr";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildWorkspace, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, type AgentConfig, type AgentProvider } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
@@ -220,9 +220,20 @@ export class HerdrHerd implements Herd {
   private async byIssue(): Promise<Map<string, { pane: string; cwd: string | null }>> {
     const { agents } = await this.herdr.agent.list();
     const map = new Map<string, { pane: string; cwd: string | null }>();
+    const ambiguous = new Set<string>();
+    const root = workspaceRoot();
     for (const a of agents) {
-      const issue = issueOf((a as { name?: string }).name);
-      if (issue && a.pane_id) map.set(issue, { pane: a.pane_id, cwd: (a as { cwd?: string | null }).cwd ?? null });
+      const cwd = a.cwd ?? null;
+      if (!cwd || dirname(cwd) !== root || !a.pane_id) continue;
+      const issue = basename(cwd).toUpperCase();
+      // More than one live pane at one owned path is ambiguous. Do not let
+      // iteration order silently choose which process Butchr controls.
+      if (map.has(issue)) {
+        map.delete(issue);
+        ambiguous.add(issue);
+      } else if (!ambiguous.has(issue)) {
+        map.set(issue, { pane: a.pane_id, cwd });
+      }
     }
     return map;
   }
