@@ -41,6 +41,16 @@ describe("agent name convention", () => {
 const instant = () => Promise.resolve();
 
 describe("HerdrHerd", () => {
+  test("AGY creates its pane with the prepared isolated HOME", async () => {
+    const f = fakeHerdr([]);
+    const creates: any[] = [];
+    f.client.workspace.create = async (p: any) => { creates.push(p); return { root_pane: "w9:p1" }; };
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant, undefined,
+      { provider: "agy" }, undefined, async () => ({ HOME: "/tmp/isolated-agy-home" }));
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(creates[0].env).toEqual({ HOME: "/tmp/isolated-agy-home" });
+    expect(f.started[0].kind).toBe("agy");
+  });
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
     const { client } = fakeHerdr([{ name: "butchr-kan-1", pane_id: "w1:p1" }, { name: "someone-else", pane_id: "w1:p2" }, { pane_id: "w1:p3" }]);
     const herd = new HerdrHerd(client, "http://localhost:7717/mcp");

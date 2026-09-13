@@ -1,4 +1,6 @@
-import { accessSync, constants, readFileSync } from "node:fs";
+import { accessSync, constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { prepareAgyHome, type ManagedAgentProvider } from "@brooswit/drovr";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,17 +32,24 @@ export function bridgeExecutable(): string {
     : resolve(dirname(current), "../../dist/butchr-mcp.js");
 }
 
-/** Read only the service user's registration; never log its contents. */
+export async function prepareFactoryWorkspace(options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) {
+  if (options.provider !== "agy") return undefined;
+  const key = createHash("sha256").update(resolve(options.cwd)).digest("hex");
+  const state = process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state");
+  return prepareAgyHome({
+    home: join(state, "butchr", "agy-homes", key), cwd: options.cwd,
+    servers: { butchr: { command: process.execPath, args: [bridgeExecutable(), "--workspace-root", resolve(workspaceRoot())] } },
+  });
+}
+
+/** The shared bridge must exist; per-worker registration is prepared at launch. */
 export function inventoryAgyMcp(
   agent: AgentConfig,
   log: (line: string) => void,
   probe: () => boolean = () => {
     const executable = bridgeExecutable();
     accessSync(executable, constants.X_OK);
-    return registrationMatches(
-      JSON.parse(readFileSync(join(homedir(), ".gemini/config/mcp_config.json"), "utf8")),
-      workspaceRoot(), executable, process.execPath,
-    );
+    return true;
   },
 ): AgentConfig {
   if (![agent.provider, ...(agent.providers ?? []), ...Object.values(agent.roleProviders ?? {}).flat()].includes("agy")) return agent;
@@ -51,7 +60,7 @@ export function inventoryAgyMcp(
       return ready;
     }
   } catch { /* Missing and malformed registrations are equally unavailable. */ }
-  const reason = "Antigravity Butchr MCP bridge is unavailable or misconfigured; new AGY spawns disabled. Configure the service user's butchr stdio registration and restart Butchr.";
+  const reason = "Antigravity Butchr MCP bridge is unavailable; new AGY spawns disabled. Build the bridge and restart Butchr.";
   log(reason);
   return { ...agent, agySpawnBlocked: reason };
 }

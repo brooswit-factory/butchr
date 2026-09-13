@@ -1,4 +1,5 @@
-import { closeManagedAgent, startManagedAgent, managedAgentProviderOfProcess, prepareManagedAgentWorkspace, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, startManagedAgent, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
@@ -192,7 +193,7 @@ export class HerdrHerd implements Herd {
     private readonly log?: (line: string) => void,
     private readonly agent: AgentConfig = { provider: "claude" },
     private readonly availability: ProviderAvailabilityRegistry = processProviderAvailability,
-    private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareManagedAgentWorkspace,
+    private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareFactoryWorkspace,
     /** Monotonic readiness clock; paired with the injected wait in tests. */
     private readonly monotonicNow: () => number = () => performance.now(),
   ) {}
@@ -425,7 +426,9 @@ export class HerdrHerd implements Herd {
         // Validate the launch before replacing a refused worker. The same
         // filesystem directory carries its work across provider sessions.
         const launch = agentStartParams(spec, dir, "pending", nameFor(spec.key), selected, this.mcpUrl);
-        await this.prepareWorkspace({ provider, cwd: dir, unattended: true });
+        const prepared = await this.prepareWorkspace({ provider, cwd: dir, unattended: true });
+        const env = provider === "agy" && prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string"
+          ? { HOME: prepared.HOME } : undefined;
         if (refusedPane) {
           const current = await resolveManagedAgent(this.herdr, { cwd: dir });
           if (current.status !== "found" || current.agent.pane_id !== refusedPane ||
@@ -436,7 +439,7 @@ export class HerdrHerd implements Herd {
           this.refused.delete(spec.key);
           refusedPane = undefined;
         }
-        const created = await this.herdr.workspace.create({ label: spec.key, cwd: dir } as Parameters<DrovrClient["workspace"]["create"]>[0]);
+        const created = await this.herdr.workspace.create({ label: spec.key, cwd: dir, ...(env ? { env } : {}) } as Parameters<DrovrClient["workspace"]["create"]>[0]);
         const root = (created as { root_pane?: unknown }).root_pane;
         const paneId = typeof root === "string" ? root : (root as { pane_id?: string })?.pane_id;
         if (!paneId) throw new Error(`workspace.create for ${spec.key} returned no root pane`);
