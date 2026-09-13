@@ -1,4 +1,4 @@
-import { closeManagedAgent, HerdrError, managedAgentProviderOfProcess, prepareManagedAgentWorkspace, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { closeManagedAgent, startManagedAgent, managedAgentProviderOfProcess, prepareManagedAgentWorkspace, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { agentStartParams, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
@@ -102,34 +102,13 @@ const NUDGE_VERIFY_MS = 8_000;
  */
 const KICKOFF_VERIFY_MS = 12_000;
 
-/**
- * BUTCHR-268: `workspace.create`'s own just-returned root pane is not
- * reliably ready for `agent.start` — herdr rejects it with `agent_pane_busy`
- * ("not an available shell") on a race, measured (this branch's own commit,
- * see PR) to resolve within roughly the low hundreds of ms on a loaded herd,
- * but NOT bounded by any fixed wait: a repeated measurement still saw a
- * single busy rejection out past 1s. Waiting this long before EVERY
- * `agent.start` attempt (first attempt included) closes most of the gap
- * cheaply — it's negligible next to `KICKOFF_VERIFY_MS`'s multi-second wait
- * a few lines below — but per the measurement above a wait alone is not
- * sufficient; see `PANE_BUSY_MAX_RETRIES`.
- *
- * Exported so `scripts/repro-pane-busy.ts`'s "fixed" measurement mode can
- * exercise the SAME constants this file actually uses, rather than a copy
- * that could silently drift from them.
- */
+/** Retry interval after Herdr confirms a shell-busy rejection. */
 export const PANE_READY_WAIT_MS = 200;
 
-/**
- * Sibling to `PANE_READY_WAIT_MS`: bounded retries specifically on
- * `agent_pane_busy`, never on any other `agent.start` rejection (those must
- * still reach `spawn()`'s own catch immediately, which closes the pane it
- * just created — BUTCHR-111's leak-safety guarantee). At `PANE_READY_WAIT_MS`
- * between attempts, this bounds the extra wait spawn() can spend retrying to
- * `PANE_BUSY_MAX_RETRIES * PANE_READY_WAIT_MS` = 800ms in the worst case —
- * still negligible next to `KICKOFF_VERIFY_MS`, and small next to the whole
- * poll cycle a failed spawn used to cost before this existed.
- */
+/** Deadline for confirmed shell-busy retries; native launch timeouts remain Herdr-owned. */
+export const PANE_READINESS_TIMEOUT_MS = 5_000;
+
+/** @deprecated Historical reproduction-script budget; runtime uses Drovr's deadline. */
 export const PANE_BUSY_MAX_RETRIES = 4;
 
 /**
@@ -214,6 +193,8 @@ export class HerdrHerd implements Herd {
     private readonly agent: AgentConfig = { provider: "claude" },
     private readonly availability: ProviderAvailabilityRegistry = processProviderAvailability,
     private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareManagedAgentWorkspace,
+    /** Monotonic readiness clock; paired with the injected wait in tests. */
+    private readonly monotonicNow: () => number = () => performance.now(),
   ) {}
 
   private async exclusive<T>(issue: string, action: () => Promise<T>): Promise<T> {
@@ -477,25 +458,14 @@ export class HerdrHerd implements Herd {
     });
   }
 
-  /**
-   * BUTCHR-268: waits `PANE_READY_WAIT_MS` before every attempt (including
-   * the first), and retries ONLY an `agent_pane_busy` rejection, up to
-   * `PANE_BUSY_MAX_RETRIES` extra times. Any other rejection — including a
-   * busy rejection that has exhausted its retries — propagates immediately,
-   * unchanged, so `spawn()`'s own catch above still sees it and closes the
-   * pane it just created.
-   */
+  /** Drovr bounds shell-busy retries; startProviders retains pane cleanup on failure. */
   private async startWithReadinessRetry(params: Parameters<DrovrClient["agent"]["start"]>[0]): Promise<void> {
-    for (let attempt = 0; ; attempt++) {
-      await this.wait(PANE_READY_WAIT_MS);
-      try {
-        await this.herdr.agent.start(params);
-        return;
-      } catch (e) {
-        const busy = e instanceof HerdrError && e.code === "agent_pane_busy";
-        if (!busy || attempt >= PANE_BUSY_MAX_RETRIES) throw e;
-      }
-    }
+    await startManagedAgent(this.herdr, params, {
+      readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS,
+      retryIntervalMs: PANE_READY_WAIT_MS,
+      now: this.monotonicNow,
+      wait: this.wait,
+    });
   }
 
   /**
