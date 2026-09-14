@@ -159,7 +159,7 @@ describe("provider selection", () => {
     expect(await herd.closeStranded({ workspaceId: "w", paneIds: ["p1"] } as any)).toBe(false);
   });
 
-  test("Codex spawn recovers kickoff through generic prompt and stays idempotent", async () => {
+  test("Codex spawn dispatches kickoff once and stays idempotent", async () => {
     const started: any[] = [], prompts: any[] = [];
     const agent = { name: "butchr-test-990", pane_id: "p", agent: "codex", cwd: join(workspaceRoot(), spec.key), agent_status: "idle" };
     const client = {
@@ -173,9 +173,9 @@ describe("provider selection", () => {
     expect(started).toHaveLength(1);
     expect(started[0].kind).toBe("codex");
     expect(started[0].args).toContain("follow your AGENTS.md");
-    expect(prompts[0].text).toBe("Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
+    expect(prompts).toEqual([]);
     expect(await herd.nudge(spec.key, "fixture update")).toEqual({ delivered: true });
-    expect(prompts[1].text).toBe("fixture update");
+    expect(prompts[0].text).toBe("fixture update");
   });
 
   test("channel routing excludes Codex but retains legacy Claude clients", async () => {
@@ -200,14 +200,14 @@ describe("provider selection", () => {
     expect(stale[0]!.reason).toContain("yappr");
   });
 
-  test("kickoff recovery uses shared instructions after changing the selected provider", async () => {
+  test("explicit nudges keep caller workspace instructions after provider selection", async () => {
     const prompts: any[] = [];
     const client = {
       agent: { list: async () => ({ agents: [{ name: "butchr-test-990", pane_id: "p", agent_status: "idle", agent: "codex", cwd: join(workspaceRoot(), spec.key) }] }), prompt: async (p: any) => { prompts.push(p); return { agent: { agent_status: "idle" } }; } },
       pane: { read: async () => ({ read: { text: "" } }), sendKeys: instant },
     };
     const herd = new HerdrHerd(client as any, url, instant, undefined, { provider: "codex" });
-    await (herd as any).verifyKickoff(spec.key);
+    await herd.nudge(spec.key, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
     expect(prompts[0].text).toContain("brief.md");
     expect(prompts[0].text).not.toContain("AGENTS.md");
   });
@@ -235,7 +235,6 @@ describe("provider selection", () => {
     } as any });
     expect((await client.agent.list()).agents[0]!.agent_status).toBe("blocked");
     const herd = new HerdrHerd(client, url, instant);
-    await (herd as any).verifyKickoff(spec.key);
     expect(await herd.nudge(spec.key, "fixture update")).toEqual({ delivered: false });
     expect(prompts).toEqual([]);
     expect(keys).toEqual([]);

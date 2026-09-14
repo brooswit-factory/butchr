@@ -38,6 +38,7 @@ export async function prepareFactoryWorkspace(options: { provider: ManagedAgentP
   const state = process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state");
   return prepareAgyHome({
     home: join(state, "butchr", "agy-homes", key), cwd: options.cwd,
+    setupFromHome: homedir(), installHerdrIntegration: true,
     servers: { butchr: { command: process.execPath, args: [bridgeExecutable(), "--workspace-root", resolve(workspaceRoot())] } },
   });
 }

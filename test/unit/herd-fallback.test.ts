@@ -14,21 +14,47 @@ const instant = async () => {};
 const config: AgentConfig = { provider: "claude", providers: ["claude", "codex"], disabledMcpServers: [] };
 type Row = { pane_id: string; agent: string; cwd: string; agent_status: string };
 
-function fixture(options: { refuseClaude?: boolean; launchError?: Error; existing?: Row[]; text?: string } = {}) {
+function fixture(options: { refuseClaude?: boolean; launchError?: Error; existing?: Row[]; text?: string; missingTranscript?: boolean; missingAck?: boolean } = {}) {
   let rows = options.existing ?? [];
   const starts: any[] = [], creates: any[] = [], closed: string[] = [], prompts: any[] = [];
   const texts = new Map<string, string>();
+  const histories = new Map<string, string>();
+  function record(pane: string, provider: string, prompt?: string) {
+    const token = prompt?.match(/DROVR_HANDOFF_READY_[a-f0-9-]+/)?.[0];
+    const text = token && !options.missingAck ? `${token}\nWorking summary with outstanding work.` : "Previous work and pending objectives.";
+    const item = provider === "agy" ? { step_index: 0, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: text }
+      : provider === "codex" ? { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text }] } }
+      : { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+    const path = join(workspaceRoot(), `${pane}-native.jsonl`);
+    writeFileSync(path, JSON.stringify(item) + "\n");
+    histories.set(pane, path);
+  }
   const client = {
     agent: {
       list: async () => ({ agents: rows }),
+      get: async (pane: string) => {
+        const agent = rows.find(r => r.pane_id === pane)!;
+        if (options.missingTranscript) return { agent };
+        if (!histories.has(pane)) record(pane, agent.agent);
+        return { agent: { ...agent, agent_session: { agent: agent.agent, kind: "path", value: histories.get(pane), source: "fixture" } } };
+      },
       start: async (params: any) => {
         starts.push(params);
         if (options.launchError) throw options.launchError;
         const refused = params.kind === "claude" && options.refuseClaude;
-        rows.push({ pane_id: params.pane_id, cwd: creates.at(-1).cwd, agent: params.kind, agent_status: refused ? "idle" : "working" });
+        const prompt = params.args[params.kind === "agy" ? 1 : 0];
+        const importing = prompt.includes("DROVR_HANDOFF_READY_");
+        rows.push({ pane_id: params.pane_id, cwd: creates.at(-1).cwd, agent: params.kind, agent_status: refused || importing ? "idle" : "working" });
+        record(params.pane_id, params.kind, prompt);
         texts.set(params.pane_id, refused ? banner : "working");
       },
-      prompt: async (params: any) => { prompts.push(params); return { agent: rows.find((r) => r.pane_id === params.target) }; },
+      prompt: async (params: any) => {
+        prompts.push(params);
+        const agent = rows.find(r => r.pane_id === params.target)!;
+        if (params.text.includes("DROVR_HANDOFF_READY_")) record(agent.pane_id, agent.agent, params.text);
+        else agent.agent_status = "working";
+        return { agent };
+      },
     },
     workspace: { create: async (params: any) => { creates.push(params); return { root_pane: `new-${creates.length}` }; } },
     pane: {
@@ -62,6 +88,42 @@ describe("HerdrHerd ordered provider fallback", () => {
     pane_id: "old", cwd: join(workspaceRoot(), spec.key), agent, agent_status,
   });
 
+  test("missing native history preserves the refused worker and reports waiting", async () => {
+    const f = fixture({ existing: [existing()], missingTranscript: true });
+    const logs: string[] = [];
+    const herd = new HerdrHerd(f.client, url, instant, line => logs.push(line), config);
+    expect(await herd.recoverQuota(spec)).toBe("waiting");
+    expect(f.creates).toEqual([]);
+    expect(f.closed).toEqual([]);
+    expect(f.prompts).toEqual([]);
+    expect(await herd.paneFor(spec.key)).toBe("old");
+    expect(logs.some(line => line.includes("native transcript"))).toBe(true);
+  });
+
+  test("nudge waits for handoff acknowledgement and uses the committed pane", async () => {
+    const f = fixture({ existing: [existing()] });
+    const start = f.client.agent.start;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const importing = new Promise<void>(resolve => { entered = resolve; });
+    f.client.agent.start = async (params: any) => { await start(params); entered(); await gate; };
+    const herd = new HerdrHerd(f.client, url, instant, undefined, config);
+    const recovery = herd.recoverQuota(spec);
+    await importing;
+    expect(await herd.paneFor(spec.key)).toBe("old");
+    expect(await herd.runningIssues()).toEqual([spec.key]);
+    const nudge = herd.nudge(spec.key, "new request");
+    expect(f.prompts).toEqual([]);
+    release();
+    expect(await recovery).toBe("recovered");
+    expect(await nudge).toEqual({ delivered: true });
+    expect(f.prompts).toEqual([
+      { target: "new-1", text: "follow your AGENTS.md" },
+      { target: "new-1", text: "new request" },
+    ]);
+  });
+
   test("role order wins and a different provider does not inherit the Claude model", async () => {
     const f = fixture();
     const herd = new HerdrHerd(f.client, url, instant, undefined, {
@@ -79,7 +141,8 @@ describe("HerdrHerd ordered provider fallback", () => {
     }, undefined, instant);
     await herd.spawn(spec);
     expect(f.starts.map(p => p.kind)).toEqual(["claude", "agy"]);
-    expect(f.starts[1].args).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
+    expect(f.starts[1].args[1]).toContain("ONLY for importing and compacting historical context");
+    expect(f.prompts).toEqual([{ target: "new-2", text: "follow your AGENTS.md" }]);
     expect(f.closed).toEqual(["new-1"]);
     expect(JSON.parse(readFileSync(join(f.creates[1].cwd, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: url });
     expect(await herd.runningIssues()).toEqual([spec.key]);
