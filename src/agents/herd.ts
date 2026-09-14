@@ -1,8 +1,8 @@
-import { closeManagedAgent, startManagedAgent, managedAgentProviderOfProcess, promptManagedAgent, resolveManagedAgent, ProviderAvailabilityRegistry, processProviderAvailability, runWithProviderFallback, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { ManagedHerdrLifecycle, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { join } from "node:path";
 import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
-import { agentStartParams, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -93,16 +93,6 @@ const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
  */
 const NUDGE_VERIFY_MS = 8_000;
 
-/**
- * Sibling to NUDGE_VERIFY_MS: how long spawn() waits after `agent.start`
- * before checking whether the kickoff actually started a turn (KAN-804/807 —
- * the kickoff is fire-and-forget, unlike a nudge, so nothing else ever
- * re-checks it). Slightly longer than the nudge wait: a cold process start
- * (loading, startup dialogs) is slower than an already-running agent
- * accepting a new prompt. ~8-15s is the intended range.
- */
-const KICKOFF_VERIFY_MS = 12_000;
-
 /** Retry interval after Herdr confirms a shell-busy rejection. */
 export const PANE_READY_WAIT_MS = 200;
 
@@ -173,6 +163,7 @@ export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
+  private readonly lifecycles = new Map<string, ManagedHerdrLifecycle>();
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
 
@@ -198,6 +189,22 @@ export class HerdrHerd implements Herd {
     private readonly monotonicNow: () => number = () => performance.now(),
   ) {}
 
+  private lifecycle(issue: string): ManagedHerdrLifecycle {
+    let lifecycle = this.lifecycles.get(issue);
+    if (!lifecycle) {
+      lifecycle = new ManagedHerdrLifecycle({
+        client: this.herdr, cwd: join(workspaceRoot(), issue),
+        availability: this.availability, wait: this.wait,
+        startOptions: {
+          readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS,
+          now: this.monotonicNow, wait: this.wait,
+        },
+      });
+      this.lifecycles.set(issue, lifecycle);
+    }
+    return lifecycle;
+  }
+
   private async exclusive<T>(issue: string, action: () => Promise<T>): Promise<T> {
     const previous = this.operations.get(issue) ?? Promise.resolve();
     const pending = previous.catch(() => {}).then(action);
@@ -211,12 +218,10 @@ export class HerdrHerd implements Herd {
   async recoverQuota(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting"> {
     if (!this.agent.providers && !this.agent.roleProviders) return "not-refused";
     return this.exclusive(spec.key, async () => {
-      const resolved = await resolveManagedAgent(this.herdr, { cwd: join(workspaceRoot(), spec.key) });
-      if (resolved.status !== "found") {
-        if (resolved.status === "missing") this.refused.delete(spec.key);
-        return "not-refused";
-      }
-      const current = resolved.agent;
+      let current: results.AgentInfo | undefined;
+      try { current = await this.lifecycle(spec.key).resolveCurrent(); }
+      catch { return "not-refused"; }
+      if (!current) { this.refused.delete(spec.key); return "not-refused"; }
       if (current.pane_id !== this.refused.get(spec.key)?.pane || current.agent !== "claude" || current.agent_status === "working") {
         this.refused.delete(spec.key);
       }
@@ -258,6 +263,8 @@ export class HerdrHerd implements Herd {
       const cwd = a.cwd ?? null;
       const issue = issueOfWorkspacePath(cwd);
       if (!cwd || !issue || !a.pane_id) continue;
+      const currentPane = this.lifecycles.get(issue)?.current?.paneId;
+      if (currentPane && a.pane_id !== currentPane) continue;
       // More than one live pane at one owned path is ambiguous. Do not let
       // iteration order silently choose which process Butchr controls.
       if (map.has(issue)) {
@@ -341,19 +348,10 @@ export class HerdrHerd implements Herd {
    * same issue elsewhere) can still reach this early return. Neither guard
    * makes it unreachable; both are independent lines of defense.
    *
-   * "SUCCESS" MEANS SUCCESS, not "attempted": the success line is written
-   * only at the very end, after `verifyKickoff` — never right after
-   * `agent.start` resolves. `agent.start` resolving only means herdr
-   * accepted the start call; it is not proof a claude process is actually
-   * alive (that is exactly why `PANE_READY_WAIT_MS`/`agent_pane_busy`
-   * retries and `verifyKickoff`'s own wait-then-check exist at all).
-   * `verifyKickoff` is the point where this method has actually waited
-   * `KICKOFF_VERIFY_MS` and inspected the agent's real status — either the
-   * kickoff already landed (status moved off idle/done: a genuinely running
-   * turn) or a best-effort recovery nudge was sent. That is the strongest
-   * confirmation this call chain affords, so the success line's wording
-   * claims exactly that ("spawned", not "kickoff confirmed running") and no
-   * more.
+   * Success is logged after Drovr verifies the current worker remains
+   * present and checks the measured Claude quota signal. Provider handoff
+   * also requires an acknowledged native working summary before commit.
+   * Idle/done alone does not prove kickoff was swallowed; it is not resent.
    *
    * FAILURE IS LOGGED WHATEVER THE COMPLAINT/LATCH STATE (hard constraint on
    * the ticket): this method's own `log` call is the ONLY place a failure is
@@ -402,8 +400,8 @@ export class HerdrHerd implements Herd {
         return;
       }
       const result = await this.startProviders(spec);
-      if (result.status === "exhausted") {
-        this.log?.(`${SPAWN_TAG} ${issue} waiting - providers exhausted origin=${origin}`);
+      if (result.status !== "success") {
+        this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
         return;
       }
       this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}`);
@@ -414,84 +412,33 @@ export class HerdrHerd implements Herd {
   }
 
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
-    return runWithProviderFallback({
-      priority: providerOrder(this.agent, spec.issuetype).map((provider) => ({ provider, accountId: "default" })),
-      availability: this.availability,
-      attempt: async ({ provider }) => {
+    const result = await this.lifecycle(spec.key).start({
+      priority: providerOrder(this.agent, spec.issuetype).map(provider => ({ provider, accountId: "default" })),
+      label: spec.key,
+      ...(refusedPane ? { replacePaneId: refusedPane } : {}),
+      kickoff: kickoffFor,
+      prepare: async provider => {
         const selected = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
         if (provider === "codex" && selected.codexSpawnBlocked) throw new Error(selected.codexSpawnBlocked);
         if (provider === "agy" && selected.agySpawnBlocked) throw new Error(selected.agySpawnBlocked);
         const dir = buildWorkspace(spec, this.mcpUrl, provider, selected.disabledMcpServers);
-        // Validate the launch before replacing a refused worker. The same
-        // filesystem directory carries its work across provider sessions.
-        const launch = agentStartParams(spec, dir, "pending", nameFor(spec.key), selected, this.mcpUrl);
+        const launch = agentLaunchConfig(spec, dir, "pending", nameFor(spec.key), selected, this.mcpUrl);
         const prepared = await this.prepareWorkspace({ provider, cwd: dir, unattended: true });
-        const env = provider === "agy" && prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string"
-          ? { HOME: prepared.HOME } : undefined;
-        if (refusedPane) {
-          const current = await resolveManagedAgent(this.herdr, { cwd: dir });
-          if (current.status !== "found" || current.agent.pane_id !== refusedPane ||
-              (current.agent.agent_status !== "idle" && current.agent.agent_status !== "done")) {
-            throw new Error(`Quota recovery for ${spec.key}: refused worker changed before replacement`);
-          }
-          await this.herdr.pane.close(refusedPane);
-          this.refused.delete(spec.key);
-          refusedPane = undefined;
-        }
-        const created = await this.herdr.workspace.create({ label: spec.key, cwd: dir, ...(env ? { env } : {}) } as Parameters<DrovrClient["workspace"]["create"]>[0]);
-        const root = (created as { root_pane?: unknown }).root_pane;
-        const paneId = typeof root === "string" ? root : (root as { pane_id?: string })?.pane_id;
-        if (!paneId) throw new Error(`workspace.create for ${spec.key} returned no root pane`);
-        try {
-          await this.startWithReadinessRetry({ ...launch, pane_id: paneId });
-          const refusal = await this.verifyKickoff(spec.key);
-          if (refusal) {
-            refusedPane = paneId;
-            return { status: "quota-blocked" as const, refusal };
-          }
-          this.refused.delete(spec.key);
-          return { status: "success" as const, value: paneId };
-        } catch (error) {
-          await this.herdr.pane.close(paneId).catch(() => {});
-          this.refused.delete(spec.key);
-          throw error;
-        }
+        const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string"
+          ? prepared.HOME : undefined;
+        return { launch, ...(home ? { env: { HOME: home }, home } : {}) };
       },
     });
-  }
-
-  /** Drovr bounds shell-busy retries; startProviders retains pane cleanup on failure. */
-  private async startWithReadinessRetry(params: Parameters<DrovrClient["agent"]["start"]>[0]): Promise<void> {
-    await startManagedAgent(this.herdr, params, {
-      readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS,
-      retryIntervalMs: PANE_READY_WAIT_MS,
-      now: this.monotonicNow,
-      wait: this.wait,
-    });
-  }
-
-  /**
-   * KAN-804/807: the kickoff is fire-and-forget — unlike nudge()'s prompt, or
-   * a blocked dialog, NOTHING else ever re-sends it if it's swallowed (e.g.
-   * landing at a Claude session-limit refusal). Give it KICKOFF_VERIFY_MS,
-   * then check whether a turn actually started; if not, recover the same way
-   * nudge() recovers a stranded composer — UNLESS the pane shows a
-   * session-limit refusal, which is not recoverable by re-sending (the
-   * refusal is a property of the CLI session, not of the composer) and is
-   * instead handled by the level-triggered poll in session-limit-watch.ts.
-   */
-  private async verifyKickoff(issue: string): Promise<SessionLimitRefusal | null> {
-    await this.wait(KICKOFF_VERIFY_MS);
-    const status = await this.statusOf(issue);
-    if (status !== "idle" && status !== "done") return null; // working/blocked: the kickoff landed
-    const resolved = await resolveManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
-    if (resolved.status !== "found") return null;
-    const text = await this.readPane(resolved.agent.pane_id);
-    const refusal = this.observeQuota(issue, resolved.agent, text);
-    if (refusal) return refusal;
-    const result = await this.nudge(issue, "Read brief.md and ENVIRONMENT.md in your workspace and follow them.");
-    return result.refusal ?? null;
+    if (result.status === "success") this.refused.delete(spec.key);
+    else {
+      if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);
+      const current = await this.lifecycle(spec.key).resolveCurrent();
+      if (current?.agent === "claude" && (current.agent_status === "idle" || current.agent_status === "done")) {
+        this.observeQuota(spec.key, current, await this.readPane(current.pane_id));
+      }
+    }
+    return result;
   }
 
   private async readPane(paneId: string): Promise<string> {
@@ -501,7 +448,7 @@ export class HerdrHerd implements Herd {
 
   async stop(issue: string): Promise<void> {
     await this.exclusive(issue, async () => {
-      await closeManagedAgent(this.herdr, { cwd: join(workspaceRoot(), issue) });
+      await this.lifecycle(issue).stop();
       this.refused.delete(issue);
     });
   }
@@ -659,51 +606,23 @@ export class HerdrHerd implements Herd {
     return procs.some((p) => managedAgentProviderOfProcess(p)) ? "live" : "dead";
   }
 
-  private async statusOf(issue: string): Promise<string | null> {
-    const resolved = await resolveManagedAgent(this.herdr, {
-      cwd: join(workspaceRoot(), issue),
-    });
-    return resolved.status === "found" ? resolved.agent.agent_status : null;
-  }
-
   async nudge(issue: string, text: string): Promise<NudgeResult> {
-    try {
-      const result = await promptManagedAgent(this.herdr, {
-        cwd: join(workspaceRoot(), issue),
-      }, text);
-      if (result.resolution.status !== "found" || result.prompted?.agent_status === "blocked") return { delivered: false };
-    } catch {
-      return { delivered: false }; // e.g. the pane is blocked on a dialog — the prompt-watcher owns that
-    }
-    // "Delivered" is not "a turn started": a prompt landing as a turn ends
-    // strands in the composer unsubmitted (KAN-691 sat 2.5h on an approved PR)
-    // — or, per KAN-829, lands on a session-limit refusal, which looks
-    // identical from here (still idle) but must not be treated the same way.
-    // Verify a turn starts; if the agent is still IDLE — never blocked, where
-    // enter would select a dialog option — check for a refusal before
-    // submitting the stranded composer text: sending enter into a refused
-    // session accomplishes nothing and only muddies what actually happened.
-    await this.wait(NUDGE_VERIFY_MS);
-    if ((await this.statusOf(issue)) === "idle") {
-      const resolved = await resolveManagedAgent(this.herdr, {
-        cwd: join(workspaceRoot(), issue),
-      });
-      if (resolved.status === "found") {
-        // A transient herdr hiccup here must not propagate: before this
-        // refusal check existed, nudge() could no longer throw once
-        // agent.prompt succeeded (sendKeys below is already .catch(() => {})),
-        // and daemon/index.ts's caller turns a throw into `{ delivered: false }`
-        // — inverting the honesty fix (a DELIVERED prompt logged as refused)
-        // and skipping the stranded-composer enter (KAN-691's 2.5h stall,
-        // reopened via an unrelated transient). Same treatment as
-        // staleIssues()'s "herdr hiccup / pane gone — unknown, not stale".
-        const text = await this.readPane(resolved.agent.pane_id).catch(() => "");
-        const refusal = this.observeQuota(issue, resolved.agent, text);
+    return this.exclusive(issue, async () => {
+      const lifecycle = this.lifecycle(issue);
+      try {
+        const prompted = await lifecycle.prompt(text);
+        if (!prompted || prompted.agent_status === "blocked") return { delivered: false };
+      } catch { return { delivered: false }; }
+      await this.wait(NUDGE_VERIFY_MS);
+      const current = await lifecycle.resolveCurrent().catch(() => undefined);
+      if (current?.agent_status === "idle") {
+        const screen = await this.readPane(current.pane_id).catch(() => "");
+        const refusal = this.observeQuota(issue, current, screen);
         if (refusal) return { delivered: true, refusal };
-        await this.herdr.pane.sendKeys({ pane_id: resolved.agent.pane_id, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]).catch(() => {});
+        await this.herdr.pane.sendKeys({ pane_id: current.pane_id, keys: ["enter"] }).catch(() => {});
       }
-    }
-    return { delivered: true };
+      return { delivered: true };
+    });
   }
 }
 

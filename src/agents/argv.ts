@@ -5,6 +5,7 @@ import {
   inventoryCodexMcpServers,
   parseCodexMcpInventory,
   type ManagedAgentProvider,
+  type ManagedAgentLaunch,
   type ParamsOf,
 } from "@brooswit/drovr";
 
@@ -46,32 +47,32 @@ export const kickoffFor = (provider: AgentProvider): string => provider === "cla
  * Butchr supplies workspace intent; Drovr owns provider-specific process
  * arguments and returns the complete Herdr start contract.
  */
-export function agentStartParams(
+export function agentLaunchConfig(
   spec: SpawnSpec,
   dir: string,
   paneId: string,
   name: string,
   agent: AgentConfig = { provider: "claude" },
   mcpUrl = "http://localhost:7717/mcp",
-): ParamsOf<"agent.start"> {
+): ManagedAgentLaunch {
   if (agent.provider === "agy") {
-    return buildAgentStartParams({
+    return {
       provider: "agy",
       skipPermissions: true,
       name,
       paneId,
       cwd: dir,
-      prompt: kickoffFor(agent.provider),
+      prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-    });
+    };
   }
   if (agent.provider === "codex") {
-    return buildAgentStartParams({
+    return {
       provider: "codex",
       name,
       paneId,
       cwd: dir,
-      prompt: kickoffFor(agent.provider),
+      prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
       mcpServers: [{
         name: "butchr",
@@ -79,20 +80,28 @@ export function agentStartParams(
         headers: { "x-issue": spec.key, "x-butchr-provider": "codex" },
       }],
       disabledMcpServers: agent.disabledMcpServers ?? [],
-    });
+    };
   }
 
-  return buildAgentStartParams({
+  return {
     provider: "claude",
     name,
     paneId,
     cwd: dir,
-    prompt: kickoffFor(agent.provider),
+    prompt: "",
     model: agent.model ?? modelFor(spec.issuetype),
     effort: effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
     developmentChannels: ["server:butchr"],
-  });
+  };
+}
+
+/** Compatibility helper for argv inspection; lifecycle dispatches kickoff separately. */
+export function agentStartParams(
+  spec: SpawnSpec, dir: string, paneId: string, name: string,
+  agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
+): ParamsOf<"agent.start"> {
+  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider) });
 }
 
 /**

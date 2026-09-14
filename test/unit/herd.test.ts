@@ -25,7 +25,7 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
     agent: { list: async () => ({ agents: agents.map((a) => {
       const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).toUpperCase() : null;
       return issue ? { ...a, agent: "claude", cwd: join(workspaceRoot(), issue) } : a;
-    }) }), start: async (p: any) => { started.push(p); } },
+    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id }); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
     workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
   };
@@ -144,12 +144,12 @@ describe("spawn: kickoff verification (KAN-804/807)", () => {
     expect(f.closed.length).toBe(0);
   });
 
-  test("kickoff swallowed (still idle) and NOT a session-limit refusal → recovers via nudge() (re-sends the kickoff, then Enter if still idle)", async () => {
+  test("idle alone does not prove kickoff was swallowed and never repeats work", async () => {
     const f = fakeHerdrWithLiveAgent({ statusAfterStart: "idle", paneText: "some ordinary idle pane, no refusal here" });
     const herd = new HerdrHerd(f.client, "u", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
-    expect(f.prompts).toEqual([{ target: "w9:p1", text: "Read brief.md and ENVIRONMENT.md in your workspace and follow them." }]);
-    expect(f.keys[0]).toEqual({ pane_id: "w9:p1", keys: ["enter"] }); // still idle after the nudge's own wait too
+    expect(f.prompts).toEqual([]);
+    expect(f.keys).toEqual([]);
   });
 
   test("kickoff swallowed by a session-limit refusal → NOT re-sent (a limited session can't be nudged back to life)", async () => {
@@ -164,7 +164,7 @@ describe("spawn: kickoff verification (KAN-804/807)", () => {
     const f = fakeHerdrWithLiveAgent({ statusAfterStart: "done", paneText: "no refusal" });
     const herd = new HerdrHerd(f.client, "u", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
-    expect(f.prompts.length).toBe(1);
+    expect(f.prompts.length).toBe(0);
   });
 });
 
@@ -369,13 +369,17 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
   test("mixed poll: one admitted plan-spawn, one successful respawn, one FAILED respawn — the true rule closes, and the failed respawn is distinguishable from a failed plan spawn by origin alone", async () => {
     const spawnLines: string[] = [];
     const admissionLines: string[] = [];
+    const live: any[] = [];
     const client = {
       agent: {
         // Always empty: every one of the three issues below misses HerdrHerd's
         // own noop check (byIssue().has(issue)), so all three genuinely
         // attempt agent.start — same shape falsifier 2's own tests rely on.
-        list: async () => ({ agents: [] }),
-        start: async (p: any) => { if (p.name === agentNameFor("KAN-RESPAWN-FAIL")) throw new Error("boom"); },
+        list: async () => ({ agents: live }),
+        start: async (p: any) => {
+          if (p.name === agentNameFor("KAN-RESPAWN-FAIL")) throw new Error("boom");
+          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), p.name.slice(7).toUpperCase()), agent_status: "working" });
+        },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
       workspace: { create: async (p: any) => ({ root_pane: { pane_id: `pane-${p.label}` } }) },
@@ -749,12 +753,12 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
   const desired = new Map([["KAN-783", { key: "KAN-783", issuetype: "Task", summary: "s", parent: null }]]);
 
   function fakeHerdrStale(processInfo: (paneId: string) => Promise<{ process_info?: { pane_id: string; foreground_processes?: FakeProcess[] } }>) {
-    let agents: Array<{ name: string; pane_id: string; cwd: string }> = [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: dir }];
+    let agents = [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: dir, agent: "claude" }];
     const started: any[] = []; const closed: string[] = [];
     const client = {
       agent: {
         list: async () => ({ agents }),
-        start: async (p: any) => { started.push(p); agents = [...agents, { name: "butchr-kan-783", pane_id: "w9:p1", cwd: dir }]; },
+        start: async (p: any) => { started.push(p); agents = [...agents, { name: "butchr-kan-783", pane_id: "w9:p1", cwd: dir, agent: p.kind }]; },
       },
       // Closing a pane retires its agent — herdr's list no longer carries it,
       // exactly what makes spawn() (which no-ops when the name already
