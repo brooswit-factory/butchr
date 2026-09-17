@@ -6,7 +6,8 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
-import { combineHealth, createLoopHealth } from "./health.js";
+import { combineHealth, createLoopHealth, createResourceLoopHealth } from "./health.js";
+import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
@@ -53,11 +54,11 @@ import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
-import { startGithubIssueLoop } from "./github-issue-loop.js";
+import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createJiraIdeaClient } from "../resources/jira-idea.js";
 import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
-import { jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
+import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
@@ -243,6 +244,23 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
+// github-issue and jira-idea loop health, reported beside (never inside) the
+// liveness components: whether each type's rules run, and whether its polls
+// complete. The threshold covers at least three polls of the slower loop.
+const githubIssueHealth = createResourceLoopHealth({
+  name: "github-issue",
+  enabled: Boolean(githubIssues),
+  ...(githubStaffing.run ? {} : { disabledReason: githubStaffing.reason ?? "no enabled github-issue rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_ISSUE_POLL_MS),
+  log: (line) => console.error(line),
+});
+const jiraIdeaHealth = createResourceLoopHealth({
+  name: "jira-idea",
+  enabled: Boolean(jiraIdeas),
+  ...(jiraIdeas ? {} : { disabledReason: "no enabled jira-idea rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * JIRA_IDEA_POLL_MS),
+  log: (line) => console.error(line),
+});
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
 // /health sibling — see src/daemon/coverage.ts's own header for the full
 // rationale. Wired into two detectors so far (syncLabels's stalled check,
@@ -311,7 +329,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth]),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -339,8 +357,8 @@ const { app, mcp } = buildApp({
   // Linking needs both providers running: authorization reads both loops' latest matches.
   ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
 });
-app.listen(config.port);
-console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
+app.listen(listenOptions(config.port));
+console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${describeConfig(config)})`);
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
 // daemon's own /health `build` field serves (see `health` above) — never a
 // second derivation — so a journal window can be attributed to a BUILD, not
@@ -743,7 +761,8 @@ startGithubIssueLoop({
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
   onAdmitted: admissionController.recordSpawned,
-  log: (line) => console.error(`  ${line}`),
+  log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
+  onError: (e) => githubIssueHealth.recordError(e),
 });
 
 // The jira-idea rule loop: proven Product Discovery ideas only, its own
@@ -773,7 +792,8 @@ startJiraIdeaLoop({
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_IDEA),
   onAdmitted: admissionController.recordSpawned,
-  log: (line) => console.error(`  ${line}`),
+  log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
+  onError: (e) => jiraIdeaHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's

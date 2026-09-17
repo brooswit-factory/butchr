@@ -102,6 +102,25 @@ export interface HealthStatus {
    * daemon that never had the feature.
    */
   currency?: CurrencyReport;
+  /**
+   * Per resource type loop health for the github-issue and jira-idea loops —
+   * a sibling, not `components[]`, so a GitHub outage or a bad idea query
+   * never flips `ok` (and the 503 contract) that the Jira work loop owns.
+   * Each entry says whether its rules run, whether its polls are completing,
+   * and the last poll failure. Absent when the caller passes none.
+   */
+  resourceLoops?: ResourceLoopReport[];
+}
+
+export interface ResourceLoopReport extends ComponentHealth {
+  /** False when no rules of this type run (the loop still stops leftover agents). */
+  enabled: boolean;
+  /** Why the rules do not run, when known. */
+  disabledReason?: string;
+  /** Polls failed since the last success. */
+  consecutiveFailures: number;
+  /** The most recent poll failure, even if a success has followed it. */
+  lastError: { at: string; message: string } | null;
 }
 
 export interface LoopHealthOptions {
@@ -149,6 +168,7 @@ export const combineHealth = (
   coverage?: readonly DetectorCoverage[],
   admission?: AdmissionSnapshot,
   currency?: CurrencyReport,
+  resourceLoops?: readonly ResourceLoopHealth[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -158,6 +178,7 @@ export const combineHealth = (
     ...(coverage ? { coverage: [...coverage] } : {}),
     ...(admission ? { admission } : {}),
     ...(currency ? { currency } : {}),
+    ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
   };
 };
 
@@ -214,5 +235,48 @@ export function createLoopHealth(opts: LoopHealthOptions): LoopHealth {
     stop() {
       clearInterval(timer);
     },
+  };
+}
+
+export interface ResourceLoopHealthOptions extends LoopHealthOptions {
+  enabled: boolean;
+  disabledReason?: string;
+}
+
+export interface ResourceLoopHealth {
+  /** Call once a poll completes (runResourceLoop's onPollSuccess). */
+  recordSuccess(): void;
+  /** Call when a poll fails (runResourceLoop's onError). */
+  recordError(error: unknown): void;
+  report(): ResourceLoopReport;
+  stop(): void;
+}
+
+/** A `createLoopHealth` heartbeat plus the failure detail an operator needs to tell a broken resource type from a quiet one. */
+export function createResourceLoopHealth(opts: ResourceLoopHealthOptions): ResourceLoopHealth {
+  const now = opts.now ?? Date.now;
+  const heartbeat = createLoopHealth(opts);
+  let consecutiveFailures = 0;
+  let lastError: ResourceLoopReport["lastError"] = null;
+  return {
+    recordSuccess() {
+      consecutiveFailures = 0;
+      heartbeat.recordSuccess();
+    },
+    recordError(error) {
+      consecutiveFailures++;
+      lastError = { at: new Date(now()).toISOString(), message: String((error as Error)?.message ?? error) };
+    },
+    report() {
+      const [component] = heartbeat.status().components;
+      return {
+        ...component!,
+        enabled: opts.enabled,
+        ...(opts.disabledReason ? { disabledReason: opts.disabledReason } : {}),
+        consecutiveFailures,
+        lastError,
+      };
+    },
+    stop: () => heartbeat.stop(),
   };
 }

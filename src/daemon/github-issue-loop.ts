@@ -33,6 +33,10 @@ export interface GithubIssueLoopDeps {
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
+  /** Each completed poll, for /health. */
+  onPollSuccess?: () => void;
+  /** Each failed poll (after it is logged), for /health. */
+  onError?: (error: unknown) => void;
   /** Each complete poll's matches, for jira-idea rules that hear github-issue rules. */
   onMatches?: (matches: readonly GithubIssueMatch[]) => void;
 }
@@ -67,6 +71,10 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? GITHUB_ISSUE_POLL_MS,
-    onError: (e) => deps.log(`[github-issue] loop error: ${(e as Error)?.message ?? e}`),
+    onError: (e) => {
+      deps.log(`[github-issue] loop error: ${(e as Error)?.message ?? e}`);
+      deps.onError?.(e);
+    },
+    ...(deps.onPollSuccess ? { onPollSuccess: deps.onPollSuccess } : {}),
   });
 }

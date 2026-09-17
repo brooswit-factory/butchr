@@ -327,6 +327,26 @@ describe("two Jira providers in one daemon", () => {
     expect(logs.filter((l) => l.includes("loop error"))).toEqual([]);
   });
 
+  test("reports failed and completed polls to its health hooks", async () => {
+    const ideas = parseRules({ rules: [{ id: "ideas", resourceProvider: "jira-idea", query: "q", brief: "b" }] });
+    const { herd } = fakeHerd();
+    let fail = true;
+    const errors: string[] = [];
+    let successes = 0;
+    const stop = startJiraIdeaLoop({
+      rules: ideas, search: async () => { if (fail) throw new Error("Jira 500"); return []; }, herd, deliver: async () => {}, log: () => {}, intervalMs: 5,
+      onError: (e) => errors.push((e as Error).message), onPollSuccess: () => { successes++; },
+    });
+    await tick();
+    expect(errors.length).toBeGreaterThan(0);
+    expect(new Set(errors)).toEqual(new Set(["Jira 500"]));
+    expect(successes).toBe(0);
+    fail = false;
+    await tick();
+    stop();
+    expect(successes).toBeGreaterThan(0);
+  });
+
   test("no enabled jira-idea rule searches nothing, spawns nothing, and stops leftover idea agents only", async () => {
     let searched = 0;
     const onlyWork = parseRules({ rules: [

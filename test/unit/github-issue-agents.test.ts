@@ -242,6 +242,27 @@ describe("startup gating", () => {
     expect(ok.rules.map((r) => r.id)).toEqual(["bugs"]);
   });
 
+  test("reports failed and completed polls to its health hooks", async () => {
+    const { herd } = fakeHerd();
+    let fail = true;
+    const errors: string[] = [];
+    let successes = 0;
+    const stop = startGithubIssueLoop({
+      staffing: githubIssueStaffing(rules, { token: "t", orgs: ["acme"] }),
+      client: { searchAll: async () => { if (fail) throw new Error("GitHub 401"); return []; }, comments: async () => [] },
+      herd, deliver: async () => {}, log: () => {}, intervalMs: 5,
+      onError: (e) => errors.push((e as Error).message), onPollSuccess: () => { successes++; },
+    });
+    await tick();
+    expect(errors.length).toBeGreaterThan(0);
+    expect(new Set(errors)).toEqual(new Set(["GitHub 401"]));
+    expect(successes).toBe(0);
+    fail = false;
+    await tick();
+    stop();
+    expect(successes).toBeGreaterThan(0);
+  });
+
   test("a closed gate searches nothing, spawns nothing, and stops leftover github-issue agents only", async () => {
     const { herd, spawned, stopped, running } = fakeHerd([GH, JIRA, "BUTCHR-9"]);
     let searched = 0;

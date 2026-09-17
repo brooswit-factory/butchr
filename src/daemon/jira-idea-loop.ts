@@ -54,6 +54,10 @@ export interface JiraIdeaLoopDeps {
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
+  /** Each completed poll, for /health. */
+  onPollSuccess?: () => void;
+  /** Each failed poll (after it is logged), for /health. */
+  onError?: (error: unknown) => void;
 }
 
 /** The enabled `jira-idea` rules, in file order. */
@@ -95,6 +99,10 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? JIRA_IDEA_POLL_MS,
-    onError: (e) => deps.log(`[jira-idea] loop error: ${(e as Error)?.message ?? e}`),
+    onError: (e) => {
+      deps.log(`[jira-idea] loop error: ${(e as Error)?.message ?? e}`);
+      deps.onError?.(e);
+    },
+    ...(deps.onPollSuccess ? { onPollSuccess: deps.onPollSuccess } : {}),
   });
 }
