@@ -404,6 +404,7 @@ describe("interpolate", () => {
 });
 describe("buildWorkspace", () => {
   test("writes CLAUDE.md, interpolated brief.md, and mcp.json with x-issue", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
@@ -420,10 +421,15 @@ describe("buildWorkspace", () => {
       const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
       expect(mcp.mcpServers.butchr.headers["x-issue"]).toBe("KAN-9");
       expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
-    } finally { delete process.env.BUTCHR_WORKSPACES; }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("writes ENVIRONMENT.md, and CLAUDE.md is interpolated with the same ground truth", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
@@ -437,6 +443,10 @@ describe("buildWorkspace", () => {
       expect(claudeMd).toContain(hostname());
       expect(claudeMd).toContain("journalctl");
       expect(claudeMd).not.toContain("{{GROUND_TRUTH}}");
-    } finally { delete process.env.BUTCHR_WORKSPACES; }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
