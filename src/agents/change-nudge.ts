@@ -156,3 +156,13 @@ export function githubIssueNudge(resource: string, reason: NotifyReason | undefi
 export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Jira Product Discovery idea ${resource} ${reasonClause(reason)} — re-read it with jira_idea_get.`;
 }
+
+/**
+ * The push for a `jira-idea` agent about a GitHub issue its idea links to
+ * (src/rules/jira-idea-type.ts). Identity and reason only, never GitHub text;
+ * an idea agent has no GitHub tools, so it names the link-listing tool.
+ */
+export function jiraIdeaLinkedGithubNudge(idea: string, githubIssue: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
+  return `[butchr] GitHub issue ${githubIssue}, linked from your Jira Product Discovery idea ${idea}, ${clause} — see the idea's GitHub links with jira_idea_github_issues.`;
+}

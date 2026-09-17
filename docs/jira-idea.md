@@ -33,8 +33,48 @@ key now answers as a different key (a moved issue).
   fields plus `description`) and every comment, oldest first.
   `jira_idea_add_comment` posts one plain ADF paragraph through
   `POST /rest/api/3/issue/{key}/comment`.
-- No transitions, field edits, link reads or writes, labels, or detectors
-  that comment.
+- Linked GitHub issues (below): `jira_idea_github_issues` and change
+  notices for them.
+- No transitions, field edits, issue-link reads, any link writes, labels, or
+  detectors that comment.
+
+## GitHub issues linked to an idea (src/rules/jira-idea-type.ts)
+
+**How the link is stored: a Jira remote issue link** on the idea, the
+documented Jira Cloud way to point an issue at an item in another system
+(`GET /rest/api/3/issue/{issueIdOrKey}/remotelink`, schema
+`RemoteIssueLink`: `object.url` and `object.title` required; `globalId`,
+`relationship`, `application` optional). Reading needs Browse projects on
+the idea's project, and issue linking must be on for the site. JPD ideas are
+ordinary Jira issues over the platform REST API, so the endpoint applies to
+them. Insights are not used: their API is a separate app-level integration,
+and nothing here depends on it.
+
+Recognised: a link whose `object.url` is exactly
+`https://github.com/<owner>/<repo>/issues/<n>` (the REST `html_url` form; a
+query or fragment is ignored). Owner and repo are lowercased into the
+`github-issue` resource id. Pull requests, `www.github.com`, GitHub
+Enterprise hosts, other schemes and deeper paths are not issues. Title,
+relationship, `globalId` and `application` are free text anyone who can link
+the idea may set, and route nothing.
+
+Routing (read-only, one way): agent `R:IDEA` hears GitHub issue `G` when `R`
+lists a `github-issue` rule `C` in `inwardConnectionRules`, `C` currently
+matches `G`, and `IDEA` has a remote link to `G`. GitHub matches come from
+the `github-issue` loop's last complete poll, so ideas hear nothing unless
+that loop runs. Notices use GitHub's own change detection. A link appearing
+or disappearing is not a change.
+
+Not done, and kept separate until verified live:
+
+- **Creating links** (`POST .../remotelink`). An upsert by `globalId` needs
+  Link issues permission and an agreed `globalId` scheme. Nothing writes one.
+- **Creating ideas from GitHub issues.**
+- **The GitHub for Jira app's development panel.** It is not remote links
+  and has no documented read API for this, so its links are invisible here.
+- Whether remote links on ideas show in the JPD UI, and whether adding one
+  moves the idea's `updated`. Links are re-read every poll instead of
+  relying on that.
 
 ## Needs empirical proof before any code depends on it
 
@@ -61,7 +101,11 @@ recorded real response (redacted fixture) before it is modelled:
    idea is delivered by epics or work items (its name and inward/outward
    direction as `issuelinks` reports it), and whether it is visible to the
    Butchr account from both ends. Until that is shown, `jira-idea` rules take
-   no `relationships`, and no rule may reference a rule of another provider.
+   no `childRule`, their `inwardConnectionRules` name only `github-issue`
+   rules, and no other rule may reference a `jira-idea` rule.
+9. **Remote links on ideas.** A recorded `GET .../remotelink` for a real
+   idea carrying a GitHub issue link, to replace the schema-shaped fixture
+   in test/unit/jira-idea-github.test.ts.
 6. **Insights.** Whether insights are exposed through any documented REST
    endpoint at all, or only through the JPD UI or GraphQL.
 7. **Change detection coverage.** Whether edits to JPD-only fields (votes,

@@ -93,6 +93,24 @@ export interface IssueLink {
   status?: string;
 }
 
+/**
+ * One Jira remote issue link (`GET /rest/api/3/issue/{key}/remotelink`,
+ * schema `RemoteIssueLink`): a link from the issue to an item in another
+ * system. Jira requires only `object.url` and `object.title`; everything
+ * else is optional and free text set by whoever created the link.
+ */
+export interface JiraRemoteLink {
+  id: string;
+  /** The link's own global id, when its creator set one (the upsert key for `POST .../remotelink`). */
+  globalId: string | null;
+  /** Free-text relationship, e.g. "mentioned in" — not a controlled vocabulary. */
+  relationship: string | null;
+  url: string;
+  title: string;
+  /** `application.type`, when set by a registered rendering app. */
+  applicationType: string | null;
+}
+
 export interface JiraComment {
   id: string;
   body: string;      // ADF flattened to plain text

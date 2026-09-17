@@ -5,8 +5,8 @@
  *
  * Kept apart from the Jira rule type (./resource-type.ts) on purpose: the two
  * share the generic loop, agent keys and rule schema, and nothing else.
- * GitHub issues have no relationships here yet — no related set, no
- * cross-provider links.
+ * A `github-issue` rule has no relationships of its own; its matches are
+ * shared (`onMatches`) so `jira-idea` rules that list it can hear them.
  *
  * Notifications carry identity and a reason, never GitHub-authored text:
  * titles, bodies and comments can be written by anyone who can open an
@@ -36,6 +36,8 @@ export interface GithubIssueResourceDeps {
   /** True when a change to `resource` (now at `updated`) is `watcher`'s own write — e.g. its own comment — and not worth a nudge. */
   suppress?: (resource: string, updated: string, watcher: string) => boolean;
   log?: (line: string) => void;
+  /** Told each poll's complete match list — how `jira-idea` rules hear the issues they list (src/rules/jira-idea-type.ts). */
+  onMatches?: (matches: readonly GithubIssueMatch[]) => void;
 }
 
 /** True for exactly the herd ids this type owns. */
@@ -122,7 +124,14 @@ export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, 
 
 export function createGithubIssueResourceType(deps: GithubIssueResourceDeps): ResourceType<GithubIssueMatch> {
   return {
-    discovery: { idOf: (m) => m.agentKey, search: () => searchGithubIssueRules(deps) },
+    discovery: {
+      idOf: (m) => m.agentKey,
+      search: async () => {
+        const matches = await searchGithubIssueRules(deps);
+        deps.onMatches?.(matches);
+        return matches;
+      },
+    },
     activation: { verdictFor: () => "active" },
     eventRules: createGithubIssueEventRules(deps),
     spawnConfig: { specFor: specForGithubIssue },

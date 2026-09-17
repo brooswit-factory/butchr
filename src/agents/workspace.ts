@@ -174,7 +174,7 @@ export const GITHUB_ISSUE_TOOLS_NOTE =
 
 /** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
 export const JIRA_IDEA_TOOLS_NOTE =
-  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool and comment on it with `jira_idea_add_comment`; both act only on your own idea. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
+  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool list the GitHub issues its Jira remote links point at with `jira_idea_github_issues`, and comment on it with `jira_idea_add_comment`; all three act only on your own idea. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
 
 const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE };
 

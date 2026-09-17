@@ -141,9 +141,9 @@ describe("the jira-work / jira-idea type boundary", () => {
     });
   });
 
-  test("rules: jira-idea validates, but relationships on it or across to it are refused", () => {
+  test("rules: jira-idea validates, but a child rule on it or relationships across to it are refused", () => {
     expect(rules[1]).toMatchObject({ id: "ideas", resourceProvider: "jira-idea", query: "assignee = currentUser()" });
-    expect(() => parseRules({ rules: [{ id: "i", resourceProvider: "jira-idea", query: "q", brief: "b", relationships: { inwardConnectionRules: [] } }] })).toThrow("not supported for jira-idea rules");
+    expect(() => parseRules({ rules: [{ id: "i", resourceProvider: "jira-idea", query: "q", brief: "b", relationships: { childRule: "i" } }] })).toThrow("childRule is not supported for jira-idea rules");
     expect(() => parseRules({ rules: [
       { id: "epic", resourceProvider: "jira-work", query: "q", brief: "b", relationships: { childRule: "ideas" } },
       { id: "ideas", resourceProvider: "jira-idea", query: "q", brief: "b" },
@@ -234,7 +234,7 @@ describe("jira idea tools", () => {
 
     const jiraCalls: unknown[] = [];
     const jira = forJiraCallers({ jira_transition: { description: "d", input: {}, handler: (a) => { jiraCalls.push(a); return "ok"; } } }, () => {});
-    await expect(call(jira, "jira_transition", { key: "IDEA-1" }, ideaCaller)).rejects.toThrow("refusing a jira-idea agent — Jira and Confluence tools are for jira-work agents; use jira_idea_get and jira_idea_add_comment");
+    await expect(call(jira, "jira_transition", { key: "IDEA-1" }, ideaCaller)).rejects.toThrow("refusing a jira-idea agent — Jira and Confluence tools are for jira-work agents; use jira_idea_get, jira_idea_github_issues and jira_idea_add_comment");
     expect(jiraCalls).toEqual([]);
     expect(await call(jira, "jira_transition", { key: "WORK-1" }, workCaller)).toBe("ok");
 

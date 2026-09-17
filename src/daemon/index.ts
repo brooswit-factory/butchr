@@ -50,7 +50,8 @@ import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
 import { createGithubIssueClient } from "../resources/github-issue.js";
-import { githubIssueStaffing } from "../rules/github-issue-type.js";
+import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
+import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
 import { startGithubIssueLoop } from "./github-issue-loop.js";
 import { createJiraIdeaClient } from "../resources/jira-idea.js";
@@ -722,7 +723,10 @@ runResourceLoop(ruleResourceType, {
 // The github-issue rule loop: its own agents only, its own admission bucket
 // under the same host cap, and none of the Jira-writing detectors above.
 if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
+// Read by the jira-idea loop: the GitHub issues idea rules may hear. Empty while the GitHub loop is not running.
+let githubMatches: readonly GithubIssueMatch[] = [];
 startGithubIssueLoop({
+  onMatches: (matches) => { githubMatches = matches; },
   staffing: githubStaffing,
   client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
   herd,
@@ -740,6 +744,7 @@ startGithubIssueLoop({
 // The jira-idea rule loop: proven Product Discovery ideas only, its own
 // agents and admission bucket, and none of the work-item detectors above.
 if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
+if (!githubIssues && ideaRules.some((r) => r.relationships?.inwardConnectionRules?.length)) console.error("  WARNING: jira-idea rules list github-issue rules, but github-issue rules are not staffed; ideas hear no GitHub issues");
 startJiraIdeaLoop({
   rules,
   search: async (jql) => {
@@ -748,6 +753,11 @@ startJiraIdeaLoop({
     return issues;
   },
   comments: (key) => atlassian.comments(key),
+  ...(githubIssues && jiraIdeas ? {
+    githubMatches: () => githubMatches,
+    githubLinks: (key: string) => jiraIdeas.githubIssues(key),
+    githubComments: (ref: GithubIssueRef) => githubIssues.comments(ref),
+  } : {}),
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));

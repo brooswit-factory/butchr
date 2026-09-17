@@ -1,4 +1,4 @@
-import type { JiraIssue, IssueLink, JiraComment } from "./types.js";
+import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink } from "./types.js";
 
 /** One issue read by key, with its description flattened to plain text. */
 export interface JiraIssueDetail extends JiraIssue { description: string }
@@ -187,6 +187,23 @@ export class AtlassianClient {
     });
     if (!res.ok) throw new AtlassianHttpError(res.status, "POST", path, (await res.text()).slice(0, 200));
     return mapComment(await res.json());
+  }
+
+  /**
+   * Every remote issue link on a ticket, as Jira orders them — or a throw on
+   * an unexpected body, never a silently empty list. Read-only. Entries
+   * without the two fields Jira requires (`object.url`, `object.title`) are
+   * dropped. Needs Browse projects, and issue linking active on the site.
+   */
+  async remoteLinks(issueKey: string): Promise<JiraRemoteLink[]> {
+    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/remotelink`);
+    if (!Array.isArray(body)) throw new Error(`Jira remote links for ${issueKey} returned an unexpected body`);
+    const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+    return body.flatMap((l: any): JiraRemoteLink[] => {
+      const url = str(l?.object?.url), title = str(l?.object?.title);
+      if (url === null || title === null || (typeof l.id !== "number" && typeof l.id !== "string")) return [];
+      return [{ id: String(l.id), globalId: str(l.globalId), relationship: str(l.relationship), url, title, applicationType: str(l.application?.type) }];
+    });
   }
 
   /** Recent comments on a ticket, newest-first, ADF bodies flattened to plain text. */

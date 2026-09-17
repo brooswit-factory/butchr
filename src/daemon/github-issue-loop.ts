@@ -14,7 +14,7 @@ import { githubIssueNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { GithubIssueClient } from "../resources/github-issue.js";
 import type { NotifyReason } from "../resources/types.js";
-import { createGithubIssueResourceType, ownsGithubIssueAgent, type GithubIssueStaffing } from "../rules/github-issue-type.js";
+import { createGithubIssueResourceType, ownsGithubIssueAgent, type GithubIssueMatch, type GithubIssueStaffing } from "../rules/github-issue-type.js";
 import type { Stop } from "@brooswit/sundry";
 import { runResourceLoop } from "./loop.js";
 
@@ -33,6 +33,8 @@ export interface GithubIssueLoopDeps {
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
+  /** Each complete poll's matches, for jira-idea rules that hear github-issue rules. */
+  onMatches?: (matches: readonly GithubIssueMatch[]) => void;
 }
 
 /** Starts the loop when staffing allows it; otherwise logs why (if there is anything to say) and starts nothing. */
@@ -46,6 +48,7 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop | null {
     search: (query) => deps.client.searchAll(query),
     comments: (ref) => deps.client.comments(ref),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
+    ...(deps.onMatches ? { onMatches: deps.onMatches } : {}),
     log: deps.log,
   });
   return runResourceLoop(type, {

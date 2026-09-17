@@ -41,7 +41,11 @@ export interface AgentPreference { harness: AgentHarness; model?: string; effort
 export interface RuleRelationships {
   /** The rule a child created by this rule's agent is meant to match — "what a child is". One child rule per rule. */
   childRule?: string;
-  /** Rules whose agents may open an inward connection to this rule's agents. Static ids only; no patterns yet. */
+  /**
+   * Rules whose agents may open an inward connection to this rule's agents. Static ids only; no patterns yet.
+   * Same-provider for `jira-work` (over Jira `Relates` links). A `jira-idea` rule may list only
+   * `github-issue` rules (over the idea's Jira remote links to those issues); it takes no `childRule`.
+   */
   inwardConnectionRules?: string[];
 }
 
@@ -147,7 +151,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if (resourceProvider !== "jira-work" && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if (resourceProvider === "github-issue" && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
     rules.push({
@@ -159,7 +164,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
   });
   for (const { at, id, provider } of refs) {
     if (!seen.has(id)) errors.push(`${at} references unknown rule "${id}"`);
-    else if (providerOf.get(id) !== provider) errors.push(`${at} references rule "${id}" of another resource provider; cross-provider relationships are not supported`);
+    else if (provider === "jira-idea") {
+      if (providerOf.get(id) !== "github-issue") errors.push(`${at} references rule "${id}"; a jira-idea rule may only hear github-issue rules`);
+    } else if (providerOf.get(id) !== provider) errors.push(`${at} references rule "${id}" of another resource provider; cross-provider relationships are not supported`);
   }
   if (errors.length) throw new Error(errors.join("\n"));
   return rules;

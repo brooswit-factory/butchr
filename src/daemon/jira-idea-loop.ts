@@ -9,12 +9,19 @@
  * respawn and crash-loop comments — those write work-item conventions onto
  * the ticket. `ownsId` scopes reconciliation to `jira-idea` agents, and the
  * other loops scope themselves, so no loop can stop another's agents.
+ *
+ * Idea agents also hear the GitHub issues their ideas link to, when their
+ * rule lists the matching `github-issue` rule (src/rules/jira-idea-type.ts).
+ * The GitHub loop's matches are read, never searched again here.
  */
 import type { Herd } from "../agents/herd.js";
-import { jiraIdeaNudge } from "../agents/change-nudge.js";
+import { jiraIdeaLinkedGithubNudge, jiraIdeaNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { JiraComment, JiraIssue } from "../atlassian/types.js";
+import type { LinkedGithubIssue } from "../resources/jira-idea.js";
 import type { NotifyReason } from "../resources/types.js";
+import { decodeAgentKey } from "../rules/agent-key.js";
+import type { GithubIssueMatch, GithubIssueResourceDeps } from "../rules/github-issue-type.js";
 import { createJiraIdeaResourceType, ownsJiraIdeaAgent } from "../rules/jira-idea-type.js";
 import type { Rule } from "../rules/rules.js";
 import type { Stop } from "@brooswit/sundry";
@@ -30,6 +37,11 @@ export interface JiraIdeaLoopDeps {
   search: (jql: string) => Promise<JiraIssue[]>;
   /** Recent comments, newest first (AtlassianClient#comments) — for change reasons and echo checks. */
   comments?: (key: string) => Promise<readonly JiraComment[]>;
+  /** The github-issue loop's latest matches; omitted when that loop is not running, and then nothing is heard. */
+  githubMatches?: () => readonly GithubIssueMatch[];
+  /** The GitHub issues an idea's Jira remote links name (JiraIdeaClient#githubIssues). */
+  githubLinks?: (ideaKey: string) => Promise<readonly LinkedGithubIssue[]>;
+  githubComments?: GithubIssueResourceDeps["comments"];
   herd: Herd;
   /** Deliver one message to one agent (channel push and pane prompt). */
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
@@ -53,14 +65,21 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop | null {
     search: deps.search,
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
+    ...(deps.githubMatches ? { githubMatches: deps.githubMatches } : {}),
+    ...(deps.githubLinks ? { githubLinks: deps.githubLinks } : {}),
+    ...(deps.githubComments ? { githubComments: deps.githubComments } : {}),
     log: deps.log,
   });
   return runResourceLoop(type, {
     herd: deps.herd,
     ownsId: ownsJiraIdeaAgent,
-    notify: async (agent: string, _about: string, reason?: NotifyReason) => {
+    notify: async (agent: string, about: string, reason?: NotifyReason) => {
       const resource = resourceKeyOf(agent);
-      await deps.deliver(agent, resource, jiraIdeaNudge(resource, reason));
+      const heard = about === agent ? null : decodeAgentKey(about);
+      const msg = heard?.resourceProvider === "github-issue"
+        ? jiraIdeaLinkedGithubNudge(resource, heard.resourceId, reason)
+        : jiraIdeaNudge(resource, reason);
+      await deps.deliver(agent, resource, msg);
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
     ...(deps.admission ? { admission: deps.admission } : {}),

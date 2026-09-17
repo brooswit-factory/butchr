@@ -39,3 +39,19 @@ export function parseGithubIssueRef(id: string): GithubIssueRef | null {
   if (!isGithubOwner(owner) || !isGithubRepo(repo) || !NUMBER_RE.test(number)) return null;
   return { owner, repo, number: Number(number) };
 }
+
+/**
+ * The issue an `https://github.com/<owner>/<repo>/issues/<n>` web URL names,
+ * as the REST API's `html_url` spells it, or `null` for anything else: pull
+ * requests, other hosts (including `www.github.com` and GitHub Enterprise),
+ * other schemes, credentials or ports, and paths below the issue. A query or
+ * fragment (e.g. `#issuecomment-1`) still names the issue.
+ */
+export function githubIssueRefFromUrl(url: string): GithubIssueRef | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  if (u.protocol !== "https:" || u.hostname !== "github.com" || u.port || u.username || u.password) return null;
+  const m = /^\/([^/]+)\/([^/]+)\/issues\/([^/]+)\/?$/.exec(u.pathname);
+  if (!m) return null;
+  return parseGithubIssueRef(`${m[1]!.toLowerCase()}/${m[2]!.toLowerCase()}#${m[3]}`);
+}
