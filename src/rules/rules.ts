@@ -8,9 +8,9 @@
  * in its brief and in which rule its children match. Each matching resource
  * gets its own agent per rule, so several rules may cover one resource.
  *
- * PURE AND UNWIRED. Nothing in the daemon reads this module yet — loading
- * rules here changes no runtime behaviour. The only I/O is the injectable
- * `read` in `loadRules`, mirroring `loadConfig`'s `readFile` seam.
+ * Pure apart from the injectable `read` in `loadRules`, mirroring
+ * `loadConfig`'s `readFile` seam. The daemon loads rules once at startup
+ * and runs them through `./resource-type.ts`.
  *
  * Rules live in a JSON file OUTSIDE the repo: `BUTCHR_RULES_FILE` when set,
  * else `$XDG_CONFIG_HOME/butchr/rules.json`, else
@@ -22,16 +22,10 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isIssueKey } from "../resources/id.js";
 import { DEFAULT_RULES_DOCUMENT } from "./defaults.js";
+import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
-/**
- * One provider per resource TYPE, not per vendor: Jira work items today;
- * Product Discovery ideas, GitHub issues, Zendesk tickets would each be
- * their own provider later. Only providers with an adapter are listed.
- */
-export const RESOURCE_PROVIDERS = ["jira-work"] as const;
-export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
+export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /** Agent harnesses Drovr can launch. */
 export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];
@@ -66,12 +60,6 @@ export interface Rule {
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
 }
-
-/** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
-const RULE_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-export const RULE_ID_MAX = 64;
-
-export const isRuleId = (id: string): boolean => id.length <= RULE_ID_MAX && RULE_ID_RE.test(id);
 
 const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "agentPreferences", "relationships"]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
@@ -198,47 +186,4 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   return { path, origin: "file", rules: parseRules(doc, path) };
 }
 
-/**
- * Agent keys. An agent is (resource provider, rule id, provider-native
- * resource id) — never the resource alone, since several rules may match it:
- *
- *   <resourceProvider>:<ruleId>:<resourceId>     e.g. jira-work:triage:BUTCHR-12
- *
- * Each component is `encodeURIComponent`-escaped, which always escapes `:`,
- * so the key splits back into exactly one tuple. Decoding also requires the
- * key to be in canonical encoding (re-encoding reproduces it), so no two
- * distinct strings decode to the same tuple either: the codec is a bijection
- * between valid tuples and valid keys. A bare issue key contains no `:` and
- * never decodes. Native ids are escaped rather than charset-restricted so a
- * future provider's ids (`owner/repo#12`) need no codec change.
- */
-export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: string; resourceId: string }
-
-/** Provider-native resource id shape. `jira-work`: an issue key (`PROJ-1`); project keys are not resources. */
-export function isResourceId(provider: ResourceProvider, id: string): boolean {
-  switch (provider) {
-    case "jira-work": return isIssueKey(id);
-  }
-}
-
-const SEP = ":";
-const joinKey = (p: AgentKeyParts): string => [p.resourceProvider, p.ruleId, p.resourceId].map(encodeURIComponent).join(SEP);
-
-export function encodeAgentKey(parts: AgentKeyParts): string {
-  if (!oneOf(RESOURCE_PROVIDERS, parts.resourceProvider)) throw new Error(`invalid resource provider: ${JSON.stringify(parts.resourceProvider)}`);
-  if (!isRuleId(parts.ruleId)) throw new Error(`invalid rule id: ${JSON.stringify(parts.ruleId)}`);
-  if (!isResourceId(parts.resourceProvider, parts.resourceId)) throw new Error(`invalid ${parts.resourceProvider} resource id: ${JSON.stringify(parts.resourceId)}`);
-  return joinKey(parts);
-}
-
-/** Inverse of `encodeAgentKey`; `null` for anything it could not have produced. */
-export function decodeAgentKey(key: string): AgentKeyParts | null {
-  const raw = key.split(SEP);
-  if (raw.length !== 3) return null;
-  let decoded: string[];
-  try { decoded = raw.map(decodeURIComponent); } catch { return null; }
-  const [resourceProvider, ruleId, resourceId] = decoded as [string, string, string];
-  if (!oneOf(RESOURCE_PROVIDERS, resourceProvider) || !isRuleId(ruleId) || !isResourceId(resourceProvider, resourceId)) return null;
-  const parts = { resourceProvider, ruleId, resourceId };
-  return joinKey(parts) === key ? parts : null;
-}
+export { decodeAgentKey, encodeAgentKey, isResourceId, type AgentKeyParts } from "./agent-key.js";

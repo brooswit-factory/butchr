@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, findWorkers, ensureDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
@@ -7,7 +7,8 @@ import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
-import { briefFor, interpolate, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
+import { ruleBriefHeader, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
+import { decodeAgentKey } from "../rules/agent-key.js";
 import { ADMISSION_PREFIX, AGENT_PREFIX } from "../labels/plan.js";
 import { Refusal } from "./outcome.js";
 
@@ -1937,32 +1938,41 @@ export interface CorrectWorkerResult {
 
 /**
  * BUTCHR-169: `WORKSPACE_REGISTRY.SUMMARY`'s declared withdrawal mechanism
- * (src/workspace/registry.ts) — best-effort regenerates `brief.md` for any
- * workspace already built for `spec.key`, from the SAME `briefFor`/
- * `interpolate` machinery `buildWorkspace` itself uses (src/agents/
- * workspace.ts), so the file on disk matches exactly what a fresh spawn
- * would have written with the corrected summary. Deliberately does NOT
- * touch `CLAUDE.md` — it carries no `{{SUMMARY}}` placeholder (see
- * `WORKSPACE_REGISTRY.SUMMARY`'s own `appliedBy`), and rewriting it would
- * silently reintroduce the exact false claim this ticket fixed elsewhere.
- * NEVER THROWS: a workspace that was never built (or already cleaned up)
- * for `spec.key` is the common, expected case, not an error — reported as
- * "no-workspace-on-disk". A write failure (permission, disk) is caught and
- * reported as "failed" with its message, NEVER re-thrown — by the time this
- * runs, `correctWorker`'s Jira edit has already succeeded and must not be
- * lost over a filesystem problem (DoD 6 / `retireOrphanHeader`'s precedent).
- * Does NOT reach a RUNNING agent's already-loaded context — no file rewrite
- * can — `correctWorker`'s own returned `message` names that gap explicitly.
+ * (src/workspace/registry.ts) — best-effort rewrites the summary snapshotted
+ * into `brief.md` for every RULE-ENGINE workspace already built for
+ * `spec.key` (`<root>/jira-work/<rule>/<KEY>`, one per rule that matched it).
+ * A rule brief snapshots the summary in its header line only
+ * (`ruleBriefHeader`, src/agents/workspace.ts), so only that line is
+ * replaced — the rule's own brief text below it is never regenerated.
+ * LEGACY `<root>/<KEY>` workspaces from the pre-rules issue tier are never
+ * read or written: they are preserved exactly as they were left.
+ * Deliberately does NOT touch `CLAUDE.md` — it carries no summary.
+ * NEVER THROWS: no rule workspace for `spec.key` is the common, expected
+ * case, reported as "no-workspace-on-disk". A write failure (permission,
+ * disk) is caught and reported as "failed" with its message, NEVER
+ * re-thrown — by the time this runs, `correctWorker`'s Jira edit has already
+ * succeeded and must not be lost over a filesystem problem (DoD 6 /
+ * `retireOrphanHeader`'s precedent). Does NOT reach a RUNNING agent's
+ * already-loaded context — no file rewrite can — `correctWorker`'s own
+ * returned `message` names that gap explicitly.
  */
 function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace-on-disk" | "rewritten" | "failed"; error?: string } {
-  const briefPath = join(workspaceRoot(), spec.key, "brief.md");
-  if (!existsSync(briefPath)) return { outcome: "no-workspace-on-disk" };
-  try {
-    writeFileSync(briefPath, interpolate(briefFor(spec.issuetype), spec));
-    return { outcome: "rewritten" };
-  } catch (e) {
-    return { outcome: "failed", error: (e as Error).message };
+  const providerDir = join(workspaceRoot(), "jira-work");
+  let ruleIds: string[];
+  try { ruleIds = readdirSync(providerDir); } catch { return { outcome: "no-workspace-on-disk" }; }
+  let rewrote = false;
+  for (const ruleId of ruleIds) {
+    const briefPath = join(workspaceDirFor(`jira-work:${ruleId}:${spec.key}`), "brief.md");
+    if (!decodeAgentKey(`jira-work:${ruleId}:${spec.key}`) || !existsSync(briefPath)) continue;
+    try {
+      const [, ...rest] = readFileSync(briefPath, "utf8").split("\n");
+      writeFileSync(briefPath, [ruleBriefHeader(ruleId, spec.key, spec.summary), ...rest].join("\n"));
+      rewrote = true;
+    } catch (e) {
+      return { outcome: "failed", error: (e as Error).message };
+    }
   }
+  return { outcome: rewrote ? "rewritten" : "no-workspace-on-disk" };
 }
 
 /**
@@ -2155,9 +2165,9 @@ export async function correctWorker(ops: AtlassianOps, callerKey: string, worker
     summaryRewrite === undefined
       ? ""
       : summaryRewrite.outcome === "rewritten"
-        ? ` brief.md on ${workerKey}'s on-disk workspace was regenerated with the new summary — see WORKSPACE_REGISTRY.SUMMARY (src/workspace/registry.ts).`
+        ? ` brief.md on ${workerKey}'s on-disk rule workspace(s) was updated with the new summary — see WORKSPACE_REGISTRY.SUMMARY (src/workspace/registry.ts).`
         : summaryRewrite.outcome === "no-workspace-on-disk"
-          ? ` No on-disk workspace exists for ${workerKey} (never spawned, or already cleaned up) — nothing to rewrite.`
+          ? ` No on-disk rule workspace exists for ${workerKey} (never spawned, already cleaned up, or only a legacy workspace, which is never modified) — nothing to rewrite.`
           : ` brief.md rewrite FAILED (${summaryRewrite.error}) — Jira's correction above already landed and is UNAFFECTED; the on-disk brief.md is now stale. Safe to retry (this call is idempotent for the rewrite step) or fix brief.md by hand.`;
 
   const message = correctedSummary

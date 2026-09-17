@@ -5,8 +5,8 @@ Agents support selectable Claude (default) and Codex providers. See
 
 The software factory, rewritten. A single local daemon that:
 
-1. **Watches your Jira** — the tickets assigned to the account that owns the API token, and whatever those tickets implement (task→story→epic; the Jira parent field is membership only).
-2. **Runs an agent per active ticket** — when a ticket is In Progress or In Review, it spins up a [herdr](https://herdr.dev) agent via [`@brooswit/drovr`](https://github.com/brooswit-factory/drovr), which corrects Herdr status reports.
+1. **Runs your resource-agent rules** — each rule is a JQL query plus a brief and agent preferences, read from `BUTCHR_RULES_FILE` or `$XDG_CONFIG_HOME/butchr/rules.json` (built-in example rules when that file is absent; an empty `rules` array staffs nothing). See `src/rules/rules.ts` for the schema.
+2. **Runs one agent per (rule, matched ticket)** — while a rule's query returns a ticket, a [herdr](https://herdr.dev) agent works it via [`@brooswit/drovr`](https://github.com/brooswit-factory/drovr), in `<workspace root>/jira-work/<rule>/<ISSUE>`; when the query stops returning it, the agent is stopped. Two rules matching one ticket run two independent agents. Workspaces from before rules (`<workspace root>/<ISSUE>`) are left untouched and never adopted.
 3. **Pushes updates to those agents** — over MCP ([`@brooswit/thatch`](https://www.npmjs.com/package/@brooswit/thatch)): agents connect to the daemon identifying which issue they work on, and the daemon channels ticket/comment/link changes up the Implements chain to the right one.
 4. **Shows a live view** — a webapp listing the active agents; click one and butchr opens a terminal window running `herdr agent attach` on it, so you drop straight into that agent's shell. No browser extension, no embedded terminal — terminals are real herdr terminals.
 
@@ -16,11 +16,11 @@ Change detection is [`@brooswit/sundry`](https://www.npmjs.com/package/@brooswit
 
 ```
 one Elysia process
-├── /mcp          agents connect here (thatch), identifying via x-issue header
+├── /mcp          agents connect here (thatch), identifying via x-issue (ticket) + x-butchr-agent (rule agent) headers
 ├── /agents,/health   read-only live view
 └── loops (landing incrementally)
-    ├── jira-watch    sundry.watch over `assignee = currentUser() AND updated >= cursor`
-    ├── reconcile     desired (In Progress/In Review) ↔ herdr agents: spawn / stop
+    ├── rules         every enabled rule's JQL → one desired agent per (rule, ticket)
+    ├── reconcile     desired rule agents ↔ herdr agents: spawn / stop
     └── notify        ticket/comment/link change → thatch channel → the agent for whatever that ticket implements
 ```
 

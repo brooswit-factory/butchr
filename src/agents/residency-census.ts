@@ -1,4 +1,4 @@
-import { join, dirname, basename } from "node:path";
+import { agentIdOfWorkspacePath, workspaceDirFor } from "./workspace.js";
 import type { results } from "@brooswit/drovr";
 
 /**
@@ -106,7 +106,7 @@ export type ResidencyVerdict = "resident" | "vacant" | "unknown";
  * to add.
  */
 export function panesFor(issue: string, panes: readonly results.PaneInfo[], root: string): readonly results.PaneInfo[] {
-  const expectedCwd = join(root, issue);
+  const expectedCwd = workspaceDirFor(issue, root);
   return panes.filter((p) => p.cwd === expectedCwd);
 }
 
@@ -123,8 +123,8 @@ export function panesFor(issue: string, panes: readonly results.PaneInfo[], root
 export function groupOwnedPanes(panes: readonly results.PaneInfo[], root: string): ReadonlyMap<string, readonly results.PaneInfo[]> {
   const out = new Map<string, results.PaneInfo[]>();
   for (const p of panes) {
-    if (!p.cwd || dirname(p.cwd) !== root) continue;
-    const issue = basename(p.cwd);
+    const issue = agentIdOfWorkspacePath(p.cwd, root);
+    if (!issue) continue;
     const arr = out.get(issue);
     if (arr) arr.push(p);
     else out.set(issue, [p]);

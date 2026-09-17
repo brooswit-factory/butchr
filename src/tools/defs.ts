@@ -227,9 +227,10 @@ export function atlassianTools(
   standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
-    log(`  [tools] ${c.headers["x-issue"] ?? "?"} → ${what}`);
+    log(`  [tools] ${c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "?"} → ${what}`);
   const noted = (c: { headers: Record<string, string> }, keys: readonly string[]) => {
-    const writer = c.headers["x-issue"];
+    // A rule-engine agent's own echo is suppressed for IT, not for every agent sharing the ticket.
+    const writer = c.headers["x-butchr-agent"] ?? c.headers["x-issue"];
     if (writer) onWrite?.(keys, writer);
   };
   const tools: Record<string, ToolDef<any>> = {

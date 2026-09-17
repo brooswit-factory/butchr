@@ -9,6 +9,8 @@ export interface BridgeOptions {
   requestTimeoutMs?: number;
   cleanupTimeoutMs?: number;
   onError?: (error: Error) => void;
+  /** Rule-engine agent key, sent as `x-butchr-agent` alongside the issue identity. */
+  agent?: string;
 }
 
 /** Relay only: Thatch owns initialization, discovery, and the entire tool surface. */
@@ -16,6 +18,9 @@ export async function startBridge(url: URL, identity: string, options: BridgeOpt
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("MCP bridge requires an HTTP URL");
   if (!identity.trim() || identity !== identity.trim() || /[^\x21-\x7e]/.test(identity)) {
     throw new Error("MCP bridge requires a nonempty issue identity without whitespace");
+  }
+  if (options.agent !== undefined && (!options.agent || /[^\x21-\x7e]/.test(options.agent))) {
+    throw new Error("MCP bridge requires a nonempty agent identity without whitespace");
   }
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 1_000;
@@ -28,7 +33,7 @@ export async function startBridge(url: URL, identity: string, options: BridgeOpt
   const stdout = options.stdout ?? process.stdout;
   const stdio = new StdioServerTransport(stdin, stdout);
   const http = new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: { headers: { "x-issue": identity, "x-butchr-provider": "agy" } },
+    requestInit: { headers: { "x-issue": identity, ...(options.agent ? { "x-butchr-agent": options.agent } : {}), "x-butchr-provider": "agy" } },
     reconnectionOptions: {
       maxRetries: 0, initialReconnectionDelay: 1_000,
       maxReconnectionDelay: 1_000, reconnectionDelayGrowFactor: 1,

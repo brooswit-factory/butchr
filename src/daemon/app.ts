@@ -34,6 +34,16 @@ export function buildApp(view: ViewDeps, tools: Record<string, ToolDef<any>> = {
   return { app, mcp };
 }
 
+/**
+ * Push an update to one rule-engine agent: the connection whose
+ * `x-butchr-agent` is `agentKey`. Several agents may share a ticket
+ * (`x-issue`), so matching on the ticket would hand each of them every other
+ * agent's nudges too.
+ */
+export function notifyAgent(mcp: ReturnType<typeof buildApp>["mcp"], agentKey: string, issueKey: string, content: string) {
+  return mcp.sendAll({ content, meta: { issue: issueKey } }, { where: (c) => c.headers["x-butchr-agent"] === agentKey && !["codex", "agy"].includes(c.headers["x-butchr-provider"] ?? "") });
+}
+
 /** Push an update to whichever agent(s) say they are working `issueKey`. */
 export function notifyIssue(mcp: ReturnType<typeof buildApp>["mcp"], issueKey: string, content: string) {
   return mcp.sendAll({ content, meta: { issue: issueKey } }, { where: (c) => c.headers["x-issue"] === issueKey && !["codex", "agy"].includes(c.headers["x-butchr-provider"] ?? "") });

@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, issueOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
@@ -32,10 +32,10 @@ describe("workspace identity", () => {
   });
   test("derives identity only from a direct child of the configured workspace root", () => {
     const root = workspaceRoot();
-    expect(issueOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
-    expect(issueOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
-    expect(issueOfWorkspacePath("/tmp/KAN-42")).toBeNull();
-    expect(issueOfWorkspacePath(null)).toBeNull();
+    expect(agentIdOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
+    expect(agentIdOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
+    expect(agentIdOfWorkspacePath("/tmp/KAN-42")).toBeNull();
+    expect(agentIdOfWorkspacePath(null)).toBeNull();
   });
 });
 

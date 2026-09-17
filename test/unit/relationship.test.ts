@@ -1018,38 +1018,53 @@ describe("correctWorker", () => {
       addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
       const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
       expect(result.summaryWorkspaceRewrite).toBe("no-workspace-on-disk");
-      expect(result.message).toContain("No on-disk workspace exists for BUTCHR-2");
+      expect(result.message).toContain("No on-disk rule workspace exists for BUTCHR-2");
     });
 
-    test("an existing workspace's brief.md is regenerated with the new summary, using the SAME briefFor/interpolate machinery buildWorkspace uses", async () => {
+    test("a LEGACY <root>/<KEY> workspace is never modified: its brief.md stays byte-identical and the outcome is no-workspace-on-disk", async () => {
       const { ops, addIssue } = makeWorld();
       addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
       addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
       const dir = join(workspacesRoot, "BUTCHR-2");
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "brief.md"), "# Task agent — BUTCHR-2: old summary\n\nstale content from a previous build\n");
-      writeFileSync(join(dir, "CLAUDE.md"), "unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+
+      const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
+
+      expect(result.summaryWorkspaceRewrite).toBe("no-workspace-on-disk");
+      expect(result.message).toContain("legacy workspace, which is never modified");
+      expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe("# Task agent — BUTCHR-2: old summary\n\nstale content from a previous build\n");
+    });
+
+    test("every rule workspace for the worker gets its summary header rewritten; the rule's brief body and CLAUDE.md are left alone", async () => {
+      const { ops, addIssue } = makeWorld();
+      addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
+      addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
+      const dirs = ["task", "review"].map((rule) => join(workspacesRoot, "jira-work", rule, "BUTCHR-2"));
+      for (const dir of dirs) {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "brief.md"), "# x agent — BUTCHR-2: old summary\n\nrule body stays\n");
+        writeFileSync(join(dir, "CLAUDE.md"), "unrelated");
+      }
+      mkdirSync(join(workspacesRoot, "jira-work", "task", "BUTCHR-3"), { recursive: true });
+      writeFileSync(join(workspacesRoot, "jira-work", "task", "BUTCHR-3", "brief.md"), "other ticket\n");
 
       const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
 
       expect(result.summaryWorkspaceRewrite).toBe("rewritten");
-      expect(result.message).toContain("brief.md on BUTCHR-2's on-disk workspace was regenerated");
-      const rewritten = readFileSync(join(dir, "brief.md"), "utf8");
-      expect(rewritten).toContain("new summary");
-      expect(rewritten).not.toContain("old summary");
-      expect(rewritten).toContain("BUTCHR-2");
-      // it re-derived the boss from the SAME issue fetch (bossKey: "BUTCHR-1"), not a stale/guessed value
-      expect(rewritten).toContain("BUTCHR-1");
-      // CLAUDE.md is untouched — it carries no {{SUMMARY}} placeholder (see WORKSPACE_REGISTRY.SUMMARY)
-      expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toBe("unrelated — must be left alone, brief.md has no {{SUMMARY}} sibling there");
+      expect(result.message).toContain("rule workspace(s) was updated");
+      expect(readFileSync(join(dirs[0]!, "brief.md"), "utf8")).toBe("# task agent — BUTCHR-2: new summary\n\nrule body stays\n");
+      expect(readFileSync(join(dirs[1]!, "brief.md"), "utf8")).toBe("# review agent — BUTCHR-2: new summary\n\nrule body stays\n");
+      expect(readFileSync(join(dirs[0]!, "CLAUDE.md"), "utf8")).toBe("unrelated");
+      expect(readFileSync(join(workspacesRoot, "jira-work", "task", "BUTCHR-3", "brief.md"), "utf8")).toBe("other ticket\n");
     });
 
     test("a rewrite failure is reported, never thrown — the Jira correction (which already landed) is NOT lost", async () => {
       const { ops, addIssue } = makeWorld();
       addIssue("BUTCHR-1", { issuetype: "Story", project: "BUTCHR" });
       addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1", summary: "old summary" });
-      // A DIRECTORY at the exact path brief.md would be written to — writeFileSync throws EISDIR, deterministic across platforms.
-      mkdirSync(join(workspacesRoot, "BUTCHR-2", "brief.md"), { recursive: true });
+      // A DIRECTORY at the exact path brief.md would be read from — readFileSync throws EISDIR, deterministic across platforms.
+      mkdirSync(join(workspacesRoot, "jira-work", "task", "BUTCHR-2", "brief.md"), { recursive: true });
 
       const result = await correctWorker(ops, "BUTCHR-1", "BUTCHR-2", { summary: "new summary", why: "reason" });
 
