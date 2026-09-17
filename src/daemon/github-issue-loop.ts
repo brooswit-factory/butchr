@@ -37,14 +37,17 @@ export interface GithubIssueLoopDeps {
   onMatches?: (matches: readonly GithubIssueMatch[]) => void;
 }
 
-/** Starts the loop when staffing allows it; otherwise logs why (if there is anything to say) and starts nothing. */
-export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop | null {
-  if (!deps.staffing.run) {
-    if (deps.staffing.reason) deps.log(`WARNING: ${deps.staffing.reason}`);
-    return null;
-  }
+/**
+ * Starts the loop. When staffing does not allow github-issue rules it logs
+ * why (if there is anything to say) and runs with NO rules: nothing is
+ * searched or spawned, but `github-issue` agents left over from an earlier
+ * run (a rule since disabled, GitHub config since removed) are stopped
+ * rather than left running with no tools and no loop to stop them.
+ */
+export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
+  if (!deps.staffing.run && deps.staffing.reason) deps.log(`WARNING: ${deps.staffing.reason}`);
   const type = createGithubIssueResourceType({
-    rules: deps.staffing.rules,
+    rules: deps.staffing.run ? deps.staffing.rules : [],
     search: (query) => deps.client.searchAll(query),
     comments: (ref) => deps.client.comments(ref),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),

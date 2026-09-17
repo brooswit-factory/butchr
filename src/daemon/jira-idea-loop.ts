@@ -59,10 +59,14 @@ export interface JiraIdeaLoopDeps {
 /** The enabled `jira-idea` rules, in file order. */
 export const jiraIdeaRules = (rules: readonly Rule[]): Rule[] => rules.filter((r) => r.enabled && r.resourceProvider === "jira-idea");
 
-/** Starts the loop when any `jira-idea` rule is enabled; otherwise starts nothing. */
-export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop | null {
+/**
+ * Starts the loop. With no enabled `jira-idea` rule it searches nothing and
+ * spawns nothing, but still stops `jira-idea` agents left over from an
+ * earlier run (a rule since disabled or removed) — never leaves them running
+ * with no tools and no loop to stop them.
+ */
+export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
   const rules = jiraIdeaRules(deps.rules);
-  if (!rules.length) return null;
   const type = createJiraIdeaResourceType({
     rules,
     search: deps.search,

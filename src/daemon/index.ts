@@ -726,7 +726,7 @@ runResourceLoop(ruleResourceType, {
 // The github-issue rule loop: its own agents only, its own admission bucket
 // under the same host cap, and none of the Jira-writing detectors above.
 if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
-// Read by the jira-idea loop: the GitHub issues idea rules may hear. Empty while the GitHub loop is not running.
+// Read by the jira-idea loop: the GitHub issues idea rules may hear. Empty while github-issue rules are not staffed.
 let githubMatches: readonly GithubIssueMatch[] = [];
 // Read by the link tools: the ideas jira-idea rules currently match. Empty until the idea loop completes a poll.
 let ideaMatches: readonly RuleMatch[] = [];

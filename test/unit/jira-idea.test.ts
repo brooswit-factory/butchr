@@ -171,6 +171,7 @@ describe("jira-idea MCP identity and workspace", () => {
     const dir = buildWorkspace(ideaSpec, "http://localhost:7717/mcp", "claude");
     expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers.butchr.headers).toEqual({ "x-butchr-agent": IDEA });
     expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe(`# ideas agent — IDEA-1: Offline mode\n\n${JIRA_IDEA_TOOLS_NOTE}\n\nshape it\n`);
+    for (const tool of ["jira_idea_get", "jira_idea_github_issues", "jira_idea_add_comment", "jira_idea_link_github_issue"]) expect(JIRA_IDEA_TOOLS_NOTE).toContain(`\`${tool}\``);
     const agy = buildWorkspace(ideaSpec, "http://localhost:7717/mcp", "agy");
     expect(bridgeWorkspace(root, agy)).toEqual({ url: new URL("http://localhost:7717/mcp"), agent: IDEA });
     writeFileSync(join(agy, ".butchr-agy.json"), JSON.stringify({ issue: "IDEA-1", agent: IDEA, resource: "IDEA-1", mcpUrl: "http://localhost:7717/mcp" }));
@@ -326,15 +327,18 @@ describe("two Jira providers in one daemon", () => {
     expect(logs.filter((l) => l.includes("loop error"))).toEqual([]);
   });
 
-  test("no enabled jira-idea rule starts no loop and searches nothing", async () => {
+  test("no enabled jira-idea rule searches nothing, spawns nothing, and stops leftover idea agents only", async () => {
     let searched = 0;
     const onlyWork = parseRules({ rules: [
       { id: "task", resourceProvider: "jira-work", query: "q", brief: "b" },
       { id: "ideas", enabled: false, resourceProvider: "jira-idea", query: "q", brief: "b" },
     ] });
-    const stop = startJiraIdeaLoop({ rules: onlyWork, search: async () => { searched++; return [idea("IDEA-1")]; }, herd: fakeHerd().herd, deliver: async () => {}, log: () => {}, intervalMs: 5 });
+    const { herd, spawned, stopped, running } = fakeHerd([IDEA, WORK, "WORK-9"]);
+    const stop = startJiraIdeaLoop({ rules: onlyWork, search: async () => { searched++; return [idea("IDEA-1")]; }, herd, deliver: async () => {}, log: () => {}, intervalMs: 5 });
     await tick();
-    expect([stop, searched]).toEqual([null, 0]);
+    stop();
+    expect([searched, spawned, stopped]).toEqual([0, [], [IDEA]]);
+    expect(new Set(running)).toEqual(new Set([WORK, "WORK-9"]));
   });
 
   test("nudge text for an idea without a determinable reason", () => {

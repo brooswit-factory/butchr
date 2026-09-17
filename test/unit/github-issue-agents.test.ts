@@ -108,6 +108,7 @@ describe("provider-aware MCP identity", () => {
     const dir = buildWorkspace(ghSpec, "http://localhost:7717/mcp", "claude");
     expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers.butchr.headers).toEqual({ "x-butchr-agent": GH });
     expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe(`# bugs agent — acme/w#12: Crash on save\n\n${GITHUB_ISSUE_TOOLS_NOTE}\n\nfix it\n`);
+    for (const tool of ["github_get_issue", "github_add_comment", "github_link_jira_idea"]) expect(GITHUB_ISSUE_TOOLS_NOTE).toContain(`\`${tool}\``);
     const jiraDir = buildWorkspace(jiraSpec, "http://localhost:7717/mcp", "claude");
     expect(readFileSync(join(jiraDir, "brief.md"), "utf8")).toBe("# task agent — BUTCHR-1: s\n\ndo it\n");
   });
@@ -241,8 +242,8 @@ describe("startup gating", () => {
     expect(ok.rules.map((r) => r.id)).toEqual(["bugs"]);
   });
 
-  test("a closed gate starts no loop, searches nothing and spawns nothing", async () => {
-    const { herd, spawned } = fakeHerd();
+  test("a closed gate searches nothing, spawns nothing, and stops leftover github-issue agents only", async () => {
+    const { herd, spawned, stopped, running } = fakeHerd([GH, JIRA, "BUTCHR-9"]);
     let searched = 0;
     const logs: string[] = [];
     const stop = startGithubIssueLoop({
@@ -251,11 +252,19 @@ describe("startup gating", () => {
       herd, deliver: async () => {}, log: (l) => logs.push(l), intervalMs: 5,
     });
     await tick();
-    expect(stop).toBeNull();
-    expect([searched, spawned]).toEqual([0, []]);
-    expect(logs).toEqual([expect.stringContaining("WARNING: github-issue rules not staffed (bugs)")]);
-    expect(startGithubIssueLoop({ staffing: githubIssueStaffing(onlyJira, undefined), client: { searchAll: async () => [], comments: async () => [] }, herd, deliver: async () => {}, log: (l) => logs.push(l) })).toBeNull();
-    expect(logs.length).toBe(1);
+    stop();
+    expect([searched, spawned, stopped]).toEqual([0, [], [GH]]);
+    expect(new Set(running)).toEqual(new Set([JIRA, "BUTCHR-9"]));
+    expect(logs.filter((l) => l.startsWith("WARNING"))).toEqual([expect.stringContaining("WARNING: github-issue rules not staffed (bugs)")]);
+
+    // No github-issue rule at all: nothing to warn about, and a leftover agent (its rule since removed) is still stopped.
+    const leftover = fakeHerd([GH]);
+    const logs2: string[] = [];
+    const stop2 = startGithubIssueLoop({ staffing: githubIssueStaffing(onlyJira, undefined), client: { searchAll: async () => { searched++; return []; }, comments: async () => [] }, herd: leftover.herd, deliver: async () => {}, log: (l) => logs2.push(l), intervalMs: 5 });
+    await tick();
+    stop2();
+    expect([searched, leftover.spawned, leftover.stopped]).toEqual([0, [], [GH]]);
+    expect(logs2.filter((l) => l.startsWith("WARNING"))).toEqual([]);
   });
 });
 
