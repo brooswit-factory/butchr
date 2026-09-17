@@ -5,7 +5,7 @@ import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
-import { workspaceRoot } from "../../src/agents/workspace.js";
+import { workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
@@ -35,6 +35,7 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
 
 describe("agent name convention", () => {
   const HERDR_NAME = /^[a-z0-9_-]+$/;
+  const HERDR_NAME_MAX = 32;
 
   test("formats the optional display alias as a readable slug plus a key hash", () => {
     expect(agentNameFor("KAN-1")).toMatch(/^butchr-kan-1-[0-9a-f]{12}$/);
@@ -49,9 +50,11 @@ describe("agent name convention", () => {
       encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "triage", resourceId: "acme#123" }),
     ]) {
       expect(agentNameFor(key)).toMatch(HERDR_NAME);
+      expect(agentNameFor(key).length).toBeLessThanOrEqual(HERDR_NAME_MAX);
       expect(agentNameFor(key)).toBe(agentNameFor(key));
     }
-    expect(agentNameFor("jira-work:triage:BUTCHR-364")).toMatch(/^butchr-jira-work-triage-butchr-364-[0-9a-f]{12}$/);
+    expect(agentNameFor("jira-work:triage:BUTCHR-364")).toMatch(/^butchr-butchr-364-[0-9a-f]{12}$/);
+    expect(agentNameFor("jira-work:live-jira-work:BUTCHR-364")).toMatch(/^butchr-butchr-364-[0-9a-f]{12}$/);
   });
 
   test("keys that squash to the same slug still get distinct names", () => {
@@ -63,9 +66,21 @@ describe("agent name convention", () => {
     for (const [a, b] of pairs) expect(agentNameFor(a)).not.toBe(agentNameFor(b));
   });
 
+  test("the live-validation key that Herdr rejected fits Herdr's 32-character limit", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
+    const name = agentNameFor(key);
+    expect(name.length).toBeGreaterThanOrEqual(1);
+    expect(name.length).toBeLessThanOrEqual(HERDR_NAME_MAX);
+    expect(name).toMatch(HERDR_NAME);
+    expect(name).toBe(name.toLowerCase());
+    expect(name).not.toBe(agentNameFor(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-365" })));
+    expect(name).not.toBe(agentNameFor(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-wrk", resourceId: "BUTCHR-364" })));
+    expect(name).not.toBe(agentNameFor(key.toLowerCase()));
+  });
+
   test("very long keys stay bounded and distinct", () => {
     const long = (n: number) => encodeAgentKey({ resourceProvider: "github-issue", ruleId: "a".repeat(64), resourceId: `owner/${"r".repeat(80)}#${n}` });
-    expect(agentNameFor(long(1)).length).toBeLessThanOrEqual("butchr-".length + 48 + 1 + 12);
+    expect(agentNameFor(long(1)).length).toBeLessThanOrEqual(HERDR_NAME_MAX);
     expect(agentNameFor(long(1))).toMatch(HERDR_NAME);
     expect(agentNameFor(long(1))).not.toBe(agentNameFor(long(2)));
   });
@@ -91,6 +106,8 @@ describe("HerdrHerd", () => {
     await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
     expect(f.started[0].name).toBe(agentNameFor(key));
     expect(f.started[0].name).toMatch(/^[a-z0-9_-]+$/);
+    expect(f.started[0].name.length).toBeLessThanOrEqual(32);
+    expect(workspaceDirFor(key)).toBe(join(workspaceRoot(), "jira-work", "triage", "BUTCHR-364")); // workspace identity keeps the exact key
   });
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
     const { client } = fakeHerdr([{ name: "butchr-kan-1", pane_id: "w1:p1" }, { name: "someone-else", pane_id: "w1:p2" }, { pane_id: "w1:p3" }]);
@@ -419,7 +436,8 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
         list: async () => ({ agents: live }),
         start: async (p: any) => {
           if (p.name === agentNameFor("KAN-RESPAWN-FAIL")) throw new Error("boom");
-          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), p.name.slice(7).replace(/-[0-9a-f]{12}$/, "").toUpperCase()), agent_status: "working" });
+          const issue = [...desired.keys()].find((k) => agentNameFor(k) === p.name)!;
+          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), issue), agent_status: "working" });
         },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },

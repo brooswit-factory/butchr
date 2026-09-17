@@ -84,19 +84,26 @@ export interface ManagedHerdAgent {
 }
 
 const AGENT_PREFIX = "butchr-";
-const NAME_SLUG_MAX = 48;
+/** Herdr rejects agent names outside 1-32 characters (`invalid_agent_name`). */
+const NAME_MAX = 32;
+const NAME_HASH_LEN = 12;
+const NAME_SLUG_MAX = NAME_MAX - AGENT_PREFIX.length - 1 - NAME_HASH_LEN;
 /**
  * Display name only (identity comes from the workspace cwd). Herdr accepts
- * only `[a-z0-9_-]`, and squashing a key into that charset is lossy
- * (`jira-work:x-my:PROJ-1` and `jira-work:x:MY_PROJ-1`, or
+ * only `[a-z0-9_-]`, at most 32 characters, and squashing a key into that
+ * charset is lossy (`jira-work:x-my:PROJ-1` and `jira-work:x:MY_PROJ-1`, or
  * `github-issue:r:a-b/c#1` and `github-issue:r:a/b-c#1`, share one slug),
- * and Jira keys are uppercase (`BUTCHR-364`), so the readable, length-capped
- * slug is followed by a hash of the exact, case-preserving key: distinct
- * keys get distinct names, and one key always gets the same name.
+ * and Jira keys are uppercase (`BUTCHR-364`), so a short readable slug of the
+ * key's tail (where the resource id sits) is followed by a hash of the exact,
+ * case-preserving key: distinct keys get distinct names, and one key always
+ * gets the same name.
  */
 const nameFor = (key: string) => {
-  const slug = key.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, NAME_SLUG_MAX).replace(/^-+|-+$/g, "");
-  const hash = createHash("sha256").update(key).digest("hex").slice(0, 12);
+  const squashed = key.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  // Truncating from the front would cut a word in half; drop the partial one.
+  const tail = squashed.length > NAME_SLUG_MAX ? squashed.slice(-NAME_SLUG_MAX).replace(/^[^-]*-/, "") : squashed;
+  const slug = tail.replace(/^-+|-+$/g, "");
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, NAME_HASH_LEN);
   return `${AGENT_PREFIX}${slug ? `${slug}-` : ""}${hash}`;
 };
 
