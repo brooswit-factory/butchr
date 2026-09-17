@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
@@ -83,8 +84,21 @@ export interface ManagedHerdAgent {
 }
 
 const AGENT_PREFIX = "butchr-";
-/** Display name only (identity comes from the workspace cwd) — squashed to a conservative charset since agent keys contain `:`. */
-const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+const NAME_SLUG_MAX = 48;
+/**
+ * Display name only (identity comes from the workspace cwd). Herdr accepts
+ * only `[a-z0-9_-]`, and squashing a key into that charset is lossy
+ * (`jira-work:x-my:PROJ-1` and `jira-work:x:MY_PROJ-1`, or
+ * `github-issue:r:a-b/c#1` and `github-issue:r:a/b-c#1`, share one slug),
+ * and Jira keys are uppercase (`BUTCHR-364`), so the readable, length-capped
+ * slug is followed by a hash of the exact, case-preserving key: distinct
+ * keys get distinct names, and one key always gets the same name.
+ */
+const nameFor = (key: string) => {
+  const slug = key.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, NAME_SLUG_MAX).replace(/^-+|-+$/g, "");
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 12);
+  return `${AGENT_PREFIX}${slug ? `${slug}-` : ""}${hash}`;
+};
 
 /**
  * How long nudge() waits after delivering a prompt before checking whether a

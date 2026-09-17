@@ -7,6 +7,7 @@ import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 
 const clearQuota = () => {
@@ -23,7 +24,7 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
   const started: any[] = []; const closed: string[] = [];
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
-      const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).toUpperCase() : null;
+      const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).replace(/-[0-9a-f]{12}$/, "").toUpperCase() : null;
       return issue ? { ...a, agent: "claude", cwd: join(workspaceRoot(), issue) } : a;
     }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id }); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
@@ -33,8 +34,40 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
 }
 
 describe("agent name convention", () => {
-  test("formats the optional display alias", () => {
-    expect(agentNameFor("KAN-1")).toBe("butchr-kan-1");
+  const HERDR_NAME = /^[a-z0-9_-]+$/;
+
+  test("formats the optional display alias as a readable slug plus a key hash", () => {
+    expect(agentNameFor("KAN-1")).toMatch(/^butchr-kan-1-[0-9a-f]{12}$/);
+  });
+
+  test("uppercase Jira keys in rule agent keys become Herdr-valid names", () => {
+    for (const key of [
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "triage", resourceId: "IDEAS-7" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "MY_PROJ-1" }),
+      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "triage", resourceId: "owner/repo.js#12" }),
+      encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "triage", resourceId: "acme#123" }),
+    ]) {
+      expect(agentNameFor(key)).toMatch(HERDR_NAME);
+      expect(agentNameFor(key)).toBe(agentNameFor(key));
+    }
+    expect(agentNameFor("jira-work:triage:BUTCHR-364")).toMatch(/^butchr-jira-work-triage-butchr-364-[0-9a-f]{12}$/);
+  });
+
+  test("keys that squash to the same slug still get distinct names", () => {
+    const pairs: [string, string][] = [
+      [encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x-my", resourceId: "PROJ-1" }), encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x", resourceId: "MY_PROJ-1" })],
+      [encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a-b/c#1" }), encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a/b-c#1" })],
+      ["KAN-1", "kan-1"],
+    ];
+    for (const [a, b] of pairs) expect(agentNameFor(a)).not.toBe(agentNameFor(b));
+  });
+
+  test("very long keys stay bounded and distinct", () => {
+    const long = (n: number) => encodeAgentKey({ resourceProvider: "github-issue", ruleId: "a".repeat(64), resourceId: `owner/${"r".repeat(80)}#${n}` });
+    expect(agentNameFor(long(1)).length).toBeLessThanOrEqual("butchr-".length + 48 + 1 + 12);
+    expect(agentNameFor(long(1))).toMatch(HERDR_NAME);
+    expect(agentNameFor(long(1))).not.toBe(agentNameFor(long(2)));
   });
 });
 
@@ -50,6 +83,14 @@ describe("HerdrHerd", () => {
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(creates[0].env).toEqual({ HOME: "/tmp/isolated-agy-home" });
     expect(f.started[0].kind).toBe("agy");
+  });
+  test("a rule agent key with an uppercase Jira key starts under a Herdr-valid name", async () => {
+    const f = fakeHerdr([]);
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" });
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
+    await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
+    expect(f.started[0].name).toBe(agentNameFor(key));
+    expect(f.started[0].name).toMatch(/^[a-z0-9_-]+$/);
   });
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
     const { client } = fakeHerdr([{ name: "butchr-kan-1", pane_id: "w1:p1" }, { name: "someone-else", pane_id: "w1:p2" }, { pane_id: "w1:p3" }]);
@@ -76,7 +117,7 @@ describe("HerdrHerd", () => {
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: "KAN-1" });
     expect(f.started.length).toBe(1);
-    expect(f.started[0].name).toBe("butchr-kan-7");
+    expect(f.started[0].name).toBe(agentNameFor("KAN-7"));
     expect(f.started[0].pane_id).toBe("w9:p1");   // started in the new workspace's root pane
     expect(f.started[0].kind).toBe("claude");
     expect(f.started[0].args).toContain("--permission-mode");
@@ -303,7 +344,7 @@ describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same pol
     const client = {
       agent: {
         list: async () => ({ agents: [] }), // never running — no residency race in this test
-        start: async (p: any) => { if (p.name === "butchr-kan-3") throw new Error("boom"); },
+        start: async (p: any) => { if (p.name === agentNameFor("KAN-3")) throw new Error("boom"); },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
       workspace: { create: async (p: any) => ({ root_pane: { pane_id: `pane-${p.label}` } }) },
@@ -378,7 +419,7 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
         list: async () => ({ agents: live }),
         start: async (p: any) => {
           if (p.name === agentNameFor("KAN-RESPAWN-FAIL")) throw new Error("boom");
-          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), p.name.slice(7).toUpperCase()), agent_status: "working" });
+          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), p.name.slice(7).replace(/-[0-9a-f]{12}$/, "").toUpperCase()), agent_status: "working" });
         },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
