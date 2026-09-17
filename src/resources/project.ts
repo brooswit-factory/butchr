@@ -1126,6 +1126,47 @@ export interface ProjectEligibility {
   eligible: readonly EligibleProject[];
 }
 
+/** What `readProjectTierProperty` returns for a project that DOES carry a project-tier root doc — see its own doc comment. */
+export interface ProjectTierProperty {
+  rootDocId: string;
+  wake: Partial<ProjectWatermark> | undefined;
+}
+
+/**
+ * Does project `projectKey` carry the project-tier `butchr` entity property
+ * naming a root doc? THE ONE test for that question (BUTCHR-333) — a
+ * straight property read on the ONE project named, nothing else: no
+ * `getMyself`, no project search, no lead filter, no allowlist. Nothing
+ * about the calling credential enters this result, which is the whole
+ * point — see `resolveEligibleProjects`'s own doc comment for the CONTRAST:
+ * that function layers a lead filter and a project search ON TOP of this
+ * exact same read, for its own different purpose ("who is a peer FOR ME").
+ * A caller that only needs "does this one project have a project tier at
+ * all" — `finishWithoutABoss`'s branch (b) in src/tools/relationship.ts is
+ * the motivating one — must call this, not that, or its verdict silently
+ * starts depending on which daemon's credential happened to handle the
+ * call (BUTCHR-333's defect 1).
+ *
+ * Factored out of what used to be inline in `resolveEligibleProjects` as
+ * `if (!property?.rootDoc?.id) return null;`, so there is exactly ONE place
+ * that knows the `?.rootDoc?.id` shape — `resolveEligibleProjects` below
+ * calls this too. `PROPERTY_KEY` deliberately stays module-private: this
+ * helper owns the property read entirely, so the key itself never has to
+ * leave this module for a second call site to reuse the test.
+ *
+ * FAILS CLOSED the same way `resolveEligibleProjects` already documented
+ * (BUTCHR-81): a genuinely missing property (a clean 404, via
+ * `getProjectPropertyOrNull`) returns `null` — no project tier. ANY OTHER
+ * read failure — rate limit, timeout, permission change — is left to
+ * PROPAGATE; a project this call could not read is not silently "no
+ * project tier", the caller sees the error and decides how to fail closed.
+ */
+export async function readProjectTierProperty(ops: AtlassianOps, projectKey: string): Promise<ProjectTierProperty | null> {
+  const property = (await ops.getProjectPropertyOrNull(projectKey, PROPERTY_KEY)) as { rootDoc?: { id?: string }; wake?: Partial<ProjectWatermark> } | null;
+  if (!property?.rootDoc?.id) return null;
+  return { rootDocId: property.rootDoc.id, wake: property.wake };
+}
+
 /**
  * THE SINGLE, REUSABLE RESOLVER for "who is a peer" / "who is eligible"
  * (BUTCHR-184/BUTCHR-188) — Declaration 2 in this file's top comment, live +
@@ -1138,6 +1179,16 @@ export interface ProjectEligibility {
  * disagreeing issue-key regexes in src/resources/id.ts). If a future call
  * site needs "who is a peer", it imports this function; it does not
  * recompute the lead filter or the property read inline.
+ *
+ * NOTE (BUTCHR-333): "eligible" here is deliberately CREDENTIAL-DEPENDENT —
+ * live AND led by THIS credential AND carrying the property — because that
+ * is genuinely the right question for this function's own callers
+ * (`loadProjects`'s staffing discovery, `list_peers`/`tell_peer`'s "who can
+ * I reach"). It is the WRONG question for "does this project have a project
+ * tier at all", which must not vary by which daemon asks — that narrower,
+ * credential-invariant question is `readProjectTierProperty` above, not
+ * this function. Do not point a caller that only needs the narrower
+ * question at this one just because it happens to compute a superset.
  *
  * `preFilter`, OPTIONAL and applied to the lead-filtered set BEFORE any
  * per-project I/O (the property read): this is what lets `loadProjects`
@@ -1175,10 +1226,10 @@ export async function resolveEligibleProjects(
   const properties = await Promise.all(
     admitted.map(async (p): Promise<EligibleProject | null> => {
       // Only a clean NOT-FOUND is ineligibility; any other rejection
-      // propagates (see this function's own doc comment above).
-      const property = (await ops.getProjectPropertyOrNull(p.key, PROPERTY_KEY)) as { rootDoc?: { id?: string }; wake?: Partial<ProjectWatermark> } | null;
-      if (!property?.rootDoc?.id) return null;
-      return { key: p.key, name: p.name, rootDocId: property.rootDoc.id, wake: property.wake };
+      // propagates (see `readProjectTierProperty`'s own doc comment).
+      const tier = await readProjectTierProperty(ops, p.key);
+      if (!tier) return null;
+      return { key: p.key, name: p.name, rootDocId: tier.rootDocId, wake: tier.wake };
     }),
   );
   const eligible = properties.filter((p): p is EligibleProject => p !== null);

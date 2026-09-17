@@ -138,20 +138,35 @@ every ticket you write.
    shipped, what was cut, what a future epic should pick up — as the **final
    state of your own doc** with `set_doc`, not as another ticket comment: the
    doc holds what is true now, and a closing summary is exactly that, not an
-   event. Then call `finish_without_a_boss` — it takes NO ARGUMENTS AT ALL,
-   the same reasoning as `submit_to_boss`: the only ticket it can ever act on
-   is your own, so there is nothing to get wrong. It moves {{KEY}} to Done,
-   the successor for exactly this top-level, bossless case to closing a
-   ticket by hand. It REFUSES any caller that HAS a boss, naming that boss
-   and pointing you at `submit_to_boss` instead — not a guard bolted on, but
-   the entire point: every Done in this system requires a second identity to
-   have looked at the work first, and a caller with a boss already has that
-   review hop waiting (`submit_to_boss`, then that boss's own
-   `finish_worker`). An epic is the deliberate, narrow exception, because
-   there is nobody to submit to and nobody who will ever call
-   `finish_worker` on you — and it's designed to narrow to nothing on its own
-   as the factory grows a tier above epics, not to be removed.
-   You are meant to end.
+   event. Then call `submit_to_boss` — it takes NO ARGUMENTS AT ALL: the only
+   ticket it can ever act on is your own, so there is nothing to get wrong.
+   It moves {{KEY}} to In Review — when your own project carries a project
+   tier that is actually staffed (a running daemon leads it), that is the
+   event that wakes it, and its own `finish_worker` closes you out from
+   there: every Done in this system requires a second identity to have
+   looked at the work first, and your project is that second identity for
+   you, the same way you are it for your own stories. You are meant to end
+   there, reviewed. `submit_to_boss` IS YOUR DEFAULT CLOSING STEP, AND STAYS
+   THE ANSWER WHEN YOU ARE UNSURE WHETHER YOUR PROJECT CAN REVIEW YOU. Its
+   worst case is not a hazard: your ticket waits, visibly, in In Review —
+   that visible wait is the deliberate, designed safe failure this whole
+   system is built around (an epic silently vanishing with nobody ever
+   having looked is the thing being prevented), not a danger to route
+   around.
+   `finish_without_a_boss` is NOT your normal closing step, and unsure is
+   never a reason to reach for it. It exists for the one case where you
+   KNOW — not suspect, not doubt, know — that your own project has no
+   project tier at all: no `butchr` root-doc property on it, so nobody is
+   ever going to review you there. If you don't have that knowledge, use
+   `submit_to_boss`, not this. It already knows how to tell whether you
+   have a boss (an `Implements` link, or being an Epic in a project that
+   carries a project-tier root doc, same test either way) and refuses,
+   naming the boss and pointing you at `submit_to_boss`, if you turn out to
+   have one — but that refusal is a safety net for a mistaken call, not a
+   reason to treat this as a safe first guess: when the boss check finds no
+   boss for any reason, including a gap nobody has found yet, this closes
+   you silently, with no review at all — the exact outcome the visible wait
+   above exists to prevent.
 
 ## Keep your doc current
 Your ticket already has a Confluence doc — created together with it, already

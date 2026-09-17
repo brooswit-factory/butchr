@@ -10,6 +10,7 @@ import {
   checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
+import { Refusal } from "../../src/tools/outcome.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
 
@@ -1951,6 +1952,101 @@ describe("finishWithoutABoss", () => {
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey at all
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUTCHR-326/BUTCHR-333: finishWithoutABoss's branch (b) — an Epic whose own
+// project carries a project-tier `butchr` root-doc property also has a boss
+// (that project), even with no `Implements` link at all. BUTCHR-333: this
+// verdict is CREDENTIAL-INVARIANT — it reads `getProjectPropertyOrNull`
+// directly for the caller's own project key ONLY, never `searchProjects` or
+// `getMyself` (the ops `resolveEligibleProjects` uses for ITS OWN, different,
+// lead-filtered purpose). Tests below deliberately do NOT default the fake
+// world's project lead to the caller's own credential — doing that would
+// silently launder the exact defect this ticket fixes back into the suite.
+// ---------------------------------------------------------------------------
+
+describe("BUTCHR-326/BUTCHR-333: finishWithoutABoss branch (b) — Epic in a project-tier project has a boss, credential-invariantly", () => {
+  // Sets ONLY the property read — no searchProjects/getMyself override at
+  // all, so a test using this is a direct proof the verdict never consults
+  // either.
+  function projectTierOps(ops: AtlassianOps, projectKey: string): AtlassianOps {
+    return {
+      ...ops,
+      getProjectPropertyOrNull: async (key: string) => (key === projectKey ? { rootDoc: { id: "1" } } : null),
+    };
+  }
+
+  test("1. THE DEFECT-1 REGRESSION PIN — an Epic whose project carries a project-tier root doc is refused even when that project is LED BY A DIFFERENT CREDENTIAL than the caller's own getMyself(): the verdict must not depend on which daemon's account leads the project", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("TIER-1", { issuetype: "Epic", project: "TIER" }); // no Implements link
+    // makeWorld's default getMyself() -> "test-account". This project is led
+    // by a DIFFERENT account entirely, on purpose: the pre-BUTCHR-333 branch
+    // (b) called resolveEligibleProjects, which filters by
+    // `lead.accountId === me.accountId` BEFORE ever reading the property —
+    // under that old gate this project would not be "led by me", `eligible`
+    // would come back empty, and the call would wrongly transition instead
+    // of refusing. The current gate must refuse regardless.
+    const otherCredential: AtlassianOps = {
+      ...ops,
+      searchProjects: async () => ({ values: [{ key: "TIER", name: "TIER", lead: { accountId: "some-other-account" } }] }),
+      getProjectPropertyOrNull: async (key: string) => (key === "TIER" ? { rootDoc: { id: "1" } } : null),
+    };
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/TIER-1 has a boss/);
+    // BUTCHR-341: the TYPE is what the outcome record classifies on, never
+    // the message — a deliberate guard must record as `refused`, not `error`.
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toBeInstanceOf(Refusal);
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/\bTIER\b/); // the project key, not just the caller's own key
+    await expect(finishWithoutABoss(otherCredential, "TIER-1")).rejects.toThrow(/submit_to_boss/);
+    expect(issues.get("TIER-1")!.status).toBe("To Do"); // never transitioned by the refused call
+  });
+
+  test("2. an Epic whose project carries NO butchr property still transitions to Done — no project tier at all, the case that must keep working", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // makeWorld's default getProjectPropertyOrNull -> null for every key: a
+    // clean not-found, never fail-closed.
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+
+  test("3. a ticket with an Implements link is refused as today, with today's byte-identical message — branch (a), unaffected by branch (b)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-2")).rejects.toThrow(/has a boss \(BUTCHR-1\)/);
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do");
+  });
+
+  test("4. a project-tier read FAILURE (not a clean not-found) refuses with a DISTINCT fail-closed message naming the error — 'could not look' never becomes 'no boss'", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    const broken: AtlassianOps = { ...ops, getProjectPropertyOrNull: async () => { throw new Error("jira property read down"); } };
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/could not determine whether BUTCHR-1 has a boss/);
+    // BUTCHR-341: fail-closed is a Refusal, NOT an Error — a guard declining
+    // to act on an unreliable read, committing nothing (outcome.ts names this
+    // exact case). Left as a plain Error, this working guard would read as
+    // flakiness in every outcome record.
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toBeInstanceOf(Refusal);
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.toThrow(/jira property read down/);
+    // distinguishable from both other refusal shapes:
+    await expect(finishWithoutABoss(broken, "BUTCHR-1")).rejects.not.toThrow(/still has open worker/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do"); // refused, not silently treated as bossless
+  });
+
+  // 5. A project caller is still refused at tool registration — that's
+  // tools.test.ts's "finish_without_a_boss REFUSES a project caller at the
+  // gate" test (unaffected by this branch: refuseProjectCaller runs before
+  // relationship.ts's finishWithoutABoss is ever reached, so it neither
+  // knows nor cares that branch (b) now exists below it).
+
+  test("6. a bossless STORY (or Task) whose project carries a project-tier root doc is NOT refused by branch (b) — it transitions, pinning the Epic-only narrowing from 1b", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("TIER-1", { issuetype: "Story", project: "TIER" }); // no Implements link, shares the project-tier project, but is not an Epic
+    const tiered = projectTierOps(ops, "TIER");
+    await finishWithoutABoss(tiered, "TIER-1");
+    expect(issues.get("TIER-1")!.status).toBe("Done");
   });
 });
 
