@@ -138,3 +138,13 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // holds: additive, not a meaning change to the existing shape.
   return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`; // "comment" in reason
 }
+
+/**
+ * The agent-facing push for a `github-issue` agent's own issue. Names the
+ * tool to re-read with, since a GitHub agent has no Jira tools; carries no
+ * GitHub-authored text (see src/rules/github-issue-type.ts).
+ */
+export function githubIssueNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
+  return `[butchr] GitHub issue ${resource} ${clause} — re-read it with github_get_issue.`;
+}

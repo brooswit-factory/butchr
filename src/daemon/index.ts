@@ -49,6 +49,10 @@ import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
+import { createGithubIssueClient } from "../resources/github-issue.js";
+import { githubIssueStaffing } from "../rules/github-issue-type.js";
+import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { startGithubIssueLoop } from "./github-issue-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
@@ -82,15 +86,18 @@ try {
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
   if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
   else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
-  // github-issue rules validate and have a resource type
-  // (src/rules/github-issue-type.ts), but no loop runs them: agent tools and
-  // MCP identity are Jira-only, so an agent on a GitHub issue could not work it.
-  const github = rules.filter((r) => r.enabled && r.resourceProvider === "github-issue").map((r) => r.id);
-  if (github.length) console.error(`butchr: github-issue rules are not staffed by this build: ${github.join(", ")}`);
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   process.exit(1);
 }
+
+// github-issue rules run only with GitHub auth and org scope configured and
+// every enabled rule's query scoped inside those orgs; otherwise none of them
+// runs and nothing is spawned for one (announced by startGithubIssueLoop).
+const githubStaffing = githubIssueStaffing(rules, config.github);
+const githubIssues = githubStaffing.run && config.github
+  ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
+  : undefined;
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // Label writes must never silently 403: Jira only honours notifyUsers=false
@@ -124,12 +131,13 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 // `runResourceLoop` call site) are what actually name a call's own tier —
 // this daemon never calls `admissionController.admit` directly.
 const ADMISSION_SOURCE_ISSUE = "issue";
+const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE],
+  sources: githubIssues ? [ADMISSION_SOURCE_ISSUE, ADMISSION_SOURCE_GITHUB_ISSUE] : [ADMISSION_SOURCE_ISSUE],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -313,7 +321,11 @@ const { app, mcp } = buildApp({
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed));
+}, {
+  // Jira/Confluence tools refuse github-issue agents; GitHub tools exist only when github-issue rules run.
+  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+});
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
@@ -696,6 +708,24 @@ runResourceLoop(ruleResourceType, {
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
   onPollSuccess: () => loopHealth.recordSuccess(),
   onNotifySuccess: () => notifyHealth.recordSuccess(),
+});
+
+// The github-issue rule loop: its own agents only, its own admission bucket
+// under the same host cap, and none of the Jira-writing detectors above.
+if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
+startGithubIssueLoop({
+  staffing: githubStaffing,
+  client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
+  onAdmitted: admissionController.recordSpawned,
+  log: (line) => console.error(`  ${line}`),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's

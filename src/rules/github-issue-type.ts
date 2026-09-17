@@ -14,7 +14,7 @@
  * into its prompt.
  */
 import type { SpawnSpec } from "../agents/workspace.js";
-import type { GithubComment, GithubIssue } from "../resources/github-issue.js";
+import { scopedIssueQuery, type GithubComment, type GithubIssue } from "../resources/github-issue.js";
 import { parseGithubIssueRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
 import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, ResourceType } from "../resources/types.js";
 import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
@@ -33,6 +33,8 @@ export interface GithubIssueResourceDeps {
   search: (query: string) => Promise<GithubIssue[]>;
   /** Comments on one issue, oldest first — used only to name the newest comment in a notification reason. */
   comments?: (ref: GithubIssueRef) => Promise<readonly GithubComment[]>;
+  /** True when a change to `resource` (now at `updated`) is `watcher`'s own write — e.g. its own comment — and not worth a nudge. */
+  suppress?: (resource: string, updated: string, watcher: string) => boolean;
   log?: (line: string) => void;
 }
 
@@ -79,7 +81,7 @@ const observed = (i: GithubIssue) => JSON.stringify([i.title, i.body, i.state, i
  * Reason precedence: state, then a new comment (its id, when `comments` can
  * name it), then title; any other observed change delivers without a reason.
  */
-export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, "comments" | "log">): EventRules<GithubIssueMatch> {
+export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, "comments" | "suppress" | "log">): EventRules<GithubIssueMatch> {
   return {
     async poll(prev: PollSnapshot<GithubIssueMatch>, next: PollSnapshot<GithubIssueMatch>): Promise<EventPoll> {
       const before = new Map(prev.primary.map((m) => [m.agentKey, m.issue]));
@@ -95,6 +97,7 @@ export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, 
           const pair = pairs.get(key);
           if (space !== "primary" || watcher !== key || !pair) return { deliver: false };
           const { from, to } = pair;
+          if (deps.suppress?.(to.ref, to.updated, key)) return { deliver: false };
           if (from.state !== to.state) return { deliver: true, reason: { status: { from: from.state, to: to.state } } };
           if (to.comments > from.comments) return { deliver: true, reason: await newCommentReason(to) };
           if (from.title !== to.title) return { deliver: true, reason: { summary: true } };
@@ -124,4 +127,27 @@ export function createGithubIssueResourceType(deps: GithubIssueResourceDeps): Re
     eventRules: createGithubIssueEventRules(deps),
     spawnConfig: { specFor: specForGithubIssue },
   };
+}
+
+/**
+ * Whether this daemon may run `github-issue` rules, decided once at startup.
+ * Fails closed: without GitHub auth and org scope, or with any enabled rule
+ * whose query cannot be scoped to those orgs, NO github-issue rule runs and
+ * nothing is spawned for one — the reason says why. Jira rules are unaffected.
+ */
+export type GithubIssueStaffing =
+  | { run: true; rules: Rule[] }
+  | { run: false; rules: Rule[]; reason: string | null };
+
+export function githubIssueStaffing(rules: readonly Rule[], github: { token: string; orgs: readonly string[] } | undefined): GithubIssueStaffing {
+  const enabled = rules.filter((r) => r.enabled && r.resourceProvider === "github-issue");
+  if (!enabled.length) return { run: false, rules: [], reason: null };
+  const ids = enabled.map((r) => r.id).join(", ");
+  if (!github?.token || !github.orgs.length) return { run: false, rules: enabled, reason: `github-issue rules not staffed (${ids}): set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS` };
+  const problems: string[] = [];
+  for (const r of enabled) {
+    try { scopedIssueQuery(r.query, github.orgs); } catch (e) { problems.push(`${r.id}: ${(e as Error).message}`); }
+  }
+  if (problems.length) return { run: false, rules: enabled, reason: `github-issue rules not staffed (${ids}): ${problems.join("; ")}` };
+  return { run: true, rules: enabled };
 }

@@ -1,8 +1,10 @@
 /**
  * The `github-issue` resource provider's GitHub side: rule-query validation,
- * org scoping, and a read-only REST client for issues and their comments.
+ * org scoping, and a REST client for issues and their comments.
  *
- * READ-ONLY. Nothing here creates, edits, labels, or comments on anything.
+ * The ONE write is `addComment`, and it only ever lands on an issue it has
+ * just re-read as an issue (not a pull request) inside the configured orgs.
+ * Nothing here creates, edits, closes, or labels anything.
  *
  * Auth and scope reuse the pr:* discovery configuration (src/config/config.ts
  * `github`): the token from `GITHUB_TOKEN_FILE`, and `BUTCHR_GITHUB_ORGS` as
@@ -163,6 +165,14 @@ export interface GithubIssueClient {
   searchAll(query: string): Promise<GithubIssue[]>;
   /** Every comment on one issue, oldest first. */
   comments(ref: GithubIssueRef): Promise<GithubComment[]>;
+  /**
+   * One issue, re-read by number. Rejects when GitHub answers with a pull
+   * request, an owner outside the configured orgs, or a different issue (a
+   * transferred issue redirects elsewhere) — never returns one of those.
+   */
+  get(ref: GithubIssueRef): Promise<GithubIssue>;
+  /** Post a comment after `get` confirms the target; resolves the new comment. */
+  addComment(ref: GithubIssueRef, body: string): Promise<GithubComment>;
 }
 
 export function createGithubIssueClient(deps: GithubIssueClientDeps): GithubIssueClient {
@@ -172,7 +182,29 @@ export function createGithubIssueClient(deps: GithubIssueClientDeps): GithubIssu
     if (!res.ok) throw new GithubHttpError(res.status, what);
     return res.json();
   };
+  const issueUrl = (ref: GithubIssueRef) => `https://api.github.com/repos/${ref.owner}/${ref.repo}/issues/${ref.number}`;
+  const getIssue = async (ref: GithubIssueRef): Promise<GithubIssue> => {
+    const want = formatGithubIssueRef(ref);
+    if (!allowed.has(ref.owner.toLowerCase())) throw new Error(`${want} is outside BUTCHR_GITHUB_ORGS`);
+    const item = await get(issueUrl(ref), "issue read") as SearchItem | null;
+    if (item && typeof item === "object" && item.pull_request !== undefined) throw new Error(`${want} is a pull request, not an issue`);
+    const issue = item && typeof item === "object" ? mapGithubIssue(item) : null;
+    if (!issue) throw new Error(`GitHub issue read for ${want} returned an unexpected body`);
+    if (issue.ref !== want) throw new Error(`GitHub answered ${issue.ref} for ${want}; refusing a moved or transferred issue`);
+    return issue;
+  };
   return {
+    get: getIssue,
+    async addComment(ref, body) {
+      await getIssue(ref);
+      const res = await deps.fetchImpl(`${issueUrl(ref)}/comments`, {
+        method: "POST",
+        headers: { ...ghHeaders(deps.token), "content-type": "application/json" },
+        body: JSON.stringify({ body }),
+      });
+      if (!res.ok) throw new GithubHttpError(res.status, "issue comment");
+      return mapComment(await res.json() as Record<string, unknown>);
+    },
     async searchAll(query) {
       // Created order, oldest first: new issues land on the last page, so paging
       // cannot skip an issue the way updated order can when one moves mid-read.
@@ -201,17 +233,19 @@ export function createGithubIssueClient(deps: GithubIssueClientDeps): GithubIssu
         const params = new URLSearchParams({ per_page: String(PAGE), page: String(page) });
         const body = await get(`https://api.github.com/repos/${ref.owner}/${ref.repo}/issues/${ref.number}/comments?${params}`, "issue comments");
         if (!Array.isArray(body)) throw new Error("GitHub issue comments returned an unexpected body");
-        for (const c of body as Array<Record<string, unknown>>) {
-          out.push({
-            id: String(c.id),
-            author: typeof (c.user as { login?: unknown } | null)?.login === "string" ? (c.user as { login: string }).login : null,
-            body: typeof c.body === "string" ? c.body : "",
-            created: typeof c.created_at === "string" ? c.created_at : "",
-            updated: typeof c.updated_at === "string" ? c.updated_at : "",
-          });
-        }
+        for (const c of body as Array<Record<string, unknown>>) out.push(mapComment(c));
         if (body.length < PAGE) return out;
       }
     },
+  };
+}
+
+function mapComment(c: Record<string, unknown>): GithubComment {
+  return {
+    id: String(c.id),
+    author: typeof (c.user as { login?: unknown } | null)?.login === "string" ? (c.user as { login: string }).login : null,
+    body: typeof c.body === "string" ? c.body : "",
+    created: typeof c.created_at === "string" ? c.created_at : "",
+    updated: typeof c.updated_at === "string" ? c.updated_at : "",
   };
 }
