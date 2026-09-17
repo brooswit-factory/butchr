@@ -27,7 +27,10 @@
  * `plan.respawn` (stop-then-spawn of an ALREADY-resident agent, net zero
  * change in residency) never passes through this module at all. Gating a
  * respawn against this cap would let a stale agent be stopped and then
- * refused its own replacement, strictly worse than leaving it stale.
+ * refused its own replacement, strictly worse than leaving it stale. A
+ * respawn does `reserve()` its own id from before its stop until its
+ * replacement settles, though, so no OTHER loop's admission reads the gap
+ * between the two as a free slot.
  *
  * FLEET-WIDE, NOT PER-TIER (Trap 1 on the ticket): the `residency` census
  * this module is built over MUST be the raw, UNSCOPED herd's
@@ -47,10 +50,10 @@
  * spawned agents, so four rule loops reading it in the same round used to
  * each admit up to the whole remaining budget and together start more than
  * the cap. `createAdmissionController` now closes that: calls are serialized,
- * and each source's last admitted ids stay reserved against the shared
- * budget until that source's next call (see `reserved` there). The census
- * stays the source of truth for everything else; reservations only cover the
- * spawn window a census cannot see.
+ * and each admitted id stays reserved against the shared budget until
+ * `reconcileNow` releases it when its spawn settles (see `reserved` there).
+ * The census stays the source of truth for everything else; reservations
+ * only cover the spawn window a census cannot see.
  *
  * TRAP 2 — A CONFIDENT ZERO ADMITS A STAMPEDE, MEASURED LIVE (BUTCHR-282's
  * own hazard, inverted here): BUTCHR-282's measured condition is a daemon
@@ -446,6 +449,24 @@ export interface AdmissionController {
    * harmless no-op. Synchronous, like `snapshot()` — no census plumbing.
    */
   recordSpawned(succeeded: readonly string[]): void;
+  /**
+   * Holds `ids` against the shared cap for `source` until `release` — for a
+   * respawn, whose agent leaves the census between its stop and its
+   * replacement landing. Without the hold another loop's admission reads
+   * that gap as a free slot and the replacement lands over the cap. Never
+   * refuses: a respawn is not admission-controlled. An id also in the
+   * census is counted once.
+   */
+  reserve(ids: readonly string[], source?: string): void;
+  /**
+   * Drops `ids` from `source`'s reservations once their spawn has settled:
+   * a landed agent is in the census from then on, and one that did not land
+   * (failed, or waiting on provider quota with no agent) holds nothing.
+   * Runs after any in-progress `admit()`, so an admission never combines a
+   * census read from before a spawn landed with reservations from after its
+   * release. Never rejects.
+   */
+  release(ids: readonly string[], source?: string): Promise<void>;
 }
 
 /** Pure: which of `candidates` (already in the desired admit order) fit inside `budget` slots. Exported for direct unit testing of the arithmetic at/below/above the cap, independent of any census plumbing. */
@@ -560,27 +581,47 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     (deps.sources ?? []).map((source) => [source, { source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "never-reported" }]),
   );
   const setBucket = (bucket: AdmissionCensusBucket) => buckets.set(bucket.source, bucket);
-  // Shared-cap reservations: the ids each source was last admitted, held
-  // until that SAME source's next `admit()` call. Several rule loops share
-  // this controller on independent timers, and an admitted id is not in
-  // `residency()` until its spawn lands — without these, every loop reading
-  // the same pre-spawn census gets the whole remaining budget and together
-  // they start more than the cap. A source's loop awaits its whole
-  // reconcile round before polling again, so by its next call its previous
-  // spawns have settled: succeeded ones are resident (counted once — the
-  // budget below takes the union), failed ones are simply gone. With a
-  // single source the reservations are always dropped before they are read,
-  // so one loop alone admits exactly as before.
-  const reserved = new Map<string, readonly string[]>();
-  // `admit()` runs one call at a time so a census read and the reservations
-  // it is combined with always come from the same side of another source's
-  // reservation change.
+  // Shared-cap reservations: ids admitted (or respawning) whose spawn has
+  // not settled yet, per source. Several rule loops share this controller on
+  // independent timers, and an agent is not in `residency()` until its spawn
+  // lands — without these, every loop reading the same pre-spawn census gets
+  // the whole remaining budget and together they start more than the cap.
+  // `reconcileNow` releases each id as soon as its own spawn settles, and
+  // releases the rest if its round throws, so a reservation never outlives
+  // the round that made it: a spawn that returns with no agent (provider
+  // quota) or a loop whose source search then fails holds no slot. A
+  // source's leftovers are also dropped at its next `admit()` (a caller that
+  // never releases admits as before). With a single source the reservations
+  // are never read, so one loop alone admits exactly as before.
+  const reserved = new Map<string, Set<string>>();
+  // `admit()` and `release()` run one at a time so a census read and the
+  // reservations it is combined with always come from the same side of a
+  // release. A `reserve()` is applied immediately: it only ever adds.
   let turn: Promise<unknown> = Promise.resolve();
-
-  function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
-    const run = turn.then(() => admitExclusive(candidates, stopping, source));
+  const exclusive = <R>(fn: () => Promise<R> | R): Promise<R> => {
+    const run = turn.then(fn);
     turn = run.catch(() => undefined);
     return run;
+  };
+
+  function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
+    return exclusive(() => admitExclusive(candidates, stopping, source));
+  }
+
+  function reserve(ids: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): void {
+    if (!ids.length) return;
+    const held = reserved.get(source) ?? new Set<string>();
+    for (const id of ids) held.add(id);
+    reserved.set(source, held);
+  }
+
+  function release(ids: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<void> {
+    return exclusive(() => {
+      const held = reserved.get(source);
+      if (!held) return;
+      for (const id of ids) held.delete(id);
+      if (!held.size) reserved.delete(source);
+    });
   }
 
   async function admitExclusive(candidates: readonly string[], stopping: readonly string[], source: string): Promise<readonly string[]> {
@@ -694,7 +735,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // ADMITTED count too, not only withheld — see `ADMISSION2_TAG`'s own doc
     // comment for why the tag itself changed (criterion D) rather than
     // reusing `[admission]` with a wider firing condition.
-    if (admitted.length) reserved.set(source, admitted);
+    reserve(admitted, source);
     log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits, occupied.size - observed));
     setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
     return admitted;
@@ -710,6 +751,8 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   return {
     admit,
     recordSpawned,
+    reserve,
+    release,
     snapshot: () => {
       const longestId = lastWithheld[0];
       const longestWait = longestId !== undefined ? { id: longestId, polls: waits.get(longestId) ?? 0 } : null;

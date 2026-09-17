@@ -51,6 +51,8 @@ export interface JiraIdeaLoopDeps {
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   onAdmitted?: (succeeded: readonly string[]) => void;
+  reserveAdmission?: (ids: readonly string[]) => void;
+  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
@@ -96,6 +98,8 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
     ...(deps.admission ? { admission: deps.admission } : {}),
     ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+    ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
+    ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? JIRA_IDEA_POLL_MS,

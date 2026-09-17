@@ -30,6 +30,8 @@ export interface GithubIssueLoopDeps {
   suppress?: (resource: string, updated: string, watcher: string) => boolean;
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   onAdmitted?: (succeeded: readonly string[]) => void;
+  reserveAdmission?: (ids: readonly string[]) => void;
+  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
@@ -68,6 +70,8 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
     ...(deps.admission ? { admission: deps.admission } : {}),
     ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+    ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
+    ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? GITHUB_ISSUE_POLL_MS,
