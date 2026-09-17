@@ -135,6 +135,17 @@ export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: str
   return decodeAgentKey(key) ? key : null;
 }
 
+/**
+ * The rule-engine agent owning `cwd`, of ANY provider — never a legacy
+ * one-deep workspace. For provider-neutral pane care (session-limit
+ * recovery) that every rule loop's agents need, unlike the Jira-writing
+ * detectors, which scope themselves to `jira-work`.
+ */
+export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
+  const id = agentIdOfWorkspacePath(cwd, root);
+  return id && decodeAgentKey(id) ? id : null;
+}
+
 /** The resource (Jira key) a herd id works: the decoded resource of an agent key, else the id itself. */
 export const resourceKeyOf = (id: string): string => decodeAgentKey(id)?.resourceId ?? id;
 

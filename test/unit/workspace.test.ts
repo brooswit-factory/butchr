@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, ruleAgentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
@@ -36,6 +36,16 @@ describe("workspace identity", () => {
     expect(agentIdOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
     expect(agentIdOfWorkspacePath("/tmp/KAN-42")).toBeNull();
     expect(agentIdOfWorkspacePath(null)).toBeNull();
+  });
+  test("rule agent ids cover every provider and never a legacy workspace", () => {
+    const root = "/w";
+    expect(ruleAgentIdOfWorkspacePath("/w/jira-work/build/KAN-1", root)).toBe("jira-work:build:KAN-1");
+    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/acme%2Fweb%2342", root)).toBe("github-issue:triage:acme%2Fweb%2342");
+    expect(ruleAgentIdOfWorkspacePath("/w/jira-idea/ideas/IDEA-7", root)).toBe("jira-idea:ideas:IDEA-7");
+    expect(ruleAgentIdOfWorkspacePath("/w/zendesk-ticket/support/acme%2312", root)).toBe("zendesk-ticket:support:acme%2312");
+    expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
   });
 });
 

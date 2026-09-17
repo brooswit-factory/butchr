@@ -11,7 +11,7 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
-import { agentIdOfWorkspacePath, resourceKeyOf } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -497,7 +497,10 @@ const quotaGate = createQuotaGate(
   async () => (await herdr.agent.list()).agents.map((a) => ({
     pane_id: a.pane_id,
     agent_status: a.agent_status ?? "",
-    issue: ownedAgentOfCwd(a.cwd),
+    // Every rule loop's agents: a github-issue, jira-idea or zendesk-ticket
+    // pane refused at a session limit needs the same close-after-reset as a
+    // jira-work one, and nothing on this path writes to a resource.
+    issue: ruleAgentIdOfWorkspacePath(a.cwd),
   })),
   readPane,
   () => Date.now(),
