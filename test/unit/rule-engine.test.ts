@@ -152,6 +152,8 @@ describe("rule relationships", () => {
   // WORKER implements BOSS, seen from both ends exactly as Jira reports it.
   const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
   const implementedBy = (worker: string): IssueLink[] => [{ type: "Implements", otherEnd: "outward", key: worker }];
+  // Relates is symmetric; `otherEnd` is only which side Jira stored the other ticket on.
+  const relatesTo = (other: string, otherEnd: IssueLink["otherEnd"]): IssueLink[] => [{ type: "Relates", otherEnd, key: other }];
   const match = (rule: Rule, i: JiraIssue): RuleMatch => ({ agentKey: `jira-work:${rule.id}:${i.key}`, rule, issue: i });
   const byId = (ruleSet: Rule[], id: string) => ruleSet.find((r) => r.id === id)!;
   const keys = (ms: RuleMatch[]) => ms.map((m) => m.agentKey);
@@ -185,12 +187,103 @@ describe("rule relationships", () => {
     expect(relatedForRules(ruleSet, ms, keys(ms).filter((k) => k !== "jira-work:epic:BUTCHR-1"))).toEqual([]);
   });
 
-  test("an inward connection rule hears the connecting rule's ticket; the link is read from either end", () => {
-    const b = issue("BUTCHR-1"), w = worker();
-    const ms = [match(byId(ruleSet, "audit"), b), match(byId(ruleSet, "story"), w)];
+  test("an inward connection rule hears the connecting rule's ticket over Relates; the link is read from either end", () => {
+    const w = issue("BUTCHR-2", { issuelinks: relatesTo("BUTCHR-1", "inward") });
+    const ms = [match(byId(ruleSet, "audit"), issue("BUTCHR-1")), match(byId(ruleSet, "story"), w)];
     expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([{ issue: ms[1]!, watchers: ["jira-work:audit:BUTCHR-1"] }]);
-    const fromBossEnd = [match(byId(ruleSet, "audit"), boss()), match(byId(ruleSet, "story"), issue("BUTCHR-2"))];
-    expect(relatedForRules(ruleSet, fromBossEnd, keys(fromBossEnd))[0]!.watchers).toEqual(["jira-work:audit:BUTCHR-1"]);
+    const fromListenerEnd = [match(byId(ruleSet, "audit"), issue("BUTCHR-1", { issuelinks: relatesTo("BUTCHR-2", "outward") })), match(byId(ruleSet, "story"), issue("BUTCHR-2"))];
+    expect(relatedForRules(ruleSet, fromListenerEnd, keys(fromListenerEnd))[0]!.watchers).toEqual(["jira-work:audit:BUTCHR-1"]);
+  });
+
+  describe("sideways over Relates", () => {
+    // "idea" accepts inward connections from "ticket"; "ticket" names nobody.
+    const side = rules(
+      { id: "idea", query: "q", relationships: { inwardConnectionRules: ["ticket"] } },
+      { id: "ticket", query: "q" },
+      { id: "triage", query: "q", relationships: { inwardConnectionRules: ["ticket"] } },
+      { id: "other", query: "q" },
+    );
+    const r = (id: string) => byId(side, id);
+    // The Relates link exactly as Jira reports it from BOTH tickets.
+    const idea = (key = "BUTCHR-1", linked = "BUTCHR-2") => issue(key, { issuelinks: relatesTo(linked, "outward") });
+    const ticket = (key = "BUTCHR-2", linked = "BUTCHR-1") => issue(key, { issuelinks: relatesTo(linked, "inward") });
+
+    test("two-way link data, one-way communication: the listing rule hears, the listed rule does not", () => {
+      const ms = [match(r("idea"), idea()), match(r("ticket"), ticket())];
+      expect(relatedForRules(side, ms, keys(ms))).toEqual([{ issue: ms[1]!, watchers: ["jira-work:idea:BUTCHR-1"] }]);
+      // Swapping which end is outward in Jira changes nothing: direction is configuration's.
+      const swapped = [match(r("idea"), issue("BUTCHR-1", { issuelinks: relatesTo("BUTCHR-2", "inward") })), match(r("ticket"), issue("BUTCHR-2", { issuelinks: relatesTo("BUTCHR-1", "outward") }))];
+      expect(relatedForRules(side, swapped, keys(swapped))).toEqual([{ issue: swapped[1]!, watchers: ["jira-work:idea:BUTCHR-1"] }]);
+    });
+
+    test("rules that name each other hear each other", () => {
+      const mutual = rules(
+        { id: "idea", query: "q", relationships: { inwardConnectionRules: ["ticket"] } },
+        { id: "ticket", query: "q", relationships: { inwardConnectionRules: ["idea"] } },
+      );
+      const ms = [match(byId(mutual, "idea"), idea()), match(byId(mutual, "ticket"), ticket())];
+      expect(relatedForRules(mutual, ms, keys(ms))).toEqual([
+        { issue: ms[0]!, watchers: ["jira-work:ticket:BUTCHR-2"] },
+        { issue: ms[1]!, watchers: ["jira-work:idea:BUTCHR-1"] },
+      ]);
+    });
+
+    test("several listening rule agents each watch under their own key; a non-listening rule on the same ticket does not", () => {
+      const ms = [
+        match(r("idea"), idea()), match(r("triage"), idea()), match(r("other"), idea()),
+        match(r("ticket"), ticket()),
+      ];
+      expect(relatedForRules(side, ms, keys(ms))).toEqual([
+        { issue: ms[3]!, watchers: ["jira-work:idea:BUTCHR-1", "jira-work:triage:BUTCHR-1"] },
+      ]);
+      expect(relatedForRules(side, ms, keys(ms).filter((k) => k !== "jira-work:triage:BUTCHR-1"))[0]!.watchers).toEqual(["jira-work:idea:BUTCHR-1"]);
+    });
+
+    test("one heard ticket is one entry: several source rules, duplicate links, and several listening tickets all dedupe", () => {
+      const twoSources = rules(
+        { id: "idea", query: "q", relationships: { inwardConnectionRules: ["ticket", "bug"] } },
+        { id: "ticket", query: "q" },
+        { id: "bug", query: "q" },
+      );
+      // BUTCHR-2 relates to two ideas, and Jira shows the BUTCHR-1 link twice.
+      const src = issue("BUTCHR-2", { issuelinks: [...relatesTo("BUTCHR-1", "inward"), ...relatesTo("BUTCHR-1", "inward"), ...relatesTo("BUTCHR-3", "outward")] });
+      const ms = [
+        match(byId(twoSources, "idea"), idea()), match(byId(twoSources, "idea"), issue("BUTCHR-3", { issuelinks: relatesTo("BUTCHR-2", "inward") })),
+        match(byId(twoSources, "ticket"), src), match(byId(twoSources, "bug"), src),
+      ];
+      expect(relatedForRules(twoSources, ms, keys(ms))).toEqual([
+        { issue: ms[3]!, watchers: ["jira-work:idea:BUTCHR-1", "jira-work:idea:BUTCHR-3"] },
+      ]);
+    });
+
+    test("unrelated links route nothing sideways: Blocks, Implements for an inward rule, Relates for a child rule, links to unmatched tickets", () => {
+      const withChild = rules(
+        { id: "idea", query: "q", relationships: { inwardConnectionRules: ["ticket"] } },
+        { id: "epic", query: "q", relationships: { childRule: "ticket" } },
+        { id: "ticket", query: "q" },
+      );
+      const t = (id: string) => byId(withChild, id);
+      const cases: RuleMatch[][] = [
+        [match(t("idea"), issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] })), match(t("ticket"), issue("BUTCHR-2"))],
+        [match(t("idea"), boss()), match(t("ticket"), worker())],
+        [match(t("epic"), idea()), match(t("ticket"), ticket())],
+        [match(t("idea"), idea("BUTCHR-1", "BUTCHR-99")), match(t("ticket"), ticket("BUTCHR-2", "BUTCHR-98"))],
+      ];
+      for (const ms of cases) expect(relatedForRules(withChild, ms, keys(ms))).toEqual([]);
+    });
+
+    test("a Relates change notifies the listening agent once through event routing, and not the listed one", async () => {
+      const events = createRuleEventRules({ rules: side });
+      const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(side, ms, keys(ms)) });
+      const at = (t: JiraIssue, i: JiraIssue = idea()) => [match(r("idea"), i), match(r("ticket"), t)];
+      const ev = await events.poll(snap(at(ticket())), snap(at(issue("BUTCHR-2", { issuelinks: relatesTo("BUTCHR-1", "inward"), status: "Done", updated: "later" }))));
+      expect(ev.changedRelated).toEqual(["jira-work:ticket:BUTCHR-2"]);
+      expect((await ev.decide("jira-work:ticket:BUTCHR-2", "jira-work:idea:BUTCHR-1", "related")).deliver).toBe(true);
+      expect(await ev.decide("jira-work:ticket:BUTCHR-2", "jira-work:ticket:BUTCHR-2", "related")).toEqual({ deliver: false });
+      // The idea changing is heard by nobody else: the ticket rule does not accept it inward.
+      const back = await events.poll(snap(at(ticket())), snap(at(ticket(), issue("BUTCHR-1", { issuelinks: relatesTo("BUTCHR-2", "outward"), status: "Done", updated: "later" }))));
+      expect(back.changedRelated).toEqual([]);
+    });
   });
 
   test("a missing or invalid relationship routes nothing, without disturbing a valid one", () => {
@@ -213,16 +306,19 @@ describe("rule relationships", () => {
     expect(relatedForRules(ruleSet, mixed, keys(mixed)).map((r) => [r.issue.issue.key, r.watchers])).toEqual([["BUTCHR-2", ["jira-work:epic:BUTCHR-1"]]]);
   });
 
-  test("a worker matched by several rules is one entry; several boss rules on one ticket each watch under their own key", () => {
+  test("a worker matched by several rules is one entry; a child rule and an inward rule on one ticket each watch under their own key", () => {
     const two = rules(
       { id: "epic", query: "q", relationships: { childRule: "story" } },
       { id: "lead", query: "q", relationships: { inwardConnectionRules: ["story", "spike"] } },
       { id: "story", query: "q" },
       { id: "spike", query: "q" },
     );
+    // The tickets are joined both ways: Implements (for epic) and Relates (for lead).
+    const b = boss({ issuelinks: [...implementedBy("BUTCHR-2"), ...relatesTo("BUTCHR-2", "outward")] });
+    const w = worker({ issuelinks: [...implementsBoss("BUTCHR-1"), ...relatesTo("BUTCHR-1", "inward")] });
     const ms = [
-      match(byId(two, "epic"), boss()), match(byId(two, "lead"), boss()),
-      match(byId(two, "story"), worker()), match(byId(two, "spike"), worker()),
+      match(byId(two, "epic"), b), match(byId(two, "lead"), b),
+      match(byId(two, "story"), w), match(byId(two, "spike"), w),
     ];
     expect(relatedForRules(two, ms, keys(ms))).toEqual([
       { issue: ms[3]!, watchers: ["jira-work:epic:BUTCHR-1", "jira-work:lead:BUTCHR-1"] },

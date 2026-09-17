@@ -12,8 +12,8 @@
  *
  * Relationships are READ, never written: a rule's `childRule` and
  * `inwardConnectionRules` name the rules whose agents it hears, and an
- * existing Jira `Implements` link names which tickets (see
- * `relatedForRules`). Deliberately NOT here (later slices): creating or
+ * existing Jira `Implements` (child) or `Relates` (inward) link names which
+ * tickets (see `relatedForRules`). Deliberately NOT here (later slices): creating or
  * editing links, relationship patterns, and stand-down sleep.
  */
 import type { JiraIssue } from "../atlassian/types.js";
@@ -64,57 +64,66 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
   return perRule.flat();
 }
 
-/** Ids of the rules whose agents `rule`'s agents hear: its child rule and every inward connection rule. */
-const heardRules = (rule: Rule): Set<string> =>
-  new Set([...(rule.relationships?.childRule ? [rule.relationships.childRule] : []), ...(rule.relationships?.inwardConnectionRules ?? [])]);
-
 /**
  * The related set: which rule agents hear which OTHER matched tickets.
  *
- * Agent `R:B` hears ticket `W` exactly when BOTH hold:
- * - configuration: some rule `C` matching `W` is `R`'s `childRule` or is in
- *   `R`'s `inwardConnectionRules`; and
- * - Jira: `W` implements `B` — an `Implements` link with `W` on the
- *   implementer side, as read from either ticket's `issuelinks`.
+ * Agent `R:B` hears ticket `W` exactly when, for some rule `C` matching `W`,
+ * one of these holds:
+ * - up (boss hears worker): `C` is `R`'s `childRule` and Jira has `W`
+ *   implementing `B` — an `Implements` link with `W` on the implementer side;
+ * - inward (sideways): `C` is in `R`'s `inwardConnectionRules` and Jira has
+ *   `W` and `B` joined by a `Relates` link, either way round.
+ * Links are read from either ticket's `issuelinks`.
  *
- * Direction is the link's, never the issue type's or project's: a boss hears
- * its worker, a worker never hears its boss, and a `Relates`/`Blocks` link or
- * a reversed `Implements` link routes nothing. A ticket no enabled rule
- * matches has no identity here and neither hears nor is heard. Only agents in
- * `active` watch.
+ * `Implements` carries direction itself: a worker never hears its boss, and
+ * nothing routes down. `Relates` is symmetric in Jira, so ONLY configuration
+ * decides direction across it: `R:B` hearing `C:W` says nothing about `C:W`
+ * hearing `R:B`, which needs `R` in `C`'s `inwardConnectionRules`. The two
+ * link kinds never stand in for each other (a child over `Relates`, or an
+ * inward connection over `Implements`, routes nothing), and `Blocks` and
+ * other types route nothing. A ticket no enabled rule matches has no
+ * identity here and neither hears nor is heard. Only agents in `active`
+ * watch.
  *
- * One entry per worker TICKET, however many rules match it, so a boss hears
- * one change once. Its id is the smallest contributing worker agent key —
- * any stable member works, since routing reads the ticket, not the rule.
+ * One entry per heard TICKET, however many rules or links connect it, so a
+ * listener hears one change once. Its id is the smallest contributing agent
+ * key — any stable member works, since routing reads the ticket, not the rule.
  */
 export function relatedForRules(rules: readonly Rule[], matches: readonly RuleMatch[], active: readonly string[]): RelatedResource<RuleMatch>[] {
   const activeSet = new Set(active);
-  const heard = new Map(rules.map((r) => [r.id, heardRules(r)]));
+  const byId = new Map(rules.map((r) => [r.id, r]));
+  const hears: Record<"child" | "inward", (listener: Rule, source: Rule) => boolean> = {
+    child: (listener, source) => byId.get(listener.id)?.relationships?.childRule === source.id,
+    inward: (listener, source) => byId.get(listener.id)?.relationships?.inwardConnectionRules?.includes(source.id) ?? false,
+  };
   const byIssue = new Map<string, RuleMatch[]>();
   for (const m of matches) byIssue.set(m.issue.key, [...(byIssue.get(m.issue.key) ?? []), m]);
 
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
-  const edge = (workerKey: string, bossKey: string) => {
-    if (workerKey === bossKey) return;
-    for (const boss of byIssue.get(bossKey) ?? []) {
-      if (!activeSet.has(boss.agentKey)) continue;
-      const hears = heard.get(boss.rule.id);
-      for (const worker of byIssue.get(workerKey) ?? []) {
-        if (!hears?.has(worker.rule.id)) continue;
-        const e = out.get(workerKey);
-        if (!e) out.set(workerKey, { issue: worker, watchers: new Set([boss.agentKey]) });
+  const edge = (sourceKey: string, listenerKey: string, kind: "child" | "inward") => {
+    if (sourceKey === listenerKey) return;
+    for (const listener of byIssue.get(listenerKey) ?? []) {
+      if (!activeSet.has(listener.agentKey)) continue;
+      for (const source of byIssue.get(sourceKey) ?? []) {
+        if (!hears[kind](listener.rule, source.rule)) continue;
+        const e = out.get(sourceKey);
+        if (!e) out.set(sourceKey, { issue: source, watchers: new Set([listener.agentKey]) });
         else {
-          e.watchers.add(boss.agentKey);
-          if (worker.agentKey < e.issue.agentKey) e.issue = worker;
+          e.watchers.add(listener.agentKey);
+          if (source.agentKey < e.issue.agentKey) e.issue = source;
         }
       }
     }
   };
   for (const [key, ms] of byIssue) {
     for (const link of ms[0]!.issue.issuelinks ?? []) {
-      if (link.type !== "Implements") continue;
-      if (link.otherEnd === "inward") edge(key, link.key);
-      else edge(link.key, key);
+      if (link.type === "Implements") {
+        if (link.otherEnd === "inward") edge(key, link.key, "child");
+        else edge(link.key, key, "child");
+      } else if (link.type === "Relates") {
+        edge(key, link.key, "inward");
+        edge(link.key, key, "inward");
+      }
     }
   }
   return [...out.values()].map((e) => ({ issue: e.issue, watchers: [...e.watchers].sort() }));
@@ -142,7 +151,7 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
  * it back to the agent key, so one agent's own write is swallowed for that
  * agent but still reaches a second agent on the same ticket.
  *
- * Related changes (a worker heard by boss agents, see `relatedForRules`) go
+ * Related changes (a ticket heard by other rule agents, see `relatedForRules`) go
  * through one more instance of the same stack whose watchers ARE agent keys,
  * so a worker agent's own write still reaches its boss.
  */
