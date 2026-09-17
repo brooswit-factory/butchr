@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
@@ -20,69 +21,60 @@ afterEach(clearQuota);
 /** One foreground process, as herdr's `pane.process_info` reports it. */
 interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
-function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
-  const started: any[] = []; const closed: string[] = [];
+function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined }>) {
+  const started: any[] = []; const closed: string[] = []; let createdCwd: string | undefined;
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
-      const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).replace(/-[0-9a-f]{12}$/, "").toUpperCase() : null;
-      return issue ? { ...a, agent: "claude", cwd: join(workspaceRoot(), issue) } : a;
-    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id }); } },
+      // Names are key hashes, so started agents carry their workspace's cwd; fixtures seeded by name still map `butchr-kan-1` to KAN-1.
+      const cwd = a.cwd ?? (a.name?.startsWith("butchr-") ? join(workspaceRoot(), a.name.slice("butchr-".length).toUpperCase()) : undefined);
+      return cwd ? { ...a, agent: "claude", cwd } : a;
+    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd }); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
-    workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
+    workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: "w9:p1" } }; } },
   };
   return { client: client as any, started, closed };
 }
 
 describe("agent name convention", () => {
-  const HERDR_NAME = /^[a-z0-9_-]+$/;
-  const HERDR_NAME_MAX = 32;
-
-  test("formats the optional display alias as a readable slug plus a key hash", () => {
-    expect(agentNameFor("KAN-1")).toMatch(/^butchr-kan-1-[0-9a-f]{12}$/);
-  });
-
-  test("uppercase Jira keys in rule agent keys become Herdr-valid names", () => {
-    for (const key of [
-      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" }),
-      encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "triage", resourceId: "IDEAS-7" }),
-      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "MY_PROJ-1" }),
-      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "triage", resourceId: "owner/repo.js#12" }),
-      encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "triage", resourceId: "acme#123" }),
-    ]) {
-      expect(agentNameFor(key)).toMatch(HERDR_NAME);
-      expect(agentNameFor(key).length).toBeLessThanOrEqual(HERDR_NAME_MAX);
-      expect(agentNameFor(key)).toBe(agentNameFor(key));
-    }
-    expect(agentNameFor("jira-work:triage:BUTCHR-364")).toMatch(/^butchr-butchr-364-[0-9a-f]{12}$/);
-    expect(agentNameFor("jira-work:live-jira-work:BUTCHR-364")).toMatch(/^butchr-butchr-364-[0-9a-f]{12}$/);
-  });
-
-  test("keys that squash to the same slug still get distinct names", () => {
-    const pairs: [string, string][] = [
-      [encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x-my", resourceId: "PROJ-1" }), encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x", resourceId: "MY_PROJ-1" })],
-      [encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a-b/c#1" }), encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a/b-c#1" })],
-      ["KAN-1", "kan-1"],
-    ];
-    for (const [a, b] of pairs) expect(agentNameFor(a)).not.toBe(agentNameFor(b));
-  });
-
-  test("the live-validation key that Herdr rejected fits Herdr's 32-character limit", () => {
-    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
+  const HERDR_NAME = /^butchr-[0-9a-f]{24}$/;
+  const valid = (key: string) => {
     const name = agentNameFor(key);
-    expect(name.length).toBeGreaterThanOrEqual(1);
-    expect(name.length).toBeLessThanOrEqual(HERDR_NAME_MAX);
     expect(name).toMatch(HERDR_NAME);
-    expect(name).toBe(name.toLowerCase());
-    expect(name).not.toBe(agentNameFor(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-365" })));
-    expect(name).not.toBe(agentNameFor(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-wrk", resourceId: "BUTCHR-364" })));
-    expect(name).not.toBe(agentNameFor(key.toLowerCase()));
+    expect(name.length).toBe(31);
+    expect(name.length).toBeLessThanOrEqual(32);
+    return name;
+  };
+
+  test("one key always gets the same fixed-length name", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
+    expect(valid(key)).toBe(agentNameFor(key));
+    expect(agentNameFor(key)).toBe(`butchr-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`);
   });
 
-  test("very long keys stay bounded and distinct", () => {
-    const long = (n: number) => encodeAgentKey({ resourceProvider: "github-issue", ruleId: "a".repeat(64), resourceId: `owner/${"r".repeat(80)}#${n}` });
-    expect(agentNameFor(long(1)).length).toBeLessThanOrEqual(HERDR_NAME_MAX);
-    expect(agentNameFor(long(1))).toMatch(HERDR_NAME);
-    expect(agentNameFor(long(1))).not.toBe(agentNameFor(long(2)));
+  test("different resources, rules and providers get different names", () => {
+    const names = [
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-365" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage-2", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "triage", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x-my", resourceId: "PROJ-1" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x", resourceId: "MY_PROJ-1" }),
+      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a-b/c#1" }),
+      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a/b-c#1" }),
+      encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "r", resourceId: "acme#123" }),
+    ].map(valid);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  test("uppercase keys become lowercase names that still distinguish case", () => {
+    expect(valid("jira-work:TRIAGE:BUTCHR-364")).not.toBe(valid("jira-work:triage:butchr-364"));
+    expect(valid("KAN-1")).not.toBe(valid("kan-1"));
+  });
+
+  test("very long and unusual keys stay within Herdr's limit and distinct", () => {
+    const long = (n: number) => `github-issue:${"a".repeat(200)}:owner%2F${"R".repeat(500)}%23${n}`;
+    expect(valid(long(1))).not.toBe(valid(long(2)));
+    for (const key of ["", ":", "Ünïcødé:ключ:🦀", "x".repeat(10_000), " \t\n:/#%"]) valid(key);
   });
 });
 
@@ -105,8 +97,7 @@ describe("HerdrHerd", () => {
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
     await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
     expect(f.started[0].name).toBe(agentNameFor(key));
-    expect(f.started[0].name).toMatch(/^[a-z0-9_-]+$/);
-    expect(f.started[0].name.length).toBeLessThanOrEqual(32);
+    expect(f.started[0].name).toMatch(/^butchr-[0-9a-f]{24}$/);
     expect(workspaceDirFor(key)).toBe(join(workspaceRoot(), "jira-work", "triage", "BUTCHR-364")); // workspace identity keeps the exact key
   });
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
