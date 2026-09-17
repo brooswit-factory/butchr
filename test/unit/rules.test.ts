@@ -3,7 +3,6 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeAgentKey, encodeAgentKey, loadRules, parseRules, RULE_ID_MAX, rulesPath } from "../../src/rules/rules.js";
-import { DEFAULT_RULES_DOCUMENT } from "../../src/rules/defaults.js";
 
 const minimal = { id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "triage it" };
 const parsedMinimal = { ...minimal, enabled: true };
@@ -19,21 +18,19 @@ describe("rulesPath", () => {
 });
 
 describe("loadRules", () => {
-  test("absent file uses the built-in defaults in memory, marked as such", () => {
+  test("absent file is zero rules, marked missing, and nothing is written", () => {
     const writes: string[] = [];
     const r = loadRules({ BUTCHR_RULES_FILE: "/nope.json" }, (p) => { writes.push(p); return undefined; });
-    expect(r.origin).toBe("defaults");
-    expect(r.path).toBe("/nope.json");
-    expect(r.rules.map((x) => x.id)).toEqual(["epic", "story", "task", "subtask", "bug"]);
+    expect(r).toEqual({ path: "/nope.json", origin: "missing", rules: [] });
     expect(writes).toEqual(["/nope.json"]);
   });
-  test("a present file replaces the defaults entirely, even when empty", () => {
+  test("a present empty file is also zero rules", () => {
     expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [] });
   });
-  test("default reader: absent file is defaults, present file parses, a directory throws", () => {
+  test("default reader: absent file is missing, present file parses, a directory throws", () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-rules-"));
     try {
-      expect(loadRules({ XDG_CONFIG_HOME: dir }).origin).toBe("defaults");
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [] });
       mkdirSync(join(dir, "butchr"));
       writeFileSync(join(dir, "butchr", "rules.json"), JSON.stringify({ rules: [minimal] }));
       expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [parsedMinimal as never] });
@@ -42,18 +39,6 @@ describe("loadRules", () => {
   });
   test("invalid JSON names the file", () => {
     expect(() => loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => "{")).toThrow("/r.json: invalid JSON");
-  });
-});
-
-describe("built-in defaults", () => {
-  test("validate like any user file, round-trip through JSON, and chain children", () => {
-    const rules = parseRules(JSON.parse(JSON.stringify(DEFAULT_RULES_DOCUMENT)));
-    expect(Object.fromEntries(rules.map((r) => [r.id, r.relationships?.childRule ?? null])))
-      .toEqual({ epic: "story", story: "task", task: "subtask", subtask: null, bug: "story" });
-    for (const r of rules) {
-      expect(r.enabled).toBe(true);
-      expect(r.query).toContain("assignee = currentUser() AND labels = chop");
-    }
   });
 });
 

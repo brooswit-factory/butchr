@@ -14,15 +14,13 @@
  *
  * Rules live in a JSON file OUTSIDE the repo: `BUTCHR_RULES_FILE` when set,
  * else `$XDG_CONFIG_HOME/butchr/rules.json`, else
- * `~/.config/butchr/rules.json`. When that file is absent the built-in
- * example rules (`./defaults.ts`) are used in memory; nothing is written.
- * A present file replaces the defaults entirely — it is never merged, so
- * deleting a rule from the file really deletes it.
+ * `~/.config/butchr/rules.json`. When that file is absent there are ZERO
+ * rules and nothing is staffed; nothing is written. There are no built-in
+ * rules or templates — a present file is the only source of rules.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_RULES_DOCUMENT } from "./defaults.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
@@ -172,14 +170,14 @@ const readIfExists: ReadRulesFile = (path) => {
 };
 
 /**
- * Loads and validates rules. `origin` says whether they came from the user's
- * file or the in-memory built-in examples, so a caller can refuse to act on
- * defaults it was never told to use.
+ * Loads and validates rules. A missing file is `origin: "missing"` with zero
+ * rules — there is no fallback — so a caller can say plainly why nothing is
+ * staffed.
  */
-export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "defaults"; rules: Rule[] } {
+export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[] } {
   const path = rulesPath(env);
   const text = read(path);
-  if (text === undefined) return { path, origin: "defaults", rules: parseRules(DEFAULT_RULES_DOCUMENT, "built-in default rules") };
+  if (text === undefined) return { path, origin: "missing", rules: [] };
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }

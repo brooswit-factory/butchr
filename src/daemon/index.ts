@@ -73,14 +73,15 @@ if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
-// an absent file falls back to the built-in example rules, announced loudly
-// so that is never mistaken for configuration.
+// an absent file means zero rules (there are no built-in defaults), announced
+// so an idle daemon is never a mystery.
 let rules;
 try {
   const loaded = loadRules(process.env as Record<string, string | undefined>);
   rules = loaded.rules;
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
-  console.error(`butchr: rules from ${loaded.origin === "file" ? loaded.path : `built-in defaults (no file at ${loaded.path})`}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
+  else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   process.exit(1);
