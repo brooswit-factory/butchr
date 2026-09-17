@@ -70,7 +70,9 @@ function compactUtc(ms: number): string {
  * `<PROJECT>-<trigger>-<compact-UTC-timestamp>.txt` — recognises exactly the
  * filenames this module writes, for BOTH an issue caller's id (`BUTCHR-68`,
  * `-\d+` suffix) and a project caller's bare key (`BUTCHR`, no suffix — see
- * `src/resources/id.ts`), and captures the timestamp segment. Three things
+ * `src/resources/id.ts`) — and for a rule-engine agent key
+ * (`jira-work:<rule>:<ISSUE>`, src/rules/agent-key.ts), which is what the
+ * daemon's rows carry now — and captures the timestamp segment. Three things
  * depend on this, all from review on BUTCHR-12/BUTCHR-98: eviction must sort
  * by the TIMESTAMP, not the whole filename — a plain lexicographic sort of
  * the full name orders by issue key first, so across more than one issue it
@@ -83,7 +85,7 @@ function compactUtc(ms: number): string {
  * `-escalation-` in that position instead, so the two shapes stay mutually
  * exclusive regardless of the issue-vs-project prefix.
  */
-const CAPTURE_NAME = /^[A-Z][A-Z0-9]*(?:-\d+)?-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
+const CAPTURE_NAME = /^(?:[A-Z][A-Z0-9]*(?:-\d+)?|(?:jira-work|github-issue|jira-idea|zendesk-ticket):[a-z0-9-]+:[A-Za-z0-9%._~-]+)-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
 
 /** Our own capture files present in the sink, oldest (by timestamp) first; anything we didn't write is excluded. */
 async function ourCapturesOldestFirst(sink: CaptureSink): Promise<{ name: string; ts: string }[]> {
