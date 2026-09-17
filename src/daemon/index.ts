@@ -642,8 +642,10 @@ void sweepStaleAgentLabels({
 // never decodes as an agent key, so this loop can neither stop nor adopt it.
 const ruleResourceType = createRuleResourceType({
   rules,
+  // searchAll, never search: a first-page-only result would read as tickets
+  // leaving the query and stop their agents.
   search: async (jql) => {
-    const issues = await atlassian.search(jql);
+    const issues = await atlassian.searchAll(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
   },

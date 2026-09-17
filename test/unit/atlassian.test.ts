@@ -27,6 +27,38 @@ describe("AtlassianClient", () => {
     const c2 = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [{ key: "K", fields: {} }] } }));
     expect((await c2.search("x"))[0]).toMatchObject({ key: "K", summary: "", assignee: null });
   });
+  describe("searchAll", () => {
+    const pages = (bodies: Record<string, unknown>) => {
+      const urls: string[] = [];
+      const fetchImpl = async (url: string): Promise<Response> => {
+        urls.push(url);
+        const token = new URL(url).searchParams.get("nextPageToken") ?? "";
+        return new Response(JSON.stringify(bodies[token]), { status: 200 });
+      };
+      return { urls, fetchImpl };
+    };
+    const iss = (...keys: string[]) => keys.map((key) => ({ key, fields: {} }));
+
+    test("follows nextPageToken until the last page, so no match past page one reads as absent", async () => {
+      const { urls, fetchImpl } = pages({
+        "": { issues: iss("K-1", "K-2"), nextPageToken: "t1", isLast: false },
+        t1: { issues: iss("K-3"), isLast: true },
+      });
+      const c = new AtlassianClient("https://x", "a", "t", fetchImpl);
+      expect((await c.searchAll("labels = chop", 1000, 2)).map((i) => i.key)).toEqual(["K-1", "K-2", "K-3"]);
+      expect(urls.length).toBe(2);
+      expect(new URL(urls[1]!).searchParams.get("jql")).toBe("labels = chop");
+    });
+
+    test("refuses a partial result instead of truncating", async () => {
+      const over = new AtlassianClient("https://x", "a", "t", pages({ "": { issues: iss("K-1", "K-2"), nextPageToken: "t1" }, t1: { issues: iss("K-3") } }).fetchImpl);
+      await expect(over.searchAll("q", 2, 2)).rejects.toThrow(/more than 2 issues/);
+      const noToken = new AtlassianClient("https://x", "a", "t", pages({ "": { issues: iss("K-1"), isLast: false } }).fetchImpl);
+      await expect(noToken.searchAll("q")).rejects.toThrow(/partial result/);
+      const loop = new AtlassianClient("https://x", "a", "t", pages({ "": { issues: [], nextPageToken: "t1" }, t1: { issues: [], nextPageToken: "t1" } }).fetchImpl);
+      await expect(loop.searchAll("q")).rejects.toThrow(/repeated nextPageToken/);
+    });
+  });
   // BUTCHR-169: ISSUE_SPAWN_CONFIG.specFor (src/resources/issue.ts) derives a
   // spawned ticket's boss from issuelinks on the SEARCH result — this is the
   // batching that makes that possible without a second, per-issue API call

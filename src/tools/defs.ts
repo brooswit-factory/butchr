@@ -221,8 +221,9 @@ export function atlassianTools(
    * module's own top comment for why pane release is a separate signal from
    * sleep itself) rather than this tool layer knowing either one exists.
    * Optional — every existing caller of `atlassianTools` keeps working
-   * unchanged; when omitted, `stand_down` still reads and returns its
-   * snapshot, it just never actually sleeps or releases its pane.
+   * unchanged; when omitted, `stand_down` still reads its snapshot but
+   * answers `asleep: false` with a note, since nothing will sleep or release
+   * its pane.
    */
   standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
 ): Record<string, ToolDef<any>> {
@@ -871,7 +872,13 @@ export function atlassianTools(
         // without throwing — see standDown's own doc comment (this
         // function's parameter list) for why the daemon composes this from
         // two registries rather than this handler knowing either exists.
-        standDown?.(who, seen);
+        if (!standDown) {
+          // Never claim a sleep nobody will enforce: the rule engine wires no
+          // stand-down yet, and an agent told it is asleep waits for a pane
+          // release and a fresh session that never come.
+          return { ok: true, key: who, asleep: false, watching: keys, note: "stand_down is not available for this agent: you were NOT put to sleep and your session was NOT released. Stay in this session; changes to your ticket still reach you as messages." };
+        }
+        standDown(who, seen);
         return { ok: true, key: who, asleep: true, watching: keys };
       },
     },

@@ -31,6 +31,8 @@ export class AtlassianHttpError extends Error {
   }
 }
 
+const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks";
+
 /**
  * A thin Jira Cloud REST client using classic-token Basic auth. `fetch` is
  * injectable so the client is testable without the network. Small on purpose —
@@ -86,9 +88,33 @@ export class AtlassianClient {
    * separately.
    */
   async search(jql: string, maxResults = 100): Promise<JiraIssue[]> {
-    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: "summary,status,issuetype,assignee,parent,updated,labels,issuelinks" });
+    const q = new URLSearchParams({ jql, maxResults: String(maxResults), fields: SEARCH_FIELDS });
     const body = await this.get(`/rest/api/3/search/jql?${q}`);
     return (body.issues ?? []).map(mapIssue);
+  }
+
+  /**
+   * EVERY issue matching `jql`, following `nextPageToken` — or a throw, never
+   * a silently truncated list. For callers where a missing issue means
+   * something (the rule engine reads absence as "left the query" and stops
+   * that agent), `search`'s first-page-only result is unsafe. More than
+   * `maxIssues` matches also throws: that query is almost certainly a
+   * mistake, and failing the poll is better than staffing it.
+   */
+  async searchAll(jql: string, maxIssues = 1000, pageSize = 100): Promise<JiraIssue[]> {
+    const out: JiraIssue[] = [];
+    let token: string | undefined;
+    do {
+      const q = new URLSearchParams({ jql, maxResults: String(pageSize), fields: SEARCH_FIELDS, ...(token ? { nextPageToken: token } : {}) });
+      const body = await this.get(`/rest/api/3/search/jql?${q}`);
+      out.push(...(body.issues ?? []).map(mapIssue));
+      if (out.length > maxIssues) throw new Error(`JQL matched more than ${maxIssues} issues — refusing a partial result: ${jql}`);
+      const next = typeof body.nextPageToken === "string" && body.nextPageToken ? body.nextPageToken : undefined;
+      if (body.isLast === false && !next) throw new Error(`Jira reported more results without a nextPageToken — refusing a partial result: ${jql}`);
+      if (next !== undefined && next === token) throw new Error(`Jira repeated nextPageToken — refusing a partial result: ${jql}`);
+      token = next;
+    } while (token);
+    return out;
   }
 
   /**
