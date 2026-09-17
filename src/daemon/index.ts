@@ -53,6 +53,9 @@ import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing } from "../rules/github-issue-type.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
 import { startGithubIssueLoop } from "./github-issue-loop.js";
+import { createJiraIdeaClient } from "../resources/jira-idea.js";
+import { jiraIdeaTools } from "../tools/jira-idea.js";
+import { jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
@@ -100,6 +103,10 @@ const githubIssues = githubStaffing.run && config.github
   : undefined;
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// jira-idea rules share this Jira client but are their own provider: their
+// own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
+const ideaRules = jiraIdeaRules(rules);
+const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
 // This gate preflights that per project (first sight, cached for the run)
@@ -132,12 +139,13 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 // this daemon never calls `admissionController.admit` directly.
 const ADMISSION_SOURCE_ISSUE = "issue";
 const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
+const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: githubIssues ? [ADMISSION_SOURCE_ISSUE, ADMISSION_SOURCE_GITHUB_ISSUE] : [ADMISSION_SOURCE_ISSUE],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : [])],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -322,9 +330,10 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue agents; GitHub tools exist only when github-issue rules run.
+  // Jira/Confluence tools refuse github-issue and jira-idea agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
 });
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -724,6 +733,29 @@ startGithubIssueLoop({
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
+  onAdmitted: admissionController.recordSpawned,
+  log: (line) => console.error(`  ${line}`),
+});
+
+// The jira-idea rule loop: proven Product Discovery ideas only, its own
+// agents and admission bucket, and none of the work-item detectors above.
+if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
+startJiraIdeaLoop({
+  rules,
+  search: async (jql) => {
+    const issues = await atlassian.searchAll(jql);
+    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
+    return issues;
+  },
+  comments: (key) => atlassian.comments(key),
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_IDEA),
   onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),
 });

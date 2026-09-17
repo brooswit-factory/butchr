@@ -1,5 +1,8 @@
 import type { JiraIssue, IssueLink, JiraComment } from "./types.js";
 
+/** One issue read by key, with its description flattened to plain text. */
+export interface JiraIssueDetail extends JiraIssue { description: string }
+
 /** ADF node shape is large and mostly irrelevant here; walk it structurally. */
 interface AdfNode { type?: string; text?: string; content?: AdfNode[] }
 
@@ -31,7 +34,7 @@ export class AtlassianHttpError extends Error {
   }
 }
 
-const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks";
+const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks,project";
 
 /**
  * A thin Jira Cloud REST client using classic-token Basic auth. `fetch` is
@@ -149,11 +152,48 @@ export class AtlassianClient {
     return parseIssueLinks(body.fields?.issuelinks);
   }
 
+  /**
+   * One issue by key or id, with the search fields plus its description.
+   * Jira answers a moved issue's OLD key with the issue under its NEW key,
+   * so callers that act on a specific key must compare `key` themselves.
+   */
+  async issue(issueKey: string): Promise<JiraIssueDetail> {
+    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${SEARCH_FIELDS},description`);
+    if (!body || typeof body.key !== "string") throw new Error(`Jira issue read for ${issueKey} returned an unexpected body`);
+    return { ...mapIssue(body), description: adfToText(body.fields?.description) };
+  }
+
+  /** EVERY comment on a ticket, oldest first — or a throw, never a silently partial list. */
+  async allComments(issueKey: string, maxComments = 1000, pageSize = 100): Promise<JiraComment[]> {
+    const out: JiraComment[] = [];
+    for (;;) {
+      const q = new URLSearchParams({ orderBy: "created", startAt: String(out.length), maxResults: String(pageSize) });
+      const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment?${q}`);
+      if (!Array.isArray(body?.comments) || typeof body.total !== "number") throw new Error(`Jira comments for ${issueKey} returned an unexpected body`);
+      out.push(...body.comments.map(mapComment));
+      if (out.length > maxComments) throw new Error(`Jira comments for ${issueKey} exceed ${maxComments} — refusing a partial list`);
+      if (out.length >= body.total) return out;
+      if (!body.comments.length) throw new Error(`Jira comments for ${issueKey} stopped before the reported total (${body.total}) — refusing a partial list`);
+    }
+  }
+
+  /** Post a plain-text comment (one ADF paragraph, the same shape `adf()` in src/tools/atlassian-real.ts sends). */
+  async addComment(issueKey: string, text: string): Promise<JiraComment> {
+    const path = `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`;
+    const res = await this.fetchImpl(`${this.site}${path}`, {
+      method: "POST",
+      headers: { authorization: this.auth, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] } }),
+    });
+    if (!res.ok) throw new AtlassianHttpError(res.status, "POST", path, (await res.text()).slice(0, 200));
+    return mapComment(await res.json());
+  }
+
   /** Recent comments on a ticket, newest-first, ADF bodies flattened to plain text. */
   async comments(issueKey: string, maxResults = 20): Promise<JiraComment[]> {
     const q = new URLSearchParams({ orderBy: "-created", maxResults: String(maxResults) });
     const body = await this.get(`/rest/api/3/issue/${issueKey}/comment?${q}`);
-    return (body.comments ?? []).map((c: any) => ({ id: c.id, body: adfToText(c.body), created: c.created ?? "", authorEmail: c.author?.emailAddress ?? null }));
+    return (body.comments ?? []).map(mapComment);
   }
 }
 
@@ -183,6 +223,10 @@ function parseIssueLinks(raw: any[] | undefined): IssueLink[] {
   return out;
 }
 
+function mapComment(c: any): JiraComment {
+  return { id: c.id, body: adfToText(c.body), created: c.created ?? "", authorEmail: c.author?.emailAddress ?? null };
+}
+
 function mapIssue(i: any): JiraIssue {
   const f = i.fields ?? {};
   return {
@@ -194,6 +238,7 @@ function mapIssue(i: any): JiraIssue {
     parent: f.parent?.key ?? null,
     updated: f.updated ?? "",
     labels: f.labels ?? [],
+    ...(typeof f.project?.projectTypeKey === "string" ? { projectType: f.project.projectTypeKey } : {}),
     // BUTCHR-169: only set when the caller's `fields` included "issuelinks"
     // (search() does; nothing else calling mapIssue needs to) — `undefined`
     // when absent from the response, never a fabricated `[]` standing in

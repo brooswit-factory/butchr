@@ -18,6 +18,13 @@ export interface JiraIssue {
   updated: string;
   labels: string[];
   /**
+   * The issue's project type (`fields.project.projectTypeKey`: `software`,
+   * `business`, `service_desk`, `product_discovery`), when the response
+   * carried it — `undefined` means UNKNOWN. Read by the jira-work/jira-idea
+   * boundary (src/resources/jira-idea.ts), which treats unknown as unproven.
+   */
+  projectType?: string;
+  /**
    * BUTCHR-169: this issue's links, when the caller asked `search()` for
    * them (see that method's `fields` param) — OPTIONAL, not because a real
    * issue can lack the field, but because most existing fixtures across this

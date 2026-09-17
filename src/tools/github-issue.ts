@@ -75,10 +75,16 @@ export function githubIssueTools(deps: GithubIssueToolDeps): Record<string, Tool
   return withOutcomeRecording(tools, log);
 }
 
+/** The only tools each key-only provider's agents may use instead of the Jira work tools. */
+const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work">, string>> = {
+  "github-issue": "github_get_issue and github_add_comment",
+  "jira-idea": "jira_idea_get and jira_idea_add_comment",
+};
+
 /**
- * Wrap Jira/Confluence tools so a `github-issue` agent is refused before any
- * of them runs. A caller the tools already accepted (anyone with `x-issue`)
- * reaches the original handler exactly as before.
+ * Wrap Jira/Confluence tools so a `github-issue` or `jira-idea` agent is
+ * refused before any of them runs. A caller the tools already accepted
+ * (anyone with `x-issue`) reaches the original handler exactly as before.
  */
 export function forJiraCallers(tools: Record<string, ToolDef<any>>, log: (line: string) => void = console.error): Record<string, ToolDef<any>> {
   const gated: Record<string, ToolDef<any>> = {};
@@ -86,9 +92,10 @@ export function forJiraCallers(tools: Record<string, ToolDef<any>>, log: (line: 
     gated[name] = {
       ...def,
       handler: (args: unknown, c: { headers: Readonly<Record<string, string>> }) => {
-        if (callerIdentity(c.headers)?.provider === "github-issue") {
-          log(`  [tools] ${c.headers["x-butchr-agent"]} → refused ${name}: github-issue agents have no Jira or Confluence tools`);
-          throw new Refusal(`${name}: refusing a github-issue agent — Jira and Confluence tools are for jira-work agents; use github_get_issue and github_add_comment`);
+        const provider = callerIdentity(c.headers)?.provider;
+        if (provider && provider !== "jira-work") {
+          log(`  [tools] ${c.headers["x-butchr-agent"]} → refused ${name}: ${provider} agents have no Jira work or Confluence tools`);
+          throw new Refusal(`${name}: refusing a ${provider} agent — Jira and Confluence tools are for jira-work agents; use ${OWN_TOOLS[provider]}`);
         }
         return def.handler(args as never, c as never);
       },

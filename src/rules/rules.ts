@@ -52,9 +52,11 @@ export interface Rule {
   enabled: boolean;
   resourceProvider: ResourceProvider;
   /**
-   * Provider-native query selecting matching resources: JQL for `jira-work`;
-   * GitHub issue search syntax for `github-issue` (scoped to
-   * `BUTCHR_GITHUB_ORGS`, never pull requests — see src/resources/github-issue.ts).
+   * Provider-native query selecting matching resources: JQL for `jira-work`
+   * (proven work items only) and `jira-idea` (proven Product Discovery ideas
+   * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
+   * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
+   * src/resources/github-issue.ts).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -145,7 +147,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if (resourceProvider === "github-issue" && relationships) { errors.push(`${at}.relationships are not supported for github-issue rules yet`); return; }
+    if (resourceProvider !== "jira-work" && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
     rules.push({

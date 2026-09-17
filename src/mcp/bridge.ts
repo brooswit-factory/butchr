@@ -15,13 +15,13 @@ export interface BridgeOptions {
 
 /**
  * Relay only: Thatch owns initialization, discovery, and the entire tool surface.
- * `identity` (the `x-issue`) is omitted only for a `github-issue` agent, which
- * must then name its agent key.
+ * `identity` (the `x-issue`) is omitted only for a `github-issue` or
+ * `jira-idea` agent, which must then name its agent key.
  */
 export async function startBridge(url: URL, identity: string | undefined, options: BridgeOptions = {}) {
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("MCP bridge requires an HTTP URL");
   if (identity === undefined) {
-    if (!options.agent?.startsWith("github-issue:")) throw new Error("MCP bridge requires an issue identity unless it bridges a github-issue agent");
+    if (!/^(github-issue|jira-idea):/.test(options.agent ?? "")) throw new Error("MCP bridge requires an issue identity unless it bridges a github-issue or jira-idea agent");
   } else if (!identity.trim() || identity !== identity.trim() || /[^\x21-\x7e]/.test(identity)) {
     throw new Error("MCP bridge requires a nonempty issue identity without whitespace");
   }

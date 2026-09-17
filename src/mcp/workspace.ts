@@ -1,15 +1,16 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { decodeAgentKey } from "../rules/agent-key.js";
+import { KEY_ONLY_PROVIDERS } from "./identity.js";
 
 /**
  * The global registration is shared; identity is local to each MCP child.
  * Two workspace shapes are accepted: a legacy direct child of the root
  * (`<root>/<ISSUE>`, identity = the directory name) and a rule-engine
  * workspace (`<root>/<provider>/<rule>/<ISSUE>`), whose metadata must also
- * name the agent key the path encodes. A `github-issue` workspace's metadata
- * names its agent and resource instead of an `issue`, and the bridge sends
- * the agent key alone (src/mcp/identity.ts).
+ * name the agent key the path encodes. A `github-issue` or `jira-idea`
+ * workspace's metadata names its agent and resource instead of an `issue`,
+ * and the bridge sends the agent key alone (src/mcp/identity.ts).
  */
 export function bridgeWorkspace(root: string, cwd: string): { url: URL; identity?: string; agent?: string } {
   const directory = realpathSync(cwd);
@@ -21,7 +22,7 @@ export function bridgeWorkspace(root: string, cwd: string): { url: URL; identity
   if (segments.length !== 1 && !decoded) throw new Error("Not a factory workspace");
   const expectedIssue = decoded ? decoded.resourceId : segments[0];
   const value: unknown = JSON.parse(readFileSync(join(directory, ".butchr-agy.json"), "utf8"));
-  if (decoded?.resourceProvider === "github-issue") {
+  if (decoded && KEY_ONLY_PROVIDERS.includes(decoded.resourceProvider)) {
     if (!value || typeof value !== "object" || "issue" in value || !("agent" in value) || value.agent !== agent
       || !("resource" in value) || value.resource !== expectedIssue || !("mcpUrl" in value) || typeof value.mcpUrl !== "string") {
       throw new Error("Invalid factory workspace identity");

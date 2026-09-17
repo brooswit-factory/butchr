@@ -19,6 +19,7 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
+import { jiraIssueClass } from "../resources/jira-idea.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
 import type { Rule } from "./rules.js";
@@ -43,18 +44,25 @@ export interface RuleResourceDeps {
 /** True for exactly the `jira-work` herd ids this engine owns — never a legacy bare-issue or project id, nor another provider's agent. */
 export const ownsRuleAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "jira-work";
 
+/** Told about each issue a rule's query returned that its provider may not staff (see src/resources/jira-idea.ts). */
+export type ExcludedIssue = (rule: Rule, issue: JiraIssue) => void;
+
 /**
  * Every enabled rule's matches. Rules are searched in parallel; ANY failure
  * rejects the whole poll, never a partial result — a partial result would
  * read as "those tickets left the query" and stop healthy agents.
+ *
+ * Only proven work items match: a Product Discovery idea, or anything that
+ * might be one, is `jira-idea`'s or nobody's, however broad the JQL.
  */
-export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search">): Promise<RuleMatch[]> {
+export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search"> & { excluded?: ExcludedIssue }): Promise<RuleMatch[]> {
   const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "jira-work");
   const perRule = await Promise.all(enabled.map(async (rule) => {
     const issues = await deps.search(rule.query);
     const seen = new Set<string>();
     const out: RuleMatch[] = [];
     for (const issue of issues) {
+      if (jiraIssueClass(issue) !== "work") { deps.excluded?.(rule, issue); continue; }
       if (seen.has(issue.key)) continue;
       seen.add(issue.key);
       out.push({ agentKey: encodeAgentKey({ resourceProvider: rule.resourceProvider, ruleId: rule.id, resourceId: issue.key }), rule, issue });
@@ -222,10 +230,11 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
   // The loop calls `related` right after `search` in the same poll, so the
   // relationship walk reads this poll's matches with no second Jira call.
   let latest: RuleMatch[] = [];
+  const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
   return {
     discovery: {
       idOf: (m) => m.agentKey,
-      search: async () => (latest = await searchRules(deps)),
+      search: async () => (latest = await searchRules({ ...deps, excluded })),
       related: async (active) => relatedForRules(deps.rules, latest, active),
     },
     activation: { verdictFor: () => "active" },
@@ -239,4 +248,15 @@ export function uniqueIssues(matches: readonly RuleMatch[]): JiraIssue[] {
   const byKey = new Map<string, JiraIssue>();
   for (const m of matches) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);
   return [...byKey.values()];
+}
+
+/** Logs each (rule, issue) exclusion once per resource type, not once per poll. */
+export function onceExcluded(provider: string, why: string, log: ((line: string) => void) | undefined): ExcludedIssue {
+  const logged = new Set<string>();
+  return (rule, issue) => {
+    const id = `${rule.id}:${issue.key}`;
+    if (logged.has(id)) return;
+    logged.add(id);
+    log?.(`[${provider}] rule ${rule.id} skips ${issue.key}: ${why} (issue type "${issue.issuetype}", project type "${issue.projectType ?? "unknown"}")`);
+  };
 }

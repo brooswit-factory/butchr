@@ -148,3 +148,11 @@ export function githubIssueNudge(resource: string, reason: NotifyReason | undefi
   const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
   return `[butchr] GitHub issue ${resource} ${clause} — re-read it with github_get_issue.`;
 }
+
+/**
+ * The agent-facing push for a `jira-idea` agent's own idea. Names the tool to
+ * re-read with, since an idea agent has no Jira work tools.
+ */
+export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined): string {
+  return `[butchr] Jira Product Discovery idea ${resource} ${reasonClause(reason)} — re-read it with jira_idea_get.`;
+}

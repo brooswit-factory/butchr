@@ -152,7 +152,7 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
-  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isGithub(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
+  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
   writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, resource) : interpolate(briefFor(spec.issuetype), view));
@@ -164,26 +164,36 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
 /** The first line of a rule-engine brief — the only place a rule workspace snapshots the ticket's summary. */
 export const ruleBriefHeader = (ruleId: string, resource: string, summary: string): string => `# ${ruleId} agent — ${resource}: ${summary}`;
 
-const isGithub = (spec: SpawnSpec): boolean => decodeAgentKey(spec.key)?.resourceProvider === "github-issue";
+const providerOf = (spec: SpawnSpec) => decodeAgentKey(spec.key)?.resourceProvider;
+/** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
+const isKeyOnly = (spec: SpawnSpec): boolean => providerOf(spec) === "github-issue" || providerOf(spec) === "jira-idea";
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
   "Your resource is a GitHub issue, not a Jira ticket. Read it (title, body, type, comments) with the butchr `github_get_issue` tool and comment on it with `github_add_comment`; both act only on your own issue. Jira and Confluence tools refuse you. You are told when the issue changes — re-read it then.";
 
+/** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
+export const JIRA_IDEA_TOOLS_NOTE =
+  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool and comment on it with `jira_idea_add_comment`; both act only on your own idea. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
+
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE };
+
 /** A rule-engine brief: the rule's own text under a header naming the ticket. */
-const ruleBrief = (spec: SpawnSpec, resource: string): string =>
-  `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", resource, spec.summary)}\n\n${isGithub(spec) ? `${GITHUB_ISSUE_TOOLS_NOTE}\n\n` : ""}${spec.brief!.trim()}\n`;
+const ruleBrief = (spec: SpawnSpec, resource: string): string => {
+  const note = TOOLS_NOTE[providerOf(spec) ?? ""];
+  return `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", resource, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${spec.brief!.trim()}\n`;
+};
 
 /**
  * Headers identifying an agent to the butchr MCP server. `x-issue` is always
  * the resource (every tool resolves the caller's ticket from it);
  * `x-butchr-agent` is added for rule-engine agents so events and own-write
  * echoes are scoped to the one agent, not every agent on the same ticket.
- * A `github-issue` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
+ * A `github-issue` or `jira-idea` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
  */
 export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
-  // A GitHub issue is not a Jira key: its agent is identified by key alone, so no Jira tool can resolve it as a ticket.
-  if (decodeAgentKey(spec.key)?.resourceProvider === "github-issue") return { "x-butchr-agent": spec.key };
+  // A GitHub issue is not a Jira key, and an idea is not a work item: such an agent is identified by key alone, so no Jira work tool can resolve it as a ticket.
+  if (isKeyOnly(spec)) return { "x-butchr-agent": spec.key };
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }
 
