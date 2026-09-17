@@ -5,9 +5,40 @@ syntax; each matching ticket gets one agent per rule, keyed
 `zendesk-ticket:<ruleId>:<subdomain>#<id>` and working in
 `<workspace root>/zendesk-ticket/<ruleId>/<subdomain>%23<id>`.
 
-This first version reads tickets and adds **internal notes only**. A public
-reply to the requester is not possible: no tool, argument or client method
-can send one (see "What an agent can do" below).
+This first version reads tickets and adds **internal notes only** through
+its tools: no tool, argument or client method sends a public reply (see
+"What an agent can do" below). That is not a security boundary against a
+shell-capable agent, so Zendesk is off until explicitly acknowledged (see
+"Security limit" next).
+
+## Security limit: the tools are not a sandbox
+
+The internal-note-only guarantee below holds for **the MCP tools only**. It
+is not a boundary against the agent itself. Agents run with shell access
+(Claude with `bypassPermissions`, Codex without its sandbox) as the same OS
+user as the daemon. Such an agent can read `ZENDESK_OAUTH_TOKEN_FILE`, or the
+daemon's environment under `/proc`, and call the Zendesk API directly with
+the token. That includes posting a public reply, changing any ticket the
+account can reach, or sending the token elsewhere. The file-mode checks keep
+the token from other users on the host, not from the agents.
+
+So Zendesk staffing is **off by default**, even with rules and credentials
+configured, until the operator sets
+
+```sh
+BUTCHR_ZENDESK_ACCEPT_SHELL_CREDENTIAL_RISK=agents-can-read-the-zendesk-token
+```
+
+(exactly that value). Without it, no `zendesk-ticket` rule runs, the token
+file is not read, leftover `zendesk-ticket` agents are stopped, and startup
+and `/health` give the reason.
+
+Before setting it, the real boundary is what Zendesk enforces for the token's
+account: a dedicated agent whose role allows private comments only (or a
+light agent), limited to the groups the rules need, and the narrowest OAuth
+scopes (see "Setting up the Zendesk side"). Butchr does not isolate agents
+from its credentials; running them as a separate OS user or in a sandbox
+without the token file is not implemented.
 
 ## Configuration
 
@@ -15,21 +46,26 @@ can send one (see "What an agent can do" below).
 |---|---|
 | `ZENDESK_SUBDOMAIN` | The subdomain alone: `acme` for `https://acme.zendesk.com`. |
 | `ZENDESK_OAUTH_TOKEN_FILE` | Path to a file holding one OAuth access token and nothing else. |
+| `BUTCHR_ZENDESK_ACCEPT_SHELL_CREDENTIAL_RISK` | Must be exactly `agents-can-read-the-zendesk-token`, or Zendesk stays off. See "Security limit". |
 
-Both are read only when at least one enabled `zendesk-ticket` rule exists.
-Zendesk staffing **fails closed**: if either is missing, or any check below
+They are read only when at least one enabled `zendesk-ticket` rule exists.
+Zendesk staffing **fails closed**: if the acknowledgement is not set, or
+either of the others is missing, or any check below
 fails, no `zendesk-ticket` rule runs. Nothing is searched or spawned, any
 `zendesk-ticket` agent left from an earlier run is stopped, and startup logs
 the reason. `/health` reports it under `resourceLoops`. Jira, GitHub and idea
 rules run as usual.
 
-Checks on the token file:
+Checks on the token file (read only after the acknowledgement passes):
 
 - a regular file,
 - no group or other permission bits (`chmod 600`, or `400`),
 - owned by the daemon's user or by root (the daemon must still be able to read
   it: a root-owned `0600` file works only for a daemon running as root),
 - one token, no whitespace inside it.
+
+These checks protect the token from other OS users. They do not protect it
+from the agents, which run as the daemon's user.
 
 Email/API-token authentication (`{email}/token:{api_token}` basic auth) is
 **not supported**. If `ZENDESK_EMAIL` or `ZENDESK_API_TOKEN` is set, Zendesk
@@ -123,7 +159,8 @@ not status, assignee, group, tags, fields or requester.
 
 Jira, Confluence, GitHub and idea tools refuse `zendesk-ticket` agents, and
 the Zendesk tools refuse every other caller. The tools exist only while
-Zendesk staffing runs.
+Zendesk staffing runs. These are limits on the tools, not on the agent: an
+agent that reads the token can bypass them (see "Security limit").
 
 ## Change notices (src/rules/zendesk-ticket-type.ts)
 

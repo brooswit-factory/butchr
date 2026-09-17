@@ -136,12 +136,23 @@ export function createZendeskTicketResourceType(deps: ZendeskTicketResourceDeps)
 }
 
 /**
+ * The explicit opt-in Zendesk staffing needs. MCP tools do not confine a
+ * shell-capable agent running as the daemon's OS user: it can read
+ * `ZENDESK_OAUTH_TOKEN_FILE` (or the daemon's environment) and call the
+ * Zendesk API directly, public replies included. Zendesk stays dormant until
+ * the operator sets this variable to exactly this value, acknowledging that.
+ */
+export const ZENDESK_RISK_ACK_ENV = "BUTCHR_ZENDESK_ACCEPT_SHELL_CREDENTIAL_RISK";
+export const ZENDESK_RISK_ACK_VALUE = "agents-can-read-the-zendesk-token";
+
+/**
  * Whether this daemon may run `zendesk-ticket` rules, decided once at startup.
- * Fails closed: without `ZENDESK_SUBDOMAIN` and a usable
+ * Fails closed: without the `ZENDESK_RISK_ACK_ENV` acknowledgement, without
+ * `ZENDESK_SUBDOMAIN` and a usable
  * `ZENDESK_OAUTH_TOKEN_FILE`, or with any enabled rule whose query cannot be
  * sent, NO zendesk-ticket rule runs and nothing is spawned for one — the
  * reason says why. Other providers are unaffected. The token file is read
- * only when an enabled rule needs it.
+ * only when an enabled rule needs it and the acknowledgement is set.
  */
 export type ZendeskTicketStaffing =
   | { run: true; rules: Rule[]; subdomain: string; token: string }
@@ -151,6 +162,9 @@ export function zendeskTicketStaffing(rules: readonly Rule[], env: ZendeskAuthEn
   const enabled = rules.filter((r) => r.enabled && r.resourceProvider === "zendesk-ticket");
   if (!enabled.length) return { run: false, rules: [], reason: null };
   const ids = enabled.map((r) => r.id).join(", ");
+  if (env[ZENDESK_RISK_ACK_ENV]?.trim() !== ZENDESK_RISK_ACK_VALUE) {
+    return { run: false, rules: enabled, reason: `zendesk-ticket rules not staffed (${ids}): Zendesk is off until ${ZENDESK_RISK_ACK_ENV}=${ZENDESK_RISK_ACK_VALUE} is set. Agents run shell commands as the daemon's user, so they can read the OAuth token and call Zendesk directly, including public replies; the internal-note-only tool is not a boundary (see docs/zendesk-ticket.md)` };
+  }
   const problems: string[] = [];
   for (const r of enabled) {
     try { scopedTicketQuery(r.query); } catch (e) { problems.push(`${r.id}: ${(e as Error).message}`); }

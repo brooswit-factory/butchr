@@ -18,11 +18,20 @@ describe("rulesPath", () => {
 });
 
 describe("loadRules", () => {
-  test("absent file is zero rules, marked missing, and nothing is written", () => {
+  test("absent default file is zero rules, marked missing, and nothing is written", () => {
     const writes: string[] = [];
-    const r = loadRules({ BUTCHR_RULES_FILE: "/nope.json" }, (p) => { writes.push(p); return undefined; });
-    expect(r).toEqual({ path: "/nope.json", origin: "missing", rules: [] });
-    expect(writes).toEqual(["/nope.json"]);
+    const r = loadRules({ XDG_CONFIG_HOME: "/x" }, (p) => { writes.push(p); return undefined; });
+    expect(r).toEqual({ path: "/x/butchr/rules.json", origin: "missing", rules: [] });
+    expect(writes).toEqual(["/x/butchr/rules.json"]);
+  });
+  test("an explicit BUTCHR_RULES_FILE that does not exist is an error, never zero rules", () => {
+    expect(() => loadRules({ BUTCHR_RULES_FILE: " /nope.json ", XDG_CONFIG_HOME: "/x" }, () => undefined)).toThrow("BUTCHR_RULES_FILE /nope.json does not exist");
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rules-"));
+    try {
+      expect(() => loadRules({ BUTCHR_RULES_FILE: join(dir, "missing.json") })).toThrow("does not exist");
+      // A blank override is unset: the absent default is still zero rules.
+      expect(loadRules({ BUTCHR_RULES_FILE: "  ", XDG_CONFIG_HOME: dir })).toMatchObject({ origin: "missing", rules: [] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   test("a present empty file is also zero rules", () => {
     expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [] });

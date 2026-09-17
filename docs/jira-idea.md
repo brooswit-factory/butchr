@@ -116,6 +116,16 @@ Not done, and kept separate until verified live:
   moves the idea's `updated`. Links are re-read every poll instead of
   relying on that.
 
+## Security limit: tool scoping is not a sandbox
+
+"Only its own idea" and "only its own issue" describe what the MCP tools
+allow. Agents run with shell access (no permission prompts, no Codex
+sandbox) as the daemon's OS user, so any agent can read the credentials the
+daemon uses (`ATLASSIAN_TOKEN_FILE`, `GITHUB_TOKEN_FILE`, or the daemon's
+environment) and call Jira or GitHub directly, on any resource those
+accounts can reach. The real boundary is the permissions of those accounts.
+Butchr does not isolate agents from its credentials.
+
 ## Needs empirical proof before any code depends on it
 
 None of the following has been checked against a live site. Each needs a

@@ -14,8 +14,10 @@
  *
  * Rules live in a JSON file OUTSIDE the repo: `BUTCHR_RULES_FILE` when set,
  * else `$XDG_CONFIG_HOME/butchr/rules.json`, else
- * `~/.config/butchr/rules.json`. When that file is absent there are ZERO
- * rules and nothing is staffed; nothing is written. There are no built-in
+ * `~/.config/butchr/rules.json`. When the DEFAULT file is absent there are
+ * ZERO rules and nothing is staffed; nothing is written. An explicit
+ * `BUTCHR_RULES_FILE` that does not exist is an error: a typo must never
+ * read as "no rules" and stop every rule agent. There are no built-in
  * rules or templates — a present file is the only source of rules.
  */
 import { readFileSync } from "node:fs";
@@ -193,14 +195,17 @@ const readIfExists: ReadRulesFile = (path) => {
 };
 
 /**
- * Loads and validates rules. A missing file is `origin: "missing"` with zero
- * rules — there is no fallback — so a caller can say plainly why nothing is
- * staffed.
+ * Loads and validates rules. A missing default file is `origin: "missing"`
+ * with zero rules — there is no fallback — so a caller can say plainly why
+ * nothing is staffed. A missing explicit `BUTCHR_RULES_FILE` throws.
  */
 export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[] } {
   const path = rulesPath(env);
   const text = read(path);
-  if (text === undefined) return { path, origin: "missing", rules: [] };
+  if (text === undefined) {
+    if (env.BUTCHR_RULES_FILE?.trim()) throw new Error(`BUTCHR_RULES_FILE ${path} does not exist; fix or unset it (only the default path may be absent)`);
+    return { path, origin: "missing", rules: [] };
+  }
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }

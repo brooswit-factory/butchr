@@ -21,7 +21,7 @@ import { decodeAgentKey, encodeAgentKey } from "../../src/rules/agent-key.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { parseRules } from "../../src/rules/rules.js";
-import { createZendeskTicketEventRules, ownsZendeskTicketAgent, specForZendeskTicket, zendeskTicketStaffing, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
+import { createZendeskTicketEventRules, ownsZendeskTicketAgent, specForZendeskTicket, ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
 import { forJiraCallers, githubIssueTools } from "../../src/tools/github-issue.js";
 import { Refusal } from "../../src/tools/outcome.js";
 import { zendeskNoteTag, zendeskTicketTools } from "../../src/tools/zendesk-ticket.js";
@@ -180,15 +180,31 @@ describe("zendesk OAuth token loading", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  const ack = { [ZENDESK_RISK_ACK_ENV]: ZENDESK_RISK_ACK_VALUE };
+
+  test("staffing stays dormant, reading no token file, until the shell-credential risk is acknowledged exactly", () => {
+    let stats = 0;
+    const counting: ZendeskTokenFileIo = { ...io(), stat: (p) => { stats++; return io().stat(p); } };
+    for (const over of [{}, { [ZENDESK_RISK_ACK_ENV]: "" }, { [ZENDESK_RISK_ACK_ENV]: "1" }, { [ZENDESK_RISK_ACK_ENV]: "true" }]) {
+      const r = zendeskTicketStaffing(rules, { ...env, ...over }, counting);
+      expect(r.run).toBe(false);
+      const reason = r.run ? "" : r.reason ?? "";
+      expect(reason).toContain(`Zendesk is off until ${ZENDESK_RISK_ACK_ENV}=${ZENDESK_RISK_ACK_VALUE}`);
+      expect(reason).toContain("the internal-note-only tool is not a boundary");
+    }
+    expect(stats).toBe(0);
+    expect(zendeskTicketStaffing(rules, { ...env, [ZENDESK_RISK_ACK_ENV]: ` ${ZENDESK_RISK_ACK_VALUE} ` }, counting)).toMatchObject({ run: true });
+  });
+
   test("staffing: no rules needs no config and reads no file; otherwise every enabled query and the auth must pass", () => {
     let stats = 0;
     const counting: ZendeskTokenFileIo = { ...io(), stat: (p) => { stats++; return io().stat(p); } };
     const onlyJira = parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "b" }] });
     expect(zendeskTicketStaffing(onlyJira, {}, counting)).toEqual({ run: false, rules: [], reason: null });
     expect(stats).toBe(0);
-    expect(zendeskTicketStaffing(rules, {}, counting)).toMatchObject({ run: false, reason: "zendesk-ticket rules not staffed (support): set ZENDESK_SUBDOMAIN and ZENDESK_OAUTH_TOKEN_FILE" });
-    expect(zendeskTicketStaffing(rules, env, io({ mode: 0o100644 }))).toMatchObject({ run: false, reason: expect.stringContaining("group or others") });
-    const ok = zendeskTicketStaffing(rules, env, io());
+    expect(zendeskTicketStaffing(rules, ack, counting)).toMatchObject({ run: false, reason: "zendesk-ticket rules not staffed (support): set ZENDESK_SUBDOMAIN and ZENDESK_OAUTH_TOKEN_FILE" });
+    expect(zendeskTicketStaffing(rules, { ...env, ...ack }, io({ mode: 0o100644 }))).toMatchObject({ run: false, reason: expect.stringContaining("group or others") });
+    const ok = zendeskTicketStaffing(rules, { ...env, ...ack }, io());
     expect(ok).toMatchObject({ run: true, subdomain: "acme", token: FAKE_TOKEN });
     expect(ok.rules.map((r) => r.id)).toEqual(["support"]);
   });
@@ -458,7 +474,7 @@ describe("the zendesk-ticket loop", () => {
     stop();
     expect([searched, spawned, stopped]).toEqual([0, [], [ZD]]);
     expect(new Set(running)).toEqual(new Set([JIRA, "BUTCHR-9"]));
-    expect(logs.filter((l) => l.startsWith("WARNING"))).toEqual([expect.stringContaining("zendesk-ticket rules not staffed (support): set ZENDESK_SUBDOMAIN")]);
+    expect(logs.filter((l) => l.startsWith("WARNING"))).toEqual([expect.stringContaining(`zendesk-ticket rules not staffed (support): Zendesk is off until ${ZENDESK_RISK_ACK_ENV}=`)]);
   });
 
   test("staffs, notifies and stops only its own agents; its own note is not echoed back; health hooks see polls", async () => {
@@ -470,7 +486,7 @@ describe("the zendesk-ticket loop", () => {
     const errors: string[] = [];
     let successes = 0;
     const stop = startZendeskTicketLoop({
-      staffing: zendeskTicketStaffing(rules, env, okIo),
+      staffing: zendeskTicketStaffing(rules, { ...env, [ZENDESK_RISK_ACK_ENV]: ZENDESK_RISK_ACK_VALUE }, okIo),
       client: {
         searchAll: async () => { if (fail) throw new Error("Zendesk ticket search failed: HTTP 429"); return tickets; },
         comments: async () => [{ id: "c9", authorId: 1, public: true, body: "hi", created: "2026-09-16T10:30:00Z" }],

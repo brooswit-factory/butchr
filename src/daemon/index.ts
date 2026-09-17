@@ -64,6 +64,7 @@ import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
+import { legacyAgentPreflight } from "./legacy-preflight.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -131,6 +132,15 @@ const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+// Before any listener or loop exists: live agents in legacy flat workspaces
+// count against the host cap but no rule loop owns them, so refuse to start
+// rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
+// Read-only — nothing is stopped and no workspace is touched.
+const preflight = await legacyAgentPreflight(async () => (await herdr.agent.list()).agents);
+if (!preflight.ok) {
+  console.error(`butchr: ${preflight.message}`);
+  process.exit(1);
+}
 // BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
