@@ -3,6 +3,7 @@
  * `./rules.ts` so the workspace/herd layer can name agents without loading
  * rule-file parsing. See `encodeAgentKey` for the format.
  */
+import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isIssueKey } from "../resources/id.js";
 
 /**
@@ -10,7 +11,7 @@ import { isIssueKey } from "../resources/id.js";
  * Product Discovery ideas, GitHub issues, Zendesk tickets would each be
  * their own provider later. Only providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -37,10 +38,15 @@ const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => t
  */
 export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: string; resourceId: string }
 
-/** Provider-native resource id shape. `jira-work`: an issue key (`PROJ-1`); project keys are not resources. */
+/**
+ * Provider-native resource id shape. `jira-work`: an issue key (`PROJ-1`);
+ * project keys are not resources. `github-issue`: a canonical
+ * `owner/repo#number` (lowercase owner and repo).
+ */
 export function isResourceId(provider: ResourceProvider, id: string): boolean {
   switch (provider) {
     case "jira-work": return isIssueKey(id);
+    case "github-issue": return isGithubIssueRef(id);
   }
 }
 

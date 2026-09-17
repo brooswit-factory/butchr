@@ -82,6 +82,11 @@ try {
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
   if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
   else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+  // github-issue rules validate and have a resource type
+  // (src/rules/github-issue-type.ts), but no loop runs them: agent tools and
+  // MCP identity are Jira-only, so an agent on a GitHub issue could not work it.
+  const github = rules.filter((r) => r.enabled && r.resourceProvider === "github-issue").map((r) => r.id);
+  if (github.length) console.error(`butchr: github-issue rules are not staffed by this build: ${github.join(", ")}`);
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   process.exit(1);

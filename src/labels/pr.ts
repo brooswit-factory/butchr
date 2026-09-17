@@ -25,7 +25,7 @@ interface Review {
   state: string;
 }
 
-const ghHeaders = (token: string | undefined): Record<string, string> => ({
+export const ghHeaders = (token: string | undefined): Record<string, string> => ({
   accept: "application/vnd.github+json",
   "user-agent": "butchr",
   ...(token ? { authorization: `Bearer ${token}` } : {}),

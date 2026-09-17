@@ -40,8 +40,8 @@ export interface RuleResourceDeps {
   log?: (line: string) => void;
 }
 
-/** True for exactly the herd ids this engine owns — never a legacy bare-issue or project id. */
-export const ownsRuleAgent = (id: string): boolean => decodeAgentKey(id) !== null;
+/** True for exactly the `jira-work` herd ids this engine owns — never a legacy bare-issue or project id, nor another provider's agent. */
+export const ownsRuleAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "jira-work";
 
 /**
  * Every enabled rule's matches. Rules are searched in parallel; ANY failure

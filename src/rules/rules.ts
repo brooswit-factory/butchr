@@ -21,6 +21,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
@@ -50,7 +51,11 @@ export interface Rule {
   /** Disabled rules stay configured (and keep their identity) but should run no agents. Defaults to true. */
   enabled: boolean;
   resourceProvider: ResourceProvider;
-  /** Provider-native query selecting matching resources (JQL for `jira-work`). */
+  /**
+   * Provider-native query selecting matching resources: JQL for `jira-work`;
+   * GitHub issue search syntax for `github-issue` (scoped to
+   * `BUTCHR_GITHUB_ORGS`, never pull requests — see src/resources/github-issue.ts).
+   */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
   brief: string;
@@ -121,7 +126,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
   const errors: string[] = [];
   const seen = new Set<string>();
   const rules: Rule[] = [];
-  const refs: Array<{ at: string; id: string }> = [];
+  const refs: Array<{ at: string; id: string; provider: ResourceProvider }> = [];
+  const providerOf = new Map<string, unknown>();
   doc.rules.forEach((raw, i) => {
     const at = `${origin}: rules[${i}]`;
     if (!isObject(raw)) { errors.push(`${at} must be an object`); return; }
@@ -130,16 +136,18 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const { id, enabled, resourceProvider, query, brief } = raw;
     if (typeof id !== "string" || !isRuleId(id)) errors.push(`${at}.id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})`);
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
-    else seen.add(id);
+    else { seen.add(id); providerOf.set(id, resourceProvider); }
     if (enabled !== undefined && typeof enabled !== "boolean") errors.push(`${at}.enabled must be a boolean`);
     if (!oneOf(RESOURCE_PROVIDERS, resourceProvider)) errors.push(`${at}.resourceProvider must be one of ${RESOURCE_PROVIDERS.join(", ")}`);
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
+    else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule });
-    for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r });
+    if (resourceProvider === "github-issue" && relationships) { errors.push(`${at}.relationships are not supported for github-issue rules yet`); return; }
+    if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
+    for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
     rules.push({
       id: id as string, enabled: enabled !== false, resourceProvider: resourceProvider as ResourceProvider,
       query: (query as string).trim(), brief: brief as string,
@@ -147,7 +155,10 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(relationships ? { relationships } : {}),
     });
   });
-  for (const { at, id } of refs) if (!seen.has(id)) errors.push(`${at} references unknown rule "${id}"`);
+  for (const { at, id, provider } of refs) {
+    if (!seen.has(id)) errors.push(`${at} references unknown rule "${id}"`);
+    else if (providerOf.get(id) !== provider) errors.push(`${at} references rule "${id}" of another resource provider; cross-provider relationships are not supported`);
+  }
   if (errors.length) throw new Error(errors.join("\n"));
   return rules;
 }
