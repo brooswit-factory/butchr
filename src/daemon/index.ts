@@ -20,7 +20,7 @@ import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules } from "../rules/rules.js";
-import { createRuleResourceType, ownsRuleAgent, uniqueIssues } from "../rules/resource-type.js";
+import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -56,6 +56,7 @@ import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
 import { startGithubIssueLoop } from "./github-issue-loop.js";
 import { createJiraIdeaClient } from "../resources/jira-idea.js";
 import { jiraIdeaTools } from "../tools/jira-idea.js";
+import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 
@@ -335,6 +336,8 @@ const { app, mcp } = buildApp({
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // Linking needs both providers running: authorization reads both loops' latest matches.
+  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
 });
 app.listen(config.port);
 console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
@@ -725,6 +728,8 @@ runResourceLoop(ruleResourceType, {
 if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
 // Read by the jira-idea loop: the GitHub issues idea rules may hear. Empty while the GitHub loop is not running.
 let githubMatches: readonly GithubIssueMatch[] = [];
+// Read by the link tools: the ideas jira-idea rules currently match. Empty until the idea loop completes a poll.
+let ideaMatches: readonly RuleMatch[] = [];
 startGithubIssueLoop({
   onMatches: (matches) => { githubMatches = matches; },
   staffing: githubStaffing,
@@ -753,6 +758,7 @@ startJiraIdeaLoop({
     return issues;
   },
   comments: (key) => atlassian.comments(key),
+  onMatches: (matches) => { ideaMatches = matches; },
   ...(githubIssues && jiraIdeas ? {
     githubMatches: () => githubMatches,
     githubLinks: (key: string) => jiraIdeas.githubIssues(key),

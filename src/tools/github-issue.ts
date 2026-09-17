@@ -77,8 +77,8 @@ export function githubIssueTools(deps: GithubIssueToolDeps): Record<string, Tool
 
 /** The only tools each key-only provider's agents may use instead of the Jira work tools. */
 const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work">, string>> = {
-  "github-issue": "github_get_issue and github_add_comment",
-  "jira-idea": "jira_idea_get, jira_idea_github_issues and jira_idea_add_comment",
+  "github-issue": "github_get_issue, github_add_comment and github_link_jira_idea",
+  "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
 };
 
 /**

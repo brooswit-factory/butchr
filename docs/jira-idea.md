@@ -35,8 +35,9 @@ key now answers as a different key (a moved issue).
   `POST /rest/api/3/issue/{key}/comment`.
 - Linked GitHub issues (below): `jira_idea_github_issues` and change
   notices for them.
-- No transitions, field edits, issue-link reads, any link writes, labels, or
-  detectors that comment.
+- Linking an idea to a GitHub issue, only when an agent asks (below).
+- No transitions, field edits, issue-link reads, other link writes, labels,
+  or detectors that comment.
 
 ## GitHub issues linked to an idea (src/rules/jira-idea-type.ts)
 
@@ -65,10 +66,49 @@ the `github-issue` loop's last complete poll, so ideas hear nothing unless
 that loop runs. Notices use GitHub's own change detection. A link appearing
 or disappearing is not a change.
 
+## Linking an idea to a GitHub issue (src/tools/idea-github-link.ts)
+
+One explicit operation, two entry points; nothing links on its own:
+
+| tool | caller | names |
+|---|---|---|
+| `github_link_jira_idea` | `github-issue` agent (its own issue) | `idea`: a Jira key |
+| `jira_idea_link_github_issue` | `jira-idea` agent (its own idea) | `url`: `https://github.com/<owner>/<repo>/issues/<n>` |
+
+Checks, in order, with nothing written until all pass:
+
+1. **Shape.** The argument must be the other provider's identifier. A pull
+   request URL, a Jira URL, an `owner/repo#n` ref where a key belongs, and
+   the like are refused, not coerced. Each tool refuses every other caller.
+2. **Configuration.** Idea rule `R` must list GitHub rule `C` in
+   `inwardConnectionRules`, and both must currently match their resources
+   (the loops' last complete polls, the same data routing uses). The caller's
+   own rule is pinned to its agent key. An issue outside `C`'s org or
+   `repo:` scope is never matched, so it is never linkable.
+3. **Live resources.** GitHub re-reads the issue: not a pull request, owner in
+   `BUTCHR_GITHUB_ORGS`, not transferred. Jira re-reads the idea: a proven
+   idea, not moved.
+4. **Write.** The idea's remote links are read. If any link (Butchr's or a
+   person's) already names the issue, nothing is written. Otherwise
+   `POST /rest/api/3/issue/{key}/remotelink` with
+   `globalId = system=https://github.com&id=<owner>/<repo>#<n>` (lowercase),
+   `relationship = "GitHub issue"`, `object.url` = the canonical issue URL,
+   `object.title` = `<ref>: <issue title>` (≤255 chars), and a GitHub icon.
+   Jira documents this POST as create-or-update by `globalId` (201 created,
+   200 updated), so a retry or a race from both sides leaves one link. A
+   link someone deleted is created again on the next call. A Butchr link
+   whose URL someone edited is put back in place.
+
+Links are ordinary web links people see in the idea's links panel. The
+title is not refreshed when the GitHub title changes, and nothing is written
+to GitHub. Linking is not a change notice: the idea agent starts hearing
+the issue on the next poll, silently. The tools exist only when both the
+`github-issue` and `jira-idea` loops run, and they refuse until each loop
+has completed a poll.
+
 Not done, and kept separate until verified live:
 
-- **Creating links** (`POST .../remotelink`). An upsert by `globalId` needs
-  Link issues permission and an agreed `globalId` scheme. Nothing writes one.
+- **Removing links.** Nothing deletes one; people remove them in Jira.
 - **Creating ideas from GitHub issues.**
 - **The GitHub for Jira app's development panel.** It is not remote links
   and has no documented read API for this, so its links are invisible here.
@@ -105,7 +145,10 @@ recorded real response (redacted fixture) before it is modelled:
    rules, and no other rule may reference a `jira-idea` rule.
 9. **Remote links on ideas.** A recorded `GET .../remotelink` for a real
    idea carrying a GitHub issue link, to replace the schema-shaped fixture
-   in test/unit/jira-idea-github.test.ts.
+   in test/unit/jira-idea-github.test.ts. Also a recorded
+   `POST .../remotelink` (201, then 200 on a repeat with the same
+   `globalId`), proof the Butchr account holds **Link issues** on the
+   discovery project, and a look at how the link shows in the JPD idea view.
 6. **Insights.** Whether insights are exposed through any documented REST
    endpoint at all, or only through the JPD UI or GraphQL.
 7. **Change detection coverage.** Whether edits to JPD-only fields (votes,

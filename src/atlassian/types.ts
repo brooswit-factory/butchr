@@ -111,6 +111,14 @@ export interface JiraRemoteLink {
   applicationType: string | null;
 }
 
+/** The body `POST .../remotelink` takes (Jira's `RemoteIssueLinkRequest`): `object.url` and `object.title` are required. */
+export interface JiraRemoteLinkInput {
+  /** At most 255 characters; the create-or-update key. */
+  globalId: string;
+  relationship?: string;
+  object: { url: string; title: string; icon?: { url16x16: string; title: string } };
+}
+
 export interface JiraComment {
   id: string;
   body: string;      // ADF flattened to plain text

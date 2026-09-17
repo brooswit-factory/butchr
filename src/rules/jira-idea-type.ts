@@ -11,8 +11,9 @@
  * `jira-idea` rule never staffs a work item.
  *
  * The one relationship: GitHub issues an idea HEARS (`relatedGithubIssues`).
- * Read-only — nothing here creates links, issues or ideas. No idea↔work
- * links yet.
+ * Read-only: links are created only by the explicit tools in
+ * src/tools/idea-github-link.ts, and nothing creates issues or ideas. No
+ * idea↔work links yet.
  */
 import type { SpawnSpec } from "../agents/workspace.js";
 import { jiraIssueClass, type LinkedGithubIssue } from "../resources/jira-idea.js";
@@ -108,6 +109,8 @@ export interface JiraIdeaResourceDeps extends RuleResourceDeps {
   githubLinks?: (ideaKey: string) => Promise<readonly LinkedGithubIssue[]>;
   /** GitHub comments, only to name a heard issue's newest comment in a nudge. */
   githubComments?: GithubIssueResourceDeps["comments"];
+  /** Told each poll's complete idea matches — how the link tools check which idea rules match (src/tools/idea-github-link.ts). */
+  onMatches?: (matches: readonly RuleMatch[]) => void;
 }
 
 /**
@@ -169,7 +172,11 @@ export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): Resource
   return {
     discovery: {
       idOf: (m) => m.agentKey,
-      search: async () => (latest = await searchJiraIdeaRules({ rules, search: deps.search, excluded })),
+      search: async () => {
+        latest = await searchJiraIdeaRules({ rules, search: deps.search, excluded });
+        deps.onMatches?.(latest);
+        return latest;
+      },
       related: async (active) => {
         const github = deps.githubMatches?.() ?? [];
         const activeSet = new Set(active);

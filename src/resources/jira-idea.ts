@@ -21,7 +21,9 @@
  * (`linkedGithubIssues`): the documented, durable way a Jira issue points at
  * an item in another system. Only a link whose URL is a GitHub issue's web
  * URL counts; its title and relationship are free text and decide nothing.
- * Nothing here creates, edits or deletes a link.
+ * The one link write is `linkGithubIssue`: an idempotent create keyed by a
+ * deterministic `globalId`, made only by the explicit connection tools
+ * (src/tools/idea-github-link.ts). Nothing here edits or deletes a link.
  *
  * NOT here, deliberately: JPD-specific fields (Impact, Effort, Goals,
  * Insights, roadmap columns, delivery progress) and idea↔work "delivery"
@@ -31,8 +33,8 @@
  * docs/jira-idea.md).
  */
 import type { AtlassianClient, JiraIssueDetail } from "../atlassian/client.js";
-import type { JiraComment, JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
-import { formatGithubIssueRef, githubIssueRefFromUrl } from "./github-issue-ref.js";
+import type { JiraComment, JiraIssue, JiraRemoteLink, JiraRemoteLinkInput } from "../atlassian/types.js";
+import { formatGithubIssueRef, githubIssueRefFromUrl, parseGithubIssueRef } from "./github-issue-ref.js";
 
 export const JIRA_IDEA_ISSUE_TYPE = "Idea";
 export const JIRA_DISCOVERY_PROJECT_TYPE = "product_discovery";
@@ -74,6 +76,40 @@ export function linkedGithubIssues(links: readonly JiraRemoteLink[]): LinkedGith
   return [...byRef.values()];
 }
 
+/**
+ * The `globalId` Butchr writes for a link to GitHub issue `ref` (canonical,
+ * lowercased): one per issue on an idea, so a retried or concurrent write
+ * updates the same link instead of adding a second. Uses the
+ * `system=<url>&id=<id>` shape Atlassian's remote link guide suggests.
+ */
+export const githubIssueGlobalId = (ref: string): string => `system=https://github.com&id=${ref}`;
+
+/** Jira's remote link title limit is not documented per field; stay inside the 255 characters `globalId` allows. */
+const REMOTE_LINK_TITLE_MAX = 255;
+
+/**
+ * The remote link Butchr writes for a GitHub issue: a plain web link to the
+ * canonical issue URL, visible to people in the idea's links panel, titled
+ * with the issue ref and its title at link time.
+ */
+export function githubIssueRemoteLink(issue: { ref: string; title: string }): JiraRemoteLinkInput {
+  const r = parseGithubIssueRef(issue.ref);
+  if (!r) throw new Error(`invalid GitHub issue reference: ${JSON.stringify(issue.ref)}`);
+  const title = `${issue.ref}: ${issue.title}`.replace(/\s+/g, " ").trim();
+  return {
+    globalId: githubIssueGlobalId(issue.ref),
+    relationship: "GitHub issue",
+    object: {
+      url: `https://github.com/${r.owner}/${r.repo}/issues/${r.number}`,
+      title: title.length > REMOTE_LINK_TITLE_MAX ? `${title.slice(0, REMOTE_LINK_TITLE_MAX - 1)}…` : title,
+      icon: { url16x16: "https://github.com/favicon.ico", title: "GitHub" },
+    },
+  };
+}
+
+/** What `linkGithubIssue` did: `created` is false when the idea already linked the issue (no write) or Jira updated an existing link. */
+export interface GithubIssueLinkResult { remoteLinkId: string; created: boolean; alreadyLinked: boolean }
+
 export interface JiraIdeaClient {
   /**
    * One idea, re-read by key. Rejects when Jira answers with something that
@@ -87,9 +123,16 @@ export interface JiraIdeaClient {
   addComment(key: string, text: string): Promise<JiraComment>;
   /** The GitHub issues the idea's remote links name, after `get` confirms the target is still this idea. */
   githubIssues(key: string): Promise<LinkedGithubIssue[]>;
+  /**
+   * Link the idea to a GitHub issue the caller has already verified, after
+   * `get` confirms the target. Any existing remote link naming the issue
+   * (Butchr's or a person's) makes this a no-op; otherwise one create-or-
+   * update keyed by `githubIssueGlobalId`.
+   */
+  linkGithubIssue(key: string, issue: { ref: string; title: string }): Promise<GithubIssueLinkResult>;
 }
 
-export function createJiraIdeaClient(jira: Pick<AtlassianClient, "issue" | "allComments" | "addComment" | "remoteLinks">): JiraIdeaClient {
+export function createJiraIdeaClient(jira: Pick<AtlassianClient, "issue" | "allComments" | "addComment" | "remoteLinks" | "upsertRemoteLink">): JiraIdeaClient {
   const get = async (key: string): Promise<JiraIssueDetail> => {
     const issue = await jira.issue(key);
     if (issue.key !== key) throw new Error(`Jira answered ${issue.key} for ${key}; refusing a moved issue`);
@@ -109,6 +152,14 @@ export function createJiraIdeaClient(jira: Pick<AtlassianClient, "issue" | "allC
     async githubIssues(key) {
       await get(key);
       return linkedGithubIssues(await jira.remoteLinks(key));
+    },
+    async linkGithubIssue(key, issue) {
+      const link = githubIssueRemoteLink(issue);
+      await get(key);
+      const existing = linkedGithubIssues(await jira.remoteLinks(key)).find((l) => l.ref === issue.ref);
+      if (existing) return { remoteLinkId: existing.remoteLinkId, created: false, alreadyLinked: true };
+      const written = await jira.upsertRemoteLink(key, link);
+      return { remoteLinkId: written.id, created: written.created, alreadyLinked: false };
     },
   };
 }

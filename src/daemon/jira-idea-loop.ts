@@ -23,6 +23,7 @@ import type { NotifyReason } from "../resources/types.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import type { GithubIssueMatch, GithubIssueResourceDeps } from "../rules/github-issue-type.js";
 import { createJiraIdeaResourceType, ownsJiraIdeaAgent } from "../rules/jira-idea-type.js";
+import type { RuleMatch } from "../rules/resource-type.js";
 import type { Rule } from "../rules/rules.js";
 import type { Stop } from "@brooswit/sundry";
 import { runResourceLoop } from "./loop.js";
@@ -42,6 +43,8 @@ export interface JiraIdeaLoopDeps {
   /** The GitHub issues an idea's Jira remote links name (JiraIdeaClient#githubIssues). */
   githubLinks?: (ideaKey: string) => Promise<readonly LinkedGithubIssue[]>;
   githubComments?: GithubIssueResourceDeps["comments"];
+  /** Told each poll's complete idea matches (for the link tools' rule checks). */
+  onMatches?: (matches: readonly RuleMatch[]) => void;
   herd: Herd;
   /** Deliver one message to one agent (channel push and pane prompt). */
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
@@ -68,6 +71,7 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop | null {
     ...(deps.githubMatches ? { githubMatches: deps.githubMatches } : {}),
     ...(deps.githubLinks ? { githubLinks: deps.githubLinks } : {}),
     ...(deps.githubComments ? { githubComments: deps.githubComments } : {}),
+    ...(deps.onMatches ? { onMatches: deps.onMatches } : {}),
     log: deps.log,
   });
   return runResourceLoop(type, {

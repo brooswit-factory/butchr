@@ -10,8 +10,9 @@
  * the Jira work tools refuse `jira-idea` agents in turn (`forJiraCallers`,
  * src/tools/github-issue.ts).
  *
- * Deliberately read and comment only: no transitions, field edits, link
- * writes, or JPD-specific fields (see docs/jira-idea.md). Linked GitHub
+ * Deliberately read and comment only: no transitions, field edits, or
+ * JPD-specific fields (see docs/jira-idea.md). The one link write lives with
+ * its authorization in src/tools/idea-github-link.ts. Linked GitHub
  * issues are listed from the idea's Jira remote links, never fetched from
  * GitHub.
  */

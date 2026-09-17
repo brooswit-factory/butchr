@@ -1,4 +1,4 @@
-import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink } from "./types.js";
+import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink, JiraRemoteLinkInput } from "./types.js";
 
 /** One issue read by key, with its description flattened to plain text. */
 export interface JiraIssueDetail extends JiraIssue { description: string }
@@ -204,6 +204,26 @@ export class AtlassianClient {
       if (url === null || title === null || (typeof l.id !== "number" && typeof l.id !== "string")) return [];
       return [{ id: String(l.id), globalId: str(l.globalId), relationship: str(l.relationship), url, title, applicationType: str(l.application?.type) }];
     });
+  }
+
+  /**
+   * `POST /rest/api/3/issue/{key}/remotelink`: Jira's documented create-or-
+   * update. When `globalId` names a remote link already on the issue, that
+   * link is updated (every field not sent becomes null) and Jira answers 200;
+   * otherwise a link is created and Jira answers 201. Needs Browse projects
+   * and Link issues on the issue's project; a 401/403/404 throws.
+   */
+  async upsertRemoteLink(issueKey: string, link: JiraRemoteLinkInput): Promise<{ id: string; created: boolean }> {
+    const path = `/rest/api/3/issue/${encodeURIComponent(issueKey)}/remotelink`;
+    const res = await this.fetchImpl(`${this.site}${path}`, {
+      method: "POST",
+      headers: { authorization: this.auth, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(link),
+    });
+    if (!res.ok) throw new AtlassianHttpError(res.status, "POST", path, (await res.text()).slice(0, 200));
+    const body = await res.json() as { id?: unknown };
+    if (typeof body?.id !== "number" && typeof body?.id !== "string") throw new Error(`Jira remote link write for ${issueKey} returned an unexpected body`);
+    return { id: String(body.id), created: res.status === 201 };
   }
 
   /** Recent comments on a ticket, newest-first, ADF bodies flattened to plain text. */

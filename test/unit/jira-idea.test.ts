@@ -234,7 +234,7 @@ describe("jira idea tools", () => {
 
     const jiraCalls: unknown[] = [];
     const jira = forJiraCallers({ jira_transition: { description: "d", input: {}, handler: (a) => { jiraCalls.push(a); return "ok"; } } }, () => {});
-    await expect(call(jira, "jira_transition", { key: "IDEA-1" }, ideaCaller)).rejects.toThrow("refusing a jira-idea agent — Jira and Confluence tools are for jira-work agents; use jira_idea_get, jira_idea_github_issues and jira_idea_add_comment");
+    await expect(call(jira, "jira_transition", { key: "IDEA-1" }, ideaCaller)).rejects.toThrow("refusing a jira-idea agent — Jira and Confluence tools are for jira-work agents; use jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue");
     expect(jiraCalls).toEqual([]);
     expect(await call(jira, "jira_transition", { key: "WORK-1" }, workCaller)).toBe("ok");
 
