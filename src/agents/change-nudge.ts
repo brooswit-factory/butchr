@@ -150,6 +150,16 @@ export function githubIssueNudge(resource: string, reason: NotifyReason | undefi
 }
 
 /**
+ * The agent-facing push for a `zendesk-ticket` agent's own ticket. Names the
+ * tool to re-read with; carries no customer-authored text (see
+ * src/rules/zendesk-ticket-type.ts).
+ */
+export function zendeskTicketNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its subject edited" : reasonClause(reason);
+  return `[butchr] Zendesk ticket ${resource} ${clause} — re-read it with zendesk_get_ticket.`;
+}
+
+/**
  * The agent-facing push for a `jira-idea` agent's own idea. Names the tool to
  * re-read with, since an idea agent has no Jira work tools.
  */

@@ -8,7 +8,7 @@ import { KEY_ONLY_PROVIDERS } from "./identity.js";
  * Two workspace shapes are accepted: a legacy direct child of the root
  * (`<root>/<ISSUE>`, identity = the directory name) and a rule-engine
  * workspace (`<root>/<provider>/<rule>/<ISSUE>`), whose metadata must also
- * name the agent key the path encodes. A `github-issue` or `jira-idea`
+ * name the agent key the path encodes. A `github-issue`, `jira-idea` or `zendesk-ticket`
  * workspace's metadata names its agent and resource instead of an `issue`,
  * and the bridge sends the agent key alone (src/mcp/identity.ts).
  */

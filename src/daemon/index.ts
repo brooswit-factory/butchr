@@ -60,6 +60,10 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
+import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
+import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
+import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -105,6 +109,15 @@ const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
+// zendesk-ticket rules run only with ZENDESK_SUBDOMAIN and an owner-only
+// ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
+// for one (announced by startZendeskTicketLoop). The token file is read only
+// when an enabled zendesk-ticket rule exists.
+const zendeskStaffing = zendeskTicketStaffing(rules, process.env as Record<string, string | undefined>);
+const zendeskTickets = zendeskStaffing.run
+  ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
+  : undefined;
+
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
@@ -143,12 +156,13 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 const ADMISSION_SOURCE_ISSUE = "issue";
 const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
 const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
+const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : [])],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : [])],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -244,7 +258,7 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
-// github-issue and jira-idea loop health, reported beside (never inside) the
+// github-issue, jira-idea and zendesk-ticket loop health, reported beside (never inside) the
 // liveness components: whether each type's rules run, and whether its polls
 // complete. The threshold covers at least three polls of the slower loop.
 const githubIssueHealth = createResourceLoopHealth({
@@ -259,6 +273,13 @@ const jiraIdeaHealth = createResourceLoopHealth({
   enabled: Boolean(jiraIdeas),
   ...(jiraIdeas ? {} : { disabledReason: "no enabled jira-idea rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * JIRA_IDEA_POLL_MS),
+  log: (line) => console.error(line),
+});
+const zendeskTicketHealth = createResourceLoopHealth({
+  name: "zendesk-ticket",
+  enabled: Boolean(zendeskTickets),
+  ...(zendeskStaffing.run ? {} : { disabledReason: zendeskStaffing.reason ?? "no enabled zendesk-ticket rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * ZENDESK_TICKET_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
@@ -329,7 +350,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth]),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth]),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -350,9 +371,10 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue and jira-idea agents; each provider's own tools exist only when its rules run.
+  // Jira/Confluence tools refuse github-issue, jira-idea and zendesk-ticket agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking needs both providers running: authorization reads both loops' latest matches.
   ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
@@ -794,6 +816,26 @@ startJiraIdeaLoop({
   onAdmitted: admissionController.recordSpawned,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
   onError: (e) => jiraIdeaHealth.recordError(e),
+});
+
+// The zendesk-ticket rule loop: its own agents and admission bucket, and none
+// of the detectors above. Its agents' only write is a private internal note.
+if (zendeskStaffing.run) console.error(`  zendesk-ticket rules: ${zendeskStaffing.rules.map((r) => r.id).join(", ")} (subdomain ${zendeskStaffing.subdomain})`);
+startZendeskTicketLoop({
+  staffing: zendeskStaffing,
+  client: zendeskTickets ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ZENDESK_TICKET),
+  onAdmitted: admissionController.recordSpawned,
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
+  onError: (e) => zendeskTicketHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's

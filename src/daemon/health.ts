@@ -103,7 +103,7 @@ export interface HealthStatus {
    */
   currency?: CurrencyReport;
   /**
-   * Per resource type loop health for the github-issue and jira-idea loops —
+   * Per resource type loop health for the github-issue, jira-idea and zendesk-ticket loops —
    * a sibling, not `components[]`, so a GitHub outage or a bad idea query
    * never flips `ok` (and the 503 contract) that the Jira work loop owns.
    * Each entry says whether its rules run, whether its polls are completing,

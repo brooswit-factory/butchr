@@ -166,7 +166,7 @@ export const ruleBriefHeader = (ruleId: string, resource: string, summary: strin
 
 const providerOf = (spec: SpawnSpec) => decodeAgentKey(spec.key)?.resourceProvider;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => providerOf(spec) === "github-issue" || providerOf(spec) === "jira-idea";
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
@@ -176,7 +176,11 @@ export const GITHUB_ISSUE_TOOLS_NOTE =
 export const JIRA_IDEA_TOOLS_NOTE =
   "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool, list the GitHub issues its Jira remote links point at with `jira_idea_github_issues`, and comment on it with `jira_idea_add_comment`; all three act only on your own idea. When your rule is allowed to, `jira_idea_link_github_issue` links your idea to an existing GitHub issue. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
 
-const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE };
+/** What a `zendesk-ticket` agent is told about its tools; a Jira work brief carries no such section. */
+export const ZENDESK_TICKET_TOOLS_NOTE =
+  "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
+
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE };
 
 /** A rule-engine brief: the rule's own text under a header naming the ticket. */
 const ruleBrief = (spec: SpawnSpec, resource: string): string => {
@@ -189,10 +193,10 @@ const ruleBrief = (spec: SpawnSpec, resource: string): string => {
  * the resource (every tool resolves the caller's ticket from it);
  * `x-butchr-agent` is added for rule-engine agents so events and own-write
  * echoes are scoped to the one agent, not every agent on the same ticket.
- * A `github-issue` or `jira-idea` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
+ * A `github-issue`, `jira-idea` or `zendesk-ticket` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
  */
 export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
-  // A GitHub issue is not a Jira key, and an idea is not a work item: such an agent is identified by key alone, so no Jira work tool can resolve it as a ticket.
+  // A GitHub issue or Zendesk ticket is not a Jira key, and an idea is not a work item: such an agent is identified by key alone, so no Jira work tool can resolve it as a ticket.
   if (isKeyOnly(spec)) return { "x-butchr-agent": spec.key };
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }

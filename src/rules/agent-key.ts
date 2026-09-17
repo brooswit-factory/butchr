@@ -5,14 +5,15 @@
  */
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isIssueKey } from "../resources/id.js";
+import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
  * One provider per resource TYPE, not per vendor: Jira work items, GitHub
- * issues and Jira Product Discovery ideas (the same Jira API as work items,
- * still a separate provider); Zendesk tickets would be their own provider
- * later. Only providers with an adapter are listed.
+ * issues, Jira Product Discovery ideas (the same Jira API as work items,
+ * still a separate provider) and Zendesk tickets. Only providers with an
+ * adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -43,13 +44,15 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * Provider-native resource id shape. `jira-work`: an issue key (`PROJ-1`);
  * project keys are not resources. `github-issue`: a canonical
  * `owner/repo#number` (lowercase owner and repo). `jira-idea`: the Jira
- * issue key of a Product Discovery idea (`IDEAS-7`).
+ * issue key of a Product Discovery idea (`IDEAS-7`). `zendesk-ticket`: a
+ * canonical `<subdomain>#<id>` (`acme#123`).
  */
 export function isResourceId(provider: ResourceProvider, id: string): boolean {
   switch (provider) {
     case "jira-work": return isIssueKey(id);
     case "github-issue": return isGithubIssueRef(id);
     case "jira-idea": return isIssueKey(id);
+    case "zendesk-ticket": return isZendeskTicketRef(id);
   }
 }
 

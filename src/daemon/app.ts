@@ -9,7 +9,7 @@ import { callerIdentity } from "../mcp/identity.js";
  * One process, one HTTP server: the MCP endpoint agents connect to (`/mcp`) and
  * the read-only live view. Agents identify the issue they work on with an
  * `x-issue` header at connect; the daemon addresses channel events by it. A
- * `github-issue` agent identifies with its agent key alone (see
+ * `github-issue`, `jira-idea` or `zendesk-ticket` agent identifies with its agent key alone (see
  * src/mcp/identity.ts); a connection mixing the two is refused.
  *
  * `log` defaults to `console.error`, the same convention `atlassianTools`

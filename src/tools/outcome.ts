@@ -282,7 +282,7 @@ export function withOutcomeRecording(
     wrapped[name] = {
       ...def,
       handler: (args: unknown, c: { headers: Readonly<Record<string, string>> }) => {
-        // A github-issue agent has no x-issue; its agent key is its identity.
+        // A github-issue, jira-idea or zendesk-ticket agent has no x-issue; its agent key is its identity.
         const caller = c.headers["x-issue"] ?? c.headers["x-butchr-agent"] ?? UNKNOWN_CALLER;
         const target = extractTarget(args);
         const record = (outcome: Outcome, err?: unknown) => {

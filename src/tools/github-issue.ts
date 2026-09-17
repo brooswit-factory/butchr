@@ -79,10 +79,11 @@ export function githubIssueTools(deps: GithubIssueToolDeps): Record<string, Tool
 const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work">, string>> = {
   "github-issue": "github_get_issue, github_add_comment and github_link_jira_idea",
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
+  "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
 };
 
 /**
- * Wrap Jira/Confluence tools so a `github-issue` or `jira-idea` agent is
+ * Wrap Jira/Confluence tools so a `github-issue`, `jira-idea` or `zendesk-ticket` agent is
  * refused before any of them runs. A caller the tools already accepted
  * (anyone with `x-issue`) reaches the original handler exactly as before.
  */
