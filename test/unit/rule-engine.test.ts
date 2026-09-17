@@ -2,18 +2,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JiraIssue } from "../../src/atlassian/types.js";
+import type { IssueLink, JiraIssue } from "../../src/atlassian/types.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import { spawnArgs, agentLaunchConfig } from "../../src/agents/argv.js";
 import { agentIdOfWorkspacePath, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { panesFor, groupOwnedPanes } from "../../src/agents/residency-census.js";
 import { strandedCandidates } from "../../src/agents/reap.js";
-import { desiredFrom, reconcileNow, scopedHerd } from "../../src/daemon/loop.js";
+import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../src/daemon/loop.js";
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
-import { createRuleEventRules, createRuleResourceType, ownsRuleAgent, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import { createRuleEventRules, createRuleResourceType, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
   ({ key, status: "In Progress", summary: `summary of ${key}`, issuetype: "Task", assignee: "me", parent: null, updated: "2026-09-16T00:00:00.000+0000", labels: [], ...over });
@@ -145,6 +145,130 @@ describe("rule event routing", () => {
     const ev = await events.poll(snapshot(matchesFor(ruleSet, [issue("BUTCHR-1")])), snapshot(matchesFor(ruleSet, [issue("BUTCHR-1", { status: "In Review", updated: "later" })])));
     expect((await ev.decide("jira-work:task:BUTCHR-1", "jira-work:task:BUTCHR-1", "primary")).deliver).toBe(false);
     expect((await ev.decide("jira-work:review:BUTCHR-1", "jira-work:review:BUTCHR-1", "primary")).deliver).toBe(true);
+  });
+});
+
+describe("rule relationships", () => {
+  // WORKER implements BOSS, seen from both ends exactly as Jira reports it.
+  const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
+  const implementedBy = (worker: string): IssueLink[] => [{ type: "Implements", otherEnd: "outward", key: worker }];
+  const match = (rule: Rule, i: JiraIssue): RuleMatch => ({ agentKey: `jira-work:${rule.id}:${i.key}`, rule, issue: i });
+  const byId = (ruleSet: Rule[], id: string) => ruleSet.find((r) => r.id === id)!;
+  const keys = (ms: RuleMatch[]) => ms.map((m) => m.agentKey);
+
+  // "epic" staffs bosses and hears "story" workers; "review" also matches the
+  // boss ticket but declares no relationship; "audit" hears "story" as an
+  // inward connection.
+  const ruleSet = rules(
+    { id: "epic", query: "q1", relationships: { childRule: "story" } },
+    { id: "story", query: "q2" },
+    { id: "review", query: "q3" },
+    { id: "audit", query: "q4", relationships: { inwardConnectionRules: ["story"] } },
+  );
+  const boss = (over: Partial<JiraIssue> = {}) => issue("BUTCHR-1", { issuelinks: implementedBy("BUTCHR-2"), ...over });
+  const worker = (over: Partial<JiraIssue> = {}) => issue("BUTCHR-2", { issuelinks: implementsBoss("BUTCHR-1"), ...over });
+  const world = (w: JiraIssue, b: JiraIssue = boss()): RuleMatch[] => [
+    match(byId(ruleSet, "epic"), b), match(byId(ruleSet, "review"), b),
+    match(byId(ruleSet, "story"), w), match(byId(ruleSet, "review"), w),
+  ];
+
+  test("the boss rule's agent watches its child-rule worker; the unrelated rule on either ticket does not", () => {
+    const ms = world(worker());
+    expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([
+      { issue: match(byId(ruleSet, "story"), worker()), watchers: ["jira-work:epic:BUTCHR-1"] },
+    ]);
+  });
+
+  test("the worker never watches its boss, and only active agents watch", () => {
+    const ms = world(worker());
+    expect(relatedForRules(ruleSet, ms, keys(ms)).flatMap((r) => r.watchers)).not.toContain("jira-work:story:BUTCHR-2");
+    expect(relatedForRules(ruleSet, ms, keys(ms).filter((k) => k !== "jira-work:epic:BUTCHR-1"))).toEqual([]);
+  });
+
+  test("an inward connection rule hears the connecting rule's ticket; the link is read from either end", () => {
+    const b = issue("BUTCHR-1"), w = worker();
+    const ms = [match(byId(ruleSet, "audit"), b), match(byId(ruleSet, "story"), w)];
+    expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([{ issue: ms[1]!, watchers: ["jira-work:audit:BUTCHR-1"] }]);
+    const fromBossEnd = [match(byId(ruleSet, "audit"), boss()), match(byId(ruleSet, "story"), issue("BUTCHR-2"))];
+    expect(relatedForRules(ruleSet, fromBossEnd, keys(fromBossEnd))[0]!.watchers).toEqual(["jira-work:audit:BUTCHR-1"]);
+  });
+
+  test("a missing or invalid relationship routes nothing, without disturbing a valid one", () => {
+    const epic = byId(ruleSet, "epic"), story = byId(ruleSet, "story"), review = byId(ruleSet, "review");
+    const cases: Array<[string, RuleMatch[]]> = [
+      ["no link", [match(epic, issue("BUTCHR-1")), match(story, issue("BUTCHR-2"))]],
+      ["a Relates link", [match(epic, issue("BUTCHR-1", { issuelinks: [{ type: "Relates", otherEnd: "outward", key: "BUTCHR-2" }] })), match(story, issue("BUTCHR-2"))]],
+      ["a reversed Implements link (boss implements worker)", [match(epic, issue("BUTCHR-1", { issuelinks: implementsBoss("BUTCHR-2") })), match(story, issue("BUTCHR-2", { issuelinks: implementedBy("BUTCHR-1") }))]],
+      ["the worker matched only by a rule the boss does not hear", [match(epic, boss()), match(review, worker())]],
+      ["a link to a ticket no rule matches", [match(epic, issue("BUTCHR-1", { issuelinks: implementedBy("BUTCHR-99") })), match(story, issue("BUTCHR-2", { issuelinks: implementsBoss("BUTCHR-98") }))]],
+    ];
+    for (const [, ms] of cases) expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([]);
+
+    // One bad link beside a good one: only the good one routes.
+    const mixed = [
+      match(epic, issue("BUTCHR-1", { issuelinks: [...implementedBy("BUTCHR-2"), ...implementedBy("BUTCHR-3")] })),
+      match(story, worker()),
+      match(review, issue("BUTCHR-3", { issuelinks: implementsBoss("BUTCHR-1") })),
+    ];
+    expect(relatedForRules(ruleSet, mixed, keys(mixed)).map((r) => [r.issue.issue.key, r.watchers])).toEqual([["BUTCHR-2", ["jira-work:epic:BUTCHR-1"]]]);
+  });
+
+  test("a worker matched by several rules is one entry; several boss rules on one ticket each watch under their own key", () => {
+    const two = rules(
+      { id: "epic", query: "q", relationships: { childRule: "story" } },
+      { id: "lead", query: "q", relationships: { inwardConnectionRules: ["story", "spike"] } },
+      { id: "story", query: "q" },
+      { id: "spike", query: "q" },
+    );
+    const ms = [
+      match(byId(two, "epic"), boss()), match(byId(two, "lead"), boss()),
+      match(byId(two, "story"), worker()), match(byId(two, "spike"), worker()),
+    ];
+    expect(relatedForRules(two, ms, keys(ms))).toEqual([
+      { issue: ms[3]!, watchers: ["jira-work:epic:BUTCHR-1", "jira-work:lead:BUTCHR-1"] },
+    ]);
+  });
+
+  test("the boss learns a child's status change, once, and no other agent does", async () => {
+    const events = createRuleEventRules({ rules: ruleSet });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
+    const before = world(worker()), after = world(worker({ status: "In Review", updated: "later" }));
+    const ev = await events.poll(snap(before), snap(after));
+    expect(ev.changedRelated).toEqual(["jira-work:story:BUTCHR-2"]);
+    expect(await ev.decide("jira-work:story:BUTCHR-2", "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { status: { from: "In Progress", to: "In Review" } } });
+    for (const other of ["jira-work:review:BUTCHR-1", "jira-work:story:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
+      expect(await ev.decide("jira-work:story:BUTCHR-2", other, "related")).toEqual({ deliver: false });
+    }
+    // The worker's own agents still hear it on the primary path, each under its own key.
+    expect([...ev.changedPrimary].sort()).toEqual(["jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2"]);
+  });
+
+  test("a worker agent's own write is swallowed for itself but still reaches its boss", async () => {
+    const ledger = createOwnWriteLedger();
+    ledger.record("BUTCHR-2", "later", "jira-work:story:BUTCHR-2", Date.now());
+    const events = createRuleEventRules({ rules: ruleSet, suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()), comments: async () => [] });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
+    const ev = await events.poll(snap(world(worker())), snap(world(worker({ status: "In Review", updated: "later" }))));
+    expect((await ev.decide("jira-work:story:BUTCHR-2", "jira-work:story:BUTCHR-2", "primary")).deliver).toBe(false);
+    expect((await ev.decide("jira-work:story:BUTCHR-2", "jira-work:epic:BUTCHR-1", "related")).deliver).toBe(true);
+  });
+
+  test("through the loop: a child status change notifies the boss agent exactly once and no unrelated agent", async () => {
+    const store = { worker: worker() };
+    const jql: Record<string, () => JiraIssue[]> = { q1: () => [boss()], q2: () => [store.worker], q3: () => [boss(), store.worker], q4: () => [] };
+    const type = createRuleResourceType({ rules: ruleSet, search: async (q) => jql[q]!() });
+    const notified: string[] = [];
+    const stop = runResourceLoop(type, { herd: fakeHerd(), ownsId: ownsRuleAgent, notify: async (agent, about) => { notified.push(`${agent} <- ${about}`); }, intervalMs: 15 });
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+      expect(notified).toEqual([]);
+      store.worker = worker({ status: "In Review", updated: "later" });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally { stop(); }
+    expect(notified.filter((n) => n.startsWith("jira-work:epic:"))).toEqual(["jira-work:epic:BUTCHR-1 <- jira-work:story:BUTCHR-2"]);
+    expect(notified.filter((n) => n.includes("BUTCHR-1 <-") && !n.startsWith("jira-work:epic:"))).toEqual([]);
+    expect(notified.filter((n) => n.startsWith("jira-work:story:BUTCHR-2") || n.startsWith("jira-work:review:BUTCHR-2")).sort())
+      .toEqual(["jira-work:review:BUTCHR-2 <- jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2 <- jira-work:story:BUTCHR-2"]);
   });
 });
 
