@@ -52,6 +52,10 @@ describe("loadRules", () => {
 });
 
 describe("parseRules", () => {
+  test("a @builtin:<type> brief must name a shipped brief; the type is case-insensitive", () => {
+    expect(parseRules({ rules: [{ ...minimal, brief: "@builtin:bug" }, { ...minimal, id: "epics", brief: "@builtin:Epic" }] }).map((r) => r.brief)).toEqual(["@builtin:bug", "@builtin:Epic"]);
+    expect(() => parseRules({ rules: [{ ...minimal, brief: "@builtin:stroy" }] })).toThrow('rules[0].brief names unknown built-in brief "stroy"');
+  });
   test("accepts every optional setting and normalises", () => {
     const full = {
       ...minimal, enabled: false, query: " status = Open ",

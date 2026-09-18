@@ -71,6 +71,7 @@ interface TypeExclusion { readonly type: string; readonly reason: string }
 const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [
   { type: "task", reason: "task.md is the reviewee here, not the reviewer — a task has no worker below it whose test diff it would review, so this instruction (aimed at a reviewer about to reach for the expect() tally) has nothing to attach to in task.md" },
   { type: "project", reason: "project.md's epic-review workflow has no equivalent test-gate framing to attach this instruction to, unlike story (reviews a task's test diff) and epic (reviews a story's test diff)" },
+  { type: "bug", reason: "bug.md is a defect-fix brief and does not review a worker's test diff; its verification guidance is specific to reproducing the reported failure" },
 ];
 
 const ASSERTED_TYPES: ReadonlySet<string> = new Set(ASSERTION_CHECK_INSTRUCTING_BRIEFS);

@@ -8,6 +8,7 @@ import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
 import EPIC from "../../briefs/epic.md" with { type: "text" };
 import STORY from "../../briefs/story.md" with { type: "text" };
 import TASK from "../../briefs/task.md" with { type: "text" };
+import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
@@ -37,7 +38,7 @@ export interface SpawnSpec {
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
 export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
 
-const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, project: PROJECT };
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
 
 /**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
@@ -80,6 +81,26 @@ export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.t
  * added above — which is exactly how `briefs/project.md` went uncovered.
  */
 export const knownBriefTypes = (): string[] => Object.keys(BRIEF_BY_TYPE);
+
+/** A rule's `brief` of the form `@builtin:<type>` names one of the shipped briefs above instead of inline text. */
+export const BUILTIN_BRIEF_PREFIX = "@builtin:";
+
+/** A rule's brief as the agent gets it: a `@builtin:<type>` reference resolved to that shipped brief, any other text as-is. */
+export const resolveRuleBrief = (brief: string): string =>
+  brief.startsWith(BUILTIN_BRIEF_PREFIX) ? briefFor(brief.slice(BUILTIN_BRIEF_PREFIX.length)) : brief;
+
+/**
+ * Why a rule's brief is unusable, or null. Only `@builtin:` references are
+ * checked: an unknown type would otherwise fall back to DEFAULT silently, so a
+ * typo like `@builtin:stroy` must fail the rules file at load instead.
+ */
+export const builtinBriefProblem = (brief: string): string | null => {
+  if (!brief.startsWith(BUILTIN_BRIEF_PREFIX)) return null;
+  const type = brief.slice(BUILTIN_BRIEF_PREFIX.length);
+  return knownBriefTypes().includes(type.toLowerCase())
+    ? null
+    : `names unknown built-in brief "${type}" (known: ${knownBriefTypes().join(", ")})`;
+};
 
 /** `groundTruth` fills `{{GROUND_TRUTH}}` (only CLAUDE.md carries that placeholder); omit it for templates that don't need it. */
 export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: string): string => {

@@ -17,7 +17,7 @@
  * editing links, relationship patterns, and stand-down sleep.
  */
 import type { JiraIssue } from "../atlassian/types.js";
-import type { SpawnSpec } from "../agents/workspace.js";
+import { resolveRuleBrief, type SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
 import { jiraIssueClass } from "../resources/jira-idea.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
@@ -144,7 +144,7 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     issuetype: issue.issuetype,
     summary: issue.summary,
     parent: bossKeyFrom(issue),
-    brief: rule.brief,
+    brief: resolveRuleBrief(rule.brief),
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
   };
 }

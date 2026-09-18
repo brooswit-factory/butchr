@@ -6,7 +6,7 @@ import type { IssueLink, JiraIssue } from "../../src/atlassian/types.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import { spawnArgs, agentLaunchConfig } from "../../src/agents/argv.js";
-import { agentIdOfWorkspacePath, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
+import { agentIdOfWorkspacePath, briefFor, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { panesFor, groupOwnedPanes } from "../../src/agents/residency-census.js";
 import { strandedCandidates } from "../../src/agents/reap.js";
 import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../src/daemon/loop.js";
@@ -76,6 +76,16 @@ describe("rule discovery", () => {
       key: "jira-work:task:BUTCHR-7", resource: "BUTCHR-7", issuetype: "Task", summary: "summary of BUTCHR-7", parent: "BUTCHR-1",
       brief: "do it", agents: [{ harness: "codex", model: "gpt-5" }, { harness: "claude", effort: "max" }],
     });
+  });
+});
+
+describe("rule briefs", () => {
+  test("a @builtin:<type> brief reaches the agent as that shipped brief; inline text passes through", () => {
+    const [builtin, inline] = rules({ id: "bugs", query: "q", brief: "@builtin:bug" }, { id: "task", query: "q" });
+    const specOf = (rule: typeof builtin) => specForMatch({ agentKey: `jira-work:${rule!.id}:BUTCHR-7`, rule: rule!, issue: issue("BUTCHR-7") });
+    expect(specOf(builtin).brief).toBe(briefFor("bug"));
+    expect(specOf(builtin).brief).not.toBe(briefFor("default-fallback"));
+    expect(specOf(inline).brief).toBe("do it");
   });
 });
 
