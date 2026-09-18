@@ -81,12 +81,11 @@ describe("HerdrHerd", () => {
     expect(f.started[0].kind).toBe("claude");
     expect(f.started[0].args).toContain("--permission-mode");
     expect(f.started[0].args).toContain("bypassPermissions");
-    expect(f.started[0].args).toContain("--dangerously-load-development-channels");
-    expect(f.started[0].args).toContain("server:butchr");
-    // the kickoff prompt is the FIRST argument: the variadic channel/mcp flags
-    // swallow a trailing positional as one of their own entries
+    expect(f.started[0].args).toContain("--dangerously-load-development-channels=server:butchr");
+    // the kickoff prompt is the FIRST argument: the variadic mcp flag would
+    // swallow a trailing positional as one of its own entries
     expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
-    expect(f.started[0].args[f.started[0].args.length - 1]).toBe("server:butchr");
+    expect(f.started[0].args[f.started[0].args.length - 1]).toBe("--dangerously-load-development-channels=server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
     expect(cfg.mcpServers.butchr.url).toBe("http://localhost:7717/mcp");

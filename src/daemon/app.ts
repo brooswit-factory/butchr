@@ -18,6 +18,11 @@ export function buildApp(view: ViewDeps, tools: Record<string, ToolDef<any>> = {
   const { plugin, mcp } = thatch({
     serverInfo: { name: "butchr", version: "0" },
     tools,
+    // thatch >= 0.7 reaps sessions that sit idle with no notification stream.
+    // codex/agy ticket agents never open one (notifyIssue skips them), so the
+    // 10-min default would reap them mid-ticket; keep them for 2h instead.
+    // A dropped stream (a dead Claude agent) is still reaped after 60s.
+    reap: { idleMs: 2 * 60 * 60 * 1000 },
     // Every agent connecting must say which issue it is working on. BUTCHR-341
     // (B): before this change, a connection refused here (no `x-issue`) left
     // NO record anywhere — @brooswit/thatch returns the 401 itself, with no
