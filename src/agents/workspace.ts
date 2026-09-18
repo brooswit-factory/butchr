@@ -187,7 +187,7 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
   writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
-  writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, resource) : interpolate(briefFor(spec.issuetype), view));
+  writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
   if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) } } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
@@ -214,10 +214,17 @@ export const ZENDESK_TICKET_TOOLS_NOTE =
 
 const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE };
 
-/** A rule-engine brief: the rule's own text under a header naming the ticket. */
-const ruleBrief = (spec: SpawnSpec, resource: string): string => {
+/**
+ * A rule-engine brief: the rule's own text under a header naming the ticket.
+ * `view` is the spec as templates see it ({{KEY}} is the resource, not the
+ * agent key). The rule's brief is resolved (`@builtin:<type>` → that shipped
+ * brief) and interpolated here, for every provider, so a shipped brief's
+ * {{KEY}}/{{PARENT}}/… placeholders never reach the agent raw.
+ */
+const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
   const note = TOOLS_NOTE[providerOf(spec) ?? ""];
-  return `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", resource, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${spec.brief!.trim()}\n`;
+  const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
+  return `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
 };
 
 /**

@@ -79,16 +79,6 @@ describe("rule discovery", () => {
   });
 });
 
-describe("rule briefs", () => {
-  test("a @builtin:<type> brief reaches the agent as that shipped brief; inline text passes through", () => {
-    const [builtin, inline] = rules({ id: "bugs", query: "q", brief: "@builtin:bug" }, { id: "task", query: "q" });
-    const specOf = (rule: typeof builtin) => specForMatch({ agentKey: `jira-work:${rule!.id}:BUTCHR-7`, rule: rule!, issue: issue("BUTCHR-7") });
-    expect(specOf(builtin).brief).toBe(briefFor("bug"));
-    expect(specOf(builtin).brief).not.toBe(briefFor("default-fallback"));
-    expect(specOf(inline).brief).toBe("do it");
-  });
-});
-
 describe("rule reconcile", () => {
   test("zero rules means zero staffing: every rule agent is stopped, nothing is spawned", async () => {
     const herd = fakeHerd(["jira-work:task:BUTCHR-1", "jira-work:review:BUTCHR-2"]);
@@ -405,6 +395,25 @@ describe("rule workspaces", () => {
     }
     expect(resourceKeyOf("jira-work:task:BUTCHR-12")).toBe("BUTCHR-12");
     expect(resourceKeyOf("BUTCHR-12")).toBe("BUTCHR-12");
+  });
+
+  test("a @builtin:<type> brief is written as that shipped brief, interpolated for the resource, with no raw placeholders", () => {
+    const dir = buildWorkspace({ ...ruleSpec, key: "jira-work:bugs:BUTCHR-12", brief: "@builtin:bug", parent: "BUTCHR-1" }, "http://localhost:7717/mcp", "claude");
+    const brief = readFileSync(join(dir, "brief.md"), "utf8");
+    expect(brief.startsWith("# bugs agent — BUTCHR-12: fix it\n\n")).toBe(true);
+    // the shipped bug brief's own text, not the @builtin reference and not the default brief
+    expect(brief).not.toContain("@builtin:");
+    expect(brief).toContain(briefFor("bug").split("\n").find((l) => l.trim() && !l.includes("{{"))!.trim());
+    // every placeholder was filled in for the RESOURCE, never left raw or given the agent key
+    expect(brief).not.toMatch(/\{\{[A-Z_]+\}\}/);
+    expect(brief).not.toContain("jira-work:bugs:BUTCHR-12");
+    if (briefFor("bug").includes("{{KEY}}")) expect(brief).toContain("BUTCHR-12");
+    if (briefFor("bug").includes("{{PARENT}}")) expect(brief).toContain("BUTCHR-1");
+  });
+
+  test("an inline rule brief is written as-is, with placeholders filled in for the resource", () => {
+    const dir = buildWorkspace({ ...ruleSpec, brief: "Work {{KEY}} under {{PARENT}}." }, "http://localhost:7717/mcp", "claude");
+    expect(readFileSync(join(dir, "brief.md"), "utf8")).toBe("# task agent — BUTCHR-12: fix it\n\nWork BUTCHR-12 under (none — you are top-level).\n");
   });
 
   test("building a rule workspace leaves a legacy workspace for the same ticket byte-identical", () => {

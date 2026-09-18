@@ -65,6 +65,7 @@ import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
+import { missingRulesPreflight } from "./missing-rules-preflight.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -91,9 +92,11 @@ if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console
 // an absent file means zero rules (there are no built-in defaults), announced
 // so an idle daemon is never a mystery.
 let rules;
+let missingRulesPath: string | null = null;
 try {
   const loaded = loadRules(process.env as Record<string, string | undefined>);
   rules = loaded.rules;
+  if (loaded.origin === "missing") missingRulesPath = loaded.path;
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
   if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
   else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
@@ -140,6 +143,15 @@ const preflight = await legacyAgentPreflight(async () => (await herdr.agent.list
 if (!preflight.ok) {
   console.error(`butchr: ${preflight.message}`);
   process.exit(1);
+}
+// No rules file + live rule agents: refuse, rather than stop the whole fleet
+// on the first poll over what is usually an accident (src/daemon/missing-rules-preflight.ts).
+if (missingRulesPath !== null) {
+  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents);
+  if (!rulesPreflight.ok) {
+    console.error(`butchr: ${rulesPreflight.message}`);
+    process.exit(1);
+  }
 }
 // BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
