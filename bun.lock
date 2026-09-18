@@ -4,9 +4,9 @@
   "workspaces": {
     "": {
       "dependencies": {
-        "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.6.0/brooswit-drovr-0.6.0.tgz",
+        "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.10.3/brooswit-drovr-0.10.3.tgz",
         "@brooswit/sundry": "^0.2.1",
-        "@brooswit/thatch": "0.6.3",
+        "@brooswit/thatch": "0.8.0",
         "@modelcontextprotocol/sdk": "^1.30.0",
         "confluence.js": "^3.2.0",
         "elysia": "^1.4.29",
@@ -21,13 +21,13 @@
   "packages": {
     "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, "sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ=="],
 
-    "@brooswit/drovr": ["@brooswit/drovr@https://github.com/brooswit-factory/drovr/releases/download/v0.6.0/brooswit-drovr-0.6.0.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3" } }, "sha512-baHpgUl/GyU9IO1HFSMtOgs4GNXGunzc0OskMbpkgwnUBaZD/qeedNUydOOht9TtJnbn9/R9ljH/QN0/n9HsXw=="],
+    "@brooswit/drovr": ["@brooswit/drovr@https://github.com/brooswit-factory/drovr/releases/download/v0.10.3/brooswit-drovr-0.10.3.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3" } }, "sha512-iXt7PFXW/lCfouAym//uLvehmIS9bHhOrtu4akUqFfuLnikCZbzbF7ErlL5Kx7z/csnGbuBHT84Bd42r5x10xw=="],
 
     "@brooswit/herdr-sdk": ["@brooswit/herdr-sdk@0.1.3", "", {}, "sha512-mEwipLDaDGnUEtUhGBSjDUhFU3gB3HvkjyC9Q7OLJNugpU7Hk3romKnO1ZUna9WyZYq7lteqaLu5TmPvILkekQ=="],
 
     "@brooswit/sundry": ["@brooswit/sundry@0.2.1", "", {}, "sha512-ixeQZXmV0HG5zCz+KsIlgYa4EGUNXBW67G9SBYnIYKSBMbN3DKHd9sk83p4CpryEiwdrlfbtzCDg2kILDeopzQ=="],
 
-    "@brooswit/thatch": ["@brooswit/thatch@0.6.3", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-SFEFxWL3gkNguFmacIs4IqAxAI209WvWY0TcPNb/IBLPU6oj4/DuqPuhkXXa4hnYcrQBCanjRZqanNn3LUYLKg=="],
+    "@brooswit/thatch": ["@brooswit/thatch@0.8.0", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-9rdAm9Wl2B33cYsTzwLWNKG3nVe0RagMRW+vrqE+8i4AtLggIeIfg/LaXMi4tdoYmqKokgXOyZ9irNgTMSa0Gg=="],
 
     "@hono/node-server": ["@hono/node-server@2.1.1", "", { "peerDependencies": { "hono": "^4" } }, "sha512-ELuehkj5VCBdgEw9zs+ivkKwyzzUCSQuE96YmiPvn1ECBoZCczbFXJLeEGMTYjphP6gydh4pHMqEYPVMYUVgQg=="],
 

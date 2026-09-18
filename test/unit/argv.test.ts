@@ -24,7 +24,9 @@ describe("spawnArgs", () => {
       "--effort", "high",
       "--permission-mode", "bypassPermissions",
       "--mcp-config", "/w/KAN-783/mcp.json",
-      "--dangerously-load-development-channels", "server:butchr",
+      // drovr >= 0.10 joins each channel onto its flag with "=": a separate
+      // "server:x" value could be swallowed as a user turn.
+      "--dangerously-load-development-channels=server:butchr",
     ]);
   });
 
@@ -34,7 +36,7 @@ describe("spawnArgs", () => {
     expect(args[modelIdx + 2]).toBe("--effort");
     expect(args[modelIdx + 3]).toBe("high");
     expect(args.indexOf("--mcp-config")).toBeGreaterThan(modelIdx + 3);
-    expect(args.indexOf("--dangerously-load-development-channels")).toBeGreaterThan(modelIdx + 3);
+    expect(args.indexOf("--dangerously-load-development-channels=server:butchr")).toBeGreaterThan(modelIdx + 3);
   });
 });
 
