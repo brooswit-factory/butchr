@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { join } from "node:path";
-import { buildWorkspace, issueOfWorkspacePath, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { decodeAgentKey } from "../rules/agent-key.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
@@ -83,7 +84,16 @@ export interface ManagedHerdAgent {
 }
 
 const AGENT_PREFIX = "butchr-";
-const nameFor = (issue: string) => AGENT_PREFIX + issue.toLowerCase();
+/** Hex characters of the key's SHA-256 in a name: `butchr-` plus 24 is 31, under Herdr's 32-character limit. */
+const NAME_HASH_LEN = 24;
+/**
+ * Display name only (identity comes from the workspace cwd). Herdr accepts
+ * only lowercase `[a-z0-9_-]` names of at most 32 characters, while agent keys
+ * are arbitrarily long, mixed-case, and full of `:`, `/` and `#`. So the name
+ * is a fixed-length hash of the exact key: one key always gets the same name,
+ * distinct keys get distinct names, and no key can make it invalid.
+ */
+const nameFor = (key: string) => AGENT_PREFIX + createHash("sha256").update(key).digest("hex").slice(0, NAME_HASH_LEN);
 
 /**
  * How long nudge() waits after delivering a prompt before checking whether a
@@ -193,7 +203,7 @@ export class HerdrHerd implements Herd {
     let lifecycle = this.lifecycles.get(issue);
     if (!lifecycle) {
       lifecycle = new ManagedHerdrLifecycle({
-        client: this.herdr, cwd: join(workspaceRoot(), issue),
+        client: this.herdr, cwd: workspaceDirFor(issue),
         availability: this.availability, wait: this.wait,
         startOptions: {
           readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS,
@@ -214,6 +224,12 @@ export class HerdrHerd implements Herd {
   }
 
   quotaBlocked(issue: string): boolean { return this.refused.has(issue); }
+
+  /** Whether any agent working `resource` (a Jira key) is quota-blocked — the label/stall layer thinks in tickets, the herd in agents. */
+  resourceQuotaBlocked(resource: string): boolean {
+    for (const id of this.refused.keys()) if (id === resource || decodeAgentKey(id)?.resourceId === resource) return true;
+    return false;
+  }
 
   async recoverQuota(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting"> {
     if (!this.agent.providers && !this.agent.roleProviders) return "not-refused";
@@ -261,7 +277,7 @@ export class HerdrHerd implements Herd {
     const ambiguous = new Set<string>();
     for (const a of agents) {
       const cwd = a.cwd ?? null;
-      const issue = issueOfWorkspacePath(cwd);
+      const issue = agentIdOfWorkspacePath(cwd);
       if (!cwd || !issue || !a.pane_id) continue;
       const currentPane = this.lifecycles.get(issue)?.current?.paneId;
       if (currentPane && a.pane_id !== currentPane) continue;
@@ -316,7 +332,8 @@ export class HerdrHerd implements Herd {
         out.push({ issue, reason: "Codex MCP isolation inventory missing", observedArgv: proc.argv });
         continue;
       }
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      const decoded = decodeAgentKey(issue);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -413,13 +430,17 @@ export class HerdrHerd implements Herd {
 
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
     const result = await this.lifecycle(spec.key).start({
-      priority: providerOrder(this.agent, spec.issuetype).map(provider => ({ provider, accountId: "default" })),
+      priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label: spec.key,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
       kickoff: kickoffFor,
       prepare: async provider => {
-        const selected = { ...this.agent, provider };
+        const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
+        // A rule's own preference for this harness (its first entry naming it) overrides the global model.
+        const preference = spec.agents?.find((p) => p.harness === provider);
+        if (preference?.model) selected.model = preference.model;
+        if (preference?.effort) selected.effort = preference.effort;
         if (provider === "codex" && selected.codexSpawnBlocked) throw new Error(selected.codexSpawnBlocked);
         if (provider === "agy" && selected.agySpawnBlocked) throw new Error(selected.agySpawnBlocked);
         const dir = buildWorkspace(spec, this.mcpUrl, provider, selected.disabledMcpServers);

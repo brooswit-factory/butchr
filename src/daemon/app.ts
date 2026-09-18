@@ -3,11 +3,14 @@ import { thatch } from "@brooswit/thatch";
 import { liveView, type ViewDeps } from "../web/view.js";
 import type { ToolDef } from "@brooswit/thatch";
 import { preIdentityRefusalLine } from "../tools/outcome.js";
+import { callerIdentity } from "../mcp/identity.js";
 
 /**
  * One process, one HTTP server: the MCP endpoint agents connect to (`/mcp`) and
  * the read-only live view. Agents identify the issue they work on with an
- * `x-issue` header at connect; the daemon addresses channel events by it.
+ * `x-issue` header at connect; the daemon addresses channel events by it. A
+ * `github-issue`, `jira-idea` or `zendesk-ticket` agent identifies with its agent key alone (see
+ * src/mcp/identity.ts); a connection mixing the two is refused.
  *
  * `log` defaults to `console.error`, the same convention `atlassianTools`
  * (src/tools/defs.ts) already uses for its own audit/outcome lines — so both
@@ -30,13 +33,26 @@ export function buildApp(view: ViewDeps, tools: Record<string, ToolDef<any>> = {
     // where that was confirmed). Record it here, in butchr's own code, since
     // this `auth` closure IS butchr's own code, not the framework's.
     auth: (req) => {
-      const identified = Boolean(req.headers.get("x-issue"));
+      const identified = callerIdentity({
+        "x-issue": req.headers.get("x-issue") ?? undefined,
+        "x-butchr-agent": req.headers.get("x-butchr-agent") ?? undefined,
+      }) !== null;
       if (!identified) log(preIdentityRefusalLine());
       return identified;
     },
   });
   const app = new Elysia().use(plugin).use(liveView(mcp, view));
   return { app, mcp };
+}
+
+/**
+ * Push an update to one rule-engine agent: the connection whose
+ * `x-butchr-agent` is `agentKey`. Several agents may share a ticket
+ * (`x-issue`), so matching on the ticket would hand each of them every other
+ * agent's nudges too.
+ */
+export function notifyAgent(mcp: ReturnType<typeof buildApp>["mcp"], agentKey: string, issueKey: string, content: string) {
+  return mcp.sendAll({ content, meta: { issue: issueKey } }, { where: (c) => c.headers["x-butchr-agent"] === agentKey && !["codex", "agy"].includes(c.headers["x-butchr-provider"] ?? "") });
 }
 
 /** Push an update to whichever agent(s) say they are working `issueKey`. */

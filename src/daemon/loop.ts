@@ -376,6 +376,23 @@ export interface ReconcileOptions {
    */
   onAdmitted?: (succeeded: readonly string[]) => void;
   /**
+   * Holds ids against the shared admission cap while their spawn is in
+   * flight — `AdmissionController.reserve`. Called for each respawn before
+   * its stop, so another loop's admission cannot fill the slot the stop
+   * frees before the replacement lands. `admission` reserves what it admits
+   * itself. Optional; omitted, nothing is held.
+   */
+  reserveAdmission?: (ids: readonly string[]) => void;
+  /**
+   * Drops ids from the shared admission cap's reservations —
+   * `AdmissionController.release`. Called for each admitted id and each
+   * respawn as soon as its spawn settles, whatever the outcome (a spawn can
+   * return with no agent when every provider is out of quota), and for every
+   * admitted id still held if this round throws before its spawns run.
+   * Optional; omitted, reservations last until the source's next admission.
+   */
+  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
+  /**
    * BUTCHR-305/BUTCHR-238: audible-only detection of a resource pinned
    * `"active"` by an agent that has stopped acting — see
    * src/agents/pinned-active.ts for the full mechanism (why every other hook
@@ -537,43 +554,57 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // plan.spawn" assertions, and admission.test.ts's own reconcileNow
   // integration tests) is unaffected.
   const admitted = opts.admission ? await opts.admission(live, plan.stop) : live;
-  // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
-  // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
-  // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
-  // (not `plan.spawn`) is what the detector prunes its own tracking against —
-  // the pruning trap that module's top comment names.
-  if (opts.checkCrashLoop) await opts.checkCrashLoop(admitted, [...desired.keys()]);
-  // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
-  // freed THIS poll is available to THIS poll's spawns rather than sitting
-  // idle an extra cycle. This ordering is not what makes an in-flight spawn
-  // safe, though — a workspace `spawn()` just created (pane up, agent not
-  // registered yet) would look exactly like a stranded slot to `checkReap`
-  // for the first several seconds either way. What actually protects it is
-  // `ReapGuard`'s own grace period (reap.ts: 2 observations AND >= 60s),
-  // which comfortably outlasts `KICKOFF_VERIFY_MS` (12s, herd.ts) — the
-  // ordering here is purely a throughput optimization, never a safety
-  // mechanism.
-  if (opts.checkReap) await opts.checkReap();
-  // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
-  // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
-  // burst of N new spawns (e.g. several stories activating in one poll)
-  // would stall this ENTIRE poll — label sync and every ticket's
-  // notifications included — for N times that wait. Each issue's spawn is
-  // independent (its own workspace directory, its own pane), so nothing
-  // requires them to run one after another.
-  //
-  // BUTCHR-147: each mapped async function catches its OWN rejection — the
-  // outer `Promise.all` therefore never rejects on a bad spawn, unlike
-  // before this ticket. One resource's `workspace.create`/`agent.start`
-  // failure is recorded into `failures` and never touches any other
-  // resource's spawn this same `Promise.all`.
-  await Promise.all(admitted.map(async (issue) => {
-    try {
-      await herd.spawn(desired.get(issue)!);
-    } catch (e) {
-      failures.push({ id: issue, stage: "spawn", error: e });
-    }
-  }));
+  // Every admitted id's reservation is released as its own spawn settles
+  // below; this `finally` releases whatever is still held if anything
+  // between here and there throws, so no reservation outlives this round.
+  const held = new Set(admitted);
+  const release = async (ids: readonly string[]) => {
+    if (!opts.releaseAdmission || !ids.length) return;
+    for (const id of ids) held.delete(id);
+    await opts.releaseAdmission(ids);
+  };
+  try {
+    // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
+    // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
+    // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
+    // (not `plan.spawn`) is what the detector prunes its own tracking against —
+    // the pruning trap that module's top comment names.
+    if (opts.checkCrashLoop) await opts.checkCrashLoop(admitted, [...desired.keys()]);
+    // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
+    // freed THIS poll is available to THIS poll's spawns rather than sitting
+    // idle an extra cycle. This ordering is not what makes an in-flight spawn
+    // safe, though — a workspace `spawn()` just created (pane up, agent not
+    // registered yet) would look exactly like a stranded slot to `checkReap`
+    // for the first several seconds either way. What actually protects it is
+    // `ReapGuard`'s own grace period (reap.ts: 2 observations AND >= 60s),
+    // which comfortably outlasts `KICKOFF_VERIFY_MS` (12s, herd.ts) — the
+    // ordering here is purely a throughput optimization, never a safety
+    // mechanism.
+    if (opts.checkReap) await opts.checkReap();
+    // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
+    // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
+    // burst of N new spawns (e.g. several stories activating in one poll)
+    // would stall this ENTIRE poll — label sync and every ticket's
+    // notifications included — for N times that wait. Each issue's spawn is
+    // independent (its own workspace directory, its own pane), so nothing
+    // requires them to run one after another.
+    //
+    // BUTCHR-147: each mapped async function catches its OWN rejection — the
+    // outer `Promise.all` therefore never rejects on a bad spawn, unlike
+    // before this ticket. One resource's `workspace.create`/`agent.start`
+    // failure is recorded into `failures` and never touches any other
+    // resource's spawn this same `Promise.all`.
+    await Promise.all(admitted.map(async (issue) => {
+      try {
+        await herd.spawn(desired.get(issue)!);
+      } catch (e) {
+        failures.push({ id: issue, stage: "spawn", error: e });
+      }
+      await release([issue]);
+    }));
+  } finally {
+    await release([...held]);
+  }
   // BUTCHR-297 (§B4): report which of THIS poll's admitted candidates
   // actually succeeded their spawn — see ReconcileOptions.onAdmitted's own
   // doc comment for why this must be `admitted` minus only the `"spawn"`-
@@ -615,6 +646,9 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // until it is freshly spawned and found stale again; it falls into the
     // ORDINARY `spawn` list on the very next poll instead, unaffected by
     // this guard window at all).
+    // Held from before the stop until the replacement settles, so another
+    // loop's admission never reads the stopped agent's slot as free.
+    opts.reserveAdmission?.([issue]);
     try {
       await herd.stop(issue);
       await herd.spawn(desired.get(issue)!, "respawn");
@@ -630,6 +664,8 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       // so there is nothing to notify about.
       failures.push({ id: issue, stage: "respawn", error: e });
       continue;
+    } finally {
+      await opts.releaseAdmission?.([issue]);
     }
     // BUTCHR-147 §7: only reached when BOTH herd.stop and herd.spawn above
     // succeeded — `opts.onRespawn` (the daemon's `[butchr:respawn]` Jira
@@ -814,6 +850,10 @@ export interface GenericLoopDeps<T> {
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
+  reserveAdmission?: (ids: readonly string[]) => void;
+  /** See `ReconcileOptions.releaseAdmission` — threaded straight through to `reconcileNow` below. */
+  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
   log?: (line: string) => void;
@@ -905,6 +945,8 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+        ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
+        ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
         atRest,
       });

@@ -267,7 +267,9 @@ interface TypeExclusion { readonly type: string; readonly reason: string }
 // sets for an empty-but-checked list — rather than omitted, so the
 // "every exclusion still matches a real family member" test below has
 // something to iterate that isn't vacuously true by omission.
-const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [];
+const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [
+  { type: "bug", reason: "bug.md owns defect reproduction and verification; it has no worker below it whose pull request it reviews or merges" },
+];
 
 const labelToType = (label: string): string => {
   const m = /^brief:([A-Za-z]+):brief\.md$/.exec(label);

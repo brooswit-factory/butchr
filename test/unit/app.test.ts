@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { buildApp, notifyIssue } from "../../src/daemon/app.js";
+import { buildApp, notifyAgent, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
 import { createCoverageTracker } from "../../src/daemon/coverage.js";
@@ -100,6 +100,15 @@ describe("butchr daemon app", () => {
     expect(await a.nextFrame()).toMatchObject({ content: "hello", meta: { issue: "KAN-9" } });
     expect((await notifyIssue(mcp, "KAN-000", "x")).sent).toEqual([]);
     await a.disconnect(); await Bun.sleep(30);
+  });
+  test("notifyAgent pushes only to the one rule agent, not to another agent on the same ticket", async () => {
+    const a = await FakeConnection.connect(base, { headers: { "x-issue": "KAN-10", "x-butchr-agent": "jira-work:task:KAN-10" } });
+    const b = await FakeConnection.connect(base, { headers: { "x-issue": "KAN-10", "x-butchr-agent": "jira-work:review:KAN-10" } });
+    let r; for (let i = 0; i < 100; i++) { r = await notifyAgent(mcp, "jira-work:task:KAN-10", "KAN-10", "for task"); if (r.sent.length) break; await Bun.sleep(10); }
+    expect(r!.sent).toEqual([a.sessionId!]);
+    expect(await a.nextFrame()).toMatchObject({ content: "for task", meta: { issue: "KAN-10" } });
+    expect((await notifyAgent(mcp, "jira-work:task:KAN-99", "KAN-99", "x")).sent).toEqual([]);
+    await a.disconnect(); await b.disconnect(); await Bun.sleep(30);
   });
 });
 

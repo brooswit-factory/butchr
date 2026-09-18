@@ -18,6 +18,13 @@ export interface JiraIssue {
   updated: string;
   labels: string[];
   /**
+   * The issue's project type (`fields.project.projectTypeKey`: `software`,
+   * `business`, `service_desk`, `product_discovery`), when the response
+   * carried it — `undefined` means UNKNOWN. Read by the jira-work/jira-idea
+   * boundary (src/resources/jira-idea.ts), which treats unknown as unproven.
+   */
+  projectType?: string;
+  /**
    * BUTCHR-169: this issue's links, when the caller asked `search()` for
    * them (see that method's `fields` param) — OPTIONAL, not because a real
    * issue can lack the field, but because most existing fixtures across this
@@ -84,6 +91,32 @@ export interface IssueLink {
    * addition.
    */
   status?: string;
+}
+
+/**
+ * One Jira remote issue link (`GET /rest/api/3/issue/{key}/remotelink`,
+ * schema `RemoteIssueLink`): a link from the issue to an item in another
+ * system. Jira requires only `object.url` and `object.title`; everything
+ * else is optional and free text set by whoever created the link.
+ */
+export interface JiraRemoteLink {
+  id: string;
+  /** The link's own global id, when its creator set one (the upsert key for `POST .../remotelink`). */
+  globalId: string | null;
+  /** Free-text relationship, e.g. "mentioned in" — not a controlled vocabulary. */
+  relationship: string | null;
+  url: string;
+  title: string;
+  /** `application.type`, when set by a registered rendering app. */
+  applicationType: string | null;
+}
+
+/** The body `POST .../remotelink` takes (Jira's `RemoteIssueLinkRequest`): `object.url` and `object.title` are required. */
+export interface JiraRemoteLinkInput {
+  /** At most 255 characters; the create-or-update key. */
+  globalId: string;
+  relationship?: string;
+  object: { url: string; title: string; icon?: { url16x16: string; title: string } };
 }
 
 export interface JiraComment {

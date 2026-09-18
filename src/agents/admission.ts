@@ -27,7 +27,10 @@
  * `plan.respawn` (stop-then-spawn of an ALREADY-resident agent, net zero
  * change in residency) never passes through this module at all. Gating a
  * respawn against this cap would let a stale agent be stopped and then
- * refused its own replacement, strictly worse than leaving it stale.
+ * refused its own replacement, strictly worse than leaving it stale. A
+ * respawn does `reserve()` its own id from before its stop until its
+ * replacement settles, though, so no OTHER loop's admission reads the gap
+ * between the two as a free slot.
  *
  * FLEET-WIDE, NOT PER-TIER (Trap 1 on the ticket): the `residency` census
  * this module is built over MUST be the raw, UNSCOPED herd's
@@ -41,19 +44,16 @@
  * that ONE instance to both `runResourceLoop` calls, so the two tiers draw
  * against one shared budget rather than each getting their own.
  *
- * The two tiers poll at very different cadences (the issue tier's 15s vs.
- * the project tier's `PROJECT_POLL_INTERVAL_MS`, 5 minutes) and each calls
- * `admit()` independently, computing its own budget against a FRESH census
- * taken at that moment — this is a per-poll decision, not a running ledger.
- * Two loops consulting the same shared budget can therefore each admit up
- * to it before either's spawns actually land, so a transient overshoot of a
- * few agents past the cap is possible. This is deliberate, not an oversight:
- * a cross-loop ledger would need coordination this codebase's existing
- * per-loop-instance state (RespawnGuard, CrashLoopTracker, ReapGuard) has no
- * precedent for, and the overshoot it would prevent is small and self-
- * correcting (the very next poll's census reflects it) — acceptable as long
- * as the default cap carries headroom, which its own doc comment
- * (src/config/config.ts) states plainly.
+ * The loops poll at different cadences and each calls `admit()`
+ * independently, computing its budget against a FRESH census taken at that
+ * moment. A census alone cannot see another loop's admitted-but-not-yet-
+ * spawned agents, so four rule loops reading it in the same round used to
+ * each admit up to the whole remaining budget and together start more than
+ * the cap. `createAdmissionController` now closes that: calls are serialized,
+ * and each admitted id stays reserved against the shared budget until
+ * `reconcileNow` releases it when its spawn settles (see `reserved` there).
+ * The census stays the source of truth for everything else; reservations
+ * only cover the spawn window a census cannot see.
  *
  * TRAP 2 — A CONFIDENT ZERO ADMITS A STAMPEDE, MEASURED LIVE (BUTCHR-282's
  * own hazard, inverted here): BUTCHR-282's measured condition is a daemon
@@ -449,6 +449,24 @@ export interface AdmissionController {
    * harmless no-op. Synchronous, like `snapshot()` — no census plumbing.
    */
   recordSpawned(succeeded: readonly string[]): void;
+  /**
+   * Holds `ids` against the shared cap for `source` until `release` — for a
+   * respawn, whose agent leaves the census between its stop and its
+   * replacement landing. Without the hold another loop's admission reads
+   * that gap as a free slot and the replacement lands over the cap. Never
+   * refuses: a respawn is not admission-controlled. An id also in the
+   * census is counted once.
+   */
+  reserve(ids: readonly string[], source?: string): void;
+  /**
+   * Drops `ids` from `source`'s reservations once their spawn has settled:
+   * a landed agent is in the census from then on, and one that did not land
+   * (failed, or waiting on provider quota with no agent) holds nothing.
+   * Runs after any in-progress `admit()`, so an admission never combines a
+   * census read from before a spawn landed with reservations from after its
+   * release. Never rejects.
+   */
+  release(ids: readonly string[], source?: string): Promise<void>;
 }
 
 /** Pure: which of `candidates` (already in the desired admit order) fit inside `budget` slots. Exported for direct unit testing of the arithmetic at/below/above the cap, independent of any census plumbing. */
@@ -489,8 +507,8 @@ export function orderByWait(candidates: readonly string[], waits: ReadonlyMap<st
  * trailing `wanted:` clause is exactly as parseable as the withheld-nonzero
  * case, just shorter.
  */
-export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>): string {
-  const base = `${ADMISSION2_TAG} cap=${cap} residency=${residency} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
+export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>, inFlight = 0): string {
+  const base = `${ADMISSION2_TAG} cap=${cap} residency=${residency}${inFlight > 0 ? ` in-flight=${inFlight}` : ""} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
   if (withheld.length === 0) return base;
   const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
   return `${base} wanted: ${withheldDesc}`;
@@ -563,8 +581,51 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     (deps.sources ?? []).map((source) => [source, { source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "never-reported" }]),
   );
   const setBucket = (bucket: AdmissionCensusBucket) => buckets.set(bucket.source, bucket);
+  // Shared-cap reservations: ids admitted (or respawning) whose spawn has
+  // not settled yet, per source. Several rule loops share this controller on
+  // independent timers, and an agent is not in `residency()` until its spawn
+  // lands — without these, every loop reading the same pre-spawn census gets
+  // the whole remaining budget and together they start more than the cap.
+  // `reconcileNow` releases each id as soon as its own spawn settles, and
+  // releases the rest if its round throws, so a reservation never outlives
+  // the round that made it: a spawn that returns with no agent (provider
+  // quota) or a loop whose source search then fails holds no slot. A
+  // source's leftovers are also dropped at its next `admit()` (a caller that
+  // never releases admits as before). With a single source the reservations
+  // are never read, so one loop alone admits exactly as before.
+  const reserved = new Map<string, Set<string>>();
+  // `admit()` and `release()` run one at a time so a census read and the
+  // reservations it is combined with always come from the same side of a
+  // release. A `reserve()` is applied immediately: it only ever adds.
+  let turn: Promise<unknown> = Promise.resolve();
+  const exclusive = <R>(fn: () => Promise<R> | R): Promise<R> => {
+    const run = turn.then(fn);
+    turn = run.catch(() => undefined);
+    return run;
+  };
 
-  async function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
+  function admit(candidates: readonly string[], stopping: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<readonly string[]> {
+    return exclusive(() => admitExclusive(candidates, stopping, source));
+  }
+
+  function reserve(ids: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): void {
+    if (!ids.length) return;
+    const held = reserved.get(source) ?? new Set<string>();
+    for (const id of ids) held.add(id);
+    reserved.set(source, held);
+  }
+
+  function release(ids: readonly string[], source: string = DEFAULT_ADMISSION_SOURCE): Promise<void> {
+    return exclusive(() => {
+      const held = reserved.get(source);
+      if (!held) return;
+      for (const id of ids) held.delete(id);
+      if (!held.size) reserved.delete(source);
+    });
+  }
+
+  async function admitExclusive(candidates: readonly string[], stopping: readonly string[], source: string): Promise<readonly string[]> {
+    reserved.delete(source);
     let resident: readonly string[];
     try {
       resident = await deps.residency();
@@ -634,7 +695,9 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // addendum for why aging lives here and why the tie-break reproduces
     // today's exact order at wait 0.
     const ordered = orderByWait(candidates, waits);
-    const budget = deps.cap - observed;
+    const occupied = new Set(resident);
+    for (const ids of reserved.values()) for (const id of ids) occupied.add(id);
+    const budget = deps.cap - occupied.size;
     const { admitted, withheld } = admitWithinBudget(ordered, budget);
     // §A4/B1/B4: increment the wait for every candidate withheld THIS call
     // only — never an admitted one (admission is not the same event as
@@ -672,7 +735,8 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // ADMITTED count too, not only withheld — see `ADMISSION2_TAG`'s own doc
     // comment for why the tag itself changed (criterion D) rather than
     // reusing `[admission]` with a wider firing condition.
-    log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits));
+    reserve(admitted, source);
+    log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits, occupied.size - observed));
     setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
     return admitted;
   }
@@ -687,6 +751,8 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   return {
     admit,
     recordSpawned,
+    reserve,
+    release,
     snapshot: () => {
       const longestId = lastWithheld[0];
       const longestWait = longestId !== undefined ? { id: longestId, polls: waits.get(longestId) ?? 0 } : null;

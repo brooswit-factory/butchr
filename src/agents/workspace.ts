@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
@@ -8,15 +8,37 @@ import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
 import EPIC from "../../briefs/epic.md" with { type: "text" };
 import STORY from "../../briefs/story.md" with { type: "text" };
 import TASK from "../../briefs/task.md" with { type: "text" };
+import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
+import { decodeAgentKey } from "../rules/agent-key.js";
+import type { AgentPreference } from "../rules/rules.js";
 
-export interface SpawnSpec { key: string; issuetype: string; summary: string; parent: string | null }
+/**
+ * `key` is the herd identity: a rule-engine agent key
+ * (`jira-work:<rule>:<ISSUE>`, see src/rules/agent-key.ts), or — for the
+ * legacy/test callers that predate rules — a bare resource key. The optional
+ * fields are set only for rule-engine agents: `resource` is the Jira key the
+ * agent works (what MCP tools see as `x-issue`), `brief` replaces the
+ * issue-type brief, and `agents` is the rule's ranked harness preference.
+ */
+export interface SpawnSpec {
+  key: string;
+  issuetype: string;
+  summary: string;
+  parent: string | null;
+  resource?: string;
+  brief?: string;
+  agents?: readonly AgentPreference[];
+}
 
-const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, project: PROJECT };
+/** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
+export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
+
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
 
 /**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
@@ -60,6 +82,26 @@ export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.t
  */
 export const knownBriefTypes = (): string[] => Object.keys(BRIEF_BY_TYPE);
 
+/** A rule's `brief` of the form `@builtin:<type>` names one of the shipped briefs above instead of inline text. */
+export const BUILTIN_BRIEF_PREFIX = "@builtin:";
+
+/** A rule's brief as the agent gets it: a `@builtin:<type>` reference resolved to that shipped brief, any other text as-is. */
+export const resolveRuleBrief = (brief: string): string =>
+  brief.startsWith(BUILTIN_BRIEF_PREFIX) ? briefFor(brief.slice(BUILTIN_BRIEF_PREFIX.length)) : brief;
+
+/**
+ * Why a rule's brief is unusable, or null. Only `@builtin:` references are
+ * checked: an unknown type would otherwise fall back to DEFAULT silently, so a
+ * typo like `@builtin:stroy` must fail the rules file at load instead.
+ */
+export const builtinBriefProblem = (brief: string): string | null => {
+  if (!brief.startsWith(BUILTIN_BRIEF_PREFIX)) return null;
+  const type = brief.slice(BUILTIN_BRIEF_PREFIX.length);
+  return knownBriefTypes().includes(type.toLowerCase())
+    ? null
+    : `names unknown built-in brief "${type}" (known: ${knownBriefTypes().join(", ")})`;
+};
+
 /** `groundTruth` fills `{{GROUND_TRUTH}}` (only CLAUDE.md carries that placeholder); omit it for templates that don't need it. */
 export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: string): string => {
   const values: Record<WorkspacePlaceholder, string> = {
@@ -82,10 +124,51 @@ export const effortFor = (issuetype: string): string =>
 
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
-export function issueOfWorkspacePath(cwd: string | null | undefined): string | null {
-  if (!cwd || dirname(cwd) !== workspaceRoot()) return null;
-  return basename(cwd).toUpperCase();
+/**
+ * Where an agent's workspace lives. A rule-engine agent key maps to
+ * `<root>/<provider>/<ruleId>/<resourceId>` (each segment already
+ * URI-escaped by the key codec, so the key's `:`-joined parts ARE the path
+ * segments). Anything else keeps the legacy `<root>/<id>` layout. The two
+ * layouts cannot collide: a legacy directory is one level deep, a
+ * rule-engine one is three — so a legacy workspace is never reused,
+ * rewritten, or adopted by a rule agent for the same ticket.
+ */
+export function workspaceDirFor(id: string, root: string = workspaceRoot()): string {
+  return decodeAgentKey(id) ? join(root, ...id.split(":")) : join(root, id);
 }
+
+/**
+ * The herd id owning `cwd`, inverse of `workspaceDirFor`: a canonical agent
+ * key for a three-deep rule-engine workspace, the upper-cased directory name
+ * for a legacy one-deep workspace, `null` for anything else. Legacy ids are
+ * still reported so legacy agents stay visible (dashboard, admission
+ * census); the rule loop's `ownsId` is what keeps it from ever stopping or
+ * adopting them.
+ */
+export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
+  if (!cwd) return null;
+  const rel = relative(root, cwd);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+  const segments = rel.split(sep);
+  if (segments.length === 1) return segments[0]!.toUpperCase();
+  if (segments.length !== 3) return null;
+  const key = segments.join(":");
+  return decodeAgentKey(key) ? key : null;
+}
+
+/**
+ * The rule-engine agent owning `cwd`, of ANY provider — never a legacy
+ * one-deep workspace. For provider-neutral pane care (session-limit
+ * recovery) that every rule loop's agents need, unlike the Jira-writing
+ * detectors, which scope themselves to `jira-work`.
+ */
+export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
+  const id = agentIdOfWorkspacePath(cwd, root);
+  return id && decodeAgentKey(id) ? id : null;
+}
+
+/** The resource (Jira key) a herd id works: the decoded resource of an agent key, else the id itself. */
+export const resourceKeyOf = (id: string): string => decodeAgentKey(id)?.resourceId ?? id;
 
 /**
  * Create the agent's workspace: CLAUDE.md (generic pointer, interpolated so
@@ -95,16 +178,66 @@ export function issueOfWorkspacePath(cwd: string | null | undefined): string | n
  * directory — the agent's cwd.
  */
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
-  const dir = join(workspaceRoot(), spec.key);
+  const dir = workspaceDirFor(spec.key);
+  const resource = resourceOfSpec(spec);
+  // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
+  const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
-  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify({ issue: spec.key, mcpUrl }, null, 2));
+  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
-  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, spec, groundTruth));
-  writeFileSync(join(dir, "brief.md"), interpolate(briefFor(spec.issuetype), spec));
-  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: { "x-issue": spec.key } } } }, null, 2));
+  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
+  writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
+  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) } } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
+}
+
+/** The first line of a rule-engine brief — the only place a rule workspace snapshots the ticket's summary. */
+export const ruleBriefHeader = (ruleId: string, resource: string, summary: string): string => `# ${ruleId} agent — ${resource}: ${summary}`;
+
+const providerOf = (spec: SpawnSpec) => decodeAgentKey(spec.key)?.resourceProvider;
+/** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket"].includes(providerOf(spec) ?? "");
+
+/** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
+export const GITHUB_ISSUE_TOOLS_NOTE =
+  "Your resource is a GitHub issue, not a Jira ticket. Read it (title, body, type, comments) with the butchr `github_get_issue` tool and comment on it with `github_add_comment`; both act only on your own issue. When your rule is allowed to, `github_link_jira_idea` links your issue to an existing Jira Product Discovery idea. Jira and Confluence tools refuse you. You are told when the issue changes — re-read it then.";
+
+/** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
+export const JIRA_IDEA_TOOLS_NOTE =
+  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool, list the GitHub issues its Jira remote links point at with `jira_idea_github_issues`, and comment on it with `jira_idea_add_comment`; all three act only on your own idea. When your rule is allowed to, `jira_idea_link_github_issue` links your idea to an existing GitHub issue. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
+
+/** What a `zendesk-ticket` agent is told about its tools; a Jira work brief carries no such section. */
+export const ZENDESK_TICKET_TOOLS_NOTE =
+  "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
+
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE };
+
+/**
+ * A rule-engine brief: the rule's own text under a header naming the ticket.
+ * `view` is the spec as templates see it ({{KEY}} is the resource, not the
+ * agent key). The rule's brief is resolved (`@builtin:<type>` → that shipped
+ * brief) and interpolated here, for every provider, so a shipped brief's
+ * {{KEY}}/{{PARENT}}/… placeholders never reach the agent raw.
+ */
+const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
+  const note = TOOLS_NOTE[providerOf(spec) ?? ""];
+  const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
+  return `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
+};
+
+/**
+ * Headers identifying an agent to the butchr MCP server. `x-issue` is always
+ * the resource (every tool resolves the caller's ticket from it);
+ * `x-butchr-agent` is added for rule-engine agents so events and own-write
+ * echoes are scoped to the one agent, not every agent on the same ticket.
+ * A `github-issue`, `jira-idea` or `zendesk-ticket` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
+ */
+export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
+  // A GitHub issue or Zendesk ticket is not a Jira key, and an idea is not a work item: such an agent is identified by key alone, so no Jira work tool can resolve it as a ticket.
+  if (isKeyOnly(spec)) return { "x-butchr-agent": spec.key };
+  return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }
 
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */

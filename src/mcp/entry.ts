@@ -9,8 +9,8 @@ export async function runBridge(args: string[]) {
     return;
   }
   if (!values["workspace-root"]) throw new Error("Workspace root required");
-  const { url, identity } = bridgeWorkspace(values["workspace-root"], process.cwd());
-  const bridge = await startBridge(url, identity, { onError: () => {
+  const { url, identity, agent } = bridgeWorkspace(values["workspace-root"], process.cwd());
+  const bridge = await startBridge(url, identity, { ...(agent ? { agent } : {}), onError: () => {
     process.exitCode = 1;
     console.error("Butchr MCP transport failed");
   } });

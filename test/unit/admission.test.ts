@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
-import { reconcileNow } from "../../src/daemon/loop.js";
+import { reconcileNow, scopedHerd } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
 function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
@@ -757,5 +757,278 @@ describe("createAdmissionController.census() — per-source residency census (BU
     expect(await ctrl.admit(["A", "B"], [], "issue")).toEqual([]);
     expect(ctrl.snapshot().longestWait).toEqual({ id: "B", polls: 1 }); // unchanged — §B3 still holds with the census write added beside it
     expect(ctrl.census().buckets.find((b) => b.source === "issue")!.checked).toBe(false);
+  });
+});
+
+describe("shared cap across rule loops — in-flight reservations", () => {
+  // A herd whose spawns land only when `release()` is called, like a real
+  // provider handoff: until then the agent is admitted but not yet resident.
+  // Tracks which harness each agent runs so the census covers every provider.
+  function slowHerd(initial: ReadonlyArray<readonly [string, string]> = []) {
+    const running = new Map<string, string>(initial);
+    const pending: Array<() => void> = [];
+    let peak = running.size;
+    const herd: Herd = {
+      async runningIssues() { return [...running.keys()]; },
+      async staleIssues() { return []; },
+      async spawn(sp) {
+        await new Promise<void>((resolve) => pending.push(resolve));
+        running.set(sp.key, sp.agents?.[0]?.harness ?? "claude");
+        peak = Math.max(peak, running.size);
+      },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    return { herd, running, peak: () => peak, release: () => { for (const r of pending.splice(0)) r(); } };
+  }
+  const providerSpec = (k: string, harness: "claude" | "codex" | "agy") => ({ ...spec(k), agents: [{ harness }] });
+  const until = async (cond: () => boolean) => { for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 0)); };
+  const SOURCES = ["issue", "github-issue", "jira-idea", "zendesk-ticket"] as const;
+
+  test("four sources admitting concurrently against one census never admit more than the remaining budget", async () => {
+    const resident = ["R1", "R2", "R3"];
+    const ctrl = createAdmissionController({ cap: 8, residency: async () => resident, sources: SOURCES });
+    const results = await Promise.all(SOURCES.map((s) => ctrl.admit([`${s}-1`, `${s}-2`, `${s}-3`], [], s)));
+    expect(results.flat().length).toBe(5);
+    expect(results[0]).toEqual(["issue-1", "issue-2", "issue-3"]);
+    expect(results[1]).toEqual(["github-issue-1", "github-issue-2"]);
+    expect(results[2]).toEqual([]);
+    expect(results[3]).toEqual([]);
+  });
+
+  test("four reconcile loops with mixed providers and existing agents stay within the cap while spawns are still in flight", async () => {
+    const { herd, running, peak, release } = slowHerd([["issue-0", "claude"], ["zendesk-ticket-0", "codex"]]);
+    const ctrl = createAdmissionController({ cap: 6, residency: () => herd.runningIssues(), sources: SOURCES });
+    const harnesses = ["claude", "codex", "agy"] as const;
+    const rounds = SOURCES.map((source, n) => {
+      const desired = new Map([0, 1, 2, 3].map((i) => [`${source}-${i}`, providerSpec(`${source}-${i}`, harnesses[(n + i) % 3]!)] as const));
+      return reconcileNow(scopedHerd(herd, (id) => id.startsWith(`${source}-`)), desired, {
+        admission: (candidates, stopping) => ctrl.admit(candidates, stopping, source),
+        onAdmitted: ctrl.recordSpawned,
+        reserveAdmission: (ids) => ctrl.reserve(ids, source),
+        releaseAdmission: (ids) => ctrl.release(ids, source),
+      });
+    });
+    await until(() => false);
+    release();
+    await Promise.all(rounds);
+    expect(peak()).toBe(6);
+    expect(running.size).toBe(6);
+    expect(running.has("issue-0") && running.has("zendesk-ticket-0")).toBe(true);
+    expect(new Set(running.values())).toEqual(new Set(["claude", "codex", "agy"]));
+  });
+
+  test("a sibling's in-flight admissions hold the budget until that sibling's next round", async () => {
+    let resident: string[] = ["R1"];
+    const ctrl = createAdmissionController({ cap: 3, residency: async () => resident });
+    expect(await ctrl.admit(["A1", "A2"], [], "issue")).toEqual(["A1", "A2"]);
+    // A1/A2 not yet visible in the census: another source gets nothing.
+    expect(await ctrl.admit(["B1"], [], "jira-idea")).toEqual([]);
+    // A1 landed, A2's spawn failed; the issue loop polls again with nothing new.
+    resident = ["R1", "A1"];
+    expect(await ctrl.admit([], [], "issue")).toEqual([]);
+    expect(await ctrl.admit(["B1"], [], "jira-idea")).toEqual(["B1"]);
+  });
+
+  test("a landed spawn still reserved is counted once, not twice", async () => {
+    const ctrl = createAdmissionController({ cap: 3, residency: async () => ["A1"] });
+    expect(await ctrl.admit(["A1"], [], "issue")).toEqual(["A1"]);
+    expect(await ctrl.admit(["B1", "B2"], [], "jira-idea")).toEqual(["B1", "B2"]);
+  });
+
+  test("a census failure drops the calling source's reservations along with its withheld round", async () => {
+    let fail = false;
+    const ctrl = createAdmissionController({ cap: 2, residency: async () => { if (fail) throw new Error("down"); return []; } });
+    expect(await ctrl.admit(["A1", "A2"], [], "issue")).toEqual(["A1", "A2"]);
+    fail = true;
+    expect(await ctrl.admit(["A3"], [], "issue")).toEqual([]);
+    fail = false;
+    expect(await ctrl.admit(["B1", "B2"], [], "jira-idea")).toEqual(["B1", "B2"]);
+  });
+
+  test("a single loop is never limited by its own previous admissions", async () => {
+    const herd = fakeHerd([]);
+    let failing = true;
+    const flaky: Herd = { ...herd, async spawn(sp) { if (failing) throw new Error("handoff blocked"); await herd.spawn(sp); } };
+    const ctrl = createAdmissionController({ cap: 2, residency: () => herd.runningIssues() });
+    const desired = new Map([["A", spec("A")], ["B", spec("B")], ["C", spec("C")]]);
+    await reconcileNow(flaky, desired, { admission: (c, s) => ctrl.admit(c, s, "issue") });
+    expect(herd.spawned).toEqual([]);
+    failing = false;
+    await reconcileNow(flaky, desired, { admission: (c, s) => ctrl.admit(c, s, "issue") });
+    // Aging puts the withheld C first; the budget is still the full cap.
+    expect(herd.spawned.sort()).toEqual(["A", "C"]);
+  });
+
+  test("the admission line reports in-flight reservations only when there are some", async () => {
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1"], log: (l) => lines.push(l) });
+    await ctrl.admit(["A1", "A2"], [], "issue");
+    await ctrl.admit(["B1"], [], "jira-idea");
+    expect(lines[0]).toBe(`${ADMISSION2_TAG} cap=5 residency=1 admitted=2 withheld 0/2`);
+    expect(lines[1]).toBe(`${ADMISSION2_TAG} cap=5 residency=1 in-flight=2 admitted=1 withheld 0/1`);
+  });
+
+  test("a throwing census on one call does not wedge later calls", async () => {
+    let calls = 0;
+    const ctrl = createAdmissionController({ cap: 2, residency: async () => { if (calls++ === 0) throw new Error("down"); return []; } });
+    const [first, second] = await Promise.all([ctrl.admit(["A"], [], "issue"), ctrl.admit(["B"], [], "jira-idea")]);
+    expect(first).toEqual([]);
+    expect(second).toEqual(["B"]);
+  });
+
+  // Production wiring for one source's `reconcileNow` options.
+  const wired = (ctrl: ReturnType<typeof createAdmissionController>, source: string) => ({
+    admission: (candidates: readonly string[], stopping: readonly string[]) => ctrl.admit(candidates, stopping, source),
+    onAdmitted: ctrl.recordSpawned,
+    reserveAdmission: (ids: readonly string[]) => ctrl.reserve(ids, source),
+    releaseAdmission: (ids: readonly string[]) => ctrl.release(ids, source),
+  });
+
+  test("a spawn that returns with no agent (provider quota) releases its slot to other loops", async () => {
+    const running = new Set<string>(["zendesk-ticket-0"]);
+    const spawned: string[] = [];
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      // Every provider out of quota: spawn logs "waiting" and returns normally, no agent.
+      async spawn(sp) { spawned.push(sp.key); if (!sp.key.startsWith("issue-")) running.add(sp.key); },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues(), sources: ["issue", "jira-idea"] });
+    const issues = new Map([["issue-1", spec("issue-1")], ["issue-2", spec("issue-2")]]);
+    const ideas = new Map([["jira-idea-1", spec("jira-idea-1")], ["jira-idea-2", spec("jira-idea-2")]]);
+    for (let round = 0; round < 3; round++) {
+      await reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), issues, wired(ctrl, "issue"));
+      await reconcileNow(scopedHerd(herd, (id) => id.startsWith("jira-idea-")), ideas, wired(ctrl, "jira-idea"));
+    }
+    // The waiting issue loop retries every round, but holds no slot between rounds.
+    expect([...running].sort()).toEqual(["jira-idea-1", "jira-idea-2", "zendesk-ticket-0"]);
+    expect(spawned.filter((k) => k.startsWith("issue-")).length).toBeGreaterThanOrEqual(2);
+    // And it still gets the budget back once the ideas are gone.
+    running.delete("jira-idea-1");
+    running.delete("jira-idea-2");
+    expect(await ctrl.admit(["issue-1", "issue-2"], [], "issue")).toEqual(["issue-1", "issue-2"]);
+  });
+
+  test("an unsettled spawn still holds its slot; a waiting one frees it as soon as it returns", async () => {
+    const { herd, running, release } = slowHerd();
+    const ctrl = createAdmissionController({ cap: 1, residency: () => herd.runningIssues() });
+    const round = reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")]]), wired(ctrl, "issue"));
+    await until(() => false);
+    expect(await ctrl.admit(["jira-idea-1"], [], "jira-idea")).toEqual([]);
+    running.clear();
+    release();
+    await round;
+    running.delete("issue-1"); // landed, then exited: nothing resident, nothing reserved
+    expect(await ctrl.admit(["jira-idea-1"], [], "jira-idea")).toEqual(["jira-idea-1"]);
+  });
+
+  test("a round that throws after admission releases its reservations, so a loop whose search then keeps failing holds nothing", async () => {
+    const herd = fakeHerd([]);
+    const ctrl = createAdmissionController({ cap: 2, residency: () => herd.runningIssues() });
+    const desired = new Map([["issue-1", spec("issue-1")], ["issue-2", spec("issue-2")]]);
+    const round = reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), desired, {
+      ...wired(ctrl, "issue"),
+      checkCrashLoop: async () => { throw new Error("detector down"); },
+    });
+    await expect(round).rejects.toThrow("detector down");
+    expect(herd.spawned).toEqual([]);
+    // The issue loop's search now fails every poll, so it never admits again.
+    expect(await ctrl.admit(["jira-idea-1", "jira-idea-2"], [], "jira-idea")).toEqual(["jira-idea-1", "jira-idea-2"]);
+  });
+
+  test("after a completed round, a failing source search leaves only its real agents counted", async () => {
+    const herd = fakeHerd([]);
+    const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues() });
+    await reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")], ["issue-2", spec("issue-2")]]), wired(ctrl, "issue"));
+    herd.running.delete("issue-2"); // exited later; no further issue poll succeeds
+    expect(await ctrl.admit(["jira-idea-1", "jira-idea-2", "jira-idea-3"], [], "jira-idea")).toEqual(["jira-idea-1", "jira-idea-2"]);
+  });
+
+  test("a respawn holds its slot between stop and replacement, so another loop cannot push the host over the cap", async () => {
+    const running = new Set(["issue-1", "zendesk-ticket-0"]);
+    let peak = running.size;
+    let landRespawn!: () => void;
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return [{ issue: "issue-1", reason: "argv lacks flags", observedArgv: [] }]; },
+      async spawn(sp, origin) {
+        if (origin === "respawn") await new Promise<void>((r) => { landRespawn = r; });
+        running.add(sp.key);
+        peak = Math.max(peak, running.size);
+      },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues() });
+    const respawning = reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")]]), wired(ctrl, "issue"));
+    await until(() => landRespawn !== undefined);
+    expect(running.has("issue-1")).toBe(false);
+    const ideas = new Map([["jira-idea-1", spec("jira-idea-1")], ["jira-idea-2", spec("jira-idea-2")]]);
+    await reconcileNow(scopedHerd(herd, (id) => id.startsWith("jira-idea-")), ideas, wired(ctrl, "jira-idea"));
+    expect([...running].sort()).toEqual(["jira-idea-1", "zendesk-ticket-0"]);
+    landRespawn();
+    await respawning;
+    expect(peak).toBe(3);
+    expect([...running].sort()).toEqual(["issue-1", "jira-idea-1", "zendesk-ticket-0"]);
+    // The respawn's hold is gone once it settled.
+    running.delete("issue-1");
+    expect(await ctrl.admit(["jira-idea-2"], [], "jira-idea")).toEqual(["jira-idea-2"]);
+  });
+
+  test("a failed respawn releases its hold", async () => {
+    const running = new Set(["issue-1", "zendesk-ticket-0"]);
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return [{ issue: "issue-1", reason: "argv lacks flags", observedArgv: [] }]; },
+      async spawn() { throw new Error("handoff failed"); },
+      async stop(i) { running.delete(i); },
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ctrl = createAdmissionController({ cap: 2, residency: () => herd.runningIssues() });
+    await reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")]]), wired(ctrl, "issue"));
+    expect(await ctrl.admit(["jira-idea-1"], [], "jira-idea")).toEqual(["jira-idea-1"]);
+  });
+
+  test("a single loop's respawns and silent spawns never change what it admits", async () => {
+    const running = new Set(["issue-0"]);
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return [{ issue: "issue-0", reason: "argv lacks flags", observedArgv: [] }]; },
+      async spawn(sp) { if (sp.key !== "issue-3") running.add(sp.key); },
+      async stop(i) { running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues() });
+    const desired = new Map(["issue-0", "issue-1", "issue-3"].map((k) => [k, spec(k)] as const));
+    await reconcileNow(herd, desired, wired(ctrl, "issue"));
+    expect([...running].sort()).toEqual(["issue-0", "issue-1"]);
+    desired.set("issue-2", spec("issue-2"));
+    await reconcileNow(herd, desired, wired(ctrl, "issue"));
+    expect([...running].sort()).toEqual(["issue-0", "issue-1", "issue-2"]);
+  });
+
+  test("a release waits for an admission already reading the census, so that read is never combined with the release", async () => {
+    let answer!: (ids: string[]) => void;
+    const ctrl = createAdmissionController({ cap: 1, residency: () => new Promise<string[]>((r) => { answer = r; }) });
+    ctrl.reserve(["issue-1"], "issue");
+    const admitting = ctrl.admit(["jira-idea-1"], [], "jira-idea");
+    await new Promise((r) => setTimeout(r, 0));
+    // issue-1's spawn settles (and it exits) while the census read taken before it is still pending.
+    const released = ctrl.release(["issue-1"], "issue");
+    answer([]);
+    expect(await admitting).toEqual([]);
+    await released;
+    const next = ctrl.admit(["jira-idea-1"], [], "jira-idea");
+    await new Promise((r) => setTimeout(r, 0));
+    answer([]);
+    expect(await next).toEqual(["jira-idea-1"]);
   });
 });

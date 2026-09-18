@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, issueOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, ruleAgentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
@@ -32,10 +32,20 @@ describe("workspace identity", () => {
   });
   test("derives identity only from a direct child of the configured workspace root", () => {
     const root = workspaceRoot();
-    expect(issueOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
-    expect(issueOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
-    expect(issueOfWorkspacePath("/tmp/KAN-42")).toBeNull();
-    expect(issueOfWorkspacePath(null)).toBeNull();
+    expect(agentIdOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
+    expect(agentIdOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
+    expect(agentIdOfWorkspacePath("/tmp/KAN-42")).toBeNull();
+    expect(agentIdOfWorkspacePath(null)).toBeNull();
+  });
+  test("rule agent ids cover every provider and never a legacy workspace", () => {
+    const root = "/w";
+    expect(ruleAgentIdOfWorkspacePath("/w/jira-work/build/KAN-1", root)).toBe("jira-work:build:KAN-1");
+    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/acme%2Fweb%2342", root)).toBe("github-issue:triage:acme%2Fweb%2342");
+    expect(ruleAgentIdOfWorkspacePath("/w/jira-idea/ideas/IDEA-7", root)).toBe("jira-idea:ideas:IDEA-7");
+    expect(ruleAgentIdOfWorkspacePath("/w/zendesk-ticket/support/acme%2312", root)).toBe("zendesk-ticket:support:acme%2312");
+    expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
   });
 });
 
@@ -394,6 +404,7 @@ describe("interpolate", () => {
 });
 describe("buildWorkspace", () => {
   test("writes CLAUDE.md, interpolated brief.md, and mcp.json with x-issue", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
@@ -410,10 +421,15 @@ describe("buildWorkspace", () => {
       const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
       expect(mcp.mcpServers.butchr.headers["x-issue"]).toBe("KAN-9");
       expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
-    } finally { delete process.env.BUTCHR_WORKSPACES; }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("writes ENVIRONMENT.md, and CLAUDE.md is interpolated with the same ground truth", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
@@ -427,6 +443,10 @@ describe("buildWorkspace", () => {
       expect(claudeMd).toContain(hostname());
       expect(claudeMd).toContain("journalctl");
       expect(claudeMd).not.toContain("{{GROUND_TRUTH}}");
-    } finally { delete process.env.BUTCHR_WORKSPACES; }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

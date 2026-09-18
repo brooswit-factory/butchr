@@ -450,6 +450,31 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     expect(files.size).toBe(50); // 49 kept + 1 new
   });
 
+  // The daemon's rows carry rule-engine agent keys (`jira-work:<rule>:<ISSUE>`,
+  // `github-issue:<rule>:<owner%2Frepo%23n>`), so capture names start with
+  // one. They must count against the cap exactly like bare issue keys did.
+  test("(j) rule-engine agent-key captures are recognised and evicted at the same cap", async () => {
+    const agent = "github-issue:triage:acme%2Fweb.app%2342";
+    const ours = Array.from({ length: 50 }, (_, i) => `jira-work:build:KAN-${i + 1}-unrecognised-20260201T${String(i).padStart(2, "0")}0000Z.txt`);
+    const oldestName = ours[0]!;
+    const foreign = "jira-work:build:KAN-1-escalation-20260101T000000Z.txt";
+    const { sink, files } = fakeSink([...ours, foreign]);
+    const stop = watchSessionLimits({
+      list: async () => [row(agent, "idle", "p1")],
+      read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
+      close: async () => {},
+      now: () => Date.now(),
+      log: () => {},
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    expect(files.has(oldestName)).toBe(false); // evicted
+    expect(files.has(foreign)).toBe(true); // not ours: never evicted
+    expect([...files.keys()].some((n) => n.startsWith(`${agent}-unrecognised-`))).toBe(true);
+    expect(files.size).toBe(51); // 49 kept + 1 new + the foreign file
+  });
+
   test("(g) no captures dep supplied => today's behaviour exactly (no throw, no capture-shaped log)", async () => {
     const logs: string[] = [];
     const stop = watchSessionLimits({

@@ -1791,11 +1791,12 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
     expect(observed[0]![1].get("KAN-8")).toEqual(["200"]);
   });
 
-  test("the standDown effect is optional — omitting it still reads and returns the snapshot, it just never sleeps or releases a pane", async () => {
+  test("the standDown effect is optional — omitting it still reads the snapshot but never claims the caller is asleep", async () => {
     const { tools } = standDownRig({ issue: { key: "KAN-7", fields: { issuelinks: [] } }, commentsByKey: { "KAN-7": [] } });
-    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const conn = { headers: { "x-issue": "KAN-7", "x-butchr-agent": "jira-work:task:KAN-7" } } as any;
     const result = await tools.stand_down!.handler({}, conn);
-    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7"] });
+    expect(result).toMatchObject({ ok: true, key: "KAN-7", asleep: false, watching: ["KAN-7"] });
+    expect((result as { note: string }).note).toMatch(/NOT put to sleep/);
   });
 });
 

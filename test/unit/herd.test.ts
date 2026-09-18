@@ -1,12 +1,14 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
-import { workspaceRoot } from "../../src/agents/workspace.js";
+import { workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 
 const clearQuota = () => {
@@ -19,22 +21,60 @@ afterEach(clearQuota);
 /** One foreground process, as herdr's `pane.process_info` reports it. */
 interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
-function fakeHerdr(agents: Array<{ name?: string; pane_id: string }>) {
-  const started: any[] = []; const closed: string[] = [];
+function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined }>) {
+  const started: any[] = []; const closed: string[] = []; let createdCwd: string | undefined;
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
-      const issue = a.name?.startsWith("butchr-") ? a.name.slice("butchr-".length).toUpperCase() : null;
-      return issue ? { ...a, agent: "claude", cwd: join(workspaceRoot(), issue) } : a;
-    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id }); } },
+      // Names are key hashes, so started agents carry their workspace's cwd; fixtures seeded by name still map `butchr-kan-1` to KAN-1.
+      const cwd = a.cwd ?? (a.name?.startsWith("butchr-") ? join(workspaceRoot(), a.name.slice("butchr-".length).toUpperCase()) : undefined);
+      return cwd ? { ...a, agent: "claude", cwd } : a;
+    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd }); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
-    workspace: { create: async (_p: any) => ({ root_pane: { pane_id: "w9:p1" } }) },
+    workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: "w9:p1" } }; } },
   };
   return { client: client as any, started, closed };
 }
 
 describe("agent name convention", () => {
-  test("formats the optional display alias", () => {
-    expect(agentNameFor("KAN-1")).toBe("butchr-kan-1");
+  const HERDR_NAME = /^butchr-[0-9a-f]{24}$/;
+  const valid = (key: string) => {
+    const name = agentNameFor(key);
+    expect(name).toMatch(HERDR_NAME);
+    expect(name.length).toBe(31);
+    expect(name.length).toBeLessThanOrEqual(32);
+    return name;
+  };
+
+  test("one key always gets the same fixed-length name", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
+    expect(valid(key)).toBe(agentNameFor(key));
+    expect(agentNameFor(key)).toBe(`butchr-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`);
+  });
+
+  test("different resources, rules and providers get different names", () => {
+    const names = [
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-365" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage-2", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "triage", resourceId: "BUTCHR-364" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x-my", resourceId: "PROJ-1" }),
+      encodeAgentKey({ resourceProvider: "jira-work", ruleId: "x", resourceId: "MY_PROJ-1" }),
+      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a-b/c#1" }),
+      encodeAgentKey({ resourceProvider: "github-issue", ruleId: "r", resourceId: "a/b-c#1" }),
+      encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "r", resourceId: "acme#123" }),
+    ].map(valid);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  test("uppercase keys become lowercase names that still distinguish case", () => {
+    expect(valid("jira-work:TRIAGE:BUTCHR-364")).not.toBe(valid("jira-work:triage:butchr-364"));
+    expect(valid("KAN-1")).not.toBe(valid("kan-1"));
+  });
+
+  test("very long and unusual keys stay within Herdr's limit and distinct", () => {
+    const long = (n: number) => `github-issue:${"a".repeat(200)}:owner%2F${"R".repeat(500)}%23${n}`;
+    expect(valid(long(1))).not.toBe(valid(long(2)));
+    for (const key of ["", ":", "Ünïcødé:ключ:🦀", "x".repeat(10_000), " \t\n:/#%"]) valid(key);
   });
 });
 
@@ -50,6 +90,15 @@ describe("HerdrHerd", () => {
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(creates[0].env).toEqual({ HOME: "/tmp/isolated-agy-home" });
     expect(f.started[0].kind).toBe("agy");
+  });
+  test("a rule agent key with an uppercase Jira key starts under a Herdr-valid name", async () => {
+    const f = fakeHerdr([]);
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-364" });
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
+    await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
+    expect(f.started[0].name).toBe(agentNameFor(key));
+    expect(f.started[0].name).toMatch(/^butchr-[0-9a-f]{24}$/);
+    expect(workspaceDirFor(key)).toBe(join(workspaceRoot(), "jira-work", "triage", "BUTCHR-364")); // workspace identity keeps the exact key
   });
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
     const { client } = fakeHerdr([{ name: "butchr-kan-1", pane_id: "w1:p1" }, { name: "someone-else", pane_id: "w1:p2" }, { pane_id: "w1:p3" }]);
@@ -76,7 +125,7 @@ describe("HerdrHerd", () => {
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: "KAN-1" });
     expect(f.started.length).toBe(1);
-    expect(f.started[0].name).toBe("butchr-kan-7");
+    expect(f.started[0].name).toBe(agentNameFor("KAN-7"));
     expect(f.started[0].pane_id).toBe("w9:p1");   // started in the new workspace's root pane
     expect(f.started[0].kind).toBe("claude");
     expect(f.started[0].args).toContain("--permission-mode");
@@ -302,7 +351,7 @@ describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same pol
     const client = {
       agent: {
         list: async () => ({ agents: [] }), // never running — no residency race in this test
-        start: async (p: any) => { if (p.name === "butchr-kan-3") throw new Error("boom"); },
+        start: async (p: any) => { if (p.name === agentNameFor("KAN-3")) throw new Error("boom"); },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },
       workspace: { create: async (p: any) => ({ root_pane: { pane_id: `pane-${p.label}` } }) },
@@ -377,7 +426,8 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
         list: async () => ({ agents: live }),
         start: async (p: any) => {
           if (p.name === agentNameFor("KAN-RESPAWN-FAIL")) throw new Error("boom");
-          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), p.name.slice(7).toUpperCase()), agent_status: "working" });
+          const issue = [...desired.keys()].find((k) => agentNameFor(k) === p.name)!;
+          live.push({ pane_id: p.pane_id, agent: p.kind, cwd: join(workspaceRoot(), issue), agent_status: "working" });
         },
       },
       pane: { close: async () => {}, read: async () => ({ read: { text: "" } }) },

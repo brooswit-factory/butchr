@@ -35,6 +35,8 @@ export interface QuotaGate {
    * observed, or last observed clear.
    */
   isBlocked: (issue: string) => boolean;
+  /** Every id currently blocked — lets a per-ticket caller ask about all agents working one ticket. */
+  blockedIds: () => string[];
   /** Drop-in replacement for the `list` handed to `watchSessionLimits` — records each poll's rows so `read` below can resolve a `pane_id` back to its issue. */
   list: () => Promise<AgentRow[]>;
   /** Drop-in replacement for the `read` handed to `watchSessionLimits` — returns the SAME text unchanged, after teeing it through `detectSessionLimitRefusal` for the row that owns this `pane_id`. */
@@ -46,6 +48,7 @@ export function createQuotaGate(list: () => Promise<AgentRow[]>, read: (paneId: 
   let lastRows: AgentRow[] = [];
   return {
     isBlocked: (issue) => blocked.get(issue) ?? false,
+    blockedIds: () => [...blocked.keys()],
     list: async () => {
       lastRows = await list();
       return lastRows;

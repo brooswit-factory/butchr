@@ -138,3 +138,41 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // holds: additive, not a meaning change to the existing shape.
   return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`; // "comment" in reason
 }
+
+/**
+ * The agent-facing push for a `github-issue` agent's own issue. Names the
+ * tool to re-read with, since a GitHub agent has no Jira tools; carries no
+ * GitHub-authored text (see src/rules/github-issue-type.ts).
+ */
+export function githubIssueNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
+  return `[butchr] GitHub issue ${resource} ${clause} — re-read it with github_get_issue.`;
+}
+
+/**
+ * The agent-facing push for a `zendesk-ticket` agent's own ticket. Names the
+ * tool to re-read with; carries no customer-authored text (see
+ * src/rules/zendesk-ticket-type.ts).
+ */
+export function zendeskTicketNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its subject edited" : reasonClause(reason);
+  return `[butchr] Zendesk ticket ${resource} ${clause} — re-read it with zendesk_get_ticket.`;
+}
+
+/**
+ * The agent-facing push for a `jira-idea` agent's own idea. Names the tool to
+ * re-read with, since an idea agent has no Jira work tools.
+ */
+export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined): string {
+  return `[butchr] Jira Product Discovery idea ${resource} ${reasonClause(reason)} — re-read it with jira_idea_get.`;
+}
+
+/**
+ * The push for a `jira-idea` agent about a GitHub issue its idea links to
+ * (src/rules/jira-idea-type.ts). Identity and reason only, never GitHub text;
+ * an idea agent has no GitHub tools, so it names the link-listing tool.
+ */
+export function jiraIdeaLinkedGithubNudge(idea: string, githubIssue: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
+  return `[butchr] GitHub issue ${githubIssue}, linked from your Jira Product Discovery idea ${idea}, ${clause} — see the idea's GitHub links with jira_idea_github_issues.`;
+}

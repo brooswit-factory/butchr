@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { workspaceDirFor } from "./workspace.js";
 import type { results } from "@brooswit/drovr";
 
 /**
@@ -69,7 +69,7 @@ export function strandedCandidates(
   for (const w of workspaces) {
     if (agentWorkspaceIds.has(w.workspace_id)) continue; // something herdr knows about lives here — never a candidate
     const wpanes = panesByWorkspace.get(w.workspace_id) ?? [];
-    const expectedCwd = join(root, w.label);
+    const expectedCwd = workspaceDirFor(w.label, root);
     if (!wpanes.some((p) => p.cwd === expectedCwd)) continue; // ownership not proven — never a candidate, whatever else is true
     out.push({ workspaceId: w.workspace_id, label: w.label, paneIds: wpanes.map((p) => p.pane_id) });
   }

@@ -3,14 +3,15 @@ import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
-import { buildApp, notifyIssue } from "./app.js";
+import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
-import { combineHealth, createLoopHealth } from "./health.js";
+import { combineHealth, createLoopHealth, createResourceLoopHealth } from "./health.js";
+import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
-import { issueOfWorkspacePath } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -18,9 +19,9 @@ import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
-import { createIssueResourceType, ISSUE_JQL, createTodoWorkersFetch } from "../resources/issue.js";
-import { createProjectResourceType, PROJECT_POLL_INTERVAL_MS } from "../resources/project.js";
-import { isIssueKey, isProjectId } from "../resources/id.js";
+import { createTodoWorkersFetch } from "../resources/issue.js";
+import { loadRules } from "../rules/rules.js";
+import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -45,15 +46,26 @@ import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
-import { createFrozenAsleepDetector } from "../agents/frozen-asleep.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
+import { createGithubIssueClient } from "../resources/github-issue.js";
+import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
+import type { GithubIssueRef } from "../resources/github-issue-ref.js";
+import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
+import { createJiraIdeaClient } from "../resources/jira-idea.js";
+import { jiraIdeaTools } from "../tools/jira-idea.js";
+import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
+import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
-import { createCheckInExitRegistry } from "../agents/check-in-exit.js";
-import { createStandDownRegistry } from "../agents/stand-down.js";
-import { createPinnedActiveDetector } from "../agents/pinned-active.js";
+import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
+import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
+import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
+import { legacyAgentPreflight } from "./legacy-preflight.js";
+import { missingRulesPreflight } from "./missing-rules-preflight.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -75,7 +87,46 @@ try {
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 
+// Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
+// gets staffed. A present rules file with zero enabled rules staffs nothing;
+// an absent file means zero rules (there are no built-in defaults), announced
+// so an idle daemon is never a mystery.
+let rules;
+let missingRulesPath: string | null = null;
+try {
+  const loaded = loadRules(process.env as Record<string, string | undefined>);
+  rules = loaded.rules;
+  if (loaded.origin === "missing") missingRulesPath = loaded.path;
+  const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
+  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
+  else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+} catch (e) {
+  console.error(`butchr: ${(e as Error).message}`);
+  process.exit(1);
+}
+
+// github-issue rules run only with GitHub auth and org scope configured and
+// every enabled rule's query scoped inside those orgs; otherwise none of them
+// runs and nothing is spawned for one (announced by startGithubIssueLoop).
+const githubStaffing = githubIssueStaffing(rules, config.github);
+const githubIssues = githubStaffing.run && config.github
+  ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
+  : undefined;
+
+// zendesk-ticket rules run only with ZENDESK_SUBDOMAIN and an owner-only
+// ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
+// for one (announced by startZendeskTicketLoop). The token file is read only
+// when an enabled zendesk-ticket rule exists.
+const zendeskStaffing = zendeskTicketStaffing(rules, process.env as Record<string, string | undefined>);
+const zendeskTickets = zendeskStaffing.run
+  ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
+  : undefined;
+
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// jira-idea rules share this Jira client but are their own provider: their
+// own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
+const ideaRules = jiraIdeaRules(rules);
+const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
 // This gate preflights that per project (first sight, cached for the run)
@@ -84,6 +135,24 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
 const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+// Before any listener or loop exists: live agents in legacy flat workspaces
+// count against the host cap but no rule loop owns them, so refuse to start
+// rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
+// Read-only — nothing is stopped and no workspace is touched.
+const preflight = await legacyAgentPreflight(async () => (await herdr.agent.list()).agents);
+if (!preflight.ok) {
+  console.error(`butchr: ${preflight.message}`);
+  process.exit(1);
+}
+// No rules file + live rule agents: refuse, rather than stop the whole fleet
+// on the first poll over what is usually an accident (src/daemon/missing-rules-preflight.ts).
+if (missingRulesPath !== null) {
+  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents);
+  if (!rulesPreflight.ok) {
+    console.error(`butchr: ${rulesPreflight.message}`);
+    process.exit(1);
+  }
+}
 // BUTCHR-320: the 4th, optional `log` param emits one [spawn] outcome line
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
@@ -107,13 +176,15 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 // `runResourceLoop` call site) are what actually name a call's own tier —
 // this daemon never calls `admissionController.admit` directly.
 const ADMISSION_SOURCE_ISSUE = "issue";
-const ADMISSION_SOURCE_PROJECT = "project";
+const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
+const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
+const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ADMISSION_SOURCE_PROJECT],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : [])],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -153,7 +224,7 @@ const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 // falsifier for the ordering proof).
 const dashboardFeed = createDashboardFeed({
   now: () => Date.now(),
-  issueMeta: (key) => issueMeta.get(key),
+  issueMeta: (key) => issueMeta.get(resourceKeyOf(key)),
   tracker: dashboardStatusFloor,
   withheldTracker: dashboardWithheldStatusFloor,
   admission: () => admissionController.census(),
@@ -209,24 +280,28 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
-// BUTCHR-91/BUTCHR-68: the project tier's own pair of liveness components,
-// so `/health` (and an operator asking "is the project tier deployed?")
-// gets a truthful answer even when its allowlist is empty — the loop below
-// always starts, so these always report SOMETHING (starting/ok/stale)
-// rather than being silently absent. Threshold is a 4x multiple of the
-// project loop's OWN 5-minute interval, mirroring the issue tier's own
-// ratio above (60_000 / 15_000 = 4) rather than reusing `config.pollStaleMs`
-// (tuned for a 15s loop; applied to a 5-minute one it would flap red on
-// perfectly normal cadence).
-const PROJECT_POLL_STALE_MS = PROJECT_POLL_INTERVAL_MS * 4;
-const projectLoopHealth = createLoopHealth({
-  name: "projectPollLoop",
-  thresholdMs: PROJECT_POLL_STALE_MS,
+// github-issue, jira-idea and zendesk-ticket loop health, reported beside (never inside) the
+// liveness components: whether each type's rules run, and whether its polls
+// complete. The threshold covers at least three polls of the slower loop.
+const githubIssueHealth = createResourceLoopHealth({
+  name: "github-issue",
+  enabled: Boolean(githubIssues),
+  ...(githubStaffing.run ? {} : { disabledReason: githubStaffing.reason ?? "no enabled github-issue rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_ISSUE_POLL_MS),
   log: (line) => console.error(line),
 });
-const projectNotifyHealth = createLoopHealth({
-  name: "projectNotify",
-  thresholdMs: PROJECT_POLL_STALE_MS,
+const jiraIdeaHealth = createResourceLoopHealth({
+  name: "jira-idea",
+  enabled: Boolean(jiraIdeas),
+  ...(jiraIdeas ? {} : { disabledReason: "no enabled jira-idea rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * JIRA_IDEA_POLL_MS),
+  log: (line) => console.error(line),
+});
+const zendeskTicketHealth = createResourceLoopHealth({
+  name: "zendesk-ticket",
+  enabled: Boolean(zendeskTickets),
+  ...(zendeskStaffing.run ? {} : { disabledReason: zendeskStaffing.reason ?? "no enabled zendesk-ticket rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * ZENDESK_TICKET_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
@@ -261,54 +336,18 @@ const currency = createCurrencyTracker({ compute: () => computeBuildCurrency(bui
 const isStaffed = async (key: string): Promise<boolean | null> => {
   try {
     const running = await herd.runningIssues();
-    return running.includes(key);
+    return running.some((id) => resourceKeyOf(id) === key);
   } catch {
     return null;
   }
 };
-
-// BUTCHR-275: the project agent's own positive "I have checked in" exit
-// signal — see src/agents/check-in-exit.ts's own top comment for the full
-// mechanism and why it is a separate registry from frozenAsleepDetector
-// below rather than folded into it. One instance, shared between the
-// `check_in` tool handler (which declares) and the project loop's
-// `checkDeclaredDone` hook (which consumes) — declared here, ahead of both,
-// same "shared, not duplicated" discipline as `ownChannelComments` below.
-const checkInExit = createCheckInExitRegistry();
-// BUTCHR-307: the issue tier's own pane-release signal — a SECOND, separate
-// `CheckInExitRegistry` instance (never the project tier's `checkInExit`
-// above — see that module's own top comment: it is generic over an opaque
-// id, but one instance per LOOP, same "one instance per runResourceLoop
-// call" discipline `RespawnGuard`/`ReapGuard` already follow elsewhere in
-// this file). `stand_down`'s tool handler below declares into this instance
-// (composed alongside `issueStandDown.standDown` — see the `standDown`
-// callback passed to `atlassianTools`), and the issue loop's own
-// `checkDeclaredDone`/`invalidateDeclaredDone` hooks consume it.
-const issueCheckInExit = createCheckInExitRegistry();
-// BUTCHR-307: the issue tier's own sleep/wake registry — see
-// src/agents/stand-down.ts's own top comment for the full mechanism (the
-// self-wake hazard it closes, the seen-set bound, the two new failure modes
-// it bounds). `comments`/`addComment` are the plain issue-only seams
-// (`stalled`/`parkedDetector` above already use the same shape) rather than
-// the tier-aware `ownChannelComments` reader below: every id this registry
-// ever sees is an issue key, never a project id, so there is no second
-// resource shape to route around here.
-const issueStandDown = createStandDownRegistry({
-  now: () => Date.now(),
-  maxSleepMinutes: config.standDownMaxSleepMinutes,
-  yieldLoopCount: config.yieldLoopCount,
-  yieldLoopWindowMinutes: config.yieldLoopWindowMinutes,
-  addComment: async (id, text) => { await ops.addComment(id, text); },
-  comments: (id) => atlassian.comments(id),
-  log: (line) => console.error(`  ${line}`),
-});
 
 const { app, mcp } = buildApp({
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
       status,
-      summary: issueMeta.get(issue)?.summary ?? "",
+      summary: issueMeta.get(resourceKeyOf(issue))?.summary ?? "",
     }));
   },
   open: async (issue) => {
@@ -333,7 +372,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth, projectLoopHealth, projectNotifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth]),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -348,18 +387,22 @@ const { app, mcp } = buildApp({
   // BUTCHR-339: the dashboard row's resource-link redirect target — the
   // decision itself is `resolveResourceLink` (src/resources/resource-link.ts,
   // directly unit-tested there); this just supplies its real deps.
-  resourceLink: (key) => resolveResourceLink(key, { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
-}, atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed, checkInExit.declare, (key, seen) => {
-  // BUTCHR-307: `stand_down`'s effect is composed from TWO registries — see
-  // `issueCheckInExit`/`issueStandDown`'s own construction comments above
-  // for why pane release (a `CheckInExitRegistry` instance) is a separate
-  // signal from sleep/wake itself (`StandDownRegistry`), same reasoning
-  // `check_in`/`checkInExit` already keep separate for the project tier.
-  issueStandDown.standDown(key, seen);
-  issueCheckInExit.declare(key);
-}));
-app.listen(config.port);
-console.error(`butchr daemon on http://localhost:${config.port}  (${describeConfig(config)})`);
+  resourceLink: (key) => resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+// check_in/stand_down are passed no registries: the rule engine has no
+// project tier to check in and no per-agent sleep yet, so both tools run in
+// their documented "declares nothing" mode instead of feeding state that no
+// loop reads.
+}, {
+  // Jira/Confluence tools refuse github-issue, jira-idea and zendesk-ticket agents; each provider's own tools exist only when its rules run.
+  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // Linking needs both providers running: authorization reads both loops' latest matches.
+  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+});
+app.listen(listenOptions(config.port));
+console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${describeConfig(config)})`);
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
 // daemon's own /health `build` field serves (see `health` above) — never a
 // second derivation — so a journal window can be attributed to a BUILD, not
@@ -381,17 +424,27 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // existing seam, do not add a second reader". Behaviour-preserving: this is
 // the exact closure `syncLabels` was already given, moved to a name instead
 // of an inline argument.
+/** The ticket a pane's workspace works, for rule-engine workspaces only — a legacy workspace is never attributed to its ticket. */
+const ownedAgentOfCwd = (cwd: string | null | undefined): string | null => {
+  const id = agentIdOfWorkspacePath(cwd);
+  return id && ownsRuleAgent(id) ? id : null;
+};
+const resourceOfCwd = (cwd: string | null | undefined): string | null => {
+  const id = ownedAgentOfCwd(cwd);
+  return id ? resourceKeyOf(id) : null;
+};
 const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
   const m = new Map<string, string>();
   for (const a of agents) {
     const issue = a.resource_key ?? null;
-    if (issue) m.set(issue, a.agent_status ?? "unknown");
+    // Several rule agents may work one ticket; the ticket's agent:* label follows its busiest agent.
+    if (issue && !(m.get(issue) === "working")) m.set(issue, a.agent_status ?? "unknown");
   }
   return m;
 };
 const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
   const { agents } = await herdr.agent.list();
-  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })));
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })));
 };
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
@@ -428,7 +481,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
-      return { agents: agents.map((a) => ({ ...a, resource_key: issueOfWorkspacePath(a.cwd) })) };
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
@@ -456,7 +509,10 @@ const quotaGate = createQuotaGate(
   async () => (await herdr.agent.list()).agents.map((a) => ({
     pane_id: a.pane_id,
     agent_status: a.agent_status ?? "",
-    issue: issueOfWorkspacePath(a.cwd),
+    // Every rule loop's agents: a github-issue, jira-idea or zendesk-ticket
+    // pane refused at a session limit needs the same close-after-reset as a
+    // jira-work one, and nothing on this path writes to a resource.
+    issue: ruleAgentIdOfWorkspacePath(a.cwd),
   })),
   readPane,
   () => Date.now(),
@@ -473,7 +529,7 @@ const stallRemediation = createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
-  quotaBlocked: (issue) => herd.quotaBlocked(issue) || quotaGate.isBlocked(issue),
+  quotaBlocked: (issue) => herd.resourceQuotaBlocked(issue) || quotaGate.blockedIds().some((id) => resourceKeyOf(id) === issue),
   // BUTCHR-353: a worker's own labels, for the "withheld at the admission
   // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
   // never a herd/live probe: a boss's worker is staffed under a different
@@ -537,66 +593,6 @@ const abandonedDetector = createAbandonedDetector({
   todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-95/123: bounds `atRest` (src/reconcile/plan.ts) in time — see
-// src/agents/frozen-asleep.ts for the full mechanism. `addComment` reuses the
-// SAME `speakOnOwnChannel` seam the blocked-dialog escalator already wires
-// below, so this adds no second Atlassian writer either.
-const frozenAsleepDetector = createFrozenAsleepDetector({
-  now: () => Date.now(),
-  minutes: config.atRestMinutes,
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: ownChannelComments,
-  log: (line) => console.error(`  ${line}`),
-});
-// BUTCHR-307: a SECOND, issue-tier instance of the SAME generic detector —
-// `ISSUE_ACTIVATION.verdictFor` (src/resources/issue.ts) can now read
-// "asleep" too (via `stand_down`), so the issue loop needs its own
-// `atRest`-in-time bound for the exact same advance-then-exit race this
-// module's own top comment describes, same "one instance per loop"
-// discipline `frozenAsleepDetector` above already follows for the project
-// tier. The complaint text (`frozenComment`, frozen-asleep.ts) is already
-// tier-agnostic — it names `id` and never says "project" — so it needs no
-// issue-tier rewording.
-const issueFrozenAsleepDetector = createFrozenAsleepDetector({
-  now: () => Date.now(),
-  minutes: config.atRestMinutes,
-  addComment: async (id, text) => { await ops.addComment(id, text); },
-  comments: (id) => atlassian.comments(id),
-  log: (line) => console.error(`  ${line}`),
-});
-// BUTCHR-305/BUTCHR-238: audible-only detection of a PROJECT pinned "active"
-// by an agent that has stopped acting — see src/agents/pinned-active.ts for
-// the full mechanism. Wired into the project loop ONLY (see that call site
-// below): the issue tier already covers this same shape via
-// `syncLabels`/`stallRemediation` above. Reuses `agentStatuses` (this file's
-// existing herdr.agent.list() seam), the SAME `speakOnOwnChannel`/
-// `ownChannelComments` seams every sibling detector uses, and the SAME
-// `quotaGate.isBlocked` predicate `stallRemediation` above already wires
-// (constraint 6 — a quota-blocked agent is the session-limit path's case,
-// not this one's). `comments` is wrapped to report BUTCHR-179 coverage
-// (`/health`) the same way `stalled`'s own check does in src/labels/sync.ts:
-// `recordChecked` for a resolved fetch (found an adoption target or not),
-// `recordDeclined` for a rejected one — never invoked for a poll that never
-// reached the fetch at all (nothing stalled, already spoken, or
-// quota-blocked this poll).
-const pinnedActiveDetector = createPinnedActiveDetector({
-  now: () => Date.now(),
-  minutes: config.stalledMinutes,
-  agentStatuses,
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: async (id) => {
-    try {
-      const rows = await ownChannelComments(id);
-      coverage.recordChecked("pinned-active");
-      return rows;
-    } catch (e) {
-      coverage.recordDeclined("pinned-active");
-      throw e;
-    }
-  },
-  quotaBlocked: (issue) => herd.quotaBlocked(issue) || quotaGate.isBlocked(issue),
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
 // for the full mechanism. TWO SEPARATE INSTANCES, one per loop (unlike
 // frozenAsleepDetector above, which only the project tier can ever produce a
@@ -609,16 +605,8 @@ const issueCrashLoopDetector = createCrashLoopDetector({
   now: () => Date.now(),
   count: config.crashLoopCount,
   windowMinutes: config.crashLoopWindowMinutes,
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: ownChannelComments,
-  log: (line) => console.error(`  ${line}`),
-});
-const projectCrashLoopDetector = createCrashLoopDetector({
-  now: () => Date.now(),
-  count: config.crashLoopCount,
-  windowMinutes: config.crashLoopWindowMinutes,
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: ownChannelComments,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
@@ -631,14 +619,8 @@ const projectCrashLoopDetector = createCrashLoopDetector({
 // writer or reader.
 const issueReconcileFailureDetector = createReconcileFailureDetector({
   now: () => Date.now(),
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: ownChannelComments,
-  log: (line) => console.error(`  ${line}`),
-});
-const projectReconcileFailureDetector = createReconcileFailureDetector({
-  now: () => Date.now(),
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, id, text); },
-  comments: ownChannelComments,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-245: per-poll reclamation of a workspace whose agent exited on its
@@ -662,12 +644,6 @@ const issueReaper = createReaper({
   close: (c) => herd.closeStranded(c),
   log: (line) => console.error(`  ${line}`),
 });
-const projectReaper = createReaper({
-  now: () => Date.now(),
-  candidates: () => herd.strandedCandidates(),
-  close: (c) => herd.closeStranded(c),
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-287: a live per-issue residency census, independent of
 // agent.list() — see src/agents/residency-guard.ts and
 // src/agents/residency-census.ts for the full mechanism. TWO SEPARATE
@@ -683,10 +659,6 @@ const projectReaper = createReaper({
 // arrive pre-scoped to this loop's own `plan.spawn`, so there is nothing
 // for `scopedHerd`'s `ownsId` filtering to add here.
 const issueResidencyGuard = createResidencyGuard({
-  census: (candidates) => herd.residency(candidates),
-  log: (line) => console.error(`  ${line}`),
-});
-const projectResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
@@ -710,7 +682,7 @@ const projectResidencyGuard = createResidencyGuard({
 // own call order), never a second/stale read.
 const issueAdmissionWithheld = (): ReadonlySet<string> | "unknown" => {
   const bucket = admissionController.census().buckets.find((b) => b.source === ADMISSION_SOURCE_ISSUE);
-  return bucket?.checked ? new Set(bucket.withheld) : "unknown";
+  return bucket?.checked ? new Set(bucket.withheld.map(resourceKeyOf)) : "unknown";
 };
 
 const syncLabels = createLabelSync({
@@ -755,117 +727,62 @@ void sweepStaleAgentLabels({
   log: (line) => console.error(`  ${line}`),
 }).catch((e) => console.error(`  WARNING: startup agent:* sweep failed: ${(e as Error)?.message ?? e}`));
 
-// The issue tier expressed as ONE instance of ResourceType<JiraIssue>
-// (BUTCHR-64/BUTCHR-69) — discovery (the JQL + the Implements-chain
-// `related` walk), activation, event rules (the suppression stack) and
-// spawn config all live in src/resources/issue.ts now; this daemon is just
-// the wiring of that instance's I/O (the live Jira client + the own-write
-// ledger) to the generic loop below.
-const issueResourceType = createIssueResourceType({
+// The rule engine: every enabled rule's JQL, one agent per (rule, matched
+// ticket), reconciled by the SAME generic loop the issue and project tiers
+// used to run (src/rules/resource-type.ts). This replaces both of those
+// loops outright — there is no second loop that could also staff a ticket.
+//
+// `ownsId: ownsRuleAgent` is what keeps legacy agents and workspaces
+// untouched: a legacy `<root>/<ISSUE>` agent reports a bare issue key, which
+// never decodes as an agent key, so this loop can neither stop nor adopt it.
+const ruleResourceType = createRuleResourceType({
+  rules,
+  // searchAll, never search: a first-page-only result would read as tickets
+  // leaving the query and stop their agents.
   search: async (jql) => {
-    const issues = await atlassian.search(jql);
+    const issues = await atlassian.searchAll(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
   },
-  links: (key) => atlassian.links(key),
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
-  // BUTCHR-307: wires `.asleep` stamping (discovery.search()) and the
-  // stand-down gate (createIssueEventRules's decide()) to the SAME registry
-  // `stand_down`'s tool handler declares into above.
-  standDown: issueStandDown,
-  // BUTCHR-350: the SUPPRESSION side of the notify record — `[notify]`'s own
-  // sibling, `[notify-suppressed]`. Same `console.error` + two-space-indent
-  // convention as every other `log:` dep in this file (e.g. `runResourceLoop`
-  // below), so it reads as one stream in `journalctl` alongside `[notify]`,
-  // `[labels]`, `[reconcile]`, etc.
   log: (line) => console.error(`  ${line}`),
 });
 
-runResourceLoop(issueResourceType, {
+runResourceLoop(ruleResourceType, {
   herd,
-  // BUTCHR-91/BUTCHR-68: required as of the project tier's own second
-  // `runResourceLoop` instance below — both loops share this ONE `herd`
-  // (one flat `butchr-*` agent namespace), so each must scope its own
-  // reconcile to only the ids it owns or they evict each other's agents on
-  // every poll (see loop.ts's `scopedHerd` doc comment for the measured
-  // mechanism). `isIssueKey`/`isProjectId` (src/resources/id.ts) are
-  // mutually exclusive by construction — a project loop's agent can never
-  // also match this predicate.
-  ownsId: isIssueKey,
-  notify: async (issue, about, reason) => {
-    // BUTCHR-87: `reason?.pr` keeps its own dedicated rendering
-    // (prReviewStateNudge, src/agents/pr-nudge.ts — guarded by
-    // test/unit/merge-check-guard.test.ts, deliberately untouched here);
-    // every other member of NotifyReason, plus the no-reason fallback,
-    // renders through changeNudge (src/agents/change-nudge.ts) instead of
-    // the old bare "was updated" text this ticket replaces.
-    const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, about, reason);
-    // Channel push renders mid-turn; the prompt is what STARTS a turn on an
-    // idle agent (measured: an idle epic never woke on the push alone).
-    void notifyIssue(mcp, issue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(issue, msg).catch((): NudgeResult => ({ delivered: false }));
-    // BUTCHR-87: was `reason?.pr ? " (pr:from→to)" : ""` — every notify line
-    // now carries a reason tag, never a silent "" for the 89% that used to
-    // fall through the pr-only branch (see BUTCHR-34's own journal counts,
-    // the measurement this line's [notify] output makes reproducible).
+  ownsId: ownsRuleAgent,
+  notify: async (agent, about, reason) => {
+    const issue = resourceKeyOf(agent);
+    const aboutIssue = resourceKeyOf(about);
+    const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, aboutIssue, reason);
+    void notifyAgent(mcp, agent, issue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
     const reasonTag = notifyReasonTag(reason);
-    // KAN-829: a prompt that landed on a session-limit refusal is NOT
-    // "delivered" in any sense an operator cares about — say so explicitly,
-    // with the reset time, so `grep '\[notify\]'` and `grep 'session limit'`
-    // both surface it instead of the incident's silent "prompt delivered".
     const promptState = outcome.refusal
       ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
       : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${issue} ← ${about}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
+    console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
-  onRespawn: async (issue, reason, observedArgv) => {
-    console.error(`  [reconcile] ${issue} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
-    // A failed notice must not undo the respawn that already happened — log and move on.
-    await ops.addComment(issue, respawnComment(issue, reason, new Date().toISOString())).catch((e) =>
-      console.error(`  WARNING: [reconcile] respawn notice failed for ${issue}: ${(e as Error)?.message ?? e}`));
+  onRespawn: async (agent, reason, observedArgv) => {
+    const issue = resourceKeyOf(agent);
+    console.error(`  [reconcile] ${agent} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
-  syncLabels,
-  checkParked: parkedDetector.check,
-  checkAbandoned: abandonedDetector.check,
-  // BUTCHR-141: the issue tier is the fast, high-volume loop (15s) — the one
-  // most likely to actually observe a crash loop reach its threshold quickly.
-  // BUTCHR-307: `spawning` is filtered through `issueStandDown.consumeCrashLoopExemptions`
-  // FIRST — a spawn that is a wake from a declared stand_down is an ORDERLY
-  // exit, not an undeclared crash, so it must never reach this detector's
-  // own candidate list at all (see stand-down.ts's own top comment for why
-  // this is a call-site change, not a change to the detector's definition).
-  checkCrashLoop: (spawning, desired) => issueCrashLoopDetector.check(issueStandDown.consumeCrashLoopExemptions(spawning), desired),
-  // BUTCHR-147: see src/agents/reconcile-failure.ts.
+  // Label sync and the parked/abandoned detectors work per TICKET, so they
+  // see each matched issue once however many rules matched it.
+  syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
+  checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
+  checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
+  checkCrashLoop: issueCrashLoopDetector.check,
   checkReconcileFailure: issueReconcileFailureDetector.check,
-  // BUTCHR-307: `ISSUE_ACTIVATION.verdictFor` can now read "asleep" (via
-  // `stand_down`), so the issue loop needs the same `atRest` machinery the
-  // project tier already had — see issueFrozenAsleepDetector/issueCheckInExit's
-  // own construction comments above for why each is a SEPARATE instance from
-  // the project tier's.
-  checkFrozenAsleep: issueFrozenAsleepDetector.check,
-  checkDeclaredDone: issueCheckInExit.check,
-  invalidateDeclaredDone: issueCheckInExit.invalidateActive,
-  // BUTCHR-245: the issue tier is the fast, high-volume loop (15s) — the
-  // one most likely to actually clear a stranded workspace's grace period
-  // quickly. See src/agents/reap.ts.
   checkReap: issueReaper.check,
-  // BUTCHR-287: see src/agents/residency-guard.ts. Runs BEFORE `admission`
-  // below (its output feeds `admission`, not `plan.spawn` — see
-  // ReconcileOptions.checkResidency's own doc comment in loop.ts for the
-  // reason, not merely the order).
   checkResidency: issueResidencyGuard.filter,
-  // BUTCHR-284: the SAME shared controller instance the project loop below
-  // also uses — see admissionController's own construction comment above
-  // for why this must be one instance, not one per loop.
-  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
-  // the recording itself lives in admission.ts's `admit`.
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
-  // BUTCHR-297: the SAME shared controller instance's success signal — see
-  // admissionController's own construction comment above and
-  // src/agents/admission.ts's own B4 addendum for why this must be one
-  // ledger, not one per tier.
   onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ISSUE),
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -873,110 +790,85 @@ runResourceLoop(issueResourceType, {
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
 
-// BUTCHR-91/BUTCHR-68: the project tier's own second `runResourceLoop`
-// instance — the SAME `ops` (realAtlassian) and the SAME `atlassian.search`
-// Jira client the issue tier already uses above; no second Atlassian
-// client, no third credential path. OPT-IN, default OFF:
-// `config.projectAllowlist` is empty unless BUTCHR_PROJECT_ALLOWLIST is
-// set, and the allowlist is enforced inside `loadProjects`
-// (src/resources/project.ts) itself — the SOLE discovery path
-// `createProjectResourceType` exposes — so an unlisted project can never
-// reach `eligible`/`active` by any route this daemon takes, regardless of
-// what this wiring does or forgets to do.
-//
-// DESIGN CHOICE, stated per the ticket: this loop ALWAYS STARTS, even with
-// an empty allowlist, rather than being conditionally constructed only when
-// the allowlist is non-empty. An operator reading `/health` or this
-// daemon's own logs to answer "is the project tier deployed?" gets a
-// truthful answer either way: `projectPollLoop`/`projectNotify` always show
-// up in `/health`, and this file's own startup banner (`describeConfig`,
-// above) states the allowlist plainly — a loop that silently doesn't exist
-// at all whenever the list is empty would be indistinguishable, from
-// outside, from this code never having shipped. The cost of always starting
-// it is one poll's worth of `getMyself()` + `searchProjects("live")` every
-// `PROJECT_POLL_INTERVAL_MS` (5 min) even at zero allowlisted projects —
-// negligible, and it never reaches any per-project I/O (property/version/
-// comment reads), since `loadProjects` filters the allowlist before any of
-// that runs.
-const projectResourceType = createProjectResourceType({
-  ops,
-  search: (jql) => atlassian.search(jql),
-  allowlist: new Set(config.projectAllowlist),
+// The github-issue rule loop: its own agents only, its own admission bucket
+// under the same host cap, and none of the Jira-writing detectors above.
+if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
+// Read by the jira-idea loop: the GitHub issues idea rules may hear. Empty while github-issue rules are not staffed.
+let githubMatches: readonly GithubIssueMatch[] = [];
+// Read by the link tools: the ideas jira-idea rules currently match. Empty until the idea loop completes a poll.
+let ideaMatches: readonly RuleMatch[] = [];
+startGithubIssueLoop({
+  onMatches: (matches) => { githubMatches = matches; },
+  staffing: githubStaffing,
+  client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
+  log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
+  onError: (e) => githubIssueHealth.recordError(e),
 });
 
-runResourceLoop(projectResourceType, {
-  herd,
-  // See the issue loop's own `ownsId` comment above — the other half of the
-  // same fix, via the disjoint predicate.
-  ownsId: isProjectId,
-  notify: async (project, about, reason) => {
-    // Projects have no `pr`-reason path (`createProjectEventRules` never
-    // populates `reason` at all — src/resources/project.ts) and no related/
-    // Implements-chain concept (`about === project` always, per that
-    // module's own `eventRules.poll`), so this is a simplified sibling of
-    // the issue loop's own notify closure above, not a call into it — the
-    // issue loop's own call site above is left byte-for-byte untouched.
-    const msg = changeNudge(project, about, reason);
-    void notifyIssue(mcp, project, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(project, msg).catch((): NudgeResult => ({ delivered: false }));
-    const promptState = outcome.refusal
-      ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
-      : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${project} ← ${about}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
+// The jira-idea rule loop: proven Product Discovery ideas only, its own
+// agents and admission bucket, and none of the work-item detectors above.
+if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
+if (!githubIssues && ideaRules.some((r) => r.relationships?.inwardConnectionRules?.length)) console.error("  WARNING: jira-idea rules list github-issue rules, but github-issue rules are not staffed; ideas hear no GitHub issues");
+startJiraIdeaLoop({
+  rules,
+  search: async (jql) => {
+    const issues = await atlassian.searchAll(jql);
+    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
+    return issues;
   },
-  // BUTCHR-95/123: the project tier's own instance — see ReconcileOptions.checkFrozenAsleep's
-  // doc comment (src/daemon/loop.ts). BUTCHR-307 UPDATE: this is no longer
-  // the only tier that can produce a non-empty `atRest` — `ISSUE_ACTIVATION.verdictFor`
-  // can now read "asleep" too (via `stand_down`) — but each tier keeps its
-  // OWN detector instance regardless (see `issueFrozenAsleepDetector` at the
-  // issue loop's own wiring above), same "one instance per loop" discipline
-  // every other per-loop detector in this file already follows.
-  checkFrozenAsleep: frozenAsleepDetector.check,
-  // BUTCHR-275: the project tier's own instance. BUTCHR-307 UPDATE: the
-  // issue tier now has its own `check_in`-equivalent (`stand_down`) and its
-  // own `checkInExit`-equivalent instance (`issueCheckInExit`, wired at the
-  // issue loop's own call site above) — this one stays project-only.
-  checkDeclaredDone: checkInExit.check,
-  // BUTCHR-275 (review round 2): wired here too, same tier reasoning —
-  // see ReconcileOptions.invalidateDeclaredDone's own doc comment
-  // (src/daemon/loop.ts) and src/agents/check-in-exit.ts's "PER-EPISODE
-  // INVALIDATION" for the hazard this closes.
-  invalidateDeclaredDone: checkInExit.invalidateActive,
-  // BUTCHR-141: wired here too — a crash loop has no `atRest`-style
-  // single-tier restriction, and the project tier is the slower loop where a
-  // real crash loop still needs to reach the threshold well inside the
-  // configured window (see crashLoopCount's own doc comment, config.ts).
-  checkCrashLoop: projectCrashLoopDetector.check,
-  // BUTCHR-305/BUTCHR-238: wired here ONLY — the issue tier already covers
-  // this same "active+running+idle" shape via `syncLabels`/`stallRemediation`
-  // above (see src/agents/pinned-active.ts's own top comment for why wiring
-  // both would double-post).
-  checkPinnedActive: pinnedActiveDetector.check,
-  // BUTCHR-147: wired here too, same reasoning — see src/agents/reconcile-failure.ts.
-  checkReconcileFailure: projectReconcileFailureDetector.check,
-  // BUTCHR-245: wired here too — a stranded workspace has no `atRest`-style
-  // single-tier restriction, and this loop's own `workspace.list()` poll
-  // (5min cadence) is still a valid independent chance to catch a candidate
-  // the issue tier's own tracker missed a cap on. See src/agents/reap.ts.
-  checkReap: projectReaper.check,
-  // BUTCHR-287: wired here too, same reasoning as issueResidencyGuard above
-  // — see src/agents/residency-guard.ts.
-  checkResidency: projectResidencyGuard.filter,
-  // BUTCHR-284: the SAME shared controller instance the issue loop above
-  // also uses — see admissionController's own construction comment for why
-  // this must be one instance, not one per loop.
-  // BUTCHR-332: a thin wrapper naming this call's own tier — wiring only,
-  // the recording itself lives in admission.ts's `admit`.
-  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_PROJECT),
-  // BUTCHR-297: the SAME shared controller instance's success signal the
-  // issue loop above also uses — see that call site's own comment for why
-  // this must be one instance, not one per tier.
+  comments: (key) => atlassian.comments(key),
+  onMatches: (matches) => { ideaMatches = matches; },
+  ...(githubIssues && jiraIdeas ? {
+    githubMatches: () => githubMatches,
+    githubLinks: (key: string) => jiraIdeas.githubIssues(key),
+    githubComments: (ref: GithubIssueRef) => githubIssues.comments(ref),
+  } : {}),
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_IDEA),
   onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_IDEA),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_JIRA_IDEA),
+  log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
+  onError: (e) => jiraIdeaHealth.recordError(e),
+});
+
+// The zendesk-ticket rule loop: its own agents and admission bucket, and none
+// of the detectors above. Its agents' only write is a private internal note.
+if (zendeskStaffing.run) console.error(`  zendesk-ticket rules: ${zendeskStaffing.rules.map((r) => r.id).join(", ")} (subdomain ${zendeskStaffing.subdomain})`);
+startZendeskTicketLoop({
+  staffing: zendeskStaffing,
+  client: zendeskTickets ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ZENDESK_TICKET),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
   log: (line) => console.error(`  ${line}`),
-  intervalMs: PROJECT_POLL_INTERVAL_MS,
-  onError: (e) => console.error(`  project loop error: ${(e as Error)?.message ?? e}`),
-  onPollSuccess: () => projectLoopHealth.recordSuccess(),
-  onNotifySuccess: () => projectNotifyHealth.recordSuccess(),
+  onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
+  onError: (e) => zendeskTicketHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
@@ -1031,7 +923,7 @@ const escalator = createEscalator({
 // both need it, and neither can assume the caller already has it.
 async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
-  return issueOfWorkspacePath(agents.find((a) => a.pane_id === paneId)?.cwd);
+  return resourceOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
@@ -1113,6 +1005,3 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
-atlassian.search(ISSUE_JQL)
-  .then((issues) => console.error(`  ${issues.length} active issue(s) assigned to this credential`))
-  .catch((e) => console.error(`  WARNING: Atlassian credential check failed: ${e.message}`));
