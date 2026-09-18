@@ -29,9 +29,9 @@
     "build": "bun run scripts/build/build.ts"
   },
   "dependencies": {
-    "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.6.0/brooswit-drovr-0.6.0.tgz",
+    "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.10.3/brooswit-drovr-0.10.3.tgz",
     "@brooswit/sundry": "^0.2.1",
-    "@brooswit/thatch": "0.6.3",
+    "@brooswit/thatch": "0.8.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "confluence.js": "^3.2.0",
     "elysia": "^1.4.29",
