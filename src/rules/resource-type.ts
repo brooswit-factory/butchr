@@ -217,9 +217,19 @@ export const FOREIGN_RULE_ID = "external";
 
 /**
  * BUTCHR-388: most keys a single `key in (...)` fetch will ask for per poll.
- * Bounds the JQL rather than the truth — a fleet with more cross-daemon
- * implementers than this hears the first `FOREIGN_FETCH_LIMIT` by key order
- * and the rest on a later poll, which is strictly better than today's zero.
+ *
+ * ⚠️ This bounds the JQL by STARVING the tail, not by deferring it.
+ * `foreignImplementerKeys` sorts, and this takes the first N of that stable
+ * order every poll — so with a steady overflow the keys past N are **never**
+ * heard, not "heard on a later poll". They become reachable only when a key
+ * ahead of them leaves the set. That is the same silently-wrong shape this
+ * ticket exists to fix, one layer up, which is why crossing the limit is
+ * logged (see `related`) rather than left to be inferred from a fleet that
+ * mysteriously misses some children.
+ *
+ * Still strictly better than the zero cross-daemon edges that preceded it,
+ * so it ships — but raise it, page it, or order it by something meaningful
+ * before relying on it in a fleet that actually overflows.
  */
 export const FOREIGN_FETCH_LIMIT = 200;
 
@@ -341,7 +351,15 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
       // A failed fetch degrades to the same-daemon set rather than throwing
       // the poll away, and says so — never silently.
       related: async (active) => {
-        const wanted = foreignImplementerKeys(latest).slice(0, FOREIGN_FETCH_LIMIT);
+        const all = foreignImplementerKeys(latest);
+        const wanted = all.slice(0, FOREIGN_FETCH_LIMIT);
+        // BUTCHR-388: crossing the limit starves the tail for as long as the
+        // overflow lasts (see FOREIGN_FETCH_LIMIT), so say so. Without this
+        // an overflowing fleet is indistinguishable from a fitting one, and
+        // the count that would have told you is discarded on the line above.
+        if (all.length > wanted.length) {
+          deps.log?.(`  WARNING: [related] ${all.length} cross-rule implementer(s) exceeds FOREIGN_FETCH_LIMIT=${FOREIGN_FETCH_LIMIT}; ${all.length - wanted.length} will NOT be heard while this persists (first ${wanted.length} by key order fetched)`);
+        }
         let foreign: JiraIssue[] = [];
         if (wanted.length) {
           try {
