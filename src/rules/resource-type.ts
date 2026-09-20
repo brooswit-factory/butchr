@@ -75,13 +75,37 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
 /**
  * The related set: which rule agents hear which OTHER matched tickets.
  *
- * Agent `R:B` hears ticket `W` exactly when, for some rule `C` matching `W`,
- * one of these holds:
- * - up (boss hears worker): `C` is `R`'s `childRule` and Jira has `W`
- *   implementing `B` — an `Implements` link with `W` on the implementer side;
- * - inward (sideways): `C` is in `R`'s `inwardConnectionRules` and Jira has
- *   `W` and `B` joined by a `Relates` link, either way round.
+ * Agent `R:B` hears ticket `W` when either holds:
+ * - up (boss hears worker): Jira has `W` implementing `B` — an `Implements`
+ *   link with `W` on the implementer side. **Routed on the LINK alone**: no
+ *   rule configuration is consulted, and `W` need not be matched by any of
+ *   THIS daemon's rules (see `foreign`, and `foreignImplementerKeys`).
+ * - inward (sideways): for some rule `C` matching `W`, `C` is in `R`'s
+ *   `inwardConnectionRules` and Jira has `W` and `B` joined by a `Relates`
+ *   link, either way round.
  * Links are read from either ticket's `issuelinks`.
+ *
+ * BUTCHR-388 — A GUARANTEE WAS DELIBERATELY WITHDRAWN HERE, READ BEFORE
+ * RESTORING IT: `Implements` used to require the listener's rule to name the
+ * source's rule as its `relationships.childRule`. That gate was doing two
+ * jobs and only one was ever costed:
+ *   1. whether a boss hears its implementer at all — **dead in production**:
+ *      no rules file in this fleet declares `childRule`, so NOTHING was ever
+ *      heard, and the parent/child handoff silently depended on a human
+ *      noticing (198 of 198 notify lines in 24h were self-addressed);
+ *   2. WHICH rule hears, when one ticket is matched by several rules —
+ *      **given up on purpose.** Every rule matching the boss ticket now
+ *      hears. Verified 2026-09-20 against both live rules files: booswrit's
+ *      three rules are `issuetype = Epic|Task|Bug` and wroosbit's two enabled
+ *      ones are `Story|Sub-task`, so no ticket matches two rules on either
+ *      daemon and job 2 has never fired here.
+ * The gate also cannot be satisfied across daemons by construction: a rule id
+ * is per-file, and a ticket matched only by the other daemon has no local rule
+ * to name — which is every parent/child pair in a fleet that splits
+ * Epic/Task/Bug from Story/Sub-task by account. `src/jira-watch/routes.ts` has
+ * always stated the intended rule with no gate at all ("a boss hears what
+ * implements it"), and the legacy `createRelated` (src/resources/issue.ts)
+ * honoured it "regardless of assignee". This restores that.
  *
  * `Implements` carries direction itself: a worker never hears its boss, and
  * nothing routes down. `Relates` is symmetric in Jira, so ONLY configuration
@@ -96,45 +120,117 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
  * One entry per heard TICKET, however many rules or links connect it, so a
  * listener hears one change once. Its id is the smallest contributing agent
  * key — any stable member works, since routing reads the ticket, not the rule.
+ * BUTCHR-390: that tiebreak is arbitrary and only becomes visible the day a
+ * fleet runs overlapping rules; it is tracked there, not settled here.
  */
-export function relatedForRules(rules: readonly Rule[], matches: readonly RuleMatch[], active: readonly string[]): RelatedResource<RuleMatch>[] {
+export function relatedForRules(
+  rules: readonly Rule[],
+  matches: readonly RuleMatch[],
+  active: readonly string[],
+  foreign: readonly JiraIssue[] = [],
+): RelatedResource<RuleMatch>[] {
   const activeSet = new Set(active);
   const byId = new Map(rules.map((r) => [r.id, r]));
-  const hears: Record<"child" | "inward", (listener: Rule, source: Rule) => boolean> = {
-    child: (listener, source) => byId.get(listener.id)?.relationships?.childRule === source.id,
-    inward: (listener, source) => byId.get(listener.id)?.relationships?.inwardConnectionRules?.includes(source.id) ?? false,
-  };
+  const hearsInward = (listener: Rule, source: Rule) =>
+    byId.get(listener.id)?.relationships?.inwardConnectionRules?.includes(source.id) ?? false;
   const byIssue = new Map<string, RuleMatch[]>();
   for (const m of matches) byIssue.set(m.issue.key, [...(byIssue.get(m.issue.key) ?? []), m]);
+  const foreignByKey = new Map(foreign.map((i) => [i.key, i]));
 
+  /**
+   * BUTCHR-388: the sources a listener can hear for `sourceKey` — this
+   * daemon's own matches when it has them, otherwise a stand-in for a ticket
+   * only ANOTHER daemon's rules match. `foreignMatch`'s `rule` is a sentinel
+   * (`external`, disabled, empty query/brief): a related entry is only ever
+   * diffed and addressed — the loop reads `agentKey` (via `discovery.idOf`)
+   * and `issue`, never `rule`, and never spawns one — so there is no caller
+   * to mislead. Its `agentKey` is deliberately NOT an `encodeAgentKey` value,
+   * so it can never collide with a primary agent key or be decoded as one.
+   */
+  const sourcesFor = (sourceKey: string, listener: RuleMatch): RuleMatch[] => {
+    const own = byIssue.get(sourceKey);
+    if (own?.length) return own;
+    const issue = foreignByKey.get(sourceKey);
+    if (!issue) return [];
+    const provider = listener.rule.resourceProvider;
+    return [{
+      agentKey: `related:${provider}:${issue.key}`,
+      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "" },
+      issue,
+    }];
+  };
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
-  const edge = (sourceKey: string, listenerKey: string, kind: "child" | "inward") => {
+  const record = (sourceKey: string, listener: RuleMatch, source: RuleMatch) => {
+    const e = out.get(sourceKey);
+    if (!e) out.set(sourceKey, { issue: source, watchers: new Set([listener.agentKey]) });
+    else {
+      e.watchers.add(listener.agentKey);
+      if (source.agentKey < e.issue.agentKey) e.issue = source;
+    }
+  };
+  /**
+   * BUTCHR-388: an `Implements` edge routes on the LINK alone — "a boss hears
+   * what implements it", the rule `src/jira-watch/routes.ts` has always
+   * stated and the legacy `createRelated` (src/resources/issue.ts) has always
+   * honoured: *"a boss must hear about its implementer's progress even when
+   * another account staffs it."* The rules engine added a `relationships.childRule`
+   * gate on top of that, which no rules file in this fleet declares and which
+   * cannot be satisfied across daemons anyway (a rule id is per-file, and a
+   * ticket matched only by the other daemon has no local rule to name). The
+   * listener is the BOSS in both branches below — this does NOT route an
+   * implementer to its boss, the case `routes.ts` excludes deliberately.
+   */
+  const implementsEdge = (sourceKey: string, listenerKey: string) => {
+    if (sourceKey === listenerKey) return;
+    for (const listener of byIssue.get(listenerKey) ?? []) {
+      if (!activeSet.has(listener.agentKey)) continue;
+      for (const source of sourcesFor(sourceKey, listener)) record(sourceKey, listener, source);
+    }
+  };
+  /** `Relates` is symmetric in Jira, so ONLY configuration decides direction across it — unchanged. */
+  const relatesEdge = (sourceKey: string, listenerKey: string) => {
     if (sourceKey === listenerKey) return;
     for (const listener of byIssue.get(listenerKey) ?? []) {
       if (!activeSet.has(listener.agentKey)) continue;
       for (const source of byIssue.get(sourceKey) ?? []) {
-        if (!hears[kind](listener.rule, source.rule)) continue;
-        const e = out.get(sourceKey);
-        if (!e) out.set(sourceKey, { issue: source, watchers: new Set([listener.agentKey]) });
-        else {
-          e.watchers.add(listener.agentKey);
-          if (source.agentKey < e.issue.agentKey) e.issue = source;
-        }
+        if (!hearsInward(listener.rule, source.rule)) continue;
+        record(sourceKey, listener, source);
       }
     }
   };
   for (const [key, ms] of byIssue) {
     for (const link of ms[0]!.issue.issuelinks ?? []) {
       if (link.type === "Implements") {
-        if (link.otherEnd === "inward") edge(key, link.key, "child");
-        else edge(link.key, key, "child");
+        if (link.otherEnd === "inward") implementsEdge(key, link.key);
+        else implementsEdge(link.key, key);
       } else if (link.type === "Relates") {
-        edge(key, link.key, "inward");
-        edge(link.key, key, "inward");
+        relatesEdge(key, link.key);
+        relatesEdge(link.key, key);
       }
     }
   }
   return [...out.values()].map((e) => ({ issue: e.issue, watchers: [...e.watchers].sort() }));
+}
+
+/** BUTCHR-388: the sentinel rule id carried by a related entry for a ticket only another daemon's rules match. Never a real rule, never spawned, never decoded. */
+export const FOREIGN_RULE_ID = "external";
+
+/**
+ * BUTCHR-388: most keys a single `key in (...)` fetch will ask for per poll.
+ * Bounds the JQL rather than the truth — a fleet with more cross-daemon
+ * implementers than this hears the first `FOREIGN_FETCH_LIMIT` by key order
+ * and the rest on a later poll, which is strictly better than today's zero.
+ */
+export const FOREIGN_FETCH_LIMIT = 200;
+
+/** BUTCHR-388: the `Implements` link targets of `matches` that this daemon's own rules do NOT match — the tickets a boss must hear about but cannot see through its own search. */
+export function foreignImplementerKeys(matches: readonly RuleMatch[]): string[] {
+  const have = new Set(matches.map((m) => m.issue.key));
+  const wanted = new Set<string>();
+  for (const m of matches)
+    for (const link of m.issue.issuelinks ?? [])
+      if (link.type === "Implements" && link.otherEnd === "outward" && !have.has(link.key)) wanted.add(link.key);
+  return [...wanted].sort();
 }
 
 export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
@@ -235,7 +331,27 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
     discovery: {
       idOf: (m) => m.agentKey,
       search: async () => (latest = await searchRules({ ...deps, excluded })),
-      related: async (active) => relatedForRules(deps.rules, latest, active),
+      // BUTCHR-388: an `Implements` target this daemon's own rules do not
+      // match is invisible to `search`, so a boss whose implementer is
+      // staffed by the OTHER daemon would hear nothing — which is every
+      // parent/child pair in a fleet that splits Epic/Task/Bug from
+      // Story/Sub-task by account. Fetch those targets by key so the boss
+      // can hear them, exactly as the legacy `createRelated` did
+      // ("watched regardless of assignee", src/resources/issue.ts).
+      // A failed fetch degrades to the same-daemon set rather than throwing
+      // the poll away, and says so — never silently.
+      related: async (active) => {
+        const wanted = foreignImplementerKeys(latest).slice(0, FOREIGN_FETCH_LIMIT);
+        let foreign: JiraIssue[] = [];
+        if (wanted.length) {
+          try {
+            foreign = await deps.search(`key in (${wanted.join(",")})`);
+          } catch (e) {
+            deps.log?.(`  WARNING: [related] cross-rule fetch failed for ${wanted.length} key(s), hearing same-rule tickets only this poll: ${(e as Error)?.message ?? e}`);
+          }
+        }
+        return relatedForRules(deps.rules, latest, active, foreign);
+      },
     },
     activation: { verdictFor: () => "active" },
     eventRules: createRuleEventRules(deps),

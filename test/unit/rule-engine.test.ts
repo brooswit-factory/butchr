@@ -13,7 +13,7 @@ import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../sr
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
-import { createRuleEventRules, createRuleResourceType, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
   ({ key, status: "In Progress", summary: `summary of ${key}`, issuetype: "Task", assignee: "me", parent: null, updated: "2026-09-16T00:00:00.000+0000", labels: [], ...over });
@@ -174,17 +174,26 @@ describe("rule relationships", () => {
     match(byId(ruleSet, "story"), w), match(byId(ruleSet, "review"), w),
   ];
 
-  test("the boss rule's agent watches its child-rule worker; the unrelated rule on either ticket does not", () => {
+  // BUTCHR-388: EVERY rule matching the boss ticket hears its implementer —
+  // `Implements` routes on the link alone. The withdrawn guarantee (only the
+  // rule declaring `childRule` heard) is asserted positively below rather
+  // than deleted: `review` matches the boss ticket, declares no relationship,
+  // and now hears. See this file's BUTCHR-388 describe block for why.
+  test("every rule on the boss ticket hears its implementer, whether or not it declares a childRule", () => {
     const ms = world(worker());
-    expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([
-      { issue: match(byId(ruleSet, "story"), worker()), watchers: ["jira-work:epic:BUTCHR-1"] },
-    ]);
+    const [entry, ...rest] = relatedForRules(ruleSet, ms, keys(ms));
+    expect(rest).toEqual([]); // one entry per heard TICKET, however many rules hear it
+    expect(entry!.issue.issue.key).toBe("BUTCHR-2");
+    expect(entry!.watchers).toEqual(["jira-work:epic:BUTCHR-1", "jira-work:review:BUTCHR-1"]);
   });
 
   test("the worker never watches its boss, and only active agents watch", () => {
     const ms = world(worker());
     expect(relatedForRules(ruleSet, ms, keys(ms)).flatMap((r) => r.watchers)).not.toContain("jira-work:story:BUTCHR-2");
-    expect(relatedForRules(ruleSet, ms, keys(ms).filter((k) => k !== "jira-work:epic:BUTCHR-1"))).toEqual([]);
+    expect(relatedForRules(ruleSet, ms, keys(ms)).flatMap((r) => r.watchers)).not.toContain("jira-work:review:BUTCHR-2");
+    // Only the boss ticket's agents watch, so dropping BOTH of them leaves nothing.
+    const noBossAgents = keys(ms).filter((k) => !k.endsWith(":BUTCHR-1"));
+    expect(relatedForRules(ruleSet, ms, noBossAgents)).toEqual([]);
   });
 
   test("an inward connection rule hears the connecting rule's ticket over Relates; the link is read from either end", () => {
@@ -193,6 +202,57 @@ describe("rule relationships", () => {
     expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([{ issue: ms[1]!, watchers: ["jira-work:audit:BUTCHR-1"] }]);
     const fromListenerEnd = [match(byId(ruleSet, "audit"), issue("BUTCHR-1", { issuelinks: relatesTo("BUTCHR-2", "outward") })), match(byId(ruleSet, "story"), issue("BUTCHR-2"))];
     expect(relatedForRules(ruleSet, fromListenerEnd, keys(fromListenerEnd))[0]!.watchers).toEqual(["jira-work:audit:BUTCHR-1"]);
+  });
+
+  // BUTCHR-388: a boss hears what implements it, on the LINK alone. Before
+  // this, an `Implements` edge also required the listener's rule to declare
+  // `relationships.childRule` — a gate no rules file in the fleet declared
+  // (so nothing was ever heard) and which cannot be satisfied across daemons
+  // at all, since a rule id is per-file and the other daemon's ticket has no
+  // local rule to name.
+  describe("BUTCHR-388: Implements routes on the link, not on configuration", () => {
+    // Deliberately declares NO relationships at all — the shape of every
+    // live resource-rules.json on booswrit and wroosbit.
+    const plain = rules({ id: "epics", query: "q1" }, { id: "tasks", query: "q2" });
+    const bossIssue = issue("BUTCHR-1", { issuelinks: implementedBy("BUTCHR-2") });
+    const workerIssue = issue("BUTCHR-2", { issuelinks: implementsBoss("BUTCHR-1") });
+
+    test("a boss hears its implementer with no childRule declared anywhere", () => {
+      const ms = [match(byId(plain, "epics"), bossIssue), match(byId(plain, "tasks"), workerIssue)];
+      expect(relatedForRules(plain, ms, keys(ms))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:epics:BUTCHR-1"] },
+      ]);
+    });
+
+    test("the implementer still never hears its boss", () => {
+      const ms = [match(byId(plain, "epics"), bossIssue), match(byId(plain, "tasks"), workerIssue)];
+      expect(relatedForRules(plain, ms, keys(ms)).flatMap((r) => r.watchers)).not.toContain("jira-work:tasks:BUTCHR-2");
+    });
+
+    test("a boss hears an implementer THIS daemon's rules do not match, supplied as foreign", () => {
+      // The live shape: a Story on wroosbit whose Task only booswrit matches.
+      const ms = [match(byId(plain, "epics"), bossIssue)];
+      expect(relatedForRules(plain, ms, keys(ms))).toEqual([]); // nothing to hear without the fetch
+      const heard = relatedForRules(plain, ms, keys(ms), [workerIssue]);
+      expect(heard.map((r) => r.watchers)).toEqual([["jira-work:epics:BUTCHR-1"]]);
+      expect(heard[0]!.issue.issue.key).toBe("BUTCHR-2");
+      // Addressable, and never mistakable for a primary agent key.
+      expect(heard[0]!.issue.agentKey).toBe("related:jira-work:BUTCHR-2");
+      expect(heard[0]!.issue.rule.id).toBe(FOREIGN_RULE_ID);
+    });
+
+    test("Relates still routes only by configuration — an undeclared Relates hears nothing", () => {
+      const a = issue("BUTCHR-1", { issuelinks: relatesTo("BUTCHR-2", "outward") });
+      const b = issue("BUTCHR-2", { issuelinks: relatesTo("BUTCHR-1", "inward") });
+      const ms = [match(byId(plain, "epics"), a), match(byId(plain, "tasks"), b)];
+      expect(relatedForRules(plain, ms, keys(ms))).toEqual([]);
+    });
+
+    test("foreignImplementerKeys names the outward targets this daemon does not match, and only those", () => {
+      const ms = [match(byId(plain, "epics"), bossIssue), match(byId(plain, "tasks"), workerIssue)];
+      expect(foreignImplementerKeys(ms)).toEqual([]); // control: matched, so not foreign
+      expect(foreignImplementerKeys([match(byId(plain, "epics"), bossIssue)])).toEqual(["BUTCHR-2"]);
+    });
   });
 
   describe("sideways over Relates", () => {
@@ -265,11 +325,26 @@ describe("rule relationships", () => {
       const t = (id: string) => byId(withChild, id);
       const cases: RuleMatch[][] = [
         [match(t("idea"), issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] })), match(t("ticket"), issue("BUTCHR-2"))],
-        [match(t("idea"), boss()), match(t("ticket"), worker())],
         [match(t("epic"), idea()), match(t("ticket"), ticket())],
         [match(t("idea"), idea("BUTCHR-1", "BUTCHR-99")), match(t("ticket"), ticket("BUTCHR-2", "BUTCHR-98"))],
       ];
       for (const ms of cases) expect(relatedForRules(withChild, ms, keys(ms))).toEqual([]);
+    });
+
+    // BUTCHR-388: the case removed from the list above, asserted positively
+    // rather than deleted. `idea` declares only `inwardConnectionRules` and
+    // no `childRule` — under link-only `Implements` routing it hears its
+    // implementer anyway, because the LINK says it is the boss.
+    test("an Implements link routes even when the listening rule declares only an inward connection", () => {
+      const withChild = rules(
+        { id: "idea", query: "q", relationships: { inwardConnectionRules: ["ticket"] } },
+        { id: "ticket", query: "q" },
+      );
+      const t = (id: string) => byId(withChild, id);
+      const ms = [match(t("idea"), boss()), match(t("ticket"), worker())];
+      expect(relatedForRules(withChild, ms, keys(ms))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:idea:BUTCHR-1"] },
+      ]);
     });
 
     test("a Relates change notifies the listening agent once through event routing, and not the listed one", async () => {
@@ -291,19 +366,41 @@ describe("rule relationships", () => {
     const cases: Array<[string, RuleMatch[]]> = [
       ["no link", [match(epic, issue("BUTCHR-1")), match(story, issue("BUTCHR-2"))]],
       ["a Relates link", [match(epic, issue("BUTCHR-1", { issuelinks: [{ type: "Relates", otherEnd: "outward", key: "BUTCHR-2" }] })), match(story, issue("BUTCHR-2"))]],
-      ["a reversed Implements link (boss implements worker)", [match(epic, issue("BUTCHR-1", { issuelinks: implementsBoss("BUTCHR-2") })), match(story, issue("BUTCHR-2", { issuelinks: implementedBy("BUTCHR-1") }))]],
-      ["the worker matched only by a rule the boss does not hear", [match(epic, boss()), match(review, worker())]],
-      ["a link to a ticket no rule matches", [match(epic, issue("BUTCHR-1", { issuelinks: implementedBy("BUTCHR-99") })), match(story, issue("BUTCHR-2", { issuelinks: implementsBoss("BUTCHR-98") }))]],
+      ["a link to a ticket no rule matches and nothing was fetched for", [match(epic, issue("BUTCHR-1", { issuelinks: implementedBy("BUTCHR-99") })), match(story, issue("BUTCHR-2", { issuelinks: implementsBoss("BUTCHR-98") }))]],
     ];
     for (const [, ms] of cases) expect(relatedForRules(ruleSet, ms, keys(ms))).toEqual([]);
 
-    // One bad link beside a good one: only the good one routes.
+    // BUTCHR-388: two cases moved out of the list above, asserted positively
+    // rather than deleted, because link-only routing now covers them.
+    // (a) A "reversed" Implements link is not invalid — it names the OTHER
+    //     ticket as the boss, so that ticket's agents hear. Direction still
+    //     decides who listens; only the rule gate is gone.
+    const reversed = [match(epic, issue("BUTCHR-1", { issuelinks: implementsBoss("BUTCHR-2") })), match(story, issue("BUTCHR-2", { issuelinks: implementedBy("BUTCHR-1") }))];
+    expect(relatedForRules(ruleSet, reversed, keys(reversed))).toEqual([
+      { issue: reversed[0]!, watchers: ["jira-work:story:BUTCHR-2"] },
+    ]);
+    // (b) THE WITHDRAWN GUARANTEE, stated: a worker matched only by a rule
+    //     the boss's rule never named is heard anyway. Before BUTCHR-388 this
+    //     routed nothing; that gate was dead in production (no rules file
+    //     declares `childRule`) and unsatisfiable across daemons.
+    const unnamed = [match(epic, boss()), match(review, worker())];
+    expect(relatedForRules(ruleSet, unnamed, keys(unnamed))).toEqual([
+      { issue: unnamed[1]!, watchers: ["jira-work:epic:BUTCHR-1"] },
+    ]);
+
+    // BUTCHR-388: two implementers of one boss — one matched by the rule the
+    // boss's rule used to name, one matched only by `review`. Both are heard
+    // now, one entry each. Before, the second routed nothing; that is the
+    // withdrawn guarantee again, in the multi-link shape.
     const mixed = [
       match(epic, issue("BUTCHR-1", { issuelinks: [...implementedBy("BUTCHR-2"), ...implementedBy("BUTCHR-3")] })),
       match(story, worker()),
       match(review, issue("BUTCHR-3", { issuelinks: implementsBoss("BUTCHR-1") })),
     ];
-    expect(relatedForRules(ruleSet, mixed, keys(mixed)).map((r) => [r.issue.issue.key, r.watchers])).toEqual([["BUTCHR-2", ["jira-work:epic:BUTCHR-1"]]]);
+    expect(relatedForRules(ruleSet, mixed, keys(mixed)).map((r) => [r.issue.issue.key, r.watchers])).toEqual([
+      ["BUTCHR-2", ["jira-work:epic:BUTCHR-1"]],
+      ["BUTCHR-3", ["jira-work:epic:BUTCHR-1"]],
+    ]);
   });
 
   test("a worker matched by several rules is one entry; a child rule and an inward rule on one ticket each watch under their own key", () => {
@@ -325,15 +422,27 @@ describe("rule relationships", () => {
     ]);
   });
 
+  // BUTCHR-388: a related entry is addressed by ONE id even when several
+  // rules match the heard ticket, and which one is an arbitrary tiebreak
+  // (smallest agent key — here `review` sorts before `story`). These tests
+  // derive it rather than hardcoding it, so they assert the behaviour that
+  // matters (the boss hears, once) and not the tiebreak, which is tracked
+  // separately and may change.
+  const relatedIdFor = (ms: RuleMatch[], issueKey: string) =>
+    relatedForRules(ruleSet, ms, keys(ms)).find((r) => r.issue.issue.key === issueKey)!.issue.agentKey;
+
   test("the boss learns a child's status change, once, and no other agent does", async () => {
     const events = createRuleEventRules({ rules: ruleSet });
     const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
     const before = world(worker()), after = world(worker({ status: "In Review", updated: "later" }));
+    const heard = relatedIdFor(after, "BUTCHR-2");
     const ev = await events.poll(snap(before), snap(after));
-    expect(ev.changedRelated).toEqual(["jira-work:story:BUTCHR-2"]);
-    expect(await ev.decide("jira-work:story:BUTCHR-2", "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { status: { from: "In Progress", to: "In Review" } } });
-    for (const other of ["jira-work:review:BUTCHR-1", "jira-work:story:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
-      expect(await ev.decide("jira-work:story:BUTCHR-2", other, "related")).toEqual({ deliver: false });
+    expect(ev.changedRelated).toEqual([heard]);
+    expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { status: { from: "In Progress", to: "In Review" } } });
+    // Every rule on the boss ticket hears it; no agent on the WORKER ticket does.
+    expect(await ev.decide(heard, "jira-work:review:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { status: { from: "In Progress", to: "In Review" } } });
+    for (const other of ["jira-work:story:BUTCHR-2", "jira-work:review:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
+      expect(await ev.decide(heard, other, "related")).toEqual({ deliver: false });
     }
     // The worker's own agents still hear it on the primary path, each under its own key.
     expect([...ev.changedPrimary].sort()).toEqual(["jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2"]);
@@ -344,9 +453,11 @@ describe("rule relationships", () => {
     ledger.record("BUTCHR-2", "later", "jira-work:story:BUTCHR-2", Date.now());
     const events = createRuleEventRules({ rules: ruleSet, suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()), comments: async () => [] });
     const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
-    const ev = await events.poll(snap(world(worker())), snap(world(worker({ status: "In Review", updated: "later" }))));
+    const after = world(worker({ status: "In Review", updated: "later" }));
+    const heard = relatedIdFor(after, "BUTCHR-2");
+    const ev = await events.poll(snap(world(worker())), snap(after));
     expect((await ev.decide("jira-work:story:BUTCHR-2", "jira-work:story:BUTCHR-2", "primary")).deliver).toBe(false);
-    expect((await ev.decide("jira-work:story:BUTCHR-2", "jira-work:epic:BUTCHR-1", "related")).deliver).toBe(true);
+    expect((await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).deliver).toBe(true);
   });
 
   test("through the loop: a child status change notifies the boss agent exactly once and no unrelated agent", async () => {
@@ -361,8 +472,15 @@ describe("rule relationships", () => {
       store.worker = worker({ status: "In Review", updated: "later" });
       await new Promise((r) => setTimeout(r, 80));
     } finally { stop(); }
-    expect(notified.filter((n) => n.startsWith("jira-work:epic:"))).toEqual(["jira-work:epic:BUTCHR-1 <- jira-work:story:BUTCHR-2"]);
-    expect(notified.filter((n) => n.includes("BUTCHR-1 <-") && !n.startsWith("jira-work:epic:"))).toEqual([]);
+    // BUTCHR-388: the boss hears exactly once. The id it hears the child
+    // UNDER is the arbitrary smallest-key tiebreak, so match on the ticket
+    // rather than on which rule won it.
+    expect(notified.filter((n) => n.startsWith("jira-work:epic:"))).toEqual([
+      expect.stringMatching(/^jira-work:epic:BUTCHR-1 <- jira-work:(story|review):BUTCHR-2$/) as unknown as string,
+    ]);
+    // `review` also matches the boss ticket, so under link-only routing it
+    // hears too — the withdrawn guarantee, asserted rather than assumed.
+    expect(notified.filter((n) => n.startsWith("jira-work:review:BUTCHR-1 <-"))).toHaveLength(1);
     expect(notified.filter((n) => n.startsWith("jira-work:story:BUTCHR-2") || n.startsWith("jira-work:review:BUTCHR-2")).sort())
       .toEqual(["jira-work:review:BUTCHR-2 <- jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2 <- jira-work:story:BUTCHR-2"]);
   });
