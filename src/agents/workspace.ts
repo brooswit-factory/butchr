@@ -8,6 +8,7 @@ import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
 import EPIC from "../../briefs/epic.md" with { type: "text" };
 import STORY from "../../briefs/story.md" with { type: "text" };
 import TASK from "../../briefs/task.md" with { type: "text" };
+import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
@@ -37,7 +38,7 @@ export interface SpawnSpec {
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
 export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
 
-const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, project: PROJECT };
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
 
 /**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
