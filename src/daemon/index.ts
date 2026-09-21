@@ -715,7 +715,7 @@ watchSessionLimits({
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
 // the 15s poll only ever sees active tickets, so nothing else ever revisits
 // this. Not a new polling timer — runs once, here, and never again.
-void sweepStaleAgentLabels({
+if (rules.some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
   jira: labelWriter,
   log: (line) => console.error(`  ${line}`),

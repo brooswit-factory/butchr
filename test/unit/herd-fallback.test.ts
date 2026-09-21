@@ -72,6 +72,7 @@ describe("HerdrHerd ordered provider fallback", () => {
   beforeEach(() => {
     processProviderAvailability.clear({ provider: "claude", accountId: "default" });
     processProviderAvailability.clear({ provider: "codex", accountId: "default" });
+    processProviderAvailability.clear({ provider: "agy", accountId: "default" });
     previous = process.env.BUTCHR_WORKSPACES;
     root = mkdtempSync(join(tmpdir(), "butchr-herd-fallback-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -79,6 +80,7 @@ describe("HerdrHerd ordered provider fallback", () => {
   afterEach(() => {
     processProviderAvailability.clear({ provider: "claude", accountId: "default" });
     processProviderAvailability.clear({ provider: "codex", accountId: "default" });
+    processProviderAvailability.clear({ provider: "agy", accountId: "default" });
     if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
     else process.env.BUTCHR_WORKSPACES = previous;
     rmSync(root, { recursive: true, force: true });
