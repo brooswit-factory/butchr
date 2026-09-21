@@ -10,7 +10,8 @@ import { buildWorkspace, workspaceRoot } from "../../src/agents/workspace.js";
 const spec = { key: "TEST-1", issuetype: "Task", summary: "fallback fixture", parent: null };
 const url = "http://localhost:7717/mcp";
 const banner = "You've hit your session limit";
-const instant = async () => {};
+// Yield to I/O and test timeouts; an immediately resolved wait can starve the full-suite runner.
+const instant = async () => { await Bun.sleep(0); };
 const config: AgentConfig = { provider: "claude", providers: ["claude", "codex"], disabledMcpServers: [] };
 type Row = { pane_id: string; agent: string; cwd: string; agent_status: string };
 
