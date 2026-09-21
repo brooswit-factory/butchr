@@ -1,3 +1,4 @@
+import { decodeAgentKey } from "../rules/agent-key.js";
 import { effortFor, mcpIdentityHeaders, modelFor, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
@@ -74,17 +75,19 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
+      ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {bypassApprovalsAndSandbox:false}: {}),
       mcpServers: [{
         name: "butchr",
         url: mcpUrl,
         headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
-      }],
+      }, ...(spec.externalMcpServers ?? [])],
       disabledMcpServers: agent.disabledMcpServers ?? [],
     };
   }
 
   return {
     provider: "claude",
+    ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"default"}: {}),
     name,
     paneId,
     cwd: dir,

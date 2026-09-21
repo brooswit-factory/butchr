@@ -17,11 +17,12 @@ import { decodeAgentKey, type ResourceProvider } from "../rules/agent-key.js";
 export type CallerIdentity =
   | { provider: "jira-work"; issue: string; agent?: string }
   | { provider: "github-issue"; agent: string; ruleId: string; resource: string; ref: GithubIssueRef }
+  | { provider: "jira-project"; agent: string; ruleId: string; resource: string }
   | { provider: "jira-idea"; agent: string; ruleId: string; resource: string }
   | { provider: "zendesk-ticket"; agent: string; ruleId: string; resource: string; ref: ZendeskTicketRef };
 
 /** Providers whose agents identify by agent key alone, never `x-issue`. */
-export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "jira-idea", "zendesk-ticket"];
+export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "jira-idea", "zendesk-ticket", "jira-project"];
 
 export function callerIdentity(headers: Readonly<Record<string, string | undefined>>): CallerIdentity | null {
   const issue = headers["x-issue"];
@@ -30,6 +31,9 @@ export function callerIdentity(headers: Readonly<Record<string, string | undefin
   if (decoded?.resourceProvider === "github-issue") {
     const ref = parseGithubIssueRef(decoded.resourceId);
     return issue || !ref ? null : { provider: "github-issue", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId, ref };
+  }
+  if (decoded?.resourceProvider === "jira-project") {
+    return issue ? null : {provider:"jira-project",agent:agent!,ruleId:decoded.ruleId,resource:decoded.resourceId};
   }
   if (decoded?.resourceProvider === "jira-idea") {
     return issue ? null : { provider: "jira-idea", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId };

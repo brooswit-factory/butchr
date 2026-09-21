@@ -4,7 +4,7 @@
  * rule-file parsing. See `encodeAgentKey` for the format.
  */
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
-import { isIssueKey } from "../resources/id.js";
+import { isIssueKey, isProjectId } from "../resources/id.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
@@ -13,7 +13,7 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * still a separate provider) and Zendesk tickets. Only providers with an
  * adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket", "jira-project"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -50,6 +50,7 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
 export function isResourceId(provider: ResourceProvider, id: string): boolean {
   switch (provider) {
     case "jira-work": return isIssueKey(id);
+    case "jira-project": return isProjectId(id);
     case "github-issue": return isGithubIssueRef(id);
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);

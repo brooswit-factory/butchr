@@ -33,6 +33,9 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  mcpConfigFile?: string;
+  externalMcpServers?: Array<{ name:string; url:string; headers?:Record<string,string> }>;
+
 }
 
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
@@ -160,15 +163,26 @@ export const resourceKeyOf = (id: string): string => decodeAgentKey(id)?.resourc
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   const dir = workspaceDirFor(spec.key);
   const resource = resourceOfSpec(spec);
+  if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
   if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
+  const freeform = decodeAgentKey(spec.key)?.resourceProvider === 'jira-project';
+  if (freeform && provider === 'codex') {
+    mkdirSync(join(dir, '.codex'), {recursive:true});
+    writeFileSync(join(dir, '.codex/config.toml'), 'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n');
+  }
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
-  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
+  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), freeform ? `# Project resource agent
+
+You are a free-form assistant for project ${resource}. Read brief.md for the operator's instructions.
+No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by this role.
+Await direction if your brief does not assign work. Preserve sandbox and approval review.
+` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, resource) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) } } }, null, 2));
+  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map(s=>[s.name,{type:"http",url:s.url,headers:s.headers}])) } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -178,7 +192,7 @@ export const ruleBriefHeader = (ruleId: string, resource: string, summary: strin
 
 const providerOf = (spec: SpawnSpec) => decodeAgentKey(spec.key)?.resourceProvider;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket"].includes(providerOf(spec) ?? "");
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
@@ -220,4 +234,9 @@ export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers
     if (!Array.isArray(value) || value.some((s) => !s || typeof s.name !== "string" || !/^[A-Za-z0-9_-]+$/.test(s.name) || !["stdio", "streamable_http"].includes(s.transport))) return undefined;
     return value;
   } catch { return undefined; }
+}
+
+export function workspaceExternalMcp(dir:string):SpawnSpec['externalMcpServers'] {
+  try {return JSON.parse(readFileSync(join(dir,'.butchr-external-mcp.json'),'utf8'));}
+  catch(e) {if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}
 }

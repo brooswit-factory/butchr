@@ -1,3 +1,6 @@
+import { decodeAgentKey } from '../rules/agent-key.js';
+import { ResourceConnections } from '../agents/resource-connections.js';
+import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
@@ -285,6 +288,7 @@ const jiraIdeaHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * JIRA_IDEA_POLL_MS),
   log: (line) => console.error(line),
 });
+const jiraProjectHealth = createResourceLoopHealth({name:'jira-project',enabled:rules.some(r=>r.enabled&&r.resourceProvider==='jira-project'),thresholdMs:300000,log:line=>console.error(line)});
 const zendeskTicketHealth = createResourceLoopHealth({
   name: "zendesk-ticket",
   enabled: Boolean(zendeskTickets),
@@ -330,6 +334,7 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, line => console.error(line));
 const { app, mcp } = buildApp({
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
@@ -360,7 +365,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth]),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth]),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -375,7 +380,7 @@ const { app, mcp } = buildApp({
   // BUTCHR-339: the dashboard row's resource-link redirect target — the
   // decision itself is `resolveResourceLink` (src/resources/resource-link.ts,
   // directly unit-tested there); this just supplies its real deps.
-  resourceLink: (key) => resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project" ? Promise.resolve({ok:true as const,url:`${config.atlassian.site}/browse/${resourceKeyOf(key)}`}) : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -389,6 +394,7 @@ const { app, mcp } = buildApp({
   // Linking needs both providers running: authorization reads both loops' latest matches.
   ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
 });
+app.all('/resource-mcp/:agent/:name', ({request,params}) => resourceConnections.handle(request,params.agent,params.name));
 app.listen(listenOptions(config.port));
 console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${describeConfig(config)})`);
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
@@ -993,3 +999,18 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
+
+// Free-form project agents share residency/admission, with no issue or Confluence workflow.
+const projectType = createJiraProjectResourceType({rules,search:q=>atlassian.searchProjects(q),prepare:spec=>resourceConnections.prepare(spec)});
+runResourceLoop(projectType, {
+  herd, ownsId:ownsJiraProjectAgent,
+  notify:async()=>{}, onRespawn:async(id,reason)=>{console.error(`[jira-project] ${id} respawned: ${reason}`);},
+  syncLabels:async matches=>{await resourceConnections.retain(new Set(matches.map(m=>m.agentKey)));return new Set<string>();},
+  admission:(candidates,stopping)=>admissionController.admit(candidates,stopping,'jira-project'),
+  onAdmitted:admissionController.recordSpawned,
+  reserveAdmission:ids=>admissionController.reserve(ids,'jira-project'),
+  releaseAdmission:ids=>admissionController.release(ids,'jira-project'),
+  intervalMs:60000,log:line=>console.error(`[jira-project] ${line}`),
+  onPollSuccess:()=>jiraProjectHealth.recordSuccess(),
+  onError:e=>{jiraProjectHealth.recordError(e);console.error(`[jira-project] ${String(e)}`);},
+});
