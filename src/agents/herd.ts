@@ -633,6 +633,9 @@ export class HerdrHerd implements Herd {
       try {
         const prompted = await lifecycle.prompt(text);
         if (!prompted || prompted.agent_status === "blocked") return { delivered: false };
+        // Codex accepts follow-ups in its native input path. Do not hold the
+        // channel relay behind Claude's delayed quota-dialog observation.
+        if (prompted.agent === "codex") return { delivered: true };
       } catch { return { delivered: false }; }
       await this.wait(NUDGE_VERIFY_MS);
       const current = await lifecycle.resolveCurrent().catch(() => undefined);

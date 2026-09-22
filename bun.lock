@@ -5,7 +5,7 @@
     "": {
       "dependencies": {
         "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.6.0/brooswit-drovr-0.6.0.tgz",
-        "@brooswit/drovr-events": "file:vendor/brooswit-drovr-0.12.0-rc.3.tgz",
+        "@brooswit/drovr-events": "file:vendor/brooswit-drovr-live-inbox-v2.tgz",
         "@brooswit/sundry": "^0.2.1",
         "@brooswit/thatch": "0.6.3",
         "@modelcontextprotocol/sdk": "^1.30.0",
@@ -24,7 +24,7 @@
 
     "@brooswit/drovr": ["@brooswit/drovr@https://github.com/brooswit-factory/drovr/releases/download/v0.6.0/brooswit-drovr-0.6.0.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3" } }, "sha512-baHpgUl/GyU9IO1HFSMtOgs4GNXGunzc0OskMbpkgwnUBaZD/qeedNUydOOht9TtJnbn9/R9ljH/QN0/n9HsXw=="],
 
-    "@brooswit/drovr-events": ["@brooswit/drovr@vendor/brooswit-drovr-0.12.0-rc.3.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3", "@modelcontextprotocol/sdk": "^1.30.0" } }, "sha512-c4MawrSqnVs4i86UD2NKlVrgK1T8r51a7cun9eXjjx8sUsTyX9HmI/5qV8bjmMqrpSic3IRGdZQ8S5KLg9vRnA=="],
+    "@brooswit/drovr-events": ["@brooswit/drovr-events@vendor/brooswit-drovr-live-inbox-v2.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3", "@modelcontextprotocol/sdk": "^1.30.0" } }, "sha512-LIreR2TdvQeCupmPJ1JCQVGEUpAV37jvMUhnyvsA95j6igFo8raoiqHjydUdGAScmlcjMx3PgKDYCfuyOgL6AQ=="],
 
     "@brooswit/herdr-sdk": ["@brooswit/herdr-sdk@0.1.3", "", {}, "sha512-mEwipLDaDGnUEtUhGBSjDUhFU3gB3HvkjyC9Q7OLJNugpU7Hk3romKnO1ZUna9WyZYq7lteqaLu5TmPvILkekQ=="],
 

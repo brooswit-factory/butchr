@@ -58,3 +58,9 @@ and automatic approval review. Claude project agents use its default approval
 mode. Old ticket-agent permissions are unchanged. A changed workspace retains
 files but provider fallback does not import another provider's native transcript;
 keep source history during migrations and reference it explicitly in the brief.
+
+Channel relays batch 100ms bursts and queued corrections. Codex pane delivery no
+longer waits through Claude's 8-second quota-dialog check. Input is still sent
+through Herdr's native agent prompt interface; blocked approval dialogs are never
+answered by the relay. App Server hosts use Drovr steering; this pane host retains
+native CLI input semantics.

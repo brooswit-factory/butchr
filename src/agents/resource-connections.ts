@@ -39,7 +39,7 @@ export class ResourceConnections {
         try { token=(await readFile(tokenFile,'utf8')).trim(); }
         catch(e) {if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;token=randomBytes(32).toString('hex');await writeFile(tokenFile,token,{mode:0o600,flag:'wx'});}
         if(!/^[a-f0-9]{64}$/.test(token))throw new Error('Invalid external MCP proxy token');
-        const relay=new InboxRelay({deliver:async text=>{
+        const relay=new InboxRelay({batchMs:100,retryMs:100,deliver:async text=>{
           if(!await this.herd.paneFor(spec.key))return {status:'busy'};
           try {
             const r=await this.herd.nudge(spec.key,text);
