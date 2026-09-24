@@ -9,7 +9,7 @@ export function specForProject(m: ProjectMatch): SpawnSpec {
  return m.spec ?? { key:m.agentKey,resource:m.project.key,issuetype:'project',summary:m.project.name,parent:null,brief:m.rule.brief,
  ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}) };
 }
-export function createJiraProjectResourceType(deps: { rules: readonly Rule[]; search: (query:string)=>Promise<JiraProject[]>; prepare?: (spec:SpawnSpec)=>Promise<SpawnSpec> }): ResourceType<ProjectMatch> {
+export function createJiraProjectResourceType(deps: { rules: readonly Rule[]; search: (query:string)=>Promise<JiraProject[]>; prepare?: (spec:SpawnSpec)=>Promise<SpawnSpec>; isFrozen?: (id:string)=>Promise<boolean> }): ResourceType<ProjectMatch> {
  return {
  discovery: {idOf:m=>m.agentKey,search:async()=>{
    const groups=await Promise.all(deps.rules.filter(r=>r.enabled&&r.resourceProvider==='jira-project').map(async rule=>{
@@ -21,7 +21,10 @@ export function createJiraProjectResourceType(deps: { rules: readonly Rule[]; se
     }return matches;
    }));
    const matches=groups.flat();
-   if(deps.prepare)for(const m of matches)m.spec=await deps.prepare(specForProject(m));
+   if(deps.prepare)for(const m of matches) {
+     if (await deps.isFrozen?.(m.agentKey)) continue;
+     m.spec=await deps.prepare(specForProject(m));
+   }
    return matches;
  }},
  activation:{verdictFor:()=> 'active'},

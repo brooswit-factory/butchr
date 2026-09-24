@@ -1001,7 +1001,7 @@ watchPrompts({
 
 
 // Free-form project agents share residency/admission, with no issue or Confluence workflow.
-const projectType = createJiraProjectResourceType({rules,search:q=>atlassian.searchProjects(q),prepare:spec=>resourceConnections.prepare(spec)});
+const projectType = createJiraProjectResourceType({rules,search:q=>atlassian.searchProjects(q),isFrozen:async id=>(await herd.frozen([id])).has(id),prepare:spec=>resourceConnections.prepare(spec)});
 runResourceLoop(projectType, {
   herd, ownsId:ownsJiraProjectAgent,
   notify:async()=>{}, onRespawn:async(id,reason)=>{console.error(`[jira-project] ${id} respawned: ${reason}`);},
