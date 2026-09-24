@@ -12,8 +12,8 @@ once. Idle or done after kickoff does not cause work to be repeated.
 
 Claude, Codex, and verified AGY full transcripts use Drovr's native reader. AGY
 launch preparation supplies isolated HOME when needed. Pane screenshots only
-support the existing Claude quota classifier; they are never imported as history.
-There is no Codex or AGY quota inference.
+support Drovr's Claude and Codex quota classifiers; they are never imported as
+history. There is no AGY quota inference.
 
 Missing history, changed native identity, launch failure, and acknowledgement
 failure preserve the old worker. A handoff blocked before commit closes only the

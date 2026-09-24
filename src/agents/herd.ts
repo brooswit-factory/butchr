@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { ManagedHerdrLifecycle, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
-import { detectSessionLimitRefusal, type SessionLimitRefusal } from "./session-limit.js";
+import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
 export type { SpawnSpec } from "./workspace.js";
@@ -231,19 +231,40 @@ export class HerdrHerd implements Herd {
     return false;
   }
 
+  /**
+   * Which providers' panes this herd observes for quota. Codex always: no
+   * other watcher recognises its usage limit, and a Codex worker at its limit
+   * otherwise sits idle on its fallback model forever. Claude only with an
+   * ordered-provider configuration; otherwise the legacy session-limit
+   * watcher owns Claude recovery (see watchSessionLimits' skipRecovery).
+   */
+  private observesQuota(provider: string | null | undefined): provider is "claude" | "codex" {
+    if (provider === "codex") return true;
+    return provider === "claude" && !!(this.agent.providers || this.agent.roleProviders);
+  }
+
   async recoverQuota(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting"> {
-    if (!this.agent.providers && !this.agent.roleProviders) return "not-refused";
+    const ordered = !!(this.agent.providers || this.agent.roleProviders);
+    // Without an ordered configuration, only a Codex worker is ours to
+    // observe; a Claude-only configuration is left exactly as the legacy
+    // watcher has it, without even a Herdr read.
+    if (!ordered && this.agent.provider !== "codex" && !spec.agents?.some(p => p.harness === "codex")) return "not-refused";
     return this.exclusive(spec.key, async () => {
       let current: results.AgentInfo | undefined;
       try { current = await this.lifecycle(spec.key).resolveCurrent(); }
       catch { return "not-refused"; }
+      if (!ordered && current?.agent !== "codex") return "not-refused";
       if (!current) { this.refused.delete(spec.key); return "not-refused"; }
-      if (current.pane_id !== this.refused.get(spec.key)?.pane || current.agent !== "claude" || current.agent_status === "working") {
+      const observed = this.observesQuota(current.agent);
+      if (current.pane_id !== this.refused.get(spec.key)?.pane || !observed || current.agent_status === "working") {
         this.refused.delete(spec.key);
       }
-      if (current.agent !== "claude" || (current.agent_status !== "idle" && current.agent_status !== "done")) return "not-refused";
+      if (!observed || (current.agent_status !== "idle" && current.agent_status !== "done")) return "not-refused";
       const refusal = this.observeQuota(spec.key, current, await this.readPane(current.pane_id));
       if (!refusal) return "not-refused";
+      // Replacement re-runs selection from the TOP of the priority list:
+      // a Codex worker at its limit goes back to Claude when Claude is
+      // available; a Claude worker at its limit goes on to Codex.
       const result = await this.startProviders(spec, current.pane_id);
       if (result.status === "success") this.log?.(`[provider-fallback] ${spec.key} recovered provider=${result.account.provider} pane=${result.value}`);
       return result.status === "success" ? "recovered" : "waiting";
@@ -251,21 +272,25 @@ export class HerdrHerd implements Herd {
   }
 
   private observeQuota(issue: string, current: results.AgentInfo, text: string): SessionLimitRefusal | null {
-    // Only Drovr's measured Claude classifier establishes pane quota. No
-    // inferred Codex/AGY banners or launch-error strings enter availability.
-    if (current.agent !== "claude" || (current.agent_status !== "idle" && current.agent_status !== "done")) return null;
-    const refusal = detectSessionLimitRefusal(text, new Date());
-    if (!refusal) { this.refused.delete(issue); return null; }
+    // Only Drovr's measured classifiers (Claude's session/weekly limit,
+    // Codex's usage-limit notice) establish pane quota. No inferred AGY
+    // banners or launch-error strings enter availability.
+    if (current.agent !== "claude" && current.agent !== "codex") return null;
+    if (current.agent_status !== "idle" && current.agent_status !== "done") return null;
+    const provider = current.agent as "claude" | "codex";
+    const classified = classifyProviderQuotaText(provider, text, new Date());
+    if (classified.kind !== "recognised") { this.refused.delete(issue); return null; }
+    const refusal = { resetsAt: classified.resetsAt, raw: classified.raw };
     const previous = this.refused.get(issue);
     // Pin the original reset for this refusal incarnation, otherwise a
     // clock-only banner rolls into tomorrow as soon as its reset passes.
     if (previous?.pane === current.pane_id && previous.refusal.raw === refusal.raw) return previous.refusal;
-    const account = { provider: current.agent, accountId: "default" } as const;
-    const outcome = this.availability.observeClaudePane(account, current.agent_status, text);
+    const account = { provider, accountId: "default" } as const;
+    const outcome = this.availability.observePane(account, current.agent_status, text);
     if (outcome.kind !== "recognised") return null;
     const confirmed = { resetsAt: outcome.resetsAt, raw: outcome.raw };
     this.refused.set(issue, { pane: current.pane_id, provider: account.provider, refusal: confirmed });
-    if (this.agent.providers || this.agent.roleProviders) {
+    if (this.agent.providers || this.agent.roleProviders || provider === "codex") {
       this.log?.(`[provider-fallback] ${issue} provider=${account.provider} quota-blocked resetsAt=${confirmed.resetsAt ?? "unknown"}`);
     }
     return confirmed;
@@ -455,7 +480,7 @@ export class HerdrHerd implements Herd {
     else {
       if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);
       const current = await this.lifecycle(spec.key).resolveCurrent();
-      if (current?.agent === "claude" && (current.agent_status === "idle" || current.agent_status === "done")) {
+      if ((current?.agent === "claude" || current?.agent === "codex") && (current.agent_status === "idle" || current.agent_status === "done")) {
         this.observeQuota(spec.key, current, await this.readPane(current.pane_id));
       }
     }
