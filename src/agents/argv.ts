@@ -87,7 +87,7 @@ export function agentLaunchConfig(
 
   return {
     provider: "claude",
-    ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"default"}: {}),
+    ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"auto"}: {}),
     name,
     paneId,
     cwd: dir,
