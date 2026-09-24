@@ -21,7 +21,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
 import { jiraIssueClass } from "../resources/jira-idea.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import type { Rule } from "./rules.js";
 
 export interface RuleMatch {
@@ -41,8 +41,15 @@ export interface RuleResourceDeps {
   log?: (line: string) => void;
 }
 
-/** True for exactly the `jira-work` herd ids this engine owns — never a legacy bare-issue or project id, nor another provider's agent. */
-export const ownsRuleAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "jira-work";
+/**
+ * True for exactly the `jira-work` herd ids this engine owns — never a
+ * legacy bare-issue or project id, nor another provider's agent. Recognises
+ * both a per-resource key and a query-level one (BUTCHR-397: `singleton`/
+ * `persistent` rules run a single agent per rule, not per matched ticket) so
+ * neither shape is ever mistaken for legacy/unowned once BUTCHR-398 starts
+ * spawning them.
+ */
+export const ownsRuleAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "jira-work";
 
 /** Told about each issue a rule's query returned that its provider may not staff (see src/resources/jira-idea.ts). */
 export type ExcludedIssue = (rule: Rule, issue: JiraIssue) => void;
@@ -155,7 +162,7 @@ export function relatedForRules(
     const provider = listener.rule.resourceProvider;
     return [{
       agentKey: `related:${provider}:${issue.key}`,
-      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "" },
+      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none" },
       issue,
     }];
   };

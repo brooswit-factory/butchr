@@ -12,19 +12,24 @@
  * closes, or touches a workspace directory. A failed list fails closed —
  * "could not check" is not "none running".
  */
-import { decodeAgentKey } from "../rules/agent-key.js";
+import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import { agentIdOfWorkspacePath, workspaceRoot } from "../agents/workspace.js";
 
 export interface PreflightAgent { pane_id?: string | null; cwd?: string | null }
 
 export interface LegacyAgent { id: string; pane: string | null; cwd: string }
 
-/** Live agents working in a one-deep legacy workspace. */
+/**
+ * Live agents working in a one-deep legacy workspace. Uses `decodeAnyAgentKey`
+ * (BUTCHR-397), not the per-resource-only `decodeAgentKey`: a query-level
+ * agent's three-deep workspace must never be flagged legacy and block
+ * startup just because it names no single resource.
+ */
 export function legacyAgents(agents: readonly PreflightAgent[], root: string = workspaceRoot()): LegacyAgent[] {
   const out: LegacyAgent[] = [];
   for (const a of agents) {
     const id = agentIdOfWorkspacePath(a.cwd, root);
-    if (id && !decodeAgentKey(id)) out.push({ id, pane: a.pane_id ?? null, cwd: a.cwd! });
+    if (id && !decodeAnyAgentKey(id)) out.push({ id, pane: a.pane_id ?? null, cwd: a.cwd! });
   }
   return out;
 }

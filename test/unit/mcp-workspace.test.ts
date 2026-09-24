@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
+import { encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -46,6 +47,27 @@ test("bridge refuses absent or mismatched identity and invalid endpoints", () =>
   expect(() => bridgeWorkspace(root, cwd)).toThrow();
   rmSync(metadata);
   expect(() => bridgeWorkspace(root, cwd)).toThrow();
+});
+
+test("BUTCHR-397: a query-level agent's workspace is recognised as a rule-engine shape (never 'Not a factory workspace'), but refused for having no defined .butchr-agy.json shape yet — no crash", () => {
+  const root = mkdtempSync(join(tmpdir(), "butchr-mcp-workspace-"));
+  roots.push(root);
+  const key = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
+  const cwd = join(root, ...key.split(":"));
+  mkdirSync(cwd, { recursive: true });
+  // A per-resource-shaped file (as an existing jira-work agent would carry) is refused:
+  // there is no single `resource`/`issue` for a query-level agent to match.
+  writeFileSync(join(cwd, ".butchr-agy.json"), JSON.stringify({ issue: "BUTCHR-12", agent: key, mcpUrl: "http://127.0.0.1:7717/mcp" }));
+  expect(() => bridgeWorkspace(root, cwd)).toThrow("Invalid factory workspace identity");
+
+  // A KEY_ONLY provider (github-issue/jira-idea/zendesk-ticket) takes the OTHER branch
+  // (mcp/workspace.ts's KEY_ONLY_PROVIDERS check): still refused with no defined shape,
+  // never crashing on the missing single `resource`.
+  const ghKey = encodeQueryAgentKey({ resourceProvider: "github-issue", ruleId: "triage" });
+  const ghCwd = join(root, ...ghKey.split(":"));
+  mkdirSync(ghCwd, { recursive: true });
+  writeFileSync(join(ghCwd, ".butchr-agy.json"), JSON.stringify({ agent: ghKey, resource: "acme/web#42", mcpUrl: "http://127.0.0.1:7717/mcp" }));
+  expect(() => bridgeWorkspace(root, ghCwd)).toThrow("Invalid factory workspace identity");
 });
 
 test("bridge entrypoint help and startup errors do not start a daemon or leak metadata", async () => {

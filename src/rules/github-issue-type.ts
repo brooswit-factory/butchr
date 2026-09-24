@@ -17,7 +17,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
 import { scopedIssueQuery, type GithubComment, type GithubIssue } from "../resources/github-issue.js";
 import { parseGithubIssueRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
 import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
+import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import type { Rule } from "./rules.js";
 
 export interface GithubIssueMatch {
@@ -40,8 +40,8 @@ export interface GithubIssueResourceDeps {
   onMatches?: (matches: readonly GithubIssueMatch[]) => void;
 }
 
-/** True for exactly the herd ids this type owns. */
-export const ownsGithubIssueAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "github-issue";
+/** True for exactly the herd ids this type owns — a per-resource key or a query-level one (BUTCHR-397) alike. */
+export const ownsGithubIssueAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "github-issue";
 
 /** Every enabled `github-issue` rule's matches. Any failed search rejects the whole poll. */
 export async function searchGithubIssueRules(deps: Pick<GithubIssueResourceDeps, "rules" | "search">): Promise<GithubIssueMatch[]> {

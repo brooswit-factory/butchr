@@ -3,7 +3,8 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, ruleAgentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, ruleAgentIdOfWorkspacePath, workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
+import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
@@ -46,6 +47,25 @@ describe("workspace identity", () => {
     expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
+  });
+  test("BUTCHR-397: a query-level agent's workspace round-trips through workspaceDirFor/agentIdOfWorkspacePath and sits as a SIBLING of that rule's per-resource ones, never their parent", () => {
+    const root = "/w";
+    const queryKey = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
+    const resourceKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" });
+    const queryDir = workspaceDirFor(queryKey, root);
+    const resourceDir = workspaceDirFor(resourceKey, root);
+    expect(queryDir).toBe(join(root, "jira-work", "triage", "%40query"));
+    // Same parent directory (the rule's own folder) — a sibling, not an ancestor: buildWorkspace()
+    // would otherwise write the query agent's own files into the directory that holds every
+    // per-resource agent's subdirectory for this rule.
+    expect(join(queryDir, "..")).toBe(join(resourceDir, ".."));
+    expect(queryDir).not.toBe(resourceDir);
+    // Round-trips back to the exact same key, and is recognised as a rule-engine (not legacy) workspace.
+    expect(agentIdOfWorkspacePath(queryDir, root)).toBe(queryKey);
+    expect(ruleAgentIdOfWorkspacePath(queryDir, root)).toBe(queryKey);
+    // Findable again after a "daemon restart" with nothing but the directory: agentIdOfWorkspacePath
+    // takes only the path and root, no in-memory state, and this is the exact inverse of workspaceDirFor.
+    expect(workspaceDirFor(agentIdOfWorkspacePath(queryDir, root)!, root)).toBe(queryDir);
   });
 });
 

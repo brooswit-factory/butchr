@@ -14,7 +14,7 @@ import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
-import { decodeAgentKey } from "../rules/agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { AgentPreference } from "../rules/rules.js";
 
 /**
@@ -125,25 +125,28 @@ export const effortFor = (issuetype: string): string =>
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
 /**
- * Where an agent's workspace lives. A rule-engine agent key maps to
- * `<root>/<provider>/<ruleId>/<resourceId>` (each segment already
- * URI-escaped by the key codec, so the key's `:`-joined parts ARE the path
- * segments). Anything else keeps the legacy `<root>/<id>` layout. The two
- * layouts cannot collide: a legacy directory is one level deep, a
- * rule-engine one is three — so a legacy workspace is never reused,
- * rewritten, or adopted by a rule agent for the same ticket.
+ * Where an agent's workspace lives. A rule-engine agent key — per-resource
+ * (`encodeAgentKey`) or query-level (`encodeQueryAgentKey`, BUTCHR-397) —
+ * maps to `<root>/<provider>/<ruleId>/<resourceId-or-"@query">` (each
+ * segment already URI-escaped by the key codec, so the key's `:`-joined
+ * parts ARE the path segments). Anything else keeps the legacy `<root>/<id>`
+ * layout. The two layouts cannot collide: a legacy directory is one level
+ * deep, a rule-engine one is three — so a legacy workspace is never reused,
+ * rewritten, or adopted by a rule agent for the same ticket. A query-level
+ * workspace sits as a SIBLING of that same rule's per-resource ones, never
+ * their ancestor (see `QUERY_AGENT_MARKER`'s own comment in agent-key.ts).
  */
 export function workspaceDirFor(id: string, root: string = workspaceRoot()): string {
-  return decodeAgentKey(id) ? join(root, ...id.split(":")) : join(root, id);
+  return decodeAnyAgentKey(id) ? join(root, ...id.split(":")) : join(root, id);
 }
 
 /**
  * The herd id owning `cwd`, inverse of `workspaceDirFor`: a canonical agent
- * key for a three-deep rule-engine workspace, the upper-cased directory name
- * for a legacy one-deep workspace, `null` for anything else. Legacy ids are
- * still reported so legacy agents stay visible (dashboard, admission
- * census); the rule loop's `ownsId` is what keeps it from ever stopping or
- * adopting them.
+ * key (per-resource or query-level) for a three-deep rule-engine workspace,
+ * the upper-cased directory name for a legacy one-deep workspace, `null` for
+ * anything else. Legacy ids are still reported so legacy agents stay visible
+ * (dashboard, admission census); the rule loop's `ownsId` is what keeps it
+ * from ever stopping or adopting them.
  */
 export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
   if (!cwd) return null;
@@ -153,18 +156,20 @@ export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: str
   if (segments.length === 1) return segments[0]!.toUpperCase();
   if (segments.length !== 3) return null;
   const key = segments.join(":");
-  return decodeAgentKey(key) ? key : null;
+  return decodeAnyAgentKey(key) ? key : null;
 }
 
 /**
  * The rule-engine agent owning `cwd`, of ANY provider — never a legacy
  * one-deep workspace. For provider-neutral pane care (session-limit
  * recovery) that every rule loop's agents need, unlike the Jira-writing
- * detectors, which scope themselves to `jira-work`.
+ * detectors, which scope themselves to `jira-work`. Recognises a
+ * query-level agent's workspace too (BUTCHR-397): it needs the same pane
+ * care as any other rule-engine agent.
  */
 export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
   const id = agentIdOfWorkspacePath(cwd, root);
-  return id && decodeAgentKey(id) ? id : null;
+  return id && decodeAnyAgentKey(id) ? id : null;
 }
 
 /** The resource (Jira key) a herd id works: the decoded resource of an agent key, else the id itself. */

@@ -77,3 +77,85 @@ export function decodeAgentKey(key: string): AgentKeyParts | null {
   const parts = { resourceProvider, ruleId, resourceId };
   return joinKey(parts) === key ? parts : null;
 }
+
+/**
+ * BUTCHR-397 — the identity of the ONE agent a `singleton`/`persistent` rule
+ * runs for its whole matching workload, as opposed to `encodeAgentKey`'s one
+ * key per matched resource. Derived from provider + rule id ALONE — never
+ * from a matched resource — so it is stable across daemon restarts and rule
+ * re-matches, exactly as the docs for `execution` in `./rules.ts` require.
+ *
+ * Reserved literal in the resource-id slot instead of a shorter key, so this
+ * shares its `<resourceProvider>:<ruleId>:` prefix with that same rule's own
+ * per-resource keys: `workspaceDirFor` (src/agents/workspace.ts) then places
+ * the query-level workspace as a SIBLING inside
+ * `<root>/<resourceProvider>/<ruleId>/`, one directory per matched resource
+ * plus this one — never as their parent. A shorter `<provider>:<ruleId>` key
+ * would instead land ON that shared parent directory, where
+ * `buildWorkspace()` would write the query agent's own CLAUDE.md/brief.md
+ * files into the very directory that is supposed to hold nothing but
+ * per-resource subdirectories.
+ *
+ * `QUERY_AGENT_MARKER` can never collide with a real resource id: it starts
+ * `@`, which no provider's native id format ever contains (Jira issue/idea
+ * keys are `[A-Z][A-Z0-9_]*-[0-9]+`; a GitHub ref requires a `/` and a `#`; a
+ * Zendesk ref requires a `#`) — asserted for every `RESOURCE_PROVIDERS`
+ * member in `agent-key.test.ts`, not just claimed here. That is what makes
+ * `decodeAgentKey` and `decodeQueryAgentKey` mutually exclusive: the former
+ * rejects this literal via `isResourceId`, the latter rejects anything else.
+ */
+const QUERY_AGENT_MARKER = "@query";
+
+/** A query-level agent key's parts: no `resourceId` — there is no single resource, by design (see `QUERY_AGENT_MARKER`). */
+export interface QueryAgentKeyParts { resourceProvider: ResourceProvider; ruleId: string }
+
+const joinQueryKey = (p: QueryAgentKeyParts): string => [p.resourceProvider, p.ruleId, QUERY_AGENT_MARKER].map(encodeURIComponent).join(SEP);
+
+/**
+ * Encodes a query-level agent key:
+ *
+ *   <resourceProvider>:<ruleId>:@query     e.g. jira-work:triage:@query
+ *
+ * Same validation and percent-encoding discipline as `encodeAgentKey`.
+ */
+export function encodeQueryAgentKey(parts: QueryAgentKeyParts): string {
+  if (!oneOf(RESOURCE_PROVIDERS, parts.resourceProvider)) throw new Error(`invalid resource provider: ${JSON.stringify(parts.resourceProvider)}`);
+  if (!isRuleId(parts.ruleId)) throw new Error(`invalid rule id: ${JSON.stringify(parts.ruleId)}`);
+  return joinQueryKey(parts);
+}
+
+/**
+ * Inverse of `encodeQueryAgentKey`; `null` for anything it could not have
+ * produced — including every key `decodeAgentKey` accepts (see
+ * `QUERY_AGENT_MARKER`'s own comment for why the two never overlap).
+ */
+export function decodeQueryAgentKey(key: string): QueryAgentKeyParts | null {
+  const raw = key.split(SEP);
+  if (raw.length !== 3) return null;
+  let decoded: string[];
+  try { decoded = raw.map(decodeURIComponent); } catch { return null; }
+  const [resourceProvider, ruleId, marker] = decoded as [string, string, string];
+  if (!oneOf(RESOURCE_PROVIDERS, resourceProvider) || !isRuleId(ruleId) || marker !== QUERY_AGENT_MARKER) return null;
+  const parts = { resourceProvider, ruleId };
+  return joinQueryKey(parts) === key ? parts : null;
+}
+
+/** Either shape a `decodeAnyAgentKey` call can return, tagged so a caller need not re-derive which one it got. */
+export type AnyAgentKeyParts = ({ kind: "resource" } & AgentKeyParts) | ({ kind: "query" } & QueryAgentKeyParts);
+
+/**
+ * Decodes either an `encodeAgentKey` (per-resource) or `encodeQueryAgentKey`
+ * (query-level) value; `null` for anything neither could have produced. Use
+ * this wherever a key must be recognised regardless of which shape it is —
+ * workspace path mapping, ownership predicates, MCP identity, herd lookups —
+ * so a query-level agent is never silently treated as legacy/unowned. Code
+ * that only ever deals with one resource (e.g. "the Jira ticket this agent
+ * works") should keep using `decodeAgentKey` directly: a query-level key
+ * correctly fails it, since there is no single resource to name.
+ */
+export function decodeAnyAgentKey(key: string): AnyAgentKeyParts | null {
+  const resource = decodeAgentKey(key);
+  if (resource) return { kind: "resource", ...resource };
+  const query = decodeQueryAgentKey(key);
+  return query ? { kind: "query", ...query } : null;
+}
