@@ -10,9 +10,19 @@ while tasks inherit `claude,codex`. Entries must be distinct supported providers
 Without ordered settings, the existing single-provider behavior is retained.
 
 Butchr supplies preferences; Drovr owns account availability and ordered
-attempts. Only demonstrated Claude quota refusals trigger automatic fallback.
-Arbitrary launch failures, authentication failures, and configuration errors
-remain errors. No Codex or Antigravity quota classifier is assumed.
+attempts. Only demonstrated quota refusals trigger automatic fallback: Claude's
+session/weekly limit and Codex's usage-limit notice ("Automatically switched to
+<model> due to usage limits.", or its "You’ve hit your usage limit" error),
+both classified by Drovr from an idle/done pane. Arbitrary launch failures,
+authentication failures, and configuration errors remain errors. No
+Antigravity quota classifier is assumed.
+
+A refused worker is replaced by re-running selection from the top of its
+order, skipping blocked accounts: under `claude,codex` a Codex worker at its
+limit goes back to Claude, and a Claude worker at its limit goes to Codex. A
+blocked provider is eligible again, at its own position, once its printed
+reset passes. A Codex worker is observed even in a codex-only configuration,
+where it is marked quota-blocked (stalled, not respawned) until its reset.
 
 Fallback retains the filesystem workspace, but a different provider cannot
 inherit the previous provider's private conversation. The replacement starts
@@ -25,8 +35,9 @@ operator reset. Exhaustion leaves work waiting. The old Claude reset watcher
 does not compete with the ordered recovery path.
 
 Antigravity is selected as `agy`, including in ordered preferences such as
-`claude,codex,agy`. It has no quota classifier: only a demonstrated Claude
-quota refusal moves to the next provider. An AGY launch error remains an error.
+`claude,codex,agy`. It has no quota classifier: only a demonstrated Claude or
+Codex quota refusal moves to the next provider. An AGY launch error remains an
+error.
 
 ## Antigravity registration
 
@@ -144,14 +155,16 @@ Codex directory-trust dialogs from idle/done to blocked. Those corrected
 reports feed the existing status watchers and kickoff checks; nudges refuse
 an already-blocked agent, report delivery as false when the prompt response
 is corrected to blocked, and never send recovery Enter while blocked.
-Drovr does not add a Codex quota classifier or confirm prompt completion.
+Drovr does not confirm prompt completion. Since Drovr 0.11.1 it classifies
+Codex's usage-limit notice; a nudge to a Codex pane showing it reports the
+refusal and never presses Enter on the notice's "Add Credits" menu.
 
 HTTP MCP tool access is separate from unsolicited notifications. Thatch 0.6.3
 uses Claude channel notifications; Butchr excludes Codex and AGY connections from
 that path. Issue and project updates still use Herdr `agent.prompt`, including
 the existing idle/blocked safeguards. Acceptance of a prompt does not prove a
-turn completed. Claude session-limit detection is not a complete Codex quota
-classifier. Codex readiness, busy/idle wake behavior, and restoration depend
+turn completed. Codex usage-limit detection recognises only the measured
+notices above. Codex readiness, busy/idle wake behavior, and restoration depend
 on the installed Herdr agent integration and require an isolated smoke test
 before production rollout. No shared SDK or Thatch changes are included.
 

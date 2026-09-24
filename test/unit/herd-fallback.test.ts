@@ -10,13 +10,23 @@ import { buildWorkspace, workspaceRoot } from "../../src/agents/workspace.js";
 const spec = { key: "TEST-1", issuetype: "Task", summary: "fallback fixture", parent: null };
 const url = "http://localhost:7717/mcp";
 const banner = "You've hit your session limit";
+// Verbatim herdr read of a quota-blocked idle Codex pane, 2026-09-24.
+const codexNotice = [
+  "• Automatically switched to Luna Reserve medium due to usage limits.",
+  "  You’re now using Luna, a faster model for simpler tasks.",
+  "  Add credits to continue using the most advanced models, or wait for usage to reset after",
+  "  16:03 on 29 Sep.",
+  "› 1. Add Credits",
+  "  2. Continue with Luna Reserve",
+  "  Press enter to confirm or esc to continue working",
+].join("\n");
 const instant = async () => {};
 const config: AgentConfig = { provider: "claude", providers: ["claude", "codex"], disabledMcpServers: [] };
 type Row = { pane_id: string; agent: string; cwd: string; agent_status: string };
 
-function fixture(options: { refuseClaude?: boolean; launchError?: Error; existing?: Row[]; text?: string; missingTranscript?: boolean; missingAck?: boolean } = {}) {
+function fixture(options: { refuseClaude?: boolean; refuseCodex?: boolean; launchError?: Error; existing?: Row[]; text?: string; missingTranscript?: boolean; missingAck?: boolean } = {}) {
   let rows = options.existing ?? [];
-  const starts: any[] = [], creates: any[] = [], closed: string[] = [], prompts: any[] = [];
+  const starts: any[] = [], creates: any[] = [], closed: string[] = [], prompts: any[] = [], keys: any[] = [];
   const texts = new Map<string, string>();
   const histories = new Map<string, string>();
   function record(pane: string, provider: string, prompt?: string) {
@@ -41,12 +51,12 @@ function fixture(options: { refuseClaude?: boolean; launchError?: Error; existin
       start: async (params: any) => {
         starts.push(params);
         if (options.launchError) throw options.launchError;
-        const refused = params.kind === "claude" && options.refuseClaude;
+        const refused = (params.kind === "claude" && options.refuseClaude) || (params.kind === "codex" && options.refuseCodex);
         const prompt = params.args[params.kind === "agy" ? 1 : 0];
         const importing = prompt.includes("DROVR_HANDOFF_READY_");
         rows.push({ pane_id: params.pane_id, cwd: creates.at(-1).cwd, agent: params.kind, agent_status: refused || importing ? "idle" : "working" });
         record(params.pane_id, params.kind, prompt);
-        texts.set(params.pane_id, refused ? banner : "working");
+        texts.set(params.pane_id, refused ? (params.kind === "codex" ? codexNotice : banner) : "working");
       },
       prompt: async (params: any) => {
         prompts.push(params);
@@ -60,10 +70,10 @@ function fixture(options: { refuseClaude?: boolean; launchError?: Error; existin
     pane: {
       close: async (pane: string) => { closed.push(pane); rows = rows.filter((r) => r.pane_id !== pane); },
       read: async ({ pane_id }: any) => ({ read: { text: texts.get(pane_id) ?? options.text ?? banner } }),
-      sendKeys: async () => {},
+      sendKeys: async (params: any) => { keys.push(params); },
     },
   };
-  return { client: client as any, starts, creates, closed, prompts, texts, rows: () => rows };
+  return { client: client as any, starts, creates, closed, prompts, keys, texts, rows: () => rows };
 }
 
 describe("HerdrHerd ordered provider fallback", () => {
@@ -377,5 +387,106 @@ describe("HerdrHerd ordered provider fallback", () => {
     await new HerdrHerd(first.client, url, instant, undefined, { provider: "claude", providers: ["claude"] }).recoverQuota(spec);
     await new HerdrHerd(second.client, url, instant, undefined, config).spawn({ ...spec, key: "TEST-2" });
     expect(second.starts.map((p) => p.kind)).toEqual(["codex"]);
+  });
+
+  describe("Codex usage limits", () => {
+    const codexAccount = { provider: "codex", accountId: "default" } as const;
+    const claudeAccount = { provider: "claude", accountId: "default" } as const;
+
+    test("a Codex worker at its usage limit is replaced from the top of the order: Claude first", async () => {
+      const f = fixture({ existing: [existing("codex")], text: codexNotice });
+      const availability = new ProviderAvailabilityRegistry(() => new Date(2026, 8, 24, 12, 0).getTime());
+      const logs: string[] = [];
+      const herd = new HerdrHerd(f.client, url, instant, line => logs.push(line), config, availability);
+      expect(await herd.recoverQuota(spec)).toBe("recovered");
+      expect(f.starts.map(p => p.kind)).toEqual(["claude"]);
+      expect(f.starts[0].args[0]).toContain("ONLY for importing and compacting historical context");
+      expect(f.closed).toEqual(["old"]);
+      expect(f.creates[0].cwd).toBe(existing().cwd);
+      expect(await herd.paneFor(spec.key)).toBe("new-1");
+      expect(herd.quotaBlocked(spec.key)).toBe(false);
+      expect(availability.get(codexAccount)).toMatchObject({ status: "quota-blocked", resetsAt: new Date(2026, 8, 29, 16, 3).getTime() });
+      expect(logs.some(line => line.includes("provider=codex quota-blocked"))).toBe(true);
+      expect(logs.some(line => line.includes("recovered provider=claude"))).toBe(true);
+    });
+
+    test("a Codex worker at its limit under a codex-first role order still goes to Claude, and Codex regains its position after the reset", async () => {
+      let now = new Date(2026, 8, 24, 12, 0).getTime();
+      const availability = new ProviderAvailabilityRegistry(() => now);
+      const agent: AgentConfig = { ...config, roleProviders: { task: ["codex", "claude"] } };
+      const f = fixture({ existing: [existing("codex")], text: codexNotice });
+      const herd = new HerdrHerd(f.client, url, instant, undefined, agent, availability);
+      expect(await herd.recoverQuota(spec)).toBe("recovered");
+      expect(f.starts.map(p => p.kind)).toEqual(["claude"]);
+      now = new Date(2026, 8, 29, 16, 3).getTime();
+      const later = fixture();
+      await new HerdrHerd(later.client, url, instant, undefined, agent, availability).spawn({ ...spec, key: "TEST-2" });
+      expect(later.starts.map(p => p.kind)).toEqual(["codex"]);
+    });
+
+    test("a Codex kickoff that lands on the usage-limit notice falls through to Claude", async () => {
+      const f = fixture({ refuseCodex: true });
+      const availability = new ProviderAvailabilityRegistry();
+      const herd = new HerdrHerd(f.client, url, instant, undefined, { ...config, providers: ["codex", "claude"] }, availability);
+      await herd.spawn(spec);
+      expect(f.starts.map(p => p.kind)).toEqual(["codex", "claude"]);
+      expect(f.closed).toEqual(["new-1"]);
+      expect(availability.get(codexAccount).status).toBe("quota-blocked");
+      expect(await herd.paneFor(spec.key)).toBe("new-2");
+    });
+
+    test("a Claude worker at its limit goes on to Codex; with both blocked the worker is kept and waits", async () => {
+      const f = fixture({ existing: [existing()] });
+      const availability = new ProviderAvailabilityRegistry();
+      availability.markQuotaBlocked(codexAccount, { resetsAt: null, raw: "Automatically switched to Luna Reserve medium due to usage limits." });
+      const herd = new HerdrHerd(f.client, url, instant, undefined, config, availability);
+      expect(await herd.recoverQuota(spec)).toBe("waiting");
+      expect(f.creates).toEqual([]);
+      expect(f.closed).toEqual([]);
+      expect(herd.quotaBlocked(spec.key)).toBe(true);
+      availability.clear(codexAccount);
+      expect(await herd.recoverQuota(spec)).toBe("recovered");
+      expect(f.starts.map(p => p.kind)).toEqual(["codex"]);
+      expect(availability.get(claudeAccount).status).toBe("quota-blocked");
+    });
+
+    test("a codex-only configuration marks the limit and waits instead of sitting silently", async () => {
+      const f = fixture({ existing: [existing("codex")], text: codexNotice });
+      const availability = new ProviderAvailabilityRegistry(() => new Date(2026, 8, 24, 12, 0).getTime());
+      const logs: string[] = [];
+      const herd = new HerdrHerd(f.client, url, instant, line => logs.push(line), { provider: "codex", disabledMcpServers: [] }, availability);
+      expect(await herd.recoverQuota(spec)).toBe("waiting");
+      expect(herd.quotaBlocked(spec.key)).toBe(true);
+      expect(herd.resourceQuotaBlocked(spec.key)).toBe(true);
+      expect(f.creates).toEqual([]);
+      expect(f.closed).toEqual([]);
+      expect(logs.some(line => line.includes("provider=codex quota-blocked resetsAt="))).toBe(true);
+    });
+
+    test("nudging a Codex pane on the notice reports the refusal and never presses Enter on its menu", async () => {
+      const f = fixture({ existing: [existing("codex")], text: codexNotice });
+      f.client.agent.prompt = async (params: any) => { f.prompts.push(params); return { agent: f.rows()[0] }; };
+      const herd = new HerdrHerd(f.client, url, instant, undefined, config, new ProviderAvailabilityRegistry());
+      const result = await herd.nudge(spec.key, "new request");
+      expect(result.delivered).toBe(true);
+      expect(result.refusal?.raw).toBe("Automatically switched to Luna Reserve medium due to usage limits.");
+      expect(f.keys).toEqual([]);
+    });
+
+    test("quoted, indented, carried-on, and AGY notices are not recovered", async () => {
+      for (const [agent, text] of [
+        ["codex", `  └ ${codexNotice}`],
+        ["codex", `${codexNotice}\n• Continuing on Luna Reserve with the tests.`],
+        ["codex", banner],
+        ["agy", codexNotice],
+      ] as const) {
+        const f = fixture({ existing: [existing(agent)], text });
+        const availability = new ProviderAvailabilityRegistry();
+        const herd = new HerdrHerd(f.client, url, instant, undefined, config, availability, instant);
+        expect(await herd.recoverQuota(spec)).toBe("not-refused");
+        expect(f.creates).toEqual([]);
+        expect(availability.get(codexAccount).status).toBe("available");
+      }
+    });
   });
 });
