@@ -54,6 +54,21 @@ Rocket.Chat account lifecycle for a rule's agent(s), independent of
 attaching, or tearing down an actual Rocket.Chat account. The field is
 validated and stored only.
 
+**`account` is not a prerequisite for event-driven delivery.** A rule's
+`mcpServers` bindings (BUTCHR-411, see docs/mcp-server-bindings.md) bind
+Claude to push notifications from ANY MCP channel server, independent of
+`account` — an `account: "none"` rule (e.g. Candlestix's MUD players, who
+get no Rocket.Chat account at all under S4) still gets full, non-polling
+channel delivery from its own bound server(s). The two fields share a rule
+but nothing else: `mcpServers`-derived launch argv never reads `account`.
+
+## `mcpServers`: binding a rule to additional MCP servers (BUTCHR-411)
+
+Separate from the three fields above — see docs/mcp-server-bindings.md for
+the full field, launch-argv, and staleness story. Noted here only because a
+reader of this page's `account` section is likely to ask exactly the
+question the previous paragraph answers.
+
 ## The vendor selector: already there, not duplicated
 
 `agentPreferences[].harness` (`"claude" | "codex" | "agy"`, `src/rules/rules.ts`)

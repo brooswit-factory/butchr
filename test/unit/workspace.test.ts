@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
@@ -509,5 +509,88 @@ describe("buildWorkspace", () => {
       else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// BUTCHR-411: a rule can bind additional MCP servers, each landing in
+// mcp.json alongside butchr's own — the channel flag itself is argv.ts's
+// concern (see argv.test.ts); this is what a Claude agent's mcp.json actually
+// contains.
+describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
+  const withRoot = (fn: (root: string) => void) => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-mcp-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try { fn(root); }
+    finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("no mcpServers -> mcp.json byte-identical to before (just butchr)", () => {
+    withRoot(() => {
+      const withField = buildWorkspace({ key: "KAN-20", issuetype: "Task", summary: "s", parent: null, mcpServers: [] }, "http://x/mcp");
+      const withoutField = buildWorkspace({ key: "KAN-21", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp");
+      const a = readFileSync(join(withField, "mcp.json"), "utf8").replace(/KAN-20/g, "KAN");
+      const b = readFileSync(join(withoutField, "mcp.json"), "utf8").replace(/KAN-21/g, "KAN");
+      expect(a).toBe(b);
+      expect(Object.keys(JSON.parse(a).mcpServers)).toEqual(["butchr"]);
+    });
+  });
+
+  test("a bound server lands in mcp.json alongside butchr's own, channel:true or not", () => {
+    withRoot(() => {
+      const dir = buildWorkspace({ key: "KAN-22", issuetype: "Task", summary: "s", parent: null, mcpServers: [mud, { ...mud, name: "silent", channel: false }] }, "http://x/mcp");
+      const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+      expect(Object.keys(mcp.mcpServers).sort()).toEqual(["butchr", "mud", "silent"]);
+      expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp" });
+      expect(mcp.mcpServers.silent).toEqual({ type: "http", url: "https://mud.example/mcp" });
+      expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp"); // butchr's own entry is unchanged by bindings
+    });
+  });
+
+  test("a bound server's headersEnvVar resolves from THIS process's own env into mcp.json headers", () => {
+    withRoot(() => {
+      process.env.BUTCHR_TEST_WS_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer t" });
+      try {
+        const dir = buildWorkspace({ key: "KAN-23", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_WS_MUD_HEADERS" }] }, "http://x/mcp");
+        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+        expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp", headers: { Authorization: "Bearer t" } });
+      } finally { delete process.env.BUTCHR_TEST_WS_MUD_HEADERS; }
+    });
+  });
+
+  test("a non-claude provider never writes mcp.json at all -- bindings must not break agy/codex launch", () => {
+    withRoot(() => {
+      const dir = buildWorkspace({ key: "KAN-24", issuetype: "Task", summary: "s", parent: null, mcpServers: [mud] }, "http://x/mcp", "agy");
+      expect(existsSync(join(dir, "mcp.json"))).toBe(false);
+    });
+  });
+});
+
+describe("resolveMcpServerHeaders (BUTCHR-411)", () => {
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("no headersEnvVar -> undefined", () => {
+    expect(resolveMcpServerHeaders(mud, {})).toBeUndefined();
+  });
+  test("headersEnvVar names an unset var -> undefined, not a throw", () => {
+    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "NOPE" }, {})).toBeUndefined();
+  });
+  test("a set var holding a flat string-valued JSON object resolves", () => {
+    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: JSON.stringify({ Authorization: "Bearer t", "X-Extra": "y" }) })).toEqual({ Authorization: "Bearer t", "X-Extra": "y" });
+  });
+  test("malformed JSON, a non-object, or a non-string-valued object all resolve to undefined rather than throwing", () => {
+    for (const raw of ["not json", "[]", "null", "42", JSON.stringify({ a: 1 }), JSON.stringify({ a: { b: "c" } })]) {
+      expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: raw })).toBeUndefined();
+    }
+  });
+  test("defaults to process.env when no env map is given", () => {
+    process.env.BUTCHR_TEST_RESOLVE_HEADERS = JSON.stringify({ A: "b" });
+    try { expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "BUTCHR_TEST_RESOLVE_HEADERS" })).toEqual({ A: "b" }); }
+    finally { delete process.env.BUTCHR_TEST_RESOLVE_HEADERS; }
   });
 });

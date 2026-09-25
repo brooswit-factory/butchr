@@ -113,10 +113,18 @@ against their observed provider; both providers count as resident processes.
 Drain existing agents deliberately before a complete provider migration.
 
 Claude receives `CLAUDE.md`, `brief.md`, `ENVIRONMENT.md`, and `mcp.json`,
-with the existing permission and development-channel flags. Codex receives
-`AGENTS.md`, the same brief/environment, and a launch-scoped TOML `--config`
-override for `mcp_servers.butchr`. It supplies the endpoint, `x-issue`, and
-`x-butchr-provider=codex` headers. No global Codex config or authentication
+with the existing permission and development-channel flags. `mcp.json` and
+the development-channel flags both extend past butchr's own server (BUTCHR-411,
+see docs/mcp-server-bindings.md): a rule's `mcpServers` bindings each add
+another entry to `mcp.json`, and every binding with `channel: true` adds its
+own `--dangerously-load-development-channels=server:<name>` flag alongside
+`server:butchr`, which always stays first. Codex receives `AGENTS.md`, the
+same brief/environment, and a launch-scoped TOML `--config` override for
+`mcp_servers.butchr` plus one more `--config mcp_servers.<name>=...` per
+bound server (any `channel` value — Codex has no development-channel
+concept, so a binding only ever reaches it as an MCP tool server, never a
+push; see docs/mcp-server-bindings.md). It supplies the endpoint, `x-issue`,
+and `x-butchr-provider=codex` headers. No global Codex config or authentication
 files are modified; project config trust is not needed to load this override.
 The factory-created workspace is explicitly trusted in launch arguments so
 Codex's first-run directory prompt cannot stall unattended startup. This trust
