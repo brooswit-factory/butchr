@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -569,24 +569,83 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
       expect(existsSync(join(dir, "mcp.json"))).toBe(false);
     });
   });
+
+  // Review finding, PR #387 (BLOCKING): a bound server's resolved header
+  // VALUE landed in a group/other-readable mcp.json at the default umask.
+  const mode = (path: string) => statSync(path).mode & 0o777;
+
+  test("mcp.json carrying a bound server's resolved header is chmod 0600 (owner-only)", () => {
+    withRoot(() => {
+      process.env.BUTCHR_TEST_WS_PERM_HEADERS = JSON.stringify({ Authorization: "Bearer secret" });
+      try {
+        const dir = buildWorkspace({ key: "KAN-25", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_WS_PERM_HEADERS" }] }, "http://x/mcp");
+        expect(mode(join(dir, "mcp.json"))).toBe(0o600);
+      } finally { delete process.env.BUTCHR_TEST_WS_PERM_HEADERS; }
+    });
+  });
+
+  test("a binding-less mcp.json keeps its default (unchanged) permissions — not tightened when there is no secret to protect", () => {
+    withRoot(() => {
+      const dir = buildWorkspace({ key: "KAN-26", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp");
+      const withoutBindings = mode(join(dir, "mcp.json"));
+      const dir2 = buildWorkspace({ key: "KAN-27", issuetype: "Task", summary: "s", parent: null, mcpServers: [mud] }, "http://x/mcp"); // bound, but headersEnvVar unset -> no resolved header
+      const withHeaderlessBinding = mode(join(dir2, "mcp.json"));
+      expect(withHeaderlessBinding).toBe(withoutBindings);
+      expect(withHeaderlessBinding).not.toBe(0o600); // proves this isn't just "always 0600 now"
+    });
+  });
+
+  test("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
+    withRoot(() => {
+      const spec = { key: "KAN-28", issuetype: "Task", summary: "s", parent: null };
+      const dir = buildWorkspace(spec, "http://x/mcp"); // first build: no bindings, default perms
+      expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
+      process.env.BUTCHR_TEST_WS_PERM_HEADERS2 = JSON.stringify({ Authorization: "Bearer secret" });
+      try {
+        buildWorkspace({ ...spec, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_WS_PERM_HEADERS2" }] }, "http://x/mcp"); // rebuild: now bound, with a resolved header
+        expect(mode(join(dir, "mcp.json"))).toBe(0o600);
+      } finally { delete process.env.BUTCHR_TEST_WS_PERM_HEADERS2; }
+    });
+  });
 });
 
 describe("resolveMcpServerHeaders (BUTCHR-411)", () => {
   const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
 
-  test("no headersEnvVar -> undefined", () => {
-    expect(resolveMcpServerHeaders(mud, {})).toBeUndefined();
+  const silent = () => {}; // most cases below intentionally exercise the "resolves to nothing" log path; keep test output clean
+
+  test("no headersEnvVar -> undefined, and the log is never called (nothing to warn about)", () => {
+    const lines: string[] = [];
+    expect(resolveMcpServerHeaders(mud, {}, (l) => lines.push(l))).toBeUndefined();
+    expect(lines).toEqual([]);
   });
   test("headersEnvVar names an unset var -> undefined, not a throw", () => {
-    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "NOPE" }, {})).toBeUndefined();
+    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "NOPE" }, {}, silent)).toBeUndefined();
   });
-  test("a set var holding a flat string-valued JSON object resolves", () => {
-    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: JSON.stringify({ Authorization: "Bearer t", "X-Extra": "y" }) })).toEqual({ Authorization: "Bearer t", "X-Extra": "y" });
+  test("a set var holding a flat string-valued JSON object resolves, and the log is never called", () => {
+    const lines: string[] = [];
+    expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: JSON.stringify({ Authorization: "Bearer t", "X-Extra": "y" }) }, (l) => lines.push(l))).toEqual({ Authorization: "Bearer t", "X-Extra": "y" });
+    expect(lines).toEqual([]);
   });
   test("malformed JSON, a non-object, or a non-string-valued object all resolve to undefined rather than throwing", () => {
     for (const raw of ["not json", "[]", "null", "42", JSON.stringify({ a: 1 }), JSON.stringify({ a: { b: "c" } })]) {
-      expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: raw })).toBeUndefined();
+      expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "H" }, { H: raw }, silent)).toBeUndefined();
     }
+  });
+  // Review finding, PR #387 (non-blocking, requested): an authenticated
+  // bridge whose headersEnvVar resolves to nothing must leave a trail
+  // naming the binding and the env var — never the (here, secret) value.
+  test("headersEnvVar set but unresolvable logs exactly one line naming the binding and env var — never the raw env value", () => {
+    const lines: string[] = [];
+    resolveMcpServerHeaders({ ...mud, headersEnvVar: "MUD_MCP_HEADERS" }, { MUD_MCP_HEADERS: "not-json-but-looks-like-a-SEKRET-token" }, (l) => lines.push(l));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("mud");
+    expect(lines[0]).toContain("MUD_MCP_HEADERS");
+    expect(lines[0]).not.toContain("SEKRET");
+    expect(lines[0]).not.toContain("not-json-but-looks-like-a-SEKRET-token");
+  });
+  test("defaults to console.error when no log fn is given (only asserting it doesn't throw — output is incidental)", () => {
+    expect(() => resolveMcpServerHeaders({ ...mud, headersEnvVar: "STILL_UNSET_VAR_XYZ" }, {})).not.toThrow();
   });
   test("defaults to process.env when no env map is given", () => {
     process.env.BUTCHR_TEST_RESOLVE_HEADERS = JSON.stringify({ A: "b" });

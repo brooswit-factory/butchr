@@ -66,7 +66,32 @@ reads it at launch/workspace-build time, expecting a flat, string-valued
 JSON object (`{"Authorization": "Bearer …"}`). Missing, empty, malformed
 JSON, or a non-flat/non-string-valued object all resolve to "no extra
 headers" rather than throwing — a bad or rotated secret must not crash
-workspace building or block every other rule's launch.
+workspace building or block every other rule's launch. When that happens,
+`resolveMcpServerHeaders` logs exactly one line naming the binding and the
+env var — never the raw env value — so an authenticated bridge that
+silently ends up unauthenticated has something to point at, rather than
+just failing later with no trail.
+
+**Where a resolved header VALUE is allowed to live, and where it is not**
+(review finding, PR #387 — the reason this section exists): a resolved
+header value may appear in `mcp.json` (Claude only — see the permissions
+note just below) and nowhere else. It is NEVER put on a process command
+line — Codex's launch deliberately omits it (see "Codex" below) — and it
+never appears in a log line: `resolveMcpServerHeaders`'s own diagnostic
+line above names the binding/env var, not the value, and nothing downstream
+of it (argv, `staleIssues()`'s `observedArgv`, the `[reconcile] … respawned`
+journal line) carries header content at all, because none of those inputs
+ever contained it in the first place.
+
+**`mcp.json` file permissions.** `buildWorkspace` `chmod`s `mcp.json` to
+`0600` (owner read/write only) whenever it embeds a bound server's resolved
+header — tightened explicitly with `chmodSync` after the write, not via
+`writeFileSync`'s own `mode` option, because that option only applies when
+the call CREATES the file; a rebuilt workspace's `mcp.json` already exists
+and would otherwise keep whatever permissions it had. A binding-less
+`mcp.json`, or one with bindings that carry no resolved header, keeps
+today's exact default permissions — untouched, byte-for-byte the same
+behaviour as before this ticket.
 
 ## Launch wiring
 
@@ -95,11 +120,28 @@ true or false, the flag is meaningless to Codex — is added to the launch's
 `mcpServers` array (`src/agents/argv.ts`, `boundCodexServers`) alongside
 `butchr`'s own entry, the same way `mcpIdentityHeaders` already is. Drovr
 renders each as its own `--config mcp_servers.<name>={ url = "…", enabled =
-true }` (plus `http_headers = {...}` when `resolveMcpServerHeaders` resolves
-something). **What a Codex agent gets today, explicitly, per this ticket's
-own DoD:** MCP **tools**, yes — the bound server behaves exactly like any
-other Codex MCP server; channel **push**, no — there is no channel push to
-Codex at all, bound server or not.
+true }`. **What a Codex agent gets today, explicitly, per this ticket's own
+DoD:** MCP **tools**, yes — the bound server behaves exactly like any other
+Codex MCP server; channel **push**, no — there is no channel push to Codex
+at all, bound server or not.
+
+**A bound server's `headersEnvVar` is NEVER sent to Codex, loudly by
+design** (review finding, PR #387): Drovr renders a Codex MCP server's
+`headers` as `http_headers = {...}` inside a `--config` argument — a real
+process command-line argument, visible to any other local user on the host
+via `ps`/`/proc`, and also exactly what `staleIssues()`/`onRespawn` would
+echo verbatim into `observedArgv` and the daemon journal on a stale
+respawn. `headersEnvVar` exists specifically so a header value (often a
+bearer token) never lands anywhere but the daemon's own process
+environment and the agent's own `mcp.json` (Claude only, and permission-
+tightened — see above); Codex argv is exactly such an "anywhere else", so
+`boundCodexServers` (`src/agents/argv.ts`) never calls
+`resolveMcpServerHeaders` at all. A binding with `headersEnvVar` set still
+reaches Codex — just with no extra headers, so an authenticated bridge
+connects unauthenticated from Codex specifically. If a bound server needs
+authentication AND Codex tool access, route Codex's connection through a
+mechanism that doesn't put the secret in argv (out of scope for this
+ticket) rather than relying on `headersEnvVar`.
 
 ### AGY
 
@@ -147,6 +189,21 @@ MCP server bindings`) covers all four shapes — `mcpBindingsOf` omitted
 entirely, resolving bindings for a matching agent, an agent launched
 without a binding its rule now has, and a rule `mcpBindingsOf` resolves to
 `undefined` for.
+
+**Known gap (review finding, PR #387), recorded rather than silently left**:
+staleness compares ARGV, and for Claude a binding's `url` and resolved
+headers are NEVER part of argv — only `name` (via the channel flag, and
+only for `channel: true` entries) is. So changing an EXISTING binding's
+`url` or its `headersEnvVar`'s resolved value (same `name`, same `channel`)
+rewrites `mcp.json` the next time that agent is (re)spawned for any other
+reason, but does **not**, by itself, make `staleIssues()` respawn an
+already-running Claude agent to pick it up — the running agent keeps
+talking to the OLD url/headers until it is restarted some other way (a
+crash, a manual `stop`, an unrelated respawn). Adding or removing a whole
+binding, or flipping its `channel` flag, IS visible to staleness (both
+change the channel-flag set), so those cases behave as documented above.
+If a rule needs a `url`/header change to reach already-running agents
+promptly, restart them explicitly rather than relying on reconciliation.
 
 ## Worked example: the Candlestix MUD bridge
 

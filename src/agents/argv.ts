@@ -1,4 +1,4 @@
-import { effortFor, mcpIdentityHeaders, modelFor, resolveMcpServerHeaders, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -56,16 +56,26 @@ const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).fil
  * Codex `McpServerLaunchConfig` entries for `spec.mcpServers` (BUTCHR-411) —
  * every binding, `channel` or not: Codex has no development-channel concept
  * (BUTCHR-359, out of scope here), so a bound server reaches Codex as MCP
- * TOOLS only, never push. Header values are resolved fresh from this
- * daemon's own environment each call (`resolveMcpServerHeaders`) — the same
- * env read `staleIssues()` and the original spawn share, so a value that
- * hasn't changed produces byte-identical argv both times.
+ * TOOLS only, never push.
+ *
+ * DELIBERATELY never `headers` (review finding, PR #387): Drovr renders a
+ * Codex `McpServerLaunchConfig`'s `headers` as `--config mcp_servers.<name>=
+ * { ..., http_headers = {...} }` — a real process command-line argument,
+ * visible to any other local user via `ps`/`/proc`, and also the exact text
+ * `staleIssues()`/`onRespawn` echo verbatim into `observedArgv` and the
+ * daemon journal. `headersEnvVar` exists precisely so a header VALUE (often
+ * a bearer token) is never written anywhere that isn't the daemon's own
+ * process environment and the agent's own `mcp.json` (Claude only, see
+ * `buildWorkspace`'s 0600 handling) — Codex argv is exactly such an
+ * "anywhere else". A binding that names `headersEnvVar` simply connects
+ * Codex to the bound server with no extra headers; say so loudly in
+ * docs/mcp-server-bindings.md rather than silently, since an authenticated
+ * bridge then fails to authenticate (`resolveMcpServerHeaders` itself, used
+ * only by the Claude/`mcp.json` path below, already logs when a named var
+ * resolves to nothing).
  */
-const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string; headers?: Record<string, string> }> =>
-  (spec.mcpServers ?? []).map((s) => {
-    const headers = resolveMcpServerHeaders(s);
-    return { name: s.name, url: s.url, ...(headers ? { headers } : {}) };
-  });
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
+  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process

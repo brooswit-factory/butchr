@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -236,11 +236,22 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
     // access; the channel flag (agentLaunchConfig, argv.ts) is the separate,
     // additive decision about PUSH notifications. No bindings -> byte-identical
     // to before (Object.fromEntries([]) spreads nothing).
+    let hasSecretHeaders = false;
     const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
       const headers = resolveMcpServerHeaders(b);
+      if (headers) hasSecretHeaders = true;
       return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
     }));
-    writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...bound } }, null, 2));
+    const mcpJsonPath = join(dir, "mcp.json");
+    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...bound } }, null, 2));
+    // Review finding, PR #387: a bound server's header VALUE (often a bearer
+    // token) landed in a group/other-readable file at the default umask.
+    // `writeFileSync`'s own `mode` option only ever applies when it CREATES
+    // the file (a rebuilt workspace's mcp.json already exists), so this is
+    // an explicit chmod, not a write option — and only when this write
+    // actually carries a secret; a binding-less (or headers-less) mcp.json
+    // keeps its exact previous permissions, untouched.
+    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
   }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
@@ -323,17 +334,30 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
  * all resolve to `undefined` (connect with no extra headers) rather than
  * throwing — a malformed/unset secret must not crash workspace building or
  * launch.
+ *
+ * Review finding, PR #387: a `headersEnvVar` that resolves to nothing used
+ * to fail this silently — for an authenticated bridge that is an agent that
+ * connects unauthenticated and only fails later, with nothing pointing back
+ * at the cause. `log` (default `console.error`, overridable for tests)
+ * prints exactly one line naming the BINDING and the ENV VAR — never the
+ * value, never the raw env content — whenever `headersEnvVar` was named but
+ * produced no usable headers.
  */
-export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env): Record<string, string> | undefined {
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
   if (!binding.headersEnvVar) return undefined;
   const raw = env[binding.headersEnvVar];
-  if (!raw) return undefined;
+  const parsed = raw ? tryParseHeaders(raw) : undefined;
+  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+  return parsed;
+}
+
+const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
-  } catch { /* malformed JSON in the env var — treated as absent, see doc comment */ }
+  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
   return undefined;
-}
+};
 
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
