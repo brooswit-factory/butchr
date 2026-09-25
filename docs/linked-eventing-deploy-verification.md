@@ -92,21 +92,41 @@ not Story/Sub-task and not either service account, so it cannot match
 wroosbit's `stories`/`subtasks` rules) and BUTCHR-442 (linked to 441 via a
 `Relates` issue link).
 
-## 3. Step C — the real linked change: PENDING
+## 3. Step C — the real linked change: PENDING, scheduled
 
 **Not yet done.** Plan: the epic makes ONE summary edit on BUTCHR-442 (not a
 status transition, so it can't be picked up by any staffing rule). This
 task's agent does not make the change and does not touch BUTCHR-441/442.
 
-Blocking condition as of this draft: `maxLinkedTurnsPerHour: 2` was
-exhausted by two REAL but UNINTENDED linked-change deliveries (07:39:42 and
-07:39:53 PDT) caused by BUTCHR-441's own description mentioning BUTCHR-430
-and BUTCHR-421 (both under active discussion for this very verification) —
-every ongoing comment on either ticket registers as a linked change to 441
-and immediately re-hits the cap. Fix in progress: the epic removing the
-430/421 mentions from BUTCHR-441's description (or scoping the rule to
-exclude them) before making the real BUTCHR-442 edit, so the freed rate-cap
-slot isn't immediately consumed by unrelated noise the instant it clears.
+Blocking condition hit: `maxLinkedTurnsPerHour: 2` was exhausted by two REAL
+but UNINTENDED linked-change deliveries (07:39:42 and 07:39:53 PDT) caused
+by BUTCHR-441's own description mentioning BUTCHR-430 and BUTCHR-421 (both
+under active discussion for this very verification) — every ongoing comment
+on either ticket registers as a linked change to 441 and immediately re-hits
+the cap. The epic has no tool to edit a Jira issue description, so the
+mentions cannot be removed from BUTCHR-441 (BUTCHR-430 comment 24095).
+
+**Fixed schedule instead (BUTCHR-430 comment 24095):**
+- The used slots free on schedule at ~07:39:42/07:39:53 PDT + 1 hour
+  (~08:39:42/08:39:53 PDT) — a suppressed tick does not extend or reset the
+  rate-limiter's own window (confirmed from source: state only advances on
+  an actual sent notify, never on a capped/suppressed one).
+- **Expected FIRST delivery — a catch-up, NOT the test:** the still-
+  outstanding accumulated 430/421 changes are expected to deliver as one
+  coalesced `[notify] ... (linked:N)` on the first poll tick after the
+  window frees (~08:39:42-58 PDT). This must NOT be mistaken for the
+  BUTCHR-442 test delivery — it is expected, unrelated noise, and will be
+  recorded as such, not counted toward the acceptance criteria.
+- The epic makes the real BUTCHR-442 summary edit at a fixed time:
+  **08:41:30 PDT (15:41:30Z)**.
+- **Expected SECOND delivery — the actual test:** exactly one
+  `[notify] ... (linked:N)` shortly after 08:41:30 PDT is the pass
+  condition for Step D.
+- Both BUTCHR-430 and this task's agent stay silent on BUTCHR-430 and
+  BUTCHR-421 from window-clear until ~08:46 PDT (a comment on either ticket
+  would itself consume a freed notify slot on BUTCHR-441). This task's own
+  ticket, BUTCHR-439, is NOT linked to BUTCHR-441, so comments here are
+  safe and are how this task's agent will keep reporting during the window.
 
 ## 4. Step D — exactly one turn, no duplicate: PENDING
 
