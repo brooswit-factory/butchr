@@ -66,6 +66,20 @@ export interface SessionDefinitionListDeps {
   list?: (query: FilesystemQuery) => Promise<FilesystemResource[]>;
   read?: (path: string) => Promise<string>;
   store: Pick<SessionFreezeStore, "read">;
+  /**
+   * BUTCHR-455 — when set, `agentKey`/`storeFrozen` are computed against
+   * `join(identityDir, resource.name)` instead of the resource's own
+   * (actual, on-disk) path. Used for `butchr session list --archived`:
+   * an archived definition physically lives under the archive directory,
+   * but its freeze-store key (and so its "would it be staffed frozen or
+   * not" answer) is derived from the path it will have once RESTORED to
+   * the active directory (see `session-freeze.ts`'s own doc comment on why
+   * the store key is path-derived) — `dir` still names where the file
+   * currently lives, for listing/reading, and stays what `entry.path`
+   * reports. Omitted (the default), `dir` is used for identity too —
+   * unchanged behaviour for `list`/`show`/`create`'s active-directory case.
+   */
+  identityDir?: string;
 }
 
 const defaultRead = (path: string): Promise<string> => readFile(path, "utf8");
@@ -88,7 +102,8 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
   for (const resource of resources) {
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
-    if (!isFilesystemResourceId(resource.path)) {
+    const identityPath = deps.identityDir !== undefined ? join(deps.identityDir, resource.name) : resource.path;
+    if (!isFilesystemResourceId(identityPath)) {
       // Too long to ever become an agent key (`sessionAgentKey`/`encodeAgentKey`
       // would throw) — same check `searchSessionDefinitions` runs BEFORE ever
       // building one, never after.
@@ -98,8 +113,8 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
       });
       continue;
     }
-    const agentKey = sessionAgentKey(resource.path);
-    const storeFrozen = await readStoreFrozen(deps.store, resource.path);
+    const agentKey = sessionAgentKey(identityPath);
+    const storeFrozen = await readStoreFrozen(deps.store, identityPath);
     try {
       const definition = parseSessionDefinitionFile(await read(resource.path), resource.path);
       out.push({
@@ -140,6 +155,14 @@ export type CreateSessionDefinitionResult = { ok: true; path: string } | { ok: f
 
 export interface CreateSessionDefinitionDeps {
   dir: string;
+  /**
+   * BUTCHR-455 — when given, `create` also refuses if a definition of the
+   * same name already exists in THIS directory (the archive dir). Omitted,
+   * `create` checks the active directory only — same as before this ticket
+   * (a caller with no archive concept at all, e.g. an old test, keeps its
+   * old behaviour unchanged).
+   */
+  archiveDir?: string;
   /** Injectable existence check so tests never touch real disk. */
   exists?: (path: string) => Promise<boolean>;
   write?: (path: string, contents: string) => Promise<void>;
@@ -167,11 +190,12 @@ const defaultExists = async (path: string): Promise<boolean> => {
  * would throw on is caught here, at create time, rather than shipping a file
  * the daemon's own poll then logs as invalid.
  *
- * Refuses to overwrite an existing definition of the same name. Does NOT
- * check an archived location of the same name — archive/unarchive
- * (BUTCHR-394 T2) has not defined where "archived" lives yet; this is a
- * known gap, not an oversight, and should be closed once that location
- * exists (see this ticket's PR description).
+ * Refuses to overwrite an existing definition of the same name, in EITHER
+ * the active directory or (when `deps.archiveDir` is given) the archive
+ * directory — BUTCHR-455 closes the gap BUTCHR-454 flagged: without this,
+ * `create`-ing a name that matches an archived definition would succeed,
+ * and a later `unarchive` of that name would then collide with the new
+ * active file it never knew about.
  */
 export async function createSessionDefinition(deps: CreateSessionDefinitionDeps, name: string, input: CreateSessionDefinitionInput): Promise<CreateSessionDefinitionResult> {
   const fileName = name.endsWith(".json") ? name : `${name}.json`;
@@ -180,6 +204,10 @@ export async function createSessionDefinition(deps: CreateSessionDefinitionDeps,
   const write = deps.write ?? writeFileAtomic;
 
   if (await exists(path)) return { ok: false, error: `${path} already exists — refusing to overwrite` };
+  if (deps.archiveDir !== undefined) {
+    const archivedPath = join(deps.archiveDir, fileName);
+    if (await exists(archivedPath)) return { ok: false, error: `${archivedPath} already exists — an archived definition of this name already exists; unarchive it or choose a different name` };
+  }
 
   const rawDoc: Record<string, unknown> = {
     workingDirectory: input.workingDirectory,

@@ -19,13 +19,17 @@ import {
   type SessionDefinitionListEntry,
 } from "../resources/session-definition-manage.js";
 import {
-  defaultSessionFreezeIo, freezeSessionDefinition, unfreezeSessionDefinition,
+  archiveSessionDefinition, assertArchiveDirDisjoint, defaultSessionArchiveIo, sessionArchiveDir,
+  unarchiveSessionDefinition, type SessionArchiveIo,
+} from "../resources/session-archive.js";
+import {
+  defaultSessionFreezeIo, freezeSessionDefinition, freezeStateRoot, unfreezeSessionDefinition,
   type SessionFreezeIo,
 } from "../resources/session-freeze.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { writeFileAtomic } from "../resources/atomic-write.js";
 
-const USAGE = `usage: butchr session list
+const USAGE = `usage: butchr session list [--archived]
        butchr session show <name>
        butchr session create <name> --working-directory <dir> --brief <text>
                              --vendor claude|codex --tier tier1..tier5
@@ -36,14 +40,22 @@ const USAGE = `usage: butchr session list
                              [--mcp-servers <json array>]
        butchr session freeze <name>
        butchr session unfreeze <name>
+       butchr session archive <name>
+       butchr session unarchive <name>
 
 <name> is a definition file's basename, with or without ".json", in the
 well-known session-definitions directory (BUTCHR_SESSION_DEFINITIONS_DIR,
-else $XDG_CONFIG_HOME/butchr/session-definitions).`;
+else $XDG_CONFIG_HOME/butchr/session-definitions). "archive" moves it out of
+that directory (so the daemon stops staffing it on its next poll) into a
+sibling archive directory (BUTCHR_SESSION_ARCHIVE_DIR, else
+<definitions-dir>-archive); "unarchive" moves it back under the exact same
+name. "list --archived" lists what's in the archive; plain "list" never
+shows archived definitions.`;
 
 export interface SessionCliIo {
   dir: string;
   freeze: SessionFreezeIo;
+  archive: SessionArchiveIo;
   list: (query: FilesystemQuery) => Promise<FilesystemResource[]>;
   read: (path: string) => Promise<string>;
   write: (path: string, contents: string) => Promise<void>;
@@ -64,9 +76,12 @@ export const realExists = async (path: string): Promise<boolean> => {
 
 function defaultIo(): SessionCliIo {
   const freeze = defaultSessionFreezeIo();
+  const dir = sessionDefinitionsPath();
+  const archiveDir = sessionArchiveDir(process.env, dir);
   return {
-    dir: sessionDefinitionsPath(),
+    dir,
     freeze,
+    archive: { activeDir: dir, archiveDir, ...defaultSessionArchiveIo() },
     list: listFilesystemResources,
     read: (p) => readFile(p, "utf8"),
     write: writeFileAtomic,
@@ -137,6 +152,22 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
   }
 
   if (sub === "list") {
+    const { flags } = parseFlags(rest);
+    if (flags.has("archived")) {
+      try {
+        assertArchiveDirDisjoint(io.dir, io.archive.archiveDir);
+      } catch (e) {
+        io.stderr(`butchr session list --archived: ${(e as Error).message}`);
+        return 1;
+      }
+      const entries = await listSessionDefinitions({ dir: io.archive.archiveDir, identityDir: io.dir, list: io.list, read: io.read, store: io.freeze.store });
+      if (!entries.length) {
+        io.stdout(`no archived session definitions in ${io.archive.archiveDir}`);
+        return 0;
+      }
+      for (const e of entries) for (const line of formatListEntry(e)) io.stdout(line);
+      return 0;
+    }
     const entries = await listSessionDefinitions({ dir: io.dir, list: io.list, read: io.read, store: io.freeze.store });
     if (!entries.length) {
       io.stdout(`no session definitions in ${io.dir}`);
@@ -192,7 +223,7 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
     const execution = str("execution");
     const account = str("account");
     const role = str("role");
-    const result = await createSessionDefinition({ dir: io.dir, exists: io.exists, write: io.write }, name, {
+    const result = await createSessionDefinition({ dir: io.dir, archiveDir: io.archive.archiveDir, exists: io.exists, write: io.write }, name, {
       workingDirectory: workingDirectory!, brief: brief!, vendor: vendor!, tier: tier!, permissionMode: permissionMode!,
       ...(execution !== undefined ? { execution } : {}),
       ...(account !== undefined ? { account } : {}),
@@ -228,6 +259,41 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
     const verb = sub === "freeze" ? "frozen" : "unfrozen";
     io.stdout(`${verb} ${entry.name} (${entry.agentKey}): ${freezeSummary(gates.manifestFrozen, gates.storeFrozen)}`);
     io.stdout(EFFECT_NOTE);
+    io.stdout(`definitions dir: ${io.dir}`);
+    io.stdout(`freeze-store root: ${freezeStateRoot()}`);
+    return 0;
+  }
+
+  if (sub === "archive" || sub === "unarchive") {
+    const [name] = rest;
+    if (!name) {
+      io.stderr(`butchr session ${sub}: expected exactly one argument\n\n${USAGE}`);
+      return 1;
+    }
+    try {
+      assertArchiveDirDisjoint(io.dir, io.archive.archiveDir);
+    } catch (e) {
+      io.stderr(`butchr session ${sub}: ${(e as Error).message}`);
+      return 1;
+    }
+    const fileName = name.endsWith(".json") ? name : `${name}.json`;
+    const result = sub === "archive"
+      ? await archiveSessionDefinition(io.archive, fileName)
+      : await unarchiveSessionDefinition(io.archive, fileName);
+    if (!result.ok) {
+      io.stderr(`butchr session ${sub}: ${result.error}`);
+      return 1;
+    }
+    io.stdout(`${sub === "archive" ? "archived" : "unarchived"} ${fileName} -> ${result.path}`);
+    if (sub === "archive" && result.hookError) {
+      io.stderr(`butchr session archive: post-archive hook failed (the move itself already succeeded — ${fileName} IS archived): ${result.hookError}`);
+    }
+    io.stdout(sub === "archive"
+      ? `archiving does not stop the agent itself; ${EFFECT_NOTE}`
+      : `unarchiving does not start the agent itself; ${EFFECT_NOTE}`);
+    io.stdout(`definitions dir: ${io.dir}`);
+    io.stdout(`archive dir: ${io.archive.archiveDir}`);
+    io.stdout(`freeze-store root: ${freezeStateRoot()}`);
     return 0;
   }
 

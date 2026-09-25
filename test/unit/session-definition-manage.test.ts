@@ -98,6 +98,35 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
   });
 });
 
+describe("listSessionDefinitions — identityDir (BUTCHR-455, backs `list --archived`)", () => {
+  test("agentKey/storeFrozen are computed against identityDir + the resource's own basename, not its actual (archived) path", async () => {
+    const { list, read } = fakeFiles({ "/archive/a.json": JSON.stringify(goodDef()) });
+    const wouldBeActivePath = "/defs/a.json";
+    const agentKeyAtArchivePath = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: "/archive/a.json" });
+    const agentKeyAtActivePath = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: wouldBeActivePath });
+    const store = fakeStore(new Set([`butchr:${agentKeyAtActivePath}`])); // frozen ONLY at the would-be-active key
+    const entries = await listSessionDefinitions({ dir: "/archive", identityDir: "/defs", list, read, store });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.path).toBe("/archive/a.json"); // still reports where the file actually lives
+    expect(entries[0]!.agentKey).toBe(agentKeyAtActivePath);
+    expect(entries[0]!.agentKey).not.toBe(agentKeyAtArchivePath);
+    expect(entries[0]!.storeFrozen).toBe(true); // read at the identity path, where the store entry actually is
+  });
+
+  test("omitted identityDir: identity is computed from dir (unchanged pre-BUTCHR-455 behaviour)", async () => {
+    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef()) });
+    const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: "/defs/a.json" });
+    const entries = await listSessionDefinitions({ dir: "/defs", list, read, store: fakeStore() });
+    expect(entries[0]!.agentKey).toBe(agentKey);
+  });
+
+  test("manifestFrozen is unaffected by identityDir — it always reads the file's own actual content", async () => {
+    const { list, read } = fakeFiles({ "/archive/a.json": JSON.stringify(goodDef({ frozen: true })) });
+    const entries = await listSessionDefinitions({ dir: "/archive", identityDir: "/defs", list, read, store: fakeStore() });
+    expect(entries[0]!.manifestFrozen).toBe(true);
+  });
+});
+
 describe("showSessionDefinition", () => {
   test("finds by exact file name", async () => {
     const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef()) });
@@ -160,6 +189,20 @@ describe("createSessionDefinition", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("vendor must be one of");
     expect(deps.written).toEqual({});
+  });
+
+  test("BUTCHR-455: refuses a name that already exists in the archive directory, never writes", async () => {
+    const deps = fakeCreateDeps(new Set(["/archive/dup.json"]));
+    const result = await createSessionDefinition({ ...deps, archiveDir: "/archive" }, "dup", goodDef() as never);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("already exists");
+    expect(deps.written).toEqual({});
+  });
+
+  test("BUTCHR-455: an archive-name collision check is skipped entirely when no archiveDir is given (unchanged pre-BUTCHR-455 behaviour)", async () => {
+    const deps = fakeCreateDeps(new Set(["/archive/dup.json"])); // "exists" would say yes if ever asked about this path
+    const result = await createSessionDefinition(deps, "dup", goodDef() as never); // no archiveDir
+    expect(result.ok).toBe(true);
   });
 
   test("both claude and codex vendors validate and write", async () => {
