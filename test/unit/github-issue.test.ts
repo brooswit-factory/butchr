@@ -158,7 +158,11 @@ describe("github issue resource type", () => {
   });
 
   test("event rules: no notice on appear, disappear or updated-only; reasons for state, comment, title, other", async () => {
-    const snap = (...m: GithubIssueMatch[]) => ({ primary: m, related: [] });
+    // BUTCHR-398: `createGithubIssueEventRules` now operates over
+    // `ExecutionUnit<GithubIssueMatch>` (swarm "resource"-kind primary
+    // units) — wrapped at the boundary; the swarm behaviour under test is
+    // otherwise unchanged.
+    const snap = (...m: GithubIssueMatch[]) => ({ primary: m.map((match) => ({ kind: "resource" as const, match })), related: [] });
     const logs: string[] = [];
     let fail = false;
     const rules = createGithubIssueEventRules({

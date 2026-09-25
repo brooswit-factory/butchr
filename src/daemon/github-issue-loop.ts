@@ -59,12 +59,23 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
     ...(deps.onMatches ? { onMatches: deps.onMatches } : {}),
     log: deps.log,
+    runningIds: async () => (await deps.herd.runningIssues()).filter(ownsGithubIssueAgent),
   });
   return runResourceLoop(type, {
     herd: deps.herd,
     ownsId: ownsGithubIssueAgent,
-    notify: async (agent: string, _about: string, reason?: NotifyReason) => {
-      const resource = resourceKeyOf(agent);
+    notify: async (agent: string, about: string, reason?: NotifyReason) => {
+      // BUTCHR-398: `about` names the CHANGED issue — for a swarm agent's
+      // own primary change this is always `agent` itself (`resourceKeyOf`
+      // recovers the same ticket either way), but for a `singleton`/
+      // `persistent` rule's own scope entry `about` is a DIFFERENT ticket
+      // than the query agent's own key. Using `resourceKeyOf(agent)`
+      // unconditionally (as before this ticket, when `about` was always
+      // `agent` and so never mattered) would push the query agent's own
+      // bogus key (`github-issue:<rule>:@query`) as if it were a real issue
+      // ref — the exact hazard this ticket's `resourceKeyOf` audit exists to
+      // close, here in notification text rather than a live API call.
+      const resource = resourceKeyOf(about === agent ? agent : about);
       await deps.deliver(agent, resource, githubIssueNudge(resource, reason));
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),

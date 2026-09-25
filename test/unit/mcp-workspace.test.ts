@@ -49,7 +49,7 @@ test("bridge refuses absent or mismatched identity and invalid endpoints", () =>
   expect(() => bridgeWorkspace(root, cwd)).toThrow();
 });
 
-test("BUTCHR-397: a query-level agent's workspace is recognised as a rule-engine shape (never 'Not a factory workspace'), but refused for having no defined .butchr-agy.json shape yet — no crash", () => {
+test("BUTCHR-397: a query-level agent's workspace is recognised as a rule-engine shape (never 'Not a factory workspace'); a per-resource- or key-only-shaped .butchr-agy.json is refused rather than crashing", () => {
   const root = mkdtempSync(join(tmpdir(), "butchr-mcp-workspace-"));
   roots.push(root);
   const key = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
@@ -60,14 +60,42 @@ test("BUTCHR-397: a query-level agent's workspace is recognised as a rule-engine
   writeFileSync(join(cwd, ".butchr-agy.json"), JSON.stringify({ issue: "BUTCHR-12", agent: key, mcpUrl: "http://127.0.0.1:7717/mcp" }));
   expect(() => bridgeWorkspace(root, cwd)).toThrow("Invalid factory workspace identity");
 
-  // A KEY_ONLY provider (github-issue/jira-idea/zendesk-ticket) takes the OTHER branch
-  // (mcp/workspace.ts's KEY_ONLY_PROVIDERS check): still refused with no defined shape,
-  // never crashing on the missing single `resource`.
+  // A KEY_ONLY provider's OWN per-resource shape (`{agent, resource, mcpUrl}`) is also
+  // refused for a query-level agent — it still has no single resource to name.
   const ghKey = encodeQueryAgentKey({ resourceProvider: "github-issue", ruleId: "triage" });
   const ghCwd = join(root, ...ghKey.split(":"));
   mkdirSync(ghCwd, { recursive: true });
   writeFileSync(join(ghCwd, ".butchr-agy.json"), JSON.stringify({ agent: ghKey, resource: "acme/web#42", mcpUrl: "http://127.0.0.1:7717/mcp" }));
   expect(() => bridgeWorkspace(root, ghCwd)).toThrow("Invalid factory workspace identity");
+});
+
+test("BUTCHR-398: a query-level agent's OWN defined .butchr-agy.json shape — {agent, mcpUrl}, no issue/resource field — succeeds, for every provider", () => {
+  const root = mkdtempSync(join(tmpdir(), "butchr-mcp-workspace-"));
+  roots.push(root);
+  for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+    const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
+    const cwd = join(root, ...key.split(":"));
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(join(cwd, ".butchr-agy.json"), JSON.stringify({ agent: key, mcpUrl: "http://127.0.0.1:7717/mcp" }));
+    expect(bridgeWorkspace(root, cwd)).toEqual({ url: new URL("http://127.0.0.1:7717/mcp"), agent: key });
+  }
+});
+
+test("BUTCHR-398: a query-level .butchr-agy.json carrying a stray issue or resource field is refused, never silently accepted", () => {
+  const root = mkdtempSync(join(tmpdir(), "butchr-mcp-workspace-"));
+  roots.push(root);
+  const key = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
+  const cwd = join(root, ...key.split(":"));
+  mkdirSync(cwd, { recursive: true });
+  for (const value of [
+    { agent: key, issue: "BUTCHR-1", mcpUrl: "http://127.0.0.1:7717/mcp" },
+    { agent: key, resource: "BUTCHR-1", mcpUrl: "http://127.0.0.1:7717/mcp" },
+    { agent: "jira-work:triage:BUTCHR-1", mcpUrl: "http://127.0.0.1:7717/mcp" }, // wrong agent
+    { mcpUrl: "http://127.0.0.1:7717/mcp" }, // missing agent entirely
+  ]) {
+    writeFileSync(join(cwd, ".butchr-agy.json"), JSON.stringify(value));
+    expect(() => bridgeWorkspace(root, cwd)).toThrow("Invalid factory workspace identity");
+  }
 });
 
 test("bridge entrypoint help and startup errors do not start a daemon or leak metadata", async () => {

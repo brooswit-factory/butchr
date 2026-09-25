@@ -22,6 +22,8 @@ import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
+import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
+import type { AgentCapacityRole } from "../agents/admission.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -104,6 +106,29 @@ try {
   console.error(`butchr: ${(e as Error).message}`);
   process.exit(1);
 }
+// BUTCHR-398: log every sentinel rule at startup, one line each, so an
+// operator can see at a glance what is exempt from the fleet agent cap —
+// the epic decision's own ask ("log each sentinel rule at startup"). No
+// warning for an unflagged rule: `role` defaults to `"worker"`, and that
+// default needs no announcement (this task's own ticket: "deliberately NO
+// startup warning for rules without a role").
+for (const r of rules) {
+  if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
+}
+/**
+ * BUTCHR-398 — the fleet capacity role classifier every rule loop's
+ * admission wiring below shares: a running or candidate agent id's role,
+ * derived from its rule (provider + rule id, `decodeAnyAgentKey`) looked up
+ * against the loaded `rules`. Fails safe to `"worker"` for anything that
+ * cannot be resolved — a legacy/bare-issue agent, or a rule since removed —
+ * per `AdmissionControllerDeps.roleOf`'s own contract (src/agents/admission.ts).
+ */
+const roleOfAgent = (id: string): AgentCapacityRole => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return "worker";
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.role ?? "worker";
+};
 
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
@@ -182,6 +207,10 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
+  // BUTCHR-398: shared across every rule provider's admission bucket —
+  // `roleOfAgent` reads the FULL `rules` list (every provider), so it
+  // correctly classifies a running id of ANY provider, not just jira-work.
+  roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
   sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : [])],
@@ -222,9 +251,23 @@ const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 // fresh call of its own; the census was already computed earlier in this
 // same poll (see admission.ts's own top comment and this ticket's own
 // falsifier for the ordering proof).
+/**
+ * BUTCHR-398: dashboard/state metadata for a herd id — `issueMeta` only ever
+ * holds REAL tickets (keyed by their own Jira key), so a query-level id
+ * (`resourceKeyOf` falls back to the whole bogus key for one — see this
+ * file's own `isQueryLevelAgent` comment) would otherwise look up nothing
+ * and render an empty summary. Synthesized here instead, from the rule
+ * itself, so a query agent's row reads as what it is rather than blank.
+ */
+const metaFor = (key: string): IssueMeta | undefined => {
+  const query = decodeQueryAgentKey(key);
+  if (!query) return issueMeta.get(resourceKeyOf(key));
+  const rule = rules.find((r) => r.id === query.ruleId && r.resourceProvider === query.resourceProvider);
+  return { summary: rule ? `${rule.id} (query agent)` : "(query agent — rule not found)", issuetype: "task" };
+};
 const dashboardFeed = createDashboardFeed({
   now: () => Date.now(),
-  issueMeta: (key) => issueMeta.get(resourceKeyOf(key)),
+  issueMeta: metaFor,
   tracker: dashboardStatusFloor,
   withheldTracker: dashboardWithheldStatusFloor,
   admission: () => admissionController.census(),
@@ -347,7 +390,7 @@ const { app, mcp } = buildApp({
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
       status,
-      summary: issueMeta.get(resourceKeyOf(issue))?.summary ?? "",
+      summary: metaFor(issue)?.summary ?? "",
     }));
   },
   open: async (issue) => {
@@ -601,12 +644,25 @@ const abandonedDetector = createAbandonedDetector({
 // `RespawnGuard` is one instance per call rather than module-level. Both
 // reuse the SAME `speakOnOwnChannel`/`ownChannelComments` seams — no second
 // Atlassian writer or reader.
+// BUTCHR-398 — the `resourceKeyOf` hazard (found in BUTCHR-397's review):
+// `resourceKeyOf` on a query-level id (a `singleton`/`persistent` rule's one
+// agent) returns the WHOLE bogus key (e.g. `jira-work:triage:@query`), never
+// a real ticket — `decodeAgentKey` deliberately rejects it (see
+// src/rules/agent-key.ts). A query-level agent has no single ticket to
+// comment on or read comments from, so every detector below that would
+// otherwise call `speakOnOwnChannel`/`ownChannelComments` with that bogus
+// key instead no-ops for one (and says so, once per id, rather than
+// silently swallowing it).
+const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== null;
 const issueCrashLoopDetector = createCrashLoopDetector({
   now: () => Date.now(),
   count: config.crashLoopCount,
   windowMinutes: config.crashLoopWindowMinutes,
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
-  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  addComment: async (id, text) => {
+    if (isQueryLevelAgent(id)) { console.error(`  [crash-loop] ${id}: query-level agent — no single ticket to comment on, skipping`); return; }
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+  comments: (id) => (isQueryLevelAgent(id) ? Promise.resolve([]) : ownChannelComments(resourceKeyOf(id))),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
@@ -619,8 +675,11 @@ const issueCrashLoopDetector = createCrashLoopDetector({
 // writer or reader.
 const issueReconcileFailureDetector = createReconcileFailureDetector({
   now: () => Date.now(),
-  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
-  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  addComment: async (id, text) => {
+    if (isQueryLevelAgent(id)) { console.error(`  [reconcile-failure] ${id}: query-level agent — no single ticket to comment on, skipping`); return; }
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+  comments: (id) => (isQueryLevelAgent(id) ? Promise.resolve([]) : ownChannelComments(resourceKeyOf(id))),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-245: per-poll reclamation of a workspace whose agent exited on its
@@ -747,6 +806,7 @@ const ruleResourceType = createRuleResourceType({
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
+  runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
 });
 
 runResourceLoop(ruleResourceType, {
@@ -765,8 +825,12 @@ runResourceLoop(ruleResourceType, {
     console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
   },
   onRespawn: async (agent, reason, observedArgv) => {
-    const issue = resourceKeyOf(agent);
     console.error(`  [reconcile] ${agent} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
+    // BUTCHR-398: a query-level agent has no single ticket to post a respawn
+    // notice on — `resourceKeyOf(agent)` would otherwise post to the bogus
+    // key itself (see this file's own `isQueryLevelAgent` comment above).
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },

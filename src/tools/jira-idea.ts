@@ -25,7 +25,7 @@ type JiraIdeaCaller = Extract<CallerIdentity, { provider: "jira-idea" }>;
 
 function requireJiraIdeaCaller(c: { headers: Readonly<Record<string, string>> }, verb: string): JiraIdeaCaller {
   const who = callerIdentity(c.headers);
-  if (who?.provider !== "jira-idea") throw new Refusal(`${verb}: only a jira-idea agent may call this — it reads and writes the caller's own Product Discovery idea`);
+  if (who?.provider !== "jira-idea" || "query" in who) throw new Refusal(`${verb}: only a jira-idea agent may call this — it reads and writes the caller's own Product Discovery idea`);
   return who;
 }
 

@@ -198,6 +198,10 @@ function renderAdmission(admission: AdmissionView, now: number): string {
     admission.residency === null
       ? `<span class="cnc">could not check (no trusted census yet)</span>`
       : `<span class="known">${admission.residency}</span>`;
+  // BUTCHR-398: workers/sentinels reported separately — a sentinel never
+  // counts toward `cap`/`residency` above, so it is rendered as its own
+  // figure, never folded into the worker count.
+  const sentinelsHtml = admission.sentinels === null ? `<span class="cnc">?</span>` : `<span class="known">${admission.sentinels}</span>`;
   const sourceRows = admission.sources
     .map((s) => {
       if (s.census.checked) {
@@ -208,7 +212,7 @@ function renderAdmission(admission: AdmissionView, now: number): string {
     .join("");
   return (
     `<div class="admission">` +
-    `<div class="admcap">admission cap: ${admission.cap} · residency: ${residencyHtml}</div>` +
+    `<div class="admcap">admission cap: ${admission.cap} · residency(workers): ${residencyHtml} · sentinels: ${sentinelsHtml}</div>` +
     `<div class="admsources">${sourceRows || '<div class="admsrc none">no census sources declared</div>'}</div>` +
     `</div>`
   );

@@ -21,7 +21,13 @@ type GithubCaller = Extract<CallerIdentity, { provider: "github-issue" }>;
 
 function requireGithubCaller(c: { headers: Readonly<Record<string, string>> }, verb: string): GithubCaller {
   const who = callerIdentity(c.headers);
-  if (who?.provider !== "github-issue") throw new Refusal(`${verb}: only a github-issue agent may call this — it reads and writes the caller's own GitHub issue`);
+  // BUTCHR-398: `"query" in who` excludes a query-level caller — it has no
+  // single GitHub issue (`resource`/`ref`) for these tools to act on, so it
+  // is refused here exactly like a caller of any other provider, not
+  // silently misread as a per-resource github-issue caller (the same
+  // `provider` string alone cannot tell the two apart — see `CallerIdentity`'s
+  // own doc comment, src/mcp/identity.ts).
+  if (who?.provider !== "github-issue" || "query" in who) throw new Refusal(`${verb}: only a github-issue agent may call this — it reads and writes the caller's own GitHub issue`);
   return who;
 }
 

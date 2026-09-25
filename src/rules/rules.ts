@@ -59,6 +59,21 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 export const ACCOUNT_POLICIES = ["none", "temporary", "permanent"] as const;
 export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
 
+/**
+ * Fleet capacity role (BUTCHR-391 epic decision, 2026-09-25T00:25Z, folded
+ * into BUTCHR-398): independent of `execution`/`account`. `worker` (the
+ * default) counts toward `BUTCHR_MAX_AGENTS` and is subject to admission
+ * withholding exactly as every agent is today. `sentinel` opts a rule's
+ * agent(s) OUT of the cap entirely — never withheld, never counted toward
+ * residency — for long-lived agents (e.g. persistent directors) that must
+ * never be starved by, or compete for, ordinary worker capacity. Applies
+ * per-agent: a swarm rule's every per-resource agent is a sentinel, or a
+ * singleton/persistent rule's one query-level agent is. See
+ * src/agents/admission.ts for how residency/admission honour this.
+ */
+export const AGENT_ROLES = ["worker", "sentinel"] as const;
+export type AgentRole = (typeof AGENT_ROLES)[number];
+
 export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
 
 /**
@@ -98,12 +113,14 @@ export interface Rule {
   execution: ExecutionMode;
   /** Rocket.Chat account lifecycle, independent of `execution`. Defaults to `"none"` (today's behaviour, exactly) when absent from the file. */
   account: AccountPolicy;
+  /** Fleet capacity role, independent of `execution`/`account`. Defaults to `"worker"` (today's behaviour, exactly) when absent from the file. */
+  role: AgentRole;
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships"]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 
@@ -172,7 +189,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!isObject(raw)) { errors.push(`${at} must be an object`); return; }
     const before = errors.length;
     unknownFields(raw, RULE_FIELDS, at, errors);
-    const { id, enabled, resourceProvider, query, brief, execution, account } = raw;
+    const { id, enabled, resourceProvider, query, brief, execution, account, role } = raw;
     if (typeof id !== "string" || !isRuleId(id)) errors.push(`${at}.id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})`);
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
     else { seen.add(id); providerOf.set(id, resourceProvider); }
@@ -188,6 +205,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // (see docs/execution-modes.md — BUTCHR-397 found no concrete provider-specific blocker).
     if (execution !== undefined && !oneOf(EXECUTION_MODES, execution)) errors.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
+    // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
+    if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
@@ -200,6 +219,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       query: (query as string).trim(), brief: brief as string,
       execution: (execution as ExecutionMode | undefined) ?? "swarm",
       account: (account as AccountPolicy | undefined) ?? "none",
+      role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
     });

@@ -20,16 +20,25 @@ import { jiraIssueClass, type LinkedGithubIssue } from "../resources/jira-idea.j
 import type { EventPoll, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { createGithubIssueEventRules, type GithubIssueMatch, type GithubIssueResourceDeps } from "./github-issue-type.js";
-import { createRuleEventRules, onceExcluded, type ExcludedIssue, type RuleMatch, type RuleResourceDeps } from "./resource-type.js";
+import { createRuleEventRules, onceExcluded, specForRuleQuery, type ExcludedIssue, type RuleMatch, type RuleResourceDeps } from "./resource-type.js";
+import { groupExecutionUnits, logExecutionModeSwitches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
 
 /** True for exactly the herd ids this type owns. */
 export const ownsJiraIdeaAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "jira-idea";
 
-/** What the idea loop tracks: its own ideas (primary) and the GitHub issues its agents hear (related only). */
-export type JiraIdeaItem = RuleMatch | GithubIssueMatch;
+/**
+ * What the idea loop tracks: its own ideas — `ExecutionUnit<RuleMatch>`,
+ * BUTCHR-398, PRIMARY only, `"resource"` (swarm) or `"query"`
+ * (`singleton`/`persistent`) — and the GitHub issues its agents hear
+ * (`GithubIssueMatch`, bare — RELATED only, never `"query"`-kind: hearing a
+ * GitHub rule's own query agent is not a thing this relationship expresses).
+ * The two are distinguished structurally: only the idea-side variant ever
+ * carries a `"kind"` field.
+ */
+export type JiraIdeaItem = ExecutionUnit<RuleMatch> | GithubIssueMatch;
 
-const isIdeaMatch = (m: JiraIdeaItem): m is RuleMatch => m.rule.resourceProvider === "jira-idea";
+const isIdeaUnit = (m: JiraIdeaItem): m is ExecutionUnit<RuleMatch> => "kind" in m;
 
 /** Every enabled `jira-idea` rule's proven ideas. Any failed search rejects the whole poll. */
 export async function searchJiraIdeaRules(deps: Pick<RuleResourceDeps, "rules" | "search"> & { excluded?: ExcludedIssue }): Promise<RuleMatch[]> {
@@ -119,6 +128,16 @@ export interface JiraIdeaResourceDeps extends RuleResourceDeps {
  * type — never `updated` alone, and never an issue merely entering or leaving
  * the heard set, e.g. a link added or a rule starting to match). A GitHub
  * agent's own comment still reaches the ideas that hear its issue.
+ *
+ * BUTCHR-398: PRIMARY is passed straight through to `ideaRules` (already
+ * `ExecutionUnit<RuleMatch>` — no filtering needed, `discovery.search()`
+ * below never produces anything else there). RELATED now mixes TWO
+ * relationships (`isIdeaUnit` tells them apart, see `JiraIdeaItem`'s own doc
+ * comment): the pre-existing github-issue-hearing entries (unchanged) and a
+ * `singleton`/`persistent` idea rule's own scope entries
+ * (`scopeRelatedResources`), decided through `ideaRules` itself (the SAME
+ * Jira suppression stack a swarm idea agent's own primary changes go
+ * through) rather than `githubRules`.
  */
 function createJiraIdeaEventRules(deps: JiraIdeaResourceDeps) {
   const ideaRules = createRuleEventRules(deps);
@@ -127,26 +146,35 @@ function createJiraIdeaEventRules(deps: JiraIdeaResourceDeps) {
     ...(deps.log ? { log: deps.log } : {}),
   });
   // The GitHub stack decides per its own agent; re-key each heard issue by its ref so one issue is one decision.
-  const byRef = (related: readonly RelatedResource<JiraIdeaItem>[]): GithubIssueMatch[] =>
-    related.map((r) => r.issue as GithubIssueMatch).map((g) => ({ ...g, agentKey: g.issue.ref }));
+  const byRef = (related: readonly RelatedResource<JiraIdeaItem>[]): ExecutionUnit<GithubIssueMatch>[] =>
+    related.map((r) => r.issue).filter((u): u is GithubIssueMatch => !isIdeaUnit(u)).map((g) => ({ kind: "resource" as const, match: { ...g, agentKey: g.issue.ref } }));
+  const ideaRelated = (related: readonly RelatedResource<JiraIdeaItem>[]): RelatedResource<ExecutionUnit<RuleMatch>>[] =>
+    related.filter((r) => isIdeaUnit(r.issue)).map((r) => ({ issue: r.issue as ExecutionUnit<RuleMatch>, watchers: r.watchers }));
   return {
     async poll(prev: PollSnapshot<JiraIdeaItem>, next: PollSnapshot<JiraIdeaItem>): Promise<EventPoll> {
-      const ideaPoll = await ideaRules.poll(
-        { primary: prev.primary.filter(isIdeaMatch), related: [] },
-        { primary: next.primary.filter(isIdeaMatch), related: [] },
+      const ideaPrimaryPoll = await ideaRules.poll(
+        { primary: prev.primary as ExecutionUnit<RuleMatch>[], related: ideaRelated(prev.related) },
+        { primary: next.primary as ExecutionUnit<RuleMatch>[], related: ideaRelated(next.related) },
       );
       const githubPoll = prev.related.length && next.related.length
         ? await githubRules.poll({ primary: byRef(prev.related), related: [] }, { primary: byRef(next.related), related: [] })
         : null;
-      const entryFor = (key: string) => next.related.find((r) => (r.issue as GithubIssueMatch).agentKey === key);
+      const entryFor = (key: string) => next.related.find((r) => !isIdeaUnit(r.issue) && (r.issue as GithubIssueMatch).agentKey === key);
       return {
-        changedPrimary: ideaPoll.changedPrimary,
-        changedRelated: (githubPoll?.changedPrimary ?? []).flatMap((ref) => {
-          const e = next.related.find((r) => (r.issue as GithubIssueMatch).issue.ref === ref);
-          return e ? [(e.issue as GithubIssueMatch).agentKey] : [];
-        }),
+        changedPrimary: ideaPrimaryPoll.changedPrimary,
+        changedRelated: [
+          ...ideaPrimaryPoll.changedRelated,
+          ...(githubPoll?.changedPrimary ?? []).flatMap((ref) => {
+            const e = next.related.find((r) => !isIdeaUnit(r.issue) && (r.issue as GithubIssueMatch).issue.ref === ref);
+            return e && !isIdeaUnit(e.issue) ? [(e.issue as GithubIssueMatch).agentKey] : [];
+          }),
+        ],
         async decide(key, watcher, space) {
-          if (space === "primary") return ideaPoll.decide(key, watcher, space);
+          if (space === "primary") return ideaPrimaryPoll.decide(key, watcher, space);
+          // Ideas' own scope entries decide through `ideaRules` (the same
+          // suppression stack); heard GitHub issues decide through `githubRules`.
+          const ideaVerdict = await ideaPrimaryPoll.decide(key, watcher, "related");
+          if (ideaVerdict.deliver) return ideaVerdict;
           const entry = entryFor(key);
           if (!githubPoll || !entry?.watchers.includes(watcher)) return { deliver: false };
           const ref = (entry.issue as GithubIssueMatch).issue.ref;
@@ -171,18 +199,23 @@ export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): Resource
 
   return {
     discovery: {
-      idOf: (m) => m.agentKey,
+      idOf: (m) => (isIdeaUnit(m) ? unitAgentKey(m) : m.agentKey),
       search: async () => {
         latest = await searchJiraIdeaRules({ rules, search: deps.search, excluded });
         deps.onMatches?.(latest);
-        return latest;
+        if (deps.runningIds) logExecutionModeSwitches("jira-idea", rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
+        return groupExecutionUnits(rules.filter((r) => r.enabled), latest);
       },
       related: async (active) => {
         const github = deps.githubMatches?.() ?? [];
         const activeSet = new Set(active);
+        // BUTCHR-398: an idea's OWN scope entries — every `singleton`/
+        // `persistent` idea rule's currently-matched ideas, watched by that
+        // rule's query agent — independent of `githubLinks`/`github` below.
+        const scoped: RelatedResource<JiraIdeaItem>[] = scopeRelatedResources(latest);
         // Links are read only for active ideas whose rule lists a rule that matches something now.
         const keys = [...new Set(latest.filter((m) => activeSet.has(m.agentKey) && listensTo(m.rule, github)).map((m) => m.issue.key))];
-        if (!deps.githubLinks || !keys.length) { links.clear(); failed.clear(); return []; }
+        if (!deps.githubLinks || !keys.length) { links.clear(); failed.clear(); return scoped; }
         for (const k of [...links.keys()]) if (!keys.includes(k)) links.delete(k);
         for (const k of [...failed]) if (!keys.includes(k)) failed.delete(k);
         await Promise.all(keys.map(async (k) => {
@@ -194,11 +227,11 @@ export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): Resource
             failed.add(k);
           }
         }));
-        return relatedGithubIssues(latest, active, (k) => links.get(k) ?? [], github);
+        return [...scoped, ...relatedGithubIssues(latest, active, (k) => links.get(k) ?? [], github)];
       },
     },
     activation: { verdictFor: () => "active" },
     eventRules: createJiraIdeaEventRules({ ...deps, rules }),
-    spawnConfig: { specFor: (m) => specForJiraIdea(m as RuleMatch) },
+    spawnConfig: { specFor: (m) => (isIdeaUnit(m) ? (m.kind === "resource" ? specForJiraIdea(m.match) : specForRuleQuery(m.rule, m.agentKey)) : specForJiraIdea(m as unknown as RuleMatch)) },
   };
 }

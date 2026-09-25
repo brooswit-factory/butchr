@@ -20,7 +20,7 @@ type ZendeskCaller = Extract<CallerIdentity, { provider: "zendesk-ticket" }>;
 
 function requireZendeskCaller(c: { headers: Readonly<Record<string, string>> }, verb: string): ZendeskCaller {
   const who = callerIdentity(c.headers);
-  if (who?.provider !== "zendesk-ticket") throw new Refusal(`${verb}: only a zendesk-ticket agent may call this — it reads and writes the caller's own Zendesk ticket`);
+  if (who?.provider !== "zendesk-ticket" || "query" in who) throw new Refusal(`${verb}: only a zendesk-ticket agent may call this — it reads and writes the caller's own Zendesk ticket`);
   return who;
 }
 
