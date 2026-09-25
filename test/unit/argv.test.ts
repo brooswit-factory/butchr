@@ -57,6 +57,37 @@ describe("spawnArgs", () => {
     expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe("follow your AGENTS.md");
   });
 
+  test("BUTCHR-408 (McsServerBinding ported from S4): a channel:true bound server adds its own development-channels flag alongside server:butchr; channel:false does not", () => {
+    const bound = [
+      { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true },
+      { name: "quiet-tools", type: "http" as const, url: "https://quiet.internal/mcp", channel: false },
+    ];
+    const args = spawnArgs({ ...spec, mcpServers: bound }, "/w/KAN-783");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).toContain("--dangerously-load-development-channels=server:mud-bridge");
+    expect(args.some((a) => a.includes("server:quiet-tools"))).toBe(false);
+  });
+
+  test("BUTCHR-408: a bound server reaches Codex as an MCP tool with NEVER a header, even when headersEnvVar names a real secret — a Codex process's argv is world-readable via ps/proc", () => {
+    const before = process.env.MUD_BRIDGE_HEADERS;
+    process.env.MUD_BRIDGE_HEADERS = JSON.stringify({ Authorization: "Bearer super-secret-token" });
+    try {
+      const bound = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", headersEnvVar: "MUD_BRIDGE_HEADERS", channel: true }];
+      const args = spawnArgs({ ...spec, mcpServers: bound }, "/w/KAN-783", { provider: "codex" });
+      expect(args.join(" ")).toContain("mud-bridge");
+      expect(args.join(" ")).not.toContain("super-secret-token");
+      expect(args.join(" ")).not.toContain("Authorization");
+      // Codex has no development-channel concept at all — a bound server reaches it as a tool only, never push.
+      expect(args.some((a) => a.includes("--dangerously-load-development-channels"))).toBe(false);
+    } finally {
+      if (before === undefined) delete process.env.MUD_BRIDGE_HEADERS; else process.env.MUD_BRIDGE_HEADERS = before;
+    }
+  });
+
+  test("BUTCHR-408: no mcpServers is byte-for-byte unchanged (today's behaviour exactly)", () => {
+    expect(spawnArgs(spec, "/w/KAN-783")).toEqual(spawnArgs({ ...spec, mcpServers: [] }, "/w/KAN-783"));
+  });
+
   test("--effort sits adjacent to --model, before the variadic flags", () => {
     const args = spawnArgs(spec, "/w/KAN-783");
     const modelIdx = args.indexOf("--model");

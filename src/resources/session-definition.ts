@@ -18,7 +18,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { expandHome } from "./filesystem-query.js";
-import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, type AccountPolicy, type AgentRole, type ExecutionMode } from "../rules/rules.js";
+import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
 
 /** Agent vendors a managed-session definition may name. Narrower than `AGENT_HARNESSES` (src/rules/rules.ts) — `agy` is not a Bakr/Candlestix vendor and is deliberately excluded here, not merely unused. */
 export const SESSION_DEFINITION_VENDORS = ["claude", "codex"] as const;
@@ -97,29 +97,26 @@ export interface SessionDefinition {
   role: AgentRole;
   /** Frozen persistent definitions run no agent at all — excluded from the built-in query's eligible set entirely (see session-definition-type.ts). Default `false`. */
   frozen: boolean;
+  /**
+   * Additional MCP servers this agent may connect to, beyond butchr's own —
+   * the ticket's own required field ("MCP server list, with per-MCP
+   * notification flags; channel bindings to ANY MCP channel server").
+   * `McpServerBinding`/`parseMcpServers` (src/rules/rules.ts) is REUSED
+   * verbatim, not redefined: the type was ported there from S4's
+   * (BUTCHR-395/BUTCHR-411) `BUTCHR-395` branch (PR #387, merge commit
+   * 5520722) per the epic's sequencing decision on BUTCHR-408 (rebase onto
+   * `main`, take S4's type as source material, do not wait for its own PR).
+   * The per-MCP "notification flag" the ticket names is `channel`, exactly
+   * as S4 designed it. Absent means none — today's behaviour exactly.
+   */
+  mcpServers?: McpServerBinding[];
 }
 
-const DEFINITION_FIELDS = new Set(["workingDirectory", "brief", "vendor", "tier", "permissionMode", "execution", "account", "role", "frozen"]);
+const DEFINITION_FIELDS = new Set(["workingDirectory", "brief", "vendor", "tier", "permissionMode", "execution", "account", "role", "frozen", "mcpServers"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
-
-/**
- * `mcpServers`/`channels`: the ticket's own required field ("MCP server
- * list, with per-MCP notification flags; channel bindings to ANY MCP
- * channel server"), deliberately NOT built here. S4 (BUTCHR-395, task
- * BUTCHR-411) is adding `Rule.mcpServers` (`McpServerBinding[]`: name, http
- * url, `headersEnvVar`, `channel: true|false`) on branch `BUTCHR-395` —
- * not yet on `main` or `BUTCHR-393`. The ticket's own sequencing rule: do
- * NOT copy or re-declare `McpServerBinding`, and do NOT merge that branch
- * in. A definition naming either key gets this specific, actionable error
- * instead of a generic "unknown field" one, so nobody mistakes silence for
- * "not needed yet" — see docs/managed-sessions.md.
- */
-const DEFERRED_MCP_FIELDS = new Set(["mcpServers", "channels"]);
-const deferredMcpProblem = (field: string, at: string): string =>
-  `${at}.${field} is not supported yet — deferred pending BUTCHR-395/BUTCHR-411 (Rule.mcpServers) landing and a sequencing decision on BUTCHR-408; omit this field for now (see docs/managed-sessions.md)`;
 
 function workingDirectoryProblems(raw: unknown, home: string): string[] {
   if (typeof raw !== "string" || !raw.trim()) return ["workingDirectory must be a non-empty string"];
@@ -135,10 +132,7 @@ function workingDirectoryProblems(raw: unknown, home: string): string[] {
 export function sessionDefinitionProblems(doc: unknown, at: string, home: string = homedir()): string[] {
   if (!isObject(doc)) return [`${at} must be a JSON object`];
   const problems: string[] = [];
-  for (const k of Object.keys(doc)) {
-    if (DEFERRED_MCP_FIELDS.has(k)) problems.push(deferredMcpProblem(k, at));
-    else if (!DEFINITION_FIELDS.has(k)) problems.push(`${at} has unknown field "${k}"`);
-  }
+  for (const k of Object.keys(doc)) if (!DEFINITION_FIELDS.has(k)) problems.push(`${at} has unknown field "${k}"`);
   problems.push(...workingDirectoryProblems(doc.workingDirectory, home).map((p) => `${at}.${p}`));
   if (!nonEmpty(doc.brief)) problems.push(`${at}.brief must be a non-empty string`);
   if (!oneOf(SESSION_DEFINITION_VENDORS, doc.vendor)) problems.push(`${at}.vendor must be one of ${SESSION_DEFINITION_VENDORS.join(", ")}`);
@@ -148,6 +142,7 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.account !== undefined && !oneOf(ACCOUNT_POLICIES, doc.account)) problems.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
   if (doc.role !== undefined && !oneOf(AGENT_ROLES, doc.role)) problems.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
   if (doc.frozen !== undefined && typeof doc.frozen !== "boolean") problems.push(`${at}.frozen must be a boolean`);
+  if (doc.mcpServers !== undefined) parseMcpServers(doc.mcpServers, `${at}.mcpServers`, problems);
   return problems;
 }
 
@@ -166,6 +161,7 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     account: (d.account as AccountPolicy | undefined) ?? "none",
     role: (d.role as AgentRole | undefined) ?? "worker",
     frozen: (d.frozen as boolean | undefined) ?? false,
+    ...(d.mcpServers !== undefined ? { mcpServers: parseMcpServers(d.mcpServers, `${at}.mcpServers`, []) as McpServerBinding[] } : {}),
   };
 }
 

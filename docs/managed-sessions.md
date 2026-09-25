@@ -41,7 +41,10 @@ takes effect on restart, not live), like every other provider's query.
   "execution": "swarm",
   "account": "none",
   "role": "worker",
-  "frozen": false
+  "frozen": false,
+  "mcpServers": [
+    { "name": "mud-bridge", "type": "http", "url": "https://mud.internal/mcp", "headersEnvVar": "MUD_BRIDGE_HEADERS", "channel": true }
+  ]
 }
 ```
 
@@ -56,6 +59,7 @@ takes effect on restart, not live), like every other provider's query.
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). Stored only — the Rocket.Chat account lifecycle itself is unimplemented for every provider today, managed sessions included. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
 | `frozen` | no | `false` default. A frozen definition is a VALID one that simply runs no agent — see "Eligible = valid, not frozen" below. |
+| `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
@@ -65,20 +69,52 @@ style as `filesystem`'s own query validation:
 /home/butchr/.config/butchr/session-definitions/foo.json: rules[0].vendor must be one of claude, codex
 ```
 
-### `mcpServers`/`channels`: deferred to S4
+### `mcpServers`: additional MCP server bindings
 
 The ticket's own required field — "MCP server list, with per-MCP
-notification flags; channel bindings to ANY MCP channel server" — is
-**deliberately not built by this ticket**. S4 (BUTCHR-395, task BUTCHR-411)
-is adding `Rule.mcpServers` (`McpServerBinding[]`: `name`, `type: "http"`,
-`url`, `headersEnvVar`, `channel: boolean`) on branch `BUTCHR-395` — not yet
-on `main` or `BUTCHR-393` as of this ticket. Per BUTCHR-408's own sequencing
-instruction: do not copy or re-declare `McpServerBinding`, and do not merge
-that branch in. A manifest naming either `mcpServers` or `channels` gets a
-specific, actionable validation error rather than a generic "unknown
-field" one or silent acceptance — see `sessionDefinitionProblems` in
-`src/resources/session-definition.ts`. Once S4 lands and the sequencing
-decision is made, this section gets the real field.
+notification flags; channel bindings to ANY MCP channel server" — reuses
+`McpServerBinding`/`parseMcpServers` (`src/rules/rules.ts`) **verbatim**,
+never a competing shape. That type was ported there from S4's
+(BUTCHR-395/BUTCHR-411) `BUTCHR-395` branch (PR #387, merge commit
+`5520722`) as source material, per the epic's sequencing decision on
+BUTCHR-408 (2026-09-25: "don't wait for S4 — import the type + validator,
+finish the MCP/channel section with the real type"). When S4's own
+`Rule.mcpServers` lands on `main`, it should reuse this exact type/module
+rather than reintroducing it — the type lives in `rules.ts`, not
+`session-definition.ts`, specifically so both can share it without either
+owning the other's shape.
+
+```json
+"mcpServers": [
+  { "name": "mud-bridge", "type": "http", "url": "https://mud.internal/mcp", "channel": true },
+  { "name": "quiet-tools", "type": "http", "url": "https://internal/tools", "headersEnvVar": "QUIET_TOOLS_HEADERS", "channel": false }
+]
+```
+
+| binding field | required | meaning |
+|---|---|---|
+| `name` | yes | Letters/digits/`_`/`-`; unique within the list; `"butchr"` is reserved. |
+| `type` | yes | Only `"http"` today. |
+| `url` | yes | Absolute `http`/`https` URL. |
+| `headersEnvVar` | no | The NAME of an env var on **this daemon's own process** holding a JSON object of header values — never a literal header value in the definition file itself. Resolved fresh at launch time (`resolveMcpServerHeaders`, `src/agents/workspace.ts`); missing/malformed resolves to "no extra headers" (logged once, value never logged). |
+| `channel` | yes | `true` adds `--dangerously-load-development-channels=server:<name>` for a **Claude** launch, alongside `server:butchr` — the same mechanism that already delivers butchr's own push notifications, so a non-Rocket.Chat MCP server (e.g. a MUD bridge) gets event-driven delivery with no polling substitute. `false` still reaches `mcp.json`/Codex's tool list (tools work) but is never added to the channel flag. |
+
+**Per-vendor reach, and the ONE case this manifest must never build (S4/PR
+#387's own hardened review finding, ported here verbatim):** a bound
+server's `headersEnvVar` value is resolved and written **ONLY** into a
+Claude workspace's `mcp.json` (chmod `0600` whenever it carries a resolved
+header — `buildWorkspace`). A **Codex** agent gets a bound server's TOOLS
+with **NO headers at all**, regardless of `headersEnvVar` — Codex's launch
+argv is a real process command line any other local user can read via
+`ps`/`/proc`, and Drovr renders a Codex header as literal argv text.
+**This is why BUTCHR-408's own Codex staged example (scenario (c)) never
+depends on an authenticated bound server** — an authenticated bridge is
+simply not usable from a Codex managed-session agent yet. The per-MCP
+"notification flag" the ticket's own text names is `channel`, exactly as
+S4 designed it; nothing else was added on top.
+
+Channel **delivery** to a non-Claude vendor (Codex push notifications) is
+still out of scope — see "Not in this version".
 
 ## Tier -> model mapping
 
@@ -257,6 +293,37 @@ the agent needing one extra `cd` step of its own at startup.
 **Absent** `spec.cwd` (every existing caller, and every provider besides
 managed sessions), behaviour is byte-for-byte unchanged throughout.
 
+## Nexus's MCP isolation constraint: every agent gets its OWN MCP config
+
+Non-negotiable constraint from Nexus (relayed on this story 2026-09-25T14:00Z):
+every managed-session agent gets its **own** MCP config; none may inherit a
+parent directory's `.mcp.json`. This is a happy accident of the "Why not a
+real process cwd" design above, not a separate mechanism bolted on: Claude
+Code auto-discovers a project-level `.mcp.json` (note the leading dot — a
+DIFFERENT file/mechanism than butchr's own explicit `--mcp-config` flag,
+which always points at `mcp.json`, no dot) from the launched **process's own
+OS `cwd`** at startup. Since that OS `cwd` is *always*
+`workspaceDirFor(spec.key)` — never `spec.workingDirectory` — for every
+managed-session agent, regardless of what the agent's kickoff later tells it
+to `cd` into, Claude Code's own project-config auto-discovery can never
+reach a `.mcp.json` sitting in the operator's real project directory: by the
+time the agent's shell runs `cd <workingDirectory>`, Claude Code has already
+started and read its config once, at the bookkeeping directory. A pre-existing
+`.mcp.json` in `workingDirectory` is read, verified, and left byte-identical
+in `test/unit/workspace.test.ts`'s "Nexus MCP isolation constraint" test —
+along with butchr's own per-agent `mcp.json` (no dot), which the agent's
+`--mcp-config` flag names explicitly and which contains ONLY butchr's own
+server plus this definition's own `mcpServers` bindings, never anything from
+`workingDirectory`.
+
+Credentials reach that per-agent `mcp.json` only via `headersEnvVar` (a NAME,
+resolved from the DAEMON's own environment — never a literal value in the
+definition file), and `mcp.json` itself lives under `BUTCHR_WORKSPACES`
+(default `~/butchr-workspaces` — `workspaceRoot()`, `src/agents/workspace.ts`),
+a directory outside this git repo entirely, never tracked or committed — a
+definition file under `sessionDefinitionsPath()` likewise never carries a
+credential value, only `headersEnvVar` names.
+
 ## Per-vendor launch differences
 
 `permissionMode` reaches a **Claude** launch's `ClaudeAgentLaunch.permissionMode`
@@ -271,8 +338,11 @@ permission wiring is out of scope for this ticket.
 
 ## Not in this version
 
-- **`mcpServers`/channel bindings** — deferred to S4 (BUTCHR-395/BUTCHR-411);
-  see "`mcpServers`/`channels`: deferred to S4" above.
+- **S4's own channel DELIVERY to a non-Claude vendor** (Codex push
+  notifications) — the `mcpServers`/`channel` FIELD and its Claude-side
+  wiring are real (see "`mcpServers`: additional MCP server bindings"
+  above); a Codex agent still only ever gets a bound server's tools, never
+  push, matching S4's own "Codex steering is a later story" scoping.
 - **The Rocket.Chat account lifecycle** (`account: "temporary"|"permanent"`)
   — accepted and stored, like every `Rule`'s own `account` field, but
   implements nothing; the account lifecycle itself is a later story for
@@ -284,8 +354,7 @@ permission wiring is out of scope for this ticket.
   matches (see "Eligible = valid, not frozen" above for why file-granularity
   swarm already satisfies the DoD's "one agent per eligible definition").
 - **The S5 migration** (converting the real 14 Bakr/Candlestix agents to
-  managed-session definitions) and **S4's own channel delivery** — both
-  explicitly out of scope per the ticket.
+  managed-session definitions) — explicitly out of scope per the ticket.
 - **No `fs.watch`/inotify** — polling only, same `filesystem`-provider
   precedent, same reasons (`docs/filesystem.md`'s own "Not in this
   version").

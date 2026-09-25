@@ -750,6 +750,56 @@ describe("staleIssues", () => {
     expect(await herd.staleIssues()).toEqual([]);
   });
 
+  test("BUTCHR-408: a managed-session agent's real bound channel server (persisted at build time, workspaceMcpServers) is honoured, not flagged stale for lacking a flag it never should have had in the first place", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Built via the SAME spawnArgs a real spawn (and staleIssues' own
+      // "expected" reconstruction) uses, so the channel-flag joining format
+      // is guaranteed consistent rather than hand-guessed here.
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", mcpServers }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("BUTCHR-408: a running agent missing its definition's bound channel flag IS flagged stale — proves workspaceMcpServers is actually consulted, not just harmlessly absent", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-drift-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Missing the server:mud-bridge channel flag the definition now calls for.
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("server:mud-bridge");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("no cwd reported for the agent -> unknown, not stale (never even calls pane.process_info)", async () => {
     const { client, calls } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }], { "w1:p1": ok([{ pid: 1, argv: ["claude", "--resume", "x"], name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);

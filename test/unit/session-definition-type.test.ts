@@ -167,6 +167,18 @@ describe("specForSessionDefinition", () => {
     expect(spec.permissionMode).toBe("auto");
     expect(spec.agents).toEqual([{ harness: "codex", model: "gpt-5.6-terra" }]);
     expect(spec.parent).toBeNull();
+    expect(spec.mcpServers).toBeUndefined();
+  });
+
+  test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+    const match: SessionDefinitionMatch = {
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"),
+      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, mcpServers },
+    };
+    expect(specForSessionDefinition(match).mcpServers).toEqual(mcpServers);
   });
 
   test("specForSessionDefinitionUnit dispatches resource units; a query-kind unit (never actually produced) throws rather than silently mis-spawning", () => {
@@ -379,7 +391,7 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     expect(stopped).toEqual([]);
   });
 
-  test("BUTCHR-408 staged scenarios: Baker directory agent, Candlestix Claude session, Candlestix Codex session, and a frozen non-Rocket.Chat-channel (mud-style) sentinel all validate and produce the expected spawn shape (mud player stays frozen — no agent)", async () => {
+  test("BUTCHR-408 staged scenarios (a-d): Baker directory agent, Candlestix Claude session, Candlestix Codex session, and a non-Rocket.Chat-channel-bound sentinel (mud-bridge director, real S4 McpServerBinding type) all validate and produce the expected spawn shape; a frozen mud player stays frozen — no agent", async () => {
     const files: Record<string, string> = {
       "/defs/baker-repo.json": JSON.stringify(goodDef({
         workingDirectory: "/repo/some-project", brief: "Keep this repo's docs current.", vendor: "claude", tier: "tier1", permissionMode: "default", role: "worker",
@@ -391,8 +403,17 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
       "/defs/candlestix-codex-agent.json": JSON.stringify(goodDef({
         workingDirectory: "/var/candlestix/codex-session", brief: "Codex channel agent.", vendor: "codex", tier: "tier1", permissionMode: "default", role: "worker",
       })),
-      // mud-bridge-bound player: real channel delivery is deferred to S4 (see session-definition.ts's mcpServers doc comment) — this
-      // definition intentionally carries NO mcpServers key yet, and is frozen (per BUTCHR-393: "10 MUD players ... frozen ... once unfrozen").
+      // (d) the mud DIRECTOR (distinct from the 10 frozen mud PLAYERS below): bound to the
+      // real, non-Rocket.Chat mud-bridge MCP server, channel:true, using the real
+      // McpServerBinding type/validator (ported from S4's BUTCHR-395 branch into
+      // src/rules/rules.ts). account:"none" — BUTCHR-411's own design point that a
+      // channel binding needs no Rocket.Chat account at all.
+      "/defs/candlestix-mud-director.json": JSON.stringify(goodDef({
+        workingDirectory: "/var/candlestix/mud", brief: "Direct the MUD channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
+        execution: "persistent", account: "none", role: "sentinel",
+        mcpServers: [{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }],
+      })),
+      // mud PLAYER: frozen (per BUTCHR-393: "10 MUD players ... frozen ... once unfrozen").
       "/defs/candlestix-mud-player-1.json": JSON.stringify(goodDef({
         workingDirectory: "/var/candlestix/mud/player-1", brief: "Play the MUD.", vendor: "claude", tier: "tier1", permissionMode: "default",
         execution: "persistent", account: "none", role: "sentinel", frozen: true,
@@ -410,7 +431,7 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     stop();
 
     const byResource = new Map(spawned.map((s) => [s.resource, s]));
-    expect(byResource.size).toBe(3); // the frozen mud player never spawns
+    expect(byResource.size).toBe(4); // the frozen mud player never spawns
     expect(byResource.has("/defs/candlestix-mud-player-1.json")).toBe(false);
     expect(logs.some((l) => l.includes("candlestix-mud-player-1.json") && l.includes("frozen"))).toBe(true);
 
@@ -426,5 +447,9 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     const codexAgent = byResource.get("/defs/candlestix-codex-agent.json")!;
     expect(codexAgent.cwd).toBe("/var/candlestix/codex-session");
     expect(codexAgent.agents).toEqual([{ harness: "codex", model: "gpt-5.6-luna" }]);
+
+    const mudDirector = byResource.get("/defs/candlestix-mud-director.json")!;
+    expect(mudDirector.cwd).toBe("/var/candlestix/mud");
+    expect(mudDirector.mcpServers).toEqual([{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }]);
   });
 });

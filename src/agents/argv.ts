@@ -67,6 +67,40 @@ export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string =>
 };
 
 /**
+ * `server:<name>` for every `spec.mcpServers` entry with `channel: true`
+ * (BUTCHR-408, type ported from S4's BUTCHR-395 branch — see
+ * `McpServerBinding`'s own doc comment, src/rules/rules.ts) — the same
+ * channel-naming convention `server:butchr` already uses. Order follows
+ * `spec.mcpServers`, so it's deterministic for argv comparison
+ * (`checkArgv`/`staleIssues`). Empty when `spec.mcpServers` is
+ * absent/empty — unaffected.
+ */
+const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).filter((s) => s.channel).map((s) => `server:${s.name}`);
+
+/**
+ * Codex `McpServerLaunchConfig` entries for `spec.mcpServers` — every
+ * binding, `channel` or not: Codex has no development-channel concept, so a
+ * bound server reaches Codex as MCP TOOLS only, never push.
+ *
+ * DELIBERATELY never `headers`, unlike `spec.externalMcpServers` above:
+ * Drovr renders a Codex `McpServerLaunchConfig`'s `headers` as `--config
+ * mcp_servers.<name>={ ..., http_headers = {...} }` — a real process
+ * command-line argument, visible to any other local user via `ps`/`/proc`,
+ * and also the exact text `staleIssues()`/`onRespawn` echo verbatim into
+ * `observedArgv` and the daemon journal (S4/PR #387 review finding, ported
+ * here with the type). `headersEnvVar` exists precisely so a header VALUE
+ * (often a bearer token) is never written anywhere that isn't the daemon's
+ * own process environment and the agent's own `mcp.json` (Claude only, see
+ * `buildWorkspace`'s 0600 handling) — Codex argv is exactly such an
+ * "anywhere else". A binding that names `headersEnvVar` simply connects
+ * Codex to the bound server with no extra headers; docs/managed-sessions.md
+ * says so loudly, and BUTCHR-408's own Codex example definition never
+ * depends on an authenticated bound server.
+ */
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
+  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
+
+/**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
  * arguments and returns the complete Herdr start contract. `dir` (the
  * bookkeeping directory, `buildWorkspace`'s return value) is ALWAYS the
@@ -107,7 +141,7 @@ export function agentLaunchConfig(
         name: "butchr",
         url: mcpUrl,
         headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
-      }, ...(spec.externalMcpServers ?? [])],
+      }, ...(spec.externalMcpServers ?? []), ...boundCodexServers(spec)],
       disabledMcpServers: agent.disabledMcpServers ?? [],
     };
   }
@@ -122,7 +156,7 @@ export function agentLaunchConfig(
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
-    developmentChannels: ["server:butchr"],
+    developmentChannels: ["server:butchr", ...boundChannels(spec)],
     ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
   };
 }

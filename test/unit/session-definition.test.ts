@@ -77,13 +77,26 @@ describe("sessionDefinitionProblems", () => {
     expect(parseSessionDefinition(good(), "def", HOME).frozen).toBe(false);
     expect(parseSessionDefinition({ ...good(), frozen: true }, "def", HOME).frozen).toBe(true);
   });
-  test("mcpServers/channels: a clear, specific deferred-field error, not a generic unknown-field one", () => {
-    const withMcp = sessionDefinitionProblems({ ...good(), mcpServers: [] }, "def");
-    expect(withMcp).toHaveLength(1);
-    expect(withMcp[0]).toContain("def.mcpServers is not supported yet");
-    expect(withMcp[0]).toContain("BUTCHR-395/BUTCHR-411");
-    const withChannels = sessionDefinitionProblems({ ...good(), channels: [] }, "def");
-    expect(withChannels[0]).toContain("def.channels is not supported yet");
+  test("mcpServers: reuses Rule's McpServerBinding/parseMcpServers verbatim (BUTCHR-408, ported from S4)", () => {
+    const binding = { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true };
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [binding] }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [] }, "def")[0]).toContain("def.mcpServers must be a non-empty array");
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...binding, name: "butchr" }] }, "def")[0]).toContain('reserved for butchr\'s own server');
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...binding, url: "not a url" }] }, "def")[0]).toContain("must be an absolute http(s) URL");
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...binding, channel: "yes" }] }, "def")[0]).toContain(".channel must be a boolean");
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [binding, binding] }, "def")[0]).toContain('is a duplicate');
+    const parsed = parseSessionDefinition({ ...good(), mcpServers: [binding] }, "def", HOME);
+    expect(parsed.mcpServers).toEqual([binding]);
+    expect(parseSessionDefinition(good(), "def", HOME).mcpServers).toBeUndefined();
+  });
+  test("mcpServers: headersEnvVar names the env var, never a literal header value — accepted, never resolved here", () => {
+    const withEnvVar = { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", headersEnvVar: "MUD_BRIDGE_HEADERS", channel: true };
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [withEnvVar] }, "def")).toEqual([]);
+    expect(parseSessionDefinition({ ...good(), mcpServers: [withEnvVar] }, "def", HOME).mcpServers).toEqual([withEnvVar]);
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...withEnvVar, headersEnvVar: "lower-case" }] }, "def")[0]).toContain(".headersEnvVar must be an env var name");
+  });
+  test("channels: not a real field — S4's shape folds the per-MCP notification flag into mcpServers[].channel, not a sibling field", () => {
+    expect(sessionDefinitionProblems({ ...good(), channels: [] }, "def")).toEqual(['def has unknown field "channels"']);
   });
   test("every problem is collected in one pass", () => {
     const problems = sessionDefinitionProblems({ workingDirectory: "", brief: "", vendor: "bogus", tier: "bogus", permissionMode: "bogus" }, "def");

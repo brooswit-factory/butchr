@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
@@ -367,7 +367,12 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // BUTCHR-408: mcpServers is read back the SAME way externalMcpServers
+      // (jira-project) is above — see workspaceMcpServers's own doc comment
+      // (src/agents/workspace.ts) for why staleIssues needs this at all
+      // (channel flags/Codex tool list are part of argv, unlike mcp.json's
+      // own contents, which argv comparison never sees).
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [], mcpServers: workspaceMcpServers(cwd) ?? [] } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
