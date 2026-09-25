@@ -92,6 +92,34 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
     expect(skipped).toEqual([oversized]);
   });
 
+  test("BUTCHR-455 review fix: a hidden (dotfile) basename is never a candidate, even with a perfectly valid, non-frozen manifest — never onOversized/onInvalid/onFrozen, never logged at all", async () => {
+    // Exactly the shape writeFileAtomic's own temp file takes (`.${uuid}.tmp`), and this ticket's own
+    // EXDEV unarchive fallback's temp file — see isHiddenDefinitionFile's own doc comment for why.
+    const { list, read } = fakeFiles({
+      "/defs/.abc123.tmp": JSON.stringify(goodDef()),
+      "/defs/good.json": JSON.stringify(goodDef()),
+    });
+    const oversized: string[] = [], invalid: string[] = [], frozen: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read },
+      (_r, p) => oversized.push(p),
+      (p) => invalid.push(p),
+      (p) => frozen.push(p),
+    );
+    expect(matches.map((m) => m.resource.path)).toEqual(["/defs/good.json"]);
+    expect(oversized).toEqual([]);
+    expect(invalid).toEqual([]);
+    expect(frozen).toEqual([]);
+  });
+
+  test("BUTCHR-455 review fix: a hidden basename with a FROZEN manifest is still never a candidate and never reported via onFrozen either", async () => {
+    const { list, read } = fakeFiles({ "/defs/.abc.tmp": JSON.stringify(goodDef({ frozen: true })) });
+    const frozen: string[] = [];
+    const matches = await searchSessionDefinitions({ rule, list, read }, undefined, undefined, (p) => frozen.push(p));
+    expect(matches).toEqual([]);
+    expect(frozen).toEqual([]);
+  });
+
   test("PR #394 review fix 3: a missing well-known directory (ENOENT) is 0 definitions, NEVER a poll error — reported via onMissingRoot, once", async () => {
     const missing: number[] = [];
     const list = async (): Promise<FilesystemResource[]> => { throw Object.assign(new Error("filesystem root /nope is not readable: ENOENT: no such file or directory, realpath '/nope'"), { code: "ENOENT" }); };

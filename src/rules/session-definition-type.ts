@@ -32,7 +32,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
-import { parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
+import { isHiddenDefinitionFile, parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
 import type { EventPoll, EventRules, PollSnapshot, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
 import { onceOversized } from "./filesystem-type.js";
@@ -162,6 +162,7 @@ export async function searchSessionDefinitions(
   for (const resource of resources) {
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
+    if (isHiddenDefinitionFile(resource.name)) continue; // BUTCHR-455 review fix: never a candidate, never logged — see isHiddenDefinitionFile's own doc comment.
     if (!isFilesystemResourceId(resource.path)) { onOversized?.(deps.rule, resource.path); continue; }
     let definition: SessionDefinition;
     try {
