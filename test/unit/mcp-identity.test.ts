@@ -18,10 +18,17 @@ describe("callerIdentity (BUTCHR-397: query-level keys)", () => {
       .toEqual({ provider: "zendesk-ticket", agent: "zendesk-ticket:support:acme%237", ruleId: "support", resource: "acme#7", ref: { subdomain: "acme", id: 7 } });
   });
 
-  test("a query-level agent key is refused (null), for every provider, whether or not x-issue is also sent", () => {
+  // BUTCHR-398: a query-level `x-butchr-agent` (a `singleton`/`persistent`
+  // rule's one agent) is now RECOGNISED — `{ provider, agent, ruleId, query:
+  // true }`, for every provider — never crashing on a missing `resourceId`
+  // and never silently misread as a per-resource caller. Refused (null)
+  // ONLY when it also carries `x-issue`: a query-level agent has no single
+  // ticket to name one for, the same double-identity refusal every
+  // `KEY_ONLY_PROVIDERS` branch already applies.
+  test("a query-level agent key resolves as its own CallerIdentity variant, for every provider; refused only alongside x-issue", () => {
     for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
       const agent = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
-      expect(callerIdentity({ "x-butchr-agent": agent })).toBeNull();
+      expect(callerIdentity({ "x-butchr-agent": agent })).toEqual({ provider: resourceProvider, agent, ruleId: "triage", query: true });
       expect(callerIdentity({ "x-issue": "BUTCHR-1", "x-butchr-agent": agent })).toBeNull();
     }
   });

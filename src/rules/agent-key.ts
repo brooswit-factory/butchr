@@ -112,11 +112,14 @@ export interface QueryAgentKeyParts { resourceProvider: ResourceProvider; ruleId
 const joinQueryKey = (p: QueryAgentKeyParts): string => [p.resourceProvider, p.ruleId, QUERY_AGENT_MARKER].map(encodeURIComponent).join(SEP);
 
 /**
- * Encodes a query-level agent key:
+ * Encodes a query-level agent key. The reserved marker is the literal
+ * `@query`, but — same percent-encoding discipline as `encodeAgentKey` — the
+ * `@` is escaped in the ACTUAL key string, so the real, produced form is
+ * `%40query`, never a bare `@query` (BUTCHR-398 review: earlier docs/comments
+ * in this codebase wrote the unescaped form, which an operator grepping a
+ * real journal line or workspace path for it would never find):
  *
- *   <resourceProvider>:<ruleId>:@query     e.g. jira-work:triage:@query
- *
- * Same validation and percent-encoding discipline as `encodeAgentKey`.
+ *   <resourceProvider>:<ruleId>:%40query   e.g. jira-work:triage:%40query
  */
 export function encodeQueryAgentKey(parts: QueryAgentKeyParts): string {
   if (!oneOf(RESOURCE_PROVIDERS, parts.resourceProvider)) throw new Error(`invalid resource provider: ${JSON.stringify(parts.resourceProvider)}`);

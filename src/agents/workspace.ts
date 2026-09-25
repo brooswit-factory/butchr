@@ -14,7 +14,7 @@ import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
-import { decodeAgentKey, decodeAnyAgentKey } from "../rules/agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import type { AgentPreference } from "../rules/rules.js";
 
 /**
@@ -127,7 +127,7 @@ export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join
 /**
  * Where an agent's workspace lives. A rule-engine agent key — per-resource
  * (`encodeAgentKey`) or query-level (`encodeQueryAgentKey`, BUTCHR-397) —
- * maps to `<root>/<provider>/<ruleId>/<resourceId-or-"@query">` (each
+ * maps to `<root>/<provider>/<ruleId>/<resourceId-or-"%40query">` (each
  * segment already URI-escaped by the key codec, so the key's `:`-joined
  * parts ARE the path segments). Anything else keeps the legacy `<root>/<id>`
  * layout. The two layouts cannot collide: a legacy directory is one level
@@ -176,6 +176,27 @@ export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root:
 export const resourceKeyOf = (id: string): string => decodeAgentKey(id)?.resourceId ?? id;
 
 /**
+ * BUTCHR-398 (review finding 1) — the resourceKeyOf hazard's sharpest miss:
+ * a caller that needs a REAL, single resource to write to or read from (a
+ * Jira comment, a Confluence page) must NEVER fall back to `resourceKeyOf`'s
+ * own whole-key fallback for a query-level id, the way `resourceKeyOf`
+ * itself does for a legacy/bare-issue id. A query-level agent has no single
+ * resource at all — that fallback would hand a caller its own bogus
+ * `<provider>:<ruleId>:%40query` key as if it were a real one, exactly the
+ * shape `speakOnOwnChannel`/`ops.addComment` cannot do anything useful with
+ * (a 404, silently logged, and the write — an escalation, in the one
+ * measured case — never reaches anyone). `null` here is the loud, honest
+ * answer: it routes a caller through whatever "I have no resource to write
+ * to" path it already has for an unowned/legacy id (e.g.
+ * `src/agents/escalation-loop.ts`'s own `issue === null` branch, which logs
+ * "cannot escalate" rather than attempting a write) — NEVER a silent 404.
+ * `id` here is expected to already be OWNED (e.g. `ownsRuleAgent(id)` true)
+ * — this function only ever narrows "owned" down to "owned AND has a single
+ * resource", never widens an unowned id into anything.
+ */
+export const singleResourceOf = (id: string): string | null => (decodeQueryAgentKey(id) ? null : resourceKeyOf(id));
+
+/**
  * Create the agent's workspace: CLAUDE.md (generic pointer, interpolated so
  * it can carry ground truth), brief.md (type-specific, interpolated),
  * mcp.json (connects back to butchr, identifying the issue), and
@@ -189,7 +210,18 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
-  if (provider === "agy") writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl }, null, 2));
+  if (provider === "agy") {
+    // BUTCHR-398: a query-level spec (no single resource, ANY provider) gets
+    // its OWN shape — `agent` alone, no `resource`/`issue` field at all, so
+    // `bridgeWorkspace` (src/mcp/workspace.ts) never hands a bogus key like
+    // `jira-work:triage:%40query` to any tool expecting a real resource id.
+    // Checked BEFORE `isKeyOnly`, which only ever answers for a per-resource
+    // spec of a key-only PROVIDER — a query-level jira-work spec is neither
+    // "resource" (no ticket) nor today's `isKeyOnly` shape (jira-work is not
+    // a key-only provider), so it needs this third branch.
+    const agyJson = isQuerySpec(spec) ? { agent: spec.key, mcpUrl } : isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl };
+    writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(agyJson, null, 2));
+  }
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
   writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
@@ -201,7 +233,18 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
 /** The first line of a rule-engine brief — the only place a rule workspace snapshots the ticket's summary. */
 export const ruleBriefHeader = (ruleId: string, resource: string, summary: string): string => `# ${ruleId} agent — ${resource}: ${summary}`;
 
-const providerOf = (spec: SpawnSpec) => decodeAgentKey(spec.key)?.resourceProvider;
+/**
+ * BUTCHR-398: `decodeAnyAgentKey`, not `decodeAgentKey` — a query-level
+ * spec's `key` (`<provider>:<ruleId>:%40query`) never decodes as a
+ * per-resource key by design (see `QUERY_AGENT_MARKER`'s own comment,
+ * src/rules/agent-key.ts), so the old per-resource-only decoder silently
+ * read every query-level spec as having NO provider at all — wrong for the
+ * TOOLS_NOTE lookup below and for `isKeyOnly` (a jira-work query agent
+ * legitimately has no `x-issue` to send either — see `mcpIdentityHeaders`).
+ */
+const providerOf = (spec: SpawnSpec) => decodeAnyAgentKey(spec.key)?.resourceProvider;
+/** A query-level spec (`singleton`/`persistent`, BUTCHR-398): no single resource, of ANY provider — see `mcpIdentityHeaders`/`buildWorkspace`'s own use. */
+const isQuerySpec = (spec: SpawnSpec): boolean => decodeQueryAgentKey(spec.key) !== null;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
 const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket"].includes(providerOf(spec) ?? "");
 
@@ -229,7 +272,7 @@ const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISS
 const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
   const note = TOOLS_NOTE[providerOf(spec) ?? ""];
   const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
-  return `${ruleBriefHeader(decodeAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
+  return `${ruleBriefHeader(decodeAnyAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
 };
 
 /**
@@ -238,8 +281,17 @@ const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
  * `x-butchr-agent` is added for rule-engine agents so events and own-write
  * echoes are scoped to the one agent, not every agent on the same ticket.
  * A `github-issue`, `jira-idea` or `zendesk-ticket` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
+ *
+ * BUTCHR-398: a query-level agent (`singleton`/`persistent`, ANY provider —
+ * checked BEFORE `isKeyOnly`) sends only `x-butchr-agent` too, for the same
+ * reason: it has no single resource, so `x-issue` would be
+ * `resourceOfSpec(spec)`'s own fallback — the raw `%40query`-suffixed agent
+ * key itself — which is exactly the bogus-issue-key hazard this ticket's
+ * `resourceKeyOf` audit exists to close, one layer earlier (never produced
+ * at all, rather than produced and then filtered downstream).
  */
 export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
+  if (isQuerySpec(spec)) return { "x-butchr-agent": spec.key };
   // A GitHub issue or Zendesk ticket is not a Jira key, and an idea is not a work item: such an agent is identified by key alone, so no Jira work tool can resolve it as a ticket.
   if (isKeyOnly(spec)) return { "x-butchr-agent": spec.key };
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };

@@ -7,19 +7,21 @@ import { KEY_ONLY_PROVIDERS } from "./identity.js";
  * The global registration is shared; identity is local to each MCP child.
  * Two workspace shapes are accepted: a legacy direct child of the root
  * (`<root>/<ISSUE>`, identity = the directory name) and a rule-engine
- * workspace (`<root>/<provider>/<rule>/<ISSUE-or-"@query">`), whose metadata
+ * workspace (`<root>/<provider>/<rule>/<ISSUE-or-"%40query">` — the real,
+ * percent-escaped directory name; see `encodeQueryAgentKey`'s own doc
+ * comment, src/rules/agent-key.ts), whose metadata
  * must also name the agent key the path encodes. A `github-issue`,
  * `jira-idea` or `zendesk-ticket` workspace's metadata names its agent and
  * resource instead of an `issue`, and the bridge sends the agent key alone
  * (src/mcp/identity.ts).
  *
  * `decodeAnyAgentKey` (BUTCHR-397) means a query-level workspace decodes
- * here too, so it is never misread as "not a factory workspace" — but this
- * bridge has no defined `.butchr-agy.json` shape for one yet (that is
- * BUTCHR-398's call, once it actually spawns one): `expectedIssue` is `null`
- * for a query-level agent, which the checks below compare against, so such a
- * workspace fails the same "Invalid factory workspace identity" checks a
- * forged file would rather than crashing or being silently accepted.
+ * here too, so it is never misread as "not a factory workspace". BUTCHR-398
+ * defines its `.butchr-agy.json` shape: `{ agent, mcpUrl }` alone — no
+ * `issue`/`resource` field at all (it has no single one — see
+ * `buildWorkspace`, src/agents/workspace.ts), checked BEFORE the
+ * `KEY_ONLY_PROVIDERS` branch since a query-level agent of ANY provider
+ * (jira-work included) uses this shape, not that one.
  */
 export function bridgeWorkspace(root: string, cwd: string): { url: URL; identity?: string; agent?: string } {
   const directory = realpathSync(cwd);
@@ -29,8 +31,15 @@ export function bridgeWorkspace(root: string, cwd: string): { url: URL; identity
   const agent = segments.length === 3 ? segments.join(":") : undefined;
   const decoded = agent === undefined ? null : decodeAnyAgentKey(agent);
   if (segments.length !== 1 && !decoded) throw new Error("Not a factory workspace");
-  const expectedIssue = decoded?.kind === "resource" ? decoded.resourceId : decoded ? null : segments[0];
   const value: unknown = JSON.parse(readFileSync(join(directory, ".butchr-agy.json"), "utf8"));
+  if (decoded?.kind === "query") {
+    if (!value || typeof value !== "object" || "issue" in value || "resource" in value
+      || !("agent" in value) || value.agent !== agent || !("mcpUrl" in value) || typeof value.mcpUrl !== "string") {
+      throw new Error("Invalid factory workspace identity");
+    }
+    return { url: endpoint(value.mcpUrl), agent: agent! };
+  }
+  const expectedIssue = decoded?.kind === "resource" ? decoded.resourceId : decoded ? null : segments[0];
   if (decoded && KEY_ONLY_PROVIDERS.includes(decoded.resourceProvider)) {
     if (!value || typeof value !== "object" || "issue" in value || !("agent" in value) || value.agent !== agent
       || !("resource" in value) || value.resource !== expectedIssue || !("mcpUrl" in value) || typeof value.mcpUrl !== "string") {

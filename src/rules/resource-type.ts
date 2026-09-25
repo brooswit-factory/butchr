@@ -22,6 +22,7 @@ import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../r
 import { jiraIssueClass } from "../resources/jira-idea.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
+import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
 
 export interface RuleMatch {
@@ -39,6 +40,17 @@ export interface RuleResourceDeps {
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   comments?: IssueResourceDeps["comments"];
   log?: (line: string) => void;
+  /**
+   * BUTCHR-398: this provider's own currently-running herd ids (already
+   * scoped — a caller passes `herd.runningIssues()` filtered by
+   * `ownsRuleAgent`), consulted once per poll purely to log a loud
+   * WARNING when a running agent's shape disagrees with its rule's CURRENT
+   * `execution` mode (`logExecutionModeSwitches`, src/rules/execution.ts) —
+   * never consulted for reconciliation itself (that stays the ordinary
+   * desired-vs-running diff in src/reconcile/plan.ts). Optional; omitted,
+   * no mode-switch logging runs (every existing caller/test).
+   */
+  runningIds?: () => Promise<readonly string[]>;
 }
 
 /**
@@ -162,7 +174,7 @@ export function relatedForRules(
     const provider = listener.rule.resourceProvider;
     return [{
       agentKey: `related:${provider}:${issue.key}`,
-      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none" },
+      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none", role: "worker" },
       issue,
     }];
   };
@@ -263,20 +275,55 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
 }
 
 /**
- * Event rules: the issue tier's full suppression stack, reused per RULE.
- * Each rule gets its own long-lived `createIssueEventRules` instance over just
- * that rule's matched issues, so every Jira-shaped decision (status, label,
- * comment, own-write echo) is made exactly as before, and the verdict for
- * issue K under rule R is delivered to agent `R:K` alone. The inner stack's
- * `watcher` is the issue key (its own-agent convention); `suppress` translates
- * it back to the agent key, so one agent's own write is swallowed for that
- * agent but still reaches a second agent on the same ticket.
- *
- * Related changes (a ticket heard by other rule agents, see `relatedForRules`) go
- * through one more instance of the same stack whose watchers ARE agent keys,
- * so a worker agent's own write still reaches its boss.
+ * BUTCHR-398: the SpawnSpec for a `singleton`/`persistent` rule's ONE
+ * query-level agent. No `resource` (there is no single ticket — see
+ * `SpawnSpec.resource`'s own doc comment) and no `parent` (a query agent has
+ * no single ticket to derive a boss from; its own boss routing, if any, is
+ * a later story's concern). `brief` is always the rule's own (never
+ * `briefFor(issuetype)` — see `buildWorkspace`, src/agents/workspace.ts), so
+ * `issuetype: "task"` here only selects model/effort.
  */
-export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): EventRules<RuleMatch> {
+export function specForRuleQuery(rule: Rule, agentKey: string): SpawnSpec {
+  return {
+    key: agentKey,
+    issuetype: "task",
+    summary: `${rule.id} (query agent — every ticket "${rule.query}" currently matches)`,
+    parent: null,
+    brief: rule.brief,
+    ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+  };
+}
+
+export const specForUnit = (u: ExecutionUnit<RuleMatch>): SpawnSpec => (u.kind === "resource" ? specForMatch(u.match) : specForRuleQuery(u.rule, u.agentKey));
+
+/**
+ * Event rules: the issue tier's full suppression stack, reused per RULE.
+ * Each SWARM rule gets its own long-lived `createIssueEventRules` instance
+ * over just that rule's matched issues (BUTCHR-398: now filtered to
+ * `"resource"`-kind primary units — see `resourceMatches` — so a
+ * `singleton`/`persistent` rule, which never produces one, is simply never
+ * iterated here; unchanged for every swarm rule), so every Jira-shaped
+ * decision (status, label, comment, own-write echo) is made exactly as
+ * before, and the verdict for issue K under rule R is delivered to agent
+ * `R:K` alone. The inner stack's `watcher` is the issue key (its own-agent
+ * convention); `suppress` translates it back to the agent key, so one
+ * agent's own write is swallowed for that agent but still reaches a second
+ * agent on the same ticket.
+ *
+ * Related changes go through one more instance of the same stack whose
+ * watchers ARE agent keys, so a worker agent's own write still reaches its
+ * boss. BUTCHR-398 widens what "related" carries: alongside the pre-existing
+ * Implements/Relates chain (`relatedForRules`, unchanged), it now also
+ * carries every `singleton`/`persistent` rule's own currently-matched
+ * tickets, watched by that rule's query agent (`scopeRelatedResources`,
+ * src/rules/execution.ts) — the mechanism that delivers scope-wide events
+ * (creates, status changes, comments) to the ONE query-level agent. Both
+ * sources are merged (`mergeRelated`) before reaching this function, so a
+ * ticket named by both (e.g. singleton-scoped AND a boss's implementer) is
+ * watched by the union of both watcher sets — this function does not need
+ * to know which source(s) contributed a given related entry.
+ */
+export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): EventRules<ExecutionUnit<RuleMatch>> {
   const inner = new Map<string, EventRules<JiraIssue>>();
   const innerFor = (rule: Rule): EventRules<JiraIssue> => {
     let rules = inner.get(rule.id);
@@ -296,11 +343,12 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.log ? { log: deps.log } : {}),
   });
-  const asIssues = (related: readonly RelatedResource<RuleMatch>[]) => related.map((r) => ({ issue: r.issue.issue, watchers: r.watchers }));
-  const issuesFor = (matches: readonly RuleMatch[], ruleId: string) => matches.filter((m) => m.rule.id === ruleId).map((m) => m.issue);
+  const asIssues = (related: readonly RelatedResource<ExecutionUnit<RuleMatch>>[]) =>
+    related.filter((r) => r.issue.kind === "resource").map((r) => ({ issue: (r.issue as { kind: "resource"; match: RuleMatch }).match.issue, watchers: r.watchers }));
+  const issuesFor = (units: readonly ExecutionUnit<RuleMatch>[], ruleId: string) => resourceMatches(units).filter((m) => m.rule.id === ruleId).map((m) => m.issue);
 
   return {
-    async poll(prev: PollSnapshot<RuleMatch>, next: PollSnapshot<RuleMatch>): Promise<EventPoll> {
+    async poll(prev: PollSnapshot<ExecutionUnit<RuleMatch>>, next: PollSnapshot<ExecutionUnit<RuleMatch>>): Promise<EventPoll> {
       const polls = new Map<string, EventPoll>();
       const changed: string[] = [];
       for (const rule of deps.rules) {
@@ -314,9 +362,12 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         }
       }
       // Related entries are one per ticket; the loop addresses them by agent key.
-      const relatedEntry = (key: string) => next.related.find((r) => r.issue.agentKey === key) ?? prev.related.find((r) => r.issue.agentKey === key);
-      const relatedIdOf = (issueKey: string) =>
-        (next.related.find((r) => r.issue.issue.key === issueKey) ?? prev.related.find((r) => r.issue.issue.key === issueKey))!.issue.agentKey;
+      const relatedEntry = (key: string) => next.related.find((r) => unitAgentKey(r.issue) === key) ?? prev.related.find((r) => unitAgentKey(r.issue) === key);
+      const relatedIdOf = (issueKey: string) => {
+        const entry = next.related.find((r) => r.issue.kind === "resource" && (r.issue as { kind: "resource"; match: RuleMatch }).match.issue.key === issueKey)
+          ?? prev.related.find((r) => r.issue.kind === "resource" && (r.issue as { kind: "resource"; match: RuleMatch }).match.issue.key === issueKey);
+        return unitAgentKey(entry!.issue);
+      };
       const relatedPoll = prev.related.length || next.related.length
         ? await relatedRules.poll({ primary: [], related: asIssues(prev.related) }, { primary: [], related: asIssues(next.related) })
         : null;
@@ -326,8 +377,8 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         async decide(key, watcher, space) {
           if (space === "related") {
             const entry = relatedEntry(key);
-            if (!relatedPoll || !entry?.watchers.includes(watcher)) return { deliver: false };
-            return relatedPoll.decide(entry.issue.issue.key, watcher, "related");
+            if (!relatedPoll || entry?.issue.kind !== "resource" || !entry.watchers.includes(watcher)) return { deliver: false };
+            return relatedPoll.decide(entry.issue.match.issue.key, watcher, "related");
           }
           const parts = decodeAgentKey(key);
           const poll = parts && polls.get(parts.ruleId);
@@ -339,15 +390,25 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
   };
 }
 
-export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<RuleMatch> {
+export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<ExecutionUnit<RuleMatch>> {
   // The loop calls `related` right after `search` in the same poll, so the
   // relationship walk reads this poll's matches with no second Jira call.
   let latest: RuleMatch[] = [];
   const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
   return {
     discovery: {
-      idOf: (m) => m.agentKey,
-      search: async () => (latest = await searchRules({ ...deps, excluded })),
+      idOf: unitAgentKey,
+      search: async () => {
+        latest = await searchRules({ ...deps, excluded });
+        // BUTCHR-398: rename-safety — a running agent whose SHAPE (per-
+        // resource vs. query-level) disagrees with its rule's CURRENT
+        // execution mode is a deliberate transition, logged loudly rather
+        // than silently retired/duplicated. See logExecutionModeSwitches's
+        // own doc comment (src/rules/execution.ts).
+        if (deps.runningIds) logExecutionModeSwitches("jira-work", deps.rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
+        const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "jira-work");
+        return groupExecutionUnits(enabled, latest);
+      },
       // BUTCHR-388: an `Implements` target this daemon's own rules do not
       // match is invisible to `search`, so a boss whose implementer is
       // staffed by the OTHER daemon would hear nothing — which is every
@@ -357,6 +418,13 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
       // ("watched regardless of assignee", src/resources/issue.ts).
       // A failed fetch degrades to the same-daemon set rather than throwing
       // the poll away, and says so — never silently.
+      //
+      // BUTCHR-398: merged with `scopeRelatedResources(latest)` — every
+      // `singleton`/`persistent` rule's own currently-matched tickets,
+      // watched by that rule's query agent — the Implements/Relates chain
+      // (`relatedForRules`) itself is UNCHANGED, still computed over the
+      // FULL `latest` (every enabled rule's matches, every execution mode)
+      // exactly as before this ticket.
       related: async (active) => {
         const all = foreignImplementerKeys(latest);
         const wanted = all.slice(0, FOREIGN_FETCH_LIMIT);
@@ -375,19 +443,25 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
             deps.log?.(`  WARNING: [related] cross-rule fetch failed for ${wanted.length} key(s), hearing same-rule tickets only this poll: ${(e as Error)?.message ?? e}`);
           }
         }
-        return relatedForRules(deps.rules, latest, active, foreign);
+        const crossRule = relatedForRules(deps.rules, latest, active, foreign);
+        const wrap = (rs: readonly RelatedResource<RuleMatch>[]): RelatedResource<ExecutionUnit<RuleMatch>>[] =>
+          rs.map((r) => ({ issue: { kind: "resource" as const, match: r.issue }, watchers: r.watchers }));
+        // BUTCHR-398: `scopeRelatedResources` already returns `"resource"`-kind
+        // wrapped entries — only `crossRule` (the pre-existing Implements/
+        // Relates output, still bare `RuleMatch`) needs wrapping here.
+        return mergeRelated((u) => (u.kind === "resource" ? u.match.issue.key : u.agentKey), wrap(crossRule), scopeRelatedResources(latest));
       },
     },
     activation: { verdictFor: () => "active" },
     eventRules: createRuleEventRules(deps),
-    spawnConfig: { specFor: specForMatch },
+    spawnConfig: { specFor: specForUnit },
   };
 }
 
-/** Each distinct Jira issue across `matches` once — for the label/detector layer, which works per ticket. */
-export function uniqueIssues(matches: readonly RuleMatch[]): JiraIssue[] {
+/** Each distinct Jira issue across `units`' `"resource"`-kind (swarm) matches once — for the label/detector layer, which works per ticket. A `singleton`/`persistent` rule's own query-level unit carries no single issue and is not represented here (BUTCHR-398): label sync, parked- and abandoned-worker detection stay per-resource concepts. */
+export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIssue[] {
   const byKey = new Map<string, JiraIssue>();
-  for (const m of matches) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);
+  for (const m of resourceMatches(units)) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);
   return [...byKey.values()];
 }
 

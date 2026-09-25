@@ -51,7 +51,7 @@ describe("loadRules", () => {
       expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [] });
       mkdirSync(join(dir, "butchr"));
       writeFileSync(join(dir, "butchr", "rules.json"), JSON.stringify({ rules: [minimal] }));
-      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none" } as never] });
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none", role: "worker" } as never] });
       expect(() => loadRules({ BUTCHR_RULES_FILE: dir })).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -73,16 +73,17 @@ describe("parseRules", () => {
     };
     const other = { ...minimal, id: "other" };
     expect(parseRules({ rules: [full, other] })).toEqual([
-      { ...full, query: "status = Open", execution: "swarm", account: "none", agentPreferences: [{ harness: "codex", model: "gpt-5", effort: "xhigh" }, { harness: "claude" }, { harness: "claude", model: "haiku" }] },
-      { ...other, enabled: true, execution: "swarm", account: "none" },
+      { ...full, query: "status = Open", execution: "swarm", account: "none", role: "worker", agentPreferences: [{ harness: "codex", model: "gpt-5", effort: "xhigh" }, { harness: "claude" }, { harness: "claude", model: "haiku" }] },
+      { ...other, enabled: true, execution: "swarm", account: "none", role: "worker" },
     ] as never);
   });
-  test("omitted optionals stay absent; enabled/execution/account default to true/swarm/none", () => {
+  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker", () => {
     const [r] = parseRules({ rules: [minimal] });
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
     expect(r!.enabled).toBe(true);
     expect(r!.execution).toBe("swarm");
     expect(r!.account).toBe("none");
+    expect(r!.role).toBe("worker");
   });
   test("rejects a non-document", () => {
     for (const doc of [null, [], {}, { rules: {} }]) expect(() => parseRules(doc)).toThrow('"rules" array');
@@ -92,7 +93,7 @@ describe("parseRules", () => {
     try {
       parseRules({ rules: [
         "nope",
-        { ...minimal, id: "Bad.Id", enabled: "yes", resourceProvider: "jira", query: " ", brief: 3, role: "task", extra: 1 },
+        { ...minimal, id: "Bad.Id", enabled: "yes", resourceProvider: "jira", query: " ", brief: 3, role: "manager", extra: 1 },
         { ...minimal, id: "prefs-bad", agentPreferences: [] },
         { ...minimal, id: "prefs-bad-2", agentPreferences: ["x", { harness: "gpt", model: "", effort: "extreme", provider: "claude" }, { harness: "claude" }, { harness: "claude" }] },
         { ...minimal, id: "rel-bad", relationships: "story" },
@@ -103,7 +104,7 @@ describe("parseRules", () => {
     } catch (e) { msg = (e as Error).message; }
     for (const part of [
       "rules[0] must be an object", "rules[1].id", "rules[1].enabled", "rules[1].resourceProvider", "rules[1].query", "rules[1].brief",
-      'rules[1] has unknown field "role"', 'rules[1] has unknown field "extra"',
+      "rules[1].role must be one of worker, sentinel", 'rules[1] has unknown field "extra"',
       "rules[2].agentPreferences must be a non-empty array",
       "rules[3].agentPreferences[0] must be an object", "rules[3].agentPreferences[1].harness", "rules[3].agentPreferences[1].model",
       "rules[3].agentPreferences[1].effort", 'rules[3].agentPreferences[1] has unknown field "provider"', "rules[3].agentPreferences[3] repeats",
@@ -171,15 +172,40 @@ describe("execution and account (BUTCHR-397)", () => {
     };
     const rules = parseRules(preChangeDoc);
     expect(rules).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR AND status = Open", brief: "Triage it.", execution: "swarm", account: "none" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR AND status = Open", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
       {
-        id: "epics", enabled: true, resourceProvider: "jira-work", query: "issuetype = Epic", brief: "@builtin:epic", execution: "swarm", account: "none",
+        id: "epics", enabled: true, resourceProvider: "jira-work", query: "issuetype = Epic", brief: "@builtin:epic", execution: "swarm", account: "none", role: "worker",
         agentPreferences: [{ harness: "claude", model: "opus" }], relationships: { childRule: "triage" },
       },
     ] as never);
     // The agent key a swarm rule's match produces is a pure function of (resourceProvider, ruleId, resourceId) —
     // execution/account are not inputs to encodeAgentKey at all, so today's keys cannot have moved (no migration, no workspace moves).
     for (const r of rules) expect(encodeAgentKey({ resourceProvider: r.resourceProvider, ruleId: r.id, resourceId: "BUTCHR-12" })).toBe(`${r.resourceProvider}:${r.id}:BUTCHR-12`);
+  });
+});
+
+describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)", () => {
+  test("defaults to worker when absent: today's behaviour, exactly", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r).toMatchObject({ role: "worker" });
+  });
+  test("both values are accepted for every provider, independent of execution and account", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+      for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
+        expect(r).toMatchObject({ resourceProvider, role, execution });
+      }
+    }
+  });
+  test("rejects a bad role value, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, role: "manager" }] }, "f.json")).toThrow("f.json: rules[0].role must be one of worker, sentinel");
+  });
+  test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
   });
 });
 

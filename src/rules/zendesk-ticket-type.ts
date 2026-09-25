@@ -14,8 +14,9 @@
 import type { SpawnSpec } from "../agents/workspace.js";
 import { loadZendeskAuth, scopedTicketQuery, type ZendeskAuthEnv, type ZendeskComment, type ZendeskTicket, type ZendeskTokenFileIo } from "../resources/zendesk-ticket.js";
 import { parseZendeskTicketRef, type ZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
-import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, ResourceType } from "../resources/types.js";
+import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
+import { diffMatches, groupExecutionUnits, logExecutionModeSwitches, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
 
 export interface ZendeskTicketMatch {
@@ -34,6 +35,8 @@ export interface ZendeskTicketResourceDeps {
   /** True when a change to `resource` (now at `updated`) is `watcher`'s own write — its own note — and not worth a nudge. */
   suppress?: (resource: string, updated: string, watcher: string) => boolean;
   log?: (line: string) => void;
+  /** BUTCHR-398: this provider's own running herd ids, for `logExecutionModeSwitches` — see `RuleResourceDeps.runningIds`'s own doc comment (src/rules/resource-type.ts). Optional; omitted, no mode-switch logging runs. */
+  runningIds?: () => Promise<readonly string[]>;
 }
 
 /** True for exactly the herd ids this type owns. */
@@ -67,13 +70,60 @@ export function specForZendeskTicket({ agentKey, rule, ticket }: ZendeskTicketMa
   };
 }
 
-/** The ticket fields whose change is worth telling an agent about. Comments are detected through `updated` (below). */
-const observed = (t: ZendeskTicket) => JSON.stringify([t.subject, t.status, t.priority, t.ticketType, t.tags]);
+/**
+ * BUTCHR-398: the SpawnSpec for a `singleton`/`persistent` rule's ONE
+ * query-level agent — no single ticket (`resource` omitted), so no Zendesk
+ * tool can be misled into resolving it as a ticket ref.
+ */
+export function specForZendeskTicketQuery(rule: Rule, agentKey: string): SpawnSpec {
+  return {
+    key: agentKey,
+    issuetype: "task",
+    summary: `${rule.id} (query agent — every ticket "${rule.query}" currently matches)`,
+    parent: null,
+    brief: rule.brief,
+    ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+  };
+}
+
+export const specForZendeskTicketUnit = (u: ExecutionUnit<ZendeskTicketMatch>): SpawnSpec =>
+  u.kind === "resource" ? specForZendeskTicket(u.match) : specForZendeskTicketQuery(u.rule, u.agentKey);
+
+/** The ticket fields whose change is worth telling an agent about, named. Comments are detected through `updated` (below) — deliberately excluded here so `decide()` can tell "a named field changed" apart from "only `updated` moved" (see `triggerObserved`). */
+const namedObserved = (t: ZendeskTicket) => JSON.stringify([t.subject, t.status, t.priority, t.ticketType, t.tags]);
+/** `diffMatches`' own trigger: a named field OR `updated` moving — the exact OR `namedObserved(from) !== namedObserved(to) || from.updated !== to.updated` had before this ticket, folded into one equality check by including `updated` in the tuple. */
+const triggerObserved = (m: ZendeskTicketMatch) => JSON.stringify([namedObserved(m.ticket), m.ticket.updated]);
+
+async function decideZendeskTicket(from: ZendeskTicket, to: ZendeskTicket, deps: Pick<ZendeskTicketResourceDeps, "comments" | "suppress" | "log">, watcher: string): Promise<EventVerdict> {
+  if (deps.suppress?.(to.ref, to.updated, watcher)) return { deliver: false };
+  if (from.status !== to.status) return { deliver: true, reason: { status: { from: from.status, to: to.status } } };
+  if (from.subject !== to.subject) return { deliver: true, reason: { summary: true } };
+  if (namedObserved(from) !== namedObserved(to)) return { deliver: true };
+  return newCommentVerdict(from, to, deps);
+}
+
+async function newCommentVerdict(from: ZendeskTicket, to: ZendeskTicket, deps: Pick<ZendeskTicketResourceDeps, "comments" | "log">): Promise<EventVerdict> {
+  const ref = parseZendeskTicketRef(to.ref);
+  if (!ref) return { deliver: false };
+  let newest: ZendeskComment | undefined;
+  try {
+    newest = (await deps.comments(ref)).at(-1);
+  } catch (e) {
+    deps.log?.(`WARNING: [zendesk-ticket] comments for ${to.ref} failed: ${(e as Error)?.message ?? e}`);
+    return { deliver: true, reason: { undetermined: "check-failed" } satisfies NotifyReason };
+  }
+  const since = Date.parse(from.updated);
+  const created = newest ? Date.parse(newest.created) : NaN;
+  return newest && Number.isFinite(since) && Number.isFinite(created) && created > since
+    ? { deliver: true, reason: { comment: newest.id } }
+    : { deliver: false };
+}
 
 /**
  * Change detection over (prev, next) matches, per agent key. A ticket
  * entering or leaving a rule's query is not a notification — the reconciler
- * spawns or stops its agent.
+ * spawns or stops its agent (swarm), or reports appear/disappear via the
+ * RELATED path below (`singleton`/`persistent`, BUTCHR-398).
  *
  * Zendesk's ticket carries no comment count, so a move in `updated` with no
  * observed field change reads the ticket's comments: a comment created after
@@ -82,56 +132,56 @@ const observed = (t: ZendeskTicket) => JSON.stringify([t.subject, t.status, t.pr
  *
  * Reason precedence: status, then subject, then any other observed field
  * (no reason), then a new comment (its id).
+ *
+ * BUTCHR-398: PRIMARY covers only `"resource"`-kind units (swarm, unchanged
+ * from before this ticket). RELATED covers every `singleton`/`persistent`
+ * rule's own currently-matched tickets, watcher = that rule's query agent
+ * key — the SAME diff logic, run over a different input list.
  */
-export function createZendeskTicketEventRules(deps: Pick<ZendeskTicketResourceDeps, "comments" | "suppress" | "log">): EventRules<ZendeskTicketMatch> {
+export function createZendeskTicketEventRules(deps: Pick<ZendeskTicketResourceDeps, "comments" | "suppress" | "log">): EventRules<ExecutionUnit<ZendeskTicketMatch>> {
   return {
-    async poll(prev: PollSnapshot<ZendeskTicketMatch>, next: PollSnapshot<ZendeskTicketMatch>): Promise<EventPoll> {
-      const before = new Map(prev.primary.map((m) => [m.agentKey, m.ticket]));
-      const pairs = new Map<string, { from: ZendeskTicket; to: ZendeskTicket }>();
-      for (const m of next.primary) {
-        const from = before.get(m.agentKey);
-        if (from && (observed(from) !== observed(m.ticket) || from.updated !== m.ticket.updated)) pairs.set(m.agentKey, { from, to: m.ticket });
-      }
+    async poll(prev: PollSnapshot<ExecutionUnit<ZendeskTicketMatch>>, next: PollSnapshot<ExecutionUnit<ZendeskTicketMatch>>): Promise<EventPoll> {
+      const primaryDiff = diffMatches(resourceMatches(prev.primary), resourceMatches(next.primary), triggerObserved);
+      const relatedOf = (related: readonly RelatedResource<ExecutionUnit<ZendeskTicketMatch>>[]) =>
+        related.map((r) => r.issue).filter((u): u is { kind: "resource"; match: ZendeskTicketMatch } => u.kind === "resource").map((u) => u.match);
+      const relatedDiff = diffMatches(relatedOf(prev.related), relatedOf(next.related), triggerObserved);
+      const relatedEntry = (key: string) =>
+        next.related.find((r) => unitAgentKey(r.issue) === key) ?? prev.related.find((r) => unitAgentKey(r.issue) === key);
       return {
-        changedPrimary: [...pairs.keys()],
-        changedRelated: [],
+        changedPrimary: primaryDiff.changed,
+        changedRelated: relatedDiff.changed,
         async decide(key, watcher, space): Promise<EventVerdict> {
-          const pair = pairs.get(key);
-          if (space !== "primary" || watcher !== key || !pair) return { deliver: false };
-          const { from, to } = pair;
-          if (deps.suppress?.(to.ref, to.updated, key)) return { deliver: false };
-          if (from.status !== to.status) return { deliver: true, reason: { status: { from: from.status, to: to.status } } };
-          if (from.subject !== to.subject) return { deliver: true, reason: { summary: true } };
-          if (observed(from) !== observed(to)) return { deliver: true };
-          return newCommentVerdict(from, to);
+          if (space === "primary") {
+            const pair = primaryDiff.pairFor(key);
+            if (watcher !== key || !pair) return { deliver: false };
+            return decideZendeskTicket(pair.from.ticket, pair.to.ticket, deps, key);
+          }
+          const pair = relatedDiff.pairFor(key);
+          const entry = relatedEntry(key);
+          if (!pair || !entry?.watchers.includes(watcher)) return { deliver: false };
+          return decideZendeskTicket(pair.from.ticket, pair.to.ticket, deps, key);
         },
       };
-      async function newCommentVerdict(from: ZendeskTicket, to: ZendeskTicket): Promise<EventVerdict> {
-        const ref = parseZendeskTicketRef(to.ref);
-        if (!ref) return { deliver: false };
-        let newest: ZendeskComment | undefined;
-        try {
-          newest = (await deps.comments(ref)).at(-1);
-        } catch (e) {
-          deps.log?.(`WARNING: [zendesk-ticket] comments for ${to.ref} failed: ${(e as Error)?.message ?? e}`);
-          return { deliver: true, reason: { undetermined: "check-failed" } satisfies NotifyReason };
-        }
-        const since = Date.parse(from.updated);
-        const created = newest ? Date.parse(newest.created) : NaN;
-        return newest && Number.isFinite(since) && Number.isFinite(created) && created > since
-          ? { deliver: true, reason: { comment: newest.id } }
-          : { deliver: false };
-      }
     },
   };
 }
 
-export function createZendeskTicketResourceType(deps: ZendeskTicketResourceDeps): ResourceType<ZendeskTicketMatch> {
+export function createZendeskTicketResourceType(deps: ZendeskTicketResourceDeps): ResourceType<ExecutionUnit<ZendeskTicketMatch>> {
+  let latest: ZendeskTicketMatch[] = [];
   return {
-    discovery: { idOf: (m) => m.agentKey, search: () => searchZendeskTicketRules(deps) },
+    discovery: {
+      idOf: unitAgentKey,
+      search: async () => {
+        latest = await searchZendeskTicketRules(deps);
+        if (deps.runningIds) logExecutionModeSwitches("zendesk-ticket", deps.rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
+        const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "zendesk-ticket");
+        return groupExecutionUnits(enabled, latest);
+      },
+      related: async () => scopeRelatedResources(latest),
+    },
     activation: { verdictFor: () => "active" },
     eventRules: createZendeskTicketEventRules(deps),
-    spawnConfig: { specFor: specForZendeskTicket },
+    spawnConfig: { specFor: specForZendeskTicketUnit },
   };
 }
 

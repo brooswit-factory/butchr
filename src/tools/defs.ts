@@ -271,7 +271,15 @@ export function atlassianTools(
         // Attribution is enforced HERE, not by agent etiquette: every comment an
         // agent posts is prefixed with its identity tag, so on a shared Jira
         // account a bare untagged comment is, by convention, the human.
-        const who = c.headers["x-issue"];
+        // BUTCHR-398 (review finding 2): a jira-work QUERY-LEVEL agent sends
+        // `x-butchr-agent` alone, never `x-issue` (mcpIdentityHeaders,
+        // src/agents/workspace.ts — it has no single ticket to name one
+        // for), so `x-issue` alone left it untagged — indistinguishable
+        // from a human's own comment by the exact convention this comment
+        // states. Fall back to the agent key, the same
+        // `x-butchr-agent ?? x-issue` precedence `audit()`'s own writer
+        // line and outcome.ts's caller field already use.
+        const who = c.headers["x-issue"] ?? c.headers["x-butchr-agent"];
         const tag = who ? `[${who}] ` : "";
         const body = tag && !text.startsWith(`[${who}]`) ? tag + text : text;
         return ops.addComment(key, body).then((r) => { noted(c, [key]); return r; });
