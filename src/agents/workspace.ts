@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -33,10 +33,35 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  /**
+   * Rocket.Chat connection material for THIS launch (BUTCHR-412/S4-follow-up)
+   * — set only by the reconcile-layer account hook (`src/agents/account-lifecycle.ts`),
+   * never by a `specFor*` function, and only after `ensureAccount` actually
+   * succeeded for this agent's rule policy. `buildWorkspace` below writes it
+   * to a dedicated 0600 file, never argv/mcp.json/logs — see
+   * `docs/rocketchat-accounts.md`'s "Wiring" section for why a file, not
+   * BUTCHR-411's `headersEnvVar` (that mechanism resolves one STATIC value
+   * per rule from the daemon's own env; this material is per-AGENT and
+   * rotates on every launch, which a static env var cannot express).
+   */
+  rocketchat?: { url: string; rcUserId: string; username: string; token: string };
 }
 
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
 export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
+
+/**
+ * BUTCHR-412: the one file `spec.rocketchat` connection material is ever
+ * written to — a regular file, 0600, inside the agent's OWN workspace
+ * directory (never argv, never a daemon log line, never brief.md/CLAUDE.md/
+ * mcp.json). Shape: `{ url, userId, authToken, username }` — RC's own
+ * `X-User-Id`/`X-Auth-Token` header pair (renamed from `rcUserId`/`token`
+ * here to match RC's own header names exactly, so a launcher can use the
+ * file's fields as those headers with no translation) plus `url` (where to
+ * send them) and `username` (for a human reading the file to recognise which
+ * managed account it is).
+ */
+export const RC_ACCOUNT_FILE = ".butchr-rocketchat.json";
 
 const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
 
@@ -227,6 +252,19 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
   if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) } } }, null, 2));
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
+  // BUTCHR-412: 0600 explicitly (not the default writeFileSync mode, which
+  // this workspace's other files get and which measures 664 under this
+  // daemon's usual umask) — a credential file, never group/other-readable.
+  // Removed (not left stale) when this launch has none: a rule's account
+  // policy can change to "none" between launches, or `ensureAccount` can
+  // refuse this launch entirely (see account-lifecycle.ts), and a
+  // previous launch's file must not linger looking current.
+  const rcAccountFile = join(dir, RC_ACCOUNT_FILE);
+  if (spec.rocketchat) {
+    writeFileSync(rcAccountFile, JSON.stringify({ url: spec.rocketchat.url, userId: spec.rocketchat.rcUserId, authToken: spec.rocketchat.token, username: spec.rocketchat.username }, null, 2), { mode: 0o600 });
+  } else {
+    try { unlinkSync(rcAccountFile); } catch { /* nothing to remove is the common, expected case */ }
+  }
   return dir;
 }
 

@@ -15,6 +15,7 @@
  * The GitHub loop's matches are read, never searched again here.
  */
 import type { Herd } from "../agents/herd.js";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import { jiraIdeaLinkedGithubNudge, jiraIdeaNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { JiraComment, JiraIssue } from "../atlassian/types.js";
@@ -54,6 +55,8 @@ export interface JiraIdeaLoopDeps {
   reserveAdmission?: (ids: readonly string[]) => void;
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment (src/daemon/loop.ts) — threaded straight through. Optional; omitted, no account lifecycle runs. */
+  account?: AccountLifecycleHooks;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -109,6 +112,7 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
+    ...(deps.account ? { account: deps.account } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? JIRA_IDEA_POLL_MS,
     onError: (e) => {

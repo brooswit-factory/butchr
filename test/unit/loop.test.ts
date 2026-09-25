@@ -152,6 +152,118 @@ describe("reconcileNow", () => {
   });
 });
 
+describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+
+  function fakeHerdCapturingSpecs(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []) {
+    const running = new Set(initial);
+    const spawnedSpecs: Array<{ key: string; rocketchat: unknown; origin: string | undefined }> = [];
+    const stopped: string[] = [];
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
+      async spawn(sp, origin) { spawnedSpecs.push({ key: sp.key, rocketchat: sp.rocketchat, origin }); running.add(sp.key); },
+      async stop(i) { stopped.push(i); running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    return { herd, running, spawnedSpecs, stopped };
+  }
+
+  test("ensure runs before spawn and the AUGMENTED spec (with connection material) is what herd.spawn actually receives", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const ensureCalledFor: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: {
+        ensure: async (s) => { ensureCalledFor.push(s.key); return { ...s, rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "tok" } }; },
+        release: async () => {},
+      },
+    });
+    expect(ensureCalledFor).toEqual(["NEW"]);
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "tok" }, origin: undefined }]);
+  });
+
+  test("ensure refusing (null) WITHHOLDS the spawn: herd.spawn is never called, and the id is excluded from onAdmitted's succeeded set", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const admitted: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: { ensure: async () => null, release: async () => {} },
+      onAdmitted: (succeeded) => admitted.push(...succeeded),
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(spawnedSpecs).toEqual([]);
+    expect(admitted).toEqual([]);
+    expect(failures).toEqual([{ id: "NEW", stage: "spawn", error: expect.any(Error) }]);
+  });
+
+  test("release is called for a genuine plan.stop id, AFTER herd.stop succeeds, with reason \"stop\"", async () => {
+    const { herd, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id, reason) => { released.push({ id, reason }); } },
+    });
+    expect(stopped).toEqual(["OLD"]);
+    expect(released).toEqual([{ id: "OLD", reason: "stop" }]);
+  });
+
+  test("release is never called when herd.stop itself throws — an agent that may still be running must not have its account released", async () => {
+    const herd: Herd = {
+      async runningIssues() { return ["OLD"]; },
+      async staleIssues() { return []; },
+      async spawn() {},
+      async stop() { throw new Error("herdr hiccup"); },
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id) => { released.push(id); } },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(released).toEqual([]);
+    expect(failures).toEqual([{ id: "OLD", stage: "stop", error: expect.any(Error) }]);
+  });
+
+  test("respawn: ensure runs BEFORE the interim stop, release(\"respawn\") is called (documented no-op), and the augmented spec is what gets respawned", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const calls: string[] = [];
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: {
+        ensure: async (s) => { calls.push("ensure"); return { ...s, rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "fresh-tok" } }; },
+        release: async (id, reason) => { calls.push("release"); released.push({ id, reason }); },
+      },
+    });
+    expect(calls).toEqual(["ensure", "release"]); // ensure resolves before the interim stop/release
+    expect(released).toEqual([{ id: "STALE", reason: "respawn" }]);
+    expect(stopped).toEqual(["STALE"]);
+    expect(spawnedSpecs).toEqual([{ key: "STALE", rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "fresh-tok" }, origin: "respawn" }]);
+  });
+
+  test("respawn: ensure refusing leaves the stale-but-working agent running rather than stopping it with no replacement", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: { ensure: async () => null, release: async (id) => { released.push(id); } },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(stopped).toEqual([]); // never stopped
+    expect(spawnedSpecs).toEqual([]); // never respawned
+    expect(released).toEqual([]); // release("respawn") never reached — ensure refused first
+    expect(failures).toEqual([{ id: "STALE", stage: "respawn", error: expect.any(Error) }]);
+  });
+
+  test("no account hooks at all: behaves exactly as before this ticket (every SpawnSpec reaches herd.spawn unchanged)", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]));
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchat: undefined, origin: undefined }]);
+    expect(stopped).toEqual(["OLD"]);
+  });
+});
+
 describe("reconcileNow storm guard (RespawnGuard)", () => {
   test("an issue that stays stale across many consecutive polls is respawned ONCE, then suppressed, with the WARNING logged and exactly ONE [butchr:respawn] notice for the window — then a NEW window opens once RESPAWN_SUPPRESS_POLLS have passed", async () => {
     // Same fake issue "stale" on every poll, forever — the shape a genuinely

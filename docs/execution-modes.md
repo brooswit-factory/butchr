@@ -50,15 +50,22 @@ providers (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`).
 
 Rocket.Chat account lifecycle for a rule's agent(s), independent of
 `execution`: `none` (nothing — today's behaviour, exactly), `temporary`, or
-`permanent`. **The lifecycle module itself now exists (BUTCHR-410, S4):** an
-RC REST client and an idempotent, race-safe account manager
+`permanent`. **The lifecycle module exists (BUTCHR-410, S4):** an RC REST
+client and an idempotent, race-safe account manager
 (`src/resources/rocketchat.ts`, `src/accounts/manager.ts`,
 `src/accounts/identity.ts`) implementing create-if-missing, unprovision, and
-a configurable guardrail below RC's 50-user allowance — see
-`docs/rocketchat-accounts.md` for the full contract. **Still not wired
-in:** nothing in the herd, the reconciler, or agent start/stop calls
-`ensureAccount`/`releaseAccount` yet — that wiring is a follow-up task. Until
-it lands, `account` is validated and stored only, exactly as before.
+a configurable guardrail below RC's 50-user allowance. **Wired into agent
+start/stop (BUTCHR-412, S4 follow-up):** `src/agents/account-lifecycle.ts`
+calls `ensureAccount`/`releaseAccount` from `reconcileNow`
+(`src/daemon/loop.ts`) at exactly the ids about to be spawned/stopped, for
+every rule loop and every execution mode alike — `execution` and `account`
+are genuinely independent axes; the account layer never inspects which
+execution mode produced an id. See `docs/rocketchat-accounts.md`'s "Wiring"
+section for the full design: which stop paths release a temporary account
+and which don't (respawn, daemon-restart and a session-limit close never
+do), how connection material reaches the agent (a 0600 file, never argv),
+and what happens when the RC user-cap guardrail refuses (the spawn is
+withheld, not degraded).
 
 ## The vendor selector: already there, not duplicated
 
