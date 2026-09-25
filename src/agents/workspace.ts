@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -15,7 +15,7 @@ import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentPreference } from "../rules/rules.js";
+import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 
 /**
  * `key` is the herd identity: a rule-engine agent key
@@ -23,7 +23,11 @@ import type { AgentPreference } from "../rules/rules.js";
  * legacy/test callers that predate rules — a bare resource key. The optional
  * fields are set only for rule-engine agents: `resource` is the Jira key the
  * agent works (what MCP tools see as `x-issue`), `brief` replaces the
- * issue-type brief, and `agents` is the rule's ranked harness preference.
+ * issue-type brief, `agents` is the rule's ranked harness preference, and
+ * `mcpServers` is the rule's additional MCP server bindings (BUTCHR-411,
+ * `Rule.mcpServers` — src/rules/rules.ts), each launched alongside butchr's
+ * own server and (for `channel: true` entries) added to Claude's development
+ * channels. Absent/empty means none — today's behaviour exactly.
  */
 export interface SpawnSpec {
   key: string;
@@ -33,6 +37,7 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  mcpServers?: readonly McpServerBinding[];
 }
 
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
@@ -225,7 +230,29 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
   writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) } } }, null, 2));
+  if (provider === "claude") {
+    // BUTCHR-411: bound servers land in mcp.json alongside butchr's own,
+    // `channel: true` or not — `mcp.json` is what gives Claude MCP TOOL
+    // access; the channel flag (agentLaunchConfig, argv.ts) is the separate,
+    // additive decision about PUSH notifications. No bindings -> byte-identical
+    // to before (Object.fromEntries([]) spreads nothing).
+    let hasSecretHeaders = false;
+    const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
+      const headers = resolveMcpServerHeaders(b);
+      if (headers) hasSecretHeaders = true;
+      return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
+    }));
+    const mcpJsonPath = join(dir, "mcp.json");
+    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...bound } }, null, 2));
+    // Review finding, PR #387: a bound server's header VALUE (often a bearer
+    // token) landed in a group/other-readable file at the default umask.
+    // `writeFileSync`'s own `mode` option only ever applies when it CREATES
+    // the file (a rebuilt workspace's mcp.json already exists), so this is
+    // an explicit chmod, not a write option — and only when this write
+    // actually carries a secret; a binding-less (or headers-less) mcp.json
+    // keeps its exact previous permissions, untouched.
+    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
+  }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -296,6 +323,41 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
   if (isKeyOnly(spec)) return { "x-butchr-agent": spec.key };
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }
+
+/**
+ * Header VALUES for a bound MCP server (BUTCHR-411), resolved from THIS
+ * DAEMON's own environment — never from the rules file, which only ever
+ * names the env var (`McpServerBinding.headersEnvVar`, src/rules/rules.ts).
+ * `env` defaults to `process.env` for every real caller; tests pass an
+ * explicit map instead of touching the process environment. Missing var,
+ * empty value, invalid JSON, or JSON that isn't a flat string-valued object
+ * all resolve to `undefined` (connect with no extra headers) rather than
+ * throwing — a malformed/unset secret must not crash workspace building or
+ * launch.
+ *
+ * Review finding, PR #387: a `headersEnvVar` that resolves to nothing used
+ * to fail this silently — for an authenticated bridge that is an agent that
+ * connects unauthenticated and only fails later, with nothing pointing back
+ * at the cause. `log` (default `console.error`, overridable for tests)
+ * prints exactly one line naming the BINDING and the ENV VAR — never the
+ * value, never the raw env content — whenever `headersEnvVar` was named but
+ * produced no usable headers.
+ */
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
+  if (!binding.headersEnvVar) return undefined;
+  const raw = env[binding.headersEnvVar];
+  const parsed = raw ? tryParseHeaders(raw) : undefined;
+  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+  return parsed;
+}
+
+const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
+  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
+  return undefined;
+};
 
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {

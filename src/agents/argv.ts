@@ -44,6 +44,40 @@ export function inventoryCodexMcp(
 export const kickoffFor = (provider: AgentProvider): string => provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
 
 /**
+ * `server:<name>` for every `spec.mcpServers` entry with `channel: true`
+ * (BUTCHR-411) — the same channel-naming convention `server:butchr` already
+ * uses. Order follows `spec.mcpServers`, so it's deterministic for argv
+ * comparison (`checkArgv`/`staleIssues`). Empty when `spec.mcpServers` is
+ * absent/empty — the pre-BUTCHR-411 shape, unaffected.
+ */
+const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).filter((s) => s.channel).map((s) => `server:${s.name}`);
+
+/**
+ * Codex `McpServerLaunchConfig` entries for `spec.mcpServers` (BUTCHR-411) —
+ * every binding, `channel` or not: Codex has no development-channel concept
+ * (BUTCHR-359, out of scope here), so a bound server reaches Codex as MCP
+ * TOOLS only, never push.
+ *
+ * DELIBERATELY never `headers` (review finding, PR #387): Drovr renders a
+ * Codex `McpServerLaunchConfig`'s `headers` as `--config mcp_servers.<name>=
+ * { ..., http_headers = {...} }` — a real process command-line argument,
+ * visible to any other local user via `ps`/`/proc`, and also the exact text
+ * `staleIssues()`/`onRespawn` echo verbatim into `observedArgv` and the
+ * daemon journal. `headersEnvVar` exists precisely so a header VALUE (often
+ * a bearer token) is never written anywhere that isn't the daemon's own
+ * process environment and the agent's own `mcp.json` (Claude only, see
+ * `buildWorkspace`'s 0600 handling) — Codex argv is exactly such an
+ * "anywhere else". A binding that names `headersEnvVar` simply connects
+ * Codex to the bound server with no extra headers; say so loudly in
+ * docs/mcp-server-bindings.md rather than silently, since an authenticated
+ * bridge then fails to authenticate (`resolveMcpServerHeaders` itself, used
+ * only by the Claude/`mcp.json` path below, already logs when a named var
+ * resolves to nothing).
+ */
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
+  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
+
+/**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
  * arguments and returns the complete Herdr start contract.
  */
@@ -74,11 +108,17 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-      mcpServers: [{
-        name: "butchr",
-        url: mcpUrl,
-        headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
-      }],
+      mcpServers: [
+        {
+          name: "butchr",
+          url: mcpUrl,
+          headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
+        },
+        // BUTCHR-411: a rule's bound servers give a Codex agent the same MCP
+        // TOOL access a Claude agent gets from mcp.json — never a channel
+        // (Codex push is BUTCHR-359, out of scope here).
+        ...boundCodexServers(spec),
+      ],
       disabledMcpServers: agent.disabledMcpServers ?? [],
     };
   }
@@ -92,7 +132,12 @@ export function agentLaunchConfig(
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
-    developmentChannels: ["server:butchr"],
+    // BUTCHR-411: `server:butchr` remains bound exactly as today, first;
+    // a rule's `channel: true` bindings are additive. Drovr emits each as
+    // its own `--dangerously-load-development-channels=server:x` flag (the
+    // variadic form this file's own doc comment below warns about), so
+    // multiple channel servers just work.
+    developmentChannels: ["server:butchr", ...boundChannels(spec)],
   };
 }
 

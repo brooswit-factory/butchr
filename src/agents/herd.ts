@@ -4,6 +4,7 @@ import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import type { McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -197,6 +198,21 @@ export class HerdrHerd implements Herd {
     private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareFactoryWorkspace,
     /** Monotonic readiness clock; paired with the injected wait in tests. */
     private readonly monotonicNow: () => number = () => performance.now(),
+    /**
+     * BUTCHR-411 — the design decision the ticket calls out by name: how
+     * `staleIssues()` sees a rule's MCP server bindings without HerdrHerd
+     * itself holding any rule state (it is one flat instance shared by every
+     * rule/provider — see src/daemon/index.ts). The caller resolves an
+     * issue id to its rule's current `mcpServers` (or `undefined`); this
+     * mirrors `roleOfAgent` in src/daemon/index.ts, the same
+     * decode-then-look-up-by-ruleId shape that field already uses for a
+     * different rule-level property. Optional and defaulting to "no
+     * bindings for anyone" is exactly what keeps a rule that never opts into
+     * `mcpServers` producing byte-identical expected argv to before this
+     * ticket — the deploy-day fleet-wide-respawn hazard the ticket's own
+     * survey flagged stays closed.
+     */
+    private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -358,7 +374,11 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // BUTCHR-411: the rule's own mcpServers, if this issue's rule binds any
+      // — see the constructor's own doc comment on mcpBindingsOf for why this
+      // lookup exists instead of caching the original spawn's SpawnSpec.
+      const mcpServers = this.mcpBindingsOf?.(issue);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId } : {}), ...(mcpServers ? { mcpServers } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }

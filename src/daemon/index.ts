@@ -130,6 +130,22 @@ const roleOfAgent = (id: string): AgentCapacityRole => {
   return rule?.role ?? "worker";
 };
 
+/**
+ * BUTCHR-411 — `HerdrHerd.staleIssues()`'s own `mcpBindingsOf` seam (see that
+ * constructor param's doc comment, src/agents/herd.ts): same
+ * decode-then-look-up-by-ruleId shape as `roleOfAgent` just above, for the
+ * SAME reason (HerdrHerd is one flat instance with no rule state of its
+ * own). `undefined` for anything unresolved — a legacy/bare-issue agent, or
+ * a rule since removed/disabled — means "no bindings", which is exactly
+ * today's argv; a rule that never sets `mcpServers` is unaffected.
+ */
+const mcpBindingsOf = (id: string) => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.mcpServers;
+};
+
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
 // runs and nothing is spawned for one (announced by startGithubIssueLoop).
@@ -182,7 +198,7 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf);
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH

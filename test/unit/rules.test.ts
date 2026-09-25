@@ -209,6 +209,79 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
 });
 
+describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a rule)", () => {
+  const mud = { name: "mud", type: "http", url: "https://mud.example/mcp", channel: true };
+
+  test("absent means none — existing rules load unchanged with no new field", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.mcpServers).toBeUndefined();
+    expect(Object.keys(r!)).not.toContain("mcpServers");
+  });
+
+  test("a bound server is accepted, normalised, and independent of execution/account — the Candlestix mud-bridge shape (account: none, no RC)", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, account: "none", mcpServers: [mud] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", channel: true }]);
+    expect(r!.account).toBe("none");
+  });
+
+  test("a channel: false binding is accepted the same way — tools yes, channel no", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, channel: false }] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", channel: false }]);
+  });
+
+  test("two channel servers on one rule both parse", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [mud, { name: "second", type: "http", url: "https://second.example/mcp", channel: true }] }] });
+    expect(r!.mcpServers).toHaveLength(2);
+  });
+
+  test("headersEnvVar names an env var; never a literal header value", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, headersEnvVar: " MUD_MCP_HEADERS " }] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", headersEnvVar: "MUD_MCP_HEADERS", channel: true }]);
+  });
+
+  test("an empty array is rejected the same way agentPreferences is", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [] }] }, "f.json")).toThrow("f.json: rules[0].mcpServers must be a non-empty array");
+  });
+
+  test("reports every malformed binding problem at once", () => {
+    let msg = "";
+    try {
+      parseRules({ rules: [{ ...minimal, mcpServers: [
+        "nope",
+        { name: "", type: "http", url: "not a url", channel: "yes" },
+        { name: "bad name!", type: "stdio", url: "ftp://x", channel: true, extra: 1 },
+        { name: "butchr", type: "http", url: "https://x", channel: true },
+        { name: "dup", type: "http", url: "https://x", channel: true },
+        { name: "dup", type: "http", url: "https://y", channel: false },
+        { name: "envbad", type: "http", url: "https://x", channel: true, headersEnvVar: "lower_case" },
+      ] }] }, "f.json");
+    } catch (e) { msg = (e as Error).message; }
+    for (const part of [
+      "rules[0].mcpServers[0] must be an object",
+      "rules[0].mcpServers[1].name must be a non-empty name",
+      "rules[0].mcpServers[1].url must be an absolute http(s) URL",
+      "rules[0].mcpServers[1].channel must be a boolean",
+      "rules[0].mcpServers[2].name must be a non-empty name",
+      "rules[0].mcpServers[2].type must be one of http",
+      "rules[0].mcpServers[2].url must be an absolute http(s) URL",
+      'rules[0].mcpServers[2] has unknown field "extra"',
+      'rules[0].mcpServers[3].name "butchr" is reserved',
+      'rules[0].mcpServers[5].name "dup" is a duplicate',
+      "rules[0].mcpServers[6].headersEnvVar must be an env var name",
+    ]) expect(msg).toContain(`f.json: ${part}`);
+  });
+
+  test("url must be absolute http(s) — a relative path or another scheme is rejected", () => {
+    for (const url of ["/relative", "ftp://x.example", "not-a-url", ""]) {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, url }] }] })).toThrow(".mcpServers[0].url must be an absolute http(s) URL");
+    }
+  });
+
+  test("mcpServers is rejected on the same terms as every other unknown-field-checked block", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, mcpServers: "nope" }] }, "f.json")).toThrow("f.json: rules[0].mcpServers must be a non-empty array");
+  });
+});
+
 describe("agent keys", () => {
   const parts = { resourceProvider: "jira-work" as const, ruleId: "triage", resourceId: "BUTCHR-12" };
   test("encodes provider, rule id and native resource id as separate components, and round-trips", () => {
