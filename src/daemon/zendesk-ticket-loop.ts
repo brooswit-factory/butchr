@@ -56,12 +56,17 @@ export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
     comments: (ref) => deps.client.comments(ref),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
     log: deps.log,
+    runningIds: async () => (await deps.herd.runningIssues()).filter(ownsZendeskTicketAgent),
   });
   return runResourceLoop(type, {
     herd: deps.herd,
     ownsId: ownsZendeskTicketAgent,
-    notify: async (agent: string, _about: string, reason?: NotifyReason) => {
-      const resource = resourceKeyOf(agent);
+    // BUTCHR-398: `about`, not `resourceKeyOf(agent)` unconditionally — see
+    // github-issue-loop.ts's own `notify` comment for why (a `singleton`/
+    // `persistent` rule's own scope entry names a DIFFERENT ticket than the
+    // query agent's own key).
+    notify: async (agent: string, about: string, reason?: NotifyReason) => {
+      const resource = resourceKeyOf(about === agent ? agent : about);
       await deps.deliver(agent, resource, zendeskTicketNudge(resource, reason));
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),

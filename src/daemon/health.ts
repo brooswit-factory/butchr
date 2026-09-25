@@ -128,6 +128,15 @@ export interface HealthStatus {
    * finding real gaps once something (e.g. cross-daemon observer rules)
    * lets a rule set carry a reference `parseRules` doesn't reject.
    *
+   * A `childRule` entry here is a documentation/validation gap only, never a
+   * routing one: PR #372 (BUTCHR-388, already in main) dropped the
+   * `childRule` gate on `Implements` routing, so today `childRule` guards no
+   * live routing edge — a boss hears its implementer on the `Implements`
+   * link alone, with no rules-file wiring. `inwardConnectionRules` is the
+   * field that still matters for routing: it gates the live `Relates` edge
+   * (`relatedForRules` in src/rules/resource-type.ts), so a dangling
+   * `inwardConnectionRules` entry here does mean a broken connection.
+   *
    * ABSENT (no key at all), never an empty array, when there is nothing
    * unresolved — the same "absent means nothing to report" convention
    * `disabledReason` above already uses, chosen so a consumer can branch on

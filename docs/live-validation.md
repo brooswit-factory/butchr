@@ -95,6 +95,11 @@ Startup log:
   for any rules file that loaded at all: a `childRule`/`inwardConnectionRules`
   naming an id missing from the same file is a startup load error, not a
   health-field case (see `unresolvedRelationships` in `src/rules/rules.ts`).
+  This is an existence-only safety net, independent of routing: `childRule`
+  itself gates no live routing edge today (`Implements` routing runs on the
+  link alone, per #372/`BUTCHR-388`), so this signal is not evidence that any
+  `Implements`/`Relates` handoff is working — check the agents/side-effects
+  section below for that.
 
 Agents and side effects:
 
