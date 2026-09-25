@@ -96,7 +96,7 @@ const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   "confluence-page": { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  filesystem: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
 };
 

@@ -40,8 +40,8 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
     expect(capabilitiesOf(REF_OF["zendesk-ticket"])).toEqual(["query", "read", "comments"]);
   });
-  test("filesystem: links only — no read/stat/watch code anywhere", () => {
-    expect(capabilitiesOf(REF_OF.filesystem)).toEqual(["links"]);
+  test("filesystem: query and links (BUTCHR-407: listFilesystemResources is a real, generic query entry point) — no read/stat-content or snapshot capability wired for a zero-provider-knowledge caller", () => {
+    expect(capabilitiesOf(REF_OF.filesystem)).toEqual(["query", "links"]);
   });
   test("webpage: links only — no fetch/read code anywhere", () => {
     expect(capabilitiesOf(REF_OF.webpage)).toEqual(["links"]);
@@ -68,7 +68,7 @@ const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typ
   "confluence-page": { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  filesystem: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
 };
 
