@@ -93,7 +93,7 @@ const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },

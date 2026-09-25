@@ -71,9 +71,30 @@ const IDEA_REF: CapabilityRef = { provider: "jira-idea", key: "IDEA-1" };
 const GITHUB_REF: CapabilityRef = { provider: "github-issue", owner: "brooswit-factory", repo: "butchr", number: 7 };
 const ZENDESK_REF: CapabilityRef = { provider: "zendesk-ticket", subdomain: "acme", id: 42 };
 
+function fakeConfluenceClient(
+  results: Array<{ id: string; body: string; author?: string; created?: string }>,
+  commentOnPageResult: unknown = { id: "930" },
+) {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  return {
+    calls,
+    client: {
+      async getPageComments(pageId: string) {
+        calls.push({ method: "getPageComments", args: [pageId] });
+        return { results };
+      },
+      async commentOnPage(pageId: string, body: string) {
+        calls.push({ method: "commentOnPage", args: [pageId, body] });
+        return commentOnPageResult;
+      },
+    },
+  };
+}
+
+const CONFLUENCE_REF: CapabilityRef = { provider: "confluence-page", pageId: "123456" };
+
 const UNSUPPORTED_REFS: CapabilityRef[] = [
   { provider: "jira-project", key: "BUTCHR" },
-  { provider: "confluence-page", pageId: "123456" },
   { provider: "filesystem", path: "/srv/factory/butchr" },
   { provider: "webpage", url: "https://example.com/resource" },
 ];
@@ -193,10 +214,97 @@ describe("readComments/addComment: zendesk-ticket reuses ZendeskTicketClient.com
   });
 });
 
+describe("readComments/addComment: confluence-page reuses AtlassianOps.getPageComments/commentOnPage (FACTORY-29/31) — footer comments only", () => {
+  test("readComments maps AtlassianOps.getPageComments' fields onto the canonical Comment shape, body left as storage-format XHTML", async () => {
+    const raw = [{ id: "40", body: "<p>hi</p>", author: "abc123", created: "2026-09-01T00:00:00.000Z" }];
+    const { client, calls } = fakeConfluenceClient(raw);
+    const result = await readComments({ "confluence-page": client }, CONFLUENCE_REF);
+    expect(result).toEqual([{ id: "40", author: "abc123", timestamp: "2026-09-01T00:00:00.000Z", body: "<p>hi</p>" }]);
+    expect(calls).toEqual([{ method: "getPageComments", args: ["123456"] }]);
+  });
+
+  test("a comment with no author/created maps author to null and timestamp to an empty string, never fabricated", async () => {
+    const raw = [{ id: "41", body: "<p>no metadata</p>" }];
+    const { client } = fakeConfluenceClient(raw);
+    const result = await readComments({ "confluence-page": client }, CONFLUENCE_REF);
+    expect(result).toEqual([{ id: "41", author: null, timestamp: "", body: "<p>no metadata</p>" }]);
+  });
+
+  test("readComments sorts oldest-first even when getPageComments returns newest-first (no server-side sort is ever requested)", async () => {
+    const raw = [
+      { id: "50", body: "third", created: "2026-09-03T00:00:00.000Z" },
+      { id: "51", body: "first", created: "2026-09-01T00:00:00.000Z" },
+      { id: "52", body: "second", created: "2026-09-02T00:00:00.000Z" },
+    ];
+    const { client } = fakeConfluenceClient(raw);
+    const result = await readComments({ "confluence-page": client }, CONFLUENCE_REF);
+    expect(result.map((c) => c.id)).toEqual(["51", "52", "50"]);
+  });
+
+  test("comments missing `created` sort after every dated comment, keeping their own relative order (stable sort)", async () => {
+    const raw = [
+      { id: "60", body: "undated A" },
+      { id: "61", body: "dated", created: "2026-09-02T00:00:00.000Z" },
+      { id: "62", body: "undated B" },
+    ];
+    const { client } = fakeConfluenceClient(raw);
+    const result = await readComments({ "confluence-page": client }, CONFLUENCE_REF);
+    expect(result.map((c) => c.id)).toEqual(["61", "60", "62"]);
+  });
+
+  test("pagination is AtlassianOps.getPageComments' own job — not re-tested here — but a thrown read propagates as a rejection, never a partial list", async () => {
+    const client = {
+      getPageComments: async () => { throw new Error("getPageComments(123456): exceeded 100 pages without the cursor running out"); },
+      commentOnPage: async () => { throw new Error("unreached"); },
+    };
+    await expect(readComments({ "confluence-page": client }, CONFLUENCE_REF)).rejects.toThrow("exceeded 100 pages");
+  });
+
+  test("addComment converts a plain sentence into a single <p> paragraph, HTML-escaping nothing that needs no escaping", async () => {
+    const { client, calls } = fakeConfluenceClient([]);
+    await addComment({ "confluence-page": client }, CONFLUENCE_REF, "Hello world");
+    expect(calls).toEqual([{ method: "commentOnPage", args: ["123456", "<p>Hello world</p>"] }]);
+  });
+
+  test("addComment HTML-escapes & < > \" ' so a caller passing them never posts malformed/misrendered storage XHTML", async () => {
+    const { client, calls } = fakeConfluenceClient([]);
+    await addComment({ "confluence-page": client }, CONFLUENCE_REF, `a < b & c > "d" 'e'`);
+    expect(calls).toEqual([{ method: "commentOnPage", args: ["123456", "<p>a &lt; b &amp; c &gt; &quot;d&quot; &#39;e&#39;</p>"] }]);
+  });
+
+  test("addComment turns each blank-line-separated paragraph into its own <p>, and a single newline within a paragraph into <br/>", async () => {
+    const { client, calls } = fakeConfluenceClient([]);
+    await addComment({ "confluence-page": client }, CONFLUENCE_REF, "First para line one\nFirst para line two\n\nSecond para");
+    expect(calls).toEqual([{ method: "commentOnPage", args: ["123456", "<p>First para line one<br/>First para line two</p><p>Second para</p>"] }]);
+  });
+
+  test("addComment posts through commentOnPage and returns a CommentRef when the response carries a usable id", async () => {
+    const { client } = fakeConfluenceClient([], { id: "930" });
+    expect(await addComment({ "confluence-page": client }, CONFLUENCE_REF, "looks good")).toEqual({ id: "930" });
+  });
+
+  test("a missing/unusable id from commentOnPage is a rejection, never a faked CommentRef — and says the comment WAS posted, so a caller must not retry", async () => {
+    const { client } = fakeConfluenceClient([], {});
+    await expect(addComment({ "confluence-page": client }, CONFLUENCE_REF, "x")).rejects.toThrow("WAS posted, but its id could not be confirmed");
+    await expect(addComment({ "confluence-page": client }, CONFLUENCE_REF, "x")).rejects.toThrow("do not retry");
+  });
+
+  test("a null/non-object commentOnPage response is also treated as a missing id, not a crash", async () => {
+    const { client } = fakeConfluenceClient([], null);
+    await expect(addComment({ "confluence-page": client }, CONFLUENCE_REF, "x")).rejects.toThrow("WAS posted, but its id could not be confirmed");
+  });
+
+  test("a client rejection (e.g. an invalid page id) propagates", async () => {
+    const client = { getPageComments: async () => ({ results: [] }), commentOnPage: async () => { throw new Error("Atlassian 404 on page 123456"); } };
+    await expect(addComment({ "confluence-page": client }, CONFLUENCE_REF, "x")).rejects.toThrow("Atlassian 404");
+  });
+});
+
 describe("a capability declared supported but given no matching client in the bag fails loudly, not silently", () => {
   test("readComments/addComment throw a plain Error (not UnsupportedCapabilityError) naming the missing provider", async () => {
     await expect(readComments({}, WORK_REF)).rejects.toThrow("no jira-work-item client");
     await expect(addComment({}, IDEA_REF, "x")).rejects.toThrow("no jira-idea client");
+    await expect(readComments({}, CONFLUENCE_REF)).rejects.toThrow("no confluence-page client");
     const err = await readComments({}, GITHUB_REF).catch((e) => e);
     expect(err).not.toBeInstanceOf(UnsupportedCapabilityError);
   });
