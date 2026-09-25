@@ -12,6 +12,7 @@ import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
 import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
 import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
+import { ownsFilesystemAgent } from "../../src/rules/filesystem-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
 
@@ -195,7 +196,7 @@ describe("execution and account (BUTCHR-397)", () => {
   test("every valid value is accepted for every provider — the two fields are provider-generic", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       for (const execution of EXECUTION_MODES) for (const account of ACCOUNT_POLICIES) {
-        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : minimal.query;
+        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, execution, account }] });
         expect(r).toMatchObject({ resourceProvider, execution, account });
       }
@@ -249,7 +250,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
   test("both values are accepted for every provider, independent of execution and account", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
       for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
         expect(r).toMatchObject({ resourceProvider, role, execution });
@@ -429,7 +430,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -454,5 +455,6 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "github-issue": return "owner/repo#12";
     case "zendesk-ticket": return "acme#12";
     case "jira-project": return "BUTCHR";
+    case "filesystem": return "/tmp/example.txt";
   }
 }

@@ -262,7 +262,7 @@ const providerOf = (spec: SpawnSpec) => decodeAnyAgentKey(spec.key)?.resourcePro
 /** A query-level spec (`singleton`/`persistent`, BUTCHR-398): no single resource, of ANY provider — see `mcpIdentityHeaders`/`buildWorkspace`'s own use. */
 const isQuerySpec = (spec: SpawnSpec): boolean => decodeQueryAgentKey(spec.key) !== null;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project"].includes(providerOf(spec) ?? "");
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
@@ -276,7 +276,11 @@ export const JIRA_IDEA_TOOLS_NOTE =
 export const ZENDESK_TICKET_TOOLS_NOTE =
   "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
 
-const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE };
+/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. */
+export const FILESYSTEM_TOOLS_NOTE =
+  "Your resource is a file or directory on disk, not a Jira ticket. Read and edit it directly with your own file tools — there is no butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. You are told when it changes (created, modified, or removed) — re-read it from disk then.";
+
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 
 /**
  * A rule-engine brief: the rule's own text under a header naming the ticket.
