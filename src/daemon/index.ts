@@ -76,6 +76,8 @@ import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
 import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
+import { createRoutingLinkStore } from "../resources/link-store-router.js";
+import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -483,10 +485,17 @@ const { app, mcp } = buildApp({
 }, {
   // Jira/Confluence tools refuse github-issue, jira-idea and zendesk-ticket agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
-  // FACTORY-7: registered unconditionally, unlike every provider-specific
-  // tool set below it — the local link store needs no credentials and works
-  // for every ResourceRef kind, so there is no configuration gate to apply.
-  ...resourceLinkTools(createLinkStore(defaultLinksStorePath()), (line) => console.error(line)),
+  // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
+  // provider-specific tool set below it — the local file store needs no
+  // credentials and works for every ResourceRef kind, and a `jira-project`
+  // owner routes to the project-property-backed store instead (this daemon
+  // already has Jira credentials loaded, unlike the CLI, so the factory
+  // below is cheap and side-effect-free rather than genuinely lazy) — see
+  // `src/resources/link-store-router.ts` for the routing decision itself.
+  ...resourceLinkTools(
+    createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: () => createJiraProjectLinkStore(ops) }),
+    (line) => console.error(line),
+  ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
