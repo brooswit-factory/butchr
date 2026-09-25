@@ -21,7 +21,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
 import { jiraIssueClass } from "../resources/jira-idea.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
 
@@ -136,6 +136,23 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
  * identity here and neither hears nor is heard. Only agents in `active`
  * watch.
  *
+ * BUTCHR-406 fix: "the agent in `active`" is not always `listener.agentKey`.
+ * `matches` (and so `byIssue`) always carries the bare PER-RESOURCE agent key
+ * (`encodeAgentKey`, from `searchRules`) regardless of the rule's `execution`
+ * — but for a `singleton`/`persistent` rule, the thing actually running (and
+ * so the id `active` actually contains, per `groupExecutionUnits`/
+ * `unitAgentKey`) is the QUERY-level key (`encodeQueryAgentKey`) for the
+ * whole rule, never a per-resource key. Before this fix, a singleton/
+ * persistent listener's bare key was NEVER in `active`, so `implementsEdge`/
+ * `relatesEdge` silently dropped every edge addressed to it — the boss was
+ * never notified (see the BUTCHR-406 regression test, red on unmodified
+ * main for exactly this). `liveAgentKeyFor` below names the key that is
+ * ACTUALLY running for a given match's rule; a listener is active when
+ * EITHER form is present (byte-identical to before for `swarm`, where the
+ * two forms coincide), and it is the LIVE key — not the bare one — that gets
+ * recorded as the watcher, so `notify` addresses the agent that actually
+ * exists rather than a phantom per-resource id nothing will ever spawn.
+ *
  * One entry per heard TICKET, however many rules or links connect it, so a
  * listener hears one change once. Its id is the smallest contributing agent
  * key — any stable member works, since routing reads the ticket, not the rule.
@@ -152,6 +169,12 @@ export function relatedForRules(
   const byId = new Map(rules.map((r) => [r.id, r]));
   const hearsInward = (listener: Rule, source: Rule) =>
     byId.get(listener.id)?.relationships?.inwardConnectionRules?.includes(source.id) ?? false;
+  // BUTCHR-406: the key the listener's rule ACTUALLY runs under — its own
+  // per-resource key for `swarm` (identical to `m.agentKey`, so this changes
+  // nothing for the pre-existing, all-swarm behaviour), or its rule's single
+  // query-level key for `singleton`/`persistent`.
+  const liveAgentKeyFor = (m: RuleMatch): string =>
+    m.rule.execution === "swarm" ? m.agentKey : encodeQueryAgentKey({ resourceProvider: m.rule.resourceProvider, ruleId: m.rule.id });
   const byIssue = new Map<string, RuleMatch[]>();
   for (const m of matches) byIssue.set(m.issue.key, [...(byIssue.get(m.issue.key) ?? []), m]);
   const foreignByKey = new Map(foreign.map((i) => [i.key, i]));
@@ -179,11 +202,14 @@ export function relatedForRules(
     }];
   };
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
-  const record = (sourceKey: string, listener: RuleMatch, source: RuleMatch) => {
+  // BUTCHR-406: takes the WATCHER'S KEY directly (already resolved to the
+  // live agent key by the caller), not a `RuleMatch` — `record` no longer
+  // decides which key names the listener, `implementsEdge`/`relatesEdge` do.
+  const record = (sourceKey: string, watcherKey: string, source: RuleMatch) => {
     const e = out.get(sourceKey);
-    if (!e) out.set(sourceKey, { issue: source, watchers: new Set([listener.agentKey]) });
+    if (!e) out.set(sourceKey, { issue: source, watchers: new Set([watcherKey]) });
     else {
-      e.watchers.add(listener.agentKey);
+      e.watchers.add(watcherKey);
       if (source.agentKey < e.issue.agentKey) e.issue = source;
     }
   };
@@ -202,18 +228,20 @@ export function relatedForRules(
   const implementsEdge = (sourceKey: string, listenerKey: string) => {
     if (sourceKey === listenerKey) return;
     for (const listener of byIssue.get(listenerKey) ?? []) {
-      if (!activeSet.has(listener.agentKey)) continue;
-      for (const source of sourcesFor(sourceKey, listener)) record(sourceKey, listener, source);
+      const live = liveAgentKeyFor(listener);
+      if (!activeSet.has(listener.agentKey) && !activeSet.has(live)) continue;
+      for (const source of sourcesFor(sourceKey, listener)) record(sourceKey, live, source);
     }
   };
-  /** `Relates` is symmetric in Jira, so ONLY configuration decides direction across it — unchanged. */
+  /** `Relates` is symmetric in Jira, so ONLY configuration decides direction across it — unchanged (BUTCHR-406: same live-key fix as `implementsEdge` above). */
   const relatesEdge = (sourceKey: string, listenerKey: string) => {
     if (sourceKey === listenerKey) return;
     for (const listener of byIssue.get(listenerKey) ?? []) {
-      if (!activeSet.has(listener.agentKey)) continue;
+      const live = liveAgentKeyFor(listener);
+      if (!activeSet.has(listener.agentKey) && !activeSet.has(live)) continue;
       for (const source of byIssue.get(sourceKey) ?? []) {
         if (!hearsInward(listener.rule, source.rule)) continue;
-        record(sourceKey, listener, source);
+        record(sourceKey, live, source);
       }
     }
   };

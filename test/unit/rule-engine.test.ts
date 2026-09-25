@@ -563,9 +563,19 @@ describe("BUTCHR-406: cross-daemon boss wake regression (two disjoint daemon vie
     const label = bossExecution ?? "undeclared (defaults to swarm)";
     test(`the boss on daemon B is woken by the child's change on daemon A, with no agent spawned for the child on B — boss rule execution=${label}`, async () => {
       const { notifiedB, herdB } = await runTwoDaemons(bossExecution);
-      expect(notifiedB.some((n) => n.includes(childKey))).toBe(true);
+      // Exactly one notify for the child's change — not merely "at least
+      // one" — so a double-delivery (e.g. the by-key Implements edge and
+      // `scopeRelatedResources` both addressing the same query-level agent)
+      // would fail this test even though `.some(...)` alone would not.
+      expect(notifiedB.filter((n) => n.includes(childKey))).toHaveLength(1);
+      // No agent is ever spawned for the child on daemon B — its own rules
+      // never match the child, in every execution mode. (A singleton/
+      // persistent boss's OWN spawned key is the query-level marker, e.g.
+      // "jira-work:story:%40query" — it contains neither the boss's nor the
+      // child's ticket key, so this only asserts the child never appears,
+      // not that every spawned key names the boss.)
       expect(herdB.spawned.some((k) => k.includes(childKey))).toBe(false);
-      expect(herdB.spawned.every((k) => k.includes(bossKey))).toBe(true);
+      expect(herdB.spawned.length).toBeGreaterThan(0);
     });
   }
 });
