@@ -221,6 +221,117 @@ per-resource agents. A content change instead notifies the running agent
 (size/mtime moved — `createSessionDefinitionEventRules`), same "modify"
 precedent `filesystem` already has for its own swarm agents.
 
+## The `butchr session` CLI (BUTCHR-454)
+
+There is now an operator CLI for the whole lifecycle above short of
+archive/unarchive (a later story, BUTCHR-394 T2): `butchr session
+list|show|create|freeze|unfreeze`, credential-free and daemon-free, exactly
+like `butchr link`'s own precedent (`src/cli/link-cli.ts`) — dispatched from
+a guard at the very top of `src/daemon/index.ts`, before config/rules
+loading. A managed-session definition is local filesystem state (plus the
+`drovr-events` freeze store below), so none of these verbs need a live
+daemon, Jira credentials, or a rules file.
+
+```
+usage: butchr session list
+       butchr session show <name>
+       butchr session create <name> --working-directory <dir> --brief <text>
+                             --vendor claude|codex --tier tier1..tier5
+                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             [--execution swarm|singleton|persistent]
+                             [--account none|temporary|permanent]
+                             [--role worker|sentinel] [--frozen]
+                             [--mcp-servers <json array>]
+       butchr session freeze <name>
+       butchr session unfreeze <name>
+```
+
+`<name>` is a definition file's basename, with or without `.json`, resolved
+against the same well-known directory `sessionDefinitionsPath()` resolves
+(`BUTCHR_SESSION_DEFINITIONS_DIR`, else `$XDG_CONFIG_HOME/butchr/session-
+definitions`).
+
+- **`list`** enumerates every direct-child file of that directory — the
+  SAME candidate set `searchSessionDefinitions` walks (same query, same
+  255-byte encoded-path cap) — but, unlike the daemon's own poll, an
+  invalid or oversized definition is listed too, WITH its problems, never
+  dropped: "eligible" is the daemon's own filter, not this command's. Each
+  row also names both freeze gates (see "Two freeze gates" below).
+- **`show <name>`** is one `list` row's full detail: parsed
+  vendor/tier/role/execution (when valid; every collected problem
+  otherwise), the resolved filesystem agent key, and both freeze gates.
+- **`create <name> ...`** validates through `sessionDefinitionProblems` —
+  the EXACT function `parseSessionDefinitionFile` (and so the daemon's own
+  poll) runs a manifest through, never a forked copy of the schema — then
+  writes the fields AS GIVEN (a `~`-prefixed `workingDirectory` is written
+  back as `~...`, never daemon-expanded; an omitted optional field stays
+  omitted, never defaulted onto disk) via a temp-file-then-`rename` in the
+  SAME directory (`src/resources/atomic-write.ts`), so the daemon's ~15s
+  poll (`MANAGED_SESSIONS_POLL_MS`) never observes a half-written file.
+  Refuses outright if a definition of that name already exists. **Does
+  NOT yet check an archived location of the same name** — archive/unarchive
+  (BUTCHR-394 T2) hasn't defined where "archived" lives yet; this is a
+  known gap to close once that location exists, not an oversight.
+- **`freeze <name>` / `unfreeze <name>`** flip both freeze gates (below),
+  in the decided order, and print a note that the effect reaches a running
+  daemon within one poll (`MANAGED_SESSIONS_POLL_MS` = 15s) — or, if no
+  daemon is currently running, the next time one starts. **The CLI never
+  stops an agent itself** — only the running daemon's own reconcile
+  (`reconcileNow`) plus `watchInstanceFreeze` do that; this command only
+  changes state for the daemon to observe.
+
+### Two freeze gates, and why both
+
+Butchr already had a freeze mechanism before this ticket:
+`HerdrHerd.frozen()` (`src/agents/herd.ts`) reads `@brooswit/drovr-events`'
+`instanceFreezeStore`, keyed `` `butchr:<agentKey>` ``; `reconcileNow`
+(`src/daemon/loop.ts`) drops a frozen id from `desired` before BOTH its
+spawn and its stop decision, unconditionally — an explicit freeze wins
+over `execution: "persistent"`/`role: "sentinel"` with no special case
+needed there (proven at the reconcile level, not just by asserting the
+store's own value, in `test/unit/session-freeze.test.ts`). This is the
+SAME store the daemon already reads; `butchr session freeze`/`unfreeze`
+is the first thing in this codebase that ever WRITES it (previously only
+`drovr-events`' own `drovr-instance` CLI did).
+
+A definition also has its own manifest `frozen` field (S2/BUTCHR-393),
+already read by `searchSessionDefinitions` to exclude it from the eligible
+set entirely (see "Eligible = valid, not frozen" above). `butchr session
+freeze`/`unfreeze` sets/clears BOTH gates together:
+
+- **freeze**: (1) `instanceFreezeStore.set("butchr:<agentKey>", true)`
+  FIRST, then (2) rewrite the manifest's `frozen: true` (preserving every
+  other field's value, via the same atomic write `create` uses).
+- **unfreeze**: (1) rewrite the manifest's `frozen: false` FIRST, then
+  (2) `instanceFreezeStore.set(..., false)`.
+
+Both are idempotent regardless of the starting combination (only one gate
+set, both set, or neither) — they always end with both gates in the
+target state.
+
+**Why both, when either alone stops a running agent:** the store's key is
+derived from the definition's FILE PATH (`sessionAgentKey`,
+`src/resources/session-freeze.ts` — the exact codec
+`searchSessionDefinitions` uses to build a match's own `agentKey`).
+Renaming or moving a manifest changes that key, silently dropping any
+store-only freeze state. The manifest flag survives a move, because
+`searchSessionDefinitions` reads it from whatever file is AT the (possibly
+new) path — independent of any store key. This is what lets a frozen
+persistent definition (the 10 CNDLX-45 MUD players) stay frozen through a
+future archive/restore move (BUTCHR-394 T2), even though that changes the
+store key entirely. **A caveat this implies:** archive/unarchive must
+restore a manifest's exact original filename, or a store-only-frozen
+definition (one whose manifest flag was never separately set) loses that
+protection on the move — recorded here for T2, not solved by this ticket.
+
+`freezeSessionDefinition`/`unfreezeSessionDefinition`
+(`src/resources/session-freeze.ts`) are plain, argv/stdout-free core
+functions for exactly this reason — a later task's `freeze_session`/
+`unfreeze_session` MCP tools (for delegated freeze control, e.g.
+`director-brooswit-mud`) call them directly, unchanged; `butchr session
+freeze`/`unfreeze` is a thin CLI layer over the same two functions, not a
+second implementation.
+
 ## Working directory wiring
 
 `SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) carries a
