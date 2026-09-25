@@ -99,7 +99,14 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * THIS DAEMON's own process that holds a JSON object of header values,
  * resolved at launch time (`resolveMcpServerHeaders`, src/agents/workspace.ts).
  * A rule with no `headersEnvVar`, or one naming an unset/malformed var,
- * simply connects with no extra headers.
+ * simply connects with no extra headers (logged once, value never logged).
+ * A resolved header value is written ONLY into a Claude workspace's
+ * `mcp.json` (permission-tightened when it carries one — see that
+ * function's own doc comment) — NEVER into Codex argv, which is a real
+ * process command line other local users can read (review finding, PR
+ * #387): `boundCodexServers` (src/agents/argv.ts) never resolves headers at
+ * all, so a Codex agent gets a bound server's tools with no extra headers,
+ * regardless of `headersEnvVar`.
  *
  * Deliberately independent of `Rule.account`/`Rule.execution`: a binding (and
  * its `channel` flag) is wired into launch argv from this field alone, never

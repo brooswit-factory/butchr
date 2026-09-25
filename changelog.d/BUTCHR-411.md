@@ -12,5 +12,9 @@ bump: minor
   binding also lands in `mcp.json` (Claude) or the launch's `mcpServers`
   (Codex, tools only — Codex has no development-channel concept). A rule
   with no `mcpServers` is unaffected: byte-identical argv/mcp.json, and
-  `staleIssues()` does not respawn any existing agent on deploy. See
-  `docs/mcp-server-bindings.md`.
+  `staleIssues()` does not respawn any existing agent on deploy. A bound
+  server's optional `headersEnvVar` (never a literal header value in the
+  rules file) is resolved only into a Claude workspace's `mcp.json`, chmod
+  0600 whenever it carries one; a Codex agent never receives bound-server
+  headers at all, since Codex would otherwise put them in cleartext on its
+  own process command line. See `docs/mcp-server-bindings.md`.

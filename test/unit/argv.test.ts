@@ -136,7 +136,7 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     if (!check.ok) expect(check.reason).toContain("--dangerously-load-development-channels server:mud");
   });
 
-  test("codex gets every bound server as an MCP tool server, butchr first, headers resolved from the daemon's own env — never a channel flag (BUTCHR-359 is out of scope here)", () => {
+  test("codex gets every bound server as an MCP tool server, butchr first — never a channel flag (BUTCHR-359 is out of scope here)", () => {
     const withHeaders = { ...mud, headersEnvVar: "MUD_MCP_HEADERS" };
     const args = spawnArgs({ ...spec, mcpServers: [withHeaders] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
     expect(args.filter((a) => a.startsWith("--dangerously-load-development-channels"))).toHaveLength(0);
@@ -145,15 +145,24 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     expect(butchrIdx).toBeGreaterThanOrEqual(0);
     expect(mudIdx).toBeGreaterThan(butchrIdx);
     expect(args[mudIdx]).toContain('url = "https://mud.example/mcp"');
-    expect(args[mudIdx]).not.toContain("http_headers"); // MUD_MCP_HEADERS unset in this process -> no headers, not a throw
+    expect(args[mudIdx]).not.toContain("http_headers");
   });
 
-  test("codex resolves headersEnvVar from an explicit env map — proves the header VALUE never lives in the rules file, only the var name", () => {
-    process.env.BUTCHR_TEST_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer secret-value" });
+  // Review finding, PR #387 (BLOCKING): a bound server's resolved header
+  // VALUE (often a bearer token) must never reach Codex argv — a real
+  // process command line other local users can read via ps/procfs — and
+  // must therefore never reach anything downstream that echoes argv
+  // verbatim (staleIssues()'s observedArgv, the respawn journal line).
+  test("a bound server's headersEnvVar is NEVER resolved for Codex, even when the env var holds a real secret — argv contains no trace of it", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE" });
     try {
       const args = spawnArgs({ ...spec, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS" }] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
       const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
-      expect(mudArg).toContain("Bearer secret-value");
+      expect(mudArg).toBeDefined();
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(mudArg).not.toContain("http_headers");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE");
     } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS; }
   });
 

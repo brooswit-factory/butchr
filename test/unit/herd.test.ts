@@ -846,6 +846,32 @@ describe("staleIssues — mcpBindingsOf / MCP server bindings (BUTCHR-411)", () 
     const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, () => undefined);
     expect(await herd.staleIssues()).toEqual([]);
   });
+
+  // Review finding, PR #387: a bound server's secret header value must
+  // never surface in a StaleAgent's `reason` or `observedArgv` — both are
+  // logged verbatim ([reconcile] .../onRespawn in src/daemon/index.ts) and
+  // shown on the Jira ticket. Proven end to end through staleIssues() for a
+  // Codex agent, since that's the only provider whose argv could ever have
+  // carried a header value at all (Claude's argv never does).
+  test("a Codex agent's stale reason/observedArgv never contain a bound server's secret header value, even when the daemon's own env holds one", async () => {
+    process.env.BUTCHR_TEST_HERD_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE" });
+    try {
+      const secretMud = { ...mud, headersEnvVar: "BUTCHR_TEST_HERD_MUD_HEADERS" };
+      const codexArgvWithoutBinding = ["codex", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1" }, cwd, { provider: "codex", disabledMcpServers: [] })];
+      const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], codexArgvWithoutBinding);
+      // Fake process reports as codex via its argv/name shape used elsewhere in this file's fakes.
+      client.pane.processInfo = async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv: codexArgvWithoutBinding, name: "codex" }] } });
+      // disabledMcpServers: [] (not undefined) so staleIssues() doesn't take
+      // the separate "Codex MCP isolation inventory missing" early-out and
+      // actually reaches the expected-vs-observed comparison this test needs.
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] }, undefined, undefined, undefined, () => [secretMud]);
+      const stale = await herd.staleIssues();
+      expect(stale.length).toBe(1);
+      expect(stale[0]!.reason).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(stale[0]!.observedArgv.join(" ")).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(stale[0]!.reason).not.toContain("Authorization");
+    } finally { delete process.env.BUTCHR_TEST_HERD_MUD_HEADERS; }
+  });
 });
 
 describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
