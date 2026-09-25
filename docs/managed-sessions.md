@@ -60,6 +60,8 @@ takes effect on restart, not live), like every other provider's query.
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
 | `frozen` | no | `false` default. A frozen definition is a VALID one that simply runs no agent — see "Eligible = valid, not frozen" below. |
 | `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
+| `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
+| `unfreezeControllers` | no | Same shape, for `unfreeze_session` — an INDEPENDENT list; a name in `freezeControllers` grants nothing here, and vice versa. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
@@ -187,19 +189,34 @@ decided once, in `searchSessionDefinitions` (`src/rules/session-definition-type.
 
 1. List every direct child file of the definitions directory (an ordinary
    `filesystem` query, `{root, kind: "file", maxDepth: 1}`).
-2. A path whose percent-encoded id would overflow the workspace
+2. **A hidden file (its basename starts with `.`) is never a candidate at
+   all — skipped SILENTLY, before any other check, never logged**
+   (`isHiddenDefinitionFile`, `src/resources/session-definition.ts`;
+   BUTCHR-455 review fix). The query above has no name filter, so without
+   this a definition writer's own temp file (`writeFileAtomic`'s
+   `.<uuid>.tmp` — used by `create`, `freeze`/`unfreeze`'s manifest
+   rewrite, and `unarchive`'s cross-filesystem fallback) would be a
+   candidate for the brief window it sits in the active directory: if a
+   poll landed there and the temp content happened to already be a valid,
+   non-frozen manifest (true for every one of those writers, which each
+   write/rewrite a full valid document), it would be staffed as a SECOND
+   agent under a key with no relationship to the real definition's own
+   freeze state. `listSessionDefinitions` (`butchr session list`) applies
+   the identical filter, for the identical reason — a hidden file is never
+   shown, valid or not, same as it's never staffed.
+3. A path whose percent-encoded id would overflow the workspace
    directory-name limit is skipped and logged once — the SAME 255-byte
    check and discipline `filesystem` already applies to every resource
    (`docs/filesystem.md`'s own "Resource identity" section).
-3. A file that fails to parse or validate is skipped and logged once
+4. A file that fails to parse or validate is skipped and logged once
    (`WARNING: [managed-sessions] <path> is not a valid definition, never
    staffed: <problems>`) — never staffed, never silently dropped, never
    crashes the poll; a sibling definition's own validity is unaffected.
-4. A file that parses and validates but is `frozen: true` is skipped and
+5. A file that parses and validates but is `frozen: true` is skipped and
    logged once, DISTINCTLY from an invalid one (`[managed-sessions] <path>
    is frozen — no agent runs`) — frozen is a property of a valid
    definition, not a kind of invalidity.
-5. Everything left is eligible: one `filesystem`-provider agent per
+6. Everything left is eligible: one `filesystem`-provider agent per
    definition file, under `swarm` execution (the built-in rule's own FIXED
    mode) — which is already "keeps exactly one agent per eligible
    definition" at the file granularity this ticket covers, no
@@ -220,6 +237,496 @@ reads it as "already running, leave alone" — same precedent as editing a
 per-resource agents. A content change instead notifies the running agent
 (size/mtime moved — `createSessionDefinitionEventRules`), same "modify"
 precedent `filesystem` already has for its own swarm agents.
+
+## The `butchr session` CLI (BUTCHR-454, BUTCHR-455)
+
+There is now an operator CLI for the whole lifecycle: `butchr session
+list|show|create|freeze|unfreeze|archive|unarchive`, credential-free and
+daemon-free, exactly like `butchr link`'s own precedent
+(`src/cli/link-cli.ts`) — dispatched from a guard at the very top of
+`src/daemon/index.ts`, before config/rules loading. A managed-session
+definition is local filesystem state (plus the `drovr-events` freeze store
+below, and — for archive/unarchive — a second, sibling directory), so none
+of these verbs need a live daemon, Jira credentials, or a rules file.
+
+```
+usage: butchr session list [--archived]
+       butchr session show <name>
+       butchr session create <name> --working-directory <dir> --brief <text>
+                             --vendor claude|codex --tier tier1..tier5
+                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             [--execution swarm|singleton|persistent]
+                             [--account none|temporary|permanent]
+                             [--role worker|sentinel] [--frozen]
+                             [--mcp-servers <json array>]
+                             [--freeze-controllers <comma-separated names>]
+                             [--unfreeze-controllers <comma-separated names>]
+       butchr session freeze <name>
+       butchr session unfreeze <name>
+       butchr session archive <name>
+       butchr session unarchive <name>
+```
+
+`<name>` is a definition file's basename, with or without `.json`, resolved
+against the same well-known directory `sessionDefinitionsPath()` resolves
+(`BUTCHR_SESSION_DEFINITIONS_DIR`, else `$XDG_CONFIG_HOME/butchr/session-
+definitions`) — or, for `unarchive` and `list --archived`, against the
+archive directory instead (see "Archive/unarchive" below).
+
+- **`list`** enumerates every direct-child file of the active directory —
+  the SAME candidate set `searchSessionDefinitions` walks (same query, same
+  255-byte encoded-path cap) — but, unlike the daemon's own poll, an
+  invalid or oversized definition is listed too, WITH its problems, never
+  dropped: "eligible" is the daemon's own filter, not this command's. Each
+  row also names both freeze gates (see "Two freeze gates" below) and both
+  delegated-freeze grants (`(none)` when unset). Plain `list` **never**
+  shows an archived definition — pass `--archived` for that (see
+  "Archive/unarchive" below).
+- **`show <name>`** is one `list` row's full detail: parsed
+  vendor/tier/role/execution (when valid; every collected problem
+  otherwise), the resolved filesystem agent key, both freeze gates, and
+  both delegated-freeze grants.
+- **`create <name> ...`** validates through `sessionDefinitionProblems` —
+  the EXACT function `parseSessionDefinitionFile` (and so the daemon's own
+  poll) runs a manifest through, never a forked copy of the schema — then
+  writes the fields AS GIVEN (a `~`-prefixed `workingDirectory` is written
+  back as `~...`, never daemon-expanded; an omitted optional field stays
+  omitted, never defaulted onto disk) via a temp-file-then-`rename` in the
+  SAME directory (`src/resources/atomic-write.ts`), so the daemon's ~15s
+  poll (`MANAGED_SESSIONS_POLL_MS`) never observes a half-written file.
+  Refuses outright if a definition of that name already exists **in either
+  the active directory or the archive directory** (BUTCHR-455 closes the
+  gap BUTCHR-454 flagged: creating a name that collided with an archived
+  definition used to succeed, and a later `unarchive` of that name would
+  then collide with the new active file it never knew about).
+  `--freeze-controllers`/`--unfreeze-controllers` (BUTCHR-456) set the two
+  delegated-freeze grants at creation — see "Delegated freeze/unfreeze"
+  below. There is deliberately no CLI verb to change a grant after
+  creation: edit the manifest file directly (or recreate it) and let the
+  daemon's own ~15s poll pick it up.
+- **`freeze <name>` / `unfreeze <name>`** flip both freeze gates (below),
+  in the decided order, and print a note that the effect reaches a running
+  daemon within one poll (`MANAGED_SESSIONS_POLL_MS` = 15s) — or, if no
+  daemon is currently running, the next time one starts — plus the
+  resolved definitions directory and freeze-store root (BUTCHR-454 review
+  follow-up), so an operator can spot the shell/daemon environment
+  mismatch described below. **The CLI never stops an agent itself** —
+  only the running daemon's own reconcile (`reconcileNow`) plus
+  `watchInstanceFreeze` do that; this command only changes state for the
+  daemon to observe.
+- **`archive <name>` / `unarchive <name>`** — see "Archive/unarchive"
+  below.
+
+### Two freeze gates, and why both
+
+Butchr already had a freeze mechanism before this ticket:
+`HerdrHerd.frozen()` (`src/agents/herd.ts`) reads `@brooswit/drovr-events`'
+`instanceFreezeStore`, keyed `` `butchr:<agentKey>` ``; `reconcileNow`
+(`src/daemon/loop.ts`) drops a frozen id from `desired` before BOTH its
+spawn and its stop decision, unconditionally — an explicit freeze wins
+over `execution: "persistent"`/`role: "sentinel"` with no special case
+needed there (proven at the reconcile level, not just by asserting the
+store's own value, in `test/unit/session-freeze.test.ts`). This is the
+SAME store the daemon already reads; `butchr session freeze`/`unfreeze`
+is the first thing in this codebase that ever WRITES it (previously only
+`drovr-events`' own `drovr-instance` CLI did).
+
+A definition also has its own manifest `frozen` field (S2/BUTCHR-393),
+already read by `searchSessionDefinitions` to exclude it from the eligible
+set entirely (see "Eligible = valid, not frozen" above). `butchr session
+freeze`/`unfreeze` sets/clears BOTH gates together:
+
+- **freeze**: (1) `instanceFreezeStore.set("butchr:<agentKey>", true)`
+  FIRST, then (2) rewrite the manifest's `frozen: true` (preserving every
+  other field's value, via the same atomic write `create` uses).
+- **unfreeze**: (1) rewrite the manifest's `frozen: false` FIRST, then
+  (2) `instanceFreezeStore.set(..., false)`.
+
+Both are idempotent regardless of the starting combination (only one gate
+set, both set, or neither) — they always end with both gates in the
+target state.
+
+**Why both, when either alone stops a running agent:** the store's key is
+derived from the definition's FILE PATH (`sessionAgentKey`,
+`src/resources/session-freeze.ts` — the exact codec
+`searchSessionDefinitions` uses to build a match's own `agentKey`).
+Renaming or moving a manifest changes that key, silently dropping any
+store-only freeze state. The manifest flag survives a move, because
+`searchSessionDefinitions` reads it from whatever file is AT the (possibly
+new) path — independent of any store key. This is what lets a frozen
+persistent definition (the 10 CNDLX-45 MUD players) stay frozen through an
+archive/restore move (BUTCHR-455, below), even though that changes the
+store key entirely. **The caveat this implies, closed by BUTCHR-455:**
+archive/unarchive restores a manifest's EXACT original filename (never a
+caller-supplied destination name) — see "Archive/unarchive" below for how
+that's enforced (refuse-on-collision, not rename-on-collision) and why it
+matters even for a definition that was only ever store-frozen (manifest
+field left `false`).
+
+`freezeSessionDefinition`/`unfreezeSessionDefinition`
+(`src/resources/session-freeze.ts`) are plain, argv/stdout-free core
+functions for exactly this reason — the `freeze_session`/`unfreeze_session`
+MCP tools below (for delegated freeze control, e.g. `director-brooswit-mud`)
+call them directly, unchanged; `butchr session freeze`/`unfreeze` is a thin
+CLI layer over the same two functions, not a second implementation.
+
+## Delegated freeze/unfreeze (BUTCHR-456, BUTCHR-394 T3)
+
+CNDLX-45 needs an agent, `director-brooswit-mud`, that can freeze and
+unfreeze the 10 MUD-player managed-session definitions — and ONLY those —
+without butchr trusting anything the director agent argues about its own
+identity. This ticket builds that CAPABILITY: two MCP tools, `freeze_session`
+and `unfreeze_session`, scoped by an explicit, per-definition grant the
+OPERATOR writes. It creates no live grant, definition, or freeze state
+itself — migrating the real 10 MUD players is a separate, later step.
+
+### Why the tool boundary, not a file check
+
+A CLI, or any same-Unix-user process editing the definitions directory
+directly, cannot be bounded by anything butchr controls — there is no
+signal at that layer to check identity against. So scoping instead lives at
+the **butchr MCP TOOL boundary**, where a caller's identity comes from the
+daemon-written per-agent MCP config header (`x-butchr-agent`; see
+`src/mcp/identity.ts`'s `callerIdentity`, and `mcpIdentityHeaders` /
+`src/agents/workspace.ts` for how a managed-session agent's own workspace
+gets that header baked in at spawn time — never something the agent
+supplies itself as a tool ARGUMENT).
+
+**This is an honest TOOL-BOUNDARY guarantee, not an OS-level one — and the
+header itself is part of that same OS-level boundary, not above it.** The
+header lives inside the agent's own daemon-written workspace config —
+`mcp.json` for a Claude launch, the launched process's own argv for Codex
+(`agentLaunchConfig`, `src/agents/argv.ts`) — so an agent WITH SHELL ACCESS
+to its own workspace could in principle read or alter that file/process
+state, same as it could edit its own manifest directly; nothing here claims
+otherwise. Any process that can write the definitions directory directly —
+a shell command run by the SAME managed-session agent, another process
+under the same Unix user, an operator by hand — can still flip a `frozen`
+field or edit a grant directly, exactly as before this ticket. What this
+capability actually buys: an agent that has ONLY MCP tools (no shell, no
+filesystem write access of its own to the definitions directory) can still
+be delegated a narrow, auditable freeze/unfreeze capability over specific
+OTHER definitions, without that agent — or anyone spoofing its ARGUMENTS —
+being able to touch anything else. The guarantee is against argument-level
+spoofing between agents, never against what an agent's own shell can do to
+itself.
+
+### The grant: `freezeControllers` / `unfreezeControllers`
+
+Two new optional fields on a managed-session definition (validated by the
+SAME `sessionDefinitionProblems` validator every other field goes through —
+see the manifest format table above): `freezeControllers: string[]` and
+`unfreezeControllers: string[]`. Each entry names a CONTROLLER definition by
+FILE NAME (with or without `.json`; `"a"` and `"a.json"` are the same
+entry for duplicate-checking purposes) — never a path. A definition never
+needs to list itself, but nothing rejects that; it is simply a no-op grant.
+
+```json
+{
+  "workingDirectory": "/opt/mud/player-1",
+  "brief": "Play the MUD.",
+  "vendor": "claude",
+  "tier": "tier2",
+  "permissionMode": "default",
+  "freezeControllers": ["director-brooswit-mud"],
+  "unfreezeControllers": []
+}
+```
+
+Here, `director-brooswit-mud` may call `freeze_session` against this
+definition, but NOT `unfreeze_session` — `unfreezeControllers` is empty, so
+nobody may unfreeze it via the MCP tool (an operator still can, directly).
+**Freezing and unfreezing are deliberately two separate grants, never one
+list:** per CNDLX-45's own decision, migrating the 10 MUD players onto
+managed sessions only requires the director to be able to FREEZE them (to
+protect the migration); whether it may also UNFREEZE them is a separate,
+explicit judgment call for the director agent's own owners and Brooswit to
+make later, not a byproduct of this ticket. Listing a controller in
+`freezeControllers` gives it NOTHING on `unfreeze_session`, and listing it
+in `unfreezeControllers` gives it nothing on `freeze_session` — verified by
+`test/unit/session-freeze-tools.test.ts`'s own "the two grants are
+independent" cases.
+
+**There is deliberately no MCP tool or CLI verb that lets an agent modify a
+grant.** `freeze_session`/`unfreeze_session` can only flip the two freeze
+gates on an already-granted target — never create, archive, delete, or
+edit any definition, including the grant fields themselves. A grant changes
+only when the OPERATOR edits the manifest file directly, or supplies
+`--freeze-controllers`/`--unfreeze-controllers` to `butchr session create`
+(see the CLI section above) — there is no "update grant" CLI verb either;
+recreate or hand-edit the file.
+
+### `freeze_session` / `unfreeze_session`
+
+Two MCP tools on the butchr MCP server (`src/tools/session-freeze-tools.ts`),
+each taking a single argument, `name` — the TARGET definition's file name
+(with or without `.json`), resolved the same with-or-without-extension way
+`butchr session show/freeze/unfreeze` already resolve a name. Available to
+a managed-session (`filesystem` provider, the built-in `managed-sessions`
+rule id) agent of **either** vendor — `claude` or `codex` — identically:
+authorization never looks at vendor at all, and a Codex agent already
+receives butchr's full MCP tool list the same way a Claude agent does (a
+`mcpServers` entry in its own launch config, `src/agents/argv.ts`'s
+`agentLaunchConfig` — not the `mcp.json` FILE, which is Claude-specific
+wiring; both paths carry the identical `x-butchr-agent` header via the same
+`mcpIdentityHeaders`).
+
+**Authorization, checked entirely server-side, never from anything the
+caller's arguments claim:**
+
+1. The caller's identity is decoded from its OWN connection header
+   (`x-butchr-agent`), never from the tool call's arguments — there is no
+   argument that could name "who I am" in the first place; the input
+   schema is `{ name }` and `name` always means the TARGET, never the
+   caller.
+2. The caller must decode as a managed-session agent specifically:
+   `resourceProvider: "filesystem"`, rule id `managed-sessions` (the
+   built-in rule's own reserved id — see `MANAGED_SESSIONS_RULE_ID`). A
+   query-level agent (no single resource), a plain BUTCHR-407 `filesystem`
+   agent under some OTHER rule, or any non-`filesystem` provider (a
+   `jira-work` ticket agent, a `github-issue` agent, …) is refused, same as
+   a caller with no identity at all.
+3. The target name is resolved against the SAME `listSessionDefinitions`
+   walk `butchr session list`/`show` already use — which is itself the
+   SAME `listFilesystemResources` walk the daemon's own
+   `searchSessionDefinitions` uses to build a match's `agentKey`. This is
+   why name resolution is inherently path-safe rather than merely
+   pattern-checked to be: a `FilesystemResource.name` is always a bare
+   basename of a REAL direct child of the definitions directory, with no
+   path separator, and NEVER a symlink (`listFilesystemResources`'s own
+   walk skips every symlink outright — `src/resources/filesystem.ts`). A
+   `name` containing `/`, `..`, an absolute path, or naming a symlink
+   therefore cannot equal any real entry's name and simply fails to
+   resolve, refused with the exact same message as an unknown name — never
+   a special-cased rejection with its own text (see "Refusals never
+   distinguish" below). It also means the resolved path this tool hands to
+   `freezeSessionDefinition`/`unfreezeSessionDefinition` is byte-identical
+   to what the daemon's own poll would use for the same file, so the
+   freeze-store key can never diverge from the key `HerdrHerd.frozen()`
+   reads.
+4. The target must be a VALID definition (parses through
+   `sessionDefinitionProblems` with no problems) — an invalid target's
+   grant fields cannot be trusted to mean anything, same reasoning
+   `manifestFrozen: undefined` already applies to an invalid `list`/`show`
+   row.
+5. The target's own `freezeControllers` (for `freeze_session`) or
+   `unfreezeControllers` (for `unfreeze_session`) must contain a name that
+   resolves (through that SAME walk) to an agent key equal to the caller's
+   own — the exact `sessionAgentKey` codec `searchSessionDefinitions`
+   already uses to build a match's `agentKey`, compared as opaque strings,
+   never re-derived by hand in the tool itself.
+
+On success, the tool calls straight into `freezeSessionDefinition`/
+`unfreezeSessionDefinition` UNCHANGED — the same two gates, same order,
+same idempotency `butchr session freeze`/`unfreeze` already gives you (see
+"Two freeze gates" above). A delegate can only flip those two gates; it can
+never create, archive, delete, or edit anything else about any definition,
+including its own grant.
+
+### Refusals never distinguish why
+
+An unknown target name, an invalid/unparseable target, a caller with no
+grant on that target, and a caller that isn't a managed-session agent at
+all (a `jira-work` ticket agent, another provider, no identity, a malformed
+agent key) all throw the **exact same** refusal message, per verb — never
+a message that would let a probing caller learn which definitions exist or
+who controls them. `unfreeze_session`'s message differs from
+`freeze_session`'s (it names the OTHER grant field), but is equally uniform
+across every one of ITS OWN failure shapes. Pinned in
+`test/unit/session-freeze-tools.test.ts`'s "every refusal reads
+identically" cases.
+
+### Docs and CLI surface
+
+`butchr session create` gained `--freeze-controllers`/
+`--unfreeze-controllers` (comma-separated definition names) to set the
+grant fields at creation; `butchr session list`/`show` display both grants
+(`(none)` when unset) — see the CLI section above. This doc's own manifest
+format table above also lists both fields.
+
+## Archive/unarchive (BUTCHR-455)
+
+`butchr session archive <name>` moves a definition file OUT of the active
+definitions directory into a second, sibling ARCHIVE directory — a
+location the built-in query's own `{root: <active dir>, kind: "file",
+maxDepth: 1}` listing can never see (see "Eligible = valid, not frozen"
+above: eligibility is decided purely by what's a direct child of the active
+directory). `butchr session unarchive <name>` moves it back. Neither verb
+stops or starts the agent itself — same design as freeze/unfreeze: the CLI
+only changes what's on disk, and the running daemon's own next reconcile
+poll (up to `MANAGED_SESSIONS_POLL_MS` = 15s later, or the next time a
+daemon starts) is what actually stops (archive) or spawns (unarchive) it,
+because the file leaving/rejoining the active directory's listing is all
+`searchSessionDefinitions` (and so `desiredFrom`/`reconcileNow`) ever look
+at. Both verbs print the resolved active directory, archive directory and
+freeze-store root, for the same reason `freeze`/`unfreeze` do (see the
+environment-mismatch section below).
+
+### The archive directory
+
+`sessionArchiveDir()` (`src/resources/session-archive.ts`) is the ONE
+function every caller resolves this through: `BUTCHR_SESSION_ARCHIVE_DIR`
+(explicit override) else a sibling of the (resolved) active definitions
+directory, named after it with an `-archive` suffix — e.g. an active
+directory of `.../butchr/session-definitions` resolves a default archive
+directory of `.../butchr/session-definitions-archive`. `sessionArchiveDir`
+never validates its own result; `assertArchiveDirDisjoint(definitionsDir,
+archiveDir)` (same module) does, and every command that touches the
+archive directory (`archive`, `unarchive`, `list --archived`, and
+`create`'s collision check) calls it FIRST, before anything else happens:
+it throws if the resolved archive directory would equal or sit inside the
+active definitions directory — which would mean an "archived" file is
+still (or becomes, one level down) a candidate the active query can see,
+defeating the entire point of archiving it. This is a refusal at command
+startup, not a moved-then-regretted state: nothing is touched before this
+check runs.
+
+### The identity rule, and why it's load-bearing
+
+An agent's identity — its filesystem agent key, and so the freeze-store
+key `butchr:<agentKey>` (see "Two freeze gates" above) — is derived from a
+definition's FILE PATH. `archive`/`unarchive` therefore move the file under
+the EXACT SAME BASENAME, never a caller-supplied destination name, and
+never touch the file's own byte content. Restoring a definition to the
+exact path it was archived from is what makes `unarchive` bring back the
+SAME agent — same key, same store-freeze answer — rather than a new,
+unrelated one that happens to share a brief. This is also why both verbs
+REFUSE outright (nothing moved) rather than picking a different name on
+collision: a silent rename would either orphan the original's identity (if
+the caller expected the same name back) or silently create a same-named
+collision waiting to happen on a future `unarchive`.
+
+Refused, nothing moved, in either direction:
+- `<name>` is not a plain basename — empty, `.`/`..`, or containing a path
+  separator (`definitionBasenameProblem`, `src/resources/session-archive.ts`;
+  BUTCHR-455 review fix). Checked FIRST, before either verb even builds a
+  source/destination path: unlike `show`/`freeze`/`unfreeze`, which all
+  resolve a name by first LISTING the directory and matching an entry
+  (inherently safe, since the result is always a path the listing itself
+  already reported), `archive`/`unarchive` build `join(dir, name)`
+  directly — an unchecked `../../etc/passwd` (or an absolute path) would
+  let either verb move a file from, or over, somewhere entirely outside
+  either directory.
+- the source file does not exist;
+- a file of that name already exists at the destination (the archive
+  directory for `archive`, the active directory for `unarchive`);
+- the destination directory cannot be created.
+
+The manifest's own `frozen` field travels with the file's content
+unconditionally — archive/unarchive never reads or rewrites it — so a
+frozen definition (both gates, or the manifest gate alone) reads exactly
+as frozen at its new path as it did at the old one; an unfrozen one stays
+unfrozen. The freeze-store gate is untouched too: reading it via the
+would-be-active path after an `unarchive` reads the SAME key it was ever
+written under, because the path is identical (see `test/unit/session-
+archive.test.ts`'s "frozen state survives archive then unarchive" suite,
+including the store-only-frozen case this identity rule specifically
+protects).
+
+### Move mechanics: atomic where the platform allows, safe fallback otherwise
+
+The move is a plain same-filesystem `rename` when the active and archive
+directories share one (the ordinary case: the default archive directory is
+a sibling of the active one, and `BUTCHR_SESSION_ARCHIVE_DIR` is expected
+to usually stay on the same volume) — atomic, so the daemon's ~15s poll of
+the active directory never observes a half-written or partially-moved
+file. When `rename` itself fails with `EXDEV` (the two directories are on
+different filesystems — only possible via the env override), the fallback
+is: copy the file to a temp name IN THE DESTINATION directory, `rename`
+that temp file into place (same filesystem as the destination, so this
+step is still atomic), then unlink the source — never the other order, and
+the source is only ever unlinked after the destination rename has already
+succeeded. A failure at any step before that final rename leaves the
+source untouched and best-effort cleans up its own temp file; no partial
+file is ever left under the destination's own final name.
+
+### Post-archive hook seam (not yet wired to S4)
+
+`archiveSessionDefinition` accepts an injected `onArchived({ agentKey,
+path })` async hook, default no-op, run once after a successful move.
+This exists for S4 (BUTCHR-395), which owns Rocket.Chat account cleanup
+(`releaseAccount(agentKey, "archive")`, `src/accounts/manager.ts`) — but
+that code lives on the BUTCHR-395 story branch, not `main`, so **this
+ticket wires the seam and imports nothing from that branch**; a follow-up
+task wires the real hook in once BUTCHR-395 merges. A hook failure is
+reported loudly (the CLI prints it to stderr, and the core function
+surfaces it as `ArchiveResult.hookError`) but **never undoes the move** —
+by the time the hook runs, the definition is already out of the eligible
+set, and rolling the file back on a hook failure would silently re-enter
+it into the eligible set for a reason (account cleanup) unrelated to
+whether the move itself was valid. The hook is never called on a refusal,
+and `unarchive` has no hook parameter at all (this seam is one-directional:
+S4's cleanup is an archive-time concern).
+
+### `list --archived`
+
+`butchr session list --archived` lists every direct-child file of the
+ARCHIVE directory, same columns and same "invalid entries shown, not
+hidden" discipline as plain `list`. Plain `list` never shows an archived
+definition (it only ever queries the active directory). **One deliberate
+asymmetry:** an archived entry's freeze gates are computed against the
+path it would have once RESTORED to the active directory, NOT its current
+archive-directory path — because the store gate is path-derived (see "The
+identity rule" above), reading it at the file's current (archived)
+location would always answer `false`, regardless of what it actually is or
+will be once unarchived. `listSessionDefinitions`'s `identityDir` parameter
+(`src/resources/session-definition-manage.ts`) is what makes this
+possible: it lists/reads from one directory but computes `agentKey`/
+`storeFrozen` against another. The manifest gate is unaffected by this —
+it always reads the file's own actual (archived) content, which is exactly
+where the `frozen` field itself is stored.
+
+### `create`'s archived-name collision check (BUTCHR-454 gap closed)
+
+`create <name> ...` now refuses if a definition of that name exists in
+EITHER the active directory or the archive directory. Before this ticket,
+only the active directory was checked (see the note this section replaces
+in earlier revisions of this doc) — creating a name that collided with an
+archived definition would succeed, and a later `unarchive` of that name
+would then collide with the newly-created active file, which the create
+step never knew existed.
+
+## Shell/daemon environment mismatch (BUTCHR-454 review follow-up)
+
+The CLI resolves the active definitions directory, the archive directory
+and the freeze-store root (`DROVR_CONTROL_HOME`, honoured via
+`freezeStateRoot()`) from the **INVOKING SHELL's** environment — not the
+daemon's. The daemon runs under a systemd user unit (`butchr.service`),
+whose environment is whatever was set at the unit's own start, which can
+silently differ from an operator's interactive shell (a different
+`XDG_CONFIG_HOME`, a leftover `BUTCHR_SESSION_DEFINITIONS_DIR` from a
+previous debugging session, ...). This is why every archive/unarchive/
+freeze/unfreeze command prints its resolved directories/root — so a
+mismatch is visible immediately, rather than showing up later as "I ran
+`butchr session freeze foo` and nothing happened."
+
+What each kind of mismatch actually does:
+- **Definitions-directory mismatch:** the CLI operates on a directory the
+  daemon never polls (or a different one than the operator expects) —
+  fails LOUDLY and immediately, the same `no definition named "<name>" in
+  <dir>` a plain typo would produce, because the CLI can't find the
+  definition it was asked to act on in the directory it resolved. Nothing
+  silently no-ops.
+- **Freeze-store-root-only mismatch** (the definitions directory matches,
+  but `DROVR_CONTROL_HOME` doesn't): the manifest gate still gets set/read
+  correctly (it's a field in the definition file itself, wherever that
+  file lives) — a `freeze`/`archive` invoked this way still visibly takes
+  effect via the manifest flag. But the STORE gate is silently written to
+  a DIFFERENT root than the one the daemon's own `HerdrHerd.frozen()`
+  reads — an operator who only checked "the manifest says frozen: true"
+  could reasonably but wrongly conclude the store gate agrees; it does
+  not, and the daemon-side answer for that gate is whatever a previous
+  write to the DAEMON's own root last left it at. This is the one mismatch
+  that does NOT fail loudly, which is exactly why the resolved
+  freeze-store root is printed on every freeze/unfreeze/archive/unarchive
+  — compare it against `journalctl --user -u butchr.service`'s own startup
+  log (or the daemon's environment directly) when a freeze/archive doesn't
+  seem to be taking effect.
+- **Archive-directory mismatch:** same shape as the definitions-directory
+  case — `unarchive`/`list --archived` operate against a directory that
+  may not be where a previous `archive` (run under a different
+  environment) actually put the file; a `does not exist` refusal is the
+  visible symptom, not a silent no-op.
 
 ## Working directory wiring
 
@@ -377,7 +884,11 @@ permission wiring is out of scope for this ticket.
 - **The Rocket.Chat account lifecycle** (`account: "temporary"|"permanent"`)
   — accepted and stored, like every `Rule`'s own `account` field, but
   implements nothing; the account lifecycle itself is a later story for
-  every provider alike.
+  every provider alike. `archiveSessionDefinition`'s `onArchived` hook
+  (BUTCHR-455, see "Post-archive hook seam" above) is the wiring POINT for
+  this — S4's `releaseAccount(agentKey, "archive")` — but is not itself
+  wired to it yet: that hook still defaults to a no-op until a follow-up
+  task connects it, once BUTCHR-395 (S4) reaches `main`.
 - **A definition's own `execution` mode is not acted on.** The built-in
   rule always runs `swarm` (one agent per eligible definition file); a
   definition's `execution` field reuses `Rule`'s type/validation and is

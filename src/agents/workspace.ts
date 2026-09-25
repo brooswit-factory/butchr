@@ -15,6 +15,7 @@ import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
+import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 
 /**
@@ -415,9 +416,23 @@ export const JIRA_IDEA_TOOLS_NOTE =
 export const ZENDESK_TICKET_TOOLS_NOTE =
   "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
 
-/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. */
+/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. NOT shown to a managed-session (`managed-sessions` rule) agent — see `MANAGED_SESSION_TOOLS_NOTE` below, which is the accurate note for that narrower case (BUTCHR-456 gives it exactly two conditional tools, not none). */
 export const FILESYSTEM_TOOLS_NOTE =
   "Your resource is a file or directory on disk, not a Jira ticket. Read and edit it directly with your own file tools — there is no butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. You are told when it changes (created, modified, or removed) — re-read it from disk then.";
+
+/**
+ * BUTCHR-456: what a MANAGED-SESSION agent specifically is told — narrower
+ * than `FILESYSTEM_TOOLS_NOTE` above, which would otherwise tell a
+ * `director-brooswit-mud`-shaped agent "there is no butchr MCP tool for it"
+ * even once its own definition IS granted freeze/unfreeze control over
+ * another one, undermining the very capability this delegation exists to
+ * give it. Shown to every managed-session agent regardless of whether it
+ * currently holds any grant (a definition's OWN manifest is what actually
+ * decides that at call time — this brief text is static per rule, like
+ * every other `TOOLS_NOTE` entry, not re-derived per grant).
+ */
+export const MANAGED_SESSION_TOOLS_NOTE =
+  "Your resource is a managed-session definition file, not a Jira ticket. Read and edit YOUR OWN definition directly with your own file tools — there is no general-purpose butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. The ONE exception: if ANOTHER definition's own `freezeControllers`/`unfreezeControllers` grant names your definition's file, you may call the butchr `freeze_session`/`unfreeze_session` tool (argument: that OTHER definition's name) to flip its freeze state. You have no other butchr MCP tool, and you can never edit any grant, or create, archive, or delete a definition — see docs/managed-sessions.md's \"Delegated freeze/unfreeze\" section. You are told when your own file changes (created, modified, or removed) — re-read it from disk then.";
 
 const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 
@@ -429,9 +444,12 @@ const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISS
  * {{KEY}}/{{PARENT}}/… placeholders never reach the agent raw.
  */
 const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
-  const note = TOOLS_NOTE[providerOf(spec) ?? ""];
+  const decoded = decodeAnyAgentKey(spec.key);
+  const note = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID
+    ? MANAGED_SESSION_TOOLS_NOTE
+    : TOOLS_NOTE[decoded?.resourceProvider ?? ""];
   const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
-  return `${ruleBriefHeader(decodeAnyAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
+  return `${ruleBriefHeader(decoded?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
 };
 
 /**

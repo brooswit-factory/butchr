@@ -110,9 +110,70 @@ export interface SessionDefinition {
    * as S4 designed it. Absent means none — today's behaviour exactly.
    */
   mcpServers?: McpServerBinding[];
+  /**
+   * BUTCHR-456 (BUTCHR-394 T3, CNDLX-45's delegated freeze/unfreeze) —
+   * OTHER managed-session definitions (named by file, with or without
+   * `.json`) whose agent may call the butchr `freeze_session` MCP tool
+   * against THIS definition. Absent/empty means nobody may. Scoping lives
+   * at the MCP TOOL boundary (`src/tools/session-freeze-tools.ts`), not
+   * here — this field is just the grant an operator writes; see
+   * docs/managed-sessions.md's "Delegated freeze/unfreeze" section for the
+   * full design and what the boundary is/isn't (a tool-boundary guarantee,
+   * not an OS-level one).
+   */
+  freezeControllers?: string[];
+  /**
+   * Same shape as `freezeControllers`, for `unfreeze_session` — DELIBERATELY
+   * a separate list: listing a controller in `freezeControllers` grants it
+   * NOTHING on `unfreeze_session`, and vice versa. Per CNDLX-45's own
+   * decision, whether an agent may freeze a definition and whether it may
+   * UNFREEZE one are two independent operator judgment calls (unfreezing
+   * undoes the very migration this capability exists to protect), so the
+   * grant fields must never be merged into one list.
+   */
+  unfreezeControllers?: string[];
 }
 
-const DEFINITION_FIELDS = new Set(["workingDirectory", "brief", "vendor", "tier", "permissionMode", "execution", "account", "role", "frozen", "mcpServers"]);
+const DEFINITION_FIELDS = new Set([
+  "workingDirectory", "brief", "vendor", "tier", "permissionMode", "execution", "account", "role", "frozen",
+  "mcpServers", "freezeControllers", "unfreezeControllers",
+]);
+
+const MAX_CONTROLLERS_PER_FIELD = 100;
+const MAX_CONTROLLER_NAME_CHARS = 200;
+
+/** Strips a trailing ".json" so "foo" and "foo.json" are recognised as the same controller — the same with-or-without-extension convenience `butchr session show/freeze/unfreeze` already extend to a CLI-supplied name. */
+const controllerCanonicalName = (raw: string): string => (raw.endsWith(".json") ? raw.slice(0, -5) : raw);
+
+/**
+ * `freezeControllers`/`unfreezeControllers`: an array of non-empty file-name
+ * strings, no duplicates (compared after stripping a trailing `.json`, so
+ * `"a"` and `"a.json"` collide), no path separators, no NUL byte, and no
+ * bare `"."`/`".."` — a controller is named by FILE NAME only, never a path,
+ * so a grant can never itself be used to smuggle a traversal segment into
+ * the resolution the MCP tool later does (src/tools/session-freeze-tools.ts).
+ * A definition never needs to list itself, but nothing here forbids it —
+ * that's a no-op grant, not an error.
+ */
+function controllerListProblems(raw: unknown, at: string): string[] {
+  if (!Array.isArray(raw)) return [`${at} must be an array of strings`];
+  const problems: string[] = [];
+  if (raw.length > MAX_CONTROLLERS_PER_FIELD) problems.push(`${at} must not list more than ${MAX_CONTROLLERS_PER_FIELD} controllers`);
+  const seen = new Set<string>();
+  raw.forEach((v, i) => {
+    const pat = `${at}[${i}]`;
+    if (typeof v !== "string" || v.trim() === "") { problems.push(`${pat} must be a non-empty string`); return; }
+    const name = v.trim();
+    if (name.length > MAX_CONTROLLER_NAME_CHARS) { problems.push(`${pat} must be at most ${MAX_CONTROLLER_NAME_CHARS} characters`); return; }
+    if (name.includes("/") || name.includes("\\") || name.includes("\0")) { problems.push(`${pat} "${name}" must not contain a path separator`); return; }
+    if (name === "." || name === "..") { problems.push(`${pat} "${name}" is not a valid file name`); return; }
+    const canonical = controllerCanonicalName(name);
+    if (!canonical) { problems.push(`${pat} "${name}" is not a valid file name`); return; }
+    if (seen.has(canonical)) { problems.push(`${pat} "${name}" duplicates an earlier entry in the same list`); return; }
+    seen.add(canonical);
+  });
+  return problems;
+}
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -143,6 +204,8 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.role !== undefined && !oneOf(AGENT_ROLES, doc.role)) problems.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
   if (doc.frozen !== undefined && typeof doc.frozen !== "boolean") problems.push(`${at}.frozen must be a boolean`);
   if (doc.mcpServers !== undefined) parseMcpServers(doc.mcpServers, `${at}.mcpServers`, problems);
+  if (doc.freezeControllers !== undefined) problems.push(...controllerListProblems(doc.freezeControllers, `${at}.freezeControllers`));
+  if (doc.unfreezeControllers !== undefined) problems.push(...controllerListProblems(doc.unfreezeControllers, `${at}.unfreezeControllers`));
   return problems;
 }
 
@@ -162,6 +225,8 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     role: (d.role as AgentRole | undefined) ?? "worker",
     frozen: (d.frozen as boolean | undefined) ?? false,
     ...(d.mcpServers !== undefined ? { mcpServers: parseMcpServers(d.mcpServers, `${at}.mcpServers`, []) as McpServerBinding[] } : {}),
+    ...(d.freezeControllers !== undefined ? { freezeControllers: (d.freezeControllers as string[]).map((s) => s.trim()) } : {}),
+    ...(d.unfreezeControllers !== undefined ? { unfreezeControllers: (d.unfreezeControllers as string[]).map((s) => s.trim()) } : {}),
   };
 }
 
@@ -186,4 +251,30 @@ export function sessionDefinitionsPath(env: SessionDefinitionsEnv = process.env)
   if (env.BUTCHR_SESSION_DEFINITIONS_DIR?.trim()) return env.BUTCHR_SESSION_DEFINITIONS_DIR.trim();
   const xdg = env.XDG_CONFIG_HOME?.trim() || join(env.HOME?.trim() || homedir(), ".config");
   return join(xdg, "butchr", "session-definitions");
+}
+
+/**
+ * BUTCHR-455 review fix: `builtinManagedSessionsRule`'s own query
+ * (`{root, kind: "file", maxDepth: 1}`) has no name filter, and
+ * `listFilesystemResources` does not skip dotfiles — so a temp file a
+ * writer leaves in the ACTIVE directory mid-write (`writeFileAtomic`'s own
+ * `.<uuid>.tmp`, used by `create`, `freeze`/`unfreeze`'s manifest rewrite,
+ * and this ticket's own cross-filesystem `unarchive` fallback) is a
+ * CANDIDATE definition for the brief window between its write and its
+ * rename into the real name. If a poll lands in that window and the temp
+ * content happens to already be a valid, non-frozen manifest (true for
+ * every one of those writers, which all write/rewrite a full valid
+ * document), it would be staffed as a SECOND agent under a path-derived
+ * key that has no relationship to the real definition's own freeze state —
+ * breaking "one agent per eligible definition" and, worse, able to run
+ * un-frozen while the real definition is still store-frozen. Both
+ * `searchSessionDefinitions` (`src/rules/session-definition-type.ts`) and
+ * `listSessionDefinitions` (`src/resources/session-definition-manage.ts`)
+ * call this FIRST, before any oversized/parse/frozen check, and skip a
+ * hidden entry SILENTLY — never logged as invalid, never listed at all —
+ * because a hidden file was never offered as a definition in the first
+ * place; it's not a broken one.
+ */
+export function isHiddenDefinitionFile(basename: string): boolean {
+  return basename.startsWith(".");
 }
