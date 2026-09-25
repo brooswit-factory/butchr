@@ -1,3 +1,4 @@
+import { parseProjectQuery, type JiraProject } from '../resources/jira-project.js';
 import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink, JiraRemoteLinkInput } from "./types.js";
 
 /** One issue read by key, with its description flattened to plain text. */
@@ -51,6 +52,28 @@ export class AtlassianClient {
     private readonly log: (line: string) => void = () => {},
   ) {
     this.auth = "Basic " + Buffer.from(`${email}:${token}`).toString("base64");
+  }
+
+  async searchProjects(query: string): Promise<JiraProject[]> {
+    const q = parseProjectQuery(query);
+    const lead = q.leadAccountId === 'me' ? (await this.get('/rest/api/3/myself')).accountId : q.leadAccountId;
+    if (q.leadAccountId && !lead) throw new Error('Cannot determine project lead identity');
+    const out: JiraProject[] = [];
+    for (let offset = 0; ;) {
+      const params = new URLSearchParams({startAt:String(offset),maxResults:'100',expand:'lead',status:'live'});
+      if (q.query) params.set('query', q.query);
+      const page = await this.get('/rest/api/3/project/search?' + params);
+      if (!Array.isArray(page.values) || typeof page.total !== 'number') throw new Error('Invalid project search page');
+      for (const p of page.values) {
+        if (typeof p.id !== 'string' || typeof p.key !== 'string' || typeof p.name !== 'string') throw new Error('Invalid project record');
+        if (lead && typeof p.lead?.accountId !== 'string') throw new Error('Project search omitted lead identity');
+        if (p.archived || (lead && p.lead.accountId !== lead) || (q.keys && !q.keys.includes(p.key))) continue;
+        out.push({id:p.id,key:p.key,name:p.name,...(p.lead?.accountId ? {leadAccountId:p.lead.accountId}:{}),...(typeof p.archived==='boolean'?{archived:p.archived}:{})});
+      }
+      offset += page.values.length;
+      if (page.isLast === true || offset >= page.total) return out;
+      if (!page.values.length) throw new Error('Incomplete project search pagination');
+    }
   }
 
   private async get(path: string): Promise<any> {
