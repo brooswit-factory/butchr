@@ -360,4 +360,40 @@ describe("BUTCHR-437: shared caps across every link kind", () => {
     expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-2");
     expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: CONF_URL, kind: "confluence", detail: "version changed from 1 to 2" }]);
   });
+
+  test("PR #401 review round 2: a poller that THROWS/REJECTS for one owner does not lose the whole tick — another owner's external change AND a third owner's Jira-kind change both still notify", async () => {
+    const throwingOwner = issue("BUTCHR-1", { description: `see ${CONF_URL}` });
+    const okExternalOwner = issue("BUTCHR-2", { description: `see ${WEBPAGE_URL}` });
+    const jiraOwner = issue("BUTCHR-3", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-9" }] as never });
+    const world = { "BUTCHR-9": issue("BUTCHR-9", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { base, notified } = fakeBase();
+    const search = async (jql: string) => {
+      const m = /^key in \((.*)\)$/.exec(jql);
+      const keys = m ? m[1]!.split(",") : [];
+      return keys.map((k) => world[k as keyof typeof world]).filter((i): i is JiraIssue => Boolean(i));
+    };
+    // A caller-supplied confluenceVersion that misbehaves and REJECTS outright (not the well-formed `{ok:false,...}` shape every real poller uses) — simulates a bug this module must survive, per the review's own "make pollExternalItem genuinely non-throwing" ask.
+    const confluenceVersion: NonNullable<LinkedEventingDeps["confluenceVersion"]> = async () => { throw new Error("boom: simulated bug in the caller-supplied Confluence client"); };
+    let wpVersion = 1;
+    const webpageFetch: FetchLike = async () => new Response("body", { status: 200, headers: { etag: `"v${wpVersion}"` } });
+    const deps: LinkedEventingDeps = { ...base, search, confluenceVersion, webpage: { fetchImpl: webpageFetch, isBlockedHost: async () => false } };
+    const mThrow = match("jira-work:task:BUTCHR-1", rule(), throwingOwner);
+    const mOk = match("jira-work:task:BUTCHR-2", rule(), okExternalOwner);
+    const mJira = match("jira-work:task:BUTCHR-3", rule(), jiraOwner);
+
+    await expect(state.runTick([mThrow, mOk, mJira], deps)).resolves.toBeUndefined(); // seed — must not reject
+    expect(notified).toHaveLength(0);
+
+    wpVersion = 2;
+    world["BUTCHR-9"] = issue("BUTCHR-9", { status: "In Progress" });
+    await expect(state.runTick([mThrow, mOk, mJira], deps)).resolves.toBeUndefined(); // must still not reject despite BUTCHR-1's confluenceVersion throwing every tick
+    expect(notified).toHaveLength(2); // BUTCHR-2 (webpage) and BUTCHR-3 (Jira) both notified; BUTCHR-1 gets nothing this tick (its poll errored, not a change)
+    expect(notified.map((n) => n.agent).sort()).toEqual(["jira-work:task:BUTCHR-2", "jira-work:task:BUTCHR-3"]);
+    // Note: `pollConfluencePage` itself already catches this throw (via `withTimeout`'s
+    // surrounding try/catch) and resolves `{status:"error"}` quietly, the same as any other
+    // transient failure — it never reaches `pollExternalItem`'s own catch. That catch is
+    // defense-in-depth for a poller that regresses on the "never throw" contract
+    // `external-poll.ts`'s own functions all currently honour.
+  });
 });

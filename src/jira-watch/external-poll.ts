@@ -200,8 +200,25 @@ const WEBPAGE_MAX_BODY_BYTES = 1_000_000;
 /** GitHub's own guidance for "stop following, something is wrong" — reused here for the same reason. */
 const WEBPAGE_MAX_REDIRECTS = 5;
 
+/** GitHub only (api.github.com — a TRUSTED host with small, bounded JSON bodies): reads the whole body so a reused connection isn't stalled by an unread one on some fetch implementations. NEVER use this for a webpage-kind response — see `cancelBody` below, and PR #401 review round 2. */
 async function drain(res: Response): Promise<void> {
-  await res.arrayBuffer().catch(() => undefined); // an unread body on a reused connection can otherwise stall a later request on some fetch implementations
+  await res.arrayBuffer().catch(() => undefined);
+}
+
+/**
+ * Webpage-kind only (an UNTRUSTED host): discards `res`'s body WITHOUT
+ * reading it — `ReadableStream#cancel`, not `arrayBuffer()`. PR #401 review
+ * round 2: every webpage response this module doesn't intend to hash
+ * (an ETag/Last-Modified hit, a 404/403/5xx, or a redirect) must never
+ * `await res.arrayBuffer()` — that reads the ENTIRE body into memory with
+ * NO size bound at all, defeating `WEBPAGE_MAX_BODY_BYTES` for exactly the
+ * responses a malicious or misconfigured host is likeliest to abuse (a
+ * `200` with a real `ETag` and an endless body costs nothing to send).
+ * Only `readCapped` below, which enforces the cap while it reads, is ever
+ * allowed to read a webpage response's actual bytes.
+ */
+async function cancelBody(res: Response): Promise<void> {
+  await res.body?.cancel().catch(() => undefined);
 }
 
 function conditionalHeadersFor(fingerprint: string | undefined): Record<string, string> {
@@ -212,34 +229,47 @@ function conditionalHeadersFor(fingerprint: string | undefined): Record<string, 
 }
 
 /**
- * Read `res`'s body up to `maxBytes`, or `null` if it would exceed the cap —
- * checked against `content-length` first (cheap, no bytes read when a
- * well-behaved server states its size up front) and enforced again while
- * streaming (a missing or LYING `content-length` must not defeat the cap).
- * The connection is cancelled, not merely abandoned, the moment the cap is
- * crossed — this function never buffers more than `maxBytes` + one chunk.
+ * Read `res`'s body up to `maxBytes`, or `null` if it would exceed the cap,
+ * runs out of time against `deadlineMs`, or fails outright (a reset mid-body,
+ * an aborted read) — NEVER throws (PR #401 review round 2: an earlier
+ * version let a rejected `reader.read()` propagate out of this function,
+ * out of `pollWebpage`, out of `pollExternalItem`, out of the `Promise.all`
+ * in `linked-eventing.ts`'s `runTick` — losing the WHOLE tick for every
+ * owner, Jira-kind changes included, over one misbehaving webpage). Checked
+ * against `content-length` first (cheap, no bytes read when a well-behaved
+ * server states its size up front) and enforced again while streaming (a
+ * missing or LYING `content-length` must not defeat the cap). The connection
+ * is cancelled, not merely abandoned, the moment the cap OR the deadline is
+ * crossed — this function never buffers more than `maxBytes` + one chunk,
+ * and never waits past `deadlineMs` for one `read()` call.
  */
-async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array | null> {
-  const len = res.headers.get("content-length");
-  if (len !== null && Number(len) > maxBytes) { await drain(res); return null; }
-  if (!res.body) {
-    const buf = await res.arrayBuffer();
-    return buf.byteLength > maxBytes ? null : new Uint8Array(buf);
+async function readCapped(res: Response, maxBytes: number, deadlineMs: number): Promise<Uint8Array | null> {
+  try {
+    const len = res.headers.get("content-length");
+    if (len !== null && Number(len) > maxBytes) { await cancelBody(res); return null; }
+    if (!res.body) {
+      const buf = await withTimeout(res.arrayBuffer(), Math.max(1, deadlineMs - Date.now()));
+      return buf.byteLength > maxBytes ? null : new Uint8Array(buf);
+    }
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) { await reader.cancel().catch(() => undefined); return null; }
+      const { done, value } = await withTimeout(reader.read(), remaining);
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) { await reader.cancel().catch(() => undefined); return null; }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+    return out;
+  } catch {
+    return null; // a reset mid-body, a read timeout, or anything else — transient, never thrown
   }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maxBytes) { await reader.cancel().catch(() => undefined); return null; }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
-  return out;
 }
 
 // PRIVATE/LOOPBACK ADDRESSES (ticket's own "state what you decided and why"):
@@ -255,12 +285,17 @@ async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array |
 // link-local (169.254.0.0/16 — includes the 169.254.169.254 cloud-metadata
 // address) and "this network" (0.0.0.0/8); IPv6 loopback (::1), unspecified
 // (::), unique-local (fc00::/7), link-local (fe80::/10), and an
-// IPv4-mapped/IPv4-compatible IPv6 address (`::ffff:a.b.c.d` OR its
-// all-hex form `::ffff:AABB:CCDD`) checked by its EMBEDDED IPv4 address
-// against the IPv4 rules above — plus the literal hostname `localhost`.
-// Applied to the INITIAL host and to every redirect hop's host (see
-// `pollWebpage`) — a page that redirects to an internal address is refused
-// exactly like one that starts there.
+// IPv4-MAPPED IPv6 address specifically (`::ffff:a.b.c.d` OR its all-hex
+// form `::ffff:AABB:CCDD`) checked by its EMBEDDED IPv4 address against the
+// IPv4 rules above — plus the literal hostname `localhost`. NOT covered:
+// the separate, long-deprecated IPv4-COMPATIBLE form (`::a.b.c.d`, no
+// `ffff` — RFC 4291 deprecated it in 2006, and neither Node's `net.isIP`
+// nor any DNS resolver in ordinary use emits it); `parseIPv6`/`isPrivateV6`
+// below do not special-case it (a bare `::a.b.c.d` parses as an ordinary
+// non-mapped IPv6 value, not as IPv4 at all). Applied to the INITIAL host
+// and to every redirect hop's host (see `pollWebpage`) — a page that
+// redirects to an internal address is refused exactly like one that starts
+// there.
 // STATED LIMITATION, NOT FIXED HERE: this is a resolve-then-check, not a
 // resolve-and-PIN-to-that-address fetch — the actual `fetch()` call still
 // re-resolves the hostname itself, so a DNS answer that changes between this
@@ -430,9 +465,9 @@ export async function pollWebpage(item: { target: string }, priorFingerprint: st
       return { status: "error" };
     }
 
-    if (res.status === 304) { await drain(res); return { status: "not-modified" }; }
+    if (res.status === 304) { await cancelBody(res); return { status: "not-modified" }; }
     if (res.status >= 300 && res.status < 400) {
-      await drain(res);
+      await cancelBody(res);
       const location = res.headers.get("location");
       if (!location) return { status: "unreadable" };
       let next: URL;
@@ -441,15 +476,21 @@ export async function pollWebpage(item: { target: string }, priorFingerprint: st
       current = next;
       continue;
     }
-    if (res.status === 404 || res.status === 403) { await drain(res); return { status: "unreadable", httpStatus: res.status }; }
-    if (!res.ok) { await drain(res); return { status: "error" }; }
+    if (res.status === 404 || res.status === 403) { await cancelBody(res); return { status: "unreadable", httpStatus: res.status }; }
+    if (!res.ok) { await cancelBody(res); return { status: "error" }; }
 
+    // PR #401 review round 2: an ETag/Last-Modified hit's body is NEVER
+    // read here — `cancelBody`, not `drain` — an untrusted host offering a
+    // validator on a huge or endless body must not cost this poller
+    // anything beyond the headers. Only the hash fallback below (no
+    // validator offered) reads the body at all, and only through
+    // `readCapped`'s own enforced cap and deadline.
     const etag = res.headers.get("etag");
-    if (etag) { await drain(res); return { status: "ok", fingerprint: `etag:${etag}` }; }
+    if (etag) { await cancelBody(res); return { status: "ok", fingerprint: `etag:${etag}` }; }
     const lastModified = res.headers.get("last-modified");
-    if (lastModified) { await drain(res); return { status: "ok", fingerprint: `lm:${lastModified}` }; }
-    const body = await readCapped(res, WEBPAGE_MAX_BODY_BYTES);
-    if (body === null) return { status: "error" }; // over the size cap — see this module's own top comment for why this is "error", not "unreadable"
+    if (lastModified) { await cancelBody(res); return { status: "ok", fingerprint: `lm:${lastModified}` }; }
+    const body = await readCapped(res, WEBPAGE_MAX_BODY_BYTES, deadline);
+    if (body === null) return { status: "error" }; // over the size cap, past the deadline, or a mid-body failure — see readCapped's own doc comment for why this is "error", not "unreadable"
     return { status: "ok", fingerprint: `hash:${fnv1a(Buffer.from(body).toString("latin1"))}` };
   }
 }

@@ -323,19 +323,34 @@ const EXTERNAL_POLL_CONCURRENCY = 8;
 
 /** BUTCHR-437: dispatches one already-discovered external-kind item to its own poller (`external-poll.ts`), threading the PRIOR fingerprint through for a genuine conditional GET (GitHub/webpage) — see `LinkedEventingDeps`'s own doc comments for what an omitted dep resolves to. Never throws — every branch below, and every poller it calls, resolves a `PollVerdict` (including `"error"`) instead. */
 async function pollExternalItem(item: LinkedItem, priorFingerprint: string | undefined, deps: LinkedEventingDeps): Promise<PollVerdict> {
-  if (item.kind === "confluence") {
-    if (!deps.confluenceVersion) return { status: "error" };
-    return pollConfluencePage(item.target, { getVersion: deps.confluenceVersion });
+  // PR #401 review round 2: this function is `mapLimit`'s own `fn`, and
+  // `mapLimit`'s doc comment says its `fn` never throws — every poller it
+  // calls is now written to hold that invariant itself (see
+  // `external-poll.ts`'s `readCapped`, `pollConfluencePage`, `pollGithubLink`
+  // — every one already resolves `"error"` rather than rejecting), but this
+  // try/catch is the belt to that suspenders: a poller that regresses on
+  // that contract, or a bug in the dispatch below, must never let ONE
+  // owner's ONE bad link throw `runTick`'s `Promise.all` and lose the
+  // WHOLE tick's notifies for EVERY owner (Jira-kind changes included) —
+  // exactly the failure mode round 2 found live in `readCapped`.
+  try {
+    if (item.kind === "confluence") {
+      if (!deps.confluenceVersion) return { status: "error" };
+      return await pollConfluencePage(item.target, { getVersion: deps.confluenceVersion });
+    }
+    if (item.kind === "github-issue" || item.kind === "github-pr") {
+      if (!deps.github) return { status: "error" };
+      return await pollGithubLink({ kind: item.kind, target: item.target }, priorFingerprint ?? null, deps.github);
+    }
+    if (item.kind === "webpage") {
+      if (!deps.webpage) return { status: "error" };
+      return await pollWebpage(item, priorFingerprint, deps.webpage);
+    }
+    return { status: "error" }; // unreachable — EXTERNAL_DISCOVERY_KINDS only ever produces the three kinds above
+  } catch (e) {
+    deps.log?.(`  WARNING: [linked-eventing] external poll threw for ${item.kind} ${item.target}: ${(e as Error)?.message ?? e}`);
+    return { status: "error" };
   }
-  if (item.kind === "github-issue" || item.kind === "github-pr") {
-    if (!deps.github) return { status: "error" };
-    return pollGithubLink({ kind: item.kind, target: item.target }, priorFingerprint ?? null, deps.github);
-  }
-  if (item.kind === "webpage") {
-    if (!deps.webpage) return { status: "error" };
-    return pollWebpage(item, priorFingerprint, deps.webpage);
-  }
-  return { status: "error" }; // unreachable — EXTERNAL_DISCOVERY_KINDS only ever produces the three kinds above
 }
 
 /** A fresh, empty linked-eventing state — one instance per daemon lifetime (mirrors `createLinkedDiscoveryTracker`/`createOwnWriteLedger`'s own "one instance, closed over, reused every poll" shape). */

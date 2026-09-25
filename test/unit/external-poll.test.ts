@@ -208,6 +208,52 @@ describe("BUTCHR-437: pollWebpage", () => {
   });
 });
 
+describe("BUTCHR-437: pollWebpage — PR #401 review round 2: an untrusted body is never read unbounded", () => {
+  test("an ETag response's body is NEVER read (cancelled, not buffered) — proven with an endless stream that would hang/OOM if actually consumed", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(64 * 1024)); // would grow forever if ever actually read
+      },
+      cancel() { cancelled = true; },
+    });
+    const deps: WebpagePollDeps = {
+      isBlockedHost: async () => false,
+      fetchImpl: async () => new Response(stream, { status: 200, headers: { etag: '"e"' } }),
+    };
+    const start = Date.now();
+    const result = await pollWebpage({ target: "https://example.com/x" }, undefined, deps);
+    expect(result).toEqual({ status: "ok", fingerprint: 'etag:"e"' });
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(pulls).toBeLessThanOrEqual(1); // at most the platform's own eager initial fill — this module never calls .read() in a loop to drain it
+    expect(cancelled).toBe(true);
+  });
+
+  test("the hash-fallback path (no ETag/Last-Modified) still enforces the size cap on a genuinely huge body without hanging", async () => {
+    let pulls = 0;
+    const stream = new ReadableStream({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(200_000)); }, // 200KB/chunk — exceeds the 1MB cap after 6 pulls
+    });
+    const deps: WebpagePollDeps = { isBlockedHost: async () => false, fetchImpl: async () => new Response(stream, { status: 200 }) };
+    const start = Date.now();
+    const result = await pollWebpage({ target: "https://example.com/x" }, undefined, deps);
+    expect(result).toEqual({ status: "error" });
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(pulls).toBeLessThanOrEqual(7); // stopped promptly once the cap was crossed, not after reading the whole (endless) stream
+  });
+
+  test("a mid-body read failure resolves error, not a thrown exception", async () => {
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(10)); },
+      pull() { throw new Error("connection reset"); },
+    });
+    const deps: WebpagePollDeps = { isBlockedHost: async () => false, fetchImpl: async () => new Response(stream, { status: 200 }) };
+    await expect(pollWebpage({ target: "https://example.com/x" }, undefined, deps)).resolves.toEqual({ status: "error" });
+  });
+});
+
 describe("BUTCHR-437: pollWebpage — PR #401 review round 1: one shared deadline across every redirect hop", () => {
   test("a fetchImpl that never resolves is bounded by timeoutMs (error), not left hanging forever, and isBlockedHost is still consulted first", async () => {
     let blockedCalls = 0;
