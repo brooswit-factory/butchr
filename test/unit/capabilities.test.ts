@@ -31,8 +31,8 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   test("jira-idea: query, read and comments (FACTORY-21: wired through comments.ts, reusing JiraIdeaClient.comments/.addComment) — links stays false, still no managed-link-store integration and still excluded from ResourceRef", () => {
     expect(capabilitiesOf(REF_OF["jira-idea"])).toEqual(["query", "read", "comments"]);
   });
-  test("confluence-page: links only — no live query/read code, only a version-number change-token hook; comments stays unsupported (no native 'project comment' analogue was wired in — see the doc for the AtlassianOps.commentOnPage/getPageComments finding)", () => {
-    expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["links"]);
+  test("confluence-page: comments and links — no live query/read code, only a version-number change-token hook; comments is now wired (FACTORY-29/31) over AtlassianOps.getPageComments/commentOnPage, see comments.test.ts", () => {
+    expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["comments", "links"]);
   });
   test("github-issue: query, read, links and comments (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — no snapshot/diff wiring", () => {
     expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links"]);
@@ -65,7 +65,7 @@ const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typ
   "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
