@@ -227,6 +227,14 @@ implementation is synchronous underneath, so a future network-backed
 implementation (FACTORY-5's Jira REST project property) can satisfy the same
 interface without a breaking signature change.
 
+The CLI resolves the store via the SAME `defaultLinksStorePath()`
+(`workspaceRoot()`/`BUTCHR_LINKS_STORE_FILE`) the daemon uses — an operator
+must run `butchr link ...` with the same environment (`BUTCHR_WORKSPACES`/
+`BUTCHR_LINKS_STORE_FILE`) as the daemon it's inspecting to see the same
+store; a different shell environment silently resolves to a different file
+rather than failing loudly, since a missing store file is a normal, valid
+empty state, not an error.
+
 **Atomic write** (temp file + rename), unlike this repo's existing
 `capture-store.ts` (plain `writeFileSync`) — deliberate, because this file is
 the durable source of truth for a resource's links, written by both an

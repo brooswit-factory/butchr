@@ -49,6 +49,25 @@ function parseOrFail(input: string, argName: string, io: LinkCliIo): { ok: true;
 }
 
 /**
+ * Runs `op` (a store-touching call — `listLinks`/`addLink`/`removeLink`) and
+ * reports any thrown/rejected error as a clean one-line `stderr` message
+ * instead of letting it propagate — a `LinkStore` read can throw (an
+ * unreadable file, invalid JSON, or `link-store.ts`'s own newer-version
+ * refusal), and this function is what keeps that from surfacing as an
+ * uncaught stack trace at the top of `src/daemon/index.ts` instead of the
+ * clean, documented exit-1 behaviour this CLI promises. `null` on failure —
+ * the caller returns 1 without touching `io.stdout`.
+ */
+async function tryStoreOp<T>(op: () => Promise<T>, io: LinkCliIo): Promise<T | null> {
+  try {
+    return await op();
+  } catch (e) {
+    io.stderr(`butchr link: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/**
  * `argv` is everything AFTER `link` (i.e. `process.argv.slice(3)` when
  * `process.argv[2] === "link"`). Returns the process exit code; never
  * throws. `io` is injectable for tests — production omits it and gets the
@@ -73,7 +92,8 @@ export async function runLinkCli(argv: string[], io: LinkCliIo = defaultIo()): P
     }
     const resource = parseOrFail(rest[0]!, "resource:", io);
     if (!resource.ok) return 1;
-    const links = await listLinks(io.store, resource.ref);
+    const links = await tryStoreOp(() => listLinks(io.store, resource.ref), io);
+    if (links === null) return 1;
     if (!links.length) {
       io.stdout(`no links for ${formatResourceRef(resource.ref)}`);
       return 0;
@@ -92,7 +112,8 @@ export async function runLinkCli(argv: string[], io: LinkCliIo = defaultIo()): P
     if (!resource.ok || !target.ok) return 1;
 
     if (sub === "add") {
-      const result = await addLink(io.store, resource.ref, target.ref);
+      const result = await tryStoreOp(() => addLink(io.store, resource.ref, target.ref), io);
+      if (result === null) return 1;
       if (!result.ok) {
         io.stderr(`butchr link add: ${result.error}`);
         return 1;
@@ -105,7 +126,8 @@ export async function runLinkCli(argv: string[], io: LinkCliIo = defaultIo()): P
       return 0;
     }
 
-    const result = await removeLink(io.store, resource.ref, target.ref);
+    const result = await tryStoreOp(() => removeLink(io.store, resource.ref, target.ref), io);
+    if (result === null) return 1;
     io.stdout(
       result.removed
         ? `removed ${formatResourceRef(target.ref)} from ${formatResourceRef(resource.ref)}`

@@ -1,20 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runLinkCli, type LinkCliIo } from "../../src/cli/link-cli.js";
 import { createLinkStore } from "../../src/resources/link-store.js";
 
 let dir: string;
+let file: string;
 let io: LinkCliIo;
 let out: string[];
 let err: string[];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "butchr-link-cli-"));
+  file = join(dir, "links.json");
   out = [];
   err = [];
-  io = { store: createLinkStore(join(dir, "links.json")), stdout: (l) => out.push(l), stderr: (l) => err.push(l) };
+  io = { store: createLinkStore(file), stdout: (l) => out.push(l), stderr: (l) => err.push(l) };
 });
 
 afterEach(() => {
@@ -100,5 +102,35 @@ describe("remove", () => {
   test("removing an absent link is still exit 0 — non-destructive, not an error", async () => {
     expect(await runLinkCli(["remove", "jira-project:BUTCHR", "confluence-page:999"], io)).toBe(0);
     expect(out).toEqual(["confluence-page:999 was not linked to jira-project:BUTCHR"]);
+  });
+});
+
+describe("store errors: a clean stderr line and exit 1, never an uncaught throw", () => {
+  test("a newer-than-supported store version, on list", async () => {
+    writeFileSync(file, JSON.stringify({ v: 999, links: {} }));
+    await expect(runLinkCli(["list", "jira-project:BUTCHR"], io)).resolves.toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join("\n")).toMatch(/newer than this build supports/);
+  });
+
+  test("a newer-than-supported store version, on add", async () => {
+    writeFileSync(file, JSON.stringify({ v: 999, links: {} }));
+    await expect(runLinkCli(["add", "jira-project:BUTCHR", "confluence-page:1"], io)).resolves.toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join("\n")).toMatch(/newer than this build supports/);
+  });
+
+  test("a newer-than-supported store version, on remove", async () => {
+    writeFileSync(file, JSON.stringify({ v: 999, links: {} }));
+    await expect(runLinkCli(["remove", "jira-project:BUTCHR", "confluence-page:1"], io)).resolves.toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join("\n")).toMatch(/newer than this build supports/);
+  });
+
+  test("invalid JSON in the store file", async () => {
+    writeFileSync(file, "not json");
+    await expect(runLinkCli(["list", "jira-project:BUTCHR"], io)).resolves.toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join("\n")).toMatch(/not valid JSON/);
   });
 });
