@@ -74,6 +74,30 @@ describe("BUTCHR-437: pollGithubLink", () => {
     expect(await pollGithubLink({ kind: "github-issue", target: "not-a-ref" }, null, deps)).toEqual({ status: "unreadable" });
     expect(called).toBe(false);
   });
+
+  describe("PR #401 review round 1: a rate-limited 403 is transient, not unreadable", () => {
+    test("x-ratelimit-remaining: 0 => error (no notify, no unreadable line)", async () => {
+      const deps: GithubConditionalDeps = { fetchImpl: async () => new Response(null, { status: 403, headers: { "x-ratelimit-remaining": "0" } }) };
+      expect(await pollGithubLink({ kind: "github-issue", target: REF }, null, deps)).toEqual({ status: "error" });
+    });
+
+    test("a retry-after header on a 403 => error too", async () => {
+      const deps: GithubConditionalDeps = { fetchImpl: async () => new Response(null, { status: 403, headers: { "retry-after": "30" } }) };
+      expect(await pollGithubLink({ kind: "github-issue", target: REF }, null, deps)).toEqual({ status: "error" });
+    });
+
+    test("a plain 403 (no rate-limit signal — e.g. access denied) is still unreadable", async () => {
+      const deps: GithubConditionalDeps = { fetchImpl: async () => new Response(null, { status: 403 }) };
+      expect(await pollGithubLink({ kind: "github-issue", target: REF }, null, deps)).toEqual({ status: "unreadable", httpStatus: 403 });
+    });
+  });
+
+  test("PR #401 review round 1: a fetchImpl that never resolves is bounded by timeoutMs (error), not left hanging forever", async () => {
+    const deps: GithubConditionalDeps = { fetchImpl: () => new Promise<Response>(() => {}), timeoutMs: 20 };
+    const start = Date.now();
+    expect(await pollGithubLink({ kind: "github-issue", target: REF }, null, deps)).toEqual({ status: "error" });
+    expect(Date.now() - start).toBeLessThan(2000);
+  });
 });
 
 describe("BUTCHR-437: pollWebpage", () => {
@@ -184,11 +208,81 @@ describe("BUTCHR-437: pollWebpage", () => {
   });
 });
 
+describe("BUTCHR-437: pollWebpage — PR #401 review round 1: one shared deadline across every redirect hop", () => {
+  test("a fetchImpl that never resolves is bounded by timeoutMs (error), not left hanging forever, and isBlockedHost is still consulted first", async () => {
+    let blockedCalls = 0;
+    const deps: WebpagePollDeps = {
+      fetchImpl: () => new Promise<Response>(() => {}),
+      isBlockedHost: async () => { blockedCalls++; return false; },
+      timeoutMs: 20,
+    };
+    const start = Date.now();
+    expect(await pollWebpage({ target: "https://example.com/x" }, undefined, deps)).toEqual({ status: "error" });
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(blockedCalls).toBe(1);
+  });
+
+  test("a hanging isBlockedHost is itself bounded — never lets an unresolved SSRF check fall through as 'not blocked'", async () => {
+    const deps: WebpagePollDeps = {
+      fetchImpl: async () => { throw new Error("should never be called"); },
+      isBlockedHost: () => new Promise<boolean>(() => {}),
+      timeoutMs: 20,
+    };
+    expect(await pollWebpage({ target: "https://example.com/x" }, undefined, deps)).toEqual({ status: "error" });
+  });
+
+  test("several redirect hops together still respect ONE overall deadline, not one timeout per hop", async () => {
+    let hops = 0;
+    const deps: WebpagePollDeps = {
+      isBlockedHost: async () => false,
+      timeoutMs: 200,
+      fetchImpl: async (u) => {
+        hops++;
+        if (hops <= 3) { await new Promise((r) => setTimeout(r, 90)); return new Response(null, { status: 302, headers: { location: `${u}?h=${hops}` } }); }
+        return new Response("late", { status: 200, headers: { etag: '"e"' } });
+      },
+    };
+    const start = Date.now();
+    const result = await pollWebpage({ target: "https://example.com/x" }, undefined, deps);
+    // 3 hops * 90ms = 270ms > the 200ms shared deadline — the chain must be cut short as transient, never followed to completion.
+    expect(result).toEqual({ status: "error" });
+    expect(Date.now() - start).toBeLessThan(2000);
+  });
+});
+
 describe("BUTCHR-437: defaultIsBlockedHost (real DNS-based SSRF guard, IP literals only exercised here to avoid a real DNS lookup in a unit test)", () => {
   test("loopback/private/link-local IP literals and localhost are blocked; an ordinary public-shaped IP literal is not", async () => {
     for (const host of ["127.0.0.1", "10.1.2.3", "172.16.0.5", "192.168.1.1", "169.254.169.254", "0.0.0.1", "localhost", "foo.localhost", "::1"]) {
       expect(await defaultIsBlockedHost(host)).toBe(true);
     }
     expect(await defaultIsBlockedHost("93.184.216.34")).toBe(false); // example.com's own A record — a public-shaped literal
+  });
+
+  test("PR #401 review round 1: CGNAT (100.64.0.0/10) is blocked", async () => {
+    expect(await defaultIsBlockedHost("100.64.0.1")).toBe(true);
+    expect(await defaultIsBlockedHost("100.127.255.254")).toBe(true);
+    expect(await defaultIsBlockedHost("100.128.0.1")).toBe(false); // just outside the /10 — a real public-shaped address
+  });
+
+  test("PR #401 review round 1: IPv6 unspecified (::), unique-local (fc00::/7), and IPv4-mapped in BOTH spellings are blocked", async () => {
+    expect(await defaultIsBlockedHost("::")).toBe(true);
+    expect(await defaultIsBlockedHost("fc00::1")).toBe(true);
+    expect(await defaultIsBlockedHost("fdff:ffff:ffff::1")).toBe(true); // top of the fc00::/7 range
+    expect(await defaultIsBlockedHost("::ffff:127.0.0.1")).toBe(true); // dotted-quad spelling
+    expect(await defaultIsBlockedHost("::ffff:7f00:1")).toBe(true); // all-hex spelling of the SAME address — the exact gap review round 1 found
+    expect(await defaultIsBlockedHost("::ffff:a9fe:a9fe")).toBe(true); // all-hex spelling of ::ffff:169.254.169.254 (cloud metadata)
+    expect(await defaultIsBlockedHost("::ffff:8.8.8.8")).toBe(false); // a genuinely public IPv4-mapped address
+    expect(await defaultIsBlockedHost("2001:4860:4860::8888")).toBe(false); // an ordinary public IPv6 literal (Google DNS)
+  });
+
+  test("PR #401 review round 1: a hostname resolving to MULTIPLE addresses is blocked if ANY of them is private, not only the first", async () => {
+    const mixedLookup = async () => [{ address: "8.8.8.8", family: 4 }, { address: "10.0.0.5", family: 4 }];
+    expect(await defaultIsBlockedHost("multi.example.com", mixedLookup)).toBe(true);
+
+    const allPublicLookup = async () => [{ address: "8.8.8.8", family: 4 }, { address: "1.1.1.1", family: 4 }];
+    expect(await defaultIsBlockedHost("multi.example.com", allPublicLookup)).toBe(false);
+
+    const secondAddressPrivate = async () => [{ address: "2001:4860:4860::8888", family: 6 }, { address: "fc00::1", family: 6 }];
+    expect(await defaultIsBlockedHost("multi.example.com", secondAddressPrivate)).toBe(true);
   });
 });

@@ -291,7 +291,37 @@ export interface LinkedEventingState {
   runTick(matches: readonly LinkedEventingMatch[], deps: LinkedEventingDeps): Promise<void>;
 }
 
-/** BUTCHR-437: dispatches one already-discovered external-kind item to its own poller (`external-poll.ts`), threading the PRIOR fingerprint through for a genuine conditional GET (GitHub/webpage) — see `LinkedEventingDeps`'s own doc comments for what an omitted dep resolves to. */
+/**
+ * BUTCHR-437 (PR #401 review round 1): runs `tasks` through `fn` with AT
+ * MOST `limit` in flight at once, never fully sequential (which let ONE
+ * slow external poll — up to `WEBPAGE_MAX_REDIRECTS + 1` hops deep,
+ * `external-poll.ts`'s own review-round-1 fix bounds each ITEM's own wait,
+ * but a tick with many items still summed their waits one after another)
+ * stall every OTHER item's, and every OTHER owner's, poll for this tick.
+ * Order of `results` matches `tasks`, regardless of finish order. A single
+ * `fn` rejection is NOT caught here — every caller in this module hands
+ * `fn` a function that already resolves to a verdict object and never
+ * throws (see `pollExternalItem` below), so this stays a plain concurrency
+ * limiter, not an error-handling layer.
+ */
+async function mapLimit<T, R>(tasks: readonly T[], limit: number, fn: (task: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(tasks.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = next++;
+      if (i >= tasks.length) return;
+      results[i] = await fn(tasks[i]!);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
+}
+
+/** BUTCHR-437 (PR #401 review round 1): how many external polls (across every owner, every kind, combined) `runTick` runs concurrently — bounds the tick's own wall-clock cost without needing a full async task queue. */
+const EXTERNAL_POLL_CONCURRENCY = 8;
+
+/** BUTCHR-437: dispatches one already-discovered external-kind item to its own poller (`external-poll.ts`), threading the PRIOR fingerprint through for a genuine conditional GET (GitHub/webpage) — see `LinkedEventingDeps`'s own doc comments for what an omitted dep resolves to. Never throws — every branch below, and every poller it calls, resolves a `PollVerdict` (including `"error"`) instead. */
 async function pollExternalItem(item: LinkedItem, priorFingerprint: string | undefined, deps: LinkedEventingDeps): Promise<PollVerdict> {
   if (item.kind === "confluence") {
     if (!deps.confluenceVersion) return { status: "error" };
@@ -385,6 +415,51 @@ export function createLinkedEventingState(): LinkedEventingState {
         if (gone.length) removedByOwner.set(m.agentKey, gone);
       }
 
+      // BUTCHR-437 (PR #401 review round 1): poll-cadence gate for the THREE
+      // EXTERNAL pollers, decided per owner BEFORE any of them are actually
+      // polled — the Jira-kind batched search above stays free/every-tick,
+      // exactly as story 2 left it. `linkedPollIntervalMs` absent means
+      // "every tick", the same "absent = uncapped" convention
+      // `maxLinkedItems`/`maxLinkedTurnsPerHour` already use. Recorded
+      // IMMEDIATELY (an attempt, not an outcome) — see this module's own top
+      // comment for why this is deliberately outside the rate-cap's
+      // "advance only on success" discipline.
+      const dueForExternalByOwner = new Map<string, boolean>();
+      for (const m of opted) {
+        const interval = m.rule.linkedPollIntervalMs;
+        const lastPoll = lastExternalPollAt.get(m.agentKey);
+        const due = interval === undefined || lastPoll === undefined || now() - lastPoll >= interval;
+        dueForExternalByOwner.set(m.agentKey, due);
+        if (due) lastExternalPollAt.set(m.agentKey, now());
+      }
+
+      // BUTCHR-437 (PR #401 review round 1): every due owner's external-kind
+      // items, across every owner, polled CONCURRENTLY (bounded by
+      // `EXTERNAL_POLL_CONCURRENCY`) rather than one at a time inside the
+      // per-owner loop below — see `mapLimit`'s own doc comment for why a
+      // sequential await here would let one slow/stalled item hold up every
+      // other item's and every other owner's tick. Results are looked up by
+      // `bkey` in the synchronous per-owner loop below, mirroring how the
+      // Jira-kind path already looks its own batched-search results up by
+      // key via `byKey`.
+      interface ExternalTask { agentKey: string; item: LinkedItem; bkey: string; priorFingerprint: string | undefined }
+      const externalTasks: ExternalTask[] = [];
+      for (const m of opted) {
+        if (!dueForExternalByOwner.get(m.agentKey)) continue;
+        for (const item of perOwnerItems.get(m.agentKey)!) {
+          if (JIRA_DISCOVERY_KINDS.has(item.kind)) continue;
+          const bkey = baselineKey(m.agentKey, item.target);
+          const beforeRaw = baselines.get(bkey);
+          const priorFingerprint = beforeRaw?.kind === "external" ? beforeRaw.fingerprint : undefined;
+          externalTasks.push({ agentKey: m.agentKey, item, bkey, priorFingerprint });
+        }
+      }
+      const externalVerdicts = new Map<string, PollVerdict>();
+      if (externalTasks.length) {
+        const verdicts = await mapLimit(externalTasks, EXTERNAL_POLL_CONCURRENCY, (t) => pollExternalItem(t.item, t.priorFingerprint, deps));
+        externalTasks.forEach((t, i) => externalVerdicts.set(t.bkey, verdicts[i]!));
+      }
+
       const eventsByOwner = new Map<string, LinkedChangeEvent[]>();
       const advanceByOwner = new Map<string, () => void>();
 
@@ -395,19 +470,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         const stillUnreadable: LinkedChangeEvent[] = [];
         const toAdvance: Array<() => void> = [];
         const nowUnreadable = new Set<string>();
-
-        // BUTCHR-437: poll-cadence gate for the THREE EXTERNAL pollers only —
-        // the Jira-kind batched search above stays free/every-tick, exactly
-        // as story 2 left it. `linkedPollIntervalMs` absent means "every
-        // tick", the same "absent = uncapped" convention `maxLinkedItems`/
-        // `maxLinkedTurnsPerHour` already use. Recorded IMMEDIATELY (an
-        // attempt, not an outcome) — see this module's own top comment for
-        // why this is deliberately outside the rate-cap's "advance only on
-        // success" discipline.
-        const interval = m.rule.linkedPollIntervalMs;
-        const lastPoll = lastExternalPollAt.get(m.agentKey);
-        const dueForExternal = interval === undefined || lastPoll === undefined || now() - lastPoll >= interval;
-        if (dueForExternal) lastExternalPollAt.set(m.agentKey, now());
+        const dueForExternal = dueForExternalByOwner.get(m.agentKey) === true;
 
         for (const item of kept) {
           if (JIRA_DISCOVERY_KINDS.has(item.kind)) {
@@ -456,12 +519,14 @@ export function createLinkedEventingState(): LinkedEventingState {
           // BUTCHR-437: EXTERNAL kind (confluence / github-issue / github-pr /
           // webpage) — only ever reachable when `m.rule.linkedDescriptionLinks
           // === true` (see how `kept` is built above); skipped entirely off
-          // its own poll cadence.
+          // its own poll cadence. Already polled (concurrently, bounded) in
+          // the pre-pass above — this is a synchronous lookup, exactly like
+          // the Jira-kind branch's own `byKey.get` above.
           if (!dueForExternal) continue;
           const bkey = baselineKey(m.agentKey, item.target);
           const beforeRaw = baselines.get(bkey);
           const before = beforeRaw?.kind === "external" ? beforeRaw : undefined;
-          const verdict = await pollExternalItem(item, before?.fingerprint, deps);
+          const verdict = externalVerdicts.get(bkey)!;
           if (verdict.status === "error") continue; // transient — this item untouched this tick, next due tick retries against the same unadvanced baseline
           if (verdict.status === "unreadable") {
             nowUnreadable.add(item.target);

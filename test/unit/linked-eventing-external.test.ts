@@ -330,4 +330,34 @@ describe("BUTCHR-437: shared caps across every link kind", () => {
     expect(notified).toHaveLength(2);
     expect(linkedEvents(notified[1]!.reason).map((e) => e.target).sort()).toEqual(["BUTCHR-2", CONF_URL]);
   });
+
+  test("PR #401 review round 1: a hung webpage poll for one owner does not stall another owner's tick — the other owner still polls and notifies within the tick", async () => {
+    const STUCK_URL = "https://stuck.example.com/slow";
+    const stuckOwner = issue("BUTCHR-1", { description: `see ${STUCK_URL}` });
+    const okOwner = issue("BUTCHR-2", { description: `spec: ${CONF_URL}` });
+    const state = createLinkedEventingState();
+    const { base, notified } = fakeBase();
+    const confState = { value: 1 as number | "404" | "403" | "error" };
+    const conf = fakeConfluence(confState);
+    const fetchImpl: FetchLike = (url) => (url === STUCK_URL ? new Promise<Response>(() => {}) : Promise.resolve(new Response("x", { status: 200 })));
+    const deps: LinkedEventingDeps = {
+      ...base,
+      confluenceVersion: conf.getVersion,
+      webpage: { fetchImpl, isBlockedHost: async () => false, timeoutMs: 20 },
+    };
+    const mStuck = match("jira-work:task:BUTCHR-1", rule(), stuckOwner);
+    const mOk = match("jira-work:task:BUTCHR-2", rule(), okOwner);
+
+    await state.runTick([mStuck, mOk], deps); // seed both
+    expect(notified).toHaveLength(0);
+
+    confState.value = 2;
+    const start = Date.now();
+    await state.runTick([mStuck, mOk], deps);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2000); // bounded — the stuck webpage item's own 20ms timeoutMs, not left hanging for the tick's duration
+    expect(notified).toHaveLength(1); // BUTCHR-2's Confluence change still notified despite BUTCHR-1's stuck webpage item
+    expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-2");
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: CONF_URL, kind: "confluence", detail: "version changed from 1 to 2" }]);
+  });
 });

@@ -63,6 +63,23 @@ export type PollVerdict =
   | { status: "unreadable"; httpStatus?: number }
   | { status: "error" };
 
+/**
+ * Races `p` against a timer that REJECTS after `ms` — unlike `AbortSignal`,
+ * this bounds a caller's WAIT even when `p` itself ignores the signal it was
+ * given (a `fetchImpl` fake, or a real implementation with a bug), which is
+ * exactly the failure mode PR #401's review round 1 flagged: "one bad link
+ * must never stall polling of the rest" must hold IN TIME, not only in
+ * eventual outcome. Every network-shaped await in this module goes through
+ * this, not only the underlying `fetch`'s own `signal` option (still passed
+ * where applicable, as a well-behaved-implementation fast path).
+ */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Confluence
 // ---------------------------------------------------------------------------
@@ -70,13 +87,22 @@ export type PollVerdict =
 export interface ConfluencePollDeps {
   /** `AtlassianClient#confluencePageVersion` — a genuinely separate REST call per distinct Confluence target per tick, never batched with any other target (this ticket's own "same call shape confluence_get_page/get_doc already use"). */
   getVersion: (pageId: string) => Promise<{ ok: true; version: number } | { ok: false; transient: false; httpStatus: number } | { ok: false; transient: true }>;
+  /** Overrides the default wait bound (`CONFLUENCE_TIMEOUT_MS`) below `getVersion` is raced against — see `withTimeout`'s own doc comment. Test-only knob; production wiring omits it. */
+  timeoutMs?: number;
 }
+
+const CONFLUENCE_TIMEOUT_MS = 10_000;
 
 /** `url` is the FULL Confluence page URL `discoverLinkedItems` stored as the target (see `LinkedItem.target`'s own doc comment) — resolved to a page id via the SAME `pageIdFromUrl` `get_doc`'s own read path uses, so the two can never disagree on what counts as a Confluence page URL. */
 export async function pollConfluencePage(url: string, deps: ConfluencePollDeps): Promise<PollVerdict> {
   const pageId = pageIdFromUrl(url);
   if (pageId === null) return { status: "unreadable" }; // not a `/pages/<id>/` URL — nothing to poll, no HTTP call made, so no status
-  const r = await deps.getVersion(pageId);
+  let r: Awaited<ReturnType<ConfluencePollDeps["getVersion"]>>;
+  try {
+    r = await withTimeout(deps.getVersion(pageId), deps.timeoutMs ?? CONFLUENCE_TIMEOUT_MS);
+  } catch {
+    return { status: "error" }; // includes a `getVersion` that hangs past the deadline — transient, retried next tick
+  }
   if (!r.ok) return r.transient ? { status: "error" } : { status: "unreadable", httpStatus: r.httpStatus };
   return { status: "ok", fingerprint: String(r.version) };
 }
@@ -89,9 +115,26 @@ export interface GithubConditionalDeps {
   fetchImpl: FetchLike;
   /** Omitted: an unauthenticated request — GitHub still serves public issues/PRs, at a much lower rate limit. Never sent to any host but api.github.com (this module builds that URL itself; nothing here takes a caller-supplied host). */
   token?: string;
+  /** Overrides the default wait bound (`GITHUB_TIMEOUT_MS`) below the fetch is raced against — see `withTimeout`'s own doc comment. Test-only knob; production wiring omits it. */
+  timeoutMs?: number;
 }
 
 const GITHUB_TIMEOUT_MS = 10_000;
+
+/**
+ * PR #401 review round 1: GitHub answers an EXHAUSTED primary/secondary rate
+ * limit with HTTP 403 (never only 429) — carrying `x-ratelimit-remaining: 0`
+ * and/or a `retry-after` header. Left undistinguished from an ordinary
+ * access-denied 403, every fleet-wide rate-limit hit would render as a
+ * TRANSITION into "unreadable" for every polled GitHub link at once (a false
+ * "unreadable" storm from a transient condition — exactly what this
+ * ticket's own UNREADABLE LINKS section says must never happen). A plain
+ * 403 (no rate-limit signal) is still genuinely `unreadable` — GitHub
+ * answers a private repo this token cannot see with 403, not 404.
+ */
+function isGithubRateLimited(res: Response): boolean {
+  return res.headers.get("x-ratelimit-remaining") === "0" || res.headers.get("retry-after") !== null;
+}
 
 /**
  * `item.target` is the canonical `owner/repo#number` `formatGithubIssueRef`
@@ -107,16 +150,18 @@ export async function pollGithubLink(item: { kind: "github-issue" | "github-pr";
   if (!ref) return { status: "unreadable" };
   const path = item.kind === "github-issue" ? "issues" : "pulls";
   const url = `https://api.github.com/repos/${ref.owner}/${ref.repo}/${path}/${ref.number}`;
+  const timeoutMs = deps.timeoutMs ?? GITHUB_TIMEOUT_MS;
   let res: Response;
   try {
-    res = await deps.fetchImpl(url, {
+    res = await withTimeout(deps.fetchImpl(url, {
       headers: { ...ghHeaders(deps.token), ...(priorEtag ? { "if-none-match": priorEtag } : {}) },
-      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
-    });
+      signal: AbortSignal.timeout(timeoutMs),
+    }), timeoutMs);
   } catch {
-    return { status: "error" }; // network failure / timeout — transient
+    return { status: "error" }; // network failure / timeout (including a hung fetchImpl the AbortSignal alone did not stop) — transient
   }
   if (res.status === 304) { await drain(res); return { status: "not-modified" }; }
+  if (res.status === 403 && isGithubRateLimited(res)) { await drain(res); return { status: "error" }; } // rate-limited — transient, see isGithubRateLimited's own doc comment
   if (res.status === 404 || res.status === 403) { await drain(res); return { status: "unreadable", httpStatus: res.status }; }
   if (!res.ok) { await drain(res); return { status: "error" }; } // 5xx and anything else non-2xx — transient
   const etag = res.headers.get("etag");
@@ -143,9 +188,13 @@ export interface WebpagePollDeps {
    * without a real DNS lookup.
    */
   isBlockedHost?: (hostname: string) => Promise<boolean>;
+  /** Overrides the default OVERALL wait bound (`WEBPAGE_TIMEOUT_MS`) below — see `pollWebpage`'s own doc comment for why this is ONE shared deadline across every redirect hop, not one per hop. Test-only knob; production wiring omits it. */
+  timeoutMs?: number;
 }
 
 const WEBPAGE_TIMEOUT_MS = 10_000;
+/** How long `isBlockedHost` (the DNS-resolving SSRF check) may take before this module gives up on it — bounded independently of, and never larger than, whatever's left of the overall per-item deadline (see `pollWebpage`). */
+const DNS_TIMEOUT_MS = 5_000;
 /** A page whose body exceeds this many bytes is never hashed — see this module's own top comment for why that resolves `"error"`, not `"unreadable"`. */
 const WEBPAGE_MAX_BODY_BYTES = 1_000_000;
 /** GitHub's own guidance for "stop following, something is wrong" — reused here for the same reason. */
@@ -199,13 +248,19 @@ async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array |
 // naming an internal address is a real SSRF surface: the daemon's own
 // network position, not the ticket author's, is what would reach it.
 // DECISION: refuse by RESOLVED ADDRESS, not by hostname string alone — a
-// hostname is resolved via DNS and the RESULT checked against the loopback
-// (127.0.0.0/8, ::1), private (10/8, 172.16/12, 192.168/16), link-local
-// (169.254.0.0/16 — includes the 169.254.169.254 cloud-metadata address —
-// and fe80::/10), and "this network" (0.0.0.0/8) ranges, plus the literal
-// hostname `localhost`. Applied to the INITIAL host and to every redirect
-// hop's host (see `pollWebpage`) — a page that redirects to an internal
-// address is refused exactly like one that starts there.
+// hostname is resolved via DNS (ALL A/AAAA answers checked, not just the
+// first — see `defaultIsBlockedHost`, PR #401 review round 1) and EVERY
+// address checked against: IPv4 loopback (127.0.0.0/8), private
+// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), CGNAT (100.64.0.0/10),
+// link-local (169.254.0.0/16 — includes the 169.254.169.254 cloud-metadata
+// address) and "this network" (0.0.0.0/8); IPv6 loopback (::1), unspecified
+// (::), unique-local (fc00::/7), link-local (fe80::/10), and an
+// IPv4-mapped/IPv4-compatible IPv6 address (`::ffff:a.b.c.d` OR its
+// all-hex form `::ffff:AABB:CCDD`) checked by its EMBEDDED IPv4 address
+// against the IPv4 rules above — plus the literal hostname `localhost`.
+// Applied to the INITIAL host and to every redirect hop's host (see
+// `pollWebpage`) — a page that redirects to an internal address is refused
+// exactly like one that starts there.
 // STATED LIMITATION, NOT FIXED HERE: this is a resolve-then-check, not a
 // resolve-and-PIN-to-that-address fetch — the actual `fetch()` call still
 // re-resolves the hostname itself, so a DNS answer that changes between this
@@ -216,6 +271,7 @@ async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array |
 // lightweight poller; flagged here and in the PR for whoever revisits it.
 const PRIVATE_V4_RANGES: ReadonlyArray<readonly [string, string]> = [
   ["10.0.0.0", "10.255.255.255"],
+  ["100.64.0.0", "100.127.255.255"], // CGNAT (RFC 6598)
   ["172.16.0.0", "172.31.255.255"],
   ["192.168.0.0", "192.168.255.255"],
   ["127.0.0.0", "127.255.255.255"],
@@ -232,23 +288,83 @@ function isPrivateV4(address: string): boolean {
   return PRIVATE_V4_RANGES.some(([lo, hi]) => n >= ipToInt(lo) && n <= ipToInt(hi));
 }
 
-function isPrivateV6(address: string): boolean {
-  const lower = address.toLowerCase();
-  return lower === "::1" || lower.startsWith("fe80:") || lower.startsWith("::ffff:127.");
+/**
+ * Parses any valid textual IPv6 address (`::` compression, an embedded
+ * dotted-quad IPv4 tail included) to its 128-bit value, or `null` if it
+ * isn't one — a small hand-rolled parser rather than a regex, so an
+ * IPv4-mapped address's embedded IPv4 octets can be reused directly against
+ * `isPrivateV4` instead of re-deriving them from a prefix match (the exact
+ * bug class PR #401 review round 1 found: prefix-matching only caught the
+ * dotted-quad spelling of `::ffff:127.0.0.1`, never its equivalent all-hex
+ * spelling `::ffff:7f00:1`).
+ */
+function parseIPv6(address: string): bigint | null {
+  const zone = address.indexOf("%");
+  const a = zone === -1 ? address : address.slice(0, zone);
+  const halves = a.split("::");
+  if (halves.length > 2) return null;
+  const expand = (s: string): string[] | null => {
+    if (s === "") return [];
+    const groups = s.split(":");
+    const last = groups[groups.length - 1]!;
+    if (last.includes(".")) {
+      const octets = last.split(".");
+      if (octets.length !== 4) return null;
+      const nums = octets.map(Number);
+      if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+      const hi = ((nums[0]! << 8) | nums[1]!).toString(16);
+      const lo = ((nums[2]! << 8) | nums[3]!).toString(16);
+      return [...groups.slice(0, -1), hi, lo];
+    }
+    return groups;
+  };
+  const head = expand(halves[0] ?? "");
+  const tail = halves.length === 2 ? expand(halves[1] ?? "") : [];
+  if (head === null || tail === null) return null;
+  let groups: string[];
+  if (halves.length === 2) {
+    const missing = 8 - head.length - tail.length;
+    if (missing < 0) return null;
+    groups = [...head, ...Array(missing).fill("0"), ...tail];
+  } else {
+    groups = head;
+  }
+  if (groups.length !== 8) return null;
+  let value = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    value = (value << 16n) | BigInt(Number.parseInt(g, 16));
+  }
+  return value;
 }
 
-/** The real DNS-resolving check `WebpagePollDeps.isBlockedHost` defaults to when a caller (production wiring) doesn't supply one. See this module's own "PRIVATE/LOOPBACK ADDRESSES" comment above for what this does and does not cover. */
-export async function defaultIsBlockedHost(hostname: string): Promise<boolean> {
+function isPrivateV6(address: string): boolean {
+  const v = parseIPv6(address);
+  if (v === null) return true; // unparseable — fail closed, same discipline as an unresolvable hostname below
+  if (v === 0n) return true; // :: (unspecified)
+  if (v === 1n) return true; // ::1 (loopback)
+  if (v >> 32n === 0xffffn) return isPrivateV4([24n, 16n, 8n, 0n].map((shift) => Number((v >> shift) & 0xffn)).join(".")); // ::ffff:0:0/96 — IPv4-mapped, checked by its embedded IPv4
+  if (v >> 118n === 0b1111111010n) return true; // fe80::/10 — link-local
+  if (v >> 121n === 0b1111110n) return true; // fc00::/7 — unique-local (ULA)
+  return false;
+}
+
+/** The real DNS-resolving check `WebpagePollDeps.isBlockedHost` defaults to when a caller (production wiring) doesn't supply one. Checks EVERY address the resolver returns (PR #401 review round 1 — a hostname with both a public and a private A/AAAA record must not pass because the first-returned address happened to be public) — blocked if ANY is private. See this module's own "PRIVATE/LOOPBACK ADDRESSES" comment above for what this does and does not cover. */
+export async function defaultIsBlockedHost(
+  hostname: string,
+  /** Injectable for testing ALL-addresses-checked without a real DNS lookup — defaults to `node:dns/promises`' own `lookup`. Production wiring never passes this. */
+  lookup: (host: string, opts: { all: true }) => Promise<Array<{ address: string; family: number }>> = dnsLookup,
+): Promise<boolean> {
   const lower = hostname.toLowerCase();
   if (lower === "localhost" || lower.endsWith(".localhost")) return true;
   const literalFamily = isIP(hostname);
   if (literalFamily === 4) return isPrivateV4(hostname);
   if (literalFamily === 6) return isPrivateV6(hostname);
   try {
-    const { address, family } = await dnsLookup(hostname);
-    return family === 4 ? isPrivateV4(address) : isPrivateV6(address);
+    const results = await withTimeout(lookup(hostname, { all: true }), DNS_TIMEOUT_MS);
+    return results.some((r) => (r.family === 4 ? isPrivateV4(r.address) : isPrivateV6(r.address)));
   } catch {
-    return true; // unresolvable — fail closed rather than let a DNS error fall through to a real connect attempt
+    return true; // unresolvable, or the lookup itself timed out — fail closed rather than let a DNS error/hang fall through to a real connect attempt
   }
 }
 
@@ -263,30 +379,53 @@ export async function defaultIsBlockedHost(hostname: string): Promise<boolean> {
  *
  * SECURITY, per this ticket: only `http`/`https` (checked on the initial URL
  * AND on every redirect hop — `redirect: "manual"`, followed by hand here,
- * up to `WEBPAGE_MAX_REDIRECTS` hops), a `WEBPAGE_TIMEOUT_MS` request
- * timeout, a `WEBPAGE_MAX_BODY_BYTES` response-size cap (`readCapped`
- * above), and NO credentials of any kind ever attached — this function takes
- * no token and sends no `authorization` header, unlike `pollGithubLink`
- * above and the Confluence path's `AtlassianClient`. See this module's own
- * "PRIVATE/LOOPBACK ADDRESSES" comment for the SSRF decision.
+ * up to `WEBPAGE_MAX_REDIRECTS` hops), a `WEBPAGE_MAX_BODY_BYTES`
+ * response-size cap (`readCapped` above), and NO credentials of any kind
+ * ever attached — this function takes no token and sends no `authorization`
+ * header, unlike `pollGithubLink` above and the Confluence path's
+ * `AtlassianClient`. See this module's own "PRIVATE/LOOPBACK ADDRESSES"
+ * comment for the SSRF decision.
+ *
+ * ONE SHARED DEADLINE, NOT ONE TIMEOUT PER HOP (PR #401 review round 1): a
+ * per-hop `WEBPAGE_TIMEOUT_MS` timeout, reapplied at every redirect, let a
+ * single item cost up to `WEBPAGE_TIMEOUT_MS * (WEBPAGE_MAX_REDIRECTS + 1)`
+ * — worst case 60s — serially, on the rule-poll's own critical path ("one
+ * bad link must never stall polling of the rest", violated in TIME even
+ * when not in outcome). `deadline` below is computed ONCE, before the first
+ * hop, and every fetch AND every `isBlocked` DNS check for this call races
+ * against however much of it remains — so the WHOLE call (every hop
+ * combined) is bounded by `WEBPAGE_TIMEOUT_MS` (or `deps.timeoutMs`),
+ * period. Ties into `withTimeout` (this module's own top-of-file helper)
+ * for a wait bound that holds even against a `fetchImpl`/`isBlockedHost`
+ * fake that ignores its `AbortSignal` entirely.
  */
 export async function pollWebpage(item: { target: string }, priorFingerprint: string | undefined, deps: WebpagePollDeps): Promise<PollVerdict> {
   const isBlocked = deps.isBlockedHost ?? defaultIsBlockedHost;
+  const timeoutMs = deps.timeoutMs ?? WEBPAGE_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let current: URL;
   try { current = new URL(item.target); } catch { return { status: "unreadable" }; }
   if (current.protocol !== "http:" && current.protocol !== "https:") return { status: "unreadable" };
 
   for (let hop = 0; ; hop++) {
     if (hop > WEBPAGE_MAX_REDIRECTS) return { status: "unreadable" };
-    if (await isBlocked(current.hostname)) return { status: "unreadable" };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { status: "error" }; // the shared deadline ran out across earlier hops — transient, retried next tick
+    let blocked: boolean;
+    try {
+      blocked = await withTimeout(isBlocked(current.hostname), Math.min(remaining, DNS_TIMEOUT_MS));
+    } catch {
+      return { status: "error" }; // the SSRF check itself timed out — transient, never treated as "not blocked"
+    }
+    if (blocked) return { status: "unreadable" };
 
     let res: Response;
     try {
-      res = await deps.fetchImpl(current.toString(), {
+      res = await withTimeout(deps.fetchImpl(current.toString(), {
         redirect: "manual",
         headers: hop === 0 ? conditionalHeadersFor(priorFingerprint) : {},
-        signal: AbortSignal.timeout(WEBPAGE_TIMEOUT_MS),
-      });
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      }), Math.max(1, deadline - Date.now()));
     } catch {
       return { status: "error" };
     }

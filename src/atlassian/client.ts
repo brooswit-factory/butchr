@@ -212,7 +212,7 @@ export class AtlassianClient {
   /**
    * BUTCHR-437 (epic BUTCHR-421, story 3/4): a Confluence page's CURRENT
    * `version.number`, for the Confluence link poller
-   * (src/jira-watch/confluence-poller.ts) — same call shape `get_doc`/
+   * (src/jira-watch/external-poll.ts) — same call shape `get_doc`/
    * `confluence_get_page` already use (`GET /wiki/api/v2/pages/{id}`, no
    * `body-format` requested, so this never pulls the page's body content the
    * way `get_doc` does), over the SAME site + Basic-auth credential this
