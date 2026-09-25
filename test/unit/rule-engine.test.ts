@@ -580,6 +580,173 @@ describe("BUTCHR-406: cross-daemon boss wake regression (two disjoint daemon vie
   }
 });
 
+// BUTCHR-416 — SCOPE NOTE (BUTCHR-402 comments 23851/23855): BUTCHR-406 above
+// proves the generic direction (two disjoint daemon views over one linked
+// pair) but does not shape either daemon's rules/search by ISSUE TYPE and
+// does not cover Story -> Epic. This block extends the same harness — real
+// `createRuleResourceType` + `runResourceLoop`, no unit called directly — so
+// each simulated daemon's rule and search are shaped like the real fleet
+// split: a wroosbit-like rule matches only Story/Sub-task, a booswrit-like
+// rule matches only Epic/Task/Bug. These queries are REPRESENTATIVE, not
+// read from or copied out of any live rules file (forbidden for this task —
+// see brief.md); "issuetype = X" is a generic JQL shape, not live content.
+// NO observer rules and no `staffed:false` anywhere below: every match here
+// is an ordinary staffed rule match, and the only mechanism under test is
+// main's existing #372 by-key foreign fetch (`foreignImplementerKeys`) plus
+// the BUTCHR-406 live-key fix — both already on main, unmodified by this PR.
+describe("BUTCHR-416: cross-daemon upward wake under the real issue-type split (no observer rules)", () => {
+  type SplitType = "Epic" | "Task" | "Bug" | "Story" | "Sub-task";
+  // The split itself, stated once. Matches the ticket's own example
+  // (booswrit: Epic/Task/Bug; wroosbit: Story/Sub-task) — verified against no
+  // live file, per the scope note above.
+  const daemonFor = (t: SplitType): "wroosbit" | "booswrit" => (t === "Story" || t === "Sub-task" ? "wroosbit" : "booswrit");
+  // One representative rule per issue type, each with its own rule id — so
+  // an execution mode set on one type's rule never entangles another type's
+  // rule, even when both are staffed by the same daemon (Story/Sub-task).
+  const RULE_FOR: Record<SplitType, { id: string; query: string }> = {
+    Epic: { id: "epics", query: "issuetype = Epic" },
+    Task: { id: "tasks", query: "issuetype = Task" },
+    Bug: { id: "bugs", query: "issuetype = Bug" },
+    Story: { id: "story", query: "issuetype = Story" },
+    "Sub-task": { id: "subtask", query: "issuetype = Sub-task" },
+  };
+  const agentKeyOf = (t: SplitType, key: string) => `jira-work:${RULE_FOR[t].id}:${key}`;
+
+  const ruleDoc = (t: SplitType, execution?: Rule["execution"]) => ({
+    ...RULE_FOR[t], resourceProvider: "jira-work" as const, brief: "hear your implementer",
+    ...(execution ? { execution } : {}),
+  });
+
+  /** This daemon's simulated JQL: each rule's own query returns only its own type; a by-key fetch (#372) returns any ticket by key, exactly as a real Jira credential would (key lookup is not type-scoped). */
+  const searchOver = (world: () => JiraIssue[]) => async (jql: string): Promise<JiraIssue[]> => {
+    if (jql.startsWith("key in (")) return world().filter((i) => jql.includes(i.key));
+    const type = (Object.keys(RULE_FOR) as SplitType[]).find((t) => RULE_FOR[t].query === jql);
+    return type ? world().filter((i) => i.issuetype === type) : [];
+  };
+
+  const childOf = (childKey: string, childType: SplitType, bossKey: string) => (over: Partial<JiraIssue> = {}): JiraIssue =>
+    issue(childKey, { issuetype: childType, issuelinks: [{ type: "Implements", otherEnd: "inward", key: bossKey }], ...over });
+  const bossOf = (bossKey: string, bossType: SplitType, childKey: string): JiraIssue =>
+    issue(bossKey, { issuetype: bossType, issuelinks: [{ type: "Implements", otherEnd: "outward", key: childKey }] });
+
+  /**
+   * Two REAL daemons — one rule each, shaped by issue type — each run
+   * through its own real `runResourceLoop`, against a single shared mutable
+   * "Jira". Only valid for a pair that IS cross-daemon under `daemonFor`;
+   * asserts that itself so a future direction can't silently reuse this
+   * harness for a same-daemon pair (see the Sub-task -> Story block below,
+   * which deliberately does NOT use this harness).
+   */
+  async function runCrossDaemon(childKey: string, childType: SplitType, bossKey: string, bossType: SplitType, bossExecution?: Rule["execution"]) {
+    expect(daemonFor(childType)).not.toBe(daemonFor(bossType)); // this harness is for genuinely cross-daemon pairs only
+    const makeChild = childOf(childKey, childType, bossKey);
+    const boss = bossOf(bossKey, bossType, childKey);
+    const world = { child: makeChild() };
+    const tickets = () => [world.child, boss];
+
+    const herdChild = fakeHerd();
+    const notifiedChild: string[] = [];
+    const typeChild = createRuleResourceType({ rules: parseRules({ rules: [ruleDoc(childType)] }), search: searchOver(tickets) });
+
+    const herdBoss = fakeHerd();
+    const notifiedBoss: string[] = [];
+    const typeBoss = createRuleResourceType({ rules: parseRules({ rules: [ruleDoc(bossType, bossExecution)] }), search: searchOver(tickets) });
+
+    const stopChild = runResourceLoop(typeChild, { herd: herdChild, ownsId: ownsRuleAgent, notify: async (a, b) => { notifiedChild.push(`${a} <- ${b}`); }, intervalMs: 15 });
+    const stopBoss = runResourceLoop(typeBoss, { herd: herdBoss, ownsId: ownsRuleAgent, notify: async (a, b) => { notifiedBoss.push(`${a} <- ${b}`); }, intervalMs: 15 });
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+      expect(notifiedBoss).toEqual([]); // (4) nothing changed yet: no spurious notify
+      expect(notifiedChild).toEqual([]);
+      // The child worker's own report_to_boss/submit_to_boss: the child ticket changes.
+      world.child = makeChild({ status: "In Review", updated: "later" });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally { stopChild(); stopBoss(); }
+    return { notifiedBoss, notifiedChild, herdBoss, herdChild };
+  }
+
+  const CROSS_DAEMON_DIRECTIONS: Array<{ label: string; childType: SplitType; bossType: SplitType; childKey: string; bossKey: string }> = [
+    // The exact incident shape named in BUTCHR-402's description (BUTCHR-398 implements BUTCHR-392).
+    { label: "Task -> Story", childType: "Task", bossType: "Story", childKey: "BUTCHR-398", bossKey: "BUTCHR-392" },
+    // The boss is now on the OTHER daemon (booswrit) than in Task -> Story above — a
+    // genuinely different direction, not a relabelling. Reuses this fleet's own real
+    // pair (BUTCHR-402 Implements BUTCHR-365 — verified live via jira_get_issue).
+    { label: "Story -> Epic", childType: "Story", bossType: "Epic", childKey: "BUTCHR-402", bossKey: "BUTCHR-365" },
+  ];
+
+  for (const { label, childType, bossType, childKey, bossKey } of CROSS_DAEMON_DIRECTIONS) {
+    describe(`${label} (cross-daemon: ${daemonFor(childType)} child, ${daemonFor(bossType)} boss)`, () => {
+      for (const bossExecution of [undefined, ...EXECUTION_MODES]) {
+        const execLabel = bossExecution ?? "undeclared (defaults to swarm)";
+        test(`the boss is woken by the child's change exactly once, no agent spawns for the child on the boss's daemon, and the child never hears about its boss — boss execution=${execLabel}`, async () => {
+          const { notifiedBoss, notifiedChild, herdBoss } = await runCrossDaemon(childKey, childType, bossKey, bossType, bossExecution);
+          // (1) exactly one notify to the boss for the child's change — not "at least
+          // one", so a double-delivery would fail this even though `.some()` would not.
+          expect(notifiedBoss.filter((n) => n.includes(childKey))).toHaveLength(1);
+          // (2) no agent is ever spawned for the foreign child on the boss's own daemon.
+          expect(herdBoss.spawned.some((k) => k.includes(childKey))).toBe(false);
+          expect(herdBoss.spawned.length).toBeGreaterThan(0); // the boss's own agent DID spawn
+          // (3) the implementer (child) never hears about its boss — routes.ts (and
+          // `relatedForRules`'s `implementsEdge`) route only boss-hears-child, never back.
+          expect(notifiedChild.some((n) => n.includes(bossKey))).toBe(false);
+        });
+      }
+    });
+  }
+
+  // Per the ticket: "check whether that pair is even cross-daemon" for
+  // Sub-task -> Story. Under `daemonFor` above, both are wroosbit — SAME
+  // daemon, not cross-daemon — so this proves the same-daemon wake instead,
+  // and proves the "same-daemon" claim directly rather than asserting it:
+  // no `key in (...)` (the cross-daemon-only foreign fetch) is ever issued
+  // for this pair. Synthetic keys (no real fleet incident named this pair).
+  describe("Sub-task -> Story: NOT cross-daemon under the real split (both staffed by wroosbit)", () => {
+    const childKey = "BUTCHR-500", bossKey = "BUTCHR-501";
+    const makeChild = childOf(childKey, "Sub-task", bossKey);
+    const boss = bossOf(bossKey, "Story", childKey);
+
+    for (const bossExecution of [undefined, "singleton"] as const) {
+      const execLabel = bossExecution ?? "undeclared (defaults to swarm)";
+      test(`the Story boss is woken by the Sub-task child's change on the SAME daemon, exactly once, with no cross-daemon fetch — boss execution=${execLabel}`, async () => {
+        const world = { child: makeChild() };
+        let sawKeyInFetch = false;
+        const search = async (jql: string): Promise<JiraIssue[]> => {
+          if (jql.startsWith("key in (")) { sawKeyInFetch = true; return [world.child, boss].filter((i) => jql.includes(i.key)); }
+          return searchOver(() => [world.child, boss])(jql);
+        };
+        const herd = fakeHerd();
+        const notified: string[] = [];
+        // TWO rules, one per type (as on the real wroosbit daemon) — only the
+        // "story" rule (the boss's) varies execution; "subtask" stays swarm.
+        const rules = parseRules({ rules: [ruleDoc("Sub-task"), ruleDoc("Story", bossExecution)] });
+        const type = createRuleResourceType({ rules, search });
+        const stop = runResourceLoop(type, { herd, ownsId: ownsRuleAgent, notify: async (a, b) => { notified.push(`${a} <- ${b}`); }, intervalMs: 15 });
+        try {
+          await new Promise((r) => setTimeout(r, 60));
+          expect(notified).toEqual([]); // (4) nothing changed yet: no spurious notify
+          world.child = makeChild({ status: "In Review", updated: "later" });
+          await new Promise((r) => setTimeout(r, 80));
+        } finally { stop(); }
+        // The child's own primary self-notify (its own agent hearing its own
+        // status change) also mentions childKey — exclude it by its exact,
+        // known shape so the assertion below isolates the BOSS's notify only.
+        const childSelfNotify = `${agentKeyOf("Sub-task", childKey)} <- ${agentKeyOf("Sub-task", childKey)}`;
+        const toBoss = notified.filter((n) => n.includes(childKey) && n !== childSelfNotify);
+        // (1) exactly one notify to the boss for the child's change.
+        expect(toBoss).toHaveLength(1);
+        // (3) the child (implementer) never hears about its boss — no notify
+        // line where the child's own agent is the LISTENER and the boss is
+        // (part of) the source.
+        expect(notified.some((n) => n.startsWith(`${agentKeyOf("Sub-task", childKey)} <-`) && n.includes(bossKey))).toBe(false);
+        // Proves "same daemon" rather than asserting it: the boss heard its
+        // implementer through this daemon's OWN search results alone — #372's
+        // cross-daemon by-key fetch was never exercised for this pair.
+        expect(sawKeyInFetch).toBe(false);
+      });
+    }
+  });
+});
+
 describe("rule workspaces", () => {
   let root: string;
   let previous: string | undefined;
