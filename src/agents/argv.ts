@@ -96,6 +96,7 @@ export function agentLaunchConfig(
     effort: agent.effort ?? effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
     developmentChannels: ["server:butchr"],
+    ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
   };
 }
 

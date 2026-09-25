@@ -510,4 +510,27 @@ describe("buildWorkspace", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("BUTCHR-408: spec.cwd overrides workspaceDirFor — bookkeeping files land in the real working directory, not the synthetic <root>/<provider>/... tree", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-root-"));
+    const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
+      const dir = buildWorkspace(spec, "http://x/mcp");
+      expect(dir).toBe(real);
+      expect(dir).not.toBe(workspaceDirFor(key, root));
+      expect(existsSync(join(real, "CLAUDE.md"))).toBe(true);
+      expect(existsSync(join(real, "brief.md"))).toBe(true);
+      expect(existsSync(join(real, "mcp.json"))).toBe(true);
+      expect(existsSync(workspaceDirFor(key, root))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
 });

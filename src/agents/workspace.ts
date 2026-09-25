@@ -37,6 +37,32 @@ export interface SpawnSpec {
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
   externalMcpServers?: Array<{ name: string; url: string; headers?: Record<string, string> }>;
+  /**
+   * BUTCHR-408: overrides the workspace directory `workspaceDirFor(spec.key)`
+   * would otherwise compute — the ONE seam a managed-session definition needs
+   * to make its `workingDirectory` the spawned agent's REAL process cwd (a
+   * Bakr agent must work IN its own project directory, not a synthetic
+   * `<workspaceRoot>/filesystem/...` bookkeeping tree). When set, BOTH the
+   * bookkeeping files (`buildWorkspace`, below) AND the launch `cwd`
+   * (`agentLaunchConfig`, src/agents/argv.ts) use this directory — CLAUDE.md/
+   * AGENTS.md/brief.md/mcp.json are written there directly, since that is
+   * the one place the spawned agent will actually look for them.
+   *
+   * TRADEOFF (documented, not solved, by this ticket — see
+   * docs/managed-sessions.md): `agentIdOfWorkspacePath`'s reverse mapping
+   * (cwd -> agent id, below) assumes the fixed `workspaceDirFor` layout, so
+   * it does NOT recognise a `cwd`-overridden agent's pane by path. Primary
+   * reconciliation (spawn/stop, no-double-owner) is unaffected — it keys
+   * purely off `herd.runningIssues()`'s own agent-key labels, never a cwd
+   * reverse lookup — but secondary safety nets that DO use that reverse
+   * mapping (startup preflight's live-rule-agent check,
+   * stranded-workspace/session-limit pane recovery) do not cover a
+   * `cwd`-overridden agent's pane. Absent (the default for every existing
+   * caller), behaviour is byte-for-byte unchanged.
+   */
+  cwd?: string;
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */
+  permissionMode?: string;
 }
 
 
@@ -209,7 +235,7 @@ export const singleResourceOf = (id: string): string | null => (decodeQueryAgent
  * directory — the agent's cwd.
  */
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
-  const dir = workspaceDirFor(spec.key);
+  const dir = spec.cwd ?? workspaceDirFor(spec.key);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.

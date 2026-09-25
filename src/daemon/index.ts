@@ -72,6 +72,8 @@ import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
+import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
+import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { runLinkCli } from "../cli/link-cli.js";
@@ -250,16 +252,29 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
 const jiraProjectEnabled = rules.some((r) => r.enabled && r.resourceProvider === "jira-project");
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
+// BUTCHR-408: unlike every rule above, the managed-sessions query is built
+// into the daemon, never a user rules.json rule — it always runs (no
+// staffing gate, same "every enabled filesystem rule always runs" reasoning
+// as ADMISSION_SOURCE_FILESYSTEM, minus the "enabled" part since there is no
+// rules.json entry to disable), so it is unconditionally in `sources` below.
+const ADMISSION_SOURCE_MANAGED_SESSIONS = "managed-sessions";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   // BUTCHR-398: shared across every rule provider's admission bucket —
   // `roleOfAgent` reads the FULL `rules` list (every provider), so it
   // correctly classifies a running id of ANY provider, not just jira-work.
+  // BUTCHR-408: a managed-session agent's OWN `role` (its manifest field) is
+  // validated and stored but NOT read here — `roleOfAgent` only ever
+  // resolves a rule-level role, and the built-in managed-sessions rule is
+  // one shared Rule for every heterogeneous definition file. Every
+  // managed-session agent is therefore classified "worker" for fleet-cap
+  // purposes today, same as an unflagged rule's agents always were before
+  // BUTCHR-398. See docs/managed-sessions.md's "Not in this version".
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : [])],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -401,6 +416,13 @@ const filesystemHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
   log: (line) => console.error(line),
 });
+// BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
+const managedSessionsHealth = createResourceLoopHealth({
+  name: "managed-sessions",
+  enabled: true,
+  thresholdMs: Math.max(config.pollStaleMs, 3 * MANAGED_SESSIONS_POLL_MS),
+  log: (line) => console.error(line),
+});
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
 // /health sibling — see src/daemon/coverage.ts's own header for the full
 // rationale. Wired into two detectors so far (syncLabels's stalled check,
@@ -470,7 +492,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth], unresolvedRuleRelationships),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1079,6 +1101,26 @@ startFilesystemLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => filesystemHealth.recordSuccess(),
   onError: (e) => filesystemHealth.recordError(e),
+});
+
+// BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
+// read from rules.json, over the well-known definitions directory. Same
+// admission/health wiring shape as every rule loop above, its own bucket.
+console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
+startManagedSessionsLoop({
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => managedSessionsHealth.recordSuccess(),
+  onError: (e) => managedSessionsHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
