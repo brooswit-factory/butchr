@@ -469,7 +469,11 @@ describe("HerdrHerd ordered provider fallback", () => {
       const herd = new HerdrHerd(f.client, url, instant, undefined, config, new ProviderAvailabilityRegistry());
       const result = await herd.nudge(spec.key, "new request");
       expect(result.delivered).toBe(true);
-      expect(result.refusal?.raw).toBe("Automatically switched to Luna Reserve medium due to usage limits.");
+      // Codex accepts follow-ups in its native input path (see nudge()'s own
+      // comment): this call returns promptly rather than waiting on Claude's
+      // delayed quota-dialog observation. The periodic recoverQuota pass
+      // reports the refusal instead — never this synchronous nudge path.
+      expect(result.refusal).toBeUndefined();
       expect(f.keys).toEqual([]);
     });
 

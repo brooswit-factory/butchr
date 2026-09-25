@@ -55,6 +55,13 @@ describe("capacityRoleFor (BUTCHR-422)", () => {
   test("Epic/Story stay uncounted even if their rule says worker", () => {
     expect(capacityRoleFor("jira-work:epics:BUTCHR-1", () => "worker", issuetypeOf)).toBe("sentinel");
   });
+
+  test("BUTCHR-425: jira-project agents are always sentinels, never workers, even when their rule's own role is \"worker\" (the default a rule file that omits `role` gets)", () => {
+    const alwaysWorker = (): AgentCapacityRole => "worker";
+    expect(capacityRoleFor("jira-project:managers:BUTCHR", alwaysWorker, issuetypeOf)).toBe("sentinel");
+    expect(capacityRoleFor("jira-project:managers:BUTCHR", noRuleRole, issuetypeOf)).toBe("sentinel");
+    expect(roleOf("jira-project:managers:ATMO")).toBe("sentinel");
+  });
 });
 
 describe("admission with leaf-only capacity (BUTCHR-422)", () => {
@@ -72,5 +79,12 @@ describe("admission with leaf-only capacity (BUTCHR-422)", () => {
     });
     expect(await ctrl.admit(["jira-work:tasks:BUTCHR-3"], [])).toEqual(["jira-work:tasks:BUTCHR-3"]);
     expect(ctrl.snapshot()).toMatchObject({ residency: 0, sentinels: 3 });
+  });
+
+  test("BUTCHR-425: 23 resident jira-project agents consume no worker slots — the cap is still fully available to leaf work", async () => {
+    const managers = Array.from({ length: 23 }, (_, i) => `jira-project:managers:PROJ${i}`);
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => managers, roleOf });
+    expect(await ctrl.admit(["jira-work:tasks:BUTCHR-3"], [])).toEqual(["jira-work:tasks:BUTCHR-3"]);
+    expect(ctrl.snapshot()).toMatchObject({ residency: 0, sentinels: 23 });
   });
 });

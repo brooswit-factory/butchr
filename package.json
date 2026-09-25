@@ -35,7 +35,8 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "confluence.js": "^3.2.0",
     "elysia": "^1.4.29",
-    "jira.js": "^6.2.0"
+    "jira.js": "^6.2.0",
+    "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

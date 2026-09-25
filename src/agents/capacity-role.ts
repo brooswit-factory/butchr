@@ -28,6 +28,13 @@ const isUncountedIssueType = (issuetype: string | undefined): boolean =>
  *   This covers `jira-work` rule agents (`jira-work:<rule>:<KEY>`) and bare
  *   issue-key agents. The type comes from `issuetypeOf`, the daemon's own
  *   record of what its latest searches returned for that key.
+ * - A `jira-project` rule agent (free-form Jira project resource, BUTCHR-425)
+ *   → always `"sentinel"`, regardless of its rule's own `role` field. These
+ *   are operator-directed project managers, not admission-capped workers —
+ *   Codey runs dozens of them, and none may consume `BUTCHR_MAX_AGENTS`.
+ *   Checked unconditionally (never falls through to `ruleRoleOf`) so a rule
+ *   file that omits `role` entirely (every live `jira-project` rule does —
+ *   see the deploy-hazard regression test) still never counts as a worker.
  * - Everything else keeps its rule's role (BUTCHR-398), via `ruleRoleOf`,
  *   defaulting to `"worker"`.
  *
@@ -43,6 +50,7 @@ export function capacityRoleFor(
   if (isProjectId(id)) return "sentinel";
   if (isIssueKey(id)) return isUncountedIssueType(issuetypeOf(id)) ? "sentinel" : (ruleRoleOf(id) ?? "worker");
   const decoded = decodeAnyAgentKey(id);
+  if (decoded?.resourceProvider === "jira-project") return "sentinel";
   if (decoded?.kind === "resource" && decoded.resourceProvider === "jira-work" && isUncountedIssueType(issuetypeOf(decoded.resourceId))) return "sentinel";
   return ruleRoleOf(id) ?? "worker";
 }

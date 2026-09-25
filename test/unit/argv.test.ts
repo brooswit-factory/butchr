@@ -94,3 +94,13 @@ describe("checkArgv", () => {
     if (!check.ok) expect(check.reason).toBe("argv lacks --mcp-config /w/KAN-783/mcp.json");
   });
 });
+
+describe("project-manager Claude permissions", () => {
+  // No human answers a project manager's prompts; Claude's auto mode is the
+  // counterpart of the Codex launch's on-request + auto_review policy.
+  test("a jira-project Claude agent launches in auto permission mode", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
+  });
+});

@@ -22,9 +22,10 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
+import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
@@ -104,7 +105,9 @@ export interface Rule {
    * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
    * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
    * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
-   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts).
+   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
+   * a JSON object (not JQL) for `jira-project` — `{ leadAccountId?, keys?,
+   * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -118,6 +121,8 @@ export interface Rule {
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /** Operator-owned MCP config path (`jira-project` rules only); `{{KEY}}` expands to the resource key. Absolute path required. */
+  mcpConfigFile?: string;
   /**
    * BUTCHR-429 (epic BUTCHR-421, story 1/4): four additive, independently
    * optional knobs for "linked-change eventing" — a change to anything
@@ -176,7 +181,7 @@ export interface Rule {
 }
 
 const RULE_FIELDS = new Set([
-  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships",
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
@@ -257,6 +262,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
+    if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
+    if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
     // `execution` and `account` are independent of each other (any of the 9 combinations
@@ -280,7 +288,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -292,6 +300,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
+      ...(typeof raw.mcpConfigFile === "string" ? { mcpConfigFile: raw.mcpConfigFile } : {}),
       ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
       ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
       ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
