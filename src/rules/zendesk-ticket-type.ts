@@ -15,7 +15,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
 import { loadZendeskAuth, scopedTicketQuery, type ZendeskAuthEnv, type ZendeskComment, type ZendeskTicket, type ZendeskTokenFileIo } from "../resources/zendesk-ticket.js";
 import { parseZendeskTicketRef, type ZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
+import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import type { Rule } from "./rules.js";
 
 export interface ZendeskTicketMatch {
@@ -37,7 +37,7 @@ export interface ZendeskTicketResourceDeps {
 }
 
 /** True for exactly the herd ids this type owns. */
-export const ownsZendeskTicketAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "zendesk-ticket";
+export const ownsZendeskTicketAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "zendesk-ticket";
 
 /** Every enabled `zendesk-ticket` rule's matches. Any failed search rejects the whole poll. */
 export async function searchZendeskTicketRules(deps: Pick<ZendeskTicketResourceDeps, "rules" | "search">): Promise<ZendeskTicketMatch[]> {

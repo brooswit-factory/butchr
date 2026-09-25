@@ -18,13 +18,13 @@
 import type { SpawnSpec } from "../agents/workspace.js";
 import { jiraIssueClass, type LinkedGithubIssue } from "../resources/jira-idea.js";
 import type { EventPoll, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
+import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { createGithubIssueEventRules, type GithubIssueMatch, type GithubIssueResourceDeps } from "./github-issue-type.js";
 import { createRuleEventRules, onceExcluded, type ExcludedIssue, type RuleMatch, type RuleResourceDeps } from "./resource-type.js";
 import type { Rule } from "./rules.js";
 
 /** True for exactly the herd ids this type owns. */
-export const ownsJiraIdeaAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "jira-idea";
+export const ownsJiraIdeaAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "jira-idea";
 
 /** What the idea loop tracks: its own ideas (primary) and the GitHub issues its agents hear (related only). */
 export type JiraIdeaItem = RuleMatch | GithubIssueMatch;
