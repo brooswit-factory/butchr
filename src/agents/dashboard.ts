@@ -193,8 +193,10 @@ export type AdmissionCensusField = { checked: true; confirmedAt: string } | { ch
 export interface AdmissionView {
   /** Same value `/health` already reads via `AdmissionSnapshot.cap` — not a second source. */
   cap: number;
-  /** Same value `/health` already reads via `AdmissionSnapshot.residency` — not a second source. */
+  /** Same value `/health` already reads via `AdmissionSnapshot.residency` — WORKERS only (BUTCHR-398: sentinels excluded — see `sentinels` below) — not a second source. */
   residency: number | null;
+  /** BUTCHR-398: same value `/health` already reads via `AdmissionSnapshot.sentinels` — not a second source. Reported separately from `residency` so a reader can tell "N workers" from "N workers + M sentinels" rather than only seeing the fleet total. */
+  sentinels: number | null;
   sources: readonly { source: string; census: AdmissionCensusField }[];
 }
 
@@ -203,6 +205,7 @@ export function buildAdmissionView(census: AdmissionCensus): AdmissionView {
   return {
     cap: census.cap,
     residency: census.residency,
+    sentinels: census.sentinels,
     sources: census.buckets.map((b) => ({
       source: b.source,
       census: b.checked ? { checked: true as const, confirmedAt: b.confirmedAt } : { checked: false as const, declinedAt: b.declinedAt, reason: b.reason },

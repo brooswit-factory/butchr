@@ -3,7 +3,8 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, ruleAgentIdOfWorkspacePath, workspaceRoot } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
@@ -46,6 +47,66 @@ describe("workspace identity", () => {
     expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
+  });
+  test("BUTCHR-397: a query-level agent's workspace round-trips through workspaceDirFor/agentIdOfWorkspacePath and sits as a SIBLING of that rule's per-resource ones, never their parent", () => {
+    const root = "/w";
+    const queryKey = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
+    const resourceKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" });
+    const queryDir = workspaceDirFor(queryKey, root);
+    const resourceDir = workspaceDirFor(resourceKey, root);
+    expect(queryDir).toBe(join(root, "jira-work", "triage", "%40query"));
+    // Same parent directory (the rule's own folder) — a sibling, not an ancestor: buildWorkspace()
+    // would otherwise write the query agent's own files into the directory that holds every
+    // per-resource agent's subdirectory for this rule.
+    expect(join(queryDir, "..")).toBe(join(resourceDir, ".."));
+    expect(queryDir).not.toBe(resourceDir);
+    // Round-trips back to the exact same key, and is recognised as a rule-engine (not legacy) workspace.
+    expect(agentIdOfWorkspacePath(queryDir, root)).toBe(queryKey);
+    expect(ruleAgentIdOfWorkspacePath(queryDir, root)).toBe(queryKey);
+    // Findable again after a "daemon restart" with nothing but the directory: agentIdOfWorkspacePath
+    // takes only the path and root, no in-memory state, and this is the exact inverse of workspaceDirFor.
+    expect(workspaceDirFor(agentIdOfWorkspacePath(queryDir, root)!, root)).toBe(queryDir);
+  });
+
+  test("BUTCHR-398 (review finding 1): singleResourceOf is null for a query-level id — a caller that needs a real single resource to write to (e.g. an escalation comment) must never fall back to the bogus whole key resourceKeyOf itself falls back to", () => {
+    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+      const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
+      expect(singleResourceOf(key)).toBeNull();
+      // Never equal to resourceKeyOf's own fallback (the bogus whole key) — this is the actual bug being closed.
+      expect(resourceKeyOf(key)).toBe(key);
+    }
+  });
+  test("BUTCHR-398: singleResourceOf is unchanged for a per-resource id, of any provider — same as resourceKeyOf", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-1" });
+    expect(singleResourceOf(key)).toBe("BUTCHR-1");
+    expect(singleResourceOf(key)).toBe(resourceKeyOf(key));
+  });
+  test("BUTCHR-398: mcpIdentityHeaders for a query-level spec sends x-butchr-agent alone, never x-issue, for every provider including jira-work", () => {
+    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+      const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
+      const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "b" };
+      expect(mcpIdentityHeaders(spec)).toEqual({ "x-butchr-agent": key });
+    }
+  });
+
+  test("BUTCHR-398: buildWorkspace for a query-level agy spec writes {agent, mcpUrl} only — no issue/resource field a real Jira/GitHub/Zendesk lookup could be keyed off", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "butchr-agy-query-workspace-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
+      const spec: SpawnSpec = { key, issuetype: "task", summary: "triage (query agent)", parent: null, brief: "Handle the whole queue." };
+      const dir = buildWorkspace(spec, "http://localhost:7717/mcp", "agy");
+      expect(dir).toBe(workspaceDirFor(key, root));
+      expect(JSON.parse(readFileSync(join(dir, ".butchr-agy.json"), "utf8"))).toEqual({ agent: key, mcpUrl: "http://localhost:7717/mcp" });
+      // mcp.json (the Claude path) carries the same header shape.
+      buildWorkspace(spec, "http://localhost:7717/mcp", "claude");
+      expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers.butchr.headers).toEqual({ "x-butchr-agent": key });
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -327,8 +327,10 @@ export class ImplausibleZeroGuard {
 export interface AdmissionSnapshot {
   /** BUTCHR_MAX_AGENTS — see src/config/config.ts for the derivation. */
   cap: number;
-  /** Last successfully TRUSTED fleet-wide residency count, or null before any trusted observation (nothing has polled yet). An implausible read never updates this. */
+  /** Last successfully TRUSTED fleet-wide WORKER residency count (BUTCHR-398: sentinels excluded — see `sentinels` below), or null before any trusted observation (nothing has polled yet). An implausible read never updates this. */
   residency: number | null;
+  /** BUTCHR-398: last successfully TRUSTED fleet-wide sentinel count — computed on the SAME trusted path as `residency` (never a fail-safe path — see B3), so `residency === null` already means "neither field has a trusted observation yet", same discriminator `residency` itself uses. Never withheld, never counted toward `cap`. */
+  sentinels: number | null;
   /**
    * BUTCHR-297: the currently-withheld candidate with the highest
    * accumulated wait, or null when nothing is withheld. Deliberately never
@@ -348,6 +350,9 @@ export interface AdmissionSnapshot {
   longestWait: { id: string; polls: number } | null;
 }
 
+/** BUTCHR-398: a running or candidate agent's fleet capacity role — see `AdmissionControllerDeps.roleOf`. */
+export type AgentCapacityRole = "worker" | "sentinel";
+
 export interface AdmissionControllerDeps {
   /** BUTCHR_MAX_AGENTS. */
   cap: number;
@@ -355,9 +360,29 @@ export interface AdmissionControllerDeps {
    * The fleet-wide residency census — MUST be the raw, unscoped herd's
    * `runningIssues()` (see this module's own top comment, Trap 1), never a
    * `scopedHerd`-wrapped view. Returns every currently-running agent id,
-   * regardless of resource type.
+   * regardless of resource type. BUTCHR-398: still the WHOLE fleet, sentinels
+   * included — `roleOf` below is what this module uses to tell them apart,
+   * not a second, pre-filtered residency source (Trap 1's own "one shared
+   * reading" reasoning extends to this: two residency sources could disagree
+   * about which ids exist at all, where one classifier over one reading
+   * cannot).
    */
   residency: () => Promise<readonly string[]>;
+  /**
+   * BUTCHR-398 — the fleet capacity role epic decision (BUTCHR-391,
+   * 2026-09-25T00:25Z): classifies a running or candidate agent id as
+   * `"worker"` (counts toward `cap`, subject to withholding — today's exact
+   * behaviour) or `"sentinel"` (never withheld, never counted toward
+   * residency; `admit()` computes every worker decision as though sentinels
+   * did not exist — see this module's own top comment for how). Derives the
+   * role from the id's rule (provider + rule id, from `decodeAnyAgentKey`)
+   * looked up against the loaded rules' own `role` field. MUST fail safe: an
+   * id whose rule cannot be resolved (a legacy/bare-issue agent, or a rule
+   * since removed) is a WORKER, never a sentinel — an unrecognised agent
+   * silently escaping the cap would be the opposite of safe. Optional;
+   * omitted, every id is a worker — today's exact behaviour, unchanged.
+   */
+  roleOf?: (id: string) => AgentCapacityRole;
   /** Poll-count bound for a readable-but-implausible zero — see `ImplausibleZeroGuard`. Optional; defaults to `MAX_IMPLAUSIBLE_POLLS`. */
   maxImplausiblePolls?: number;
   log?: (line: string) => void;
@@ -415,6 +440,8 @@ export type AdmissionCensusBucket =
 export interface AdmissionCensus {
   cap: number;
   residency: number | null;
+  /** BUTCHR-398: same value `AdmissionSnapshot.sentinels` already exposes — see that field's own doc comment. */
+  sentinels: number | null;
   buckets: readonly AdmissionCensusBucket[];
 }
 
@@ -506,9 +533,19 @@ export function orderByWait(candidates: readonly string[], waits: ReadonlyMap<st
  * id list only when there's something withheld — `withheld 0/N` with no
  * trailing `wanted:` clause is exactly as parseable as the withheld-nonzero
  * case, just shorter.
+ *
+ * BUTCHR-398: `residency=<n>` is now `residency(workers)=<n> sentinels=<m>`
+ * — a deliberate FORMAT CHANGE (same house convention `ADMISSION2_TAG`'s own
+ * introduction already set: a distinct, visible shape rather than a silently
+ * reinterpreted old one), because the bare figure is no longer honest once
+ * sentinels exist: `n` was always "every resident agent", and staying silent
+ * about sentinels here would leave a reader unable to tell "13 workers" from
+ * "10 workers + 3 sentinels" from the residency figure alone. `sentinels` is
+ * a required param (not optional/defaulted away): every caller states its
+ * count explicitly, `0` included, rather than this function guessing.
  */
-export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>, inFlight = 0): string {
-  const base = `${ADMISSION2_TAG} cap=${cap} residency=${residency}${inFlight > 0 ? ` in-flight=${inFlight}` : ""} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
+export function admissionLine(cap: number, residency: number, admittedCount: number, totalCandidates: number, withheld: readonly string[], waits: ReadonlyMap<string, number>, sentinels: number, inFlight = 0): string {
+  const base = `${ADMISSION2_TAG} cap=${cap} residency(workers)=${residency} sentinels=${sentinels}${inFlight > 0 ? ` in-flight=${inFlight}` : ""} admitted=${admittedCount} withheld ${withheld.length}/${totalCandidates}`;
   if (withheld.length === 0) return base;
   const withheldDesc = withheld.map((id) => `${id}(${waits.get(id) ?? 0})`).join(", ");
   return `${base} wanted: ${withheldDesc}`;
@@ -556,8 +593,10 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   const log = (line: string) => deps.log?.(line);
   const now = deps.now ?? Date.now;
   const guard = new ImplausibleZeroGuard(deps.maxImplausiblePolls);
-  /** Last TRUSTED residency — null means no trusted observation yet (cold start: the very next zero is trusted, not treated as implausible). */
+  /** Last TRUSTED residency (workers only, BUTCHR-398) — null means no trusted observation yet (cold start: the very next zero is trusted, not treated as implausible). */
   let lastTrusted: number | null = null;
+  /** BUTCHR-398: last TRUSTED sentinel count, updated on the SAME assignment as `lastTrusted` — see `AdmissionSnapshot.sentinels`'s own doc comment. */
+  let lastTrustedSentinels: number | null = null;
   /** BUTCHR-297: accumulated wait per candidate, in `admit()` calls — see this file's own top-comment addendum (B1/B2/B4) for why calls, and why this is only ever touched by the code that received a given id as an argument this call. */
   const waits = new Map<string, number>();
   /** BUTCHR-297 (§B2): the call number each ledger entry was last touched at — the eviction bookkeeping `LEDGER_UNSEEN_EVICTION_CALLS` is measured against. Only ever holds keys that are also in `waits`. */
@@ -626,6 +665,15 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
 
   async function admitExclusive(candidates: readonly string[], stopping: readonly string[], source: string): Promise<readonly string[]> {
     reserved.delete(source);
+    // BUTCHR-398: sentinels bypass this whole function's withholding logic
+    // — never trust-gated, never rationed, never ledgered. Every return
+    // point below appends `sentinelCandidates` unconditionally, including
+    // both fail-safe paths: a residency-census outage says nothing trustworthy
+    // about the CAP, but a sentinel was never subject to the cap in the first
+    // place, so there is nothing for that outage to withhold it FROM.
+    const roleOf = deps.roleOf ?? ((): AgentCapacityRole => "worker");
+    const sentinelCandidates = candidates.filter((id) => roleOf(id) === "sentinel");
+    const workerCandidates = candidates.filter((id) => roleOf(id) !== "sentinel");
     let resident: readonly string[];
     try {
       resident = await deps.residency();
@@ -633,32 +681,39 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
       // Failure shape (1) — see this module's own top comment. Unambiguous:
       // withhold everything, touch nothing about the trust state (a herdr
       // outage is a different condition from a readable-but-wrong answer).
-      if (candidates.length) {
-        log(`WARNING: [admission] residency census threw (${(e as Error)?.message ?? e}) — withholding all ${candidates.length} wanted this poll (fail-safe): ${candidates.join(", ")}`);
-        log(admissionFailSafeLine(deps.cap, "census-threw", candidates));
+      if (workerCandidates.length) {
+        log(`WARNING: [admission] residency census threw (${(e as Error)?.message ?? e}) — withholding all ${workerCandidates.length} wanted this poll (fail-safe): ${workerCandidates.join(", ")}`);
+        log(admissionFailSafeLine(deps.cap, "census-threw", workerCandidates));
       }
       // BUTCHR-332: a bucket WRITE beside the existing fail-safe `return []`
       // — never a change to it (§B3: the wait ledger/lastTrusted/lastWithheld
       // are all still untouched below, exactly as before this ticket).
       setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-threw" });
-      return [];
+      return sentinelCandidates;
     }
-    const observed = resident.length;
+    const residentWorkers = resident.filter((id) => roleOf(id) !== "sentinel");
+    const sentinelResidencyCount = resident.length - residentWorkers.length;
+    const observed = residentWorkers.length;
 
     // Failure shape (2) — see this module's own top comment, Trap 2(b)/(c).
     // A cold start (lastTrusted === null) is never implausible: there is no
     // prior trusted observation for a bare zero to contradict.
-    const implausible = lastTrusted !== null && lastTrusted > 0 && observed === 0 && stopping.length < lastTrusted;
+    // BUTCHR-398: `stopping` is filtered to workers too — a sentinel being
+    // stopped this poll explains nothing about a WORKER residency drop
+    // (`lastTrusted` is itself worker-only now), so counting it here would
+    // let a sentinel-only stop wrongly excuse an implausible worker zero.
+    const workerStopping = stopping.filter((id) => roleOf(id) !== "sentinel");
+    const implausible = lastTrusted !== null && lastTrusted > 0 && observed === 0 && workerStopping.length < lastTrusted;
 
     if (implausible) {
       const stillUntrusted = guard.record();
       if (stillUntrusted) {
-        if (candidates.length) {
-          log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only stops ${stopping.length} of that — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${candidates.length} wanted this poll`);
-          log(admissionFailSafeLine(deps.cap, "implausible-zero", candidates));
+        if (workerCandidates.length) {
+          log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only stops ${workerStopping.length} of that — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${workerCandidates.length} wanted this poll`);
+          log(admissionFailSafeLine(deps.cap, "implausible-zero", workerCandidates));
         }
         setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-untrusted" });
-        return [];
+        return sentinelCandidates;
       }
       // Trap 2(d): the bound is exceeded — accept the zero as real rather
       // than deadlock a genuinely-emptied fleet forever. Bounded mitigation
@@ -671,6 +726,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     }
 
     lastTrusted = observed;
+    lastTrustedSentinels = sentinelResidencyCount;
     // Review fix (round 1): an empty candidate list means nothing is
     // withheld, full stop — `lastWithheld` must say so too, or a candidate
     // that leaves `desired` WITHOUT ever being admitted (ticket closed,
@@ -681,22 +737,25 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // `callCount` are untouched below, same as before) and does not
     // violate B3 — B3 is about the ledger, and both fail-safe paths return
     // earlier than this line already.
-    if (candidates.length === 0) {
+    if (workerCandidates.length === 0) {
       lastWithheld = [];
       // BUTCHR-332: a real, TRUSTED observation — "checked: nothing wanted
       // this poll" — not a decline and not silence (the ticket's own
       // explicit correction: an empty shape carrying no timestamp reopens
       // the exact gap BUTCHR-264 closed, one level down).
       setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld: [] });
-      return candidates;
+      return [...workerCandidates, ...sentinelCandidates];
     }
     callCount++;
     // BUTCHR-297: order BEFORE slicing — see this file's own top-comment
     // addendum for why aging lives here and why the tie-break reproduces
     // today's exact order at wait 0.
-    const ordered = orderByWait(candidates, waits);
-    const occupied = new Set(resident);
-    for (const ids of reserved.values()) for (const id of ids) occupied.add(id);
+    const ordered = orderByWait(workerCandidates, waits);
+    const occupied = new Set(residentWorkers);
+    // BUTCHR-398: a reserved SENTINEL id (e.g. one mid-respawn via
+    // `reserveAdmission`) never eats worker budget either — `roleOf` applied
+    // here too, not only to `residentWorkers` above.
+    for (const ids of reserved.values()) for (const id of ids) if (roleOf(id) !== "sentinel") occupied.add(id);
     const budget = deps.cap - occupied.size;
     const { admitted, withheld } = admitWithinBudget(ordered, budget);
     // §A4/B1/B4: increment the wait for every candidate withheld THIS call
@@ -736,9 +795,11 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // comment for why the tag itself changed (criterion D) rather than
     // reusing `[admission]` with a wider firing condition.
     reserve(admitted, source);
-    log(admissionLine(deps.cap, observed, admitted.length, candidates.length, withheld, waits, occupied.size - observed));
+    log(admissionLine(deps.cap, observed, admitted.length, workerCandidates.length, withheld, waits, sentinelResidencyCount, occupied.size - observed));
     setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
-    return admitted;
+    // BUTCHR-398: sentinel candidates are ALWAYS appended, unconditionally
+    // admitted — never subject to `budget`/`withheld` above.
+    return [...admitted, ...sentinelCandidates];
   }
 
   function recordSpawned(succeeded: readonly string[]): void {
@@ -756,11 +817,11 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     snapshot: () => {
       const longestId = lastWithheld[0];
       const longestWait = longestId !== undefined ? { id: longestId, polls: waits.get(longestId) ?? 0 } : null;
-      return { cap: deps.cap, residency: lastTrusted, longestWait };
+      return { cap: deps.cap, residency: lastTrusted, sentinels: lastTrustedSentinels, longestWait };
     },
     // BUTCHR-332: reads the SAME `cap`/`lastTrusted` `snapshot()` already
     // reads (never a second source) plus the per-source `buckets` map —
     // synchronous, no fresh call of its own.
-    census: () => ({ cap: deps.cap, residency: lastTrusted, buckets: [...buckets.values()] }),
+    census: () => ({ cap: deps.cap, residency: lastTrusted, sentinels: lastTrustedSentinels, buckets: [...buckets.values()] }),
   };
 }

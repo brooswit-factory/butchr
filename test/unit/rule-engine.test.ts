@@ -14,12 +14,22 @@ import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import type { ExecutionUnit } from "../../src/rules/execution.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
   ({ key, status: "In Progress", summary: `summary of ${key}`, issuetype: "Task", assignee: "me", parent: null, updated: "2026-09-16T00:00:00.000+0000", labels: [], ...over });
 
 const rules = (...docs: object[]): Rule[] =>
   parseRules({ rules: docs.map((d) => ({ resourceProvider: "jira-work", brief: "do it", ...d })) });
+
+// BUTCHR-398: `createRuleEventRules`/`createRuleResourceType` now operate over
+// `ExecutionUnit<RuleMatch>` (swarm "resource"-kind primary/related units) —
+// these tests exercise the swarm path exactly as before this ticket, so every
+// fixture is wrapped at the boundary rather than changing what `matchesFor`/
+// `match`/`relatedForRules` themselves produce (still plain `RuleMatch`).
+const asUnit = (m: RuleMatch): ExecutionUnit<RuleMatch> => ({ kind: "resource", match: m });
+const asRelatedUnits = (rs: readonly { issue: RuleMatch; watchers: readonly string[] }[]) =>
+  rs.map((r) => ({ issue: asUnit(r.issue), watchers: r.watchers }));
 
 function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: string[]; specs: Map<string, unknown> } {
   const running = new Set(initial);
@@ -37,7 +47,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
 }
 
 /** One reconcile pass exactly as `runResourceLoop` performs it. */
-async function poll(herd: Herd, ruleSet: Rule[], search: (jql: string) => Promise<JiraIssue[]>): Promise<RuleMatch[]> {
+async function poll(herd: Herd, ruleSet: Rule[], search: (jql: string) => Promise<JiraIssue[]>): Promise<ExecutionUnit<RuleMatch>[]> {
   const type = createRuleResourceType({ rules: ruleSet, search });
   const matches = await type.discovery.search();
   await reconcileNow(scopedHerd(herd, ownsRuleAgent), desiredFrom(matches, type));
@@ -61,7 +71,7 @@ describe("rule discovery", () => {
     });
     expect(seen.sort()).toEqual(["status = Review", "type = Task"]);
     expect(matches.map((m) => m.agentKey)).toEqual(["jira-work:task:BUTCHR-1", "jira-work:task:BUTCHR-2", "jira-work:review:BUTCHR-1"]);
-    expect(uniqueIssues(matches).map((i) => i.key)).toEqual(["BUTCHR-1", "BUTCHR-2"]);
+    expect(uniqueIssues(matches.map(asUnit)).map((i) => i.key)).toEqual(["BUTCHR-1", "BUTCHR-2"]);
   });
 
   test("one rule's failed search fails the whole poll rather than reading as zero matches", async () => {
@@ -114,7 +124,7 @@ describe("rule reconcile", () => {
 });
 
 describe("rule event routing", () => {
-  const snapshot = (primary: RuleMatch[]) => ({ primary, related: [] });
+  const snapshot = (primary: RuleMatch[]) => ({ primary: primary.map((m) => ({ kind: "resource" as const, match: m })), related: [] });
   const matchesFor = (ruleSet: Rule[], issues: JiraIssue[]) =>
     ruleSet.flatMap((rule) => issues.map((i) => ({ agentKey: `jira-work:${rule.id}:${i.key}`, rule, issue: i })));
 
@@ -349,7 +359,7 @@ describe("rule relationships", () => {
 
     test("a Relates change notifies the listening agent once through event routing, and not the listed one", async () => {
       const events = createRuleEventRules({ rules: side });
-      const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(side, ms, keys(ms)) });
+      const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(side, ms, keys(ms))) });
       const at = (t: JiraIssue, i: JiraIssue = idea()) => [match(r("idea"), i), match(r("ticket"), t)];
       const ev = await events.poll(snap(at(ticket())), snap(at(issue("BUTCHR-2", { issuelinks: relatesTo("BUTCHR-1", "inward"), status: "Done", updated: "later" }))));
       expect(ev.changedRelated).toEqual(["jira-work:ticket:BUTCHR-2"]);
@@ -433,7 +443,7 @@ describe("rule relationships", () => {
 
   test("the boss learns a child's status change, once, and no other agent does", async () => {
     const events = createRuleEventRules({ rules: ruleSet });
-    const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(ruleSet, ms, keys(ms))) });
     const before = world(worker()), after = world(worker({ status: "In Review", updated: "later" }));
     const heard = relatedIdFor(after, "BUTCHR-2");
     const ev = await events.poll(snap(before), snap(after));
@@ -452,7 +462,7 @@ describe("rule relationships", () => {
     const ledger = createOwnWriteLedger();
     ledger.record("BUTCHR-2", "later", "jira-work:story:BUTCHR-2", Date.now());
     const events = createRuleEventRules({ rules: ruleSet, suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()), comments: async () => [] });
-    const snap = (ms: RuleMatch[]) => ({ primary: ms, related: relatedForRules(ruleSet, ms, keys(ms)) });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(ruleSet, ms, keys(ms))) });
     const after = world(worker({ status: "In Review", updated: "later" }));
     const heard = relatedIdFor(after, "BUTCHR-2");
     const ev = await events.poll(snap(world(worker())), snap(after));
