@@ -340,7 +340,22 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Rul
   return {
     discovery: {
       idOf: (m) => m.agentKey,
-      search: async () => (latest = await searchRules({ ...deps, excluded })),
+      // BUTCHR-404: `latest` keeps the FULL result (observer matches
+      // included) for `related` below to read — the relationship walk must
+      // see the whole picture. What `search()` RETURNS is filtered at this
+      // boundary instead: every consumer downstream of the loop's own
+      // `issues` variable (src/daemon/loop.ts's `runResourceLoop`) —
+      // `desiredFrom`/`atRestFrom` (staffing/spawn), `syncLabels`,
+      // `checkParked`, `checkAbandoned`, and every `reconcileNow` detector —
+      // reads THIS return value, never `latest` directly, so filtering here
+      // is the one choke point that keeps an observer match out of every
+      // Jira-writing or agent-spawning path at once. Filtered at the return
+      // boundary, not inside `searchRules` itself, so `searchRules` stays a
+      // pure "run every enabled rule's JQL" step with no staffing opinion.
+      search: async () => {
+        latest = await searchRules({ ...deps, excluded });
+        return latest.filter((m) => m.rule.staffed !== false);
+      },
       // BUTCHR-388: an `Implements` target this daemon's own rules do not
       // match is invisible to `search`, so a boss whose implementer is
       // staffed by the OTHER daemon would hear nothing — which is every

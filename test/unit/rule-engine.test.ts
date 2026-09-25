@@ -486,6 +486,103 @@ describe("rule relationships", () => {
   });
 });
 
+// BUTCHR-404: observer rules (`staffed: false`). A rule can be searched for
+// relationship purposes WITHOUT ever being staffed, so a daemon can hear a
+// ticket a DIFFERENT daemon's own rules staff — the RuleMatch[] a poll
+// produces is still both the relationship-walk's full picture (`latest`,
+// kept in the resource-type's own closure) AND the staffing/spawn input
+// (what `search()` RETURNS), but the two are no longer the SAME array.
+describe("BUTCHR-404: observer rules (staffed:false)", () => {
+  const implementedBy = (worker: string): IssueLink[] => [{ type: "Implements", otherEnd: "outward", key: worker }];
+  const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
+  // The live shape BUTCHR-392/398 named: a Story (boss) on one daemon,
+  // implemented by a Task (child) only the OTHER daemon's rules match.
+  const bossIssue = issue("BUTCHR-392", { issuetype: "Story", issuelinks: implementedBy("BUTCHR-398") });
+  const childIssue = issue("BUTCHR-398", { issuelinks: implementsBoss("BUTCHR-392") });
+
+  describe("relatedForRules needs no change — it only needs the match present in `latest`", () => {
+    // BUTCHR-388: no `relationships` declared at all — the shape of every
+    // live rules file in the fleet. `Implements` routes on the LINK alone.
+    const bossOnly = parseRules({ rules: [
+      { id: "boss", resourceProvider: "jira-work", query: "q1", brief: "do it" },
+    ] });
+
+    // RED: run on the code exactly as it behaves without an observer entry —
+    // this is today's live bug (BUTCHR-392 never wakes because BUTCHR-398 is
+    // simply absent from wroosbit's own `latest`, and no `foreign` fetch is
+    // supplied here either).
+    test("RED (current bug, matches BUTCHR-392/398): the child absent from `latest` produces no edge", () => {
+      const ms: RuleMatch[] = [{ agentKey: "jira-work:boss:BUTCHR-392", rule: bossOnly[0]!, issue: bossIssue }];
+      expect(relatedForRules(bossOnly, ms, ms.map((m) => m.agentKey))).toEqual([]);
+    });
+
+    // GREEN: the SAME relatedForRules, unmodified, produces the edge the
+    // moment an observer match for the child is present in `latest` — proof
+    // that fixing this ticket's bug never required touching relatedForRules
+    // itself, only what feeds it.
+    test("GREEN: an observer (staffed:false) match for the child in `latest` produces the edge", () => {
+      const withObserver = parseRules({ rules: [
+        { id: "boss", resourceProvider: "jira-work", query: "q1", brief: "do it", relationships: { childRule: "child" } },
+        { id: "child", resourceProvider: "jira-work", query: "q2", staffed: false },
+      ] });
+      const [bossRule, observerRule] = withObserver;
+      const ms: RuleMatch[] = [
+        { agentKey: "jira-work:boss:BUTCHR-392", rule: bossRule!, issue: bossIssue },
+        { agentKey: "jira-work:child:BUTCHR-398", rule: observerRule!, issue: childIssue },
+      ];
+      expect(relatedForRules(withObserver, ms, ms.map((m) => m.agentKey))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:boss:BUTCHR-392"] },
+      ]);
+    });
+  });
+
+  // HIGHEST SEVERITY: a leak here would make a daemon spawn agents on
+  // another daemon's tickets and burn the shared admission cap. Asserted
+  // directly against `createRuleResourceType`'s real `discovery.search()`
+  // return value — the exact boundary `src/daemon/loop.ts`'s
+  // `runResourceLoop` reads into its `issues` variable and then hands to
+  // `desiredFrom`/`atRestFrom` (staffing/spawn), `syncLabels`, `checkParked`,
+  // and `checkAbandoned` alike — never a mock of that boundary.
+  test("HIGHEST SEVERITY: an observer match never reaches search()'s return (staffing/spawn/syncLabels/checkParked/checkAbandoned); only the relationship walk sees it", async () => {
+    const ruleSet = parseRules({ rules: [
+      { id: "boss", resourceProvider: "jira-work", query: "q1", brief: "do it", relationships: { childRule: "child" } },
+      { id: "child", resourceProvider: "jira-work", query: "q2", staffed: false },
+    ] });
+    const type = createRuleResourceType({ rules: ruleSet, search: async (jql) => (jql === "q1" ? [bossIssue] : jql === "q2" ? [childIssue] : []) });
+    const matches = await type.discovery.search();
+    // The write/spawn boundary: the observer's ticket is simply not there.
+    expect(matches.map((m) => m.agentKey)).toEqual(["jira-work:boss:BUTCHR-392"]);
+    expect(matches.map((m) => m.issue.key)).not.toContain("BUTCHR-398");
+    expect(uniqueIssues(matches).map((i) => i.key)).toEqual(["BUTCHR-392"]); // syncLabels/checkParked/checkAbandoned's own input
+    const desired = desiredFrom(matches, type); // the staffing/spawn path
+    expect([...desired.keys()]).toEqual(["jira-work:boss:BUTCHR-392"]);
+    // The relationship walk, called right after search() in the SAME poll
+    // exactly as runResourceLoop does, still sees the observer's match.
+    const related = await type.discovery.related!([...desired.keys()]);
+    expect(related.map((r) => r.issue.issue.key)).toEqual(["BUTCHR-398"]);
+    expect(related[0]!.watchers).toEqual(["jira-work:boss:BUTCHR-392"]);
+  });
+
+  test("an observer rule leaks into nothing even with no boss to hide behind: search() returns it to nobody", async () => {
+    const ruleSet = parseRules({ rules: [{ id: "solo", resourceProvider: "jira-work", query: "q", staffed: false }] });
+    const type = createRuleResourceType({ rules: ruleSet, search: async () => [issue("BUTCHR-1")] });
+    expect(await type.discovery.search()).toEqual([]);
+  });
+
+  test("an observer rule is never staffed through the real reconcile loop, even though it is matched every poll", async () => {
+    const herd = fakeHerd();
+    const ruleSet = parseRules({ rules: [{ id: "solo", resourceProvider: "jira-work", query: "q", staffed: false }] });
+    for (let i = 0; i < 2; i++) await poll(herd, ruleSet, async () => [issue("BUTCHR-1")]);
+    expect(herd.spawned).toEqual([]);
+  });
+
+  test("regression: existing rules with no `staffed` field behave exactly as before (default true) — search() returns them unfiltered", async () => {
+    const ruleSet = rules({ id: "task", query: "q" });
+    const type = createRuleResourceType({ rules: ruleSet, search: async () => [issue("BUTCHR-1")] });
+    expect((await type.discovery.search()).map((m) => m.agentKey)).toEqual(["jira-work:task:BUTCHR-1"]);
+  });
+});
+
 describe("rule workspaces", () => {
   let root: string;
   let previous: string | undefined;

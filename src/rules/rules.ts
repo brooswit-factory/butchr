@@ -68,14 +68,29 @@ export interface Rule {
    * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts).
    */
   query: string;
-  /** Brief the agent is given; opaque to validation beyond being non-empty. */
+  /** Brief the agent is given; opaque to validation beyond being non-empty. Must be absent when `staffed` is `false`. */
   brief: string;
-  /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
+  /** Ranked, most preferred first. Absent means "use Butchr's global agent config". Must be absent when `staffed` is `false`. */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /**
+   * BUTCHR-404: `false` makes this an OBSERVER rule — still searched every
+   * poll (so its matches are visible to the relationship walk, see
+   * `src/rules/resource-type.ts`'s `relatedForRules`/`createRuleResourceType`),
+   * but its matches are filtered out before reaching the staffing/spawn path
+   * and any Jira-writing detector (label sync, parked, abandoned). An
+   * observer rule is a SOURCE of a relationship edge, never a destination
+   * that gets an agent. Exists so a daemon can see (for relationship
+   * purposes only) tickets that a DIFFERENT daemon staffs. Defaults to
+   * `true`. A `false` rule may declare neither `brief` nor
+   * `agentPreferences` (rejected at validation time, not merely ignored at
+   * runtime) — both are meaningless without an agent, and allowing them
+   * would let a typo silently half-staff a rule.
+   */
+  staffed?: boolean;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "agentPreferences", "relationships", "staffed"]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 
@@ -149,13 +164,25 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
     else { seen.add(id); providerOf.set(id, resourceProvider); }
     if (enabled !== undefined && typeof enabled !== "boolean") errors.push(`${at}.enabled must be a boolean`);
+    if (raw.staffed !== undefined && typeof raw.staffed !== "boolean") errors.push(`${at}.staffed must be a boolean`);
+    const staffed = raw.staffed !== false;
     if (!oneOf(RESOURCE_PROVIDERS, resourceProvider)) errors.push(`${at}.resourceProvider must be one of ${RESOURCE_PROVIDERS.join(", ")}`);
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
-    if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
-    else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
-    const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
+    // BUTCHR-404: a staffed:false (observer) rule runs no agent, so `brief`
+    // and `agentPreferences` are meaningless for it — reject their presence
+    // outright rather than silently ignoring them, so a typo can never leave
+    // a rule half-staffed (declared as an observer, but still carrying agent
+    // configuration nobody will ever use).
+    if (staffed) {
+      if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
+      else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
+    } else {
+      if (raw.brief !== undefined) errors.push(`${at}.brief must not be set on a staffed:false rule (observer rules never run an agent)`);
+      if (raw.agentPreferences !== undefined) errors.push(`${at}.agentPreferences must not be set on a staffed:false rule (observer rules never run an agent)`);
+    }
+    const agentPreferences = staffed && raw.agentPreferences !== undefined ? parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors) : undefined;
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
     if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
@@ -164,7 +191,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
     rules.push({
       id: id as string, enabled: enabled !== false, resourceProvider: resourceProvider as ResourceProvider,
-      query: (query as string).trim(), brief: brief as string,
+      query: (query as string).trim(), brief: staffed ? (brief as string) : "",
+      ...(staffed ? {} : { staffed: false }),
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
     });
