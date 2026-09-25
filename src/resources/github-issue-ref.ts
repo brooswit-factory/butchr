@@ -55,3 +55,23 @@ export function githubIssueRefFromUrl(url: string): GithubIssueRef | null {
   if (!m) return null;
   return parseGithubIssueRef(`${m[1]!.toLowerCase()}/${m[2]!.toLowerCase()}#${m[3]}`);
 }
+
+/**
+ * BUTCHR-429: the pull request an `https://github.com/<owner>/<repo>/pull/<n>`
+ * web URL names — `githubIssueRefFromUrl`'s twin, `/pull/` in place of
+ * `/issues/`. Reuses `GithubIssueRef`'s shape (owner/repo/number is the same
+ * triple for a PR as for an issue — GitHub's issue and PR numbers share one
+ * counter per repo) rather than a parallel type; a caller that needs to tell
+ * the two apart does so by which of these two functions matched, not by
+ * inspecting the returned shape. Same exclusions as the issue parser: other
+ * hosts, schemes, credentials, ports, and paths below the PR all return
+ * `null`; a query or fragment (e.g. `#issuecomment-1`) still names the PR.
+ */
+export function githubPrRefFromUrl(url: string): GithubIssueRef | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  if (u.protocol !== "https:" || u.hostname !== "github.com" || u.port || u.username || u.password) return null;
+  const m = /^\/([^/]+)\/([^/]+)\/pull\/([^/]+)\/?$/.exec(u.pathname);
+  if (!m) return null;
+  return parseGithubIssueRef(`${m[1]!.toLowerCase()}/${m[2]!.toLowerCase()}#${m[3]}`);
+}
