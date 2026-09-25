@@ -5,6 +5,7 @@ import type { Herd, SpawnSpec } from "../agents/herd.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
 export type { NotifyReason } from "../resources/types.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -413,6 +414,18 @@ export interface ReconcileOptions {
    * report through).
    */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
+  /**
+   * BUTCHR-412: Rocket.Chat account lifecycle, independent of every hook
+   * above (residency/admission/crash-loop/etc. all still run exactly as
+   * before — this only decides what `ensureAccount`/`releaseAccount` see, and
+   * WITHHOLDS a spawn `admitted`/`plan.respawn` would otherwise have made,
+   * never adds one). See `../agents/account-lifecycle.ts` for the hook
+   * contract and why its two call sites below are exactly the boundary the
+   * account manager's own token-rotation contract needs. Optional; omitted,
+   * no account lifecycle runs (every caller before this ticket) — every
+   * `SpawnSpec` reaches `herd.spawn` exactly as `desired` provided it.
+   */
+  account?: AccountLifecycleHooks;
 }
 
 /**
@@ -596,7 +609,24 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // resource's spawn this same `Promise.all`.
     await Promise.all(admitted.map(async (issue) => {
       try {
-        await herd.spawn(desired.get(issue)!);
+        const spec = desired.get(issue)!;
+        // BUTCHR-412: `ensure` runs BEFORE herd.spawn, and only ever for an
+        // id `admitted` (never one already resident — BUTCHR-287's own
+        // residency filter already removed those from `live`/`admitted`
+        // upstream of this point) — see AccountLifecycleHooks' own doc
+        // comment for why that boundary is exactly what the account
+        // manager's token-rotation contract needs.
+        const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
+        if (toSpawn === null) {
+          // A real refusal, already logged (and, where wired, posted) by
+          // `ensure` itself — recorded here as an ordinary "spawn" failure so
+          // it shares checkReconcileFailure's existing audible-failure route
+          // and is excluded from `onAdmitted` below, same as any other failed
+          // spawn attempt.
+          failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
+        } else {
+          await herd.spawn(toSpawn);
+        }
       } catch (e) {
         failures.push({ id: issue, stage: "spawn", error: e });
       }
@@ -623,6 +653,12 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   for (const issue of plan.stop) {
     try {
       await herd.stop(issue);
+      // BUTCHR-412: released only AFTER a successful stop — if herd.stop
+      // itself threw, the agent may still be running, and releasing its
+      // account out from under a still-live agent would be wrong; this
+      // falls to the catch below and is retried as an ordinary stop failure
+      // next poll instead (plan.stop recomputes every poll from scratch).
+      if (opts.account) await opts.account.release(issue, "stop");
     } catch (e) {
       failures.push({ id: issue, stage: "stop", error: e });
     }
@@ -650,8 +686,24 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // loop's admission never reads the stopped agent's slot as free.
     opts.reserveAdmission?.([issue]);
     try {
+      const spec = desired.get(issue)!;
+      // BUTCHR-412: `ensure` runs BEFORE the interim `herd.stop` below —
+      // deliberately: this is a "same agent identity coming back" launch
+      // (`docs/rocketchat-accounts.md`), so a refused account should leave
+      // the existing (stale-argv, but otherwise working) agent running
+      // rather than stop it with no replacement over an account hiccup.
+      // `release(issue, "respawn")` is a documented no-op for a temporary
+      // account either way — called for the same reason `ensureAccount`'s
+      // own "respawn never unprovisions" contract is exercised through real
+      // code here rather than assumed.
+      const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
+      if (toSpawn === null) {
+        failures.push({ id: issue, stage: "respawn", error: new Error("account policy refused this launch — see the [account] log line above; stale agent left running rather than stopped with no replacement") });
+        continue;
+      }
+      if (opts.account) await opts.account.release(issue, "respawn");
       await herd.stop(issue);
-      await herd.spawn(desired.get(issue)!, "respawn");
+      await herd.spawn(toSpawn, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
       // is unaffected. If `stop` succeeded but `spawn` then threw, `issue`
@@ -856,6 +908,8 @@ export interface GenericLoopDeps<T> {
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
+  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment — threaded straight through to `reconcileNow` below. Wired into every rule loop (src/daemon/index.ts) as the SAME shared `AccountLifecycleHooks` instance (one account manager/store, not one per tier — mirrors `admission` above). Optional; omitted, no account lifecycle runs (every caller before this ticket). */
+  account?: AccountLifecycleHooks;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -948,6 +1002,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
         ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
+        ...(deps.account ? { account: deps.account } : {}),
         atRest,
       });
       // BUTCHR-307 REVIEW FIX: `atRest` ids are unioned in here, not just

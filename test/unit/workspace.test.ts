@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, statSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, RC_ACCOUNT_FILE, type SpawnSpec } from "../../src/agents/workspace.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
@@ -509,6 +509,54 @@ describe("buildWorkspace", () => {
       else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  // BUTCHR-412: connection-material delivery — a dedicated 0600 file, never
+  // argv/mcp.json/a daemon log line.
+  describe("Rocket.Chat connection material", () => {
+    test("spec.rocketchat present: written to a 0600 file, absent from mcp.json/CLAUDE.md/brief.md", () => {
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "bw-rc-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const rocketchat = { url: "https://chat.example.com", rcUserId: "rc-user-1", username: "butchr_jira-work-triage-kan-9_deadbeef00", token: "super-secret-token" };
+        const dir = buildWorkspace({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null, rocketchat }, "http://x/mcp");
+        const path = join(dir, RC_ACCOUNT_FILE);
+        expect(existsSync(path)).toBe(true);
+        expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ url: rocketchat.url, userId: rocketchat.rcUserId, authToken: rocketchat.token, username: rocketchat.username });
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+        // The secret never leaks into any other workspace file.
+        for (const f of ["mcp.json", "CLAUDE.md", "brief.md", "ENVIRONMENT.md"]) {
+          expect(readFileSync(join(dir, f), "utf8")).not.toContain(rocketchat.token);
+        }
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+        else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("spec.rocketchat absent: no file written, and a stale file from a PRIOR launch is removed", () => {
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "bw-rc-absent-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const specNone: SpawnSpec = { key: "KAN-9", issuetype: "Task", summary: "s", parent: null };
+        const dir = buildWorkspace(specNone, "http://x/mcp");
+        expect(existsSync(join(dir, RC_ACCOUNT_FILE))).toBe(false);
+
+        // A later relaunch WITH material, then a policy change back to none:
+        // the stale file must not linger looking current.
+        buildWorkspace({ ...specNone, rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x_ab", token: "tok" } }, "http://x/mcp");
+        expect(existsSync(join(dir, RC_ACCOUNT_FILE))).toBe(true);
+        buildWorkspace(specNone, "http://x/mcp");
+        expect(existsSync(join(dir, RC_ACCOUNT_FILE))).toBe(false);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+        else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 });
 

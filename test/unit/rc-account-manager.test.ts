@@ -10,74 +10,11 @@ import {
   type AccountStore,
   type AccountManagerDeps,
 } from "../../src/accounts/manager.js";
-import { RocketChatApiError, RocketChatHttpError, type RocketChatClient, type RocketChatUser } from "../../src/resources/rocketchat.js";
+import { RocketChatHttpError, type RocketChatClient } from "../../src/resources/rocketchat.js";
+import { fakeStore, fakeRcClient, baseAccountManagerDeps as baseDeps } from "../fixtures/rocketchat-fakes.js";
 
 const AGENT = "jira-work:triage:BUTCHR-1";
 const AGENT2 = "jira-work:triage:BUTCHR-2";
-
-function fakeStore(initial: AccountRecord[] = []): AccountStore & { data: Map<string, AccountRecord> } {
-  const data = new Map(initial.map((r) => [r.agentKey, r]));
-  return {
-    data,
-    async get(k) { return data.get(k) ?? null; },
-    async set(r) { data.set(r.agentKey, r); },
-    async delete(k) { data.delete(k); },
-    async list() { return [...data.values()]; },
-  };
-}
-
-type FakeCall = { method: string; args: unknown[] };
-
-function fakeRcClient(seed: RocketChatUser[] = []) {
-  const byUsername = new Map(seed.map((u) => [u.username, u]));
-  const byId = new Map(seed.map((u) => [u.id, u]));
-  let nextId = seed.length + 1;
-  const calls: FakeCall[] = [];
-  let countOverride: number | null = null;
-  const client: RocketChatClient = {
-    async getUserByUsername(username) { calls.push({ method: "getUserByUsername", args: [username] }); return byUsername.get(username) ?? null; },
-    async countUsers() { calls.push({ method: "countUsers", args: [] }); return countOverride ?? byUsername.size; },
-    async createUser(input) {
-      calls.push({ method: "createUser", args: [input] });
-      if (byUsername.has(input.username)) throw new Error("Username is already in use");
-      const u: RocketChatUser = { id: `id-${nextId++}`, username: input.username, active: true };
-      byUsername.set(u.username, u);
-      byId.set(u.id, u);
-      return u;
-    },
-    async deleteUser(userId) {
-      calls.push({ method: "deleteUser", args: [userId] });
-      if (!byId.has(userId)) throw new RocketChatApiError("user delete", "User not found.");
-      const u = byId.get(userId)!;
-      byUsername.delete(u.username);
-      byId.delete(userId);
-    },
-    async generateManagedToken(userId) {
-      calls.push({ method: "generateManagedToken", args: [userId] });
-      if (!byId.has(userId)) throw new RocketChatApiError("token generate", "User not found.");
-      return `tok-${userId}`;
-    },
-    async revokeManagedToken(userId) {
-      calls.push({ method: "revokeManagedToken", args: [userId] });
-      if (!byId.has(userId)) throw new RocketChatApiError("token revoke", "User not found.");
-    },
-  };
-  return {
-    client, calls, byUsername,
-    setCountOverride: (n: number) => { countOverride = n; },
-    /** Simulates the RC user vanishing out-of-band (deleted by another admin, or a previous release that got interrupted) — bypasses `deleteUser` so it never appears in `calls`. */
-    removeUserExternally: (id: string) => { const u = byId.get(id); if (u) { byUsername.delete(u.username); byId.delete(id); } },
-  };
-}
-
-const baseDeps = (over: Partial<AccountManagerDeps> = {}): AccountManagerDeps => ({
-  client: fakeRcClient().client,
-  store: fakeStore(),
-  userCapThreshold: 45,
-  now: () => "2026-09-24T00:00:00.000Z",
-  randomPassword: () => "fixed-password",
-  ...over,
-});
 
 describe("Rocket.Chat username identity", () => {
   test("deterministic, RC-safe, length-bounded, and marked with the managed prefix", () => {
