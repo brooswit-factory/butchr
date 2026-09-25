@@ -1,7 +1,8 @@
 # Linked-change eventing deploy verification (BUTCHR-439, story BUTCHR-430, epic BUTCHR-421)
 
-**STATUS: Steps A-E complete and PASS. Step F (revert) is the epic's and
-admin-assembly's action, tracked separately, not gating this record.**
+**STATUS: Steps A-E complete and PASS. Step F (revert) is DONE except for
+deletion of the throwaway tickets BUTCHR-441/442, which were closed to Done
+rather than deleted — see §6.**
 
 Answers the epic's Done-when clause: "The deploy is verified in the journals
 with a real linked-item change delivering exactly one turn to its query-based
@@ -279,14 +280,57 @@ ruled on exactly this reading (BUTCHR-430 comment 24104): "exactly one
 notify/delivery" is the accepted definition of "exactly one turn" for this
 verification's own acceptance criteria.
 
-## 6. Step F — revert: PENDING (not this task's action)
+## 6. Step F — revert: DONE (rule + restart), tickets closed not deleted
 
-Fast/no-restart revert: delete BUTCHR-441 (its query then matches nothing,
-the agent stops). Full clean revert: remove the rule object from wroosbit's
-rules file and restart wroosbit's daemon. Both go through the epic and
-admin-assembly, not this task's agent — tracked on BUTCHR-421/430, not
-gating this record or this PR. Final cleanup: delete BUTCHR-441 and
-BUTCHR-442.
+Performed by admin-assembly via the epic (BUTCHR-421 comment 24118 request;
+confirmation relayed in BUTCHR-430 comment 24126). No code rollback — both
+daemons remain on `aff46dd`; only wroosbit's rules file and daemon were
+touched. Evidence below captured and pasted by BUTCHR-430 (the story agent,
+whose own daemon is wroosbit's) at 09:48 PDT from wroosbit's journal, rules
+directory, and Jira — this task's agent has no independent read access to
+any of those three sources (see §4's access-limitation note) and states
+that plainly here too.
+
+**Restart and rule removal, verbatim:**
+```
+Sep 25 09:46:41 servyboi systemd[972]: Stopped butchr.service - butchr daemon (the software factory).
+Sep 25 09:46:41 servyboi systemd[972]: Started butchr.service - butchr daemon (the software factory).
+Sep 25 09:46:42 servyboi bun[1394510]: butchr: rules from /home/wroosbit/.config/butchr-new/resource-rules.json: 2 enabled (stories, subtasks)
+Sep 25 09:46:42 servyboi bun[1394510]: build aff46dd2 (git-at-start, clean) version=0.15.5 pid=1394510 unit=butchr.service
+```
+`/health`: sha `aff46dd28fb4fb3eafcbae4996fd6062e2831591`, pid 1394510,
+startedAt `2026-09-25T16:46:41.805Z`, currency "current" — same build as
+throughout this verification, restart only reloaded config.
+
+**Rules file restored exactly:** now carries only `stories` (enabled),
+`subtasks` (enabled), `github-issues` (disabled), `zendesk-tickets`
+(disabled) — `linked-eventing-verify-430` is gone. Per BUTCHR-430, the
+current file (`jq -S`-normalized) is byte-identical to
+`resource-rules.json.bak-20260925-linked-eventing-430`, the backup taken
+before the rule was ever added; the with-rule version is preserved
+separately as `resource-rules.json.with-430-rule-20260925`.
+
+**No further activity for BUTCHR-441:** no journal line mentions BUTCHR-441
+or its rule after the 09:46:42 restart, except BUTCHR-430's own
+`jira_get_issue` lookup of it at 09:48:20 (a read, not an agent action).
+The last linked `[notify-suppressed]` for BUTCHR-441 was at 09:38:00, well
+before the revert. **Evidence limit, stated rather than papered over:**
+neither BUTCHR-430 nor this task's agent can show a specific "agent
+stopped" journal line — the absence of further BUTCHR-441 activity after
+the rules reload is the evidence, not a directly logged stop event.
+
+**Leftover, harmless:** a workspace directory at
+`/home/wroosbit/butchr-workspaces/jira-work/linked-eventing-verify-430/BUTCHR-441`
+(brief.md, CLAUDE.md only, dated 07:39) was not cleaned up. Noted, not
+treated as a problem.
+
+**Discrepancy, recorded plainly rather than smoothed over:** an earlier
+relayed summary said BUTCHR-441 and BUTCHR-442 were "deleted". They were
+NOT. As of 09:48 PDT, `jira_get_issue` on BUTCHR-441 returns the issue,
+status **Done** (transitioned 09:47:14 PDT), still linked to BUTCHR-442,
+which is also **Done**. The correct statement is: both tickets were closed
+to Done, not deleted. Deletion (if wanted) is still open, for whoever holds
+delete rights — not done by this task, not claimed as done.
 
 ## 7. Honesty statement
 
