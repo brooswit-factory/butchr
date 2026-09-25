@@ -143,11 +143,24 @@ export interface Rule {
   maxLinkedItems?: number;
   /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
   maxLinkedTurnsPerHour?: number;
+  /**
+   * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's
+   * matched resources' Jira REMOTE links as an additional linked-Jira-item
+   * source, on top of issuelinks/parent/description (all free — they ride
+   * the existing search fields). Unlike those, a remote link costs one
+   * genuinely separate API call per resource
+   * (`AtlassianClient#remoteLinks`), so it is gated behind this own knob
+   * rather than folded into `linkedEventing` — a resource whose rule leaves
+   * this absent/false makes ZERO remote-link calls. Only meaningful when
+   * `linkedEventing` is also true; absent/false is today's behaviour
+   * exactly (no remote-link fetch, same as before this field existed).
+   */
+  linkedRemoteLinks?: boolean;
 }
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships",
-  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -237,11 +250,13 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
     // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
-    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour } = raw;
+    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
     if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
     if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
     if (maxLinkedItems !== undefined && !isPositiveInt(maxLinkedItems)) errors.push(`${at}.maxLinkedItems must be a positive integer`);
     if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
+    // BUTCHR-436: fifth linked-eventing knob, same independently-optional house style.
+    if (linkedRemoteLinks !== undefined && typeof linkedRemoteLinks !== "boolean") errors.push(`${at}.linkedRemoteLinks must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
@@ -261,6 +276,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
       ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
       ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
+      ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

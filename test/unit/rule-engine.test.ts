@@ -979,3 +979,68 @@ describe("rule workspaces", () => {
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
   });
 });
+
+// BUTCHR-436 (epic BUTCHR-421, story 2/4): `createRuleResourceType`'s own
+// wiring of linked-change eventing — that `discovery.related()` actually
+// calls `deps.notify` for an owning resource's coalesced linked-change tick,
+// runs AFTER `search()` has this poll's fresh matches, and stays inert
+// (no `deps.search` calls beyond the rule's own JQL, no `deps.notify` calls)
+// when `deps.notify` is simply never wired — every existing caller/test
+// before this ticket. The coalescer/rate-cap/diff logic itself is unit-
+// tested directly against `createLinkedEventingState` in
+// test/unit/linked-eventing.test.ts; this block only proves the SEAM.
+describe("BUTCHR-436: linked-change eventing wiring", () => {
+  test("omitting deps.notify leaves linked-change eventing fully inert — no extra search calls, discovery/logging unaffected", async () => {
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    let searchCalls = 0;
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => { searchCalls++; return jql === "q" ? [withLinks] : []; },
+    });
+    await type.discovery.search();
+    await type.discovery.related!([]);
+    expect(searchCalls).toBe(1); // only the rule's own JQL — no batched linked-item fetch without deps.notify
+  });
+
+  test("a real change to a linked Jira ticket, discovered via the rule engine's own search(), reaches deps.notify through discovery.related()", async () => {
+    let linkedStatus = "To Do";
+    const withLinks = () => issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const notified: Array<{ agent: string; reason?: unknown }> = [];
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => {
+        if (jql === "q") return [withLinks()];
+        if (jql.startsWith("key in (")) return jql.includes("BUTCHR-2") ? [issue("BUTCHR-2", { status: linkedStatus })] : [];
+        return [];
+      },
+      notify: async (agent, _about, reason) => { notified.push({ agent, reason }); },
+    });
+
+    await type.discovery.search();
+    await type.discovery.related!([]); // poll 1: seeds the baseline
+    expect(notified).toHaveLength(0);
+
+    linkedStatus = "In Progress";
+    await type.discovery.search();
+    await type.discovery.related!([]); // poll 2: the linked ticket genuinely changed
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-1");
+  });
+
+  test("a linked-eventing tick failure never breaks discovery.related()'s own return value", async () => {
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const boss = issue("BUTCHR-9", { issuelinks: [{ type: "Implements", otherEnd: "outward", key: "BUTCHR-1" }] as never });
+    const lines: string[] = [];
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => (jql === "q" ? [withLinks, boss] : []),
+      notify: async () => { throw new Error("channel down"); },
+      log: (l) => lines.push(l),
+    });
+    await type.discovery.search();
+    const related = await type.discovery.related!(["jira-work:task:BUTCHR-9"]);
+    // The Implements-chain related entry for BUTCHR-1 (heard by BUTCHR-9) is still produced, unaffected by the linked-eventing tick throwing inside notify().
+    expect(related.some((r) => (r.issue.kind === "resource" ? r.issue.match.issue.key : null) === "BUTCHR-1")).toBe(true);
+    expect(lines.some((l) => l.includes("WARNING: [linked-eventing] tick threw"))).toBe(true);
+  });
+});
