@@ -362,18 +362,26 @@ daemon-written per-agent MCP config header (`x-butchr-agent`; see
 `src/mcp/identity.ts`'s `callerIdentity`, and `mcpIdentityHeaders` /
 `src/agents/workspace.ts` for how a managed-session agent's own workspace
 gets that header baked in at spawn time — never something the agent
-supplies itself).
+supplies itself as a tool ARGUMENT).
 
-**This is an honest TOOL-BOUNDARY guarantee, not an OS-level one.** Any
-process that can write the definitions directory directly — a shell command
-run by the SAME managed-session agent, another process under the same Unix
-user, an operator by hand — can still flip a `frozen` field or edit a grant
-directly, exactly as before this ticket. What this capability actually
-buys: an agent that has ONLY MCP tools (no shell, no filesystem write
-access of its own to the definitions directory) can still be delegated a
-narrow, auditable freeze/unfreeze capability over specific OTHER
-definitions, without that agent — or anyone spoofing its arguments — being
-able to touch anything else.
+**This is an honest TOOL-BOUNDARY guarantee, not an OS-level one — and the
+header itself is part of that same OS-level boundary, not above it.** The
+header lives inside the agent's own daemon-written workspace config —
+`mcp.json` for a Claude launch, the launched process's own argv for Codex
+(`agentLaunchConfig`, `src/agents/argv.ts`) — so an agent WITH SHELL ACCESS
+to its own workspace could in principle read or alter that file/process
+state, same as it could edit its own manifest directly; nothing here claims
+otherwise. Any process that can write the definitions directory directly —
+a shell command run by the SAME managed-session agent, another process
+under the same Unix user, an operator by hand — can still flip a `frozen`
+field or edit a grant directly, exactly as before this ticket. What this
+capability actually buys: an agent that has ONLY MCP tools (no shell, no
+filesystem write access of its own to the definitions directory) can still
+be delegated a narrow, auditable freeze/unfreeze capability over specific
+OTHER definitions, without that agent — or anyone spoofing its ARGUMENTS —
+being able to touch anything else. The guarantee is against argument-level
+spoofing between agents, never against what an agent's own shell can do to
+itself.
 
 ### The grant: `freezeControllers` / `unfreezeControllers`
 
