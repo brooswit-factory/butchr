@@ -42,11 +42,72 @@ export function inventoryCodexMcp(
   delete blocked.disabledMcpServers;
   return blocked;
 }
-export const kickoffFor = (provider: AgentProvider): string => provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+/**
+ * PR #394 review fix (round 2, revised): `spec` is optional and SECOND on
+ * purpose — every existing caller passes only `provider`, and behaviour for
+ * those calls is byte-for-byte unchanged (`spec` absent, or `spec.cwd`
+ * absent, falls straight through to the ordinary `"follow your CLAUDE.md"`/
+ * `"follow your AGENTS.md"` string every provider has always gotten).
+ *
+ * BUTCHR-408: a spec with `cwd` set (a managed-session definition) names
+ * the directory the agent should actually WORK in — but (see
+ * `SpawnSpec.cwd`'s own doc comment, src/agents/workspace.ts, for the full
+ * story) the spawned PROCESS's own launch cwd stays the ordinary
+ * bookkeeping directory; `cwd` is communicated to the agent through ITS
+ * OWN kickoff instructions instead, explicitly telling it to `cd` there
+ * before anything else, followed by its definition's own `brief` (its
+ * whole prompt/role) — since with the process actually launched at
+ * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
+ * PROJECT's own file (if any), never butchr's generated one, and the
+ * definition's `brief` would never reach the agent at all.
+ */
+export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
+  if (spec?.cwd && spec.brief) return `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${spec.brief}`;
+  return provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+};
+
+/**
+ * `server:<name>` for every `spec.mcpServers` entry with `channel: true`
+ * (BUTCHR-408, type ported from S4's BUTCHR-395 branch — see
+ * `McpServerBinding`'s own doc comment, src/rules/rules.ts) — the same
+ * channel-naming convention `server:butchr` already uses. Order follows
+ * `spec.mcpServers`, so it's deterministic for argv comparison
+ * (`checkArgv`/`staleIssues`). Empty when `spec.mcpServers` is
+ * absent/empty — unaffected.
+ */
+const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).filter((s) => s.channel).map((s) => `server:${s.name}`);
+
+/**
+ * Codex `McpServerLaunchConfig` entries for `spec.mcpServers` — every
+ * binding, `channel` or not: Codex has no development-channel concept, so a
+ * bound server reaches Codex as MCP TOOLS only, never push.
+ *
+ * DELIBERATELY never `headers`, unlike `spec.externalMcpServers` above:
+ * Drovr renders a Codex `McpServerLaunchConfig`'s `headers` as `--config
+ * mcp_servers.<name>={ ..., http_headers = {...} }` — a real process
+ * command-line argument, visible to any other local user via `ps`/`/proc`,
+ * and also the exact text `staleIssues()`/`onRespawn` echo verbatim into
+ * `observedArgv` and the daemon journal (S4/PR #387 review finding, ported
+ * here with the type). `headersEnvVar` exists precisely so a header VALUE
+ * (often a bearer token) is never written anywhere that isn't the daemon's
+ * own process environment and the agent's own `mcp.json` (Claude only, see
+ * `buildWorkspace`'s 0600 handling) — Codex argv is exactly such an
+ * "anywhere else". A binding that names `headersEnvVar` simply connects
+ * Codex to the bound server with no extra headers; docs/managed-sessions.md
+ * says so loudly, and BUTCHR-408's own Codex example definition never
+ * depends on an authenticated bound server.
+ */
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
+  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
- * arguments and returns the complete Herdr start contract.
+ * arguments and returns the complete Herdr start contract. `dir` (the
+ * bookkeeping directory, `buildWorkspace`'s return value) is ALWAYS the
+ * launched process's own `cwd` here — `spec.cwd`, when a spec names one,
+ * is deliberately NOT threaded into `cwd` below; see `SpawnSpec.cwd`'s own
+ * doc comment (src/agents/workspace.ts) for why, and `kickoffFor` above
+ * for how the agent still learns where to actually work.
  */
 export function agentLaunchConfig(
   spec: SpawnSpec,
@@ -80,7 +141,7 @@ export function agentLaunchConfig(
         name: "butchr",
         url: mcpUrl,
         headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
-      }, ...(spec.externalMcpServers ?? [])],
+      }, ...(spec.externalMcpServers ?? []), ...boundCodexServers(spec)],
       disabledMcpServers: agent.disabledMcpServers ?? [],
     };
   }
@@ -95,7 +156,8 @@ export function agentLaunchConfig(
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
-    developmentChannels: ["server:butchr"],
+    developmentChannels: ["server:butchr", ...boundChannels(spec)],
+    ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
   };
 }
 
@@ -104,7 +166,7 @@ export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
-  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider) });
+  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
 }
 
 /**

@@ -197,6 +197,15 @@ export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEv
 }
 
 /**
+ * The agent-facing push for a `filesystem` agent's own resource. Names no
+ * tool (there is none — a filesystem agent reads/edits its resource directly
+ * with its own file tools; see src/rules/filesystem-type.ts).
+ */
+export function filesystemNudge(resource: string, reason: NotifyReason | undefined): string {
+  return `[butchr] Filesystem resource ${resource} ${reasonClause(reason)} — re-read it from disk.`;
+}
+
+/**
  * The push for a `jira-idea` agent about a GitHub issue its idea links to
  * (src/rules/jira-idea-type.ts). Identity and reason only, never GitHub text;
  * an idea agent has no GitHub tools, so it names the link-listing tool.
