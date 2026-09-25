@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -529,6 +529,31 @@ describe("buildWorkspace", () => {
         for (const f of ["mcp.json", "CLAUDE.md", "brief.md", "ENVIRONMENT.md"]) {
           expect(readFileSync(join(dir, f), "utf8")).not.toContain(rocketchat.token);
         }
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+        else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    // BUTCHR-412 review round 1, non-blocking finding: writeFileSync's own
+    // `mode` option is ignored when the file already exists — only chmodSync
+    // after the write actually fixes an EXISTING file's permissions.
+    test("an EXISTING credential file at a permissive mode is forced back to 0600 on rebuild, not left at its old mode", () => {
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "bw-rc-chmod-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const rocketchat = { url: "https://chat.example.com", rcUserId: "rc-user-1", username: "butchr_x", token: "tok-1" };
+        const spec: SpawnSpec = { key: "KAN-9", issuetype: "Task", summary: "s", parent: null, rocketchat };
+        const dir = buildWorkspace(spec, "http://x/mcp");
+        const path = join(dir, RC_ACCOUNT_FILE);
+        chmodSync(path, 0o664); // simulate a file that somehow ended up group/other-readable
+        expect(statSync(path).mode & 0o777).toBe(0o664);
+
+        buildWorkspace({ ...spec, rocketchat: { ...rocketchat, token: "tok-2" } }, "http://x/mcp");
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+        expect(JSON.parse(readFileSync(path, "utf8")).authToken).toBe("tok-2");
       } finally {
         if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
         else process.env.BUTCHR_WORKSPACES = previous;

@@ -177,6 +177,7 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
       account: {
         ensure: async (s) => { ensureCalledFor.push(s.key); return { ...s, rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "tok" } }; },
         release: async () => {},
+        retryPendingReleases: async () => {},
       },
     });
     expect(ensureCalledFor).toEqual(["NEW"]);
@@ -188,7 +189,7 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
     const admitted: string[] = [];
     const failures: unknown[] = [];
     await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
-      account: { ensure: async () => null, release: async () => {} },
+      account: { ensure: async () => null, release: async () => {}, retryPendingReleases: async () => {} },
       onAdmitted: (succeeded) => admitted.push(...succeeded),
       checkReconcileFailure: async (fs) => { failures.push(...fs); },
     });
@@ -201,7 +202,7 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
     const { herd, stopped } = fakeHerdCapturingSpecs(["OLD"]);
     const released: Array<{ id: string; reason: string }> = [];
     await reconcileNow(herd, new Map(), {
-      account: { ensure: async (s) => s, release: async (id, reason) => { released.push({ id, reason }); } },
+      account: { ensure: async (s) => s, release: async (id, reason) => { released.push({ id, reason }); }, retryPendingReleases: async () => {} },
     });
     expect(stopped).toEqual(["OLD"]);
     expect(released).toEqual([{ id: "OLD", reason: "stop" }]);
@@ -219,7 +220,7 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
     const released: string[] = [];
     const failures: unknown[] = [];
     await reconcileNow(herd, new Map(), {
-      account: { ensure: async (s) => s, release: async (id) => { released.push(id); } },
+      account: { ensure: async (s) => s, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {} },
       checkReconcileFailure: async (fs) => { failures.push(...fs); },
     });
     expect(released).toEqual([]);
@@ -234,6 +235,7 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
       account: {
         ensure: async (s) => { calls.push("ensure"); return { ...s, rocketchat: { url: "https://chat.example.com", rcUserId: "u1", username: "butchr_x", token: "fresh-tok" } }; },
         release: async (id, reason) => { calls.push("release"); released.push({ id, reason }); },
+        retryPendingReleases: async () => {},
       },
     });
     expect(calls).toEqual(["ensure", "release"]); // ensure resolves before the interim stop/release
@@ -247,13 +249,22 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
     const released: string[] = [];
     const failures: unknown[] = [];
     await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
-      account: { ensure: async () => null, release: async (id) => { released.push(id); } },
+      account: { ensure: async () => null, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {} },
       checkReconcileFailure: async (fs) => { failures.push(...fs); },
     });
     expect(stopped).toEqual([]); // never stopped
     expect(spawnedSpecs).toEqual([]); // never respawned
     expect(released).toEqual([]); // release("respawn") never reached — ensure refused first
     expect(failures).toEqual([{ id: "STALE", stage: "respawn", error: expect.any(Error) }]);
+  });
+
+  test("retryPendingReleases is called exactly once per poll, before anything else, whether or not there is anything to spawn/stop", async () => {
+    const { herd } = fakeHerdCapturingSpecs();
+    let calls = 0;
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async () => {}, retryPendingReleases: async () => { calls++; } },
+    });
+    expect(calls).toBe(1);
   });
 
   test("no account hooks at all: behaves exactly as before this ticket (every SpawnSpec reaches herd.spawn unchanged)", async () => {

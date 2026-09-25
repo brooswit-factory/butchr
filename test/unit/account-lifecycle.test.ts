@@ -5,6 +5,7 @@ import { rcUsernameFor } from "../../src/accounts/identity.js";
 import { fakeStore, fakeRcClient, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
 import type { SpawnSpec } from "../../src/agents/workspace.js";
 import type { AccountPolicy } from "../../src/rules/rules.js";
+import type { AccountManager } from "../../src/accounts/manager.js";
 
 const AGENT = "jira-work:triage:BUTCHR-1";
 const spec = (over: Partial<SpawnSpec> = {}): SpawnSpec => ({ key: AGENT, issuetype: "task", summary: "s", parent: null, ...over });
@@ -128,5 +129,90 @@ describe("createAccountLifecycle — release", () => {
     const hooks = createAccountLifecycle({ manager, policyOf: () => "none", url: "https://chat.example.com", log: (l) => logs.push(l) });
     await hooks.release(AGENT, "stop");
     expect(logs.some((l) => l.includes("WARNING"))).toBe(false);
+  });
+});
+
+// BUTCHR-412 review round 1, blocking finding 2: a release that throws AFTER
+// a successful herd.stop is otherwise never retried by anything (the id is
+// no longer running, so it can never land in a future plan.stop on its
+// own) — `release` must queue it, and `retryPendingReleases` must drain it.
+describe("createAccountLifecycle — pending release retry (BUTCHR-412 review round 1)", () => {
+  /** A hand-rolled manager whose releaseAccount can be told to throw N times before succeeding — a real createAccountManager's releaseAccount only throws on a genuine transport failure (RocketChatHttpError etc.), which is exactly what this simulates without needing a real fake RC client wired for it. */
+  function flakyManager(throwsBeforeSucceeding: number): AccountManager & { releaseCalls: number } {
+    let releaseCalls = 0;
+    let thrown = 0;
+    return {
+      releaseCalls: 0,
+      async ensureAccount(_key, policy) {
+        if (policy === "none") return { ok: true, policy: "none" };
+        return { ok: true, policy, rcUserId: "u1", username: "butchr_x", token: "tok", created: true };
+      },
+      async releaseAccount(_key, _reason) {
+        releaseCalls++;
+        this.releaseCalls = releaseCalls;
+        if (thrown < throwsBeforeSucceeding) { thrown++; throw new Error("Rocket.Chat unreachable"); }
+        return { ok: true, released: true };
+      },
+      async reconcileOrphans() { return []; },
+    };
+  }
+
+  test("a release that throws is queued, never rethrown to the caller", async () => {
+    const manager = flakyManager(1);
+    const logs: string[] = [];
+    const hooks = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com", log: (l) => logs.push(l) });
+    await expect(hooks.release(AGENT, "stop")).resolves.toBeUndefined();
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("queued for retry"))).toBe(true);
+  });
+
+  test("retryPendingReleases retries a queued release and stops retrying once it succeeds", async () => {
+    const manager = flakyManager(2); // fails twice, succeeds on the third attempt
+    const logs: string[] = [];
+    const hooks = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com", log: (l) => logs.push(l) });
+    await hooks.release(AGENT, "stop"); // attempt 1: throws, queued
+    expect(manager.releaseCalls).toBe(1);
+
+    await hooks.retryPendingReleases(); // attempt 2: throws again, still queued
+    expect(manager.releaseCalls).toBe(2);
+    expect(logs.some((l) => l.includes("still queued"))).toBe(true);
+
+    await hooks.retryPendingReleases(); // attempt 3: succeeds
+    expect(manager.releaseCalls).toBe(3);
+    expect(logs.some((l) => l.includes("Rocket.Chat account released (stop)"))).toBe(true);
+
+    // Nothing left to retry — a further call makes no additional release attempt.
+    await hooks.retryPendingReleases();
+    expect(manager.releaseCalls).toBe(3);
+  });
+
+  test("retryPendingReleases with nothing queued is a cheap no-op", async () => {
+    const manager = flakyManager(0);
+    const hooks = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com" });
+    await expect(hooks.retryPendingReleases()).resolves.toBeUndefined();
+    expect(manager.releaseCalls).toBe(0);
+  });
+
+  test("ensure cancels a queued release for the SAME id — the account is being actively reused, not actually stopping", async () => {
+    const manager = flakyManager(100); // never succeeds on its own — proves the cancel, not a lucky retry
+    const logs: string[] = [];
+    const hooks = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com", log: (l) => logs.push(l) });
+    await hooks.release(AGENT, "stop"); // throws, queued
+    expect(manager.releaseCalls).toBe(1);
+
+    await hooks.ensure(spec());
+    expect(logs.some((l) => l.includes("cancelling a queued release"))).toBe(true);
+
+    // The cancelled release is never retried again.
+    await hooks.retryPendingReleases();
+    expect(manager.releaseCalls).toBe(1);
+  });
+
+  test("ensure for a DIFFERENT id does not disturb another id's queued release", async () => {
+    const manager = flakyManager(1);
+    const hooks = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com" });
+    await hooks.release(AGENT, "stop"); // throws, queued
+    await hooks.ensure(spec({ key: "jira-work:triage:BUTCHR-2" }));
+    await hooks.retryPendingReleases(); // AGENT's queued release still retried and succeeds
+    expect(manager.releaseCalls).toBe(2);
   });
 });

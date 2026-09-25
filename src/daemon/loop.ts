@@ -473,6 +473,13 @@ export interface ReconcileOptions {
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
   const failures: ReconcileFailure[] = [];
+  // BUTCHR-412: drain any release `AccountLifecycleHooks.release` could not
+  // complete on an earlier poll (the manager call itself threw, after
+  // herd.stop had already succeeded) BEFORE anything else this poll — see
+  // that hook's own doc comment for why this is the only retry path such a
+  // failure ever gets (the id is no longer running, so it can never land in
+  // a future plan.stop on its own).
+  if (opts.account) await opts.account.retryPendingReleases();
   if (herd.recoverQuota) {
     await Promise.all([...desired.values()].map(async (spec) => {
       try {
@@ -655,9 +662,16 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       await herd.stop(issue);
       // BUTCHR-412: released only AFTER a successful stop — if herd.stop
       // itself threw, the agent may still be running, and releasing its
-      // account out from under a still-live agent would be wrong; this
-      // falls to the catch below and is retried as an ordinary stop failure
-      // next poll instead (plan.stop recomputes every poll from scratch).
+      // account out from under a still-live agent would be wrong; a
+      // throwing herd.stop instead falls to the catch below and is retried
+      // as an ordinary stop failure next poll (plan.stop recomputes every
+      // poll from scratch). `release` ITSELF never throws past this point —
+      // see AccountLifecycleHooks.release's own doc comment: once herd.stop
+      // has succeeded, the id is no longer running and so can never again
+      // land in plan.stop on its own, which is exactly why a release
+      // failure here is queued internally and drained every poll by
+      // `retryPendingReleases` (above, top of this function) instead of
+      // being left to a retry path that does not actually exist for it.
       if (opts.account) await opts.account.release(issue, "stop");
     } catch (e) {
       failures.push({ id: issue, stage: "stop", error: e });

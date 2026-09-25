@@ -71,6 +71,7 @@ import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
 import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
 import { createAccountLifecycle } from "../agents/account-lifecycle.js";
+import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -748,27 +749,25 @@ if (rcPolicyNeeded) {
   // account whose agent genuinely stopped existing with no reaper run in
   // between (this daemon crashing before a reap poll ever observed it, or an
   // account orphaned by an earlier bug) — `reconcileOrphans` is the read-only
-  // backstop `docs/rocketchat-accounts.md` names for exactly this, and a
-  // small periodic sweep (never gated on any rule loop's own poll) is wired
-  // here: run once at startup, then on this interval, for as long as this
-  // check exists cheaply (one file read plus one `herd.runningIssues()` per
-  // sweep) that a dedicated poll loop would be overkill for.
-  const sweepAccountOrphans = async (): Promise<void> => {
-    try {
-      const running = new Set(await herd.runningIssues());
-      const orphans = await accountManager.reconcileOrphans((agentKey) => running.has(agentKey));
-      for (const o of orphans) {
-        const result = await accountManager.releaseAccount(o.agentKey, "stop");
-        if (result.ok && result.released) console.error(`  [account] orphan sweep released ${o.agentKey} (no live agent found for its recorded Rocket.Chat account)`);
-        else if (!result.ok) console.error(`  WARNING: [account] orphan sweep release refused for ${o.agentKey}: ${result.reason} — ${result.message}`);
-      }
-    } catch (e) {
-      console.error(`  WARNING: [account] orphan sweep failed: ${(e as Error)?.message ?? e}`);
-    }
-  };
+  // backstop `docs/rocketchat-accounts.md` names for exactly this.
+  // `createAccountOrphanSweep` (src/agents/account-orphan-sweep.ts) is the
+  // SAFE wrapper around it — see that module's own top comment for why a
+  // single `herd.runningIssues()` snapshot is NOT safe to act on directly
+  // (review finding, round 1): it uses `herd.residentIssues()` (a real
+  // per-pane liveness check) plus a minimum record age and a two-consecutive-
+  // sweep grace before ever releasing anything. Run once at startup, then on
+  // this interval — cheap enough (one file read, one herd read per sweep)
+  // that a dedicated poll loop would be overkill.
+  const orphanSweep = createAccountOrphanSweep({
+    now: () => Date.now(),
+    reconcileOrphans: (agentExists) => accountManager.reconcileOrphans(agentExists),
+    residentIssues: () => herd.residentIssues(),
+    release: (agentKey, reason) => accountLifecycle!.release(agentKey, reason),
+    log: (line) => console.error(`  ${line}`),
+  });
   const ACCOUNT_ORPHAN_SWEEP_MS = 30 * 60_000;
-  void sweepAccountOrphans();
-  setInterval(() => void sweepAccountOrphans(), ACCOUNT_ORPHAN_SWEEP_MS);
+  void orphanSweep.sweep();
+  setInterval(() => void orphanSweep.sweep(), ACCOUNT_ORPHAN_SWEEP_MS);
 }
 
 const issueCrashLoopDetector = createCrashLoopDetector({

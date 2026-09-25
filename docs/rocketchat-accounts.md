@@ -364,6 +364,26 @@ the SAME `plan.stop` diff `reconcileNow` already computes every poll. One
 hook, every one of those paths covered by construction, not by a
 per-mechanism special case.
 
+**A failed `release` is retried, not lost (review round 1, blocking finding
+2).** By the time `release` runs, `herd.stop` has already succeeded — the
+agent is gone. If the underlying `releaseAccount` call then THROWS (a
+transient Rocket.Chat failure; its own "user not found" is already caught
+and treated as success), the id is no longer `running`, so it can never
+again land in a future poll's `plan.stop` on its own — there is no natural
+retry path through the ordinary reconcile diff the way any other spawn/stop
+failure gets one. `release` never lets that throw escape: it queues the id
+in an in-memory map instead, and a new `retryPendingReleases` hook — called
+once per poll by `reconcileNow`, at the very top, independent of `plan.stop`
+— keeps retrying every queued id until the manager confirms it one way or
+the other. `ensure` cancels a queued release for the SAME id before
+proceeding (the account is being actively reused — `ensureAccount` will
+correctly ADOPT the still-live RC user, since the earlier release never
+actually completed, so a stale queued release must not go on to delete it
+out from under the now-running agent). This is the FAST recovery path
+(next poll, seconds to a minute); the periodic orphan sweep below is the
+SLOW, crash-safe backstop for the same failure mode across a daemon
+restart, which drops the in-memory queue but not the store's own record.
+
 **Deliberately NOT wired**: `watchSessionLimits`'s own `herd.stop()` call
 (`src/daemon/index.ts`) — a session-limit close is the same agent identity,
 about to resume once its limit resets, exactly the "about to be reused"
@@ -385,11 +405,38 @@ daemon restarts (this is exactly why `"daemon-restart"` never unprovisions).
 The residual gap this leaves is an account whose agent genuinely stopped
 existing with no reaper run in between (a daemon crash before any reap poll
 observed it, or an account orphaned by an earlier bug) — `reconcileOrphans`
-is the read-only backstop named above for exactly this. `src/daemon/index.ts`
-wires a small periodic sweep (once at startup, then every 30 minutes) that
-lists orphans against `herd.runningIssues()` and releases each — cheap
-enough (one file read, one herd read) that a dedicated poll loop would be
-overkill.
+is the read-only backstop named above for exactly this.
+
+`src/agents/account-orphan-sweep.ts`'s `createAccountOrphanSweep` is the SAFE
+wrapper `src/daemon/index.ts` wires around it (once at startup, then every 30
+minutes) — a first pass acted on a single `herd.runningIssues()` snapshot
+directly and was rejected in review (round 1, blocking finding 1): `HerdrHerd.byIssue()`,
+which `runningIssues()` is built on, deliberately DROPS an id from that
+snapshot whenever two live panes currently share its workspace path (the
+ordinary overlap during a respawn or a quota-recovery pane replacement) —
+reading as "not running" for reasons that have nothing to do with whether
+the agent is actually there, which a single-snapshot sweep could act on
+destructively. Two independent layers fix this:
+
+1. **`herd.residentIssues()`, not `runningIssues()`.** It groups panes by
+   workspace directory rather than requiring a uniquely-attributed pane the
+   way `byIssue()` does, and reads "resident" the instant ANY owned pane
+   shows a live claude process — exactly the ambiguous-pane shape above,
+   correctly resolved (pinned directly at the residency-census layer:
+   `test/unit/residency-census.test.ts`'s `aggregateVerdict(["dead","live","unknown"])
+   === "resident"`). It also THROWS rather than returning `[]` on a
+   `pane.list()` failure; the sweep treats that as "observed nothing
+   reliable this round," never as "everything is gone."
+2. **A minimum record age (10 minutes) and a two-consecutive-sweep grace**
+   before any release — protects a genuinely live, but freshly-created,
+   agent (a brief window where `residentIssues()` still reads "unknown," not
+   yet "resident," before its pane reports a recognisable process) far more
+   generously than that window could ever last.
+
+Never releases on an unreliable read either way: a failed `residentIssues()`
+or `reconcileOrphans` call leaves every tracked streak untouched — not
+reset, not advanced — so a transient herdr hiccup costs a delay, never a
+false release.
 
 **Connection material delivery.** The provisioned account's `{ rcUserId,
 token }` (RC's own `X-User-Id`/`X-Auth-Token` pair) plus `url` reaches the
@@ -399,11 +446,17 @@ workspace directory — never argv, never a daemon log line, never brief.md/
 CLAUDE.md/mcp.json (the late secret-handling constraint on this ticket).
 Written by `buildWorkspace` alongside its other per-agent dotfiles
 (`.butchr-agy.json`, `.butchr-codex-isolation.json`) with an explicit
-`{ mode: 0o600 }` — this workspace's other files get the default umask
-(measured 664); this one never does. Removed (not left stale) on a launch
-that carries no material, so a rule edited to `"none"`, or a launch
-`ensureAccount` refused, never leaves a PRIOR launch's token file looking
-current.
+`{ mode: 0o600 }` **and** an explicit `chmodSync(..., 0o600)` right after the
+write (review round 1, non-blocking finding: `writeFileSync`'s own `mode`
+option is applied only when the underlying `open()` call actually CREATES
+the file — for a workspace directory a prior launch already populated, the
+file already exists, so `mode` is silently ignored and whatever permissions
+it happened to have survive untouched; `chmodSync` fixes the mode
+unconditionally, on both a fresh file and an overwritten one — this
+workspace's other files get the default umask (measured 664); this one
+never does). Removed (not left stale) on a launch that carries no material,
+so a rule edited to `"none"`, or a launch `ensureAccount` refused, never
+leaves a PRIOR launch's token file looking current.
 
 **Why a file, not BUTCHR-411's `headersEnvVar`.** BUTCHR-411 (`Rule.mcpServers`,
 `resolveMcpServerHeaders`) resolves header VALUES for a bound MCP server from
@@ -429,13 +482,24 @@ harness (a fake `AccountStore` and a fake `RocketChatClient`, both plain
 in-memory doubles) — shared by `test/unit/rc-account-manager.test.ts` (this
 module's own unit tests, unchanged behaviourally by this task) and this
 task's `test/unit/account-lifecycle.test.ts` (the hook contract in
-isolation) and `test/unit/account-reconcile-matrix.test.ts` (the full 3x3
+isolation, including the pending-release retry: a throwing release is
+queued and never rethrown, `retryPendingReleases` drains it, `ensure`
+cancels a queued release for the same id) and
+`test/unit/account-reconcile-matrix.test.ts` (the full 3x3
 `{swarm,singleton,persistent} x {none,temporary,permanent}` grid, run
 through the REAL `reconcileNow`, proving the account layer never branches on
 execution mode at all — the 3x3 is genuinely 3 independent repetitions of
-one 3-way behaviour). `test/unit/reap.test.ts` covers the self-exit release
-hook; `test/unit/workspace.test.ts` covers the 0600 file and its removal;
-`test/unit/loop.test.ts` covers `reconcileNow`'s own three call sites
-(ensure-before-spawn withholding, release-after-stop, ensure-before-respawn
-leaving a refused stale agent running rather than stopping it with nothing
-to replace it).
+one 3-way behaviour). `test/unit/account-orphan-sweep.test.ts` covers the
+safe sweep directly, per the review's own required list: a resident agent is
+never released, an id `residentIssues()` reports absent is never released
+until the grace rule clears it, a mid-spawn (too-young) record is never
+released, a genuinely gone agent IS released after two consecutive absent
+sweeps, a permanent account is never touched, and a failing
+`residentIssues()`/`reconcileOrphans()` releases nothing and leaves any
+in-progress streak untouched. `test/unit/reap.test.ts` covers the self-exit
+release hook; `test/unit/workspace.test.ts` covers the 0600 file, its
+removal, and the chmod-an-existing-file fix; `test/unit/loop.test.ts` covers
+`reconcileNow`'s own call sites (ensure-before-spawn withholding,
+release-after-stop, ensure-before-respawn leaving a refused stale agent
+running rather than stopping it with nothing to replace it, and
+`retryPendingReleases` called exactly once per poll).

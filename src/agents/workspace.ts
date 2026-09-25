@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, chmodSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -259,9 +259,19 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // policy can change to "none" between launches, or `ensureAccount` can
   // refuse this launch entirely (see account-lifecycle.ts), and a
   // previous launch's file must not linger looking current.
+  //
+  // BOTH `{ mode: 0o600 }` AND an explicit `chmodSync` (review round 1,
+  // non-blocking finding): `writeFileSync`'s own `mode` option is applied
+  // only when the underlying `open()` call actually CREATES the file — for
+  // a workspace directory a prior launch already populated, this file
+  // already exists, so `mode` is silently ignored and whatever permissions
+  // it happened to have (664, if it somehow ever predates this ticket's own
+  // code) survive untouched. `chmodSync` after the write fixes the mode
+  // unconditionally, on both a fresh file and an overwritten one.
   const rcAccountFile = join(dir, RC_ACCOUNT_FILE);
   if (spec.rocketchat) {
     writeFileSync(rcAccountFile, JSON.stringify({ url: spec.rocketchat.url, userId: spec.rocketchat.rcUserId, authToken: spec.rocketchat.token, username: spec.rocketchat.username }, null, 2), { mode: 0o600 });
+    chmodSync(rcAccountFile, 0o600);
   } else {
     try { unlinkSync(rcAccountFile); } catch { /* nothing to remove is the common, expected case */ }
   }
