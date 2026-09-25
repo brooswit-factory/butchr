@@ -83,6 +83,7 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     ...(deps.githubComments ? { githubComments: deps.githubComments } : {}),
     ...(deps.onMatches ? { onMatches: deps.onMatches } : {}),
     log: deps.log,
+    runningIds: async () => (await deps.herd.runningIssues()).filter(ownsJiraIdeaAgent),
   });
   return runResourceLoop(type, {
     herd: deps.herd,
@@ -90,9 +91,16 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     notify: async (agent: string, about: string, reason?: NotifyReason) => {
       const resource = resourceKeyOf(agent);
       const heard = about === agent ? null : decodeAgentKey(about);
+      // BUTCHR-398: a `singleton`/`persistent` idea rule's OWN scope entry
+      // (`about` names one of ITS matched ideas, not a github-issue) must be
+      // described by THAT idea (`resourceKeyOf(about)`), never by
+      // `resourceKeyOf(agent)` — the query agent's own key, which is not a
+      // real idea and would otherwise be pushed as one (the exact bogus-
+      // resource hazard this ticket's `resourceKeyOf` audit exists to close,
+      // applied to notification text rather than a live API call).
       const msg = heard?.resourceProvider === "github-issue"
         ? jiraIdeaLinkedGithubNudge(resource, heard.resourceId, reason)
-        : jiraIdeaNudge(resource, reason);
+        : jiraIdeaNudge(about === agent ? resource : resourceKeyOf(about), reason);
       await deps.deliver(agent, resource, msg);
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),

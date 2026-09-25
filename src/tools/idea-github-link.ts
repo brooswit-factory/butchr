@@ -102,7 +102,7 @@ export function ideaGithubLinkTools(deps: IdeaGithubLinkToolDeps): Record<string
       input: { idea: z.string().min(1).describe("The idea's Jira issue key, e.g. IDEA-12") },
       handler: async (a, c) => {
         const who = callerIdentity(c.headers);
-        if (who?.provider !== "github-issue") throw new Refusal("github_link_jira_idea: only a github-issue agent may call this — it links the caller's own GitHub issue");
+        if (who?.provider !== "github-issue" || "query" in who) throw new Refusal("github_link_jira_idea: only a github-issue agent may call this — it links the caller's own GitHub issue");
         const idea = (a as { idea: string }).idea.trim();
         if (!isIssueKey(idea)) throw new Refusal(`github_link_jira_idea: "${idea}" is not a Jira issue key (e.g. IDEA-12); pass the idea's key, not a URL or GitHub reference`);
         return link("github_link_jira_idea", who.agent, { ideaKey: idea, ref: who.resource, githubRuleId: who.ruleId });
@@ -113,7 +113,7 @@ export function ideaGithubLinkTools(deps: IdeaGithubLinkToolDeps): Record<string
       input: { url: z.string().min(1).describe("The GitHub issue's web URL") },
       handler: async (a, c) => {
         const who = callerIdentity(c.headers);
-        if (who?.provider !== "jira-idea") throw new Refusal("jira_idea_link_github_issue: only a jira-idea agent may call this — it links the caller's own Product Discovery idea");
+        if (who?.provider !== "jira-idea" || "query" in who) throw new Refusal("jira_idea_link_github_issue: only a jira-idea agent may call this — it links the caller's own Product Discovery idea");
         const url = (a as { url: string }).url.trim();
         const parsed = githubIssueRefFromUrl(url);
         if (!parsed) throw new Refusal(`jira_idea_link_github_issue: ${JSON.stringify(url)} is not a GitHub issue URL (https://github.com/<owner>/<repo>/issues/<n>); pull requests, other hosts and Jira links are refused`);

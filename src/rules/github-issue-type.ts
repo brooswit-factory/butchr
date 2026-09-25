@@ -16,8 +16,9 @@
 import type { SpawnSpec } from "../agents/workspace.js";
 import { scopedIssueQuery, type GithubComment, type GithubIssue } from "../resources/github-issue.js";
 import { parseGithubIssueRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
-import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, ResourceType } from "../resources/types.js";
-import { decodeAgentKey, encodeAgentKey } from "./agent-key.js";
+import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
+import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
+import { diffMatches, groupExecutionUnits, logExecutionModeSwitches, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
 
 export interface GithubIssueMatch {
@@ -38,10 +39,12 @@ export interface GithubIssueResourceDeps {
   log?: (line: string) => void;
   /** Told each poll's complete match list — how `jira-idea` rules hear the issues they list (src/rules/jira-idea-type.ts). */
   onMatches?: (matches: readonly GithubIssueMatch[]) => void;
+  /** BUTCHR-398: this provider's own running herd ids, for `logExecutionModeSwitches` — see `RuleResourceDeps.runningIds`'s own doc comment (src/rules/resource-type.ts). Optional; omitted, no mode-switch logging runs. */
+  runningIds?: () => Promise<readonly string[]>;
 }
 
-/** True for exactly the herd ids this type owns. */
-export const ownsGithubIssueAgent = (id: string): boolean => decodeAgentKey(id)?.resourceProvider === "github-issue";
+/** True for exactly the herd ids this type owns — a per-resource key or a query-level one (BUTCHR-397) alike. */
+export const ownsGithubIssueAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "github-issue";
 
 /** Every enabled `github-issue` rule's matches. Any failed search rejects the whole poll. */
 export async function searchGithubIssueRules(deps: Pick<GithubIssueResourceDeps, "rules" | "search">): Promise<GithubIssueMatch[]> {
@@ -71,70 +74,122 @@ export function specForGithubIssue({ agentKey, rule, issue }: GithubIssueMatch):
   };
 }
 
+/**
+ * BUTCHR-398: the SpawnSpec for a `singleton`/`persistent` rule's ONE
+ * query-level agent — no single resource (`resource` is omitted, same "no
+ * single resource" contract `SpawnSpec.resource`'s own doc comment states),
+ * so no GitHub tool can be misled into resolving it as an issue ref. `brief`
+ * is always the rule's own (never `briefFor(issuetype)` — see `buildWorkspace`,
+ * src/agents/workspace.ts), so `issuetype: "task"` here only selects
+ * model/effort, not brief content.
+ */
+export function specForGithubIssueQuery(rule: Rule, agentKey: string): SpawnSpec {
+  return {
+    key: agentKey,
+    issuetype: "task",
+    summary: `${rule.id} (query agent — every issue "${rule.query}" currently matches)`,
+    parent: null,
+    brief: rule.brief,
+    ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+  };
+}
+
+export const specForGithubIssueUnit = (u: ExecutionUnit<GithubIssueMatch>): SpawnSpec =>
+  u.kind === "resource" ? specForGithubIssue(u.match) : specForGithubIssueQuery(u.rule, u.agentKey);
+
 /** The fields whose change is worth telling an agent about. `updated` alone is not one of them. */
-const observed = (i: GithubIssue) => JSON.stringify([i.title, i.body, i.state, i.stateReason, i.issueType, i.labels, i.comments]);
+const observed = (m: GithubIssueMatch) => JSON.stringify([m.issue.title, m.issue.body, m.issue.state, m.issue.stateReason, m.issue.issueType, m.issue.labels, m.issue.comments]);
+
+async function decideGithubIssue(from: GithubIssue, to: GithubIssue, key: string, deps: Pick<GithubIssueResourceDeps, "comments" | "suppress" | "log">): Promise<EventVerdict> {
+  if (deps.suppress?.(to.ref, to.updated, key)) return { deliver: false };
+  if (from.state !== to.state) return { deliver: true, reason: { status: { from: from.state, to: to.state } } };
+  if (to.comments > from.comments) return { deliver: true, reason: await newCommentReason(to, deps) };
+  if (from.title !== to.title) return { deliver: true, reason: { summary: true } };
+  return { deliver: true };
+}
+
+/** `{ comment: id }` when the newest comment can be read; otherwise says why it could not. */
+async function newCommentReason(issue: GithubIssue, deps: Pick<GithubIssueResourceDeps, "comments" | "log">): Promise<NotifyReason> {
+  const ref = parseGithubIssueRef(issue.ref);
+  if (!deps.comments || !ref) return { undetermined: "unchecked" };
+  try {
+    const id = (await deps.comments(ref)).at(-1)?.id;
+    return id ? { comment: id } : { undetermined: "checked-unchanged" };
+  } catch (e) {
+    deps.log?.(`WARNING: [github-issue] comments for ${issue.ref} failed: ${(e as Error)?.message ?? e}`);
+    return { undetermined: "check-failed" };
+  }
+}
 
 /**
  * Change detection over (prev, next) matches, per agent key. An issue
  * entering or leaving a rule's query is not a notification — the reconciler
- * spawns or stops its agent. A change GitHub reports only through `updated`
- * (a reaction, a subscription) is not one either.
+ * spawns or stops its agent (swarm), or the issue's presence/absence in a
+ * `singleton`/`persistent` rule's own scope is reported as `{ appeared: …
+ * }`/`{ disappeared: … }` via the RELATED path below (BUTCHR-398). A change
+ * GitHub reports only through `updated` (a reaction, a subscription) is not
+ * one either.
  *
  * Reason precedence: state, then a new comment (its id, when `comments` can
  * name it), then title; any other observed change delivers without a reason.
+ *
+ * BUTCHR-398: PRIMARY covers only `"resource"`-kind units (swarm agents,
+ * unchanged from before this ticket — see `resourceMatches`). RELATED covers
+ * every `singleton`/`persistent` rule's own currently-matched issues
+ * (`scopeRelatedResources`, src/rules/execution.ts), watcher = that rule's
+ * query agent key — the SAME diff (`diffMatches`/`decideGithubIssue`) run
+ * over a different input list, so a query agent hears an issue's state/
+ * comment/title changes exactly as a swarm agent would for its own issue.
  */
-export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, "comments" | "suppress" | "log">): EventRules<GithubIssueMatch> {
+export function createGithubIssueEventRules(deps: Pick<GithubIssueResourceDeps, "comments" | "suppress" | "log">): EventRules<ExecutionUnit<GithubIssueMatch>> {
   return {
-    async poll(prev: PollSnapshot<GithubIssueMatch>, next: PollSnapshot<GithubIssueMatch>): Promise<EventPoll> {
-      const before = new Map(prev.primary.map((m) => [m.agentKey, m.issue]));
-      const pairs = new Map<string, { from: GithubIssue; to: GithubIssue }>();
-      for (const m of next.primary) {
-        const from = before.get(m.agentKey);
-        if (from && observed(from) !== observed(m.issue)) pairs.set(m.agentKey, { from, to: m.issue });
-      }
+    async poll(prev: PollSnapshot<ExecutionUnit<GithubIssueMatch>>, next: PollSnapshot<ExecutionUnit<GithubIssueMatch>>): Promise<EventPoll> {
+      const primaryDiff = diffMatches(resourceMatches(prev.primary), resourceMatches(next.primary), observed);
+      const relatedOf = (related: readonly RelatedResource<ExecutionUnit<GithubIssueMatch>>[]) =>
+        related.map((r) => r.issue).filter((u): u is { kind: "resource"; match: GithubIssueMatch } => u.kind === "resource").map((u) => u.match);
+      const relatedDiff = diffMatches(relatedOf(prev.related), relatedOf(next.related), observed);
+      const relatedEntry = (key: string) =>
+        next.related.find((r) => unitAgentKey(r.issue) === key) ?? prev.related.find((r) => unitAgentKey(r.issue) === key);
       return {
-        changedPrimary: [...pairs.keys()],
-        changedRelated: [],
+        changedPrimary: primaryDiff.changed,
+        changedRelated: relatedDiff.changed,
         async decide(key, watcher, space): Promise<EventVerdict> {
-          const pair = pairs.get(key);
-          if (space !== "primary" || watcher !== key || !pair) return { deliver: false };
-          const { from, to } = pair;
-          if (deps.suppress?.(to.ref, to.updated, key)) return { deliver: false };
-          if (from.state !== to.state) return { deliver: true, reason: { status: { from: from.state, to: to.state } } };
-          if (to.comments > from.comments) return { deliver: true, reason: await newCommentReason(to) };
-          if (from.title !== to.title) return { deliver: true, reason: { summary: true } };
-          return { deliver: true };
+          if (space === "primary") {
+            const pair = primaryDiff.pairFor(key);
+            if (watcher !== key || !pair) return { deliver: false };
+            return decideGithubIssue(pair.from.issue, pair.to.issue, key, deps);
+          }
+          const pair = relatedDiff.pairFor(key);
+          const entry = relatedEntry(key);
+          if (!pair || !entry?.watchers.includes(watcher)) return { deliver: false };
+          return decideGithubIssue(pair.from.issue, pair.to.issue, key, deps);
         },
       };
-      /** `{ comment: id }` when the newest comment can be read; otherwise says why it could not. */
-      async function newCommentReason(issue: GithubIssue): Promise<NotifyReason> {
-        const ref = parseGithubIssueRef(issue.ref);
-        if (!deps.comments || !ref) return { undetermined: "unchecked" };
-        try {
-          const id = (await deps.comments(ref)).at(-1)?.id;
-          return id ? { comment: id } : { undetermined: "checked-unchanged" };
-        } catch (e) {
-          deps.log?.(`WARNING: [github-issue] comments for ${issue.ref} failed: ${(e as Error)?.message ?? e}`);
-          return { undetermined: "check-failed" };
-        }
-      }
     },
   };
 }
 
-export function createGithubIssueResourceType(deps: GithubIssueResourceDeps): ResourceType<GithubIssueMatch> {
+export function createGithubIssueResourceType(deps: GithubIssueResourceDeps): ResourceType<ExecutionUnit<GithubIssueMatch>> {
+  let latest: GithubIssueMatch[] = [];
   return {
     discovery: {
-      idOf: (m) => m.agentKey,
+      idOf: unitAgentKey,
       search: async () => {
-        const matches = await searchGithubIssueRules(deps);
-        deps.onMatches?.(matches);
-        return matches;
+        latest = await searchGithubIssueRules(deps);
+        deps.onMatches?.(latest);
+        if (deps.runningIds) logExecutionModeSwitches("github-issue", deps.rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
+        const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "github-issue");
+        return groupExecutionUnits(enabled, latest);
       },
+      // BUTCHR-398: scope-ownership — every `singleton`/`persistent` rule's
+      // own currently-matched issues, watched by that rule's query agent.
+      // `github-issue` has no other related source (no Implements/Relates
+      // chain — see this module's own top comment), so no merge is needed.
+      related: async () => scopeRelatedResources(latest),
     },
     activation: { verdictFor: () => "active" },
     eventRules: createGithubIssueEventRules(deps),
-    spawnConfig: { specFor: specForGithubIssue },
+    spawnConfig: { specFor: specForGithubIssueUnit },
   };
 }
 

@@ -35,6 +35,45 @@ export type AgentHarness = (typeof AGENT_HARNESSES)[number];
 export const AGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type AgentEffort = (typeof AGENT_EFFORTS)[number];
 
+/**
+ * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
+ * `swarm` (today's only behaviour, and the default): one agent per matching
+ * resource, none at zero matches. `singleton`: one agent for the rule's whole
+ * matching workload; it stops at zero matches and starts again when matches
+ * return. `persistent`: one agent even at zero matches; only an explicit
+ * freeze (`enabled: false`) stops it. This task adds and validates the field
+ * alone — reconciling `singleton`/`persistent` (spawning/stopping the one
+ * agent, delivering it scope-wide events) is BUTCHR-398.
+ */
+export const EXECUTION_MODES = ["swarm", "singleton", "persistent"] as const;
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+
+/**
+ * Rocket.Chat account lifecycle for a rule's agent(s) (BUTCHR-392/BUTCHR-397),
+ * independent of `execution`. `none` (the default) is today's behaviour
+ * exactly — no account is created or managed. `temporary`/`permanent` are
+ * accepted and plumbed onto `Rule` by this task only; the account lifecycle
+ * itself (creating, attaching, tearing down a Rocket.Chat account) is a later
+ * story (S4) and NOT implemented here.
+ */
+export const ACCOUNT_POLICIES = ["none", "temporary", "permanent"] as const;
+export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
+
+/**
+ * Fleet capacity role (BUTCHR-391 epic decision, 2026-09-25T00:25Z, folded
+ * into BUTCHR-398): independent of `execution`/`account`. `worker` (the
+ * default) counts toward `BUTCHR_MAX_AGENTS` and is subject to admission
+ * withholding exactly as every agent is today. `sentinel` opts a rule's
+ * agent(s) OUT of the cap entirely — never withheld, never counted toward
+ * residency — for long-lived agents (e.g. persistent directors) that must
+ * never be starved by, or compete for, ordinary worker capacity. Applies
+ * per-agent: a swarm rule's every per-resource agent is a sentinel, or a
+ * singleton/persistent rule's one query-level agent is. See
+ * src/agents/admission.ts for how residency/admission honour this.
+ */
+export const AGENT_ROLES = ["worker", "sentinel"] as const;
+export type AgentRole = (typeof AGENT_ROLES)[number];
+
 export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
 
 /**
@@ -70,12 +109,18 @@ export interface Rule {
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
   brief: string;
+  /** How many agents this rule runs. Defaults to `"swarm"` (today's behaviour) when absent from the file. */
+  execution: ExecutionMode;
+  /** Rocket.Chat account lifecycle, independent of `execution`. Defaults to `"none"` (today's behaviour, exactly) when absent from the file. */
+  account: AccountPolicy;
+  /** Fleet capacity role, independent of `execution`/`account`. Defaults to `"worker"` (today's behaviour, exactly) when absent from the file. */
+  role: AgentRole;
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships"]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 
@@ -144,7 +189,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!isObject(raw)) { errors.push(`${at} must be an object`); return; }
     const before = errors.length;
     unknownFields(raw, RULE_FIELDS, at, errors);
-    const { id, enabled, resourceProvider, query, brief } = raw;
+    const { id, enabled, resourceProvider, query, brief, execution, account, role } = raw;
     if (typeof id !== "string" || !isRuleId(id)) errors.push(`${at}.id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})`);
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
     else { seen.add(id); providerOf.set(id, resourceProvider); }
@@ -155,6 +200,13 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
+    // `execution` and `account` are independent of each other (any of the 9 combinations
+    // is valid) and, for now, of `resourceProvider` too: every provider accepts every mode
+    // (see docs/execution-modes.md — BUTCHR-397 found no concrete provider-specific blocker).
+    if (execution !== undefined && !oneOf(EXECUTION_MODES, execution)) errors.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
+    if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
+    // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
+    if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
@@ -165,6 +217,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     rules.push({
       id: id as string, enabled: enabled !== false, resourceProvider: resourceProvider as ResourceProvider,
       query: (query as string).trim(), brief: brief as string,
+      execution: (execution as ExecutionMode | undefined) ?? "swarm",
+      account: (account as AccountPolicy | undefined) ?? "none",
+      role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
     });
@@ -214,4 +269,8 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   return { path, origin: "file", rules: parseRules(doc, path) };
 }
 
-export { decodeAgentKey, encodeAgentKey, isResourceId, type AgentKeyParts } from "./agent-key.js";
+export {
+  decodeAgentKey, encodeAgentKey, isResourceId, type AgentKeyParts,
+  decodeQueryAgentKey, encodeQueryAgentKey, type QueryAgentKeyParts,
+  decodeAnyAgentKey, type AnyAgentKeyParts,
+} from "./agent-key.js";

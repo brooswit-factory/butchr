@@ -405,7 +405,11 @@ describe("zendesk ticket resource type", () => {
   const rule = rules.find((r) => r.id === "support")!;
   const match = (ref: string, over: Partial<ZendeskTicket> = {}): ZendeskTicketMatch =>
     ({ agentKey: encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: ref }), rule, ticket: zt(ref, over) });
-  const snap = (...m: ZendeskTicketMatch[]) => ({ primary: m, related: [] });
+  // BUTCHR-398: `createZendeskTicketEventRules` now operates over
+  // `ExecutionUnit<ZendeskTicketMatch>` (swarm "resource"-kind primary
+  // units) — wrapped at the boundary; the swarm behaviour under test is
+  // otherwise unchanged.
+  const snap = (...m: ZendeskTicketMatch[]) => ({ primary: m.map((match) => ({ kind: "resource" as const, match })), related: [] });
 
   test("spawn spec names the ticket ref, its type and the rule's brief", () => {
     expect(specForZendeskTicket(match("acme#42"))).toEqual({ key: ZD, resource: "acme#42", issuetype: "incident", summary: "s", parent: null, brief: "triage it" });
