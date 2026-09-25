@@ -133,8 +133,8 @@ pruning; `SLIDING_WINDOW_MS` is a true `60 * 60_000`; the rate-capped
 suppression line is logged unconditionally on every capped tick per
 `suppressed-log.ts`'s own doc comment (no sampling). None of that explains
 the stop. **This is a discrepancy between the module's own stated invariant
-and observed behavior, not yet root-caused** — recommended as a follow-up
-investigation (a candidate for `file_where_it_belongs`), not something this
+and observed behavior, not yet root-caused** — filed as a follow-up
+investigation, **BUTCHR-443** (under epic BUTCHR-421), not something this
 record resolves. It does not change the PASS verdict below, because the
 442 test delivery is independently identifiable by content and timing (see
 next section) regardless of what happened to the unrelated 430/421
@@ -336,12 +336,15 @@ delete rights — not done by this task, not claimed as done.
 
 Steps A, B, D and E are PASS, independently reasoned about by this task's
 agent from primary evidence, though the raw journal capture for Steps D/E
-came from a single source (BUTCHR-430) that this task's agent could not
-independently corroborate (documented access limitation, not an oversight).
-Step C happened but deviated from the original plan (status transition
-instead of summary edit; ~10 minutes later than scheduled) — recorded
-honestly rather than glossed over. One genuine anomaly (the missing 430/421
-catch-up delivery, §3) is flagged as unresolved and recommended for
-separate follow-up, since it does not change this record's own pass/fail
-verdicts but should not be silently dropped either. Step F (revert) has not
-happened as of this PR and is explicitly not this task's action to take.
+(and for Step F below) came from a single source (BUTCHR-430) that this
+task's agent could not independently corroborate (documented access
+limitation, not an oversight). Step C happened but deviated from the
+original plan (status transition instead of summary edit; ~10 minutes later
+than scheduled) — recorded honestly rather than glossed over. One genuine
+anomaly (the missing 430/421 catch-up delivery, §3) is flagged as unresolved
+and filed separately as BUTCHR-443, since it does not change this record's
+own pass/fail verdicts but should not be silently dropped either. Step F
+(revert) is now DONE — admin-assembly removed the opt-in rule and restarted
+wroosbit's daemon (§6) — except that BUTCHR-441/442 were closed to Done
+rather than deleted, a discrepancy from an earlier relayed "deleted"
+summary that is stated plainly in §6 rather than left uncorrected.
