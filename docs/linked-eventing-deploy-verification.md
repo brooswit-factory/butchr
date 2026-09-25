@@ -46,7 +46,7 @@ Daemon build/currency, checked two ways per daemon:
 | Daemon | Port | `/health` build.sha | `/health` currency | Journal evidence |
 |---|---|---|---|---|
 | booswrit | 7718 | `aff46dd28fb4fb3eafcbae4996fd6062e2831591` | `current` | own journal, `journalctl --user -u butchr.service`, local time: restart at 07:36:46 PDT, "build aff46dd2 (git-at-start, clean) version=0.15.5 pid=1280152" |
-| wroosbit | 7717 | `aff46dd28fb4fb3eafcbae4996fd6062e2831591` | `current` | not readable by this agent (see §5); reported by BUTCHR-430 (whose own daemon this is) at pid 1281685, restart 07:39:05 PDT |
+| wroosbit | 7717 | `aff46dd28fb4fb3eafcbae4996fd6062e2831591` | `current` | not readable by this agent (see §5); TWO restarts, per BUTCHR-430's own journal capture (`journalctl --user -u butchr.service`, wroosbit's own daemon): (1) 07:36:47 PDT, pid 1280277 — `rules from .../resource-rules.json: 2 enabled (stories, subtasks)` and `build aff46dd2 ... pid=1280277` — on `aff46dd` WITHOUT the new rule; (2) 07:39:04 PDT, pid 1281685 — `rules from ...: 3 enabled (stories, subtasks, linked-eventing-verify-430)` — the restart that actually loaded it, after the rules file was edited in between (mtime 07:37) |
 
 **STALENESS TRAP note (HARD CONSTRAINT 3 on BUTCHR-439):** this workspace's
 own `ENVIRONMENT.md` snapshot, taken at workspace-build time, reported
@@ -79,11 +79,20 @@ Pre-change state: this rule did not exist before. wroosbit's rules file
 otherwise carries `stories`, `subtasks`, `github-issues` (disabled),
 `zendesk-tickets` (disabled) — none touched.
 
-Loaded at the SAME restart that brought wroosbit onto `aff46dd` (07:39:05
-PDT) — required, because these `linked*` fields are unknown to the prior
-build (`460e13d5`) and `loadRules` throws on an unknown field, which would
-have crash-looped the daemon had the rule been applied before the code that
-understands it.
+**Correction (BUTCHR-430's PR #403 review, from wroosbit's own journal
+capture):** loaded at a SECOND, SEPARATE restart — not the same one that
+brought wroosbit onto `aff46dd` as an earlier revision of this document
+incorrectly stated. wroosbit's daemon restarted twice: first at 07:36:47
+PDT (pid 1280277), which brought the daemon onto `aff46dd` but with the
+rules file still at its pre-change 2-enabled-rule state (`stories`,
+`subtasks`) — the rules file was only edited to append the new rule AFTER
+this restart had already happened (mtime 07:37 PDT). A second restart at
+07:39:04 PDT (pid 1281685) then picked up the edited file (3 enabled rules,
+including `linked-eventing-verify-430`). Both restarts ran `aff46dd` code
+throughout — the crash-hazard ordering that actually mattered (the code
+must understand `linked*` fields before the rules file containing them is
+ever read) was still respected; it just took two restarts rather than one
+to get there.
 
 Target tickets (created by the epic/director, not by this task's agent):
 BUTCHR-441 (owner, Task, assigned to the director's account — deliberately
@@ -265,7 +274,10 @@ this very verification (every one arrived the same dual-channel way).
 **"Exactly one turn" is therefore correctly measured as exactly one
 `[notify]` journal line / one `deps.notify` call — not as "exactly one
 agent-visible message"; two agent-visible artifacts per single logical
-notify is normal and expected, not evidence of a duplicate.**
+notify is normal and expected, not evidence of a duplicate.** The epic
+ruled on exactly this reading (BUTCHR-430 comment 24104): "exactly one
+notify/delivery" is the accepted definition of "exactly one turn" for this
+verification's own acceptance criteria.
 
 ## 6. Step F — revert: PENDING (not this task's action)
 
