@@ -78,6 +78,7 @@ import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { runLinkCli } from "../cli/link-cli.js";
+import { runSessionCli } from "../cli/session-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
 import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
 import { createRoutingLinkStore } from "../resources/link-store-router.js";
@@ -92,6 +93,14 @@ import { createJiraProjectLinkStore } from "../resources/jira-project-link-store
 // run, and must not emit this daemon's own structured startup logging.
 if (process.argv[2] === "link") {
   process.exit(await runLinkCli(process.argv.slice(3)));
+}
+
+// BUTCHR-454: `butchr session list|show|create|freeze|unfreeze`, same
+// precedent as `butchr link` immediately above — a managed-session
+// definition is local filesystem state (plus the drovr-events freeze
+// store), so this must run with no Jira credentials and no rules file.
+if (process.argv[2] === "session") {
+  process.exit(await runSessionCli(process.argv.slice(3)));
 }
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
