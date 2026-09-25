@@ -12,7 +12,7 @@ import { strandedCandidates } from "../../src/agents/reap.js";
 import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../src/daemon/loop.js";
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
-import { parseRules, type Rule } from "../../src/rules/rules.js";
+import { EXECUTION_MODES, parseRules, type Rule } from "../../src/rules/rules.js";
 import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
@@ -494,6 +494,80 @@ describe("rule relationships", () => {
     expect(notified.filter((n) => n.startsWith("jira-work:story:BUTCHR-2") || n.startsWith("jira-work:review:BUTCHR-2")).sort())
       .toEqual(["jira-work:review:BUTCHR-2 <- jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2 <- jira-work:story:BUTCHR-2"]);
   });
+});
+
+// BUTCHR-406 — SCOPE NOTE: the epic (BUTCHR-365, comment 23746 on BUTCHR-402)
+// decided the PR into BUTCHR-402 should be a REGRESSION TEST ONLY, proving
+// the cross-daemon boss wake already works on main's existing mechanism (PR
+// #372, BUTCHR-388) once combined with BUTCHR-397/398's execution modes — no
+// staffed:false observer rule involved; that code stays parked on
+// origin/BUTCHR-402-observer-parked. This describe block is that test.
+describe("BUTCHR-406: cross-daemon boss wake regression (two disjoint daemon views, BUTCHR-388 x execution modes)", () => {
+  // The exact incident shape (BUTCHR-392/398): daemon A's rules match the
+  // CHILD (a Task) and daemon B's rules match the BOSS (a Story) — neither
+  // daemon's rules match the other's ticket, so the only thing that can wake
+  // the boss on B is #372's by-key foreign fetch (`foreignImplementerKeys` +
+  // `key in (...)`), read through the REAL discovery.related() and the real
+  // loop's own change detection (runResourceLoop) — not relatedForRules
+  // called directly as a unit, which every other test in this file does.
+  const childKey = "BUTCHR-398", bossKey = "BUTCHR-392";
+  const childIssue = (over: Partial<JiraIssue> = {}): JiraIssue =>
+    issue(childKey, { issuetype: "Task", issuelinks: [{ type: "Implements", otherEnd: "inward", key: bossKey }], ...over });
+  const bossIssue: JiraIssue = issue(bossKey, { issuetype: "Story", issuelinks: [{ type: "Implements", otherEnd: "outward", key: childKey }] });
+
+  /**
+   * Runs daemon A (staffs the child) and daemon B (staffs the boss, and ONLY
+   * the boss — its own search never returns the child) against a single
+   * shared mutable "Jira" (`world.child`), each through its own real
+   * `runResourceLoop`, across one polling window before and after the child
+   * changes. `bossExecution` is `undefined` for "no execution field declared
+   * at all" (the plain, pre-BUTCHR-397 shape) and one of `EXECUTION_MODES`
+   * otherwise — only the BOSS's rule varies; the child-side daemon is
+   * ordinary swarm throughout, since this test is about whether the BOSS
+   * hears, not how the child itself runs.
+   */
+  async function runTwoDaemons(bossExecution?: Rule["execution"]) {
+    const world = { child: childIssue() };
+    const rulesA = rules({ id: "task", query: "qa" });
+    const herdA = fakeHerd();
+    const typeA = createRuleResourceType({ rules: rulesA, search: async (jql) => (jql === "qa" ? [world.child] : []) });
+
+    const rulesB = parseRules({ rules: [{
+      id: "story", resourceProvider: "jira-work", query: "qb", brief: "hear your implementer",
+      ...(bossExecution ? { execution: bossExecution } : {}),
+    }] });
+    const herdB = fakeHerd();
+    const notifiedB: string[] = [];
+    const searchB = async (jql: string): Promise<JiraIssue[]> => {
+      if (jql === "qb") return [bossIssue];
+      // The cross-daemon by-key fetch (#372): the ONLY way daemon B can ever
+      // see the child, since daemon B's own rules never match it.
+      if (jql.startsWith("key in (")) return jql.includes(childKey) ? [world.child] : [];
+      return [];
+    };
+    const typeB = createRuleResourceType({ rules: rulesB, search: searchB });
+
+    const stopA = runResourceLoop(typeA, { herd: herdA, ownsId: ownsRuleAgent, notify: async () => {}, intervalMs: 15 });
+    const stopB = runResourceLoop(typeB, { herd: herdB, ownsId: ownsRuleAgent, notify: async (agent, about) => { notifiedB.push(`${agent} <- ${about}`); }, intervalMs: 15 });
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+      expect(notifiedB).toEqual([]); // nothing changed yet
+      // Daemon A's worker's report_to_boss/submit_to_boss: the child ticket changes.
+      world.child = childIssue({ status: "In Review", updated: "later" });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally { stopA(); stopB(); }
+    return { notifiedB, herdA, herdB };
+  }
+
+  for (const bossExecution of [undefined, ...EXECUTION_MODES]) {
+    const label = bossExecution ?? "undeclared (defaults to swarm)";
+    test(`the boss on daemon B is woken by the child's change on daemon A, with no agent spawned for the child on B — boss rule execution=${label}`, async () => {
+      const { notifiedB, herdB } = await runTwoDaemons(bossExecution);
+      expect(notifiedB.some((n) => n.includes(childKey))).toBe(true);
+      expect(herdB.spawned.some((k) => k.includes(childKey))).toBe(false);
+      expect(herdB.spawned.every((k) => k.includes(bossKey))).toBe(true);
+    });
+  }
 });
 
 describe("rule workspaces", () => {
