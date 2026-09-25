@@ -24,6 +24,7 @@ import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import type { AgentCapacityRole } from "../agents/admission.js";
+import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
@@ -123,12 +124,19 @@ for (const r of rules) {
  * cannot be resolved — a legacy/bare-issue agent, or a rule since removed —
  * per `AdmissionControllerDeps.roleOf`'s own contract (src/agents/admission.ts).
  */
-const roleOfAgent = (id: string): AgentCapacityRole => {
+const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const decoded = decodeAnyAgentKey(id);
-  if (!decoded) return "worker";
+  if (!decoded) return undefined;
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
-  return rule?.role ?? "worker";
+  return rule?.role;
 };
+// BUTCHR-422: only leaf work (Task/Sub-task/Bug) counts toward the cap —
+// project agents and Epic/Story agents are classified "sentinel" here (see
+// src/agents/capacity-role.ts). `issueMeta` (declared below, filled by every
+// jira-work search) supplies the issue type; it is only read at call time,
+// after the whole module has initialised.
+const roleOfAgent = (id: string): AgentCapacityRole =>
+  capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
 
 // BUTCHR-405: logged once per unresolved reference, and the same list rides
 // on /health (see combineHealth call below) — both come from
