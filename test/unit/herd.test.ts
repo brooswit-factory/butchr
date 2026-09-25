@@ -936,4 +936,24 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     expect(f.started).toEqual([]);
     expect(notices).toEqual([]);
   });
+
+  describe("providerOf (BUTCHR-413)", () => {
+    test("resolves the pane's own foreground provider for a running issue", async () => {
+      const f = fakeHerdrStale(ok([{ pid: 1, argv: ["codex", "whatever"], name: "codex" }]));
+      const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
+      expect(await herd.providerOf("KAN-783")).toBe("codex");
+    });
+
+    test("null for an issue with no running agent", async () => {
+      const f = fakeHerdrStale(ok([]));
+      const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
+      expect(await herd.providerOf("NOT-RUNNING")).toBeNull();
+    });
+
+    test("null when the pane's foreground has no recognisable provider process (unknown, not a guess)", async () => {
+      const f = fakeHerdrStale(ok([]));
+      const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
+      expect(await herd.providerOf("KAN-783")).toBeNull();
+    });
+  });
 });

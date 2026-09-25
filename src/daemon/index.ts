@@ -11,6 +11,7 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
@@ -199,6 +200,25 @@ if (missingRulesPath !== null) {
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf);
+// BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
+// binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
+// Claude agent bound to one needs nothing here (its own CLI opens the
+// notification stream directly, per BUTCHR-411's launch wiring); a Codex
+// agent has no development-channel concept and would otherwise receive
+// nothing for it at all, so this daemon opens that stream on its behalf and
+// turns each push into a `herd.nudge()` prompt — see
+// src/notify/codex-channel-relay.ts's own top comment for the full account,
+// including exactly what BUTCHR-359 should replace this with.
+const codexChannelRelays = createCodexChannelRelayPool({
+  nudge: (issue, text) => herd.nudge(issue, text),
+  providerOf: (issue) => herd.providerOf!(issue),
+  bindingsOf: mcpBindingsOf,
+  runningIssues: () => herd.runningIssues(),
+  log: (line) => console.error(`  ${line}`),
+});
+const codexChannelRelayTick = () => codexChannelRelays.reconcile().catch((e) => console.error(`  WARNING: [notify] codex channel relay reconcile failed: ${(e as Error)?.message ?? e}`));
+void codexChannelRelayTick();
+setInterval(codexChannelRelayTick, 15_000);
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH

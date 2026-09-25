@@ -75,6 +75,19 @@ export interface Herd {
    * but the pane shows a session-limit refusal rather than a started turn.
    */
   nudge(issue: string, text: string): Promise<NudgeResult>;
+  /**
+   * The provider actually running an issue's agent right now, resolved from
+   * its pane's OWN foreground process (the same source `staleIssues()`
+   * already trusts) — never from static config, which under ordered
+   * provider fallback (BUTCHR-238/docs/agent-providers.md) can differ from
+   * what is actually running. `null` when no agent is running, or its
+   * provider can't be determined from the pane (a starting shell, a process
+   * that already exited, a pane blocked on a dialog). Optional so no
+   * existing `Herd` fake needs updating (BUTCHR-413's Codex channel relay is
+   * its only caller so far). See `HerdrHerd`'s implementation for reuse with
+   * `staleIssues()`'s identical lookup.
+   */
+  providerOf?(issue: string): Promise<ManagedAgentProvider | null>;
 }
 
 export interface ManagedHerdAgent {
@@ -342,6 +355,36 @@ export class HerdrHerd implements Herd {
     return [...(await this.byIssue())].map(([issue, agent]) => ({ issue, ...agent }));
   }
 
+  /**
+   * The pane's own foreground provider, or `undefined` when it can't be
+   * determined (herdr hiccup/pane gone, a starting shell, an exited process,
+   * a pane blocked on a dialog) — shared by `staleIssues()` and `providerOf()`
+   * so both trust exactly the same evidence.
+   */
+  private async providerOfPane(pane: string): Promise<{ provider: ManagedAgentProvider; proc: results.PaneProcessInfoProcess & { argv: string[] } } | undefined> {
+    let info: results.PaneProcessInfo | undefined;
+    try {
+      info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
+    } catch {
+      return undefined; // herdr hiccup / pane gone — unknown
+    }
+    // foreground_processes/argv are both optional/nullable on the wire: a
+    // shell still starting, a claude that already exited, or a pane
+    // blocked on a dialog can all report none of this — every such gap is
+    // UNKNOWN (a fresh respawn must never itself be respawned every poll —
+    // the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
+    const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
+    if (!proc?.argv) return undefined; // no claude in the foreground, or the matched claude reported no argv
+    return { provider: managedAgentProviderOfProcess(proc)!, proc: proc as results.PaneProcessInfoProcess & { argv: string[] } };
+  }
+
+  async providerOf(issue: string): Promise<ManagedAgentProvider | null> {
+    const entry = (await this.byIssue()).get(issue);
+    if (!entry) return null;
+    const found = await this.providerOfPane(entry.pane);
+    return found?.provider ?? null;
+  }
+
   async staleIssues(): Promise<StaleAgent[]> {
     // Reconciliation stops stale workers before spawning replacements.
     if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
@@ -350,23 +393,12 @@ export class HerdrHerd implements Herd {
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
       if (this.refused.has(issue)) continue;
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
-      let info: results.PaneProcessInfo | undefined;
-      try {
-        info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
-      } catch {
-        continue; // herdr hiccup / pane gone — unknown, not stale — and this issue alone, not the whole sweep
-      }
-      // foreground_processes/argv are both optional/nullable on the wire: a
-      // shell still starting, a claude that already exited, or a pane
-      // blocked on a dialog can all report none of this — every such gap is
-      // UNKNOWN, never stale (a fresh respawn must never itself be
-      // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
-      const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
-      if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
+      const found = await this.providerOfPane(pane);
+      if (!found) continue;
+      const { provider, proc } = found;
       // issuetype/summary/parent don't matter here: --model and --effort
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
-      const provider = managedAgentProviderOfProcess(proc)!;
       if (provider === "agy" && this.agent.agySpawnBlocked) continue;
       const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
       if (provider === "codex" && disabledMcpServers === undefined) {
