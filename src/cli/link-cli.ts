@@ -10,11 +10,33 @@
  * (confirmed: no `process.argv` subcommand switch exists before this story).
  * `runLinkCli` is therefore invoked from a small guard at the very top of
  * `src/daemon/index.ts`, BEFORE that file's own config/rules loading and
- * daemon boot — a `butchr link ...` invocation must not require Jira
- * credentials or a rules file, since the link store is provider-agnostic
- * local state.
+ * daemon boot — a `butchr link ...` invocation for a NON-`jira-project`
+ * resource must not require Jira credentials or a rules file, since the
+ * file-backed link store is provider-agnostic local state.
+ *
+ * FACTORY-5 ADDS ONE EXCEPTION, LAZILY: a `jira-project:<KEY>` owner routes
+ * to the project-property-backed store instead
+ * (`src/resources/jira-project-link-store.ts`), which needs a live Jira
+ * credential to read/write `brooswit.butchr.links`. `defaultIo` below does
+ * NOT call `loadConfig` up front — it hands `createRoutingLinkStore` a
+ * FACTORY function that only calls `loadConfig`/constructs a Jira client the
+ * first time a call actually routes to a `jira-project:` owner (see
+ * `src/resources/link-store-router.ts`'s own header for why the factory is
+ * lazy). This is what keeps `butchr link list jira-work-item:X` credential-
+ * free exactly as before, while `butchr link list jira-project:X` picks up
+ * the same `ATLASSIAN_SITE`/`ATLASSIAN_EMAIL`/`ATLASSIAN_TOKEN(_FILE)`
+ * environment the daemon itself reads (`src/config/config.ts`). A missing
+ * credential, or any Jira 4xx/5xx the resulting client call hits, surfaces
+ * through the exact same path a store-read failure already did before this
+ * story (`tryStoreOp` below turns any rejected store call into one clean
+ * `stderr` line + exit 1) — no separate error-handling branch was added.
  */
+import { readFileSync } from "node:fs";
 import { addLink, createLinkStore, defaultLinksStorePath, listLinks, removeLink, type LinkStore } from "../resources/link-store.js";
+import { createRoutingLinkStore } from "../resources/link-store-router.js";
+import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
+import { loadConfig } from "../config/config.js";
+import { realAtlassian } from "../tools/atlassian-real.js";
 import { formatResourceRef, parseResourceRef } from "../resources/resource-ref.js";
 
 const USAGE = `usage: butchr link list <resource>
@@ -35,8 +57,28 @@ export interface LinkCliIo {
   stderr: (line: string) => void;
 }
 
+/**
+ * Loads Jira credentials from the SAME environment the daemon reads
+ * (`loadConfig`, `src/config/config.ts`) and builds a project-property-
+ * backed store over them. Called lazily — see this file's own header — so a
+ * missing/invalid credential only ever surfaces when a `jira-project` owner
+ * is actually named, never for any other resource kind. Throws (never
+ * catches): the rejection propagates through `createRoutingLinkStore`'s
+ * factory call into whichever `listLinks`/`addLink`/`removeLink` call
+ * triggered it, where `tryStoreOp` below converts it into a clean stderr
+ * line.
+ */
+export function jiraProjectStoreFromEnv(): LinkStore {
+  const config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  return createJiraProjectLinkStore(realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }));
+}
+
 function defaultIo(): LinkCliIo {
-  return { store: createLinkStore(defaultLinksStorePath()), stdout: (l) => console.log(l), stderr: (l) => console.error(l) };
+  return {
+    store: createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: jiraProjectStoreFromEnv }),
+    stdout: (l) => console.log(l),
+    stderr: (l) => console.error(l),
+  };
 }
 
 function parseOrFail(input: string, argName: string, io: LinkCliIo): { ok: true; ref: ReturnType<typeof parseResourceRef> } | { ok: false } {
