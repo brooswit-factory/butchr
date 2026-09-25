@@ -91,6 +91,8 @@ Startup log:
   `enabled: false` with a `disabledReason`. `github-issue` and
   `zendesk-ticket` poll every 60 s, `jira-idea` every 15 s.
 - `admission.residency` at most `1`.
+- No `unresolvedRelationships` key (a fixture rules file has no dangling
+  `childRule`/`inwardConnectionRules`), and no matching startup `WARNING:`.
 
 Agents and side effects:
 

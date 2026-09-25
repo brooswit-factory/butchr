@@ -214,4 +214,48 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   return { path, origin: "file", rules: parseRules(doc, path) };
 }
 
+/** One enabled jira-work rule's relationship field naming a rule id this daemon has no rule for. */
+export interface UnresolvedRelationship {
+  ruleId: string;
+  field: "childRule" | "inwardConnectionRules";
+  missingTarget: string;
+}
+
+/**
+ * BUTCHR-405: enabled `jira-work` rules whose `relationships.childRule` or
+ * `relationships.inwardConnectionRules` name a rule id absent from `rules`
+ * itself. Purely existence-based — it does not ask whether the missing id is
+ * staffed, observed, or enabled elsewhere (that is a different question, and
+ * this check must keep working regardless of how or whether that question is
+ * ever answered). Both the startup warning and the `/health` field call this
+ * one function so they can never disagree.
+ *
+ * `parseRules` above already refuses to load a file where a relationship
+ * targets an id missing from THAT SAME file, so this can never fire for
+ * rules that came from a single `loadRules` call today. It stays a real,
+ * independent check — not dead code — because it takes any `Rule[]`, not
+ * only ones `parseRules` validated: a rule set assembled some other way
+ * (built by hand in a test, or combined across sources) is exactly where a
+ * dangling reference can reach here uncaught.
+ */
+export function unresolvedRelationships(rules: readonly Rule[]): UnresolvedRelationship[] {
+  const ids = new Set(rules.map((r) => r.id));
+  const out: UnresolvedRelationship[] = [];
+  for (const rule of rules) {
+    if (!rule.enabled || rule.resourceProvider !== "jira-work") continue;
+    const rel = rule.relationships;
+    if (!rel) continue;
+    if (rel.childRule !== undefined && !ids.has(rel.childRule)) out.push({ ruleId: rule.id, field: "childRule", missingTarget: rel.childRule });
+    for (const target of rel.inwardConnectionRules ?? []) {
+      if (!ids.has(target)) out.push({ ruleId: rule.id, field: "inwardConnectionRules", missingTarget: target });
+    }
+  }
+  return out;
+}
+
+/** Startup log line for one `unresolvedRelationships` entry. */
+export function formatUnresolvedRelationshipWarning(u: UnresolvedRelationship): string {
+  return `WARNING: jira-work rule "${u.ruleId}" relationships.${u.field} names rule "${u.missingTarget}", which is not present in this daemon's own rules file; no edge is created — fix the id, or confirm "${u.missingTarget}" is staffed by a different daemon`;
+}
+
 export { decodeAgentKey, encodeAgentKey, isResourceId, type AgentKeyParts } from "./agent-key.js";

@@ -2,6 +2,7 @@ import type { BuildReport } from "../agents/build-identity.js";
 import type { DetectorCoverage } from "./coverage.js";
 import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
+import type { UnresolvedRelationship } from "../rules/rules.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -110,6 +111,21 @@ export interface HealthStatus {
    * and the last poll failure. Absent when the caller passes none.
    */
   resourceLoops?: ResourceLoopReport[];
+  /**
+   * BUTCHR-405: enabled `jira-work` rules whose `relationships.childRule` or
+   * `relationships.inwardConnectionRules` name a rule id absent from this
+   * daemon's own loaded rules (see `unresolvedRelationships` in
+   * src/rules/rules.ts, which this field and the matching startup warning
+   * both compute from — they can never disagree). Rules are loaded once at
+   * startup, so this is static for the daemon's lifetime, computed once and
+   * passed in on every call rather than recomputed per request.
+   *
+   * ABSENT (no key at all), never an empty array, when there is nothing
+   * unresolved — the same "absent means nothing to report" convention
+   * `disabledReason` above already uses, chosen so a consumer can branch on
+   * `"unresolvedRelationships" in health` instead of checking a length.
+   */
+  unresolvedRelationships?: UnresolvedRelationship[];
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -169,6 +185,7 @@ export const combineHealth = (
   admission?: AdmissionSnapshot,
   currency?: CurrencyReport,
   resourceLoops?: readonly ResourceLoopHealth[],
+  unresolvedRelationships?: readonly UnresolvedRelationship[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -179,6 +196,7 @@ export const combineHealth = (
     ...(admission ? { admission } : {}),
     ...(currency ? { currency } : {}),
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
+    ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
   };
 };
 
