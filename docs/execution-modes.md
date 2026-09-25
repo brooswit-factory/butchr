@@ -50,9 +50,15 @@ providers (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`).
 
 Rocket.Chat account lifecycle for a rule's agent(s), independent of
 `execution`: `none` (nothing — today's behaviour, exactly), `temporary`, or
-`permanent`. **Not yet implemented (a later story, S4):** creating,
-attaching, or tearing down an actual Rocket.Chat account. The field is
-validated and stored only.
+`permanent`. **The lifecycle module itself now exists (BUTCHR-410, S4):** an
+RC REST client and an idempotent, race-safe account manager
+(`src/resources/rocketchat.ts`, `src/accounts/manager.ts`,
+`src/accounts/identity.ts`) implementing create-if-missing, unprovision, and
+a configurable guardrail below RC's 50-user allowance — see
+`docs/rocketchat-accounts.md` for the full contract. **Still not wired
+in:** nothing in the herd, the reconciler, or agent start/stop calls
+`ensureAccount`/`releaseAccount` yet — that wiring is a follow-up task. Until
+it lands, `account` is validated and stored only, exactly as before.
 
 ## The vendor selector: already there, not duplicated
 

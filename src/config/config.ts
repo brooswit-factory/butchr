@@ -26,6 +26,24 @@ export interface Config {
    */
   github?: { token: string; orgs: string[] };
   /**
+   * BUTCHR-395/S4: Rocket.Chat account lifecycle config. OPTIONAL, same
+   * all-or-nothing shape as `github` above: present only when
+   * `ROCKETCHAT_URL`, `ROCKETCHAT_ADMIN_USER_ID` and
+   * `ROCKETCHAT_ADMIN_TOKEN_FILE` are ALL set; otherwise `undefined`, and a
+   * daemon with no rule using `account !== "none"` behaves exactly as
+   * before this field existed. `adminTokenFile` is a PATH, never the token's
+   * content — this function's `readFile` signature stays the simple
+   * "return file contents" shape every other section here uses, so the
+   * actual secret load (plus the owner-only-file permission check) happens
+   * in `../resources/rocketchat.ts`'s `loadRocketChatAuth`, at the point a
+   * caller actually builds a client from this config — never here, and
+   * never merely because this field is present. A rule with `account !==
+   * "none"` but this section absent is a refusal from the account manager
+   * at the point of use (`../accounts/manager.ts`), not a startup crash;
+   * see `docs/rocketchat-accounts.md`.
+   */
+  rocketchat?: { url: string; adminUserId: string; adminTokenFile: string; userCapThreshold: number };
+  /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
    * kickoff that never worked counts from first observed running, since it
@@ -298,6 +316,10 @@ export interface ConfigEnv {
   BUTCHR_TERMINAL?: string | undefined;
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
+  ROCKETCHAT_URL?: string | undefined;
+  ROCKETCHAT_ADMIN_USER_ID?: string | undefined;
+  ROCKETCHAT_ADMIN_TOKEN_FILE?: string | undefined;
+  ROCKETCHAT_USER_CAP_THRESHOLD?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
@@ -350,6 +372,25 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const githubToken = env.GITHUB_TOKEN_FILE ? readFile(env.GITHUB_TOKEN_FILE).trim() : undefined;
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
+
+  const rcUrl = env.ROCKETCHAT_URL?.trim();
+  const rcAdminUserId = env.ROCKETCHAT_ADMIN_USER_ID?.trim();
+  const rcAdminTokenFile = env.ROCKETCHAT_ADMIN_TOKEN_FILE?.trim();
+  // Validated only when RC is otherwise fully configured — a stray
+  // ROCKETCHAT_USER_CAP_THRESHOLD with RC otherwise unset must never crash a
+  // daemon that isn't using Rocket.Chat at all (same "optional, never a
+  // startup crash for unrelated config" contract as `github` above).
+  let rocketchat: Config["rocketchat"];
+  if (rcUrl && rcAdminUserId && rcAdminTokenFile) {
+    // BUTCHR-395/S4: default 45, not 50 — the guardrail must refuse BEFORE
+    // the real allowance is hit, so a threshold equal to (or over) it would
+    // defeat the whole point; 45 leaves 5 seats of headroom for
+    // humans/legacy users this manager never touches (see
+    // docs/rocketchat-accounts.md).
+    const userCapThreshold = env.ROCKETCHAT_USER_CAP_THRESHOLD ? Number(env.ROCKETCHAT_USER_CAP_THRESHOLD) : 45;
+    if (!Number.isInteger(userCapThreshold) || userCapThreshold <= 0 || userCapThreshold >= 50) throw new Error(`ROCKETCHAT_USER_CAP_THRESHOLD must be a positive integer below 50: ${env.ROCKETCHAT_USER_CAP_THRESHOLD}`);
+    rocketchat = { url: rcUrl, adminUserId: rcAdminUserId, adminTokenFile: rcAdminTokenFile, userCapThreshold };
+  }
 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
@@ -417,6 +458,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
+    ...(rocketchat ? { rocketchat } : {}),
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
@@ -528,6 +570,7 @@ export const describeConfig = (c: Config): string =>
   `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
+  `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
