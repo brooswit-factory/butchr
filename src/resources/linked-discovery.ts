@@ -96,6 +96,27 @@ function stripTrailingPunct(raw: string): string {
 const ATLASSIAN_CLOUD_HOST_RE = /\.atlassian\.net$/;
 
 /**
+ * A Jira issue key, when `rawUrl` is a `.../browse/<KEY>` URL on an
+ * `*.atlassian.net` host — `null` for anything else (a non-`http(s)` scheme,
+ * an unparseable string, a non-Atlassian host, or an Atlassian URL that
+ * isn't a browse link), never thrown. Exported (BUTCHR-436) so a caller
+ * that already has a URL from a DIFFERENT source than description text
+ * (e.g. a Jira remote link's own `url` field) can classify it as "linked to
+ * a Jira issue" without duplicating this parsing — `classifyUrl` below is
+ * built on this same function, so the two can never drift on what counts as
+ * a Jira browse URL.
+ */
+export function jiraBrowseKey(rawUrl: string): string | null {
+  const url = stripTrailingPunct(rawUrl);
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  if (!ATLASSIAN_CLOUD_HOST_RE.test(u.hostname)) return null;
+  const browse = /^\/browse\/([^/]+)\/?$/.exec(u.pathname);
+  return browse && isIssueKey(browse[1]!) ? browse[1]! : null;
+}
+
+/**
  * Classifies one already-extracted URL, most-specific kind first, so a URL
  * is classified exactly ONCE: a Jira browse URL is `jira-key` (never also
  * `webpage`), a Confluence page URL is `confluence`, a GitHub issue/PR URL is
@@ -110,11 +131,9 @@ function classifyUrl(rawUrl: string): LinkedItem | null {
   let u: URL;
   try { u = new URL(url); } catch { return null; }
   if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-  if (ATLASSIAN_CLOUD_HOST_RE.test(u.hostname)) {
-    const browse = /^\/browse\/([^/]+)\/?$/.exec(u.pathname);
-    if (browse && isIssueKey(browse[1]!)) return { kind: "jira-key", target: browse[1]! };
-    if (u.pathname.startsWith("/wiki/")) return { kind: "confluence", target: url };
-  }
+  const browseKey = jiraBrowseKey(url);
+  if (browseKey) return { kind: "jira-key", target: browseKey };
+  if (ATLASSIAN_CLOUD_HOST_RE.test(u.hostname) && u.pathname.startsWith("/wiki/")) return { kind: "confluence", target: url };
   const issueRef = githubIssueRefFromUrl(url);
   if (issueRef) return { kind: "github-issue", target: formatGithubIssueRef(issueRef) };
   const prRef = githubPrRefFromUrl(url);

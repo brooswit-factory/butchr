@@ -22,6 +22,7 @@ import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
+import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import type { AgentCapacityRole } from "../agents/admission.js";
 import { capacityRoleFor } from "../agents/capacity-role.js";
@@ -47,7 +48,7 @@ import { respawnComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
-import { changeNudge, notifyReasonTag } from "../agents/change-nudge.js";
+import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
@@ -825,6 +826,36 @@ void sweepStaleAgentLabels({
 // `ownsId: ownsRuleAgent` is what keeps legacy agents and workspaces
 // untouched: a legacy `<root>/<ISSUE>` agent reports a bare issue key, which
 // never decodes as an agent key, so this loop can neither stop nor adopt it.
+// BUTCHR-436: pulled out of the `runResourceLoop` call below (which used to
+// build this inline) so the SAME function can also be handed to
+// `createRuleResourceType` as `RuleResourceDeps.notify` — the seam its own
+// linked-change eventing tick delivers its coalesced nudge through (see
+// src/jira-watch/linked-eventing.ts's own top comment for why this is
+// "UNCHANGED IN SHAPE": the actual channel-push mechanism below is
+// untouched, only its `reason` branching gains one more case).
+const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
+  // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
+  // for a query-level agent that's its own query key, shown as-is in
+  // `changeNudge`'s "related to your X" framing (there is no friendlier
+  // single ticket to name it by). `aboutIssue` is the CHANGED resource —
+  // for `notifyAgent`'s own `meta.issue`, that changed resource (not the
+  // agent's own identity) is what a notification is actually about, the
+  // same thing the other three provider loops already pass as their own
+  // `deliver(agent, resource, msg)` argument.
+  const issue = resourceKeyOf(agent);
+  const aboutIssue = resourceKeyOf(about);
+  const msg = reason && "linked" in reason ? linkedChangeNudge(issue, reason.linked.events)
+    : reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
+    : changeNudge(issue, aboutIssue, reason);
+  void notifyAgent(mcp, agent, aboutIssue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+  const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+  const reasonTag = notifyReasonTag(reason);
+  const promptState = outcome.refusal
+    ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
+    : outcome.delivered ? "delivered" : "refused/absent";
+  console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
+};
+
 const ruleResourceType = createRuleResourceType({
   rules,
   // searchAll, never search: a first-page-only result would read as tickets
@@ -838,31 +869,17 @@ const ruleResourceType = createRuleResourceType({
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
+  // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
+  // that leaves it absent/false never calls this (see
+  // src/jira-watch/linked-eventing.ts's own contract).
+  remoteLinks: (key) => atlassian.remoteLinks(key),
+  notify: notifyRuleAgent,
 });
 
 runResourceLoop(ruleResourceType, {
   herd,
   ownsId: ownsRuleAgent,
-  notify: async (agent, about, reason) => {
-    // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
-    // for a query-level agent that's its own query key, shown as-is in
-    // `changeNudge`'s "related to your X" framing (there is no friendlier
-    // single ticket to name it by). `aboutIssue` is the CHANGED resource —
-    // for `notifyAgent`'s own `meta.issue`, that changed resource (not the
-    // agent's own identity) is what a notification is actually about, the
-    // same thing the other three provider loops already pass as their own
-    // `deliver(agent, resource, msg)` argument.
-    const issue = resourceKeyOf(agent);
-    const aboutIssue = resourceKeyOf(about);
-    const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, aboutIssue, reason);
-    void notifyAgent(mcp, agent, aboutIssue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    const reasonTag = notifyReasonTag(reason);
-    const promptState = outcome.refusal
-      ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
-      : outcome.delivered ? "delivered" : "refused/absent";
-    console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
-  },
+  notify: notifyRuleAgent,
   onRespawn: async (agent, reason, observedArgv) => {
     console.error(`  [reconcile] ${agent} respawned: ${reason} (was: ${observedArgv.join(" ")})`);
     // BUTCHR-398: a query-level agent has no single ticket to post a respawn

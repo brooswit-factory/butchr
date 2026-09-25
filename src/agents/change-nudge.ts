@@ -1,4 +1,4 @@
-import type { NotifyReason } from "../resources/types.js";
+import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 
 /**
  * BUTCHR-87: the daemon nudge and the `[notify]` log line for every
@@ -49,7 +49,13 @@ const REASON_NOT_DETERMINABLE = "reason not determinable from the poll";
  * silently wrong label.
  */
 function reasonClause(reason: NotifyReason | undefined): string {
-  if (!reason || "pr" in reason || "undetermined" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
+  // BUTCHR-436: `linked` is deliberately unreachable here in practice, same
+  // as `pr` — it renders via its own `linkedChangeNudge` below, never this
+  // function's "related to your X" framing (a coalesced linked-change nudge
+  // names every changed link itself; it has no single "about" clause to
+  // append). Handled defensively rather than asserted unreachable, for the
+  // same reason `pr` already is.
+  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
   if ("status" in reason) return `changed status from "${reason.status.from}" to "${reason.status.to}"`;
@@ -119,6 +125,7 @@ export function changeNudge(issue: string, about: string, reason: NotifyReason |
  */
 export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if (!reason) return " (reason: not determinable)";
+  if ("linked" in reason) return ` (linked:${reason.linked.events.length})`;
   if ("pr" in reason) return ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})`;
   if ("appeared" in reason) return " (appeared)";
   if ("disappeared" in reason) return " (disappeared)";
@@ -165,6 +172,28 @@ export function zendeskTicketNudge(resource: string, reason: NotifyReason | unde
  */
 export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Jira Product Discovery idea ${resource} ${reasonClause(reason)} — re-read it with jira_idea_get.`;
+}
+
+/**
+ * BUTCHR-436 (epic BUTCHR-421, story 2/4): the coalesced linked-Jira-item
+ * nudge — one summary line, then one `<target> (<kind>): <detail>` line per
+ * event, for every changed/unreadable/removed Jira-kind link a `jira-work`
+ * rule's `linkedEventing` poll tick found for ONE owning resource. A sibling
+ * of `changeNudge` above, kept separate (rather than folded into it, or into
+ * `reasonClause`) because its shape is fundamentally different: a plural,
+ * multi-line summary of everything that changed in ONE tick, not a single
+ * present-tense clause about the resource's own change — see
+ * `src/jira-watch/linked-eventing.ts` for how one tick's worth of
+ * `LinkedChangeEvent`s is assembled before reaching here. `issue` is the
+ * owning resource's own Jira key (this story's coalescer never fires for
+ * anyone else). Never empty: `events` is guaranteed non-empty by the
+ * coalescer (a tick with nothing to report never calls this at all).
+ */
+export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEvent[]): string {
+  const n = events.length;
+  const summary = `[butchr] ${issue}: ${n} linked Jira item${n === 1 ? "" : "s"} changed — re-read them.`;
+  const lines = events.map((e) => `${e.target} (${e.kind}): ${e.detail}`);
+  return [summary, ...lines].join("\n");
 }
 
 /**
