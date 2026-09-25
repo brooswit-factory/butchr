@@ -37,6 +37,19 @@ export interface JiraIssue {
    */
   issuelinks?: readonly IssueLink[];
   /**
+   * BUTCHR-431: this issue's description, flattened to plain text via
+   * `adfToText` (src/atlassian/client.ts) — Jira's REST v3 `description` is
+   * ADF, or null. OPTIONAL for the same reason `issuelinks` above is:
+   * existing fixtures across this codebase's test suite predate this field
+   * and legitimately don't care about it, so `undefined` means UNKNOWN, not
+   * "confirmed empty" (a real empty description flattens to `""`, which IS
+   * present). Feeds `discoverLinkedItems`'s description-derived link kinds
+   * (src/resources/linked-discovery.ts) via the wired caller
+   * (`logLinkedDiscovery`, src/rules/resource-type.ts) — nothing on this
+   * type itself decides how the text is used.
+   */
+  description?: string;
+  /**
    * BUTCHR-307: whether this issue is currently "asleep" (stood down) —
    * SYNTHETIC, never present on the raw Jira API response and never set by
    * `mapIssue` (src/atlassian/client.ts). Only `createIssueResourceType`'s

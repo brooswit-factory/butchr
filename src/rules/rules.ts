@@ -118,15 +118,44 @@ export interface Rule {
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /**
+   * BUTCHR-429 (epic BUTCHR-421, story 1/4): four additive, independently
+   * optional knobs for "linked-change eventing" — a change to anything
+   * LINKED to this rule's resources (a Jira issue link, parent Epic, remote
+   * link, Confluence page, GitHub issue/PR, or general webpage) becoming a
+   * turn-causing update, same as a change to the resource itself. Absent
+   * means exactly today's behaviour: this story's own link DISCOVERY still
+   * runs and logs (`[linked-discovery]`, src/jira-watch/linked-discovery-log.ts)
+   * regardless of these knobs — it is a cost-free pure parse of data a
+   * rule's poll already fetched — but nothing downstream of discovery exists
+   * yet (that is stories 2/3), so no knob here changes any agent's behaviour
+   * in this story. Kept as four independently optional fields, mirroring
+   * `agentPreferences`/`relationships` above rather than `execution`/
+   * `account`/`role`'s always-defaulted style, because "absent" and "false"
+   * are the same no-op here — there is no live default value to normalise
+   * onto every rule for a mechanism that does not run yet.
+   */
+  /** Opt in to linked-change eventing for this rule's agents. Absent/false: today's behaviour, exactly (see this field's own group comment above). Reserved for stories 2/3 to actually gate on; this story validates and plumbs it only. */
+  linkedEventing?: boolean;
+  /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
+  linkedPollIntervalMs?: number;
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  maxLinkedItems?: number;
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  maxLinkedTurnsPerHour?: number;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set([
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour",
+]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
+const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
 const unknownFields = (raw: Record<string, unknown>, allowed: Set<string>, at: string, errors: string[]): void => {
   for (const k of Object.keys(raw)) if (!allowed.has(k)) errors.push(`${at} has unknown field "${k}"`);
 };
@@ -207,6 +236,12 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
     // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
+    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour } = raw;
+    if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
+    if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
+    if (maxLinkedItems !== undefined && !isPositiveInt(maxLinkedItems)) errors.push(`${at}.maxLinkedItems must be a positive integer`);
+    if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
@@ -222,6 +257,10 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
+      ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
+      ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
+      ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
+      ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

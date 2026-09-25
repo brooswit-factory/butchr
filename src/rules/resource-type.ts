@@ -20,7 +20,9 @@ import type { JiraIssue } from "../atlassian/types.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
 import { jiraIssueClass } from "../resources/jira-idea.js";
+import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discovery.js";
 import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
+import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -423,11 +425,16 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   // relationship walk reads this poll's matches with no second Jira call.
   let latest: RuleMatch[] = [];
   const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
+  const linkedDiscoveryTracker = createLinkedDiscoveryTracker();
   return {
     discovery: {
       idOf: unitAgentKey,
       search: async () => {
         latest = await searchRules({ ...deps, excluded });
+        // BUTCHR-429: discovery+logging over this poll's own matches — see
+        // `logLinkedDiscovery`'s own doc comment for why this runs
+        // unconditionally (no new Jira call, no `linkedEventing` gate).
+        logLinkedDiscovery(latest, linkedDiscoveryTracker, deps.log);
         // BUTCHR-398: rename-safety — a running agent whose SHAPE (per-
         // resource vs. query-level) disagrees with its rule's CURRENT
         // execution mode is a deliberate transition, logged loudly rather
@@ -491,6 +498,42 @@ export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIs
   const byKey = new Map<string, JiraIssue>();
   for (const m of resourceMatches(units)) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);
   return [...byKey.values()];
+}
+
+/**
+ * BUTCHR-429/BUTCHR-431: logs each match's discovered link set
+ * (`[linked-discovery]`, src/jira-watch/linked-discovery-log.ts), gated on
+ * change per resource via `tracker` so an unchanged set logs nothing after
+ * its first poll. Runs for EVERY match regardless of `rule.linkedEventing` —
+ * discovery is a cost-free pure parse of data `searchRules` already fetched
+ * (`issuelinks`, `parent`, and — as of BUTCHR-431 — `description` are all
+ * part of `SEARCH_FIELDS`, src/atlassian/client.ts), so there is no cost
+ * this story needs a knob to gate. `issuelinks`, `parent`, and `description`
+ * are passed to `discoverLinkedItems` here, plus the match's own key as
+ * `ownKey` so a description that mentions its OWN issue is never reported
+ * as a link to itself (see `LinkedDiscoverySource.ownKey`'s own doc
+ * comment). Remote links are NOT part of what `searchRules` fetches (see
+ * src/resources/linked-discovery.ts's own top comment) — that parser still
+ * exists for a caller that already has that data, but wiring it here would
+ * add a second Jira call this story doesn't make. `rule.maxLinkedItems`
+ * (absent = uncapped) bounds what gets logged as kept vs. skipped per match.
+ */
+export function logLinkedDiscovery(
+  matches: readonly RuleMatch[],
+  tracker: ReturnType<typeof createLinkedDiscoveryTracker>,
+  log: ((line: string) => void) | undefined,
+): void {
+  for (const m of matches) {
+    const items = discoverLinkedItems({
+      issuelinks: m.issue.issuelinks,
+      parent: m.issue.parent,
+      description: m.issue.description,
+      ownKey: m.issue.key,
+    });
+    const { kept, skipped } = capLinkedItems(items, m.rule.maxLinkedItems);
+    if (!tracker.changed(m.agentKey, kept, skipped)) continue;
+    for (const line of formatLinkedDiscoveryLines(m.agentKey, kept, skipped)) log?.(line);
+  }
 }
 
 /** Logs each (rule, issue) exclusion once per resource type, not once per poll. */

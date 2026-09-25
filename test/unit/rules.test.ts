@@ -266,6 +266,63 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
 });
 
+describe("linked-eventing knobs (BUTCHR-429 — additive, default inert)", () => {
+  test("all four are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.linkedEventing).toBeUndefined();
+    expect(r!.linkedPollIntervalMs).toBeUndefined();
+    expect(r!.maxLinkedItems).toBeUndefined();
+    expect(r!.maxLinkedTurnsPerHour).toBeUndefined();
+  });
+
+  test("each is accepted when valid, independent of the others and of every other field", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4 }] });
+    expect(r).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4 });
+  });
+
+  test("linkedEventing: false is accepted and kept (distinct from omitted, even though both are inert today)", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: false }] });
+    expect(r!.linkedEventing).toBe(false);
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1 }] });
+      expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1 });
+    }
+  });
+
+  test("rejects a non-boolean linkedEventing", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, linkedEventing: "yes" }] }, "f.json")).toThrow("f.json: rules[0].linkedEventing must be a boolean");
+  });
+
+  test("rejects a non-positive-integer for each numeric knob, naming the rule and field", () => {
+    for (const field of ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const) {
+      for (const bad of [0, -1, 1.5, "5", null]) {
+        expect(() => parseRules({ rules: [{ ...minimal, [field]: bad }] }, "f.json")).toThrow(`f.json: rules[0].${field} must be a positive integer`);
+      }
+    }
+  });
+
+  test("all four bad at once are all reported together", () => {
+    let msg = "";
+    try { parseRules({ rules: [{ ...minimal, linkedEventing: 1, linkedPollIntervalMs: 0, maxLinkedItems: -5, maxLinkedTurnsPerHour: "many" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toContain("f.json: rules[0].linkedEventing must be a boolean");
+    expect(msg).toContain("f.json: rules[0].linkedPollIntervalMs must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedItems must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedTurnsPerHour must be a positive integer");
+  });
+
+  test("a pre-change rules document (none of the four set) loads unchanged — no existing rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
 describe("agent keys", () => {
   const parts = { resourceProvider: "jira-work" as const, ruleId: "triage", resourceId: "BUTCHR-12" };
   test("encodes provider, rule id and native resource id as separate components, and round-trips", () => {

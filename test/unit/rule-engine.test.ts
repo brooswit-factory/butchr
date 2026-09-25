@@ -89,6 +89,125 @@ describe("rule discovery", () => {
   });
 });
 
+// BUTCHR-429 (epic BUTCHR-421, story 1/4): `createRuleResourceType`'s own
+// wiring of link discovery + `[linked-discovery]` logging, over data
+// `searchRules` already fetched (`issuelinks`/`parent`, part of
+// `SEARCH_FIELDS`, src/atlassian/client.ts) — see `logLinkedDiscovery`'s own
+// doc comment (src/rules/resource-type.ts).
+describe("BUTCHR-429: linked-change discovery logging", () => {
+  test("discovery.search() logs each match's discovered link set (issuelinks + parent, already-fetched data)", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=parent target=BUTCHR-421 skipped=false");
+  });
+
+  test("an unchanged link set across polls logs only once, not every poll", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    await type.discovery.search();
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toHaveLength(1);
+  });
+
+  test("a genuine change (a new link appears) logs again", async () => {
+    const lines: string[] = [];
+    let withImplements = false;
+    const search = async () => [issue("BUTCHR-1", { issuelinks: (withImplements ? [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] : []) as never })];
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search, log: (l) => lines.push(l) });
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toHaveLength(0); // no links yet -> nothing to log
+    withImplements = true;
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toEqual(["[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false"]);
+  });
+
+  test("rule.maxLinkedItems caps discovery AND logs the skipped extras — never a silent truncation", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-3" },
+      ] as never,
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q", maxLinkedItems: 1 }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-3 skipped=true");
+  });
+
+  test("with linkedEventing absent/false, discovery still runs and logs (cost-free), but adds ZERO new Jira calls beyond the rule's own JQL search — no fetch this story didn't already make", async () => {
+    let searchCalls = 0;
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+      description: "Also see https://example.com/docs and BUTCHR-1 itself.",
+    });
+    const lines: string[] = [];
+    // linkedEventing is absent here — the whole point of this test.
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q" }),
+      search: async () => { searchCalls++; return [withLinks]; },
+      log: (l) => lines.push(l),
+    });
+    await type.discovery.search();
+    expect(searchCalls).toBe(1); // exactly the rule's own JQL search — the same count as before this story existed (description rides the same SEARCH_FIELDS payload, BUTCHR-431)
+    expect(lines.some((l) => l.startsWith("[linked-discovery]"))).toBe(true); // discovery+logging ran anyway — it's a cost-free pure parse, not gated on linkedEventing
+    expect(lines.some((l) => l.startsWith("[notify]"))).toBe(false); // and drove no notification — this story adds no eventing
+  });
+
+  // BUTCHR-431: `description` is now fed to discovery too — every kind
+  // `descriptionItems` can produce shows up as its own `[linked-discovery]`
+  // line, the match's own key is excluded, and `maxLinkedItems` still caps
+  // (and logs skipped) across the combined issuelinks+parent+description set.
+  test("a description containing a Confluence URL, a GitHub issue URL, a GitHub PR URL, a generic URL, and a bare Jira key produces a [linked-discovery] line per kind; the resource's own key is excluded", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      description: [
+        "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
+        "Issue: https://github.com/brooswit-factory/butchr/issues/42",
+        "PR: https://github.com/brooswit-factory/butchr/pull/395",
+        "Docs: https://example.com/some/docs",
+        "Also see BUTCHR-9 and, for context, this very ticket BUTCHR-1.",
+      ].join(" "),
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-issue target=brooswit-factory/butchr#42 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-pr target=brooswit-factory/butchr#395 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=webpage target=https://example.com/some/docs skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=false");
+    expect(linked.some((l) => l.includes("target=BUTCHR-1 "))).toBe(false); // own key excluded, never reported as a link to itself
+    expect(linked).toHaveLength(5);
+  });
+
+  test("maxLinkedItems still caps and logs skipped across the combined issuelinks+parent+description set", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+      description: "See BUTCHR-9 too.",
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q", maxLinkedItems: 2 }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=parent target=BUTCHR-421 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=true");
+  });
+});
+
 describe("rule reconcile", () => {
   test("zero rules means zero staffing: every rule agent is stopped, nothing is spawned", async () => {
     const herd = fakeHerd(["jira-work:task:BUTCHR-1", "jira-work:review:BUTCHR-2"]);
