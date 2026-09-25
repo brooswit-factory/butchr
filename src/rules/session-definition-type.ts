@@ -170,7 +170,7 @@ export function specForSessionDefinition({ agentKey, resource, definition }: Ses
     summary: `managed session (${definition.vendor}, ${definition.tier}) — ${resource.name}`,
     parent: null,
     brief: definition.brief,
-    agents: [{ harness: definition.vendor, model: tierToModel(definition.tier) }],
+    agents: [{ harness: definition.vendor, model: tierToModel(definition.vendor, definition.tier) }],
     cwd: definition.workingDirectory,
     permissionMode: definition.permissionMode,
   };

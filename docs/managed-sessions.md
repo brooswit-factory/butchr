@@ -47,7 +47,7 @@ takes effect on restart, not live), like every other provider's query.
 | `workingDirectory` | yes | Where the managed agent actually works. Absolute, or `~`/`~/rest` (expanded against the daemon's own `$HOME`, same rule as a `filesystem` query's `root`). Becomes the spawned agent's REAL process `cwd` — see "Working directory wiring" below. |
 | `brief` | yes | The agent's prompt/role. Literal text; no `@builtin:` shorthand (that convenience is a `Rule` field's, not a definition's). |
 | `vendor` | yes | `"claude"` or `"codex"` — narrower than `Rule.agentPreferences[].harness` (`agy` is not a Bakr/Candlestix vendor). |
-| `tier` | yes | `"tier0"` \| `"tier1"` \| `"tier2"`, mapped to a concrete model by `tierToModel()` — see "Tier -> model mapping" below. |
+| `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). Stored only — the Rocket.Chat account lifecycle itself is unimplemented for every provider today, managed sessions included. |
@@ -79,28 +79,36 @@ decision is made, this section gets the real field.
 
 ## Tier -> model mapping
 
-**PROVISIONAL.** The ticket points at a preserved Candlestix branch
-(`preserve/candlestix-runtime-f198ae1/`, in "the CNDLX manager workspace")
-as the source of truth, falling back to "read the candlestix repo under
-`~/code` and ask_boss for the location" if unreachable. Both were searched
-exhaustively (2026-09-25, BUTCHR-408): no path or git ref anywhere on the
-build host matches `preserve/candlestix-runtime-f198ae1` or `f198ae1`
-at all, and `~/code/brooswit-factory/candlestix` carries no tier/model
-mapping in any branch, tag, or even unreachable/dangling git object. Asked
-of the boss on BUTCHR-408 2026-09-25; unanswered as of this doc.
+PORTED from Candlestix's own `~/.config/candlestix/model-tiers.json` on
+host Codey. The ticket's preserved-branch pointer
+(`preserve/candlestix-runtime-f198ae1/`, "the CNDLX manager workspace") and
+its fallback (`~/code/brooswit-factory/candlestix`) were both searched
+exhaustively (2026-09-25, BUTCHR-408) and neither is reachable from this
+build host — this was raised as an `ask_boss` on BUTCHR-408 rather than
+guessed. The answer (BUTCHR-408 comment 23948, 2026-09-25, story agent)
+relays CNDLX-45 comment 23525 (John Winstead, "Codey inventory v1",
+2026-09-24T22:00Z), which this doc's author read and cross-checked
+verbatim before porting the table below.
 
-Until the real table arrives, `tierToModel()` (`src/resources/session-definition.ts`)
-uses:
+CAVEAT, carried forward from that same relay: this is a REPORT of a file
+none of us can read directly (Codey host access is blocked — CNDLX-45 says
+so), so it is ported as DATA (`CLAUDE_TIER_MODEL`/`CODEX_TIER_MODEL` in
+`src/resources/session-definition.ts`), not logic, and is **unverified
+against the live file**. A future mismatch against the real Codey file is
+grounds to fix this table, not to distrust the reporter.
 
-| tier | model | confidence |
+| tier | claude model | codex model |
 |---|---|---|
-| `tier0` | `haiku` | provisional — follows `modelFor`'s own cheap/default/expensive shape (`src/agents/workspace.ts`), not independently confirmed |
-| `tier1` | `sonnet` | **confirmed** — BUTCHR-393's own ticket text: "10 MUD players: Claude at tier 1 (sonnet)" |
-| `tier2` | `opus` | provisional, same shape as `tier0` |
+| `tier1` | `sonnet` | `gpt-5.6-luna` |
+| `tier2` | `sonnet` | `gpt-5.6-terra` |
+| `tier3` | `sonnet` | `gpt-5.6-sol` |
+| `tier4` | `opus` | `gpt-6-astra` |
+| `tier5` | `opus` | `gpt-6-astra` |
 
-`tierToModel` is the ONE place this mapping lives; update it (and
-`SESSION_TIERS` if the tier names themselves turn out different) once the
-real table is known — nothing else in this codebase encodes tier names.
+`tierToModel(vendor, tier)` is the ONE place this mapping lives; update it
+(and `SESSION_TIERS` if the tier names themselves turn out different) if a
+verified read of the live file ever disagrees — nothing else in this
+codebase encodes tier names.
 
 ## Eligible = valid, not frozen
 

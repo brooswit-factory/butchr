@@ -117,11 +117,25 @@ describe("parseSessionDefinitionFile", () => {
 });
 
 describe("tierToModel", () => {
-  test("tier1 -> sonnet: the one entry independently confirmed by BUTCHR-393's own ticket text (\"10 MUD players: Claude at tier 1 (sonnet)\")", () => {
-    expect(tierToModel("tier1")).toBe("sonnet");
+  test("claude: tiers 1-3 -> sonnet, 4-5 -> opus (Candlestix model-tiers.json, ported per CNDLX-45 comment 23525)", () => {
+    expect(tierToModel("claude", "tier1")).toBe("sonnet");
+    expect(tierToModel("claude", "tier2")).toBe("sonnet");
+    expect(tierToModel("claude", "tier3")).toBe("sonnet");
+    expect(tierToModel("claude", "tier4")).toBe("opus");
+    expect(tierToModel("claude", "tier5")).toBe("opus");
   });
-  test("every declared tier maps to a non-empty model string", () => {
-    for (const tier of SESSION_TIERS) expect(tierToModel(tier).length).toBeGreaterThan(0);
+  test("codex: tier 1 = gpt-5.6-luna, 2 = gpt-5.6-terra, 3 = gpt-5.6-sol, 4-5 = gpt-6-astra", () => {
+    expect(tierToModel("codex", "tier1")).toBe("gpt-5.6-luna");
+    expect(tierToModel("codex", "tier2")).toBe("gpt-5.6-terra");
+    expect(tierToModel("codex", "tier3")).toBe("gpt-5.6-sol");
+    expect(tierToModel("codex", "tier4")).toBe("gpt-6-astra");
+    expect(tierToModel("codex", "tier5")).toBe("gpt-6-astra");
+  });
+  test("every declared tier maps to a non-empty model string for both vendors", () => {
+    for (const tier of SESSION_TIERS) {
+      expect(tierToModel("claude", tier).length).toBeGreaterThan(0);
+      expect(tierToModel("codex", tier).length).toBeGreaterThan(0);
+    }
   });
 });
 

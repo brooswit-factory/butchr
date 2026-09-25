@@ -132,7 +132,7 @@ describe("specForSessionDefinition", () => {
     expect(spec.brief).toBe("Tend this repo.");
     expect(spec.cwd).toBe("/repo/project");
     expect(spec.permissionMode).toBe("auto");
-    expect(spec.agents).toEqual([{ harness: "codex", model: "opus" }]);
+    expect(spec.agents).toEqual([{ harness: "codex", model: "gpt-5.6-terra" }]);
     expect(spec.parent).toBeNull();
   });
 
@@ -141,7 +141,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
       rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier0", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false },
+      definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false },
     };
     expect(specForSessionDefinitionUnit({ kind: "resource", match })).toEqual(specForSessionDefinition(match));
     const qkey = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: rule.id });
@@ -173,7 +173,7 @@ describe("createManagedSessionResourceType", () => {
   test("activation is always active for whatever reaches it (frozen/invalid never do)", () => {
     const rule = builtinManagedSessionsRule("/defs");
     const type = createManagedSessionResourceType({ rule, list: async () => [], read: async () => "" });
-    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res("/defs/a.json"), definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier0", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false } };
+    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res("/defs/a.json"), definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false } };
     expect(type.activation.verdictFor({ kind: "resource", match })).toBe("active");
   });
 });
@@ -181,7 +181,7 @@ describe("createManagedSessionResourceType", () => {
 describe("createSessionDefinitionEventRules", () => {
   test("unchanged content never notifies; a size/mtime move notifies the resource's own agent only", async () => {
     const rule = builtinManagedSessionsRule("/defs");
-    const definition = { workingDirectory: "/x", brief: "b", vendor: "claude" as const, tier: "tier0" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const definition = { workingDirectory: "/x", brief: "b", vendor: "claude" as const, tier: "tier3" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
     const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" });
     const unit = (r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition } });
     const type = createSessionDefinitionEventRules();
@@ -338,10 +338,10 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     const director = byResource.get("/defs/candlestix-factory-director.json")!;
     expect(director.cwd).toBe("/var/candlestix/factory");
     expect(director.permissionMode).toBe("auto");
-    expect(director.agents).toEqual([{ harness: "claude", model: "opus" }]);
+    expect(director.agents).toEqual([{ harness: "claude", model: "sonnet" }]);
 
     const codexAgent = byResource.get("/defs/candlestix-codex-agent.json")!;
     expect(codexAgent.cwd).toBe("/var/candlestix/codex-session");
-    expect(codexAgent.agents).toEqual([{ harness: "codex", model: "sonnet" }]);
+    expect(codexAgent.agents).toEqual([{ harness: "codex", model: "gpt-5.6-luna" }]);
   });
 });

@@ -39,27 +39,36 @@ export const SESSION_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermis
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
 
 /**
- * Model tiers a definition may name, mapped to a concrete model by
- * `tierToModel`. PROVISIONAL pending the real Candlestix tier -> model table
- * (asked of the boss on BUTCHR-408 2026-09-25 — the preserved branch the
- * ticket names, `preserve/candlestix-runtime-f198ae1`, does not exist
- * anywhere reachable from this workspace, and the candlestix repo under
- * ~/code carries no tier/model mapping in any branch, tag, or even
- * unreachable git object; searched exhaustively). `tier1 -> "sonnet"` is the
- * one entry independently confirmed by BUTCHR-393's own ticket text ("10 MUD
- * players: Claude at tier 1 (sonnet)"); `tier0`/`tier2` follow the same
- * cheap/default/expensive shape `modelFor` (src/agents/workspace.ts) already
- * uses for issue types, but are NOT independently confirmed — see
- * `tierToModel`'s own doc comment. Update BOTH `SESSION_TIERS` and
- * `tierToModel` together if the real table turns out different; nothing
- * else in this module encodes tier names.
+ * Model tiers a definition may name, 1-5, PORTED from Candlestix's own
+ * `~/.config/candlestix/model-tiers.json` on host Codey. Source: CNDLX-45
+ * comment 23525 (John Winstead, "Codey inventory v1", 2026-09-24T22:00Z),
+ * relayed on BUTCHR-408 comment 23948 (story agent, 2026-09-24) in answer to
+ * this ticket's own `ask_boss`; both read and cross-checked verbatim before
+ * porting. CAVEAT carried from that same relay: this is a REPORT of a file
+ * none of us can read directly (Codey host access is blocked — CNDLX-45 says
+ * so), so it is ported as DATA, not logic, and is UNVERIFIED against the
+ * live file — treat a mismatch report against the real Codey file as
+ * grounds to fix this table, not the reporter.
  */
-export const SESSION_TIERS = ["tier0", "tier1", "tier2"] as const;
+export const SESSION_TIERS = ["tier1", "tier2", "tier3", "tier4", "tier5"] as const;
 export type SessionTier = (typeof SESSION_TIERS)[number];
 
-/** `tier -> model`. See `SESSION_TIERS`'s own doc comment for provenance/confidence per entry. */
-export function tierToModel(tier: SessionTier): string {
-  return { tier0: "haiku", tier1: "sonnet", tier2: "opus" }[tier];
+/**
+ * `(vendor, tier) -> model`. Model choice depends on BOTH fields, not tier
+ * alone — Candlestix's own table gives Claude and Codex independent per-tier
+ * model strings (see `SESSION_TIERS`'s own doc comment for provenance):
+ * claude tiers 1-3 = sonnet, 4-5 = opus; codex tier 1 = gpt-5.6-luna, 2 =
+ * gpt-5.6-terra, 3 = gpt-5.6-sol, 4-5 = gpt-6-astra.
+ */
+const CLAUDE_TIER_MODEL: Record<SessionTier, string> = {
+  tier1: "sonnet", tier2: "sonnet", tier3: "sonnet", tier4: "opus", tier5: "opus",
+};
+const CODEX_TIER_MODEL: Record<SessionTier, string> = {
+  tier1: "gpt-5.6-luna", tier2: "gpt-5.6-terra", tier3: "gpt-5.6-sol", tier4: "gpt-6-astra", tier5: "gpt-6-astra",
+};
+
+export function tierToModel(vendor: SessionDefinitionVendor, tier: SessionTier): string {
+  return (vendor === "codex" ? CODEX_TIER_MODEL : CLAUDE_TIER_MODEL)[tier];
 }
 
 export interface SessionDefinition {
