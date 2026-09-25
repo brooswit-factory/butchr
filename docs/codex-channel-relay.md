@@ -116,12 +116,31 @@ operator" notice, then a `<channel source="...">...</channel>` block holding
 the message content, with any `</channel>`/`<channel` in the body itself
 neutralised so a hostile message body cannot forge a frame boundary.
 
-**How it answers back:** no new code. BUTCHR-411 already gives a Codex agent
-bound to a channel server ordinary MCP **tool** access to that same server
-(Codex connects to every bound server for tools regardless of its `channel`
-flag) — a Codex agent replies through the bound server's own tools, exactly
-as a Claude agent would, since that path was never the gap this ticket
-closes.
+**How it answers back — CORRECTED, a real gap, not "no new code":** the
+first version of this doc claimed a Codex agent replies through the bound
+server's own MCP tools "exactly as a Claude agent would". That does not
+survive contact with BUTCHR-411's own merged review fix (b669346): a Codex
+launch's bound-server config is rendered into process argv by Drovr, so
+BUTCHR-411 deliberately strips EVERY bound-server header value from a Codex
+launch, for every binding, to keep a credential out of argv/logs/`ps`
+(`boundCodexServers`, src/agents/argv.ts; `docs/mcp-server-bindings.md`
+states plainly a Codex agent gets a bound server's tools "with no extra
+headers"). Rocket.Chat's `rocketr` is an authenticated server — BUTCHR-395's
+own consumers (admin-brooswit-nexus, the 3 Candlestix directors) are
+permanent RC accounts — so a Codex agent's own tool calls to `rocketr` have
+no way to authenticate and cannot actually succeed. **A Codex agent cannot
+yet reply through an authenticated bound server's own tools.** This is
+separate from this ticket's own inbound relay (which makes its OWN
+daemon-side connection, with its own per-agent identity — see decision 3
+below — and never touches the Codex agent's own launch config at all).
+Filed as **BUTCHR-418** → BUTCHR-391 via `file_where_it_belongs`, since
+fixing it means changing how a Codex agent's OWN launch authenticates to a
+bound server (BUTCHR-411's own domain), not this ticket's inbound-only
+relay. Until BUTCHR-418 lands: inbound delivery to a Codex agent works
+(this ticket); a Codex agent replying through `rocketr`'s own tools does
+not. A Codex agent can still reply through `server:butchr`'s own tools
+(e.g. a Jira comment) exactly as before — only a bound, authenticated,
+non-butchr server's tools are affected.
 
 ## Design decision 3: DM vs channel, and duplicate avoidance
 
@@ -134,6 +153,31 @@ bindings (two different `name`s) as far as this module is concerned; RC/
 `rocketr`'s own routing (a DM to an agent's own RC user vs a broadcast to
 the shared `rocketr` channel the consumers list — admin-brooswit-nexus and
 the 3 Candlestix directors) is that server's concern, not this one's.
+
+**Per-agent identity — CORRECTED (review finding 2):** the first version of
+this module opened every (issue, binding) connection with
+`resolveMcpServerHeaders(binding)` — ONE static credential shared by every
+agent a rule binds. A channel server can only route a DM to "this agent's
+own RC user" by the identity presented ON THE CONNECTION; with a shared
+credential, every Codex agent bound by the same rule would look identical
+to the server, so a DM meant for one would reach all of them (or none).
+Fixed: `startCodexChannelRelay` now reads THIS agent's own Rocket.Chat
+connection material first (BUTCHR-412's `RC_ACCOUNT_FILE`, written to the
+agent's own workspace directory — `readRcAccountIdentity`) and connects
+with that agent's own `x-user-id`/`x-auth-token` headers (matching RC's own
+header-name convention, `src/resources/rocketchat.ts`'s client). The
+rule-level shared credential (`resolveMcpServerHeaders`) is used only when
+this agent has no personal RC identity at all — an `account: "none"` rule
+(e.g. Candlestix's MUD players), for whom a shared credential is correct
+and the only option, since there is no personal identity to route by.
+Tested (`test/unit/codex-channel-relay.test.ts`): two Codex agents bound to
+the identical binding, each with its own identity, and a message addressed
+by identity (mirroring `src/daemon/app.ts`'s own `notifyAgent`
+`sendAll(..., { where: ... })` targeting pattern) reaches only the intended
+one. Unverified beyond that: the assumption that a real `rocketr` uses
+RC's own `x-user-id`/`x-auth-token` header names and routes a DM by
+connection identity at all — `rocketr` does not exist yet to confirm
+against.
 
 **Duplicate avoidance:** every delivered message is keyed by
 `` `${source} ${meta.id ?? meta.messageId ?? content}` `` (see
@@ -149,11 +193,29 @@ expected to forward RC's own message id, but this repo has no live RC
 instance to confirm that against (this ticket's own scope explicitly
 excludes live RC access — fakes and local staging only).
 
+## Reconcile robustness (review finding 3)
+
+`createCodexChannelRelayPool.reconcile()` originally tore a relay down
+whenever `providerOf(issue)` returned anything other than exactly
+`"codex"` — including `null`, which `Herd.providerOf` returns for "can't be
+determined right now" (a herdr hiccup, a starting shell, a pane blocked on
+a dialog), NOT "confirmed not codex". Tearing a live relay down on a
+transient `null` closes its connection and discards its queue/dedup state;
+rebuilding it a poll later means anything the channel server pushed in the
+gap is lost. Fixed: `null` now only ever PRESERVES an already-running relay
+(never starts a new one on `null` — this daemon isn't sure yet it's even
+Codex — and never tears one down on it either). Only a running issue's
+OBSERVED non-codex provider, or the issue no longer running at all, tears a
+relay down. Tested: an existing relay survives repeated `null` polls and
+still delivers the next push.
+
 ## What BUTCHR-359 should replace, exactly
 
-The entire `src/notify/codex-channel-relay.ts` file, plus its one wiring
-block in `src/daemon/index.ts` (the `createCodexChannelRelayPool`
-construction, its `providerOf`/`bindingsOf`/`nudge` deps, and the
+The entire `src/notify/codex-channel-relay.ts` file (including
+`readRcAccountIdentity`/`RcAccountIdentity`, the per-agent identity helper
+added for review finding 2), plus its one wiring block in
+`src/daemon/index.ts` (the `createCodexChannelRelayPool` construction, its
+`providerOf`/`bindingsOf`/`nudge` deps, and the
 `codexChannelRelayTick`/`setInterval` poll). Nothing else in this repo reads
 from or calls into this module. Once BUTCHR-359 lands a real,
 production-correct Codex wake path (with proper reconcile-on-restart,
@@ -182,3 +244,11 @@ to be removed alongside it.
   moment a push arrives (event-driven, no polling), and `herd.nudge` itself
   is the identical, already-relied-upon transport the rest of this daemon
   uses to wake a resident agent.
+- **A Codex agent replying through `rocketr`'s own tools** — see "How it
+  answers back" above: not possible today (BUTCHR-411 strips headers from
+  every Codex bound-server connection), filed as BUTCHR-418. Do not read
+  this ticket as having closed the reply half of "Brooswit must be able to
+  talk to the agent while it runs" for Codex specifically — inbound only.
+- **A real per-agent RC identity's header names/DM-routing behaviour** — see
+  "Per-agent identity" above: assumed to match `src/resources/rocketchat.ts`'s
+  own convention, unconfirmed against a real `rocketr`.

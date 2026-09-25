@@ -15,7 +15,21 @@ bump: minor
   file's own top comment for exactly what it should replace.
 - `Herd.providerOf(issue)`: the live, pane-observed provider of a running
   agent (never a static config guess, which ordered provider fallback can
-  make stale).
+  make stale). A relay is kept, never rebuilt or torn down, while an
+  issue's provider is transiently unknown (`null` — a herdr hiccup, a
+  starting shell, a pane blocked on a dialog).
+- Each relay connects with the agent's OWN Rocket.Chat identity when it has
+  one (BUTCHR-412's per-agent `.butchr-rocketchat.json`), falling back to
+  the rule-level shared credential only for an `account: "none"` rule —
+  needed so a channel server can route a DM to one agent rather than every
+  agent sharing that rule's binding.
+
+### Known gap (filed, not fixed here)
+
+- A Codex agent still cannot reply through an authenticated bound server's
+  own tools (e.g. `rocketr`): BUTCHR-411 strips every bound-server header
+  from a Codex launch to keep credentials out of argv. Filed as BUTCHR-418.
+  Inbound delivery to Codex works; that specific reply path does not yet.
 
 ### Fixed
 

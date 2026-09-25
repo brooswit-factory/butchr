@@ -141,16 +141,48 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     const nudge: RelayNudge = async () => ({ delivered: true });
     const SECRET = "sekrit-bearer-token-xyz";
     const relay = startCodexChannelRelay("ISS-1", binding({ url: server.url, headersEnvVar: "FAKE_ROCKETR_HEADERS" }), {
-      nudge, log: (l) => lines.push(l),
+      nudge, log: (l) => lines.push(l), identityFor: () => ({ url: server.url, userId: "u1", authToken: SECRET, username: "codex-1" }),
     });
-    // resolveMcpServerHeaders reads process.env by default; this test never
-    // sets FAKE_ROCKETR_HEADERS, so no header is actually sent — the
-    // assertion is still meaningful: it proves this module's OWN log lines
-    // are built from issue/binding-name only, never from resolved headers.
     cleanups.push(relay.stop);
     await server.push("hi");
     await until(() => lines.some((l) => l.includes("delivered")));
     expect(lines.some((l) => l.includes(SECRET))).toBe(false);
+  });
+
+  test("review finding 2: per-agent identity — two Codex agents bound to the SAME binding get distinct connection identities, so a message addressed to one reaches only it", async () => {
+    const port = 41000 + Math.floor(Math.random() * 4000);
+    const { plugin, mcp } = thatch({ serverInfo: { name: "fake-rocketr", version: "0" }, tools: {} });
+    const app = new Elysia().use(plugin);
+    app.listen(listenOptions(port));
+    const url = `http://127.0.0.1:${port}/mcp`;
+    cleanups.push(async () => { await mcp.closeAll(); app.stop(); });
+
+    const callsA: string[] = [];
+    const callsB: string[] = [];
+    const nudgeA: RelayNudge = async (issue) => { callsA.push(issue); return { delivered: true }; };
+    const nudgeB: RelayNudge = async (issue) => { callsB.push(issue); return { delivered: true }; };
+    const relayA = startCodexChannelRelay("AGENT-A", binding({ url }), { nudge: nudgeA, identityFor: () => ({ url, userId: "user-a", authToken: "token-a", username: "codex-a" }) });
+    const relayB = startCodexChannelRelay("AGENT-B", binding({ url }), { nudge: nudgeB, identityFor: () => ({ url, userId: "user-b", authToken: "token-b", username: "codex-b" }) });
+    cleanups.push(relayA.stop, relayB.stop);
+
+    // Stands in for rocketr routing a DM by the connection's own identity —
+    // exactly the pattern src/daemon/app.ts's own `notifyAgent` already uses
+    // (`sendAll(..., { where: (c) => c.headers[...] === target })`).
+    const pushToUser = async (userId: string, content: string, meta: Record<string, string> = {}) => {
+      const deadline = Date.now() + 3000;
+      for (;;) {
+        const result = await mcp.sendAll({ content, meta }, { where: (c: { headers: Record<string, string> }) => c.headers["x-user-id"] === userId });
+        if (result.sent.length > 0) return result;
+        if (Date.now() > deadline) throw new Error("no matching connection ever connected");
+        await Bun.sleep(20);
+      }
+    };
+
+    await pushToUser("user-a", "DM for A", { id: "dm-1" });
+    await until(() => callsA.length === 1);
+    await Bun.sleep(150);
+    expect(callsA).toEqual(["AGENT-A"]);
+    expect(callsB).toEqual([]);
   });
 });
 
@@ -210,6 +242,50 @@ describe("createCodexChannelRelayPool (BUTCHR-413)", () => {
     await pool.reconcile();
     expect(pool.size).toBe(0);
     expect(stopped).toEqual(["ISS-1"]);
+  });
+
+  test("review finding 3: a transient 'unknown provider' (null) never tears down an existing relay — only a running issue's OBSERVED non-codex provider or a stopped issue does", async () => {
+    const stopped: string[] = [];
+    const started: string[] = [];
+    let provider: "codex" | null = "codex";
+    const pool = createCodexChannelRelayPool({
+      nudge: async () => ({ delivered: true }),
+      runningIssues: async () => ["ISS-1"],
+      bindingsOf: () => [binding()],
+      providerOf: async () => provider,
+      start: (issue) => { started.push(issue); return { stop: async () => { stopped.push(issue); } }; },
+    });
+    await pool.reconcile();
+    expect(pool.size).toBe(1);
+    expect(started).toEqual(["ISS-1"]);
+
+    provider = null; // herdr hiccup / starting shell / pane blocked on a dialog — NOT "not codex"
+    await pool.reconcile();
+    await pool.reconcile(); // several polls in a row while still unresolved
+    expect(pool.size).toBe(1);
+    expect(stopped).toEqual([]); // never torn down
+    expect(started).toEqual(["ISS-1"]); // and never rebuilt either — same handle throughout
+  });
+
+  test("review finding 3, end to end: an existing relay survives a poll where providerOf returns null and still delivers the next push", async () => {
+    const server = fakeChannelServer();
+    cleanups.push(server.stop);
+    const calls: string[] = [];
+    let provider: "codex" | null = "codex";
+    const pool = createCodexChannelRelayPool({
+      nudge: async (issue) => { calls.push(issue); return { delivered: true }; },
+      runningIssues: async () => ["ISS-1"],
+      bindingsOf: () => [binding({ url: server.url })],
+      providerOf: async () => provider,
+    });
+    cleanups.push(pool.stopAll);
+    await pool.reconcile();
+    provider = null;
+    await pool.reconcile(); // must NOT close the connection this relay already made
+
+    await server.push("still alive?", { id: "after-null" });
+    await until(() => calls.length === 1);
+    expect(calls).toEqual(["ISS-1"]);
   });
 
   test("never asks providerOf for an issue with no channel binding at all (Claude's own fleet is untouched)", async () => {
