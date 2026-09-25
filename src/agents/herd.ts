@@ -1,7 +1,8 @@
+import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events';
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
@@ -40,6 +41,7 @@ export interface StaleAgent {
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
 export interface Herd {
+  frozen?(ids: readonly string[]): Promise<ReadonlySet<string>>;
   /** Issues that currently have a butchr-managed agent running. */
   runningIssues(): Promise<string[]>;
   /**
@@ -173,6 +175,13 @@ export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
+  private readonly freezeWatches = new Map<string, ReturnType<typeof watchInstanceFreeze>>();
+  async frozen(ids: readonly string[]): Promise<ReadonlySet<string>> {
+    const frozen = new Set<string>();
+    for(const id of ids) { try { if((await instanceFreezeStore.read(`butchr:${id}`)).frozen) frozen.add(id); }
+      catch(e) { frozen.add(id); this.log?.(`Freeze state unreadable for ${id}: ${String(e)}`); } }
+    return frozen;
+  }
   private readonly lifecycles = new Map<string, ManagedHerdrLifecycle>();
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
@@ -358,7 +367,7 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -454,6 +463,8 @@ export class HerdrHerd implements Herd {
   }
 
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
+    await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
+    if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label: spec.key,
@@ -495,6 +506,7 @@ export class HerdrHerd implements Herd {
   async stop(issue: string): Promise<void> {
     await this.exclusive(issue, async () => {
       await this.lifecycle(issue).stop();
+      this.freezeWatches.get(issue)?.close();this.freezeWatches.delete(issue);
       this.refused.delete(issue);
     });
   }
@@ -656,8 +668,12 @@ export class HerdrHerd implements Herd {
     return this.exclusive(issue, async () => {
       const lifecycle = this.lifecycle(issue);
       try {
+        await instanceFreezeStore.assertRunnable(`butchr:${issue}`);
         const prompted = await lifecycle.prompt(text);
         if (!prompted || prompted.agent_status === "blocked") return { delivered: false };
+        // Codex accepts follow-ups in its native input path. Do not hold the
+        // channel relay behind Claude's delayed quota-dialog observation.
+        if (prompted.agent === "codex") return { delivered: true };
       } catch { return { delivered: false }; }
       await this.wait(NUDGE_VERIFY_MS);
       const current = await lifecycle.resolveCurrent().catch(() => undefined);

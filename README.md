@@ -66,3 +66,6 @@ bun run check    # generate + typecheck + tests + coverage ≥90%   (what CI run
 Every `src/` change needs a `changelog.d/<TICKET>.md` fragment (CI enforces it) — see `changelog.d/README.md`. The version is assigned at merge, not on a branch: do not bump `package.json` or add a dated `CHANGELOG.md` heading yourself.
 
 Predecessor (300 releases of history) preserved at [`brooswit/butchr-legacy`](https://github.com/brooswit/butchr-legacy).
+
+Free-form project resource agents are available through `jira-project` rules;
+see [project selection, interactive use, and optional MCP connections](docs/project-agents.md).
