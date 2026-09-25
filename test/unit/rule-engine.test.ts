@@ -150,6 +150,7 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
     const withLinks = issue("BUTCHR-1", {
       issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
       parent: "BUTCHR-421",
+      description: "Also see https://example.com/docs and BUTCHR-1 itself.",
     });
     const lines: string[] = [];
     // linkedEventing is absent here — the whole point of this test.
@@ -159,9 +160,51 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
       log: (l) => lines.push(l),
     });
     await type.discovery.search();
-    expect(searchCalls).toBe(1); // exactly the rule's own JQL search — the same count as before this story existed
+    expect(searchCalls).toBe(1); // exactly the rule's own JQL search — the same count as before this story existed (description rides the same SEARCH_FIELDS payload, BUTCHR-431)
     expect(lines.some((l) => l.startsWith("[linked-discovery]"))).toBe(true); // discovery+logging ran anyway — it's a cost-free pure parse, not gated on linkedEventing
     expect(lines.some((l) => l.startsWith("[notify]"))).toBe(false); // and drove no notification — this story adds no eventing
+  });
+
+  // BUTCHR-431: `description` is now fed to discovery too — every kind
+  // `descriptionItems` can produce shows up as its own `[linked-discovery]`
+  // line, the match's own key is excluded, and `maxLinkedItems` still caps
+  // (and logs skipped) across the combined issuelinks+parent+description set.
+  test("a description containing a Confluence URL, a GitHub issue URL, a GitHub PR URL, a generic URL, and a bare Jira key produces a [linked-discovery] line per kind; the resource's own key is excluded", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      description: [
+        "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
+        "Issue: https://github.com/brooswit-factory/butchr/issues/42",
+        "PR: https://github.com/brooswit-factory/butchr/pull/395",
+        "Docs: https://example.com/some/docs",
+        "Also see BUTCHR-9 and, for context, this very ticket BUTCHR-1.",
+      ].join(" "),
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-issue target=brooswit-factory/butchr#42 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-pr target=brooswit-factory/butchr#395 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=webpage target=https://example.com/some/docs skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=false");
+    expect(linked.some((l) => l.includes("target=BUTCHR-1 "))).toBe(false); // own key excluded, never reported as a link to itself
+    expect(linked).toHaveLength(5);
+  });
+
+  test("maxLinkedItems still caps and logs skipped across the combined issuelinks+parent+description set", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+      description: "See BUTCHR-9 too.",
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q", maxLinkedItems: 2 }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=parent target=BUTCHR-421 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=true");
   });
 });
 

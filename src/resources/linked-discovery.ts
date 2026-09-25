@@ -21,17 +21,21 @@
  *   `linkedGithubIssues`, which already narrows the same endpoint's result
  *   to GitHub-issue-shaped links for jira-idea's own related-discovery) —
  *   this module adds NO new fetch to obtain it.
- * - An issue's description is likewise NOT part of `search()`'s fields —
- *   only the single-issue detail fetch (`AtlassianClient#issue`) carries it,
- *   and that fetch runs only on-demand (e.g. `jira-idea.ts`'s `get`), never
- *   during a routine poll. `descriptionItems` below is a pure parser over a
- *   PLAIN-TEXT string (Jira's ADF is already flattened by `adfToText` before
- *   it reaches any caller of `AtlassianClient#issue` — see that method — so
- *   nothing here needs to understand ADF itself), ready for a caller that
- *   already has description text in hand.
+ * - BUTCHR-431: an issue's description IS now part of `search()`'s fields
+ *   too — `SEARCH_FIELDS` (src/atlassian/client.ts) carries "description",
+ *   flattened to plain text by `mapIssue` via `adfToText` before it ever
+ *   reaches `JiraIssue.description`, so `descriptionItems` below is a pure
+ *   parser over a PLAIN-TEXT string and needs no ADF understanding of its
+ *   own. `logLinkedDiscovery` (src/rules/resource-type.ts) passes it to
+ *   `discoverLinkedItems` on every poll — same zero-new-API-calls reasoning
+ *   as `issuelinks`/`parent` above, since the field rides the same search
+ *   call. (Jira remote links remain the one source above that is NOT part of
+ *   a routine poll's data — still a separate per-issue endpoint, still
+ *   deferred to the story gated on `linkedEventing`.)
  *
- * See this ticket's PR/doc for exactly where each of these is wired at
- * runtime today, and where it is exposed-but-unwired pending a future story.
+ * See this ticket's PR/doc, and BUTCHR-431's own doc, for exactly where each
+ * of these is wired at runtime today, and where it is exposed-but-unwired
+ * pending a future story.
  */
 import type { IssueLink, JiraRemoteLink } from "../atlassian/types.js";
 import { isIssueKey } from "./id.js";
@@ -149,6 +153,19 @@ export interface LinkedDiscoverySource {
   parent?: string | null | undefined;
   remoteLinks?: readonly JiraRemoteLink[] | undefined;
   description?: string | undefined;
+  /**
+   * BUTCHR-431: this resource's OWN Jira key, when the caller has it —
+   * excluded from the returned set so a resource whose description mentions
+   * its own key (e.g. BUTCHR-426 inside BUTCHR-426's own description, or a
+   * Jira browse URL pointing at itself) is never reported as linking to
+   * itself. In practice only a description-derived match can equal it (an
+   * `issuelink`/`parent` naming the issue itself would be a Jira data
+   * error, not a discovery bug), but the filter runs over the whole
+   * combined set — one check, not one per source. Omit to skip the filter
+   * entirely (e.g. a caller with no key in hand, or a pure-parser test that
+   * doesn't care).
+   */
+  ownKey?: string | undefined;
 }
 
 /**
@@ -159,15 +176,17 @@ export interface LinkedDiscoverySource {
  * kinds are kept over later (free-text-derived) ones. De-dup is by `target`
  * alone, first occurrence wins: the SAME Jira key reached via an `issuelink`
  * AND a bare mention in the description collapses to one `issuelink` entry,
- * never two.
+ * never two. `source.ownKey`, when given, is then excluded from the result —
+ * see that field's own doc comment.
  */
 export function discoverLinkedItems(source: LinkedDiscoverySource): LinkedItem[] {
-  return dedupeByTarget([
+  const items = dedupeByTarget([
     ...issuelinkItems(source.issuelinks ?? []),
     ...parentItems(source.parent ?? null),
     ...remoteLinkItems(source.remoteLinks ?? []),
     ...descriptionItems(source.description ?? ""),
   ]);
+  return source.ownKey ? items.filter((i) => i.target !== source.ownKey) : items;
 }
 
 /** `items`, de-duplicated by `target` alone — first occurrence (and its `kind`) wins. */

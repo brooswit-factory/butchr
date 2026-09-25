@@ -501,19 +501,22 @@ export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIs
 }
 
 /**
- * BUTCHR-429: logs each match's discovered link set (`[linked-discovery]`,
- * src/jira-watch/linked-discovery-log.ts), gated on change per resource via
- * `tracker` so an unchanged set logs nothing after its first poll. Runs for
- * EVERY match regardless of `rule.linkedEventing` — discovery is a
- * cost-free pure parse of data `searchRules` already fetched (`issuelinks`/
- * `parent` are part of `SEARCH_FIELDS`, src/atlassian/client.ts), so there
- * is no cost this story needs a knob to gate. Only `issuelinks` and `parent`
- * are passed to `discoverLinkedItems` here — remote links and description
- * text are NOT part of what `searchRules` fetches (see
- * src/resources/linked-discovery.ts's own top comment), so nothing here
- * adds a second Jira call to obtain them; both parsers still exist for a
- * caller that already has that data. `rule.maxLinkedItems` (absent =
- * uncapped) bounds what gets logged as kept vs. skipped per match.
+ * BUTCHR-429/BUTCHR-431: logs each match's discovered link set
+ * (`[linked-discovery]`, src/jira-watch/linked-discovery-log.ts), gated on
+ * change per resource via `tracker` so an unchanged set logs nothing after
+ * its first poll. Runs for EVERY match regardless of `rule.linkedEventing` —
+ * discovery is a cost-free pure parse of data `searchRules` already fetched
+ * (`issuelinks`, `parent`, and — as of BUTCHR-431 — `description` are all
+ * part of `SEARCH_FIELDS`, src/atlassian/client.ts), so there is no cost
+ * this story needs a knob to gate. `issuelinks`, `parent`, and `description`
+ * are passed to `discoverLinkedItems` here, plus the match's own key as
+ * `ownKey` so a description that mentions its OWN issue is never reported
+ * as a link to itself (see `LinkedDiscoverySource.ownKey`'s own doc
+ * comment). Remote links are NOT part of what `searchRules` fetches (see
+ * src/resources/linked-discovery.ts's own top comment) — that parser still
+ * exists for a caller that already has that data, but wiring it here would
+ * add a second Jira call this story doesn't make. `rule.maxLinkedItems`
+ * (absent = uncapped) bounds what gets logged as kept vs. skipped per match.
  */
 export function logLinkedDiscovery(
   matches: readonly RuleMatch[],
@@ -521,7 +524,12 @@ export function logLinkedDiscovery(
   log: ((line: string) => void) | undefined,
 ): void {
   for (const m of matches) {
-    const items = discoverLinkedItems({ issuelinks: m.issue.issuelinks, parent: m.issue.parent });
+    const items = discoverLinkedItems({
+      issuelinks: m.issue.issuelinks,
+      parent: m.issue.parent,
+      description: m.issue.description,
+      ownKey: m.issue.key,
+    });
     const { kept, skipped } = capLinkedItems(items, m.rule.maxLinkedItems);
     if (!tracker.changed(m.agentKey, kept, skipped)) continue;
     for (const line of formatLinkedDiscoveryLines(m.agentKey, kept, skipped)) log?.(line);
