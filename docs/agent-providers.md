@@ -123,7 +123,12 @@ same brief/environment, and a launch-scoped TOML `--config` override for
 `mcp_servers.butchr` plus one more `--config mcp_servers.<name>=...` per
 bound server (any `channel` value — Codex has no development-channel
 concept, so a binding only ever reaches it as an MCP tool server, never a
-push; see docs/mcp-server-bindings.md). It supplies the endpoint, `x-issue`,
+push; see docs/mcp-server-bindings.md). **This remains true of Codex's own
+connection** — but a Codex agent bound to a `channel: true` server is not
+left with nothing: the daemon itself holds that server's notification
+stream open on the agent's behalf and relays each push as a `herd.nudge`
+prompt (BUTCHR-413, a deliberate stopgap for BUTCHR-359 to subsume — see
+docs/codex-channel-relay.md). It supplies the endpoint, `x-issue`,
 and `x-butchr-provider=codex` headers. No global Codex config or authentication
 files are modified; project config trust is not needed to load this override.
 The factory-created workspace is explicitly trusted in launch arguments so
