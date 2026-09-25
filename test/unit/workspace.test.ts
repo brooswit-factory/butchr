@@ -3,7 +3,8 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
@@ -504,6 +505,241 @@ describe("buildWorkspace", () => {
       expect(claudeMd).toContain(hostname());
       expect(claudeMd).toContain("journalctl");
       expect(claudeMd).not.toContain("{{GROUND_TRUTH}}");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("PR #394 review fix 2: spec.cwd does NOT redirect buildWorkspace — bookkeeping files always land in workspaceDirFor(spec.key), never in an operator's own working directory", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-root-"));
+    const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
+      const dir = buildWorkspace(spec, "http://x/mcp");
+      expect(dir).toBe(workspaceDirFor(key, root));
+      expect(dir).not.toBe(real);
+      expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
+      expect(existsSync(join(dir, "brief.md"))).toBe(true);
+      expect(existsSync(join(dir, "mcp.json"))).toBe(true);
+      // The operator's own working directory is untouched — nothing was ever written there.
+      expect(existsSync(join(real, "CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(real, "brief.md"))).toBe(false);
+      expect(existsSync(join(real, "mcp.json"))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("PR #394 review fix (round 3): agentLaunchConfig keeps the launched PROCESS at the bookkeeping dir even when spec.cwd is set — see SpawnSpec.cwd's own doc comment (Drovr's launch.cwd===workspace.cwd invariant) — while mcp config stays anchored there too, for both vendors", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: "/repo/some-project" };
+    const bookkeepingDir = "/butchr-workspaces/filesystem/managed-sessions/%2Fetc%2Fdefs%2Fa.json";
+    const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
+    expect(claudeLaunch.cwd).toBe(bookkeepingDir);
+    expect(claudeLaunch.cwd).not.toBe("/repo/some-project");
+    expect((claudeLaunch as { mcpConfigPath: string }).mcpConfigPath).toBe(`${bookkeepingDir}/mcp.json`);
+    const codexLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "codex" });
+    expect(codexLaunch.cwd).toBe(bookkeepingDir);
+    // No spec.cwd: byte-for-byte unchanged behaviour for every other spec.
+    const noOverride: SpawnSpec = { key: "AGY-1", issuetype: "Task", summary: "s", parent: null };
+    expect(agentLaunchConfig(noOverride, "/some/dir", "pane-1", "name", { provider: "claude" }).cwd).toBe("/some/dir");
+  });
+
+  test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors (round 3: the guarantee holds trivially now — butchr's process never even launches there)", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-root2-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    const real = mkdtempSync(join(tmpdir(), "bw-real-project-"));
+    const ownClaudeMd = "# This project's own instructions — do not touch.\n";
+    const ownAgentsMd = "# This project's own AGENTS.md — do not touch.\n";
+    const ownMcpJson = JSON.stringify({ mcpServers: { "some-other-server": { type: "http", url: "https://example.test" } } });
+    writeFileSync(join(real, "CLAUDE.md"), ownClaudeMd);
+    writeFileSync(join(real, "AGENTS.md"), ownAgentsMd);
+    writeFileSync(join(real, "mcp.json"), ownMcpJson);
+    try {
+      for (const provider of ["claude", "codex"] as const) {
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: `/etc/defs/${provider}.json` });
+        const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
+        const dir = buildWorkspace(spec, "http://x/mcp", provider);
+        const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
+        expect(launch.cwd).toBe(dir); // the process launches at the bookkeeping dir, not `real`
+        expect(launch.cwd).not.toBe(real);
+        expect(launch.prompt).toBe(""); // agentLaunchConfig itself never sets the kickoff — kickoffFor does, dispatched separately (herd.ts)
+        // Byte-identical: the operator's own files were never opened for writing.
+        expect(readFileSync(join(real, "CLAUDE.md"), "utf8")).toBe(ownClaudeMd);
+        expect(readFileSync(join(real, "AGENTS.md"), "utf8")).toBe(ownAgentsMd);
+        expect(readFileSync(join(real, "mcp.json"), "utf8")).toBe(ownMcpJson);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("BUTCHR-408 (McpServerBinding ported from S4): a bound server lands in mcp.json alongside butchr's own; headersEnvVar is resolved from THIS daemon's env, never persisted anywhere else", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-mcp-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    const envBefore = process.env.MUD_BRIDGE_HEADERS;
+    process.env.MUD_BRIDGE_HEADERS = JSON.stringify({ Authorization: "Bearer secret-token" });
+    try {
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", headersEnvVar: "MUD_BRIDGE_HEADERS", channel: true }];
+      const spec: SpawnSpec = { key: "KAN-9", issuetype: "Story", summary: "s", parent: "KAN-1", mcpServers };
+      const dir = buildWorkspace(spec, "http://x/mcp");
+      const mcpJsonPath = join(dir, "mcp.json");
+      const mcp = JSON.parse(readFileSync(mcpJsonPath, "utf8"));
+      expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
+      expect(mcp.mcpServers["mud-bridge"]).toEqual({ type: "http", url: "https://mud.internal/mcp", headers: { Authorization: "Bearer secret-token" } });
+      // A resolved secret header value makes mcp.json 0600.
+      const mode = require("node:fs").statSync(mcpJsonPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+      // The persisted, staleness-check-only sidecar carries the binding's metadata (name/url/channel/headersEnvVar NAME) — never a resolved header value.
+      const persisted = readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8");
+      expect(persisted).not.toContain("secret-token");
+      expect(JSON.parse(persisted)).toEqual(mcpServers);
+      expect(workspaceMcpServers(dir)).toEqual(mcpServers);
+    } finally {
+      if (envBefore === undefined) delete process.env.MUD_BRIDGE_HEADERS; else process.env.MUD_BRIDGE_HEADERS = envBefore;
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("mcp.json keeps its default permissions when no binding resolves a secret header", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-mcp-nosecret-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null, mcpServers }, "http://x/mcp");
+      const mode = require("node:fs").statSync(join(dir, "mcp.json")).mode & 0o777;
+      expect(mode).not.toBe(0o600);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceMcpServers is undefined for a workspace with no bound servers, never throws", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-mcp-none-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
+      expect(workspaceMcpServers(dir)).toBeUndefined();
+      expect(workspaceMcpServers("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveMcpServerHeaders: missing/malformed headersEnvVar resolves to undefined and logs the binding+var name, never a value", () => {
+    const logs: string[] = [];
+    const binding = { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", headersEnvVar: "MUD_BRIDGE_HEADERS", channel: true };
+    const noEnvVar = { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true };
+    expect(resolveMcpServerHeaders(binding, {}, (l) => logs.push(l))).toBeUndefined();
+    expect(resolveMcpServerHeaders(noEnvVar, { MUD_BRIDGE_HEADERS: "{}" })).toBeUndefined();
+    expect(resolveMcpServerHeaders(binding, { MUD_BRIDGE_HEADERS: "not json" }, (l) => logs.push(l))).toBeUndefined();
+    expect(resolveMcpServerHeaders(binding, { MUD_BRIDGE_HEADERS: JSON.stringify({ a: 1 }) }, (l) => logs.push(l))).toBeUndefined();
+    expect(resolveMcpServerHeaders(binding, { MUD_BRIDGE_HEADERS: JSON.stringify({ Authorization: "Bearer x" }) })).toEqual({ Authorization: "Bearer x" });
+    expect(logs.length).toBeGreaterThan(0);
+    for (const l of logs) { expect(l).toContain("mud-bridge"); expect(l).toContain("MUD_BRIDGE_HEADERS"); }
+  });
+
+  test("BUTCHR-408 / Nexus MCP isolation constraint, direction 1: a managed-session agent's launched cwd never becomes the operator's own workingDirectory, and butchr never reads/writes/touches a .mcp.json there — a pre-existing one stays byte-identical (does NOT by itself prove Claude Code can't discover it; see 'PR #394 review round 2' below for the direction that guarantees the property regardless of Claude Code's own undocumented discovery behaviour)", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-nexus-"));
+    const real = mkdtempSync(join(tmpdir(), "bw-nexus-real-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    // Simulate a Bakr agent's real project directory carrying its OWN project-level
+    // .mcp.json (the Claude Code auto-discovery convention — a DIFFERENT file/mechanism
+    // than butchr's own explicit --mcp-config "mcp.json", no leading dot).
+    const evilDotMcpJson = JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } });
+    writeFileSync(join(real, ".mcp.json"), evilDotMcpJson);
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
+      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
+      const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider: "claude" });
+      // The launched process's OWN cwd is the bookkeeping dir, never `real` —
+      // whatever Claude Code's own discovery does, it does it starting from
+      // THIS directory, not from workingDirectory.
+      expect(launch.cwd).toBe(dir);
+      expect(launch.cwd).not.toBe(real);
+      expect((launch as { mcpConfigPath: string }).mcpConfigPath).toBe(join(dir, "mcp.json"));
+      // butchr never reads, writes, or otherwise touches a .mcp.json anywhere —
+      // the operator's own file is byte-identical, and butchr's own config is a
+      // differently-named file (no leading dot) in a different directory entirely.
+      expect(readFileSync(join(real, ".mcp.json"), "utf8")).toBe(evilDotMcpJson);
+      expect(existsSync(join(dir, ".mcp.json"))).toBe(false);
+      const ownMcpJson = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+      expect(Object.keys(ownMcpJson.mcpServers)).toEqual(["butchr"]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("PR #394 review round 2, direction 2 — the guarantee: a .mcp.json in ANY ancestor of the launched cwd (workspaceDirFor(spec.key)), not just workingDirectory, refuses the spawn outright rather than asserting Claude Code won't discover it — a managed-session agent's launched cwd is always workspaceDirFor(spec.key), which Claude's --mcp-config is additive to, not exclusive of (no --strict-mcp-config anywhere in this codebase or @brooswit/drovr)", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-nexus-ancestor-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    // A .mcp.json two levels above workspaceRoot() itself — well outside anything
+    // butchr writes to, simulating an operator's own dotfile sitting somewhere
+    // up the tree (e.g. $HOME, or a parent of BUTCHR_WORKSPACES).
+    const ancestorMcpJson = join(root, ".mcp.json");
+    writeFileSync(ancestorMcpJson, JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } }));
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: "/repo/some-project" };
+      expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(/would inherit/);
+      expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(ancestorMcpJson);
+      // Nothing was written before the guard fired — refuse-before-write, not partial-then-fail.
+      expect(existsSync(workspaceDirFor(key))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("assertNoInheritedMcpConfig: no ancestor .mcp.json anywhere -> no throw, even walking all the way to the filesystem root", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-nexus-clean-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      expect(() => assertNoInheritedMcpConfig(join(root, "filesystem", "managed-sessions", "a"))).not.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a spec WITHOUT cwd (every non-managed-session provider) is never guarded — byte-for-byte unchanged behaviour, even with a .mcp.json sitting in an ancestor", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-nexus-unguarded-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    writeFileSync(join(root, ".mcp.json"), "{}");
+    try {
+      const spec: SpawnSpec = { key: "KAN-9", issuetype: "Story", summary: "s", parent: null };
+      expect(() => buildWorkspace(spec, "http://x/mcp")).not.toThrow();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

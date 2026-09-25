@@ -144,6 +144,27 @@ describe("HerdrHerd", () => {
     await new HerdrHerd(f2.client, "u", instant).spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(f2.started.length).toBe(0);
   });
+
+  test("PR #394 review fix (round 3): a managed-session spec (cwd set) spawns cleanly end-to-end through the REAL spawn path (HerdrHerd + Drovr's ManagedHerdrLifecycle, not a stub) — kickoff names both the working directory AND the brief, and the launched process itself stays at the ordinary bookkeeping workspace", async () => {
+    // Round 2 shipped a version where agentLaunchConfig's own `cwd` was `spec.cwd` directly. That
+    // broke Drovr's ManagedHerdrLifecycle invariant (its `cwd` is FIXED to workspaceDirFor(issue) —
+    // see herd.ts's own `lifecycle()` — and it throws "Launch does not match selected provider and
+    // workspace" the moment the prepared launch's cwd differs) — caught here, through the real spawn
+    // path, not by the narrower buildWorkspace/agentLaunchConfig-only tests the PR review itself ran.
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    await herd.spawn({
+      key, issuetype: "managed-session", summary: "s", parent: null,
+      brief: "Keep this repo's docs and dependency versions current.",
+      cwd: "/repo/some-project",
+      agents: [{ harness: "claude", model: "sonnet" }],
+    });
+    expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
+    expect(f.started[0].args[0]).toContain("/repo/some-project");
+    expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
+    expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
+  });
   test("paneFor resolves the current pane, or null when not running", async () => {
     const f = fakeHerdr([{ name: "butchr-kan-5", pane_id: "w1:p5" }]);
     const herd = new HerdrHerd(f.client, "u");
@@ -727,6 +748,56 @@ describe("staleIssues", () => {
     const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("BUTCHR-408: a managed-session agent's real bound channel server (persisted at build time, workspaceMcpServers) is honoured, not flagged stale for lacking a flag it never should have had in the first place", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Built via the SAME spawnArgs a real spawn (and staleIssues' own
+      // "expected" reconstruction) uses, so the channel-flag joining format
+      // is guaranteed consistent rather than hand-guessed here.
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", mcpServers }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("BUTCHR-408: a running agent missing its definition's bound channel flag IS flagged stale — proves workspaceMcpServers is actually consulted, not just harmlessly absent", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-drift-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Missing the server:mud-bridge channel flag the definition now calls for.
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("server:mud-bridge");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("no cwd reported for the agent -> unknown, not stale (never even calls pane.process_info)", async () => {
