@@ -34,7 +34,7 @@ export class AtlassianHttpError extends Error {
   }
 }
 
-const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks,project";
+const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks,project,description";
 
 /**
  * A thin Jira Cloud REST client using classic-token Basic auth. `fetch` is
@@ -158,7 +158,10 @@ export class AtlassianClient {
    * so callers that act on a specific key must compare `key` themselves.
    */
   async issue(issueKey: string): Promise<JiraIssueDetail> {
-    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${SEARCH_FIELDS},description`);
+    // BUTCHR-431: `SEARCH_FIELDS` already carries "description" (added so
+    // `search()`/`searchAll()` can feed it to link discovery) — no need to
+    // append it a second time here.
+    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${SEARCH_FIELDS}`);
     if (!body || typeof body.key !== "string") throw new Error(`Jira issue read for ${issueKey} returned an unexpected body`);
     return { ...mapIssue(body), description: adfToText(body.fields?.description) };
   }
@@ -281,5 +284,12 @@ function mapIssue(i: any): JiraIssue {
     // when absent from the response, never a fabricated `[]` standing in
     // for "I checked and there are none" (see JiraIssue's own doc comment).
     ...(f.issuelinks !== undefined ? { issuelinks: parseIssueLinks(f.issuelinks) } : {}),
+    // BUTCHR-431: same discipline — only set when the response carried a
+    // "description" field at all (search()/searchAll() always ask for it
+    // now; a raw fixture that predates this field simply omits it). Jira
+    // returns ADF or an explicit `null` for an empty description; `adfToText`
+    // tolerates both (and any other odd shape) without throwing, so a null
+    // description maps to `""`, never a crash.
+    ...(f.description !== undefined ? { description: adfToText(f.description) } : {}),
   };
 }

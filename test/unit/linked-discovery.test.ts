@@ -131,6 +131,23 @@ describe("discoverLinkedItems: combined, de-duplicated set", () => {
   test("every field is independently optional; an empty source is an empty set", () => {
     expect(discoverLinkedItems({})).toEqual([]);
   });
+
+  // BUTCHR-431: a description mentioning the resource's OWN key must not be
+  // reported as a link to itself.
+  describe("ownKey: excluding a self-reference", () => {
+    test("a bare mention of the resource's own key in its own description is excluded", () => {
+      expect(discoverLinkedItems({ description: "See BUTCHR-426 for context.", ownKey: "BUTCHR-426" })).toEqual([]);
+    });
+    test("a Jira browse URL pointing at the resource's own key is excluded too", () => {
+      expect(discoverLinkedItems({ description: "https://wroosbit.atlassian.net/browse/BUTCHR-426", ownKey: "BUTCHR-426" })).toEqual([]);
+    });
+    test("other keys/links in the same description are unaffected", () => {
+      expect(discoverLinkedItems({ description: "BUTCHR-426 relates to BUTCHR-1.", ownKey: "BUTCHR-426" })).toEqual([{ kind: "jira-key", target: "BUTCHR-1" }]);
+    });
+    test("omitting ownKey applies no filter at all — the resource's own key (if mentioned) passes through", () => {
+      expect(discoverLinkedItems({ description: "See BUTCHR-426 for context." })).toEqual([{ kind: "jira-key", target: "BUTCHR-426" }]);
+    });
+  });
 });
 
 describe("capLinkedItems: maxLinkedItems", () => {
