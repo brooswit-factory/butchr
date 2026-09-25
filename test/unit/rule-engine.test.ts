@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { IssueLink, JiraIssue } from "../../src/atlassian/types.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
-import { spawnArgs, agentLaunchConfig } from "../../src/agents/argv.js";
+import { spawnArgs, agentLaunchConfig, checkArgv } from "../../src/agents/argv.js";
 import { agentIdOfWorkspacePath, briefFor, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { panesFor, groupOwnedPanes } from "../../src/agents/residency-census.js";
 import { strandedCandidates } from "../../src/agents/reap.js";
@@ -607,5 +607,54 @@ describe("rule workspaces", () => {
     expect([...groupOwnedPanes(panes, root).keys()].sort()).toEqual(["BUTCHR-12", "jira-work:task:BUTCHR-12"]);
     const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-12" }] as never[];
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
+  });
+});
+
+// BUTCHR-411 / CNDLX-45: the ticket's own concrete case — the Candlestix MUD
+// players' shared `mud-mcp` HTTP bridge, account policy `none` (no
+// Rocket.Chat account is provisioned for them; that's a sibling task, S4, on
+// a parallel branch). Event-driven Claude delivery from that non-RC MCP
+// server must be preserved end to end: the rule's own binding, through
+// specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's channel
+// flag.
+describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind a non-Rocket.Chat MCP channel server", () => {
+  const mudBinding = { name: "mud-mcp", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("the binding path never reads Rule.account — account: none still gets full channel delivery", () => {
+    const [rule] = rules({ id: "mud", query: "project = CNDLX", account: "none", mcpServers: [mudBinding] });
+    expect(rule!.account).toBe("none"); // the sibling RC-lifecycle task's own field — set, but untouched below
+    const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
+    // SpawnSpec has no `account` field at all: agentLaunchConfig's channel wiring
+    // (argv.ts) has no way to consult account policy even if it wanted to —
+    // structural independence, not just an untested code path.
+    expect(spec).not.toHaveProperty("account");
+    expect(spec.mcpServers).toEqual([mudBinding]);
+    const launch = agentLaunchConfig(spec, "/d", "p", "n", { provider: "claude" });
+    expect(launch.provider === "claude" && launch.developmentChannels).toEqual(["server:butchr", "server:mud-mcp"]);
+  });
+
+  test("end to end: mcp.json carries the bound server, launch argv carries both channels, and a running agent launched without the binding reads as stale against this rule's current spec", () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-mud-ws-"));
+    const previous = process.env.BUTCHR_WORKSPACES;
+    process.env.BUTCHR_WORKSPACES = dir;
+    try {
+      const [rule] = rules({ id: "mud", query: "project = CNDLX", mcpServers: [mudBinding] });
+      const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
+      const cwd = buildWorkspace(spec, "http://localhost:7717/mcp", "claude");
+      const mcp = JSON.parse(readFileSync(join(cwd, "mcp.json"), "utf8"));
+      expect(Object.keys(mcp.mcpServers).sort()).toEqual(["butchr", "mud-mcp"]);
+      const args = spawnArgs(spec, cwd);
+      expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+      expect(args).toContain("--dangerously-load-development-channels=server:mud-mcp");
+      // A resident spawned before this rule bound mud-mcp — the deploy-day shape.
+      const withoutBinding = spawnArgs({ ...spec, mcpServers: [] }, cwd);
+      const check = checkArgv(args, withoutBinding);
+      expect(check.ok).toBe(false);
+      if (!check.ok) expect(check.reason).toContain("--dangerously-load-development-channels server:mud-mcp");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
