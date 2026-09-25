@@ -178,7 +178,10 @@ export async function addComment(clients: CommentClients, ref: CapabilityRef, bo
       // addInternalNote's own id can be null (its audit didn't carry one, see
       // ./zendesk-ticket.ts and its test's "silent audit" case) — CommentRef.id
       // is a plain string, so a null id here is a rejection, not a faked value.
-      if (result.id === null) throw new Error(`zendesk-ticket addInternalNote for ${formatZendeskTicketRef({ subdomain, id })} did not return a comment id`);
+      // The note has ALREADY BEEN POSTED at this point (addInternalNote's write
+      // happened; only its id came back unconfirmed) — the message says so
+      // explicitly so a caller that retries on rejection doesn't post a duplicate.
+      if (result.id === null) throw new Error(`zendesk-ticket addInternalNote for ${formatZendeskTicketRef({ subdomain, id })} WAS posted, but its id could not be confirmed (Zendesk's audit didn't carry one) — do not retry, it would duplicate the note`);
       return { id: result.id };
     }
     default:

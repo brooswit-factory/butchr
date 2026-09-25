@@ -181,9 +181,10 @@ describe("readComments/addComment: zendesk-ticket reuses ZendeskTicketClient.com
     expect(calls).toEqual([{ method: "addInternalNote", args: [{ subdomain: "acme", id: 42 }, "looked into it"] }]);
   });
 
-  test("a null note id (addInternalNote's audit didn't carry one) is a rejection, never a faked CommentRef", async () => {
+  test("a null note id (addInternalNote's audit didn't carry one) is a rejection, never a faked CommentRef — and says the note WAS already posted, so a caller must not retry", async () => {
     const { client } = fakeZendeskClient([], { id: null, confirmedPrivate: false, updated: "2026-09-25T00:00:00.000Z" });
-    await expect(addComment({ "zendesk-ticket": client }, ZENDESK_REF, "x")).rejects.toThrow("did not return a comment id");
+    await expect(addComment({ "zendesk-ticket": client }, ZENDESK_REF, "x")).rejects.toThrow("WAS posted, but its id could not be confirmed");
+    await expect(addComment({ "zendesk-ticket": client }, ZENDESK_REF, "x")).rejects.toThrow("do not retry");
   });
 
   test("a client rejection (e.g. Zendesk recording the note as public) propagates", async () => {
@@ -204,9 +205,11 @@ describe("a capability declared supported but given no matching client in the ba
 describe("readComments/addComment: every unsupported provider fails with the typed UnsupportedCapabilityError, never touching a client", () => {
   for (const ref of UNSUPPORTED_REFS) {
     test(`${ref.provider}: readComments/addComment refuse before any client call`, async () => {
-      const clients: CommentClients = { "jira-work-item": fakeJiraClient([{ id: "1", body: "x", created: "c", authorEmail: null }]).client };
+      const { client, calls } = fakeJiraClient([{ id: "1", body: "x", created: "c", authorEmail: null }]);
+      const clients: CommentClients = { "jira-work-item": client };
       await expect(readComments(clients, ref)).rejects.toBeInstanceOf(UnsupportedCapabilityError);
       await expect(addComment(clients, ref, "x")).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+      expect(calls).toEqual([]);
     });
 
     test(`${ref.provider}: the thrown error carries the provider and "comments", not a generic message`, async () => {
