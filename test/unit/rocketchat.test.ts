@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createRocketChatClient,
+  isRcUserNotFoundError,
   loadRocketChatAuth,
   RocketChatApiError,
   RocketChatHttpError,
@@ -103,8 +104,14 @@ describe("Rocket.Chat client", () => {
     const { client: apiMiss } = fakeRc(() => json({ success: false, error: "User not found." }, 400));
     expect(await apiMiss.getUserByUsername("ghost")).toBeNull();
 
+    // A bare 400/404 with no RC error string is ambiguous (could be a malformed
+    // request) — this client only treats RC's own not-found TEXT as a miss,
+    // never a bare status code (review finding, BUTCHR-410).
     const { client: plain400 } = fakeRc(() => json({}, 400));
-    expect(await plain400.getUserByUsername("ghost")).toBeNull();
+    await expect(plain400.getUserByUsername("ghost")).rejects.toBeInstanceOf(RocketChatHttpError);
+
+    const { client: otherApiError } = fakeRc(() => json({ success: false, error: "Invalid username" }, 400));
+    await expect(otherApiError.getUserByUsername("bad name")).rejects.toBeInstanceOf(RocketChatApiError);
 
     const { client: serverDown } = fakeRc(() => json({}, 500));
     await expect(serverDown.getUserByUsername("x")).rejects.toBeInstanceOf(RocketChatHttpError);
@@ -177,6 +184,13 @@ describe("Rocket.Chat client", () => {
 
     const { client: otherApiError } = fakeRc(() => json({ success: false, error: "not authorized" }, 403));
     await expect(otherApiError.revokeManagedToken("u1")).rejects.toBeInstanceOf(RocketChatApiError);
+  });
+
+  test("isRcUserNotFoundError matches only RC's own not-found error text, never a bare status or an unrelated API error", () => {
+    expect(isRcUserNotFoundError(new RocketChatApiError("x", "User not found."))).toBe(true);
+    expect(isRcUserNotFoundError(new RocketChatApiError("x", "Invalid username"))).toBe(false);
+    expect(isRcUserNotFoundError(new RocketChatHttpError(404, "x"))).toBe(false);
+    expect(isRcUserNotFoundError(new Error("user not found"))).toBe(false);
   });
 
   test("no error message from this client ever contains the admin token", async () => {

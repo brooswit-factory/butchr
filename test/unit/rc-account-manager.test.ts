@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isManagedUsername, rcUsernameFor, RC_MANAGED_PREFIX, RC_USERNAME_MAX } from "../../src/accounts/identity.js";
@@ -10,7 +10,7 @@ import {
   type AccountStore,
   type AccountManagerDeps,
 } from "../../src/accounts/manager.js";
-import { RocketChatHttpError, type RocketChatClient, type RocketChatUser } from "../../src/resources/rocketchat.js";
+import { RocketChatApiError, RocketChatHttpError, type RocketChatClient, type RocketChatUser } from "../../src/resources/rocketchat.js";
 
 const AGENT = "jira-work:triage:BUTCHR-1";
 const AGENT2 = "jira-work:triage:BUTCHR-2";
@@ -47,13 +47,27 @@ function fakeRcClient(seed: RocketChatUser[] = []) {
     },
     async deleteUser(userId) {
       calls.push({ method: "deleteUser", args: [userId] });
-      const u = byId.get(userId);
-      if (u) { byUsername.delete(u.username); byId.delete(userId); }
+      if (!byId.has(userId)) throw new RocketChatApiError("user delete", "User not found.");
+      const u = byId.get(userId)!;
+      byUsername.delete(u.username);
+      byId.delete(userId);
     },
-    async generateManagedToken(userId) { calls.push({ method: "generateManagedToken", args: [userId] }); return `tok-${userId}`; },
-    async revokeManagedToken(userId) { calls.push({ method: "revokeManagedToken", args: [userId] }); },
+    async generateManagedToken(userId) {
+      calls.push({ method: "generateManagedToken", args: [userId] });
+      if (!byId.has(userId)) throw new RocketChatApiError("token generate", "User not found.");
+      return `tok-${userId}`;
+    },
+    async revokeManagedToken(userId) {
+      calls.push({ method: "revokeManagedToken", args: [userId] });
+      if (!byId.has(userId)) throw new RocketChatApiError("token revoke", "User not found.");
+    },
   };
-  return { client, calls, byUsername, setCountOverride: (n: number) => { countOverride = n; } };
+  return {
+    client, calls, byUsername,
+    setCountOverride: (n: number) => { countOverride = n; },
+    /** Simulates the RC user vanishing out-of-band (deleted by another admin, or a previous release that got interrupted) — bypasses `deleteUser` so it never appears in `calls`. */
+    removeUserExternally: (id: string) => { const u = byId.get(id); if (u) { byUsername.delete(u.username); byId.delete(id); } },
+  };
 }
 
 const baseDeps = (over: Partial<AccountManagerDeps> = {}): AccountManagerDeps => ({
@@ -174,6 +188,42 @@ describe("ensureAccount", () => {
     expect(await store.get(AGENT)).toMatchObject({ rcUserId: "recovered-1", username });
   });
 
+  test("a STALE persisted record (RC user deleted out-of-band) is dropped and re-resolved instead of failing forever", async () => {
+    const { client, calls, removeUserExternally } = fakeRcClient();
+    const store = fakeStore();
+    const manager = createAccountManager(baseDeps({ client, store }));
+
+    const first = await manager.ensureAccount(AGENT, "permanent");
+    if (!first.ok || first.policy === "none") throw new Error("unreached");
+    removeUserExternally(first.rcUserId); // RC is now the source of truth: this user is simply gone
+
+    const second = await manager.ensureAccount(AGENT, "permanent");
+    expect(second).toMatchObject({ ok: true, created: true });
+    if (!second.ok || second.policy === "none") throw new Error("unreached");
+    expect(second.rcUserId).not.toBe(first.rcUserId);
+    expect(await store.get(AGENT)).toMatchObject({ rcUserId: second.rcUserId });
+    // Exactly one retry, not a loop: two creates total across both ensureAccount calls, not three-plus.
+    expect(calls.filter((c) => c.method === "createUser")).toHaveLength(2);
+
+    // A THIRD call is now a plain, un-stale adoption — no further drop/retry needed.
+    const third = await manager.ensureAccount(AGENT, "permanent");
+    expect(third).toMatchObject({ ok: true, created: false, rcUserId: second.rcUserId });
+  });
+
+  test("a real failure issuing the token for a FRESHLY created user propagates — never mistaken for a stale-record recovery", async () => {
+    const flaky: RocketChatClient = {
+      async getUserByUsername() { return null; },
+      async countUsers() { return 0; },
+      async createUser(input) { return { id: "fresh-1", username: input.username, active: true }; },
+      async deleteUser() {},
+      async generateManagedToken() { return "x"; },
+      async revokeManagedToken() { throw new RocketChatHttpError(503, "token revoke"); },
+    };
+    const manager = createAccountManager(baseDeps({ client: flaky, store: fakeStore() }));
+    // No existingRecord in this path (a fresh create), so this must NOT be treated as a stale-record retry.
+    await expect(manager.ensureAccount(AGENT, "temporary")).rejects.toBeInstanceOf(RocketChatHttpError);
+  });
+
   test("the 50-user guardrail refuses before the threshold is hit and creates nothing", async () => {
     const { client, calls, setCountOverride } = fakeRcClient();
     setCountOverride(45);
@@ -225,12 +275,12 @@ describe("ensureAccount", () => {
 
 describe("releaseAccount", () => {
   async function provision(policy: "temporary" | "permanent") {
-    const { client, calls } = fakeRcClient();
+    const { client, calls, removeUserExternally } = fakeRcClient();
     const store = fakeStore();
     const manager = createAccountManager(baseDeps({ client, store }));
     const ensured = await manager.ensureAccount(AGENT, policy);
     if (!ensured.ok || ensured.policy === "none") throw new Error("unreached");
-    return { manager, client, calls, store, rcUserId: ensured.rcUserId, username: ensured.username };
+    return { manager, client, calls, store, removeUserExternally, rcUserId: ensured.rcUserId, username: ensured.username };
   }
 
   test("no managed account on record is a no-op that says so", async () => {
@@ -280,6 +330,18 @@ describe("releaseAccount", () => {
     expect(calls.filter((c) => c.method === "createUser")).toHaveLength(2);
     expect(await store.get(AGENT)).not.toBeNull();
     void client;
+  });
+
+  test("temporary: release is idempotent when the RC user is already gone (interrupted prior release, or removed out-of-band)", async () => {
+    const { manager, calls, store, removeUserExternally, rcUserId } = await provision("temporary");
+    removeUserExternally(rcUserId);
+    const r = await manager.releaseAccount(AGENT, "stop");
+    expect(r).toEqual({ ok: true, released: true });
+    expect(await store.get(AGENT)).toBeNull();
+    // A second release call (stop/archive can legitimately repeat) is ALSO a clean no-op, not a throw.
+    const again = await manager.releaseAccount(AGENT, "stop");
+    expect(again).toMatchObject({ ok: true, released: false, note: expect.stringContaining("no managed") });
+    void calls;
   });
 
   test("no RC client configured refuses release loudly instead of throwing", async () => {
@@ -339,9 +401,41 @@ describe("createFileAccountStore", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test("a missing or unreadable file starts as an empty store rather than throwing", async () => {
+  test("a MISSING file (ENOENT) starts as an empty store rather than throwing", async () => {
     const store = createFileAccountStore(join(tmpdir(), `butchr-rc-store-missing-${Date.now()}`, "accounts.json"));
     expect(await store.list()).toEqual([]);
     expect(await store.get(AGENT)).toBeNull();
+  });
+
+  // BUTCHR-410 review, blocking finding 3 — an intended behaviour change from
+  // this module's first pass: a CORRUPT file used to be silently read as
+  // empty, so the very next `set` would rewrite it with only that one
+  // record, forgetting every other managed account. It now throws loudly
+  // instead, on every read path (`get`/`list`/`set`/`delete` all load first).
+  test("a CORRUPT (unparseable) file throws loudly instead of being read as empty", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rc-store-corrupt-"));
+    try {
+      const path = join(dir, "accounts.json");
+      writeFileSync(path, '{"jira-work:triage:BUTCHR-1": { "rcUserId": "u1", truncated mid');
+      const store = createFileAccountStore(path);
+      await expect(store.list()).rejects.toThrow(/invalid JSON/);
+      await expect(store.get(AGENT)).rejects.toThrow(/invalid JSON/);
+      // Critically: a corrupt file must never be silently overwritten by a `set` either.
+      await expect(store.set({ agentKey: AGENT2, rcUserId: "u2", username: rcUsernameFor(AGENT2), policy: "temporary", createdAt: "t" })).rejects.toThrow(/invalid JSON/);
+      expect(readFileSync(path, "utf8")).toContain("truncated mid"); // untouched
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("writes are atomic (temp file + rename): no leftover temp file, and content is never partially written", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rc-store-atomic-"));
+    try {
+      const path = join(dir, "accounts.json");
+      const store = createFileAccountStore(path);
+      await store.set({ agentKey: AGENT, rcUserId: "u1", username: rcUsernameFor(AGENT), policy: "temporary", createdAt: "t" });
+      await store.set({ agentKey: AGENT2, rcUserId: "u2", username: rcUsernameFor(AGENT2), policy: "permanent", createdAt: "t" });
+      const entries = readdirSync(dir);
+      expect(entries).toEqual(["accounts.json"]); // no .tmp-* left behind
+      expect(await store.list()).toHaveLength(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

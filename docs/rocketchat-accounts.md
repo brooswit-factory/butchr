@@ -164,7 +164,20 @@ under the fixed name `RC_MANAGED_TOKEN_NAME` (`"butchr-managed"`,
 `src/resources/rocketchat.ts`) — never a parameter, never a per-call name, so
 there is exactly one to find and remove. `ensureAccount` revokes-then-issues
 it on every call (so a launcher always gets currently-valid connection
-material, and a stale token from a previous session is never left live);
+material, and a stale token from a previous session is never left live).
+**This is a rotation contract, stated explicitly for BUTCHR-412 (the
+follow-up wiring task) to design against:** every successful `ensureAccount`
+call invalidates whatever managed token that agent held before, including
+one an already-running agent is actively using — calling `ensureAccount`
+again for a still-running agent (a duplicate start, a respawn that re-ensures
+before checking whether an account already exists, anything of that shape)
+silently pulls the rug out from under it. BUTCHR-412 must either treat
+`ensureAccount`'s token as good for exactly one launch and never call it
+again while that launch is live, or accept that re-calling it means
+reissuing the running agent's connection material too — this module does not
+decide that for it, but it must not be assumed tokens are stable across
+repeat calls.
+
 `releaseAccount` revokes it explicitly before deleting the user, even though
 deleting the user would also destroy it — the explicit revoke is what makes
 "the exact set of managed integration resources removed" auditable from the
@@ -188,6 +201,20 @@ wrong username into a record) can never cause this module to delete a human's
 account, or a legacy Bakr/Candlestix one. A mismatch refuses with `{ ok:
 false, reason: "not-managed", message }` rather than proceeding.
 
+**A named limitation, not closed by this guard:** the marker is the
+`RC_MANAGED_PREFIX` username prefix ALONE — there is no second, independent
+signal (a custom field, a tag) backing it up (see "Why a username prefix, not
+a custom field" above for why a custom field was rejected). A human — or a
+pre-existing Bakr/Candlestix — account that happens to already be named
+exactly the string `rcUsernameFor` would derive for some agent key would be
+silently adopted as though butchr had created it: `getUserByUsername` cannot
+distinguish "an account I created" from "an account that happens to carry my
+naming scheme". This is considered acceptable because the derived username
+embeds a 10-hex-char hash of the full agent key (see "Identity mapping"
+above), making an accidental real-world collision astronomically unlikely —
+but it is a probabilistic argument, not a guarantee, and is recorded here as
+a known, accepted gap rather than left implicit.
+
 ## Persistence (`src/accounts/manager.ts`'s `createFileAccountStore`)
 
 One JSON file, `<workspace root>/.butchr-rc-accounts.json` — a flat map from
@@ -210,12 +237,47 @@ ordering is the follow-up task's to decide). A single root-anchored file:
 - Makes `reconcileOrphans` one file read instead of a walk over every
   per-rule, per-resource workspace subdirectory.
 
-**Lost-record recovery.** `ensureAccount` never trusts the store alone: when
-`store.get(agentKey)` returns null, it falls back to
+**A read failure is never silently "empty".** Only a genuinely missing file
+(`ENOENT`) reads as no records. Anything else — a truncated write, disk
+corruption, anything `JSON.parse` rejects — throws loudly instead of being
+swallowed. An earlier version of this module treated every read failure as
+empty; a reviewer found that a corrupted file would then have its very next
+`set` call silently rewrite it with only that one record, forgetting every
+other managed account (a real Rocket.Chat seat leak against the 50-user
+guardrail, invisible until someone noticed accounts they thought existed did
+not). Writes are also atomic (temp file + rename), so this module's own
+writes can never produce the corruption in the first place — a reader only
+ever sees either the previous complete file or the next one, never a partial
+one.
+
+**Lost-record recovery.** `ensureAccount` never trusts a MISSING store record
+alone: when `store.get(agentKey)` returns null, it falls back to
 `client.getUserByUsername(rcUsernameFor(agentKey))` before deciding whether
 to create — Rocket.Chat is the source of truth, and the derived username
 means the record's loss (a wiped file, a moved workspace root, whatever) is
 recoverable without creating a duplicate, exactly as the ticket requires.
+
+**Stale-record recovery.** A record can also be wrong without being
+missing: it can point at an RC user that is simply gone (deleted out-of-band
+by an operator, or by a prior `releaseAccount` call that deleted the RC user
+but was interrupted before it could clear the record). `ensureAccount`
+detects this the moment it tries to act on that user (revoking/reissuing its
+managed token) and gets RC's own "no such user" refusal back: it drops the
+stale record and resolves fresh — falling through to the same
+lookup-by-username-then-create path a missing record takes — rather than
+failing that call, and every subsequent `ensureAccount` for the same agent,
+forever. This recovery is not a loop: the retry never trusts a record, so it
+terminates after at most one extra attempt.
+
+**`releaseAccount` is idempotent for the same reason.** `stop`/`archive` can
+legitimately be called more than once for the same agent (a retry, two
+callers racing, BUTCHR-412's own stop path being called from more than one
+place) — if the RC user is already gone by the time `releaseAccount` runs
+(its own earlier call succeeded but the process died before clearing the
+record; or, as above, something else removed the user), the revoke/delete
+calls' own "no such user" refusal is treated as "already released", and the
+stale record is cleared, rather than surfacing as a failure that leaves an
+orphaned, un-clearable record behind.
 
 ## Config (`src/config/config.ts`)
 

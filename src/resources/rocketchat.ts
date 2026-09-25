@@ -99,6 +99,17 @@ export const RC_MANAGED_TOKEN_NAME = "butchr-managed";
 const RC_TOKEN_NOT_FOUND_RE = /token.*not.*found|not.*found.*token|no such token/i;
 const RC_USER_NOT_FOUND_RE = /user not found/i;
 
+/**
+ * Whether `e` is RC's own "no such user" refusal — matched on RC's error
+ * TEXT only, never a bare HTTP status. A bare 400/404 with no RC error
+ * string is ambiguous (could just as well be a malformed request) and is
+ * surfaced as a real error rather than silently read as "not found" — a
+ * review finding on this module's first pass (BUTCHR-410).
+ */
+export function isRcUserNotFoundError(e: unknown): boolean {
+  return e instanceof RocketChatApiError && RC_USER_NOT_FOUND_RE.test(e.rcError);
+}
+
 export interface RocketChatClient {
   /** Looks up a user by username; `null` when RC reports no such user (never thrown — a miss is an expected outcome for a fresh agent key). */
   getUserByUsername(username: string): Promise<RocketChatUser | null>;
@@ -137,8 +148,7 @@ export function createRocketChatClient(deps: RocketChatClientDeps): RocketChatCl
         if (!body || typeof body !== "object" || !body.user) throw new Error("Rocket.Chat user lookup returned an unexpected body");
         return mapUser(body.user);
       } catch (e) {
-        if (e instanceof RocketChatApiError && RC_USER_NOT_FOUND_RE.test(e.rcError)) return null;
-        if (e instanceof RocketChatHttpError && e.status === 400) return null;
+        if (isRcUserNotFoundError(e)) return null;
         throw e;
       }
     },

@@ -8,11 +8,11 @@
  * start/stop. See that doc for the full contract, the identity mapping, the
  * persistence location, and the guardrail's exact refusal shape.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
-import type { RocketChatClient } from "../resources/rocketchat.js";
+import { isRcUserNotFoundError, type RocketChatClient } from "../resources/rocketchat.js";
 import type { AccountPolicy } from "../rules/rules.js";
 import { isManagedUsername, rcUsernameFor } from "./identity.js";
 
@@ -117,39 +117,61 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
       return withLock(agentKey, async (): Promise<EnsureAccountResult> => {
         const client = deps.client;
         if (!client) return RC_NOT_CONFIGURED(policy);
-
         const username = rcUsernameFor(agentKey);
-        const existingRecord = await deps.store.get(agentKey);
-        let user = existingRecord ? { id: existingRecord.rcUserId, username: existingRecord.username } : await client.getUserByUsername(username);
-        let created = false;
 
-        if (!user) {
-          const count = await client.countUsers();
-          if (count >= deps.userCapThreshold) {
-            return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
+        /**
+         * `trustRecord: false` is used exactly once, recursively, when the
+         * persisted record turns out to be STALE (its RC user is gone —
+         * deleted out-of-band, or a prior `releaseAccount` deleted the RC
+         * user but was interrupted before it could clear the record). RC is
+         * the source of truth (docs/rocketchat-accounts.md): rather than
+         * fail this and every future `ensureAccount` for this agent forever
+         * (BUTCHR-410 review finding 1), drop the stale record and resolve
+         * fresh — the second pass never trusts a record, so it terminates
+         * after at most one retry.
+         */
+        const attempt = async (trustRecord: boolean): Promise<EnsureAccountResult> => {
+          const existingRecord = trustRecord ? await deps.store.get(agentKey) : null;
+          let user = existingRecord ? { id: existingRecord.rcUserId, username: existingRecord.username } : await client.getUserByUsername(username);
+          let created = false;
+
+          if (!user) {
+            const count = await client.countUsers();
+            if (count >= deps.userCapThreshold) {
+              return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
+            }
+            try {
+              const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
+              user = { id: created_.id, username: created_.username };
+              created = true;
+            } catch (e) {
+              if (!isUsernameTakenError(e)) throw e;
+              // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
+              const found = await client.getUserByUsername(username);
+              if (!found) throw e;
+              user = { id: found.id, username: found.username };
+            }
           }
+
+          if (!isManagedUsername(user.username)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
+
           try {
-            const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
-            user = { id: created_.id, username: created_.username };
-            created = true;
+            // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
+            await client.revokeManagedToken(user.id);
+            const token = await client.generateManagedToken(user.id);
+            const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now() };
+            await deps.store.set(record);
+            return { ok: true, policy, rcUserId: user.id, username: user.username, token, created };
           } catch (e) {
-            if (!isUsernameTakenError(e)) throw e;
-            // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
-            const found = await client.getUserByUsername(username);
-            if (!found) throw e;
-            user = { id: found.id, username: found.username };
+            if (existingRecord && isRcUserNotFoundError(e)) {
+              await deps.store.delete(agentKey);
+              return attempt(false);
+            }
+            throw e;
           }
-        }
+        };
 
-        if (!isManagedUsername(user.username)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
-
-        // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
-        await client.revokeManagedToken(user.id);
-        const token = await client.generateManagedToken(user.id);
-
-        const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now() };
-        await deps.store.set(record);
-        return { ok: true, policy, rcUserId: user.id, username: user.username, token, created };
+        return attempt(true);
       });
     },
 
@@ -166,8 +188,18 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
           return { ok: false, reason: "not-managed", message: `refusing to unprovision ${JSON.stringify(record.username)} for ${agentKey}: it does not carry butchr's own managed-account marker for this agent` };
         }
 
-        await client.revokeManagedToken(record.rcUserId);
-        await client.deleteUser(record.rcUserId);
+        try {
+          await client.revokeManagedToken(record.rcUserId);
+          await client.deleteUser(record.rcUserId);
+        } catch (e) {
+          // Idempotent release (BUTCHR-410 review finding 2): stop/archive
+          // can legitimately be called again for an agent whose RC user is
+          // already gone (this call's own earlier attempt succeeded but was
+          // interrupted before the record was cleared, or something else
+          // removed it) — treat "already gone" as "already released", not a
+          // failure that leaves an un-clearable record behind forever.
+          if (!isRcUserNotFoundError(e)) throw e;
+        }
         await deps.store.delete(agentKey);
         return { ok: true, released: true };
       });
@@ -193,12 +225,42 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
  * single read rather than a walk of every agent's workspace directory.
  */
 export function createFileAccountStore(path: string = join(workspaceRoot(), ".butchr-rc-accounts.json")): AccountStore {
+  /**
+   * ONLY a missing file (ENOENT) reads as empty. A review finding
+   * (BUTCHR-410, blocking #3) on this module's first pass: swallowing every
+   * read error — a truncated write, disk corruption, anything — as "empty"
+   * meant the very next `set` call would silently rewrite the file with
+   * just that one record, forgetting every other managed account (a real
+   * RC seat leak against the 50-user cap, and a `reconcileOrphans` that
+   * would then report every one of them as an orphan). Any other read or
+   * parse failure THROWS instead, loud, so an operator notices a corrupt
+   * store rather than watching it quietly forget accounts.
+   */
   const load = (): Record<string, AccountRecord> => {
-    try { return JSON.parse(readFileSync(path, "utf8")) as Record<string, AccountRecord>; } catch { return {}; }
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw new Error(`Rocket.Chat account store ${path} could not be read: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
+    }
+    try {
+      return JSON.parse(text) as Record<string, AccountRecord>;
+    } catch (e) {
+      throw new Error(`Rocket.Chat account store ${path} holds invalid JSON — refusing to treat a corrupt file as empty, which would silently forget every recorded account: ${(e as Error).message}`);
+    }
   };
+  /** Write-to-temp-then-rename: a reader (this process or another) never observes a partially-written file, even if the process dies mid-write. */
   const save = (data: Record<string, AccountRecord>): void => {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(data, null, 2));
+    const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    writeFileSync(tmp, JSON.stringify(data, null, 2));
+    try {
+      renameSync(tmp, path);
+    } catch (e) {
+      try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+      throw e;
+    }
   };
   return {
     async get(agentKey) { return load()[agentKey] ?? null; },
