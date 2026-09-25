@@ -21,6 +21,7 @@ import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules } from "../rules/rules.js";
+import { statuslessJiraWorkRuleWarnings } from "../rules/status-clause-warning.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
@@ -100,6 +101,9 @@ try {
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
   if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
   else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+  // BUTCHR-400: informational only — never a refusal, never a status gate. A
+  // jira-work rule with no status clause at all still runs exactly as written.
+  for (const line of statuslessJiraWorkRuleWarnings(rules)) console.error(`butchr: ${line}`);
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   process.exit(1);
