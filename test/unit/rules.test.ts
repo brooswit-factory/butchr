@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeAgentKey, encodeAgentKey, loadRules, parseRules, RULE_ID_MAX, rulesPath } from "../../src/rules/rules.js";
+import { decodeAgentKey, encodeAgentKey, formatUnresolvedRelationshipWarning, loadRules, parseRules, RULE_ID_MAX, rulesPath, unresolvedRelationships, type Rule } from "../../src/rules/rules.js";
 
 const minimal = { id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "triage it" };
 const parsedMinimal = { ...minimal, enabled: true };
@@ -114,6 +114,62 @@ describe("parseRules", () => {
     for (const id of ["a", "triage-2", "x".repeat(RULE_ID_MAX)]) expect(parseRules({ rules: [{ ...minimal, id }] })).toHaveLength(1);
     for (const id of ["", "-a", "a-", "a--b", "A", "a.b", "a_b", "a:b", "x".repeat(RULE_ID_MAX + 1), 7])
       expect(() => parseRules({ rules: [{ ...minimal, id }] })).toThrow(".id must be");
+  });
+});
+
+describe("unresolvedRelationships", () => {
+  const rule = (over: Partial<Rule>): Rule => ({ id: "x", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", ...over });
+
+  test("childRule naming an absent id is reported", () => {
+    expect(unresolvedRelationships([rule({ id: "task", relationships: { childRule: "missing" } })]))
+      .toEqual([{ ruleId: "task", field: "childRule", missingTarget: "missing" }]);
+  });
+
+  test("inwardConnectionRules naming an absent id is reported, separately from childRule", () => {
+    expect(unresolvedRelationships([rule({ id: "task", relationships: { inwardConnectionRules: ["missing"] } })]))
+      .toEqual([{ ruleId: "task", field: "inwardConnectionRules", missingTarget: "missing" }]);
+  });
+
+  test("of a list where one entry resolves and one doesn't, only the missing one is reported", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { inwardConnectionRules: ["story", "gone"] } }),
+      rule({ id: "story" }),
+    ])).toEqual([{ ruleId: "task", field: "inwardConnectionRules", missingTarget: "gone" }]);
+  });
+
+  test("negative: every relationship resolves to an id present in the same rules -> nothing reported", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { childRule: "story", inwardConnectionRules: ["story"] } }),
+      rule({ id: "story" }),
+    ])).toEqual([]);
+  });
+
+  test("a disabled SOURCE rule is not reported, even with a dangling reference", () => {
+    expect(unresolvedRelationships([rule({ id: "task", enabled: false, relationships: { childRule: "missing" } })])).toEqual([]);
+  });
+
+  test("a disabled TARGET still counts as resolved — this check is existence-only, never enabled-ness", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { childRule: "story" } }),
+      rule({ id: "story", enabled: false }),
+    ])).toEqual([]);
+  });
+
+  test("only jira-work rules are reported — a jira-idea rule's inwardConnectionRules is out of scope here", () => {
+    expect(unresolvedRelationships([rule({ id: "idea", resourceProvider: "jira-idea", relationships: { inwardConnectionRules: ["missing"] } })])).toEqual([]);
+  });
+
+  test("a rule with no relationships at all is skipped, not an error", () => {
+    expect(unresolvedRelationships([rule({ id: "task" })])).toEqual([]);
+  });
+});
+
+describe("formatUnresolvedRelationshipWarning", () => {
+  test("names the source rule, the field, and the missing target", () => {
+    const msg = formatUnresolvedRelationshipWarning({ ruleId: "task", field: "childRule", missingTarget: "story" });
+    expect(msg).toContain('rule "task"');
+    expect(msg).toContain("childRule");
+    expect(msg).toContain('"story"');
   });
 });
 
