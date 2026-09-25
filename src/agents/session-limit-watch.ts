@@ -85,7 +85,7 @@ function compactUtc(ms: number): string {
  * `-escalation-` in that position instead, so the two shapes stay mutually
  * exclusive regardless of the issue-vs-project prefix.
  */
-const CAPTURE_NAME = /^(?:[A-Z][A-Z0-9]*(?:-\d+)?|(?:jira-work|github-issue|jira-idea|zendesk-ticket):[a-z0-9-]+:[A-Za-z0-9%._~-]+)-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
+const CAPTURE_NAME = /^(?:[A-Z][A-Z0-9]*(?:-\d+)?|(?:jira-work|github-issue|jira-idea|zendesk-ticket|filesystem):[a-z0-9-]+:[A-Za-z0-9%._~-]+)-(?:unrecognised|no-reset-time)-(\d{8}T\d{6}Z)\.txt$/;
 
 /** Our own capture files present in the sink, oldest (by timestamp) first; anything we didn't write is excluded. */
 async function ourCapturesOldestFirst(sink: CaptureSink): Promise<{ name: string; ts: string }[]> {

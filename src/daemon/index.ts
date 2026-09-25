@@ -66,6 +66,7 @@ import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
+import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 
@@ -147,6 +148,10 @@ const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
+// filesystem rules need no external credential — every enabled one always
+// runs, reading the local disk directly (src/resources/filesystem.ts).
+const fsRules = filesystemRules(rules);
+
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
@@ -204,6 +209,7 @@ const ADMISSION_SOURCE_ISSUE = "issue";
 const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
 const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
 const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
+const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
@@ -213,7 +219,7 @@ const admissionController = createAdmissionController({
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : [])],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : [])],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -323,7 +329,7 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
-// github-issue, jira-idea and zendesk-ticket loop health, reported beside (never inside) the
+// github-issue, jira-idea, zendesk-ticket and filesystem loop health, reported beside (never inside) the
 // liveness components: whether each type's rules run, and whether its polls
 // complete. The threshold covers at least three polls of the slower loop.
 const githubIssueHealth = createResourceLoopHealth({
@@ -345,6 +351,13 @@ const zendeskTicketHealth = createResourceLoopHealth({
   enabled: Boolean(zendeskTickets),
   ...(zendeskStaffing.run ? {} : { disabledReason: zendeskStaffing.reason ?? "no enabled zendesk-ticket rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * ZENDESK_TICKET_POLL_MS),
+  log: (line) => console.error(line),
+});
+const filesystemHealth = createResourceLoopHealth({
+  name: "filesystem",
+  enabled: fsRules.length > 0,
+  ...(fsRules.length ? {} : { disabledReason: "no enabled filesystem rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
@@ -415,7 +428,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth]),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, filesystemHealth]),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -436,7 +449,7 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, jira-idea and zendesk-ticket agents; each provider's own tools exist only when its rules run.
+  // Jira/Confluence tools refuse github-issue, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -958,6 +971,27 @@ startZendeskTicketLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
   onError: (e) => zendeskTicketHealth.recordError(e),
+});
+
+// The filesystem rule loop: its own agents and admission bucket, no external
+// credential, none of the Jira-writing detectors above, and its own resource
+// (a file or directory) is never written to by butchr itself.
+if (fsRules.length) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
+startFilesystemLoop({
+  rules,
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_FILESYSTEM),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_FILESYSTEM),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_FILESYSTEM),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => filesystemHealth.recordSuccess(),
+  onError: (e) => filesystemHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's

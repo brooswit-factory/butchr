@@ -30,8 +30,9 @@ rules[2].execution must be one of swarm, singleton, persistent
 rules[2].role must be one of worker, sentinel
 ```
 
-**Provider scope.** All three fields are accepted for all four resource
-providers (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`).
+**Provider scope.** All three fields are accepted for every resource
+provider (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`, and —
+BUTCHR-407 — `filesystem`).
 
 ## What `execution` means
 

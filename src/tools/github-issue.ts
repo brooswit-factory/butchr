@@ -86,6 +86,7 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
   "github-issue": "github_get_issue, github_add_comment and github_link_jira_idea",
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
   "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
+  "filesystem": "your own file tools (Read/Write/Edit/Bash) directly — there is no butchr MCP tool for a filesystem resource",
 };
 
 /**

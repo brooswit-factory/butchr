@@ -24,6 +24,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
+import { filesystemQueryProblems } from "../resources/filesystem-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
@@ -104,7 +105,11 @@ export interface Rule {
    * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
    * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
    * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
-   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts).
+   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
+   * a small JSON object for `filesystem` (root, kind, name pattern, recursion
+   * depth, an optional content/metadata predicate — see
+   * src/resources/filesystem-query.ts and docs/filesystem.md for the syntax
+   * decision).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -198,6 +203,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
     // `execution` and `account` are independent of each other (any of the 9 combinations
@@ -210,7 +216,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
