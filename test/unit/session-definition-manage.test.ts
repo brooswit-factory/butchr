@@ -46,7 +46,17 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
       name: "a.json", path: "/defs/a.json", agentKey, valid: true, problems: [],
       vendor: "claude", tier: "tier1", role: "sentinel", execution: "persistent",
       manifestFrozen: false, storeFrozen: true,
+      freezeControllers: [], unfreezeControllers: [],
     }]);
+  });
+
+  test("a definition's own freeze/unfreeze grant fields are surfaced verbatim", async () => {
+    const { list, read } = fakeFiles({
+      "/defs/target.json": JSON.stringify(goodDef({ freezeControllers: ["director"], unfreezeControllers: ["director", "operator-tool"] })),
+    });
+    const entries = await listSessionDefinitions({ dir: "/defs", list, read, store: fakeStore() });
+    expect(entries[0]!.freezeControllers).toEqual(["director"]);
+    expect(entries[0]!.unfreezeControllers).toEqual(["director", "operator-tool"]);
   });
 
   test("an invalid definition is listed WITH its problems, never hidden — manifestFrozen is undefined (unknowable)", async () => {
@@ -212,6 +222,16 @@ describe("createSessionDefinition", () => {
     const deps = fakeCreateDeps(new Set(["/archive/dup.json"])); // "exists" would say yes if ever asked about this path
     const result = await createSessionDefinition(deps, "dup", goodDef() as never); // no archiveDir
     expect(result.ok).toBe(true);
+  });
+
+  test("freezeControllers/unfreezeControllers, when given, are written verbatim; omitted otherwise", async () => {
+    const deps = fakeCreateDeps();
+    await createSessionDefinition(deps, "granted", { ...goodDef(), freezeControllers: ["director"], unfreezeControllers: [] } as never);
+    const written = JSON.parse(deps.written["/defs/granted.json"]!);
+    expect(written.freezeControllers).toEqual(["director"]);
+    expect(written.unfreezeControllers).toEqual([]);
+    await createSessionDefinition(deps, "ungranted", goodDef() as never);
+    expect(JSON.parse(deps.written["/defs/ungranted.json"]!)).not.toHaveProperty("freezeControllers");
   });
 
   test("both claude and codex vendors validate and write", async () => {

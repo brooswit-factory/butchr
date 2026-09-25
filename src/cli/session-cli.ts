@@ -38,6 +38,8 @@ const USAGE = `usage: butchr session list [--archived]
                              [--account none|temporary|permanent]
                              [--role worker|sentinel] [--frozen]
                              [--mcp-servers <json array>]
+                             [--freeze-controllers <comma-separated names>]
+                             [--unfreeze-controllers <comma-separated names>]
        butchr session freeze <name>
        butchr session unfreeze <name>
        butchr session archive <name>
@@ -50,7 +52,14 @@ that directory (so the daemon stops staffing it on its next poll) into a
 sibling archive directory (BUTCHR_SESSION_ARCHIVE_DIR, else
 <definitions-dir>-archive); "unarchive" moves it back under the exact same
 name. "list --archived" lists what's in the archive; plain "list" never
-shows archived definitions.`;
+shows archived definitions.
+
+--freeze-controllers/--unfreeze-controllers name OTHER definitions (by file
+name, with or without ".json") whose agent may call the butchr
+freeze_session/unfreeze_session MCP tool against THIS one — see
+docs/managed-sessions.md's "Delegated freeze/unfreeze". There is no CLI
+verb to change a grant after creation; edit the manifest file directly (or
+recreate it) and let the daemon's own poll pick it up.`;
 
 export interface SessionCliIo {
   dir: string;
@@ -94,19 +103,26 @@ function defaultIo(): SessionCliIo {
 const freezeSummary = (manifestFrozen: boolean | undefined, storeFrozen: boolean | undefined): string =>
   `manifest=${manifestFrozen === undefined ? "unknown (invalid definition)" : manifestFrozen} store=${storeFrozen === undefined ? "unknown (path too long for an agent key)" : storeFrozen}`;
 
+/** `[]`/`undefined` renders as `(none)` — same convention for both grant fields, list and show. */
+const controllersSummary = (names: string[] | undefined): string => (names?.length ? names.join(", ") : "(none)");
+
 function formatListEntry(e: SessionDefinitionListEntry): string[] {
   if (!e.valid) {
     const lines = [`${e.name}  INVALID  (${freezeSummary(e.manifestFrozen, e.storeFrozen)})`];
     for (const p of e.problems) lines.push(`  - ${p}`);
     return lines;
   }
-  return [`${e.name}  valid  vendor=${e.vendor} tier=${e.tier} role=${e.role} execution=${e.execution}  (${freezeSummary(e.manifestFrozen, e.storeFrozen)})`];
+  return [
+    `${e.name}  valid  vendor=${e.vendor} tier=${e.tier} role=${e.role} execution=${e.execution}  (${freezeSummary(e.manifestFrozen, e.storeFrozen)})`,
+    `  freezeControllers=${controllersSummary(e.freezeControllers)} unfreezeControllers=${controllersSummary(e.unfreezeControllers)}`,
+  ];
 }
 
 function formatShowEntry(e: SessionDefinitionListEntry): string[] {
   const lines = [`name: ${e.name}`, `path: ${e.path}`, `agentKey: ${e.agentKey}`, `valid: ${e.valid}`];
   if (e.valid) {
     lines.push(`vendor: ${e.vendor}`, `tier: ${e.tier}`, `role: ${e.role}`, `execution: ${e.execution}`);
+    lines.push(`freezeControllers: ${controllersSummary(e.freezeControllers)}`, `unfreezeControllers: ${controllersSummary(e.unfreezeControllers)}`);
   } else {
     lines.push("problems:");
     for (const p of e.problems) lines.push(`  - ${p}`);
@@ -223,6 +239,16 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
     const execution = str("execution");
     const account = str("account");
     const role = str("role");
+    // Comma-separated, trimmed, empty entries dropped — a bare `--freeze-controllers` with no value
+    // (parseFlags would then read it as `true`, not a list) is treated as "flag given, no names",
+    // same as an empty string; sessionDefinitionProblems is still what decides if the result is valid.
+    const controllerList = (k: string): string[] | undefined => {
+      const v = flags.get(k);
+      if (v === undefined) return undefined;
+      return typeof v === "string" ? v.split(",").map((s) => s.trim()).filter((s) => s !== "") : [];
+    };
+    const freezeControllers = controllerList("freeze-controllers");
+    const unfreezeControllers = controllerList("unfreeze-controllers");
     const result = await createSessionDefinition({ dir: io.dir, archiveDir: io.archive.archiveDir, exists: io.exists, write: io.write }, name, {
       workingDirectory: workingDirectory!, brief: brief!, vendor: vendor!, tier: tier!, permissionMode: permissionMode!,
       ...(execution !== undefined ? { execution } : {}),
@@ -230,6 +256,8 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
       ...(role !== undefined ? { role } : {}),
       ...(flags.has("frozen") ? { frozen: true } : {}),
       ...(mcpServers !== undefined ? { mcpServers } : {}),
+      ...(freezeControllers !== undefined ? { freezeControllers } : {}),
+      ...(unfreezeControllers !== undefined ? { unfreezeControllers } : {}),
     });
     if (!result.ok) {
       io.stderr(`butchr session create: ${result.error}`);

@@ -186,10 +186,15 @@ always answers `"active"`, same as `github-issue`/`zendesk-ticket`).
 
 ## What an agent can do
 
-There is **no butchr MCP tool** for a filesystem resource — its agent reads
-and edits it directly with its own file tools (Read/Write/Edit/Bash), the
-same access every agent already has to its own workspace. Jira, Confluence,
-GitHub and Zendesk MCP tools all refuse a `filesystem` agent
+There is **no general-purpose butchr MCP tool** for a filesystem resource —
+its agent reads and edits it directly with its own file tools
+(Read/Write/Edit/Bash), the same access every agent already has to its own
+workspace. The ONE exception (BUTCHR-456): the built-in `managed-sessions`
+rule (see `docs/managed-sessions.md`) is itself an ordinary `filesystem`
+rule, and its own agents may be delegated `freeze_session`/`unfreeze_session`
+via an explicit per-definition grant — never available to a `filesystem`
+agent under any OTHER rule id. Jira, Confluence, GitHub and Zendesk MCP
+tools all refuse a `filesystem` agent
 (`src/tools/github-issue.ts`'s `forJiraCallers`, generalized to every
 non-`jira-work` provider via `callerIdentity`). A `filesystem` agent
 identifies to MCP with `x-butchr-agent` alone (`KEY_ONLY_PROVIDERS`,

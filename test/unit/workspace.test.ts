@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -535,6 +535,32 @@ describe("buildWorkspace", () => {
       else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
       rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("BUTCHR-456: a managed-session agent's brief gets MANAGED_SESSION_TOOLS_NOTE, never the generic FILESYSTEM_TOOLS_NOTE — a plain filesystem/BUTCHR-407 agent gets the reverse", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-tools-note-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const managedSpec: SpawnSpec = { key: managedKey, issuetype: "managed-session", summary: "s", parent: null, brief: "Tend it." };
+      const managedDir = buildWorkspace(managedSpec, "http://x/mcp");
+      const managedBrief = readFileSync(join(managedDir, "brief.md"), "utf8");
+      expect(managedBrief).toContain(MANAGED_SESSION_TOOLS_NOTE);
+      expect(managedBrief).not.toContain(FILESYSTEM_TOOLS_NOTE);
+      expect(managedBrief).toContain("freeze_session");
+
+      const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
+      const plainSpec: SpawnSpec = { key: plainKey, issuetype: "filesystem", summary: "s", parent: null, brief: "Keep it current." };
+      const plainDir = buildWorkspace(plainSpec, "http://x/mcp");
+      const plainBrief = readFileSync(join(plainDir, "brief.md"), "utf8");
+      expect(plainBrief).toContain(FILESYSTEM_TOOLS_NOTE);
+      expect(plainBrief).not.toContain(MANAGED_SESSION_TOOLS_NOTE);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

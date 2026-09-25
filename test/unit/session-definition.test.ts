@@ -98,6 +98,54 @@ describe("sessionDefinitionProblems", () => {
   test("channels: not a real field — S4's shape folds the per-MCP notification flag into mcpServers[].channel, not a sibling field", () => {
     expect(sessionDefinitionProblems({ ...good(), channels: [] }, "def")).toEqual(['def has unknown field "channels"']);
   });
+  test("freezeControllers/unfreezeControllers: array of non-empty file names, independent lists, .json-insensitive dedup", () => {
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["director-brooswit-mud"] }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: [], unfreezeControllers: [] }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
+    expect(parseSessionDefinition(good(), "def", HOME).freezeControllers).toBeUndefined();
+    const parsed = parseSessionDefinition({ ...good(), freezeControllers: ["a"], unfreezeControllers: ["b", "c.json"] }, "def", HOME);
+    expect(parsed.freezeControllers).toEqual(["a"]);
+    expect(parsed.unfreezeControllers).toEqual(["b", "c.json"]);
+  });
+  test("freezeControllers: not an array is rejected", () => {
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: "a" }, "def")).toEqual(["def.freezeControllers must be an array of strings"]);
+    expect(sessionDefinitionProblems({ ...good(), unfreezeControllers: { a: 1 } }, "def")).toEqual(["def.unfreezeControllers must be an array of strings"]);
+  });
+  test("freezeControllers: each entry must be a non-empty string", () => {
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: [""] }, "def")).toEqual(['def.freezeControllers[0] must be a non-empty string']);
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["   "] }, "def")).toEqual(['def.freezeControllers[0] must be a non-empty string']);
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: [7] }, "def")).toEqual(['def.freezeControllers[0] must be a non-empty string']);
+  });
+  test("freezeControllers: no path separators, no NUL, no bare . or ..", () => {
+    for (const bad of ["a/b", "a\\b", "../x", "..", ".", "a\0b", "/etc/passwd"]) {
+      const problems = sessionDefinitionProblems({ ...good(), freezeControllers: [bad] }, "def");
+      expect(problems.length).toBe(1);
+      expect(problems[0]).toMatch(/must not contain a path separator|is not a valid file name/);
+    }
+  });
+  test("freezeControllers: length cap per entry", () => {
+    const long = "a".repeat(201);
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: [long] }, "def")[0]).toContain("must be at most 200 characters");
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a".repeat(200)] }, "def")).toEqual([]);
+  });
+  test("freezeControllers: no duplicates, compared after stripping a trailing .json", () => {
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a", "a"] }, "def")[0]).toContain('duplicates an earlier entry');
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a", "a.json"] }, "def")[0]).toContain('duplicates an earlier entry');
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a.json", "a"] }, "def")[0]).toContain('duplicates an earlier entry');
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a", "b"] }, "def")).toEqual([]);
+  });
+  test("freezeControllers: too many entries rejected", () => {
+    const many = Array.from({ length: 101 }, (_, i) => `c${i}`);
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: many }, "def")[0]).toContain("must not list more than 100 controllers");
+  });
+  test("freezeControllers and unfreezeControllers are validated and stored independently — listing a name in one says nothing about the other", () => {
+    const parsed = parseSessionDefinition({ ...good(), freezeControllers: ["a"] }, "def", HOME);
+    expect(parsed.freezeControllers).toEqual(["a"]);
+    expect(parsed.unfreezeControllers).toBeUndefined();
+    // Duplicates are only checked WITHIN one field — "a" may appear in both lists (a controller can hold both grants independently).
+    expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a"], unfreezeControllers: ["a"] }, "def")).toEqual([]);
+  });
+
   test("every problem is collected in one pass", () => {
     const problems = sessionDefinitionProblems({ workingDirectory: "", brief: "", vendor: "bogus", tier: "bogus", permissionMode: "bogus" }, "def");
     expect(problems.length).toBeGreaterThanOrEqual(5);
