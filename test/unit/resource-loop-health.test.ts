@@ -34,4 +34,16 @@ describe("resource loop health", () => {
     expect("resourceLoops" in combineHealth([poll])).toBe(false);
     poll.stop(); gh.stop();
   });
+
+  test("BUTCHR-405: unresolvedRelationships rides beside the liveness components, absent when empty", () => {
+    let t = 0;
+    const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    t = 5_000; poll.recordSuccess();
+    const unresolved = [{ ruleId: "task", field: "childRule" as const, missingTarget: "story" }];
+
+    expect(combineHealth([poll], undefined, undefined, undefined, undefined, undefined, unresolved).unresolvedRelationships).toEqual(unresolved);
+    expect("unresolvedRelationships" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
+    expect("unresolvedRelationships" in combineHealth([poll])).toBe(false);
+    poll.stop();
+  });
 });
