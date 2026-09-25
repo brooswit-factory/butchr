@@ -23,7 +23,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning } from "../rules/rules.js";
+import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -74,6 +74,7 @@ import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
+import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { runLinkCli } from "../cli/link-cli.js";
@@ -139,6 +140,19 @@ try {
 for (const r of rules) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
 }
+// BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
+// `Rule` per provider) — the built-in managed-sessions rule (never in
+// `rules`, and even if it were, fixed to `role: "worker"`) cannot express a
+// per-FILE manifest's own `role`. This map is the seam: the managed-sessions
+// loop rebuilds it every poll from that poll's eligible definitions (see
+// `ManagedSessionResourceDeps.roles`, src/rules/session-definition-type.ts),
+// keyed by the SAME agent key `roleOfAgent` is called with, and `roleOfAgent`
+// consults it FIRST for any id `ownsManagedSessionAgent` recognizes. Before
+// this loop's first poll (e.g. right after a restart, for an
+// already-running managed-session agent), it has no entry yet and
+// `roleOfAgent` falls through to its own existing fail-safe `"worker"`
+// default below — documented here, not silently relied upon.
+const managedSessionRoles = new Map<string, AgentRole>();
 /**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
@@ -146,10 +160,17 @@ for (const r of rules) {
  * against the loaded `rules`. Fails safe to `"worker"` for anything that
  * cannot be resolved — a legacy/bare-issue agent, or a rule since removed —
  * per `AdmissionControllerDeps.roleOf`'s own contract (src/agents/admission.ts).
+ * BUTCHR-408: a managed-session agent's role comes from `managedSessionRoles`
+ * (its OWN manifest field) instead, checked before the rule-level fallback —
+ * see that map's own comment just above.
  */
 const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
+  if (ownsManagedSessionAgent(id)) {
+    const manifestRole = managedSessionRoles.get(id);
+    if (manifestRole) return manifestRole;
+  }
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
@@ -264,13 +285,12 @@ const admissionController = createAdmissionController({
   // BUTCHR-398: shared across every rule provider's admission bucket —
   // `roleOfAgent` reads the FULL `rules` list (every provider), so it
   // correctly classifies a running id of ANY provider, not just jira-work.
-  // BUTCHR-408: a managed-session agent's OWN `role` (its manifest field) is
-  // validated and stored but NOT read here — `roleOfAgent` only ever
-  // resolves a rule-level role, and the built-in managed-sessions rule is
-  // one shared Rule for every heterogeneous definition file. Every
-  // managed-session agent is therefore classified "worker" for fleet-cap
-  // purposes today, same as an unflagged rule's agents always were before
-  // BUTCHR-398. See docs/managed-sessions.md's "Not in this version".
+  // BUTCHR-408: a managed-session agent's OWN `role` (its manifest field) IS
+  // read here — via `managedSessionRoles` (see that map's own comment,
+  // above `roleOfAgent`'s definition), not the rule-level lookup every
+  // other provider uses (the built-in managed-sessions rule is one shared
+  // Rule for every heterogeneous definition file, so it cannot carry a
+  // per-file role itself).
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
@@ -1108,6 +1128,7 @@ startFilesystemLoop({
 // admission/health wiring shape as every rule loop above, its own bucket.
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
+  roles: managedSessionRoles,
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));

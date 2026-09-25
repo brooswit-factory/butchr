@@ -46,7 +46,17 @@ export const kickoffFor = (provider: AgentProvider): string => provider === "cla
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
- * arguments and returns the complete Herdr start contract.
+ * arguments and returns the complete Herdr start contract. `dir` is
+ * butchr's own BOOKKEEPING directory (`buildWorkspace`'s return value —
+ * where CLAUDE.md/AGENTS.md/mcp.json actually live); the launched
+ * PROCESS's own cwd is `spec.cwd` when the spec names one (BUTCHR-408:
+ * a managed-session definition's own `workingDirectory`), else the SAME
+ * `dir`. These are kept separate on purpose — see `SpawnSpec.cwd`'s own
+ * doc comment (src/agents/workspace.ts) for why bookkeeping files must
+ * never land in an operator's own project directory. `mcpConfigPath`
+ * below stays anchored to `dir` (an absolute argv value, not resolved
+ * relative to the process's own cwd), so it keeps working even when the
+ * two directories differ.
  */
 export function agentLaunchConfig(
   spec: SpawnSpec,
@@ -56,13 +66,14 @@ export function agentLaunchConfig(
   agent: AgentConfig = { provider: "claude" },
   mcpUrl = "http://localhost:7717/mcp",
 ): ManagedAgentLaunch {
+  const cwd = spec.cwd ?? dir;
   if (agent.provider === "agy") {
     return {
       provider: "agy",
       skipPermissions: true,
       name,
       paneId,
-      cwd: dir,
+      cwd,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
     };
@@ -72,7 +83,7 @@ export function agentLaunchConfig(
       provider: "codex",
       name,
       paneId,
-      cwd: dir,
+      cwd,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
       ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {bypassApprovalsAndSandbox:false}: {}),
@@ -90,7 +101,7 @@ export function agentLaunchConfig(
     ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"auto"}: {}),
     name,
     paneId,
-    cwd: dir,
+    cwd,
     prompt: "",
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),

@@ -8,7 +8,9 @@ bump: minor
 
 ### Not yet included
 - MCP server list / channel bindings on a definition — deferred pending BUTCHR-395/BUTCHR-411's `Rule.mcpServers` shape landing and a sequencing decision.
-- A managed-session agent's own `role` is not yet read by the fleet-capacity admission classifier (rule-level only today); the field is validated and stored.
 
 ### Fixed
 - Tiers are now `tier1`-`tier5`, and `tierToModel(vendor, tier)` uses the real Candlestix `model-tiers.json` table (ported per CNDLX-45 comment 23525, relayed on BUTCHR-408) instead of the earlier provisional `tier0`-`tier2` guess — model choice depends on vendor as well as tier (Claude: sonnet/opus; Codex: gpt-5.6-luna/terra/sol, gpt-6-astra).
+- PR #394 review: a definition's `role: "sentinel"` now actually exempts its agent from the fleet-capacity admission cap (previously validated/stored but never read by the classifier — every managed-session agent silently counted as `"worker"`).
+- PR #394 review: `SpawnSpec.cwd` no longer redirects butchr's own bookkeeping files (CLAUDE.md/AGENTS.md/mcp.json/ENVIRONMENT.md) into the operator's own working directory — it only overrides the spawned PROCESS's cwd. Bookkeeping files always land in the ordinary `workspaceDirFor` tree, so a Bakr agent's own project files are never overwritten.
+- PR #394 review: a missing well-known definitions directory (the common case — most daemons won't have one) no longer fails the poll every 15s; it's treated as zero definitions, same as a missing `rules.json`. A directory that exists but is unreadable or not a directory still fails loudly.

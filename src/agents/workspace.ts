@@ -38,15 +38,23 @@ export interface SpawnSpec {
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
   externalMcpServers?: Array<{ name: string; url: string; headers?: Record<string, string> }>;
   /**
-   * BUTCHR-408: overrides the workspace directory `workspaceDirFor(spec.key)`
-   * would otherwise compute — the ONE seam a managed-session definition needs
-   * to make its `workingDirectory` the spawned agent's REAL process cwd (a
-   * Bakr agent must work IN its own project directory, not a synthetic
-   * `<workspaceRoot>/filesystem/...` bookkeeping tree). When set, BOTH the
-   * bookkeeping files (`buildWorkspace`, below) AND the launch `cwd`
-   * (`agentLaunchConfig`, src/agents/argv.ts) use this directory — CLAUDE.md/
-   * AGENTS.md/brief.md/mcp.json are written there directly, since that is
-   * the one place the spawned agent will actually look for them.
+   * BUTCHR-408: the spawned agent's REAL process cwd — a Bakr agent must
+   * work IN its own project directory, not a synthetic
+   * `<workspaceRoot>/filesystem/...` bookkeeping tree. Affects ONLY the
+   * launched process's own working directory (`agentLaunchConfig`,
+   * src/agents/argv.ts). It does NOT change where butchr's OWN bookkeeping
+   * files land: `buildWorkspace` (below) always writes CLAUDE.md/AGENTS.md/
+   * brief.md/mcp.json/ENVIRONMENT.md to `workspaceDirFor(spec.key)`, exactly
+   * as it does for every other spec — never into `cwd`. This is
+   * deliberate, not an oversight (PR #394 review, BUTCHR-408): `cwd` names
+   * an OPERATOR's own project directory (a Bakr agent's real repo), which
+   * may already hold its own `CLAUDE.md`/`AGENTS.md` with the project's own
+   * instructions — butchr writing its own bookkeeping files there would
+   * silently destroy them (see `docs/managed-sessions.md`'s "Working
+   * directory wiring" for the incident this fixed). The launched process
+   * still finds its `--mcp-config` at the bookkeeping location: that path
+   * is passed to it as an absolute argv value, not resolved relative to its
+   * own cwd, so the two directories can safely differ.
    *
    * TRADEOFF (documented, not solved, by this ticket — see
    * docs/managed-sessions.md): `agentIdOfWorkspacePath`'s reverse mapping
@@ -235,7 +243,11 @@ export const singleResourceOf = (id: string): string | null => (decodeQueryAgent
  * directory — the agent's cwd.
  */
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
-  const dir = spec.cwd ?? workspaceDirFor(spec.key);
+  // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
+  // comment for why butchr's bookkeeping files must never land in an
+  // operator's own project directory. `spec.cwd`, when present, only ever
+  // reaches the launched PROCESS's cwd (`agentLaunchConfig`, src/agents/argv.ts).
+  const dir = workspaceDirFor(spec.key);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.

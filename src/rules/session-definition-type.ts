@@ -27,11 +27,11 @@
 import { readFile } from "node:fs/promises";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, resourceMatches, unitAgentKey, type ExecutionUnit } from "./execution.js";
-import type { Rule } from "./rules.js";
+import type { AgentRole, Rule } from "./rules.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
-import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
+import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
 import type { EventPoll, EventRules, PollSnapshot, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
@@ -112,12 +112,33 @@ export interface SessionDefinitionSearchDeps {
   read: (path: string) => Promise<string>;
 }
 
+/** Told once that the well-known definitions directory does not exist yet — NOT an error (see `searchSessionDefinitions`'s own doc comment), just an operator FYI. */
+export type MissingRoot = () => void;
+
+/** Logs the missing-root FYI once, never respammed while it stays missing — same dedup shape as `onceFrozenDefinition`. */
+export function onceMissingRoot(log: ((line: string) => void) | undefined): MissingRoot {
+  let logged = false;
+  return () => {
+    if (logged) return;
+    logged = true;
+    log?.(`[managed-sessions] definitions directory does not exist yet — 0 definitions, not an error`);
+  };
+}
+
 /**
  * Every eligible (valid, not frozen) definition this poll — the ONE place
- * "eligible" is decided. ANY listing failure (a missing root, a safety cap —
- * see `listFilesystemResources`) rejects the WHOLE poll, same "a partial
+ * "eligible" is decided. A missing well-known directory is 0 definitions,
+ * NEVER a poll error (PR #394 review fix 3): most daemons simply have no
+ * managed-session definitions directory at all, the same "absent means
+ * empty, not broken" discipline `sessionDefinitionsPath`'s own doc comment
+ * already promises for it — before this fix, EVERY daemon without one
+ * logged a loop error and failed /health every poll. `isMissingRootError`
+ * (src/resources/filesystem.ts) is what tells "does not exist" (`ENOENT`)
+ * apart from "exists but is unreadable, or is not a directory" (anything
+ * else) — the latter (and every OTHER listing failure: a safety cap, see
+ * `listFilesystemResources`) still rejects the WHOLE poll, same "a partial
  * result must never read as a smaller true set" doctrine every provider's
- * own search function already follows; an individual file's OWN parse
+ * own search function already follows. An individual file's OWN parse
  * failure costs only that one file (skipped, logged), never the others —
  * same distinction PR #388 review drew for an oversized path.
  */
@@ -126,11 +147,19 @@ export async function searchSessionDefinitions(
   onOversized?: OversizedResource,
   onInvalid?: InvalidDefinition,
   onFrozen?: FrozenDefinition,
+  onMissingRoot?: MissingRoot,
 ): Promise<SessionDefinitionMatch[]> {
   const query = parseFilesystemQuery(deps.rule.query);
+  let resources: FilesystemResource[];
+  try {
+    resources = await deps.list(query);
+  } catch (e) {
+    if (isMissingRootError(e)) { onMissingRoot?.(); return []; }
+    throw e;
+  }
   const seen = new Set<string>();
   const out: SessionDefinitionMatch[] = [];
-  for (const resource of await deps.list(query)) {
+  for (const resource of resources) {
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
     if (!isFilesystemResourceId(resource.path)) { onOversized?.(deps.rule, resource.path); continue; }
@@ -205,16 +234,45 @@ export function createSessionDefinitionEventRules(): EventRules<ExecutionUnit<Se
 
 export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps {
   log?: (line: string) => void;
+  /**
+   * PR #394 review fix: an agent's own manifest `role` was validated and
+   * stored but never reached the fleet-capacity admission classifier
+   * (`roleOfAgent`, src/daemon/index.ts) — every managed-session agent was
+   * classified "worker" regardless of what its definition said, so a
+   * `role: "sentinel"` definition (every Bakr/Candlestix definition in the
+   * S5 mapping) was still capped and counted against the fleet limit.
+   * When given, cleared and rebuilt every poll from THIS poll's eligible
+   * matches, keyed identically to `discovery.idOf` — the daemon passes the
+   * SAME map instance into `roleOfAgent`, which consults it for a
+   * `managed-sessions` id before falling back to the (fixed, always
+   * `"worker"`) built-in rule's own role. Deliberately rebuilt, never
+   * merged, so a definition that goes ineligible (removed, edited invalid,
+   * frozen) stops being sentinel-exempt on the SAME poll it drops out,
+   * never lingering stale. Before this loop's first poll completes (e.g.
+   * right after a daemon restart, before an already-running managed-session
+   * agent's OWN definition has been read again), the map has no entry for
+   * it yet, and `roleOfAgent` falls back to `"worker"` — the same
+   * fail-safe default it already documents for "cannot be resolved".
+   */
+  roles?: Map<string, AgentRole>;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
   const onOversized = onceOversized(deps.log);
   const onInvalid = onceInvalidDefinition(deps.log);
   const onFrozen = onceFrozenDefinition(deps.log);
+  const onMissingRoot = onceMissingRoot(deps.log);
   return {
     discovery: {
       idOf: unitAgentKey,
-      search: async () => groupExecutionUnits([deps.rule], await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen)),
+      search: async () => {
+        const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot);
+        if (deps.roles) {
+          deps.roles.clear();
+          for (const m of matches) deps.roles.set(m.agentKey, m.definition.role);
+        }
+        return groupExecutionUnits([deps.rule], matches);
+      },
     },
     activation: { verdictFor: () => "active" },
     eventRules: createSessionDefinitionEventRules(),

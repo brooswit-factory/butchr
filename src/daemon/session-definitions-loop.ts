@@ -15,6 +15,7 @@ import type { FilesystemQuery } from "../resources/filesystem-query.js";
 import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { sessionDefinitionsPath, type SessionDefinitionsEnv } from "../resources/session-definition.js";
 import type { NotifyReason } from "../resources/types.js";
+import type { AgentRole } from "../rules/rules.js";
 import { builtinManagedSessionsRule, createManagedSessionResourceType, ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { runResourceLoop } from "./loop.js";
 
@@ -29,6 +30,8 @@ export interface ManagedSessionsLoopDeps {
   list?: (query: FilesystemQuery) => Promise<FilesystemResource[]>;
   /** Injectable so tests use an in-memory map instead of real disk. */
   read?: (path: string) => Promise<string>;
+  /** See `ManagedSessionResourceDeps.roles` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no role information is surfaced (existing behaviour unchanged). */
+  roles?: Map<string, AgentRole>;
   herd: Herd;
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
@@ -56,6 +59,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     list: deps.list ?? listFilesystemResources,
     read: deps.read ?? ((path) => readFile(path, "utf8")),
     log: deps.log,
+    ...(deps.roles ? { roles: deps.roles } : {}),
   });
   return runResourceLoop(type, {
     herd: deps.herd,

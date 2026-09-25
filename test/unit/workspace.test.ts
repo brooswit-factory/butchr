@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
@@ -511,7 +512,7 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("BUTCHR-408: spec.cwd overrides workspaceDirFor — bookkeeping files land in the real working directory, not the synthetic <root>/<provider>/... tree", () => {
+  test("PR #394 review fix 2: spec.cwd does NOT redirect buildWorkspace — bookkeeping files always land in workspaceDirFor(spec.key), never in an operator's own working directory", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-root-"));
     const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
@@ -520,12 +521,60 @@ describe("buildWorkspace", () => {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
       const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp");
-      expect(dir).toBe(real);
-      expect(dir).not.toBe(workspaceDirFor(key, root));
-      expect(existsSync(join(real, "CLAUDE.md"))).toBe(true);
-      expect(existsSync(join(real, "brief.md"))).toBe(true);
-      expect(existsSync(join(real, "mcp.json"))).toBe(true);
-      expect(existsSync(workspaceDirFor(key, root))).toBe(false);
+      expect(dir).toBe(workspaceDirFor(key, root));
+      expect(dir).not.toBe(real);
+      expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
+      expect(existsSync(join(dir, "brief.md"))).toBe(true);
+      expect(existsSync(join(dir, "mcp.json"))).toBe(true);
+      // The operator's own working directory is untouched — nothing was ever written there.
+      expect(existsSync(join(real, "CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(real, "brief.md"))).toBe(false);
+      expect(existsSync(join(real, "mcp.json"))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("PR #394 review fix 2: agentLaunchConfig sends the launched PROCESS to spec.cwd while mcp config stays anchored to the bookkeeping dir, for both vendors", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: "/repo/some-project" };
+    const bookkeepingDir = "/butchr-workspaces/filesystem/managed-sessions/%2Fetc%2Fdefs%2Fa.json";
+    const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
+    expect(claudeLaunch.cwd).toBe("/repo/some-project");
+    expect((claudeLaunch as { mcpConfigPath: string }).mcpConfigPath).toBe(`${bookkeepingDir}/mcp.json`);
+    const codexLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "codex" });
+    expect(codexLaunch.cwd).toBe("/repo/some-project");
+    // No spec.cwd: falls back to the bookkeeping dir, today's exact pre-BUTCHR-408 behaviour for every other spec.
+    const noOverride: SpawnSpec = { key: "AGY-1", issuetype: "Task", summary: "s", parent: null };
+    expect(agentLaunchConfig(noOverride, "/some/dir", "pane-1", "name", { provider: "claude" }).cwd).toBe("/some/dir");
+  });
+
+  test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-root2-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    const real = mkdtempSync(join(tmpdir(), "bw-real-project-"));
+    const ownClaudeMd = "# This project's own instructions — do not touch.\n";
+    const ownAgentsMd = "# This project's own AGENTS.md — do not touch.\n";
+    const ownMcpJson = JSON.stringify({ mcpServers: { "some-other-server": { type: "http", url: "https://example.test" } } });
+    writeFileSync(join(real, "CLAUDE.md"), ownClaudeMd);
+    writeFileSync(join(real, "AGENTS.md"), ownAgentsMd);
+    writeFileSync(join(real, "mcp.json"), ownMcpJson);
+    try {
+      for (const provider of ["claude", "codex"] as const) {
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: `/etc/defs/${provider}.json` });
+        const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
+        const dir = buildWorkspace(spec, "http://x/mcp", provider);
+        const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
+        expect(launch.cwd).toBe(real);
+        // Byte-identical: the operator's own files were never opened for writing.
+        expect(readFileSync(join(real, "CLAUDE.md"), "utf8")).toBe(ownClaudeMd);
+        expect(readFileSync(join(real, "AGENTS.md"), "utf8")).toBe(ownAgentsMd);
+        expect(readFileSync(join(real, "mcp.json"), "utf8")).toBe(ownMcpJson);
+      }
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

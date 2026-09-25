@@ -19,9 +19,12 @@ in order: `BUTCHR_SESSION_DEFINITIONS_DIR` (explicit override) else
 operator who knows one recognises the other immediately. Unlike `rulesPath`,
 this names a DIRECTORY, not a file: one `*.json` manifest per managed agent,
 direct children only (no recursion — a definition is never nested). A
-missing directory is zero definitions, nothing staffed, no error — same
-"absent means empty, not broken" discipline as a missing default
-`rules.json`.
+missing directory is zero definitions, nothing staffed, no error, no
+`/health` failure — same "absent means empty, not broken" discipline as a
+missing default `rules.json` (`isMissingRootError`, `src/resources/filesystem.ts`,
+distinguishes "does not exist" (`ENOENT`) from "exists but unreadable, or
+is not a directory", which still fails the poll loudly — see
+`searchSessionDefinitions`'s own doc comment, PR #394 review fix 3).
 
 Root resolution happens once at daemon startup (a directory-var change
 takes effect on restart, not live), like every other provider's query.
@@ -51,7 +54,7 @@ takes effect on restart, not live), like every other provider's query.
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). Stored only — the Rocket.Chat account lifecycle itself is unimplemented for every provider today, managed sessions included. |
-| `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Stored, validated — NOT yet read by the fleet-cap admission classifier; see "Not in this version". |
+| `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
 | `frozen` | no | `false` default. A frozen definition is a VALID one that simply runs no agent — see "Eligible = valid, not frozen" below. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
@@ -110,6 +113,37 @@ grounds to fix this table, not to distrust the reporter.
 verified read of the live file ever disagrees — nothing else in this
 codebase encodes tier names.
 
+## role -> fleet-capacity admission
+
+A definition's own `role` actually exempts its agent from the fleet
+capacity cap — a `role: "sentinel"` manifest (every Bakr/Candlestix
+definition in the S5 mapping) is not withheld by, and does not count
+toward, the admission limit, same as a rule-level `role: "sentinel"`
+already did before this ticket.
+
+Butchr's existing fleet-cap classifier, `roleOfAgent` (`src/daemon/index.ts`,
+BUTCHR-398), resolves a role from a `Rule` — but the built-in
+managed-sessions rule is ONE shared `Rule` for every heterogeneous
+definition file, so a per-file role needs a different hook than a
+per-rule lookup. That hook is `managedSessionRoles`, a
+`Map<agentKey, AgentRole>` the managed-sessions loop rebuilds every poll
+from that poll's eligible (valid, not frozen) matches — cleared and
+refilled, never merged, so a definition that goes ineligible (removed,
+edited invalid, frozen) stops being sentinel-exempt the SAME poll it drops
+out. `roleOfAgent` consults this map first for any managed-session agent
+id, before falling back to its ordinary rule-level lookup (which — for the
+built-in rule specifically — is always `"worker"`, since that rule's own
+`role` never reflects a per-file value; see
+`builtinManagedSessionsRule`'s own doc comment).
+
+**Before this loop's first poll after a daemon restart** (e.g. an
+already-running sentinel agent whose definition has not been read again
+yet), the map has no entry, and `roleOfAgent` falls back to `"worker"` —
+the SAME fail-safe default it already documents for any id it cannot
+resolve. This is a brief, one-poll-cycle window (`MANAGED_SESSIONS_POLL_MS`
+= 15s, and the loop's own fetch runs immediately on start, not only after
+the first interval), not a persistent gap.
+
 ## Eligible = valid, not frozen
 
 The built-in query's own definition of "eligible" (the ticket's own words),
@@ -154,16 +188,27 @@ precedent `filesystem` already has for its own swarm agents.
 ## Working directory wiring
 
 `SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) is the one new seam
-in the shared spawn machinery: when set, `buildWorkspace` writes the
-bookkeeping files (CLAUDE.md/AGENTS.md/brief.md/mcp.json/ENVIRONMENT.md)
-directly into THAT directory instead of the synthetic
-`<workspace root>/filesystem/managed-sessions/<encoded-path>` tree every
-other filesystem resource gets, and `agentLaunchConfig` launches the agent
-with that same directory as its real process `cwd`. This is necessary,
-not cosmetic: a Bakr agent's whole point is working IN its own project
-directory, and Claude/Codex read their own CLAUDE.md/AGENTS.md from their
-own `cwd` at startup — writing bookkeeping into a directory the agent never
-looks at would mean it never sees its own brief.
+in the shared spawn machinery: when set, it becomes the spawned PROCESS's
+real working directory (`agentLaunchConfig`, `src/agents/argv.ts`) — a
+Bakr agent's whole point is working IN its own project directory, and
+Claude/Codex read their own CLAUDE.md/AGENTS.md from their own `cwd` at
+startup.
+
+**It does NOT change where butchr's own bookkeeping files land.**
+`buildWorkspace` always writes CLAUDE.md/AGENTS.md/brief.md/mcp.json/
+ENVIRONMENT.md to the ordinary synthetic
+`<workspace root>/filesystem/managed-sessions/<encoded-path>` directory
+(`workspaceDirFor(spec.key)`) — the SAME directory every other filesystem
+resource already gets, regardless of `spec.cwd`. An earlier version of
+this ticket had `spec.cwd`, when set, redirect the bookkeeping files
+themselves into the operator's own working directory; PR #394's review
+caught this live (`buildWorkspace` overwriting a real project's own
+pre-existing `CLAUDE.md`/`AGENTS.md`/`mcp.json` with butchr's own,
+violating "preserve existing workspaces") and it was fixed before merge.
+The two directories are kept deliberately separate now: the spawned
+process's `--mcp-config` argv value is an ABSOLUTE path into the
+bookkeeping directory, not resolved relative to the process's own `cwd`,
+so it keeps working fine even though the two differ.
 
 **Tradeoff, documented rather than solved by this ticket**:
 `agentIdOfWorkspacePath`'s reverse mapping (a pane's `cwd` -> its agent id)
@@ -193,19 +238,6 @@ permission wiring is out of scope for this ticket.
 
 - **`mcpServers`/channel bindings** — deferred to S4 (BUTCHR-395/BUTCHR-411);
   see "`mcpServers`/`channels`: deferred to S4" above.
-- **The real Candlestix tier -> model table** — provisional; see "Tier ->
-  model mapping" above.
-- **A managed-session agent's own `role` is not read by the fleet-capacity
-  admission classifier.** `roleOfAgent` (`src/daemon/index.ts`) resolves a
-  role from a `Rule`, and the built-in managed-sessions rule is ONE shared
-  `Rule` for every heterogeneous definition file — a per-DEFINITION role
-  needs a different hook than the rule-level classifier BUTCHR-398 built.
-  Every managed-session agent is classified `"worker"` today, same as an
-  unflagged rule's agents always were before BUTCHR-398. `role` is still
-  fully validated and stored on the manifest (default `"worker"`,
-  `"sentinel"` accepted) — wiring it into the fleet cap is a natural
-  follow-up once there is a clean per-resource role hook, not something
-  this ticket patches around with module-level mutable state.
 - **The Rocket.Chat account lifecycle** (`account: "temporary"|"permanent"`)
   — accepted and stored, like every `Rule`'s own `account` field, but
   implements nothing; the account lifecycle itself is a later story for

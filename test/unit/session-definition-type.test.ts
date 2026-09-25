@@ -8,11 +8,13 @@ import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import {
   builtinManagedSessionsRule, createManagedSessionResourceType, createSessionDefinitionEventRules,
-  MANAGED_SESSIONS_RULE_ID, onceFrozenDefinition, onceInvalidDefinition, ownsManagedSessionAgent,
+  MANAGED_SESSIONS_RULE_ID, onceFrozenDefinition, onceInvalidDefinition, onceMissingRoot, ownsManagedSessionAgent,
   searchSessionDefinitions, specForSessionDefinition, specForSessionDefinitionUnit,
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
+import { listFilesystemResources } from "../../src/resources/filesystem.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
   ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
@@ -90,6 +92,19 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
     expect(skipped).toEqual([oversized]);
   });
 
+  test("PR #394 review fix 3: a missing well-known directory (ENOENT) is 0 definitions, NEVER a poll error — reported via onMissingRoot, once", async () => {
+    const missing: number[] = [];
+    const list = async (): Promise<FilesystemResource[]> => { throw Object.assign(new Error("filesystem root /nope is not readable: ENOENT: no such file or directory, realpath '/nope'"), { code: "ENOENT" }); };
+    const matches = await searchSessionDefinitions({ rule, list, read: async () => "" }, undefined, undefined, undefined, () => missing.push(1));
+    expect(matches).toEqual([]);
+    expect(missing).toEqual([1]);
+  });
+
+  test("PR #394 review fix 3: a root that exists but is unreadable/not-a-directory (any OTHER error code) still fails the whole poll", async () => {
+    const list = async (): Promise<FilesystemResource[]> => { throw Object.assign(new Error("filesystem root /defs is not readable: ENOTDIR: not a directory"), { code: "ENOTDIR" }); };
+    await expect(searchSessionDefinitions({ rule, list, read: async () => "" })).rejects.toThrow("ENOTDIR");
+  });
+
   test("mixed: one valid, one invalid, one frozen — only the valid one is eligible, nothing crashes", async () => {
     const { list, read } = fakeFiles({
       "/defs/ok.json": JSON.stringify(goodDef()),
@@ -115,6 +130,24 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
     const onFrozen = onceFrozenDefinition((l) => lines.push(l));
     onFrozen("/defs/a.json"); onFrozen("/defs/a.json");
     expect(lines).toHaveLength(1);
+  });
+  test("PR #394 review fix 3: the missing-root FYI logs only once, never respammed while it stays missing", () => {
+    const lines: string[] = [];
+    const onMissingRoot = onceMissingRoot((l) => lines.push(l));
+    onMissingRoot(); onMissingRoot(); onMissingRoot();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("not an error");
+  });
+});
+
+describe("PR #394 review fix 3, end-to-end: a genuinely nonexistent well-known directory never fails the poll", () => {
+  test("createManagedSessionResourceType against the REAL listFilesystemResources (not a fake) on a directory that does not exist", async () => {
+    const rule = builtinManagedSessionsRule("/definitely/does/not/exist/on/this/machine");
+    const logs: string[] = [];
+    const type = createManagedSessionResourceType({ rule, list: listFilesystemResources, read: async () => "", log: (l) => logs.push(l) });
+    const units = await type.discovery.search(); // must NOT throw
+    expect(units).toEqual([]);
+    expect(logs.some((l) => l.includes("does not exist yet"))).toBe(true);
   });
 });
 
@@ -168,6 +201,56 @@ describe("createManagedSessionResourceType", () => {
     expect(units.map((u) => type.discovery.idOf(u))).toEqual([encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" })]);
     files = {};
     expect((await type.discovery.search()).length).toBe(0);
+  });
+
+  test("PR #394 review fix 1: `roles` is cleared and rebuilt every search from each eligible match's OWN manifest role, keyed by agent key — a frozen/removed definition's role does not linger", async () => {
+    let files: Record<string, string> = {
+      "/defs/a.json": JSON.stringify(goodDef({ role: "sentinel" })),
+      "/defs/b.json": JSON.stringify(goodDef({ role: "worker" })),
+    };
+    const { list } = fakeFiles(files);
+    const rule = builtinManagedSessionsRule("/defs");
+    const roles = new Map<string, "worker" | "sentinel">();
+    const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, roles });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    await type.discovery.search();
+    expect(roles.get(keyA)).toBe("sentinel");
+    expect(roles.get(keyB)).toBe("worker");
+    // b.json goes frozen (still valid, but ineligible) — its role entry must not linger.
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ role: "worker", frozen: true })) };
+    await type.discovery.search();
+    expect(roles.get(keyA)).toBe("sentinel");
+    expect(roles.has(keyB)).toBe(false);
+  });
+
+  test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {
+    const files: Record<string, string> = {
+      "/defs/sentinel.json": JSON.stringify(goodDef({ role: "sentinel", workingDirectory: "/repo/sentinel" })),
+      "/defs/worker-a.json": JSON.stringify(goodDef({ role: "worker", workingDirectory: "/repo/worker-a" })),
+      "/defs/worker-b.json": JSON.stringify(goodDef({ role: "worker", workingDirectory: "/repo/worker-b" })),
+    };
+    const { list, read } = fakeFiles(files);
+    const rule = builtinManagedSessionsRule("/defs");
+    const roles = new Map<string, "worker" | "sentinel">();
+    const type = createManagedSessionResourceType({ rule, list, read, roles });
+    const units = await type.discovery.search();
+    const candidates = units.map((u) => type.discovery.idOf(u));
+    expect(candidates.length).toBe(3);
+
+    const controller = createAdmissionController({
+      cap: 1, // only ONE worker slot — the sentinel must not consume it
+      residency: async () => [],
+      roleOf: (id) => roles.get(id) ?? "worker",
+      sources: ["managed-sessions"],
+    });
+    const admitted = await controller.admit(candidates, [], "managed-sessions");
+
+    const sentinelId = candidates.find((id) => id.includes("sentinel.json"))!;
+    const workerIds = candidates.filter((id) => id.includes("worker-"));
+    expect(admitted).toContain(sentinelId); // sentinel: always admitted, per role
+    expect(admitted.filter((id) => workerIds.includes(id)).length).toBe(1); // worker: capped at 1
+    expect(admitted.length).toBe(2); // sentinel + exactly one worker, not all three
   });
 
   test("activation is always active for whatever reaches it (frozen/invalid never do)", () => {
