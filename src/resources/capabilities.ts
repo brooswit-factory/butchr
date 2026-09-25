@@ -1,9 +1,10 @@
 /**
- * FACTORY-20/23: capability declaration. Given a resource, calling code asks
- * which capability categories its provider actually supports today —
- * `capabilitiesOf`/`supports` — and gets a typed, programmatically
- * detectable failure (`UnsupportedCapabilityError`) rather than a silent
- * no-op or a faked result when it invokes one that isn't. See
+ * FACTORY-20/23 (mechanism), FACTORY-21 (comments extended to jira-idea,
+ * github-issue, zendesk-ticket): capability declaration. Given a resource,
+ * calling code asks which capability categories its provider actually
+ * supports today — `capabilitiesOf`/`supports` — and gets a typed,
+ * programmatically detectable failure (`UnsupportedCapabilityError`) rather
+ * than a silent no-op or a faked result when it invokes one that isn't. See
  * docs/provider-capabilities.md for the full 8x6 inventory this table is
  * built from, file:function evidence per cell, and every deviation from the
  * original handoff proposal.
@@ -91,11 +92,11 @@ export class UnsupportedCapabilityError extends Error {
 const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  "jira-idea": { query: true, read: true, snapshot: false, comments: false, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: false, links: true, createTask: false },
-  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: false, links: false, createTask: false },
-  filesystem: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
+  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
 };
 
