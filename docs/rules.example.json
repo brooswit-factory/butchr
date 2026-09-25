@@ -1,0 +1,34 @@
+{
+  "rules": [
+    {
+      "id": "epics",
+      "resourceProvider": "jira-work",
+      "query": "assignee = currentUser() AND issuetype = Epic AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "@builtin:epic"
+    },
+    {
+      "id": "stories",
+      "resourceProvider": "jira-work",
+      "query": "assignee = currentUser() AND issuetype = Story AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "@builtin:story"
+    },
+    {
+      "id": "tasks",
+      "resourceProvider": "jira-work",
+      "query": "assignee = currentUser() AND issuetype = Task AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "@builtin:task"
+    },
+    {
+      "id": "bugs",
+      "resourceProvider": "jira-work",
+      "query": "assignee = currentUser() AND issuetype = Bug AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "@builtin:bug"
+    },
+    {
+      "id": "subtasks",
+      "resourceProvider": "jira-work",
+      "query": "assignee = currentUser() AND issuetype = \"Sub-task\" AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "You own one subtask. Read it with jira_get_issue — its description and its parent's ticket say what done means. Do exactly that work, then report_to_boss (no key — it always posts to YOUR OWN ticket) and submit_to_boss (no arguments) to move it to In Review. If an outward action (a `gh` command, `git push`, a jira_*/butchr call) gets a permission prompt or \"denied\", don't assume policy: check your own claude argv and report it on your ticket rather than retrying blindly."
+    }
+  ]
+}
