@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
@@ -15,7 +15,7 @@ import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentPreference } from "../rules/rules.js";
+import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 
 /**
  * `key` is the herd identity: a rule-engine agent key
@@ -37,6 +37,72 @@ export interface SpawnSpec {
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
   externalMcpServers?: Array<{ name: string; url: string; headers?: Record<string, string> }>;
+  /**
+   * BUTCHR-408: where a managed-session agent should actually WORK — a
+   * Bakr agent's own project directory, never a synthetic
+   * `<workspaceRoot>/filesystem/...` bookkeeping tree.
+   *
+   * PR #394 review, round 3 — NOT the launched process's own OS-level cwd,
+   * despite an earlier version of this comment (and this ticket's own
+   * text) saying so. Two independent, load-bearing invariants make that
+   * unsafe, both discovered live reproducing this exact ticket's own
+   * staged spawn test through the REAL `HerdrHerd` + `@brooswit/drovr`
+   * `ManagedHerdrLifecycle` (not a stub — see test/unit/herd.test.ts):
+   *
+   * 1. `ManagedHerdrLifecycle` (`herd.ts`'s `lifecycle()`) is constructed
+   *    with ONE fixed `cwd` — always `workspaceDirFor(issue)` — and
+   *    HARD-REQUIRES the prepared launch's own `cwd` to equal it exactly
+   *    (`"Launch does not match selected provider and workspace"` if not).
+   *    It uses that SAME `cwd` to create the herdr workspace/pane AND as
+   *    the residency key it scans `herdr.agent.list()` against. There is
+   *    no seam in Drovr's current API for "the pane's OS cwd differs from
+   *    its own workspace identity."
+   * 2. `HerdrHerd.runningIssues()`/`byIssue()` (this file's own
+   *    `agentIdOfWorkspacePath`) reverse-maps a live pane's cwd back to an
+   *    agent id by assuming the fixed `workspaceDirFor` 1-or-3-deep shape.
+   *    A pane at an ARBITRARY operator directory returns `null` there — it
+   *    would be permanently invisible to `runningIssues()`, which EVERY
+   *    reconciliation call (`scopedHerd`, admission residency, the
+   *    daemon's own no-double-owner guarantee) is built on. This is core,
+   *    heavily-shared daemon machinery every other provider also depends
+   *    on — not something to patch around under review pressure.
+   *
+   * Given both, the launched process's cwd is ALWAYS `workspaceDirFor`
+   * (unchanged for every existing and managed-session spec alike — see
+   * `agentLaunchConfig`, src/agents/argv.ts). `cwd` here is instead
+   * communicated to the agent through its own KICKOFF instructions
+   * (`kickoffFor`, src/agents/argv.ts): told explicitly to `cd` there
+   * before doing anything else. `buildWorkspace` (below) still always
+   * writes CLAUDE.md/AGENTS.md/brief.md/mcp.json/ENVIRONMENT.md to
+   * `workspaceDirFor(spec.key)`, exactly as it does for every other spec —
+   * never into `cwd`, for the SAME reason as before (PR #394 review, round
+   * 1): `cwd` names an OPERATOR's own project directory, which may already
+   * hold its own `CLAUDE.md`/`AGENTS.md`, and butchr writing its own
+   * bookkeeping files there would silently destroy them — see
+   * `docs/managed-sessions.md`'s "Working directory wiring".
+   *
+   * Absent (the default for every existing caller), behaviour is
+   * byte-for-byte unchanged: `kickoffFor` falls straight through to its
+   * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
+   */
+  cwd?: string;
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */
+  permissionMode?: string;
+  /**
+   * BUTCHR-408: additional MCP servers this agent may connect to, beyond
+   * butchr's own — a managed-session definition's own `mcpServers`
+   * (src/resources/session-definition.ts). `McpServerBinding` (src/rules/rules.ts)
+   * was ported there from S4's (BUTCHR-395/BUTCHR-411) branch as source
+   * material per the epic's sequencing decision; when S4's own
+   * `Rule.mcpServers` lands it should reach `SpawnSpec` through this SAME
+   * field, not a second one — see `boundChannels`/`boundCodexServers`
+   * (src/agents/argv.ts) for how a binding turns into launch argv, and
+   * `resolveMcpServerHeaders`/`workspaceMcpServers` below for how a header
+   * VALUE is kept out of everywhere but this daemon's own environment and a
+   * Claude workspace's `mcp.json`. Absent/empty means none — today's
+   * behaviour exactly.
+   */
+  mcpServers?: readonly McpServerBinding[];
 }
 
 
@@ -208,10 +274,60 @@ export const singleResourceOf = (id: string): string | null => (decodeQueryAgent
  * ENVIRONMENT.md (the same ground truth, standalone). Returns the
  * directory — the agent's cwd.
  */
+/**
+ * PR #394 review fix (Nexus MCP isolation, round 2): the round-1 guarantee
+ * ("butchr never writes a `.mcp.json`") was necessary but not sufficient —
+ * Claude's own `--mcp-config` is ADDITIVE to its ordinary project-level
+ * `.mcp.json` discovery (`@brooswit/drovr` never passes
+ * `--strict-mcp-config`; verified by grepping its own built argv builder),
+ * and that discovery walks UP from the launched process's OWN cwd through
+ * every ancestor directory, not just the cwd itself. Since a managed-session
+ * agent's launched cwd is ALWAYS `workspaceDirFor(spec.key)` (never
+ * `spec.cwd` — see that field's own doc comment), a `.mcp.json` sitting in
+ * ANY ancestor of THAT directory (`workspaceRoot()`, its own parent, …) —
+ * not `spec.cwd`/`workingDirectory`, which the launched process never
+ * actually sits in or under — could still be inherited. Rather than assert
+ * an unverified claim about Claude's exact discovery behaviour, this
+ * GUARANTEES the property by refusing the spawn outright whenever the
+ * (small, fixed) ancestor chain actually contains one, walking all the way
+ * to the filesystem root — cheap (a handful of `existsSync` calls, once per
+ * spawn attempt) and unconditional, no assumption required either way.
+ * Scoped to managed-session specs only (`spec.cwd` set) per the review: a
+ * BARE `jira-work`/other-provider spec's `workspaceDirFor` ancestor chain is
+ * this same shared `workspaceRoot()` tree, but Nexus's own constraint was
+ * raised specifically against "the definitions-directory design".
+ */
+export function assertNoInheritedMcpConfig(dir: string): void {
+  let ancestor = dirname(dir);
+  while (true) {
+    if (existsSync(join(ancestor, ".mcp.json"))) {
+      throw new Error(`managed-session workspace ${dir} would inherit ${join(ancestor, ".mcp.json")} — a managed-session agent's launched cwd must have NO .mcp.json anywhere in its ancestor chain (Nexus's MCP isolation constraint); remove or relocate that file before this definition can spawn`);
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break; // reached the filesystem root ("/")
+    ancestor = parent;
+  }
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
+  // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
+  // comment for why butchr's bookkeeping files must never land in an
+  // operator's own project directory. `spec.cwd`, when present, only ever
+  // reaches the launched PROCESS's cwd (`agentLaunchConfig`, src/agents/argv.ts).
   const dir = workspaceDirFor(spec.key);
+  if (spec.cwd !== undefined) assertNoInheritedMcpConfig(dir);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
+  // BUTCHR-408: `McpServerBinding` never carries a resolved header VALUE
+  // (only `headersEnvVar`, an env var NAME) — see that type's own doc
+  // comment (src/rules/rules.ts) — so, unlike `.butchr-external-mcp.json`
+  // above, this file carries nothing secret and needs no tightened mode.
+  // `staleIssues()` (src/agents/herd.ts) reads it back via
+  // `workspaceMcpServers` (below) to rebuild the expected argv for an
+  // already-running managed-session agent, the same "persist non-secret
+  // spawn intent, re-derive it at staleness-check time" shape
+  // `.butchr-external-mcp.json`/`workspaceExternalMcp` already established.
+  if (spec.mcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-mcp-servers.json"),JSON.stringify(spec.mcpServers)); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
@@ -241,7 +357,30 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])) } }, null, 2));
+  if (provider === "claude") {
+    // BUTCHR-408: a bound server (spec.mcpServers) lands in mcp.json
+    // alongside butchr's own and any externalMcpServers, `channel: true` or
+    // not — mcp.json is what gives Claude MCP TOOL access; the channel flag
+    // (`boundChannels`, src/agents/argv.ts) is the separate, additive
+    // decision about PUSH notifications. No bindings -> byte-identical to
+    // before (Object.fromEntries([]) spreads nothing).
+    let hasSecretHeaders = false;
+    const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
+      const headers = resolveMcpServerHeaders(b);
+      if (headers) hasSecretHeaders = true;
+      return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
+    }));
+    const mcpJsonPath = join(dir, "mcp.json");
+    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
+    // A bound server's resolved header VALUE (often a bearer token) must
+    // never sit in a group/other-readable file at the default umask —
+    // `writeFileSync`'s own `mode` option only ever applies when it CREATES
+    // the file (a rebuilt workspace's mcp.json already exists), so this is
+    // an explicit chmod, not a write option, and only when this write
+    // actually carries a secret; a binding-less (or headers-less) mcp.json
+    // keeps its exact previous permissions, untouched.
+    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
+  }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -330,3 +469,49 @@ export function workspaceExternalMcp(dir:string):SpawnSpec['externalMcpServers']
   try {return JSON.parse(readFileSync(join(dir,'.butchr-external-mcp.json'),'utf8'));}
   catch(e) {if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}
 }
+
+/**
+ * BUTCHR-408: the persisted, non-secret counterpart of `workspaceExternalMcp`
+ * above, for `spec.mcpServers` (`.butchr-mcp-servers.json`, `buildWorkspace`).
+ * Lets `staleIssues()` (src/agents/herd.ts) rebuild an already-running
+ * managed-session agent's expected argv (channel flags, Codex tool list)
+ * without HerdrHerd holding any rule/definition state of its own — same
+ * read-the-workspace-back shape, same reason.
+ */
+export function workspaceMcpServers(dir: string): SpawnSpec["mcpServers"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * Header VALUES for a bound MCP server (BUTCHR-408, type ported from S4's
+ * BUTCHR-395 branch — see `McpServerBinding`'s own doc comment,
+ * src/rules/rules.ts), resolved from THIS DAEMON's own environment — never
+ * from a session-definition file, which only ever names the env var
+ * (`McpServerBinding.headersEnvVar`). `env` defaults to `process.env` for
+ * every real caller; tests pass an explicit map instead of touching the
+ * process environment. Missing var, empty value, invalid JSON, or JSON
+ * that isn't a flat string-valued object all resolve to `undefined`
+ * (connect with no extra headers) rather than throwing — a malformed/unset
+ * secret must not crash workspace building or launch. `log` (default
+ * `console.error`, overridable for tests) prints exactly one line naming
+ * the BINDING and the ENV VAR — never the value, never the raw env content
+ * — whenever `headersEnvVar` was named but produced no usable headers, so
+ * an authenticated bridge that silently connects unauthenticated has
+ * something pointing back at the cause.
+ */
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
+  if (!binding.headersEnvVar) return undefined;
+  const raw = env[binding.headersEnvVar];
+  const parsed = raw ? tryParseHeaders(raw) : undefined;
+  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+  return parsed;
+}
+
+const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
+  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
+  return undefined;
+};

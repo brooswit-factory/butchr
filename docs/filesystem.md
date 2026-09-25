@@ -200,6 +200,19 @@ Jira ticket, `get_doc`/`set_doc` and every relationship verb
 limit every other key-only provider's query-level agent has (see
 `docs/execution-modes.md`'s "What tools a query-level agent has").
 
+## Query-based agents are free-form (non-goal, recorded on the epic)
+
+Per BUTCHR-391's own epic-level decision: a `filesystem` rule's agents
+(managed-session definitions, BUTCHR-408, included) do NOT get butchr's
+upstream/downstream boss/worker relationship model. No `Implements` links,
+no `report_to_boss`/`submit_to_boss` routing, no `childRule`/
+`inwardConnectionRules` wiring tied to hierarchy — this is the same limit
+"What an agent can do" above already describes for `get_doc`/`set_doc` and
+the relationship verbs, restated here as the deliberate design decision it
+is, not an oversight. Query-based agents are free-form; they act on
+Jira/Confluence through the Atlassian MCP, and butchr's hierarchy verbs are
+for jira-work ticket agents (Epic/Story/Task) only.
+
 ## Not in this version
 
 - No `fs.watch`/inotify — polling only (deterministic, injectable, and the

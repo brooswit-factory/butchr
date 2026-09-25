@@ -78,6 +78,95 @@ export type AgentRole = (typeof AGENT_ROLES)[number];
 
 export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
 
+/** MCP server binding shapes a rule/definition can bind to, beyond butchr's own. Only `http` today. */
+export const MCP_SERVER_BINDING_TYPES = ["http"] as const;
+export type McpServerBindingType = (typeof MCP_SERVER_BINDING_TYPES)[number];
+
+/** The name every launch already reserves for butchr's own MCP server; no binding may reuse it. */
+export const RESERVED_MCP_SERVER_NAME = "butchr";
+
+/**
+ * One additional MCP server an agent may connect to, beyond butchr's own
+ * (BUTCHR-411/CNDLX-45; type ported here from that story's BUTCHR-395
+ * branch, PR #387 merge commit 5520722, per the epic's sequencing decision
+ * on BUTCHR-408 — S4 had not landed this on `main` when this story's own
+ * agent needed it, so this is source material copied verbatim, not a
+ * competing shape; when S4 lands `Rule.mcpServers` on `main` it should
+ * reuse this exact type rather than reintroducing it). `channel: true`
+ * means Claude also receives this server's push notifications — one more
+ * `--dangerously-load-development-channels=server:<name>` entry, the exact
+ * mechanism `server:butchr` already relies on (src/agents/argv.ts) — so
+ * event-driven delivery from a non-Rocket.Chat MCP server (e.g. a MUD
+ * bridge) needs no polling substitute. `channel: false` still reaches
+ * `mcp.json`/the Codex `mcpServers` config (tools work) but is never added
+ * to the channel flag.
+ *
+ * `headersEnvVar`, not `headers`: header VALUES (often bearer tokens) are
+ * never written into a rules file or a managed-session definition file
+ * itself — only the NAME of an env var on THIS DAEMON's own process that
+ * holds a JSON object of header values, resolved at launch time
+ * (`resolveMcpServerHeaders`, src/agents/workspace.ts). A binding with no
+ * `headersEnvVar`, or one naming an unset/malformed var, simply connects
+ * with no extra headers (logged once, value never logged). A resolved
+ * header value is written ONLY into a Claude workspace's `mcp.json`
+ * (permission-tightened when it carries one) — NEVER into Codex argv,
+ * which is a real process command line other local users can read (PR
+ * #387 review finding): a Codex agent gets a bound server's tools with no
+ * extra headers, regardless of `headersEnvVar` (BUTCHR-408's own manifest
+ * doc calls this out for its Codex example definitions too).
+ */
+export interface McpServerBinding {
+  name: string;
+  type: McpServerBindingType;
+  url: string;
+  headersEnvVar?: string;
+  channel: boolean;
+}
+
+const isHttpUrl = (v: unknown): boolean => {
+  if (typeof v !== "string" || v.trim() === "") return false;
+  try { const u = new URL(v.trim()); return u.protocol === "http:" || u.protocol === "https:"; }
+  catch { return false; }
+};
+
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "channel"]);
+
+/**
+ * Same validator shape as every other `parse*` helper in this file: collects
+ * every problem into `errors` and returns `undefined` when any exist (the
+ * caller never uses a partially-valid result). `at` names the field for
+ * error text (e.g. `rules[2].mcpServers` or a session definition's own
+ * `<path>.mcpServers`) — this function is deliberately caller/document
+ * agnostic so both `Rule` (S4, once it lands) and a session definition
+ * (BUTCHR-408) can share it without either owning the other's shape.
+ */
+export function parseMcpServers(raw: unknown, at: string, errors: string[]): McpServerBinding[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) { errors.push(`${at} must be a non-empty array`); return undefined; }
+  const seen = new Set<string>();
+  return raw.map((s, j) => {
+    const pat = `${at}[${j}]`;
+    if (!isObject(s)) { errors.push(`${pat} must be an object`); return undefined as never; }
+    unknownFields(s, MCP_SERVER_BINDING_FIELDS, pat, errors);
+    const name = typeof s.name === "string" ? s.name.trim() : "";
+    if (!nonEmpty(s.name) || !MCP_SERVER_NAME_RE.test(name)) errors.push(`${pat}.name must be a non-empty name of letters, digits, "_" or "-"`);
+    else if (name === RESERVED_MCP_SERVER_NAME) errors.push(`${pat}.name "${RESERVED_MCP_SERVER_NAME}" is reserved for butchr's own server`);
+    else if (seen.has(name)) errors.push(`${pat}.name "${name}" is a duplicate`);
+    else seen.add(name);
+    if (!oneOf(MCP_SERVER_BINDING_TYPES, s.type)) errors.push(`${pat}.type must be one of ${MCP_SERVER_BINDING_TYPES.join(", ")}`);
+    if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
+    const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
+    if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
+    if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
+    return {
+      name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
+      ...(headersEnvVar ? { headersEnvVar } : {}),
+      channel: s.channel as boolean,
+    };
+  });
+}
+
 /**
  * Relationships name other rules; how a link is realised in the resource
  * system (a Jira issue link, a backlink field) is the provider adapter's

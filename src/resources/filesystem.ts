@@ -64,6 +64,27 @@ export const MAX_VISITED = 200_000;
 /** Matched resources one query may report — the result-size cap. */
 export const MAX_RESULTS = 5_000;
 
+/**
+ * Wraps a root-resolution failure into the SAME "is not readable" Error
+ * message every existing caller/test already depends on (unchanged, on
+ * purpose — an ordinary `filesystem` rule's root failing the whole poll is
+ * still exactly right; see docs/filesystem.md's "Safety"), while attaching
+ * the underlying error's `.code` (`ENOENT`, `ENOTDIR`, `EACCES`, ...) as a
+ * plain property. BUTCHR-408 review fix: this is the seam that lets ONE
+ * caller (the managed-sessions loop, session-definition-type.ts) tell "the
+ * well-known directory does not exist yet" (`ENOENT` — not an error, just
+ * "no definitions") apart from "it exists but is unreadable, or is not a
+ * directory" (anything else — still a real failure) WITHOUT changing this
+ * function's own throwing behaviour or message shape for every other
+ * caller.
+ */
+function rootUnreadable(root: string, cause: unknown): Error {
+  return Object.assign(new Error(`filesystem root ${root} is not readable: ${(cause as Error)?.message ?? cause}`), { code: (cause as NodeJS.ErrnoException)?.code });
+}
+
+/** True for exactly the `listFilesystemResources` root-resolution failure that means "this root does not exist" — see `rootUnreadable`'s own doc comment for why this is `ENOENT` specifically, not "any listing error". */
+export const isMissingRootError = (e: unknown): boolean => (e as NodeJS.ErrnoException)?.code === "ENOENT";
+
 /** `*`/`?` glob, anchored to the WHOLE basename (never `/`, since a validated `namePattern` never contains one). */
 function globToRegExp(pattern: string): RegExp {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
@@ -86,7 +107,7 @@ async function predicateHolds(full: string, kind: "file" | "directory", predicat
 export async function listFilesystemResources(query: FilesystemQuery, io: FilesystemIo = realFilesystemIo): Promise<FilesystemResource[]> {
   let root: string;
   try { root = await io.realpath(query.root); }
-  catch (e) { throw new Error(`filesystem root ${query.root} is not readable: ${(e as Error)?.message ?? e}`); }
+  catch (e) { throw rootUnreadable(query.root, e); }
   const pattern = query.namePattern ? globToRegExp(query.namePattern) : null;
   const results: FilesystemResource[] = [];
   let visited = 0;
@@ -104,7 +125,7 @@ export async function listFilesystemResources(query: FilesystemQuery, io: Filesy
     let entries: Dirent[];
     try { entries = await io.readdir(dir); }
     catch (e) {
-      if (dir === root) throw new Error(`filesystem root ${query.root} is not readable: ${(e as Error)?.message ?? e}`);
+      if (dir === root) throw rootUnreadable(query.root, e);
       return; // vanished or turned unreadable mid-walk — not the root; skip quietly, see this module's own top comment.
     }
     for (const entry of entries) {
