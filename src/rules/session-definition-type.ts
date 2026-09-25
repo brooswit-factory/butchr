@@ -182,14 +182,16 @@ export async function searchSessionDefinitions(
 /**
  * The SpawnSpec for one eligible definition. `cwd`/`permissionMode`
  * (src/agents/workspace.ts, BUTCHR-408) are the two seams this ticket adds
- * to the shared spawn machinery: `cwd` makes the definition's own
- * `workingDirectory` the spawned agent's real process directory (see that
- * field's own doc comment for the workspace-identity tradeoff), and
- * `permissionMode` carries the definition's permission mode straight to a
- * Claude launch (Codex has no such field — see that field's own doc
- * comment). `agents` names exactly one preference (the definition's own
- * vendor/tier) — `spec.agents`, not `rule.agentPreferences`, is what makes
- * this heterogeneous per file despite one shared `Rule`.
+ * to the shared spawn machinery: `cwd` carries the definition's own
+ * `workingDirectory` through to the agent's own kickoff instructions — NOT
+ * the launched process's OS cwd, which stays the ordinary bookkeeping
+ * directory (see that field's own doc comment for why a literal process-cwd
+ * override broke Drovr's spawn invariants) — and `permissionMode` carries
+ * the definition's permission mode straight to a Claude launch (Codex has
+ * no such field — see that field's own doc comment). `agents` names
+ * exactly one preference (the definition's own vendor/tier) — `spec.agents`,
+ * not `rule.agentPreferences`, is what makes this heterogeneous per file
+ * despite one shared `Rule`.
  */
 export function specForSessionDefinition({ agentKey, resource, definition }: SessionDefinitionMatch): SpawnSpec {
   return {

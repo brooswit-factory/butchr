@@ -469,7 +469,13 @@ export class HerdrHerd implements Herd {
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label: spec.key,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
-      kickoff: kickoffFor,
+      // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
+      // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
+      // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
+      // its real working directory, then follow its definition's own
+      // brief — the launched process itself still starts at the ordinary
+      // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
+      kickoff: (provider) => kickoffFor(provider, spec),
       prepare: async provider => {
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;

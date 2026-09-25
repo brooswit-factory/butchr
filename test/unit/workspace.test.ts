@@ -538,21 +538,22 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("PR #394 review fix 2: agentLaunchConfig sends the launched PROCESS to spec.cwd while mcp config stays anchored to the bookkeeping dir, for both vendors", () => {
+  test("PR #394 review fix (round 3): agentLaunchConfig keeps the launched PROCESS at the bookkeeping dir even when spec.cwd is set — see SpawnSpec.cwd's own doc comment (Drovr's launch.cwd===workspace.cwd invariant) — while mcp config stays anchored there too, for both vendors", () => {
     const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
     const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: "/repo/some-project" };
     const bookkeepingDir = "/butchr-workspaces/filesystem/managed-sessions/%2Fetc%2Fdefs%2Fa.json";
     const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
-    expect(claudeLaunch.cwd).toBe("/repo/some-project");
+    expect(claudeLaunch.cwd).toBe(bookkeepingDir);
+    expect(claudeLaunch.cwd).not.toBe("/repo/some-project");
     expect((claudeLaunch as { mcpConfigPath: string }).mcpConfigPath).toBe(`${bookkeepingDir}/mcp.json`);
     const codexLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "codex" });
-    expect(codexLaunch.cwd).toBe("/repo/some-project");
-    // No spec.cwd: falls back to the bookkeeping dir, today's exact pre-BUTCHR-408 behaviour for every other spec.
+    expect(codexLaunch.cwd).toBe(bookkeepingDir);
+    // No spec.cwd: byte-for-byte unchanged behaviour for every other spec.
     const noOverride: SpawnSpec = { key: "AGY-1", issuetype: "Task", summary: "s", parent: null };
     expect(agentLaunchConfig(noOverride, "/some/dir", "pane-1", "name", { provider: "claude" }).cwd).toBe("/some/dir");
   });
 
-  test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors", () => {
+  test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors (round 3: the guarantee holds trivially now — butchr's process never even launches there)", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-root2-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -566,10 +567,12 @@ describe("buildWorkspace", () => {
     try {
       for (const provider of ["claude", "codex"] as const) {
         const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: `/etc/defs/${provider}.json` });
-        const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
+        const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
         const dir = buildWorkspace(spec, "http://x/mcp", provider);
         const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
-        expect(launch.cwd).toBe(real);
+        expect(launch.cwd).toBe(dir); // the process launches at the bookkeeping dir, not `real`
+        expect(launch.cwd).not.toBe(real);
+        expect(launch.prompt).toBe(""); // agentLaunchConfig itself never sets the kickoff — kickoffFor does, dispatched separately (herd.ts)
         // Byte-identical: the operator's own files were never opened for writing.
         expect(readFileSync(join(real, "CLAUDE.md"), "utf8")).toBe(ownClaudeMd);
         expect(readFileSync(join(real, "AGENTS.md"), "utf8")).toBe(ownAgentsMd);

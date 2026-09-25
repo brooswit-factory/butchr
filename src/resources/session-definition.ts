@@ -77,9 +77,11 @@ export interface SessionDefinition {
    * directory, a Candlestix session's own directory. Absolute, or `~`/`~/rest`
    * (expanded against the daemon's own `$HOME`, same rule as a filesystem
    * query's `root` — src/resources/filesystem-query.ts's `expandHome`).
-   * `session-definition-type.ts`'s `SpawnSpec.cwd` carries this straight
-   * through as the spawned agent's REAL process cwd (see that module's own
-   * doc comment for the workspace-identity tradeoff this implies).
+   * `specForSessionDefinition`'s `SpawnSpec.cwd` (src/rules/session-definition-type.ts)
+   * carries this through to the agent's own KICKOFF instructions, not the
+   * launched process's OS cwd — see `SpawnSpec.cwd`'s own doc comment
+   * (src/agents/workspace.ts) for why a literal process-cwd override is
+   * unsafe here.
    */
   workingDirectory: string;
   /** The agent's prompt/role. Non-empty; no `@builtin:` resolution (that shorthand is a `Rule` convenience — a definition's brief is always literal). */

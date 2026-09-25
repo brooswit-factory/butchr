@@ -144,6 +144,27 @@ describe("HerdrHerd", () => {
     await new HerdrHerd(f2.client, "u", instant).spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(f2.started.length).toBe(0);
   });
+
+  test("PR #394 review fix (round 3): a managed-session spec (cwd set) spawns cleanly end-to-end through the REAL spawn path (HerdrHerd + Drovr's ManagedHerdrLifecycle, not a stub) — kickoff names both the working directory AND the brief, and the launched process itself stays at the ordinary bookkeeping workspace", async () => {
+    // Round 2 shipped a version where agentLaunchConfig's own `cwd` was `spec.cwd` directly. That
+    // broke Drovr's ManagedHerdrLifecycle invariant (its `cwd` is FIXED to workspaceDirFor(issue) —
+    // see herd.ts's own `lifecycle()` — and it throws "Launch does not match selected provider and
+    // workspace" the moment the prepared launch's cwd differs) — caught here, through the real spawn
+    // path, not by the narrower buildWorkspace/agentLaunchConfig-only tests the PR review itself ran.
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    await herd.spawn({
+      key, issuetype: "managed-session", summary: "s", parent: null,
+      brief: "Keep this repo's docs and dependency versions current.",
+      cwd: "/repo/some-project",
+      agents: [{ harness: "claude", model: "sonnet" }],
+    });
+    expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
+    expect(f.started[0].args[0]).toContain("/repo/some-project");
+    expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
+    expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
+  });
   test("paneFor resolves the current pane, or null when not running", async () => {
     const f = fakeHerdr([{ name: "butchr-kan-5", pane_id: "w1:p5" }]);
     const herd = new HerdrHerd(f.client, "u");

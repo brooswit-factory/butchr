@@ -38,35 +38,52 @@ export interface SpawnSpec {
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
   externalMcpServers?: Array<{ name: string; url: string; headers?: Record<string, string> }>;
   /**
-   * BUTCHR-408: the spawned agent's REAL process cwd — a Bakr agent must
-   * work IN its own project directory, not a synthetic
-   * `<workspaceRoot>/filesystem/...` bookkeeping tree. Affects ONLY the
-   * launched process's own working directory (`agentLaunchConfig`,
-   * src/agents/argv.ts). It does NOT change where butchr's OWN bookkeeping
-   * files land: `buildWorkspace` (below) always writes CLAUDE.md/AGENTS.md/
-   * brief.md/mcp.json/ENVIRONMENT.md to `workspaceDirFor(spec.key)`, exactly
-   * as it does for every other spec — never into `cwd`. This is
-   * deliberate, not an oversight (PR #394 review, BUTCHR-408): `cwd` names
-   * an OPERATOR's own project directory (a Bakr agent's real repo), which
-   * may already hold its own `CLAUDE.md`/`AGENTS.md` with the project's own
-   * instructions — butchr writing its own bookkeeping files there would
-   * silently destroy them (see `docs/managed-sessions.md`'s "Working
-   * directory wiring" for the incident this fixed). The launched process
-   * still finds its `--mcp-config` at the bookkeeping location: that path
-   * is passed to it as an absolute argv value, not resolved relative to its
-   * own cwd, so the two directories can safely differ.
+   * BUTCHR-408: where a managed-session agent should actually WORK — a
+   * Bakr agent's own project directory, never a synthetic
+   * `<workspaceRoot>/filesystem/...` bookkeeping tree.
    *
-   * TRADEOFF (documented, not solved, by this ticket — see
-   * docs/managed-sessions.md): `agentIdOfWorkspacePath`'s reverse mapping
-   * (cwd -> agent id, below) assumes the fixed `workspaceDirFor` layout, so
-   * it does NOT recognise a `cwd`-overridden agent's pane by path. Primary
-   * reconciliation (spawn/stop, no-double-owner) is unaffected — it keys
-   * purely off `herd.runningIssues()`'s own agent-key labels, never a cwd
-   * reverse lookup — but secondary safety nets that DO use that reverse
-   * mapping (startup preflight's live-rule-agent check,
-   * stranded-workspace/session-limit pane recovery) do not cover a
-   * `cwd`-overridden agent's pane. Absent (the default for every existing
-   * caller), behaviour is byte-for-byte unchanged.
+   * PR #394 review, round 3 — NOT the launched process's own OS-level cwd,
+   * despite an earlier version of this comment (and this ticket's own
+   * text) saying so. Two independent, load-bearing invariants make that
+   * unsafe, both discovered live reproducing this exact ticket's own
+   * staged spawn test through the REAL `HerdrHerd` + `@brooswit/drovr`
+   * `ManagedHerdrLifecycle` (not a stub — see test/unit/herd.test.ts):
+   *
+   * 1. `ManagedHerdrLifecycle` (`herd.ts`'s `lifecycle()`) is constructed
+   *    with ONE fixed `cwd` — always `workspaceDirFor(issue)` — and
+   *    HARD-REQUIRES the prepared launch's own `cwd` to equal it exactly
+   *    (`"Launch does not match selected provider and workspace"` if not).
+   *    It uses that SAME `cwd` to create the herdr workspace/pane AND as
+   *    the residency key it scans `herdr.agent.list()` against. There is
+   *    no seam in Drovr's current API for "the pane's OS cwd differs from
+   *    its own workspace identity."
+   * 2. `HerdrHerd.runningIssues()`/`byIssue()` (this file's own
+   *    `agentIdOfWorkspacePath`) reverse-maps a live pane's cwd back to an
+   *    agent id by assuming the fixed `workspaceDirFor` 1-or-3-deep shape.
+   *    A pane at an ARBITRARY operator directory returns `null` there — it
+   *    would be permanently invisible to `runningIssues()`, which EVERY
+   *    reconciliation call (`scopedHerd`, admission residency, the
+   *    daemon's own no-double-owner guarantee) is built on. This is core,
+   *    heavily-shared daemon machinery every other provider also depends
+   *    on — not something to patch around under review pressure.
+   *
+   * Given both, the launched process's cwd is ALWAYS `workspaceDirFor`
+   * (unchanged for every existing and managed-session spec alike — see
+   * `agentLaunchConfig`, src/agents/argv.ts). `cwd` here is instead
+   * communicated to the agent through its own KICKOFF instructions
+   * (`kickoffFor`, src/agents/argv.ts): told explicitly to `cd` there
+   * before doing anything else. `buildWorkspace` (below) still always
+   * writes CLAUDE.md/AGENTS.md/brief.md/mcp.json/ENVIRONMENT.md to
+   * `workspaceDirFor(spec.key)`, exactly as it does for every other spec —
+   * never into `cwd`, for the SAME reason as before (PR #394 review, round
+   * 1): `cwd` names an OPERATOR's own project directory, which may already
+   * hold its own `CLAUDE.md`/`AGENTS.md`, and butchr writing its own
+   * bookkeeping files there would silently destroy them — see
+   * `docs/managed-sessions.md`'s "Working directory wiring".
+   *
+   * Absent (the default for every existing caller), behaviour is
+   * byte-for-byte unchanged: `kickoffFor` falls straight through to its
+   * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
    */
   cwd?: string;
   /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */

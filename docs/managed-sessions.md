@@ -47,7 +47,7 @@ takes effect on restart, not live), like every other provider's query.
 
 | field | required | meaning |
 |---|---|---|
-| `workingDirectory` | yes | Where the managed agent actually works. Absolute, or `~`/`~/rest` (expanded against the daemon's own `$HOME`, same rule as a `filesystem` query's `root`). Becomes the spawned agent's REAL process `cwd` — see "Working directory wiring" below. |
+| `workingDirectory` | yes | Where the managed agent actually works. Absolute, or `~`/`~/rest` (expanded against the daemon's own `$HOME`, same rule as a `filesystem` query's `root`). The agent is told to `cd` there at startup — see "Working directory wiring" below for why this is not the launched process's own OS `cwd`. |
 | `brief` | yes | The agent's prompt/role. Literal text; no `@builtin:` shorthand (that convenience is a `Rule` field's, not a definition's). |
 | `vendor` | yes | `"claude"` or `"codex"` — narrower than `Rule.agentPreferences[].harness` (`agy` is not a Bakr/Candlestix vendor). |
 | `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
@@ -187,40 +187,75 @@ precedent `filesystem` already has for its own swarm agents.
 
 ## Working directory wiring
 
-`SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) is the one new seam
-in the shared spawn machinery: when set, it becomes the spawned PROCESS's
-real working directory (`agentLaunchConfig`, `src/agents/argv.ts`) — a
-Bakr agent's whole point is working IN its own project directory, and
-Claude/Codex read their own CLAUDE.md/AGENTS.md from their own `cwd` at
-startup.
+`SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) carries a
+definition's own `workingDirectory` through the shared spawn machinery —
+but, as of PR #394's THIRD review round, it is **not** the spawned
+process's own OS-level `cwd`. That was round 2's design, and it broke the
+real spawn path (see "Why not a real process cwd" below); the definition's
+working directory is instead communicated to the agent through its own
+KICKOFF instructions.
 
-**It does NOT change where butchr's own bookkeeping files land.**
-`buildWorkspace` always writes CLAUDE.md/AGENTS.md/brief.md/mcp.json/
-ENVIRONMENT.md to the ordinary synthetic
+**The spawned process always launches at the ordinary bookkeeping
+directory** (`workspaceDirFor(spec.key)` — the SAME synthetic
 `<workspace root>/filesystem/managed-sessions/<encoded-path>` directory
-(`workspaceDirFor(spec.key)`) — the SAME directory every other filesystem
-resource already gets, regardless of `spec.cwd`. An earlier version of
-this ticket had `spec.cwd`, when set, redirect the bookkeeping files
-themselves into the operator's own working directory; PR #394's review
-caught this live (`buildWorkspace` overwriting a real project's own
-pre-existing `CLAUDE.md`/`AGENTS.md`/`mcp.json` with butchr's own,
-violating "preserve existing workspaces") and it was fixed before merge.
-The two directories are kept deliberately separate now: the spawned
-process's `--mcp-config` argv value is an ABSOLUTE path into the
-bookkeeping directory, not resolved relative to the process's own `cwd`,
-so it keeps working fine even though the two differ.
+every other filesystem resource gets), exactly like every other provider,
+whether or not `spec.cwd` is set (`agentLaunchConfig`, `src/agents/argv.ts`).
+`buildWorkspace` likewise always writes CLAUDE.md/AGENTS.md/brief.md/
+mcp.json/ENVIRONMENT.md there, never into `spec.cwd` — the operator's own
+project directory may already hold its own `CLAUDE.md`/`AGENTS.md`, and
+writing butchr's own bookkeeping files there would silently destroy them
+(caught live in round 1 of PR #394's review).
 
-**Tradeoff, documented rather than solved by this ticket**:
-`agentIdOfWorkspacePath`'s reverse mapping (a pane's `cwd` -> its agent id)
-assumes the fixed `workspaceDirFor` layout, so it does not recognise a
-`cwd`-overridden managed-session agent's pane by path. PRIMARY
-reconciliation (spawn/stop, no-double-owner) is unaffected — it keys purely
-off `herd.runningIssues()`'s own agent-key labels, never a cwd reverse
-lookup — but secondary safety nets that DO use that reverse mapping
-(`missingRulesPreflight`'s live-rule-agent check, stranded-workspace/
-session-limit pane recovery) do not cover a managed-session agent's pane.
-Every EXISTING caller omits `spec.cwd`, so this is purely additive —
-nothing about any other provider's behaviour changes.
+**The agent learns its real working directory from its own kickoff
+prompt.** `kickoffFor` (`src/agents/argv.ts`), when `spec.cwd` is set,
+returns `` `Your working directory for this task is <cwd> — cd there
+before doing anything else. Then: <brief>` `` instead of the ordinary
+`"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string — the agent's
+FIRST action is to `cd` into its real project directory itself, using its
+own tools, before doing any of the definition's actual work. This also
+fixes a round-2 defect: with the process launched directly at `spec.cwd`,
+`"follow your CLAUDE.md"` there would have resolved to the *project's own*
+`CLAUDE.md` (if any), never butchr's generated one, so the definition's
+`brief` would never have reached the agent at all.
+
+### Why not a real process cwd (round 2 -> round 3)
+
+Round 2 made `agentLaunchConfig`'s own `cwd` field `spec.cwd` directly.
+Reproduced live, through the REAL `HerdrHerd` + `@brooswit/drovr`
+`ManagedHerdrLifecycle` (not a stub — `test/unit/herd.test.ts`), this broke
+spawning ENTIRELY for any `cwd`-bearing spec, for two independent reasons
+neither round 1 nor round 2's own tests exercised (both tested
+`buildWorkspace`/`agentLaunchConfig` directly, never a real `herd.spawn()`):
+
+1. **Drovr's own invariant.** `ManagedHerdrLifecycle` (constructed once per
+   issue by `herd.ts`'s `lifecycle()`) is built with ONE fixed `cwd` —
+   always `workspaceDirFor(issue)` — and hard-requires the prepared
+   launch's own `cwd` to equal it exactly, throwing `"Launch does not
+   match selected provider and workspace"` otherwise. It also uses that
+   SAME `cwd` to create the herdr workspace/pane and as the residency key
+   it filters `herdr.agent.list()` against. There is no seam in Drovr's
+   current API for "the pane's OS cwd differs from its own workspace
+   identity."
+2. **`HerdrHerd.runningIssues()` cannot see a diverged pane at all.**
+   `runningIssues()`/`byIssue()` reverse-map a live pane's cwd back to an
+   agent id via `agentIdOfWorkspacePath`, which assumes the fixed
+   `workspaceDirFor` 1-or-3-deep layout; a pane at an arbitrary operator
+   directory returns `null` there. `runningIssues()` is what
+   `scopedHerd`/admission residency/every rule loop's own reconciliation
+   is built on — a managed-session agent whose pane cwd diverged would be
+   PERMANENTLY invisible to it, breaking "never run two owners for the
+   same managed agent" (this ticket's own explicit requirement), not just
+   a cosmetic gap.
+
+Both are core, heavily-shared daemon machinery every other provider also
+depends on — not something to patch around under review pressure. The
+chosen fix (communicate `cwd` through the kickoff prompt instead of the
+process's own OS cwd) keeps EVERY existing invariant intact for managed
+sessions exactly as it already is for every other provider, at the cost of
+the agent needing one extra `cd` step of its own at startup.
+
+**Absent** `spec.cwd` (every existing caller, and every provider besides
+managed sessions), behaviour is byte-for-byte unchanged throughout.
 
 ## Per-vendor launch differences
 

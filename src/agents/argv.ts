@@ -42,21 +42,38 @@ export function inventoryCodexMcp(
   delete blocked.disabledMcpServers;
   return blocked;
 }
-export const kickoffFor = (provider: AgentProvider): string => provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+/**
+ * PR #394 review fix (round 2, revised): `spec` is optional and SECOND on
+ * purpose — every existing caller passes only `provider`, and behaviour for
+ * those calls is byte-for-byte unchanged (`spec` absent, or `spec.cwd`
+ * absent, falls straight through to the ordinary `"follow your CLAUDE.md"`/
+ * `"follow your AGENTS.md"` string every provider has always gotten).
+ *
+ * BUTCHR-408: a spec with `cwd` set (a managed-session definition) names
+ * the directory the agent should actually WORK in — but (see
+ * `SpawnSpec.cwd`'s own doc comment, src/agents/workspace.ts, for the full
+ * story) the spawned PROCESS's own launch cwd stays the ordinary
+ * bookkeeping directory; `cwd` is communicated to the agent through ITS
+ * OWN kickoff instructions instead, explicitly telling it to `cd` there
+ * before anything else, followed by its definition's own `brief` (its
+ * whole prompt/role) — since with the process actually launched at
+ * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
+ * PROJECT's own file (if any), never butchr's generated one, and the
+ * definition's `brief` would never reach the agent at all.
+ */
+export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
+  if (spec?.cwd && spec.brief) return `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${spec.brief}`;
+  return provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+};
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
- * arguments and returns the complete Herdr start contract. `dir` is
- * butchr's own BOOKKEEPING directory (`buildWorkspace`'s return value —
- * where CLAUDE.md/AGENTS.md/mcp.json actually live); the launched
- * PROCESS's own cwd is `spec.cwd` when the spec names one (BUTCHR-408:
- * a managed-session definition's own `workingDirectory`), else the SAME
- * `dir`. These are kept separate on purpose — see `SpawnSpec.cwd`'s own
- * doc comment (src/agents/workspace.ts) for why bookkeeping files must
- * never land in an operator's own project directory. `mcpConfigPath`
- * below stays anchored to `dir` (an absolute argv value, not resolved
- * relative to the process's own cwd), so it keeps working even when the
- * two directories differ.
+ * arguments and returns the complete Herdr start contract. `dir` (the
+ * bookkeeping directory, `buildWorkspace`'s return value) is ALWAYS the
+ * launched process's own `cwd` here — `spec.cwd`, when a spec names one,
+ * is deliberately NOT threaded into `cwd` below; see `SpawnSpec.cwd`'s own
+ * doc comment (src/agents/workspace.ts) for why, and `kickoffFor` above
+ * for how the agent still learns where to actually work.
  */
 export function agentLaunchConfig(
   spec: SpawnSpec,
@@ -66,14 +83,13 @@ export function agentLaunchConfig(
   agent: AgentConfig = { provider: "claude" },
   mcpUrl = "http://localhost:7717/mcp",
 ): ManagedAgentLaunch {
-  const cwd = spec.cwd ?? dir;
   if (agent.provider === "agy") {
     return {
       provider: "agy",
       skipPermissions: true,
       name,
       paneId,
-      cwd,
+      cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
     };
@@ -83,7 +99,7 @@ export function agentLaunchConfig(
       provider: "codex",
       name,
       paneId,
-      cwd,
+      cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
       ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {bypassApprovalsAndSandbox:false}: {}),
@@ -101,7 +117,7 @@ export function agentLaunchConfig(
     ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"auto"}: {}),
     name,
     paneId,
-    cwd,
+    cwd: dir,
     prompt: "",
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),
@@ -116,7 +132,7 @@ export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
-  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider) });
+  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
 }
 
 /**
