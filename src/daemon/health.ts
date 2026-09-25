@@ -120,6 +120,14 @@ export interface HealthStatus {
    * startup, so this is static for the daemon's lifetime, computed once and
    * passed in on every call rather than recomputed per request.
    *
+   * `parseRules` already refuses to load a rules file where such a
+   * reference is missing from that SAME file (a hard startup error naming
+   * the bad id), so this key is expected to stay ABSENT for every rules file
+   * that loads today — it is a safety net over any enabled `jira-work` rule
+   * set, not only ones assembled by a single `loadRules()` call, and starts
+   * finding real gaps once something (e.g. cross-daemon observer rules)
+   * lets a rule set carry a reference `parseRules` doesn't reject.
+   *
    * ABSENT (no key at all), never an empty array, when there is nothing
    * unresolved — the same "absent means nothing to report" convention
    * `disabledReason` above already uses, chosen so a consumer can branch on

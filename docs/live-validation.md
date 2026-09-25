@@ -91,8 +91,10 @@ Startup log:
   `enabled: false` with a `disabledReason`. `github-issue` and
   `zendesk-ticket` poll every 60 s, `jira-idea` every 15 s.
 - `admission.residency` at most `1`.
-- No `unresolvedRelationships` key (a fixture rules file has no dangling
-  `childRule`/`inwardConnectionRules`), and no matching startup `WARNING:`.
+- No `unresolvedRelationships` key and no matching startup `WARNING:` — expected
+  for any rules file that loaded at all: a `childRule`/`inwardConnectionRules`
+  naming an id missing from the same file is a startup load error, not a
+  health-field case (see `unresolvedRelationships` in `src/rules/rules.ts`).
 
 Agents and side effects:
 
