@@ -873,6 +873,18 @@ const ruleResourceType = createRuleResourceType({
   // that leaves it absent/false never calls this (see
   // src/jira-watch/linked-eventing.ts's own contract).
   remoteLinks: (key) => atlassian.remoteLinks(key),
+  // BUTCHR-437: the three external-link pollers' own deps — every one
+  // gated by a match's own `linkedDescriptionLinks` opt-in inside
+  // linked-eventing.ts, never called otherwise. `webpage` needs no
+  // config (a bare, unauthenticated `fetch`; see external-poll.ts's own
+  // "SECURITY" doc comment for why it must never carry credentials);
+  // `github` is omitted entirely when this daemon has no GitHub token/orgs
+  // configured (same `config.github` this file's pr:* discovery already
+  // gates on) — an omitted dep makes every GitHub-kind item resolve
+  // "error" (skipped, retried, never reported unreadable), not a crash.
+  confluenceVersion: (id) => atlassian.confluencePageVersion(id),
+  ...(config.github ? { github: { fetchImpl: fetch, token: config.github.token } } : {}),
+  webpage: { fetchImpl: fetch },
   notify: notifyRuleAgent,
 });
 

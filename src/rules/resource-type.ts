@@ -23,7 +23,7 @@ import { jiraIssueClass } from "../resources/jira-idea.js";
 import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discovery.js";
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
-import { createLinkedEventingState, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
+import { createLinkedEventingState, type LinkedEventingDeps, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -71,6 +71,17 @@ export interface RuleResourceDeps {
    * see `logLinkedDiscovery`'s own doc comment).
    */
   notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
+  /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): the three external-link
+   * pollers' own deps — see `LinkedEventingDeps`'s own doc comments
+   * (src/jira-watch/linked-eventing.ts) for exactly when each is called and
+   * what an omitted one resolves to (never a crash; that kind's items are
+   * simply skipped every tick). Passed straight through to `runTick` below,
+   * same as `remoteLinks`/`suppress`/`notify` already are.
+   */
+  confluenceVersion?: LinkedEventingDeps["confluenceVersion"];
+  github?: LinkedEventingDeps["github"];
+  webpage?: LinkedEventingDeps["webpage"];
 }
 
 /**
@@ -519,6 +530,10 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
               ...(deps.suppress ? { suppress: deps.suppress } : {}),
               notify: deps.notify,
               ...(deps.log ? { log: deps.log } : {}),
+              // BUTCHR-437
+              ...(deps.confluenceVersion ? { confluenceVersion: deps.confluenceVersion } : {}),
+              ...(deps.github ? { github: deps.github } : {}),
+              ...(deps.webpage ? { webpage: deps.webpage } : {}),
             });
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] tick threw: ${(e as Error)?.message ?? e}`);
