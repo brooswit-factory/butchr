@@ -56,6 +56,9 @@ export interface SessionDefinitionListEntry {
   execution?: ExecutionMode;
   /** `undefined` for an invalid definition — the raw `frozen` field cannot be trusted to mean anything once the document itself doesn't validate. */
   manifestFrozen?: boolean;
+  /** BUTCHR-456: this definition's own delegated-freeze grants (`undefined` for an invalid definition, same reasoning as `manifestFrozen`). `[]` means nobody may freeze/unfreeze it via the MCP tools. */
+  freezeControllers?: string[];
+  unfreezeControllers?: string[];
   /** Known whenever `agentKey` is (the store key is derived from the PATH alone, independent of the file's own content) — `undefined` only for the oversized-path case, which has no agent key to derive one from. */
   storeFrozen?: boolean;
 }
@@ -106,6 +109,7 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
         name: resource.name, path: resource.path, agentKey, valid: true, problems: [],
         vendor: definition.vendor, tier: definition.tier, role: definition.role, execution: definition.execution,
         manifestFrozen: definition.frozen, storeFrozen,
+        freezeControllers: definition.freezeControllers ?? [], unfreezeControllers: definition.unfreezeControllers ?? [],
       });
     } catch (e) {
       out.push({ name: resource.name, path: resource.path, agentKey, valid: false, problems: (e as Error).message.split("\n"), storeFrozen });
@@ -134,6 +138,8 @@ export interface CreateSessionDefinitionInput {
   role?: string;
   frozen?: boolean;
   mcpServers?: unknown;
+  freezeControllers?: string[];
+  unfreezeControllers?: string[];
 }
 
 export type CreateSessionDefinitionResult = { ok: true; path: string } | { ok: false; error: string };
@@ -192,6 +198,8 @@ export async function createSessionDefinition(deps: CreateSessionDefinitionDeps,
     ...(input.role !== undefined ? { role: input.role } : {}),
     ...(input.frozen !== undefined ? { frozen: input.frozen } : {}),
     ...(input.mcpServers !== undefined ? { mcpServers: input.mcpServers } : {}),
+    ...(input.freezeControllers !== undefined ? { freezeControllers: input.freezeControllers } : {}),
+    ...(input.unfreezeControllers !== undefined ? { unfreezeControllers: input.unfreezeControllers } : {}),
   };
   const problems = sessionDefinitionProblems(rawDoc, fileName);
   if (problems.length) return { ok: false, error: problems.join("\n") };
