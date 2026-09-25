@@ -1054,3 +1054,101 @@ describe("BUTCHR-436: linked-change eventing wiring", () => {
     expect(lines.some((l) => l.includes("WARNING: [linked-eventing] tick threw"))).toBe(true);
   });
 });
+
+// FACTORY-1: investigated a reported regression — "after linked eventing was
+// enabled, a cross-daemon Story→Epic submit_to_boss no longer wakes the
+// boss", hypothesised as the new `linked:` rate cap (`maxLinkedTurnsPerHour`)
+// superseding or sharing a budget with the pre-existing `related:` (Implements
+// chain) boss-wake mechanism. NOT REPRODUCIBLE: the two mechanisms are
+// architecturally independent — `discovery.related()`'s return value (which
+// `related:` events are computed from) is built from `relatedForRules` BEFORE
+// `linkedEventingState.runTick` ever runs, and `runTick` only ever performs
+// `deps.notify` side effects under its own `turns` budget, keyed by the
+// OWNING resource's agent key — it never touches the related-resource array
+// or any state `createRuleEventRules`'s "related" space reads. This test
+// pins that independence for the epic/story case the ticket asked for: a
+// cross-daemon boss (whose OWN rule matches no local Story at all — the
+// worker is fetched only through the foreign-implementer path, exactly
+// BUTCHR-388's own documented live-fleet shape) whose OWN linked-eventing
+// budget is already exhausted by unrelated linked churn (reproducing the
+// live `[notify-suppressed] ... arm=rate-capped count=2 max=2` evidence)
+// still gets exactly one `related:` notify the moment its real child moves to
+// In Review. (Investigation record, incl. why the live incident actually
+// happened — a missing Implements issuelink, not this hypothesis — is on the
+// FACTORY-1 ticket and its linked doc.)
+describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker related: wake", () => {
+  test("cross-daemon epic hears its story's move to In Review via related:, even with its own linkedEventing budget exhausted", async () => {
+    const bossKey = "DROVR-37";
+    const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it
+    const siblingKeys = ["DROVR-30", "DROVR-31"]; // other Implements targets of the boss, used to genuinely exhaust its linked-eventing budget first
+
+    let storyStatus = "In Progress";
+    let siblingRound = 0;
+    const boss = () => issue(bossKey, {
+      issuetype: "Epic",
+      issuelinks: [
+        { type: "Implements", otherEnd: "outward", key: workerKey },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[0]! },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[1]! },
+      ] as never,
+    });
+    const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
+    const worker = () => issue(workerKey, { issuetype: "Story", status: storyStatus, issuelinks: implementsBoss(bossKey) });
+    const sibling = (key: string, round: number) =>
+      issue(key, { issuetype: "Story", status: round % 2 === 0 ? "In Progress" : "In Review", issuelinks: implementsBoss(bossKey) });
+
+    const logs: string[] = [];
+    // This daemon's own rules match ONLY Epics — BUTCHR-388's own documented
+    // live-fleet shape ("booswrit's ... rules are issuetype = Epic|Task|Bug").
+    const ruleSet = rules({ id: "epics", query: "issuetype = Epic", linkedEventing: true, maxLinkedTurnsPerHour: 2 });
+    const search = async (jql: string) => {
+      if (jql === "issuetype = Epic") return [boss()];
+      if (jql.startsWith("key in (")) {
+        const out: JiraIssue[] = [];
+        if (jql.includes(bossKey)) out.push(boss());
+        if (jql.includes(workerKey)) out.push(worker());
+        if (jql.includes(siblingKeys[0]!)) out.push(sibling(siblingKeys[0]!, siblingRound));
+        if (jql.includes(siblingKeys[1]!)) out.push(sibling(siblingKeys[1]!, siblingRound));
+        return out;
+      }
+      return [];
+    };
+    const type = createRuleResourceType({ rules: ruleSet, search, notify: async () => {}, log: (l) => logs.push(l) });
+    const active = ["jira-work:epics:" + bossKey];
+
+    await type.discovery.search();
+    let related = await type.discovery.related!(active);
+    // Two genuine sibling status flips spend the epic's own maxLinkedTurnsPerHour: 2 budget.
+    for (let i = 0; i < 2; i++) {
+      siblingRound++;
+      await type.discovery.search();
+      related = await type.discovery.related!(active);
+    }
+    logs.length = 0; // ignore the warm-up churn's own logging
+
+    // The real boss-wake event: the story moves to In Review while the budget is exhausted.
+    storyStatus = "In Review";
+    await type.discovery.search();
+    const relatedAfter = await type.discovery.related!(active);
+
+    // Confirm the rate cap genuinely bit this tick (matching the live
+    // `arm=rate-capped count=2 max=2` evidence) — a vacuously-passing test
+    // that never actually exhausted the budget would prove nothing.
+    expect(logs.some((l) => l.includes("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(bossKey))).toBe(true);
+
+    // The SAME mechanism `runResourceLoop`'s own onChange stage (src/daemon/loop.ts)
+    // uses: diff the two related snapshots, then decide+deliver per watcher.
+    const evPoll = await type.eventRules.poll({ primary: [], related }, { primary: [], related: relatedAfter });
+    const watchersOf = (k: string) =>
+      relatedAfter.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? related.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? [];
+    const delivered: string[] = [];
+    for (const key of evPoll.changedRelated) {
+      for (const w of watchersOf(key)) {
+        if ((await evPoll.decide(key, w, "related")).deliver) delivered.push(w);
+      }
+    }
+    expect(delivered).toEqual(["jira-work:epics:" + bossKey]); // exactly one related: notify to the boss, never dropped by the exhausted linked-eventing cap
+  });
+});
