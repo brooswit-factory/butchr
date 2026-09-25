@@ -115,6 +115,44 @@ describe("parseRules", () => {
     for (const id of ["", "-a", "a-", "a--b", "A", "a.b", "a_b", "a:b", "x".repeat(RULE_ID_MAX + 1), 7])
       expect(() => parseRules({ rules: [{ ...minimal, id }] })).toThrow(".id must be");
   });
+
+  // BUTCHR-404: observer rules — `staffed: false` is searched for
+  // relationship purposes but never staffed with an agent, so `brief` and
+  // `agentPreferences` (both meaningless without an agent) must be REJECTED
+  // at validation time rather than silently ignored — a typo must never
+  // half-staff a rule.
+  describe("staffed: false (observer rules)", () => {
+    const { brief: _brief, ...noBrief } = minimal;
+    const observer = { ...noBrief, staffed: false };
+
+    test("a staffed:false rule needs no brief and parses with staffed:false recorded", () => {
+      expect(parseRules({ rules: [observer] })).toEqual([{ ...observer, enabled: true, brief: "" }] as never);
+    });
+
+    test("omitted staffed, or staffed:true, behaves exactly as before (default true, no staffed field on the parsed rule)", () => {
+      expect(parseRules({ rules: [minimal] })).toEqual([{ ...minimal, enabled: true }] as never);
+      expect(parseRules({ rules: [{ ...minimal, staffed: true }] })).toEqual([{ ...minimal, enabled: true }] as never);
+    });
+
+    test("staffed must be a boolean", () => {
+      expect(() => parseRules({ rules: [{ ...observer, staffed: "false" }] })).toThrow(".staffed must be a boolean");
+    });
+
+    test("rejects a staffed:false rule that also declares a brief", () => {
+      expect(() => parseRules({ rules: [{ ...observer, brief: "do it" }] }))
+        .toThrow(".brief must not be set on a staffed:false rule (observer rules never run an agent)");
+    });
+
+    test("rejects a staffed:false rule that also declares agentPreferences", () => {
+      expect(() => parseRules({ rules: [{ ...observer, agentPreferences: [{ harness: "claude" }] }] }))
+        .toThrow(".agentPreferences must not be set on a staffed:false rule (observer rules never run an agent)");
+    });
+
+    test("a staffed:false rule may still declare relationships, and still requires a query", () => {
+      expect(parseRules({ rules: [{ ...observer, relationships: { inwardConnectionRules: [] } } as never] })).toHaveLength(1);
+      expect(() => parseRules({ rules: [{ ...observer, query: " " }] })).toThrow(".query must be a non-empty string");
+    });
+  });
 });
 
 describe("agent keys", () => {
