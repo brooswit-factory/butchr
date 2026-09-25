@@ -23,7 +23,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning } from "../rules/rules.js";
+import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -71,8 +71,28 @@ import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
+import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
+import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
+import { sessionDefinitionsPath } from "../resources/session-definition.js";
+import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
+import { runLinkCli } from "../cli/link-cli.js";
+import { resourceLinkTools } from "../tools/resource-links.js";
+import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
+import { createRoutingLinkStore } from "../resources/link-store-router.js";
+import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
+
+// FACTORY-7: `butchr link list|add|remove` is the one subcommand this
+// binary has (package.json's `bin.butchr` builds solely from THIS file —
+// see `src/cli/link-cli.ts`'s own header for why the dispatch lives here).
+// Intercepted before `installLogSink()`/config/rules loading below, on
+// purpose: the link store is provider-agnostic local state, so a `butchr
+// link ...` invocation must not require Jira credentials or a rules file to
+// run, and must not emit this daemon's own structured startup logging.
+if (process.argv[2] === "link") {
+  process.exit(await runLinkCli(process.argv.slice(3)));
+}
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
@@ -120,6 +140,19 @@ try {
 for (const r of rules) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
 }
+// BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
+// `Rule` per provider) — the built-in managed-sessions rule (never in
+// `rules`, and even if it were, fixed to `role: "worker"`) cannot express a
+// per-FILE manifest's own `role`. This map is the seam: the managed-sessions
+// loop rebuilds it every poll from that poll's eligible definitions (see
+// `ManagedSessionResourceDeps.roles`, src/rules/session-definition-type.ts),
+// keyed by the SAME agent key `roleOfAgent` is called with, and `roleOfAgent`
+// consults it FIRST for any id `ownsManagedSessionAgent` recognizes. Before
+// this loop's first poll (e.g. right after a restart, for an
+// already-running managed-session agent), it has no entry yet and
+// `roleOfAgent` falls through to its own existing fail-safe `"worker"`
+// default below — documented here, not silently relied upon.
+const managedSessionRoles = new Map<string, AgentRole>();
 /**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
@@ -127,10 +160,17 @@ for (const r of rules) {
  * against the loaded `rules`. Fails safe to `"worker"` for anything that
  * cannot be resolved — a legacy/bare-issue agent, or a rule since removed —
  * per `AdmissionControllerDeps.roleOf`'s own contract (src/agents/admission.ts).
+ * BUTCHR-408: a managed-session agent's role comes from `managedSessionRoles`
+ * (its OWN manifest field) instead, checked before the rule-level fallback —
+ * see that map's own comment just above.
  */
 const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
+  if (ownsManagedSessionAgent(id)) {
+    const manifestRole = managedSessionRoles.get(id);
+    if (manifestRole) return manifestRole;
+  }
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
@@ -164,6 +204,10 @@ const zendeskStaffing = zendeskTicketStaffing(rules, process.env as Record<strin
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
+
+// filesystem rules need no external credential — every enabled one always
+// runs, reading the local disk directly (src/resources/filesystem.ts).
+const fsRules = filesystemRules(rules);
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
@@ -228,16 +272,29 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // the same reason every other provider gets its own named source.
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
 const jiraProjectEnabled = rules.some((r) => r.enabled && r.resourceProvider === "jira-project");
+const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
+// BUTCHR-408: unlike every rule above, the managed-sessions query is built
+// into the daemon, never a user rules.json rule — it always runs (no
+// staffing gate, same "every enabled filesystem rule always runs" reasoning
+// as ADMISSION_SOURCE_FILESYSTEM, minus the "enabled" part since there is no
+// rules.json entry to disable), so it is unconditionally in `sources` below.
+const ADMISSION_SOURCE_MANAGED_SESSIONS = "managed-sessions";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
   residency: () => herd.runningIssues(),
   // BUTCHR-398: shared across every rule provider's admission bucket —
   // `roleOfAgent` reads the FULL `rules` list (every provider), so it
   // correctly classifies a running id of ANY provider, not just jira-work.
+  // BUTCHR-408: a managed-session agent's OWN `role` (its manifest field) IS
+  // read here — via `managedSessionRoles` (see that map's own comment,
+  // above `roleOfAgent`'s definition), not the rule-level lookup every
+  // other provider uses (the built-in managed-sessions rule is one shared
+  // Rule for every heterogeneous definition file, so it cannot carry a
+  // per-file role itself).
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : [])],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -347,7 +404,7 @@ const notifyHealth = createLoopHealth({
   thresholdMs: config.pollStaleMs,
   log: (line) => console.error(line),
 });
-// github-issue, jira-idea and zendesk-ticket loop health, reported beside (never inside) the
+// github-issue, jira-idea, zendesk-ticket and filesystem loop health, reported beside (never inside) the
 // liveness components: whether each type's rules run, and whether its polls
 // complete. The threshold covers at least three polls of the slower loop.
 const githubIssueHealth = createResourceLoopHealth({
@@ -370,6 +427,20 @@ const zendeskTicketHealth = createResourceLoopHealth({
   enabled: Boolean(zendeskTickets),
   ...(zendeskStaffing.run ? {} : { disabledReason: zendeskStaffing.reason ?? "no enabled zendesk-ticket rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * ZENDESK_TICKET_POLL_MS),
+  log: (line) => console.error(line),
+});
+const filesystemHealth = createResourceLoopHealth({
+  name: "filesystem",
+  enabled: fsRules.length > 0,
+  ...(fsRules.length ? {} : { disabledReason: "no enabled filesystem rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
+  log: (line) => console.error(line),
+});
+// BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
+const managedSessionsHealth = createResourceLoopHealth({
+  name: "managed-sessions",
+  enabled: true,
+  thresholdMs: Math.max(config.pollStaleMs, 3 * MANAGED_SESSIONS_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
@@ -441,7 +512,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth], unresolvedRuleRelationships),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -467,8 +538,19 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, jira-idea and zendesk-ticket agents; each provider's own tools exist only when its rules run.
+  // Jira/Confluence tools refuse github-issue, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
+  // provider-specific tool set below it — the local file store needs no
+  // credentials and works for every ResourceRef kind, and a `jira-project`
+  // owner routes to the project-property-backed store instead (this daemon
+  // already has Jira credentials loaded, unlike the CLI, so the factory
+  // below is cheap and side-effect-free rather than genuinely lazy) — see
+  // `src/resources/link-store-router.ts` for the routing decision itself.
+  ...resourceLinkTools(
+    createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: () => createJiraProjectLinkStore(ops) }),
+    (line) => console.error(line),
+  ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -1018,6 +1100,48 @@ startZendeskTicketLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
   onError: (e) => zendeskTicketHealth.recordError(e),
+});
+
+// The filesystem rule loop: its own agents and admission bucket, no external
+// credential, none of the Jira-writing detectors above, and its own resource
+// (a file or directory) is never written to by butchr itself.
+if (fsRules.length) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
+startFilesystemLoop({
+  rules,
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_FILESYSTEM),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_FILESYSTEM),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_FILESYSTEM),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => filesystemHealth.recordSuccess(),
+  onError: (e) => filesystemHealth.recordError(e),
+});
+
+// BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
+// read from rules.json, over the well-known definitions directory. Same
+// admission/health wiring shape as every rule loop above, its own bucket.
+console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
+startManagedSessionsLoop({
+  roles: managedSessionRoles,
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => managedSessionsHealth.recordSuccess(),
+  onError: (e) => managedSessionsHealth.recordError(e),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's

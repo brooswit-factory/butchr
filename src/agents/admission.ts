@@ -84,11 +84,26 @@
  *       same corrupted source could fail the identical way twice): it is
  *       `stopping` — the CALLING tier's own `plan.stop` this same poll,
  *       which comes from Jira's desired-state read, not from herdr's agent
- *       list at all. A drop from a trusted-positive residency to zero is
- *       PLAUSIBLE only when this poll's own plan explains it (it wanted to
- *       stop at least as many as were trusted running); anything narrower
+ *       list at all. BUTCHR-449: a SECOND, independent discriminator sits
+ *       beside `stopping` — a previously-trusted worker id that is STILL
+ *       resident but whose `roleOf` now reads "sentinel" (see
+ *       `AdmissionControllerDeps.roleOf`'s own fail-safe-to-"worker" doc
+ *       comment: the daemon's async `issueMeta` fill means an id can be
+ *       counted as a worker before its type resolves, then legitimately
+ *       reclassify). That id explains its OWN share of the drop —
+ *       reclassification, not vanishing — the same way a stopped id does.
+ *       A drop from a trusted-positive residency to zero is PLAUSIBLE only
+ *       when this poll's own plan EXPLAINS it — stopped at least as many
+ *       workers as were trusted running, counting a reclassified-but-still-
+ *       resident id toward that explanation too, never twice (an id is
+ *       either still a worker that's stopping, or now a sentinel that's
+ *       reclassified — `roleOf` cannot answer both ways in the same poll,
+ *       so the two explanation sources never overlap); anything narrower
  *       is treated as an untrustworthy read, not a real drop — agents do
- *       not all vanish between polls on their own.
+ *       not all vanish between polls on their own, and an unrelated
+ *       resident sentinel that was never a trusted worker explains nothing
+ *       (Trap 2's "don't blanket-suppress" bar — see `admitExclusive`'s own
+ *       `reclassifiedIds` computation below).
  *
  * BOUNDED IN TIME, THE WAY `atRest` ALREADY IS (frozen-asleep.ts/
  * `atRestMinutes`, src/config/config.ts) — SAME SHAPE, DIFFERENT UNIT:
@@ -597,6 +612,8 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
   let lastTrusted: number | null = null;
   /** BUTCHR-398: last TRUSTED sentinel count, updated on the SAME assignment as `lastTrusted` — see `AdmissionSnapshot.sentinels`'s own doc comment. */
   let lastTrustedSentinels: number | null = null;
+  /** BUTCHR-449: last TRUSTED set of resident WORKER ids, updated on the SAME assignment as `lastTrusted`/`lastTrustedSentinels` below so the three never disagree. Lets the implausible-zero check recognise a worker→sentinel reclassification (an id from this set still resident, but `roleOf` now reads "sentinel") as an explained drop — see this file's own top-comment Trap 2 addendum and `admitExclusive`'s `reclassifiedIds`. */
+  let lastTrustedWorkerIds: ReadonlySet<string> = new Set();
   /** BUTCHR-297: accumulated wait per candidate, in `admit()` calls — see this file's own top-comment addendum (B1/B2/B4) for why calls, and why this is only ever touched by the code that received a given id as an argument this call. */
   const waits = new Map<string, number>();
   /** BUTCHR-297 (§B2): the call number each ledger entry was last touched at — the eviction bookkeeping `LEDGER_UNSEEN_EVICTION_CALLS` is measured against. Only ever holds keys that are also in `waits`. */
@@ -703,13 +720,30 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // (`lastTrusted` is itself worker-only now), so counting it here would
     // let a sentinel-only stop wrongly excuse an implausible worker zero.
     const workerStopping = stopping.filter((id) => roleOf(id) !== "sentinel");
-    const implausible = lastTrusted !== null && lastTrusted > 0 && observed === 0 && workerStopping.length < lastTrusted;
+    // BUTCHR-449: a previously-trusted worker id that is STILL resident
+    // (present in `resident`, the raw census this poll) but whose CURRENT
+    // `roleOf` reads "sentinel" is explained by reclassification, not a
+    // vanishing — see this file's own top-comment Trap 2 addendum. Tied to
+    // a SPECIFIC id from `lastTrustedWorkerIds`, never a blanket "some
+    // sentinel is resident" — an unrelated sentinel that was never a
+    // trusted worker (e.g. a fresh sentinel candidate) never lands in this
+    // set and explains nothing. `workerStopping` above is already filtered
+    // to ids whose CURRENT `roleOf` is still "worker", so it can never also
+    // contain a reclassified id (now "sentinel") — the two explanation
+    // sources are disjoint by construction; unioning them through a `Set`
+    // is a belt-and-braces guard against double-counting an id that is
+    // somehow both, not a case that can actually arise today.
+    const residentSet = new Set(resident);
+    const reclassifiedIds = [...lastTrustedWorkerIds].filter((id) => residentSet.has(id) && roleOf(id) === "sentinel");
+    const explainedIds = new Set([...workerStopping, ...reclassifiedIds]);
+    const implausible = lastTrusted !== null && lastTrusted > 0 && observed === 0 && explainedIds.size < lastTrusted;
 
     if (implausible) {
       const stillUntrusted = guard.record();
       if (stillUntrusted) {
         if (workerCandidates.length) {
-          log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only stops ${workerStopping.length} of that — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${workerCandidates.length} wanted this poll`);
+          const reclassifiedNote = reclassifiedIds.length ? `, ${reclassifiedIds.length} reclassified to sentinel (${reclassifiedIds.join(", ")})` : "";
+          log(`WARNING: [admission] residency read 0 but was last trusted at ${lastTrusted} and this poll's own plan only explains ${explainedIds.size} of that (${workerStopping.length} stopping${reclassifiedNote}) — treating as an untrustworthy read (BUTCHR-282-shaped), not a real drop (streak ${guard.currentStreak}/${deps.maxImplausiblePolls ?? MAX_IMPLAUSIBLE_POLLS}); withholding all ${workerCandidates.length} wanted this poll`);
           log(admissionFailSafeLine(deps.cap, "implausible-zero", workerCandidates));
         }
         setBucket({ source, checked: false, declinedAt: new Date(now()).toISOString(), reason: "census-untrusted" });
@@ -727,6 +761,13 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
 
     lastTrusted = observed;
     lastTrustedSentinels = sentinelResidencyCount;
+    // BUTCHR-449: updated on the SAME assignment as `lastTrusted` (never
+    // separately, never conditionally) so the two can never disagree about
+    // which poll's observation they reflect — see this variable's own
+    // declaration comment. `residentWorkers` (not `workerCandidates`): the
+    // set an id is checked against next poll is who was ACTUALLY resident,
+    // independent of which candidates happened to be offered that poll.
+    lastTrustedWorkerIds = new Set(residentWorkers);
     // Review fix (round 1): an empty candidate list means nothing is
     // withheld, full stop — `lastWithheld` must say so too, or a candidate
     // that leaves `desired` WITHOUT ever being admitted (ticket closed,

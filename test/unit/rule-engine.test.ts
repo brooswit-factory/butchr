@@ -947,6 +947,16 @@ describe("rule workspaces", () => {
     expect(claude.provider === "claude" && [claude.model, claude.effort]).toEqual(["opus", "max"]);
   });
 
+  test("BUTCHR-408: spec.permissionMode reaches a claude launch's permissionMode; absent means today's behaviour exactly (no field at all)", () => {
+    const withMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "claude" });
+    expect(withMode.provider === "claude" && withMode.permissionMode).toBe("auto");
+    const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
+    expect(without.provider === "claude" && "permissionMode" in without).toBe(false);
+    // Codex has no permissionMode concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
+    const codexWithMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
+    expect(codexWithMode.provider === "codex" && "permissionMode" in codexWithMode).toBe(false);
+  });
+
   test("the herd reports rule agents by key, legacy agents by bare key, and only rule agents survive ownership scoping", async () => {
     const ruleCwd = buildWorkspace(ruleSpec, "http://localhost:7717/mcp", "codex", []);
     const legacyCwd = join(root, "BUTCHR-12");
