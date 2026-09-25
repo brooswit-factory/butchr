@@ -297,24 +297,51 @@ managed sessions), behaviour is byte-for-byte unchanged throughout.
 
 Non-negotiable constraint from Nexus (relayed on this story 2026-09-25T14:00Z):
 every managed-session agent gets its **own** MCP config; none may inherit a
-parent directory's `.mcp.json`. This is a happy accident of the "Why not a
-real process cwd" design above, not a separate mechanism bolted on: Claude
-Code auto-discovers a project-level `.mcp.json` (note the leading dot — a
-DIFFERENT file/mechanism than butchr's own explicit `--mcp-config` flag,
-which always points at `mcp.json`, no dot) from the launched **process's own
-OS `cwd`** at startup. Since that OS `cwd` is *always*
-`workspaceDirFor(spec.key)` — never `spec.workingDirectory` — for every
-managed-session agent, regardless of what the agent's kickoff later tells it
-to `cd` into, Claude Code's own project-config auto-discovery can never
-reach a `.mcp.json` sitting in the operator's real project directory: by the
-time the agent's shell runs `cd <workingDirectory>`, Claude Code has already
-started and read its config once, at the bookkeeping directory. A pre-existing
-`.mcp.json` in `workingDirectory` is read, verified, and left byte-identical
-in `test/unit/workspace.test.ts`'s "Nexus MCP isolation constraint" test —
-along with butchr's own per-agent `mcp.json` (no dot), which the agent's
-`--mcp-config` flag names explicitly and which contains ONLY butchr's own
-server plus this definition's own `mcpServers` bindings, never anything from
-`workingDirectory`.
+parent directory's `.mcp.json`. Two independent directions, only one of
+which is an actual GUARANTEE — round 2 of this constraint's own review
+(PR #394) found the first direction alone was not enough, and asked for the
+gap to be closed with an enforced check rather than an assumption about a
+third party's behaviour:
+
+**Direction 1 (asserted, tested, but NOT by itself a guarantee): the
+operator's own `workingDirectory` is never touched.** `spec.cwd`
+(`workingDirectory`) is never the spawned process's own OS `cwd` — see "Why
+not a real process cwd" above — and `buildWorkspace` never reads, writes, or
+otherwise touches a `.mcp.json` there. `test/unit/workspace.test.ts`'s
+"Nexus MCP isolation constraint, direction 1" test proves exactly that: a
+pre-existing `.mcp.json` in `workingDirectory` stays byte-identical. This
+does NOT by itself prove Claude Code cannot discover it some other way —
+see direction 2.
+
+**Direction 2 (the actual guarantee): no `.mcp.json` in ANY ancestor of the
+launched cwd.** Claude's own `--mcp-config` flag is ADDITIVE to its ordinary
+project-level `.mcp.json` auto-discovery, never exclusive of it — this
+codebase (and `@brooswit/drovr`, its launch layer) never passes
+`--strict-mcp-config` anywhere, verified by grepping drovr's own built argv
+builder. Claude Code's own discovery is understood to walk UP from the
+launched process's OS `cwd` through ancestor directories (an assumption
+about a third party's undocumented behaviour, not verified against its
+source here) — and since that OS `cwd` is *always*
+`workspaceDirFor(spec.key)` for a managed-session agent (never
+`workingDirectory`), a `.mcp.json` sitting in `workspaceRoot()` or any of
+ITS OWN ancestors could in principle be inherited. Rather than rely on that
+assumption, `assertNoInheritedMcpConfig` (`src/agents/workspace.ts`) makes
+it a non-issue regardless: `buildWorkspace`, for any managed-session spec
+(`spec.cwd` set), walks every ancestor of `workspaceDirFor(spec.key)` up to
+the filesystem root and **refuses the spawn outright** (throws before
+writing anything) if any of them contains a `.mcp.json` — cheap (a handful
+of `existsSync` calls, once per spawn attempt) and unconditional, so the
+isolation property holds whether or not the assumption above is exactly
+right. `test/unit/workspace.test.ts`'s "PR #394 review round 2, direction 2"
+test proves the refusal fires, names the offending path, and writes nothing
+first. A bare (non-managed-session) spec is never guarded — its
+`workspaceDirFor` ancestor chain is the same shared tree, but this
+constraint was raised specifically against the definitions-directory design.
+
+Butchr's own per-agent `mcp.json` (no dot) is what the agent's
+`--mcp-config` flag names explicitly, and contains ONLY butchr's own server
+plus this definition's own `mcpServers` bindings, never anything from
+`workingDirectory` or any ancestor.
 
 Credentials reach that per-agent `mcp.json` only via `headersEnvVar` (a NAME,
 resolved from the DAEMON's own environment — never a literal value in the
@@ -329,7 +356,11 @@ credential value, only `headersEnvVar` names.
 `permissionMode` reaches a **Claude** launch's `ClaudeAgentLaunch.permissionMode`
 verbatim (Drovr; untyped string there, validated at OUR layer via
 `SESSION_PERMISSION_MODES` before it ever reaches launch, so a typo fails at
-manifest-load time, not at spawn time). **Codex** has no `permissionMode`
+manifest-load time, not at spawn time) — **including `"bypassPermissions"`**,
+which is honoured exactly as written, with no additional gate: a definition
+file is operator-authored config (the same trust level as `rules.json`
+itself), so a `bypassPermissions` manifest is presumed deliberate, same as
+every other field here. **Codex** has no `permissionMode`
 concept in `CodexAgentLaunch` (its own `trustWorkspace`/
 `bypassApprovalsAndSandbox` fields instead) — a `vendor: "codex"`
 definition's `permissionMode` is validated and stored like any other, but

@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
@@ -274,12 +274,48 @@ export const singleResourceOf = (id: string): string | null => (decodeQueryAgent
  * ENVIRONMENT.md (the same ground truth, standalone). Returns the
  * directory — the agent's cwd.
  */
+/**
+ * PR #394 review fix (Nexus MCP isolation, round 2): the round-1 guarantee
+ * ("butchr never writes a `.mcp.json`") was necessary but not sufficient —
+ * Claude's own `--mcp-config` is ADDITIVE to its ordinary project-level
+ * `.mcp.json` discovery (`@brooswit/drovr` never passes
+ * `--strict-mcp-config`; verified by grepping its own built argv builder),
+ * and that discovery walks UP from the launched process's OWN cwd through
+ * every ancestor directory, not just the cwd itself. Since a managed-session
+ * agent's launched cwd is ALWAYS `workspaceDirFor(spec.key)` (never
+ * `spec.cwd` — see that field's own doc comment), a `.mcp.json` sitting in
+ * ANY ancestor of THAT directory (`workspaceRoot()`, its own parent, …) —
+ * not `spec.cwd`/`workingDirectory`, which the launched process never
+ * actually sits in or under — could still be inherited. Rather than assert
+ * an unverified claim about Claude's exact discovery behaviour, this
+ * GUARANTEES the property by refusing the spawn outright whenever the
+ * (small, fixed) ancestor chain actually contains one, walking all the way
+ * to the filesystem root — cheap (a handful of `existsSync` calls, once per
+ * spawn attempt) and unconditional, no assumption required either way.
+ * Scoped to managed-session specs only (`spec.cwd` set) per the review: a
+ * BARE `jira-work`/other-provider spec's `workspaceDirFor` ancestor chain is
+ * this same shared `workspaceRoot()` tree, but Nexus's own constraint was
+ * raised specifically against "the definitions-directory design".
+ */
+export function assertNoInheritedMcpConfig(dir: string): void {
+  let ancestor = dirname(dir);
+  while (true) {
+    if (existsSync(join(ancestor, ".mcp.json"))) {
+      throw new Error(`managed-session workspace ${dir} would inherit ${join(ancestor, ".mcp.json")} — a managed-session agent's launched cwd must have NO .mcp.json anywhere in its ancestor chain (Nexus's MCP isolation constraint); remove or relocate that file before this definition can spawn`);
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break; // reached the filesystem root ("/")
+    ancestor = parent;
+  }
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
   // operator's own project directory. `spec.cwd`, when present, only ever
   // reaches the launched PROCESS's cwd (`agentLaunchConfig`, src/agents/argv.ts).
   const dir = workspaceDirFor(spec.key);
+  if (spec.cwd !== undefined) assertNoInheritedMcpConfig(dir);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
   // BUTCHR-408: `McpServerBinding` never carries a resolved header VALUE
