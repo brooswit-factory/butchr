@@ -210,6 +210,38 @@ export class AtlassianClient {
   }
 
   /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): a Confluence page's CURRENT
+   * `version.number`, for the Confluence link poller
+   * (src/jira-watch/confluence-poller.ts) — same call shape `get_doc`/
+   * `confluence_get_page` already use (`GET /wiki/api/v2/pages/{id}`, no
+   * `body-format` requested, so this never pulls the page's body content the
+   * way `get_doc` does), over the SAME site + Basic-auth credential this
+   * class already carries for Jira (Atlassian Cloud accepts one credential
+   * across both REST APIs for one account). Never throws on a 404/403 — a
+   * genuinely unreadable/gone page is a fact the poller needs to classify as
+   * "unreadable", not an exception to catch a second time — so this resolves
+   * a tagged union instead, the same "one not-found shape, not a try/catch
+   * each" discipline `getRemoteLink` (src/tools/atlassian.ts) already
+   * documents for itself. Any OTHER non-2xx (5xx, a timeout the fetchImpl
+   * itself rejects with) resolves `{ok:false, transient:true}` — a fact the
+   * poller must retry, never report as unreadable (mirrors this story's own
+   * Jira-kind precedent: a search failure must never read as "every link
+   * unreadable").
+   */
+  async confluencePageVersion(pageId: string): Promise<{ ok: true; version: number } | { ok: false; transient: false; httpStatus: number } | { ok: false; transient: true }> {
+    try {
+      const body = await this.get(`/wiki/api/v2/pages/${encodeURIComponent(pageId)}`);
+      const version = body?.version?.number;
+      if (typeof version !== "number") throw new Error(`Confluence page ${pageId} read returned no version.number`);
+      return { ok: true, version };
+    } catch (e) {
+      if (e instanceof AtlassianHttpError && (e.status === 404 || e.status === 403)) return { ok: false, transient: false, httpStatus: e.status };
+      if (e instanceof AtlassianHttpError) return { ok: false, transient: true };
+      throw e;
+    }
+  }
+
+  /**
    * `POST /rest/api/3/issue/{key}/remotelink`: Jira's documented create-or-
    * update. When `globalId` names a remote link already on the issue, that
    * link is updated (every field not sent becomes null) and Jira answers 200;

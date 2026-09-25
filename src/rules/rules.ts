@@ -156,11 +156,28 @@ export interface Rule {
    * exactly (no remote-link fetch, same as before this field existed).
    */
   linkedRemoteLinks?: boolean;
+  /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): opt in to LIVE POLLING of
+   * Confluence / GitHub-issue / GitHub-PR / webpage links found via
+   * DESCRIPTION-TEXT PARSING (`descriptionItems`, src/resources/linked-discovery.ts)
+   * — as opposed to a Jira remote link, which this knob does not gate (a
+   * non-Jira remote link's live polling is out of scope for this story; see
+   * `jiraKindLinkedItems`'s own doc comment, src/jira-watch/linked-eventing.ts).
+   * Absent/false: today's behaviour exactly — `linkedEventing` alone still
+   * enables Jira-kind polling, but none of these three pollers ever run, even
+   * for a resource whose description names a Confluence page or GitHub
+   * issue/PR. Only meaningful when `linkedEventing` is also true; mirrors
+   * `linkedRemoteLinks`'s own independently-optional, cost-gated shape (each
+   * of the three pollers this knob gates costs a genuinely separate network
+   * call per distinct linked target per tick, never free the way `issuelinks`/
+   * `parent`/description-derived Jira keys already are).
+   */
+  linkedDescriptionLinks?: boolean;
 }
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships",
-  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -257,6 +274,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
     // BUTCHR-436: fifth linked-eventing knob, same independently-optional house style.
     if (linkedRemoteLinks !== undefined && typeof linkedRemoteLinks !== "boolean") errors.push(`${at}.linkedRemoteLinks must be a boolean`);
+    // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
+    const { linkedDescriptionLinks } = raw;
+    if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
@@ -277,6 +297,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
       ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
       ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
+      ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {
