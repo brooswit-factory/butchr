@@ -9,7 +9,7 @@ import { FILESYSTEM_TOOLS_NOTE } from "../../src/agents/workspace.js";
 import { runResourceLoop } from "../../src/daemon/loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "../../src/daemon/filesystem-loop.js";
 import { callerIdentity, KEY_ONLY_PROVIDERS } from "../../src/mcp/identity.js";
-import { isFilesystemResourceId } from "../../src/resources/filesystem-ref.js";
+import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
 import {
   expandHome, filesystemQueryProblems, MAX_ALLOWED_DEPTH, parseFilesystemQuery, type FilesystemQuery,
 } from "../../src/resources/filesystem-query.js";
@@ -18,7 +18,7 @@ import {
 } from "../../src/resources/filesystem.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey, isResourceId, RESOURCE_PROVIDERS } from "../../src/rules/agent-key.js";
 import {
-  createFilesystemEventRules, createFilesystemResourceType, ownsFilesystemAgent, searchFilesystemRules,
+  createFilesystemEventRules, createFilesystemResourceType, onceOversized, ownsFilesystemAgent, searchFilesystemRules,
   specForFilesystem, specForFilesystemQuery, specForFilesystemUnit, type FilesystemMatch,
 } from "../../src/rules/filesystem-type.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
@@ -35,9 +35,29 @@ describe("isFilesystemResourceId", () => {
     for (const id of ["/", "/a", "/a/b/c", "/a b/c.txt", "/" + "a".repeat(100)]) expect(isFilesystemResourceId(id)).toBe(true);
   });
   test("rejects anything not absolute, or not canonical", () => {
-    for (const id of ["", "a", "a/b", "/a/", "/a//b", "/a/./b", "/a/../b", "/a\0b", "/" + "a".repeat(5000)]) {
+    for (const id of ["", "a", "a/b", "/a/", "/a//b", "/a/./b", "/a/../b", "/a\0b"]) {
       expect(isFilesystemResourceId(id)).toBe(false);
     }
+  });
+  test("PR #388 review finding: rejects an id whose percent-encoded form would overflow one workspace directory-name segment, even a short but heavily non-ASCII one", () => {
+    // The review's own repro: 123 raw characters, but each "é" costs 6 bytes once percent-encoded (é is 2 UTF-8 bytes, each escaped to %XX).
+    const id = `/data/${"d".repeat(80)}/${"é".repeat(30)}/x.txt`;
+    expect(id.length).toBeLessThan(150);
+    expect(Buffer.byteLength(encodeURIComponent(id), "utf8")).toBeGreaterThan(MAX_ENCODED_SEGMENT_BYTES);
+    expect(isFilesystemResourceId(id)).toBe(false);
+  });
+  test("a purely-ASCII path long enough to overflow the encoded-segment limit is also rejected — a raw-length check could never have been stricter than this one", () => {
+    expect(isFilesystemResourceId("/" + "a".repeat(5000))).toBe(false);
+  });
+  test("the encoded-segment byte boundary is exact: MAX_ENCODED_SEGMENT_BYTES fits, one byte more does not", () => {
+    // The leading "/" alone costs 3 encoded bytes (%2F); each further "a" costs exactly 1 (unreserved) — so the boundary is found by counting up from that fixed cost, not assumed.
+    const slashBytes = Buffer.byteLength(encodeURIComponent("/"), "utf8");
+    const atLimit = "/" + "a".repeat(MAX_ENCODED_SEGMENT_BYTES - slashBytes);
+    const overLimit = "/" + "a".repeat(MAX_ENCODED_SEGMENT_BYTES - slashBytes + 1);
+    expect(Buffer.byteLength(encodeURIComponent(atLimit), "utf8")).toBe(MAX_ENCODED_SEGMENT_BYTES);
+    expect(isFilesystemResourceId(atLimit)).toBe(true);
+    expect(Buffer.byteLength(encodeURIComponent(overLimit), "utf8")).toBe(MAX_ENCODED_SEGMENT_BYTES + 1);
+    expect(isFilesystemResourceId(overLimit)).toBe(false);
   });
 });
 
@@ -328,6 +348,39 @@ describe("searchFilesystemRules", () => {
     const list = async (q: FilesystemQuery) => { if (q.root === "/other") throw new Error("boom"); return [res("/repo/a.md")]; };
     await expect(searchFilesystemRules({ rules, list })).rejects.toThrow("boom");
   });
+
+  test("PR #388 review fix: an oversized path is SKIPPED (never thrown), reported via onOversized, and does not cost its sibling resources", async () => {
+    const oversized = `/repo/${"d".repeat(80)}/${"é".repeat(30)}/x.md`;
+    expect(isFilesystemResourceId(oversized)).toBe(false);
+    const list = async () => [res("/repo/a.md"), res(oversized), res("/repo/b.md")];
+    const oversizedCalls: Array<[string, string]> = [];
+    const matches = await searchFilesystemRules({ rules: [rule()], list }, (r, path) => oversizedCalls.push([r.id, path]));
+    expect(matches.map((m) => m.resource.path).sort()).toEqual(["/repo/a.md", "/repo/b.md"]);
+    expect(oversizedCalls).toEqual([["docs", oversized]]);
+  });
+  test("without onOversized, an oversized path is still silently skipped rather than thrown", async () => {
+    const oversized = `/repo/${"d".repeat(300)}`;
+    const list = async () => [res("/repo/a.md"), res(oversized)];
+    const matches = await searchFilesystemRules({ rules: [rule()], list });
+    expect(matches.map((m) => m.resource.path)).toEqual(["/repo/a.md"]);
+  });
+});
+
+describe("onceOversized", () => {
+  test("logs each distinct (rule, path) exactly once, never repeating across calls", () => {
+    const logs: string[] = [];
+    const report = onceOversized((l) => logs.push(l));
+    report(rule(), "/repo/x");
+    report(rule(), "/repo/x");
+    report(rule({ id: "other" }), "/repo/x");
+    report(rule(), "/repo/y");
+    expect(logs).toHaveLength(3);
+    expect(logs[0]).toContain("rule docs skips /repo/x");
+    expect(logs[0]).toContain(String(MAX_ENCODED_SEGMENT_BYTES));
+  });
+  test("with no log function, it is a silent no-op", () => {
+    expect(() => onceOversized(undefined)(rule(), "/repo/x")).not.toThrow();
+  });
 });
 
 describe("spec builders", () => {
@@ -487,6 +540,26 @@ describe("the filesystem loop", () => {
   test("filesystemRules filters to enabled filesystem rules only", () => {
     const rules = [rule(), rule({ id: "off", enabled: false }), { ...rule({ id: "other" }), resourceProvider: "jira-work" as const }];
     expect(filesystemRules(rules).map((r) => r.id)).toEqual(["docs"]);
+  });
+
+  test("PR #388 review fix end-to-end: an oversized match neither crashes the poll nor blocks its siblings from staffing", async () => {
+    const oversized = `/repo/${"d".repeat(300)}`;
+    const goodKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
+    const { herd, spawned } = fakeHerd([]);
+    const logs: string[] = [];
+    const errors: string[] = [];
+    let successes = 0;
+    const stop = startFilesystemLoop({
+      rules: [rule()], list: async () => [res("/repo/a.md"), res(oversized)], herd,
+      deliver: async () => {}, log: (l) => logs.push(l), intervalMs: 5,
+      onError: (e) => errors.push((e as Error).message), onPollSuccess: () => { successes++; },
+    });
+    await tick();
+    stop();
+    expect(spawned).toEqual([goodKey]);
+    expect(errors).toEqual([]);
+    expect(successes).toBeGreaterThan(0);
+    expect(logs.some((l) => l.includes("skips") && l.includes(oversized))).toBe(true);
   });
 
   test("swarm: spawns one agent per matched resource, stops it on removal, notifies on modify, stops leftovers only among its own", async () => {

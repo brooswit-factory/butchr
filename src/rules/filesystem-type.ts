@@ -30,6 +30,7 @@
  *   `diffMatches` cannot express it (it never sees a key that left `next`).
  */
 import type { SpawnSpec } from "../agents/workspace.js";
+import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import type { FilesystemResource } from "../resources/filesystem.js";
 import type { EventPoll, EventRules, EventVerdict, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
@@ -57,13 +58,30 @@ export interface FilesystemResourceDeps {
 export const ownsFilesystemAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "filesystem";
 
 /**
+ * Told about a resource whose canonical path is otherwise a valid absolute
+ * path but whose percent-encoded form would overflow the workspace
+ * directory-name limit (`isFilesystemResourceId`'s own `MAX_ENCODED_SEGMENT_BYTES`
+ * check, src/resources/filesystem-ref.ts) — deep trees (monorepos,
+ * `node_modules`, nested project directories) reach this realistically, so
+ * this is a real per-poll possibility, not a corner case to crash on.
+ */
+export type OversizedResource = (rule: Rule, path: string) => void;
+
+/**
  * Every enabled `filesystem` rule's matches. Rules are searched in parallel;
  * ANY failure (a missing root, either safety cap crossed —
  * src/resources/filesystem.ts) rejects the WHOLE poll, never a partial result
  * — a partial result would read as "those resources left the query" and stop
  * healthy agents, same discipline as every other provider's `search*Rules`.
+ *
+ * REVIEW FINDING (PR #388 round 1): a resource whose `isFilesystemResourceId`
+ * check fails on the encoded-length limit is SKIPPED here (never included,
+ * `onOversized` told once) rather than handed to `encodeAgentKey` (which
+ * would THROW and, by the paragraph above, reject every OTHER resource this
+ * rule's poll found too) — a single oversized path must cost that one
+ * resource, never the whole rule.
  */
-export async function searchFilesystemRules(deps: Pick<FilesystemResourceDeps, "rules" | "list">): Promise<FilesystemMatch[]> {
+export async function searchFilesystemRules(deps: Pick<FilesystemResourceDeps, "rules" | "list">, onOversized?: OversizedResource): Promise<FilesystemMatch[]> {
   const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "filesystem");
   const perRule = await Promise.all(enabled.map(async (rule) => {
     const query = parseFilesystemQuery(rule.query);
@@ -72,11 +90,23 @@ export async function searchFilesystemRules(deps: Pick<FilesystemResourceDeps, "
     for (const resource of await deps.list(query)) {
       if (seen.has(resource.path)) continue;
       seen.add(resource.path);
+      if (!isFilesystemResourceId(resource.path)) { onOversized?.(rule, resource.path); continue; }
       out.push({ agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: resource.path }), rule, resource });
     }
     return out;
   }));
   return perRule.flat();
+}
+
+/** Logs each oversized-resource skip once per resource-type instance, not once per poll — same "don't spam" discipline as `onceExcluded` (src/rules/resource-type.ts). */
+export function onceOversized(log: ((line: string) => void) | undefined): OversizedResource {
+  const logged = new Set<string>();
+  return (rule, path) => {
+    const id = `${rule.id}:${path}`;
+    if (logged.has(id)) return;
+    logged.add(id);
+    log?.(`WARNING: [filesystem] rule ${rule.id} skips ${path}: its percent-encoded id would exceed the workspace directory-name limit (${MAX_ENCODED_SEGMENT_BYTES} bytes); narrow the rule's root or namePattern`);
+  };
 }
 
 export function specForFilesystem({ agentKey, rule, resource }: FilesystemMatch): SpawnSpec {
@@ -167,11 +197,12 @@ export function createFilesystemEventRules(): EventRules<ExecutionUnit<Filesyste
 
 export function createFilesystemResourceType(deps: FilesystemResourceDeps): ResourceType<ExecutionUnit<FilesystemMatch>> {
   let latest: FilesystemMatch[] = [];
+  const onOversized = onceOversized(deps.log);
   return {
     discovery: {
       idOf: unitAgentKey,
       search: async () => {
-        latest = await searchFilesystemRules(deps);
+        latest = await searchFilesystemRules(deps, onOversized);
         if (deps.runningIds) logExecutionModeSwitches("filesystem", deps.rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
         const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "filesystem");
         return groupExecutionUnits(enabled, latest);
