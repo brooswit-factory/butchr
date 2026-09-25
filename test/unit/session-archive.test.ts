@@ -99,7 +99,7 @@ describe("definitionBasenameProblem", () => {
 describe("archiveSessionDefinition / unarchiveSessionDefinition — name validation (BUTCHR-455 review fix)", () => {
   test("archive refuses a traversal name before touching disk — the active file is untouched, nothing created in the archive dir", async () => {
     const activeDir = await tmp("butchr-archive-badname-active-");
-    const archiveDir = join(activeDir, "..", "archive-badname-dst");
+    const archiveDir = await tmp("butchr-archive-badname-dst-");
     await writeFile(join(activeDir, "real.json"), "CONTENT");
     const io: SessionArchiveIo = { activeDir, archiveDir, ...defaultSessionArchiveIo() };
     const result = await archiveSessionDefinition(io, "../real.json");
@@ -128,7 +128,7 @@ describe("archiveSessionDefinition / unarchiveSessionDefinition — name validat
 describe("archiveSessionDefinition / unarchiveSessionDefinition — real disk", () => {
   test("round-trip: archive then unarchive preserves the exact name and byte-for-byte content", async () => {
     const activeDir = await tmp("butchr-archive-active-");
-    const archiveDir = join(activeDir, "..", "archive-dst");
+    const archiveDir = await tmp("butchr-archive-dst-");
     const content = JSON.stringify(goodDef({ role: "sentinel", execution: "persistent" }), null, 2) + "\n";
     await writeFile(join(activeDir, "a.json"), content);
 
@@ -144,7 +144,11 @@ describe("archiveSessionDefinition / unarchiveSessionDefinition — real disk", 
 
   test("creates the archive directory if it does not exist yet", async () => {
     const activeDir = await tmp("butchr-archive-active-");
-    const archiveDir = join(activeDir, "..", `butchr-archive-dst-${Math.random().toString(36).slice(2)}`);
+    // `archiveDir` itself must not exist yet (that's what this test proves gets created) — but its PARENT
+    // is a securely mkdtemp'd, current-user-owned directory, never the shared system tmpdir() root
+    // directly (BUTCHR-455 review fix: a fixed/loosely-random name placed straight under system tmpdir()
+    // can collide with, or be blocked by, another user's leftover directory on a multi-user host).
+    const archiveDir = join(await tmp("butchr-archive-dst-parent-"), "archive-dst");
     await writeFile(join(activeDir, "a.json"), JSON.stringify(goodDef()));
     const io: SessionArchiveIo = { activeDir, archiveDir, ...defaultSessionArchiveIo() };
     const result = await archiveSessionDefinition(io, "a.json");
