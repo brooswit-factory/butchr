@@ -16,13 +16,14 @@
  * tickets (see `relatedForRules`). Deliberately NOT here (later slices): creating or
  * editing links, relationship patterns, and stand-down sleep.
  */
-import type { JiraIssue } from "../atlassian/types.js";
+import type { JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { bossKeyFrom, createIssueEventRules, type IssueResourceDeps } from "../resources/issue.js";
 import { jiraIssueClass } from "../resources/jira-idea.js";
 import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discovery.js";
-import type { EventPoll, EventRules, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
+import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
+import { createLinkedEventingState, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -53,6 +54,23 @@ export interface RuleResourceDeps {
    * no mode-switch logging runs (every existing caller/test).
    */
   runningIds?: () => Promise<readonly string[]>;
+  /**
+   * BUTCHR-436 (epic BUTCHR-421, story 2/4): a match's Jira remote links,
+   * called ONLY for a rule with `linkedRemoteLinks: true` — see
+   * `LinkedEventingDeps.remoteLinks` (src/jira-watch/linked-eventing.ts) for
+   * the exact contract. Optional; omitted, no rule can ever opt into remote
+   * links (every existing caller/test).
+   */
+  remoteLinks?: (key: string) => Promise<JiraRemoteLink[]>;
+  /**
+   * BUTCHR-436: delivers one poll tick's coalesced linked-change nudge to an
+   * owning resource's own agent — the SAME notify seam `GenericLoopDeps.notify`
+   * (src/daemon/loop.ts) already is in production (src/daemon/index.ts wires
+   * one function to both). Optional; omitted, linked-change eventing simply
+   * never runs (discovery/logging from story 1 is unaffected either way —
+   * see `logLinkedDiscovery`'s own doc comment).
+   */
+  notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
 }
 
 /**
@@ -426,6 +444,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   let latest: RuleMatch[] = [];
   const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
   const linkedDiscoveryTracker = createLinkedDiscoveryTracker();
+  const linkedEventingState: LinkedEventingState = createLinkedEventingState();
   return {
     discovery: {
       idOf: unitAgentKey,
@@ -481,6 +500,30 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
         const crossRule = relatedForRules(deps.rules, latest, active, foreign);
         const wrap = (rs: readonly RelatedResource<RuleMatch>[]): RelatedResource<ExecutionUnit<RuleMatch>>[] =>
           rs.map((r) => ({ issue: { kind: "resource" as const, match: r.issue }, watchers: r.watchers }));
+        // BUTCHR-436: linked-change eventing runs here — AFTER `reconcileNow`
+        // has already run for this poll (`related()` is always called after
+        // `reconcileNow` in `runResourceLoop`, src/daemon/loop.ts), so a
+        // just-spawned owning agent already exists before this ever tries to
+        // nudge it. Belt-and-suspenders try/catch, same discipline as
+        // `checkParked`/`checkAbandoned` (src/daemon/loop.ts): a failure here
+        // must never take down `related()`'s own return value, which the
+        // Implements/Relates/scope-ownership related-resource mechanism
+        // below still depends on regardless of this feature. Only runs when
+        // a caller actually wired `deps.notify` — every existing caller/test
+        // that doesn't is unaffected (linked-eventing simply never runs).
+        if (deps.notify) {
+          try {
+            await linkedEventingState.runTick(latest, {
+              search: deps.search,
+              ...(deps.remoteLinks ? { remoteLinks: deps.remoteLinks } : {}),
+              ...(deps.suppress ? { suppress: deps.suppress } : {}),
+              notify: deps.notify,
+              ...(deps.log ? { log: deps.log } : {}),
+            });
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] tick threw: ${(e as Error)?.message ?? e}`);
+          }
+        }
         // BUTCHR-398: `scopeRelatedResources` already returns `"resource"`-kind
         // wrapped entries — only `crossRule` (the pre-existing Implements/
         // Relates output, still bare `RuleMatch`) needs wrapping here.
