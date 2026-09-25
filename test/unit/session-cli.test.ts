@@ -74,6 +74,14 @@ describe("butchr session list", () => {
     expect(text).toContain("codex-agent.json  valid  vendor=codex tier=tier2");
     expect(text).toContain("broken.json  INVALID");
     expect(text).toContain("tier must be one of");
+    expect(text).toContain("freezeControllers=(none) unfreezeControllers=(none)");
+  });
+
+  test("lists a definition's delegated-freeze grants when set", async () => {
+    const io = fakeIo({ "/defs/target.json": JSON.stringify(goodDef({ freezeControllers: ["director"] })) });
+    const code = await runSessionCli(["list"], io);
+    expect(code).toBe(0);
+    expect(io.out.join("\n")).toContain("freezeControllers=director unfreezeControllers=(none)");
   });
 });
 
@@ -87,6 +95,17 @@ describe("butchr session show", () => {
     expect(text).toContain("agentKey: filesystem:managed-sessions:");
     expect(text).toContain("vendor: claude");
     expect(text).toContain("frozen: manifest=false store=false");
+    expect(text).toContain("freezeControllers: (none)");
+    expect(text).toContain("unfreezeControllers: (none)");
+  });
+
+  test("shows a definition's delegated-freeze grants when set", async () => {
+    const io = fakeIo({ "/defs/target.json": JSON.stringify(goodDef({ freezeControllers: ["director"], unfreezeControllers: ["director", "ops"] })) });
+    const code = await runSessionCli(["show", "target"], io);
+    expect(code).toBe(0);
+    const text = io.out.join("\n");
+    expect(text).toContain("freezeControllers: director");
+    expect(text).toContain("unfreezeControllers: director, ops");
   });
 
   test("no such definition: error on stderr, exit 1", async () => {
@@ -170,6 +189,28 @@ describe("butchr session create", () => {
     ], io);
     expect(code).toBe(1);
     expect(io.err.join("\n")).toContain("already exists");
+  });
+
+  test("--freeze-controllers/--unfreeze-controllers: comma-separated names, trimmed, written verbatim", async () => {
+    const io = fakeIo();
+    const code = await runSessionCli([
+      "create", "target", "--working-directory", "/x", "--brief", "b", "--vendor", "claude", "--tier", "tier1", "--permission-mode", "default",
+      "--freeze-controllers", "director, mud-ops.json", "--unfreeze-controllers", "director",
+    ], io);
+    expect(code).toBe(0);
+    const written = JSON.parse(await io.read("/defs/target.json"));
+    expect(written.freezeControllers).toEqual(["director", "mud-ops.json"]);
+    expect(written.unfreezeControllers).toEqual(["director"]);
+  });
+
+  test("an invalid grant (e.g. a path separator) is refused before writing, same as any other bad field", async () => {
+    const io = fakeIo();
+    const code = await runSessionCli([
+      "create", "target", "--working-directory", "/x", "--brief", "b", "--vendor", "claude", "--tier", "tier1", "--permission-mode", "default",
+      "--freeze-controllers", "../etc/passwd",
+    ], io);
+    expect(code).toBe(1);
+    expect(io.err.join("\n")).toContain("must not contain a path separator");
   });
 
   test("invalid --mcp-servers JSON is rejected before validation", async () => {

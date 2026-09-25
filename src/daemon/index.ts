@@ -2,6 +2,7 @@ import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
@@ -75,6 +76,9 @@ import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./file
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
+import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { listFilesystemResources } from "../resources/filesystem.js";
+import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { runLinkCli } from "../cli/link-cli.js";
@@ -565,6 +569,13 @@ const { app, mcp } = buildApp({
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking needs both providers running: authorization reads both loops' latest matches.
   ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  // BUTCHR-456: registered unconditionally, like resourceLinkTools above — a
+  // managed-session agent needs no external credential to be authorized
+  // (the grant lives in another definition's own manifest), and the SAME
+  // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
+  // the managed-sessions loop and `butchr session` CLI already use, never a
+  // second resolution of "where definitions live" or "which freeze store".
+  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
