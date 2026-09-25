@@ -16,7 +16,7 @@ function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
   return { name, resource_key: name.replace(/^butchr[-:]/, "").toUpperCase(), agent_status: status, pane_id: pane };
 }
 
-const NO_ADMISSION = { cap: 0, residency: null, sources: [] as const };
+const NO_ADMISSION = { cap: 0, residency: null, sentinels: null, sources: [] as const };
 
 /**
  * Extracts the inner text of the FIRST element whose opening tag contains
@@ -594,7 +594,9 @@ describe("renderDashboard: a known, non-null residency actually appears in .admc
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
     const html = renderDashboard(response, opts());
     const admcapText = elementText(html, 'class="admcap"', "</div>");
-    expect(admcapText).toContain("residency:");
+    // BUTCHR-398: "residency:" is now "residency(workers):" — see
+    // renderAdmission's own doc comment (src/web/dashboard-page.ts).
+    expect(admcapText).toContain("residency(workers):");
     expect(admcapText).toContain("3");
   });
 });

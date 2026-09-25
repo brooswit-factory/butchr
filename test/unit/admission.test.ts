@@ -135,7 +135,7 @@ describe("createAdmissionController", () => {
   test("budget below the cap admits everything", async () => {
     const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1", "R2"] });
     expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
-    expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 2, longestWait: null });
+    expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 2, sentinels: 0, longestWait: null });
   });
 
   test("budget exactly consumed by residency admits nothing new", async () => {
@@ -150,7 +150,7 @@ describe("createAdmissionController", () => {
     const line = lines.find((l) => l.startsWith(ADMISSION2_TAG));
     expect(line).toBeDefined();
     expect(line).toContain("cap=2");
-    expect(line).toContain("residency=1");
+    expect(line).toContain("residency(workers)=1 sentinels=0");
     expect(line).toContain("admitted=1");
     expect(line).toContain("withheld 2/3");
     // BUTCHR-297 §E, carried into the new line: the withheld id list still
@@ -171,7 +171,7 @@ describe("createAdmissionController", () => {
     expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
     const line = lines.find((l) => l.startsWith(ADMISSION2_TAG));
     expect(line).toBeDefined();
-    expect(line).toBe(`${ADMISSION2_TAG} cap=5 residency=1 admitted=2 withheld 0/2`);
+    expect(line).toBe(`${ADMISSION2_TAG} cap=5 residency(workers)=1 sentinels=0 admitted=2 withheld 0/2`);
   });
 
   test("empty candidates: still nothing to admit, no admission line at all — the zero-candidate short-circuit's side effect (BUTCHR-297's finding 2) is preserved even after (B)", async () => {
@@ -194,8 +194,9 @@ describe("createAdmissionController", () => {
     const FORMAT2_SAMPLE = "[admission] cap=13 residency=13 withheld 2/2 wanted: BUTCHR-307(4), BUTCHR-308(2)";
     const FORMAT1_PATTERN = /^\[admission\] cap=\d+ residency=\d+ withheld \d+\/\d+ wanted: [A-Z]+-\d+(?:, [A-Z]+-\d+)*$/;
     const FORMAT2_PATTERN = /^\[admission\] cap=\d+ residency=\d+ withheld \d+\/\d+ wanted: [A-Z]+-\d+\(\d+\)(?:, [A-Z]+-\d+\(\d+\))*$/;
-    const FORMAT3_PATTERN = /^\[admission2\] cap=\d+ residency=\d+ admitted=\d+ withheld \d+\/\d+(?: wanted: .+)?$/;
-    const FORMAT3_SAMPLE = admissionLine(13, 13, 0, 2, ["BUTCHR-307", "BUTCHR-308"], new Map([["BUTCHR-307", 4], ["BUTCHR-308", 2]]));
+    // BUTCHR-398: `residency=` is now `residency(workers)=... sentinels=...` — a deliberate further format bump (see admissionLine's own doc comment); the pattern is widened to match, still anchored the same way.
+    const FORMAT3_PATTERN = /^\[admission2\] cap=\d+ residency\(workers\)=\d+ sentinels=\d+ admitted=\d+ withheld \d+\/\d+(?: wanted: .+)?$/;
+    const FORMAT3_SAMPLE = admissionLine(13, 13, 0, 2, ["BUTCHR-307", "BUTCHR-308"], new Map([["BUTCHR-307", 4], ["BUTCHR-308", 2]]), 0);
     // BUTCHR-334 (finding 1): the fail-safe sub-format — same tag, no
     // `residency=` field, a `fail-safe=` marker instead. Must be
     // mechanically distinguishable from all three formats above too.
@@ -244,7 +245,7 @@ describe("createAdmissionController", () => {
       const lines: string[] = [];
       const ctrl = createAdmissionController({ cap: 5, residency: async () => { throw new Error("herdr down"); }, log: (l) => lines.push(l) });
       expect(await ctrl.admit(["A", "B"], [])).toEqual([]);
-      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: null, longestWait: null }); // still no trusted observation
+      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: null, sentinels: null, longestWait: null }); // still no trusted observation
       expect(lines.some((l) => l.includes("WARNING") && l.includes("threw"))).toBe(true);
       const admLine = lines.find((l) => l.startsWith(ADMISSION2_TAG));
       expect(admLine).toBe(admissionFailSafeLine(5, "census-threw", ["A", "B"]));
@@ -261,7 +262,7 @@ describe("createAdmissionController", () => {
     test("cold start: no prior trusted observation, residency reads 0 — trusted immediately, NOT withheld (this is the legitimate boot case, not the BUTCHR-282 shape)", async () => {
       const ctrl = createAdmissionController({ cap: 3, residency: async () => [] });
       expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
-      expect(ctrl.snapshot()).toEqual({ cap: 3, residency: 0, longestWait: null });
+      expect(ctrl.snapshot()).toEqual({ cap: 3, residency: 0, sentinels: 0, longestWait: null });
     });
 
     // BUTCHR-334 finding 1 — the required test's second half: same drill for
@@ -302,7 +303,7 @@ describe("createAdmissionController", () => {
       expect(await ctrl.admit(["X"], [])).toEqual([]); // implausible streak 2/2 — withheld
       // third consecutive implausible read exceeds the bound of 2 — accepted
       expect(await ctrl.admit(["A", "B", "C"], [])).toEqual(["A", "B", "C"]);
-      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 0, longestWait: null });
+      expect(ctrl.snapshot()).toEqual({ cap: 5, residency: 0, sentinels: 0, longestWait: null });
       expect(lines.some((l) => l.includes("bound exceeded"))).toBe(true);
       // BUTCHR-334: this path is NOT one of the two fail-safe early returns —
       // it falls through to the ORDINARY admission line (with a real,
@@ -311,7 +312,7 @@ describe("createAdmissionController", () => {
       // two paths that `return []` before this point.
       const admLines = lines.filter((l) => l.startsWith(ADMISSION2_TAG));
       const admLine = admLines[admLines.length - 1]!; // the FINAL admit() call — the one that actually accepted the zero
-      expect(admLine).toContain("residency=0");
+      expect(admLine).toContain("residency(workers)=0");
       expect(admLine).not.toContain("fail-safe=");
     });
 
@@ -349,7 +350,7 @@ describe("whole-project starvation (BUTCHR-297 regression — fails on today's b
     }
     // Tied waits break lexicographically ("CATA-1" < "DROVR-1"), same rule
     // as the wait-0 case.
-    expect(ctrl.snapshot()).toEqual({ cap: 2, residency: 2, longestWait: { id: "CATA-1", polls: 10 } });
+    expect(ctrl.snapshot()).toEqual({ cap: 2, residency: 2, sentinels: 0, longestWait: { id: "CATA-1", polls: 10 } });
 
     // A slot frees (BUTCHR-1 finishes) at the exact poll a FRESH,
     // lexicographically-first BUTCHR candidate reappears wanting it — the
@@ -643,6 +644,7 @@ describe("createAdmissionController.census() — per-source residency census (BU
     expect(ctrl.census()).toEqual({
       cap: 5,
       residency: null,
+      sentinels: null,
       buckets: [
         { source: "issue", checked: false, declinedAt: new Date(1000).toISOString(), reason: "never-reported" },
         { source: "project", checked: false, declinedAt: new Date(1000).toISOString(), reason: "never-reported" },
@@ -866,8 +868,8 @@ describe("shared cap across rule loops — in-flight reservations", () => {
     const ctrl = createAdmissionController({ cap: 5, residency: async () => ["R1"], log: (l) => lines.push(l) });
     await ctrl.admit(["A1", "A2"], [], "issue");
     await ctrl.admit(["B1"], [], "jira-idea");
-    expect(lines[0]).toBe(`${ADMISSION2_TAG} cap=5 residency=1 admitted=2 withheld 0/2`);
-    expect(lines[1]).toBe(`${ADMISSION2_TAG} cap=5 residency=1 in-flight=2 admitted=1 withheld 0/1`);
+    expect(lines[0]).toBe(`${ADMISSION2_TAG} cap=5 residency(workers)=1 sentinels=0 admitted=2 withheld 0/2`);
+    expect(lines[1]).toBe(`${ADMISSION2_TAG} cap=5 residency(workers)=1 sentinels=0 in-flight=2 admitted=1 withheld 0/1`);
   });
 
   test("a throwing census on one call does not wedge later calls", async () => {
