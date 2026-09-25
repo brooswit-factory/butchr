@@ -86,3 +86,12 @@ provider kinds (`jira-work-item`, `jira-project`, `confluence-page`,
 `github-issue`, `filesystem`, `webpage`) — independent of any
 provider-native links a future adapter may merge in; see
 [`ResourceRef`, the managed-link collection, and the merge contract](docs/resource-links.md).
+
+A resource's provider can be asked which capability categories it actually
+supports today (`query`, `read`, `snapshot`, `comments`, `links`,
+`createTask`) via `supports`/`capabilitiesOf`
+(`src/resources/capabilities.ts`); invoking an unsupported capability throws
+a typed `UnsupportedCapabilityError`. Comments (`readComments`/`addComment`,
+`src/resources/comments.ts`) are implemented for `jira-work-item` only today.
+See [provider capability declaration, the comments capability, and the
+8×6 provider inventory](docs/provider-capabilities.md).
