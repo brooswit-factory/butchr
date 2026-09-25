@@ -1,0 +1,4 @@
+bump: patch
+
+### Changed
+- **README "Rules file" section's capacity-naming paragraph no longer says to adopt `workers`/`sentinels` naming once BUTCHR-392 lands (BUTCHR-401, story BUTCHR-399).** The owner clarified that the default capacity role is `worker`, so a ticket-worker rule (`docs/rules.example.json`) needs no capacity flag at all — only an always-on agent is ever flagged `sentinel`. The prior wording implied ticket-worker rules should eventually carry a capacity field of their own; `docs/rules.example.json` was already correct (no capacity field on any of its five rules), only the README's framing was wrong. The concrete field itself (BUTCHR-392, `execution: swarm|singleton|persistent` on its still-unmerged branch as of this writing) uses different names than the `sentinel` language the owner gave, so the README states the concept only and points at BUTCHR-392 for the field name once it lands, rather than guessing ahead of it.
