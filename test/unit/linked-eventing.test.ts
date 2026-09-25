@@ -236,7 +236,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(0); // nothing to report yet for either owner (seed poll)
   });
 
-  test("a failed batched linked-item search fails open (logs a WARNING; every requested target reads as unreadable this tick, same as one Jira silently omitted)", async () => {
+  test("a failed batched linked-item search fails open (logs a WARNING and skips the tick — no notify, no false 'unreadable' report for a healthy link)", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2") };
     const state = createLinkedEventingState();
@@ -244,8 +244,67 @@ describe("BUTCHR-436: linked-change eventing", () => {
     deps.search = async () => { throw new Error("timeout"); };
     await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner)], deps); // must not throw
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] batched linked-item fetch failed"))).toBe(true);
+    expect(notified).toHaveLength(0); // a search failure is not evidence the link is unreadable — skip, don't falsely report
+
+    // Once the search recovers, the still-unseeded link is seeded silently (first sighting), same as any other first poll.
+    deps.search = async (jql) => {
+      const m = /^key in \((.*)\)$/.exec(jql);
+      const keys = m ? m[1]!.split(",") : [];
+      return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+    };
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner)], deps);
+    expect(notified).toHaveLength(0);
+  });
+
+  test("an unreadable link stays unreadable across several ticks but only notifies ONCE, on the transition — not every tick", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-404" }] as never });
+    const world: Record<string, JiraIssue> = {}; // BUTCHR-404 never comes back from the batched fetch
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // first sighting IS the transition into unreadable — triggers
     expect(notified).toHaveLength(1);
-    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-2", kind: "issuelink", detail: "unreadable" }] } });
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-404", kind: "issuelink", detail: "unreadable" }] } });
+
+    await state.runTick([m], deps); // still unreadable, no transition — must not notify again
+    await state.runTick([m], deps);
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1); // unchanged across N further ticks
+
+    // Once it becomes readable again, a later transition BACK to unreadable notifies again.
+    world["BUTCHR-404"] = issue("BUTCHR-404");
+    await state.runTick([m], deps); // becomes readable — seeds baseline silently, no notify
+    expect(notified).toHaveLength(1);
+    delete world["BUTCHR-404"];
+    await state.runTick([m], deps); // unreadable again — a fresh transition
+    expect(notified).toHaveLength(2);
+  });
+
+  test("a still-unreadable link rides along as context on a message a real change triggers, without itself causing a second notify", async () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-404" },
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) }; // BUTCHR-404 stays unreadable throughout
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed BUTCHR-2; BUTCHR-404's first sighting transitions into unreadable
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-404", kind: "issuelink", detail: "unreadable" }] } });
+
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
+    await state.runTick([m], deps); // BUTCHR-2's real change triggers; BUTCHR-404 (still unreadable, no transition) rides along as context
+    expect(notified).toHaveLength(2);
+    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' },
+      { target: "BUTCHR-404", kind: "issuelink", detail: "unreadable" },
+    ]);
   });
 
   test("with no rule opted into linkedEventing, runTick makes zero calls of any kind", async () => {

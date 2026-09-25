@@ -42,8 +42,15 @@ bump: minor
   A linked key requested in a poll tick's batched fetch but not returned
   (404/403/deleted/inaccessible — Jira's `key in (...)` omits it silently,
   with no per-key HTTP status available) appears as its own
-  `<key> (<kind>): unreadable` line in the delivered message, every tick it
-  stays unreadable. A link that disappears from `discoverLinkedItems`'s own
+  `<key> (<kind>): unreadable` line in the delivered message on the tick it
+  transitions into that state (including its first sighting); it does not
+  keep re-triggering on its own while it stays unreadable, but rides along
+  as a context line on any later message a real change/removal/other
+  transition already earns, and reports again after being seen readable in
+  between. A batched-fetch failure (e.g. a timeout) is not treated as
+  "unreadable" — it skips the whole tick instead, so a transient error never
+  falsely reports a healthy link. A link that disappears from
+  `discoverLinkedItems`'s own
   output (e.g. an issuelink removed) is reported once as
   `<key> (<kind>): no longer linked`, then dropped from that resource's watch
   set — never re-reported while it stays absent.

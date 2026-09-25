@@ -72,6 +72,28 @@
  * resource fingerprint cache already has. Not a correctness bug (a stale
  * entry is simply never read again once its owner stops appearing in
  * `opted`), only a memory-growth note for whoever eventually revisits it.
+ *
+ * UNREADABLE IS TRANSITION-TRIGGERED, NOT REPEATED EVERY TICK (BUTCHR-436 PR
+ * #399 review round 1): a target that stays unreadable across many ticks
+ * must not itself keep causing a notify on every one of them — only the
+ * FIRST tick it goes unreadable (or the first tick after it was last seen
+ * readable) triggers a message. `unreadableSince` below tracks, per (owner,
+ * target), whether the target was unreadable as of the last ADVANCED tick.
+ * A still-unreadable target with no transition is still worth SHOWING once a
+ * message is already going out for some other reason (a real change, a
+ * removal, or a fresh transition), so it is carried as CONTEXT alongside
+ * whatever triggered that message — never as the sole reason to send one.
+ *
+ * SEARCH FAILURE SKIPS THE WHOLE TICK, NOT "EVERYTHING READS AS UNREADABLE"
+ * (BUTCHR-436 PR #399 review round 1): the earlier shape treated a rejected
+ * batched `key in (...)` fetch identically to Jira silently omitting one bad
+ * key — every requested target became a false "unreadable" line, waking
+ * every opted-in owner over what might be a transient timeout. A search
+ * failure instead skips event-building, notify, and every state advance for
+ * this tick entirely (the WARNING below still logs) — the next tick's
+ * batched fetch, if it succeeds, diffs against the SAME unadvanced baselines
+ * and re-derives whatever was genuinely outstanding, so nothing is lost,
+ * only delayed, exactly like a rate-capped tick.
  */
 import type { JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
 import type { Rule } from "../rules/rules.js";
@@ -181,8 +203,9 @@ export interface LinkedEventingState {
 export function createLinkedEventingState(): LinkedEventingState {
   const baselines = new Map<string, Snapshot>();
   const watchSets = new Map<string, Map<string, string>>();
+  const unreadableOwners = new Map<string, Set<string>>();
   const turns = new Map<string, number[]>();
-  const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
+  const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
 
   return {
     async runTick(matches, deps) {
@@ -204,6 +227,28 @@ export function createLinkedEventingState(): LinkedEventingState {
         perOwnerItems.set(m.agentKey, kept);
       }
 
+      // ONE combined batched fetch for every Jira-kind linked target across every opted owner this tick — never one call per linked item, never one per owner.
+      const allTargets = new Set<string>();
+      for (const items of perOwnerItems.values()) for (const i of items) allTargets.add(i.target);
+      let fetched: JiraIssue[] = [];
+      let searchFailed = false;
+      if (allTargets.size) {
+        try {
+          fetched = await deps.search(`key in (${[...allTargets].join(",")})`);
+        } catch (e) {
+          searchFailed = true;
+          deps.log?.(`  WARNING: [linked-eventing] batched linked-item fetch failed for ${allTargets.size} key(s), skipping this tick for every opted-in owner: ${(e as Error)?.message ?? e}`);
+        }
+      }
+      // A failed batched fetch means this tick has no trustworthy data at all
+      // for any opted owner's linked targets — see this module's own top
+      // comment ("SEARCH FAILURE SKIPS THE WHOLE TICK"). No events, no
+      // notify, no baseline/watch-set/unreadable-state advance: the next
+      // tick's fetch, if it succeeds, diffs against the same unadvanced state
+      // and re-derives whatever was genuinely outstanding.
+      if (searchFailed) return;
+      const byKey = new Map(fetched.map((i) => [i.key, i]));
+
       // Removed-link candidates, against each owner's watch set as of the LAST poll this ran for it — read before anything below mutates that set.
       const removedByOwner = new Map<string, LinkedChangeEvent[]>();
       for (const m of opted) {
@@ -215,26 +260,16 @@ export function createLinkedEventingState(): LinkedEventingState {
         if (gone.length) removedByOwner.set(m.agentKey, gone);
       }
 
-      // ONE combined batched fetch for every Jira-kind linked target across every opted owner this tick — never one call per linked item, never one per owner.
-      const allTargets = new Set<string>();
-      for (const items of perOwnerItems.values()) for (const i of items) allTargets.add(i.target);
-      let fetched: JiraIssue[] = [];
-      if (allTargets.size) {
-        try {
-          fetched = await deps.search(`key in (${[...allTargets].join(",")})`);
-        } catch (e) {
-          deps.log?.(`  WARNING: [linked-eventing] batched linked-item fetch failed for ${allTargets.size} key(s): ${(e as Error)?.message ?? e}`);
-        }
-      }
-      const byKey = new Map(fetched.map((i) => [i.key, i]));
-
       const eventsByOwner = new Map<string, LinkedChangeEvent[]>();
       const advanceByOwner = new Map<string, () => void>();
 
       for (const m of opted) {
         const kept = perOwnerItems.get(m.agentKey)!;
-        const events: LinkedChangeEvent[] = [...(removedByOwner.get(m.agentKey) ?? [])];
+        const wasUnreadable = unreadableOwners.get(m.agentKey) ?? new Set<string>();
+        const triggering: LinkedChangeEvent[] = [...(removedByOwner.get(m.agentKey) ?? [])];
+        const stillUnreadable: LinkedChangeEvent[] = [];
         const toAdvance: Array<() => void> = [];
+        const nowUnreadable = new Set<string>();
 
         for (const item of kept) {
           const issue = byKey.get(item.target);
@@ -245,10 +280,17 @@ export function createLinkedEventingState(): LinkedEventingState {
             // here (unlike a per-resource remote-links failure, which DOES
             // carry one — see the WARNING above; that failure is about the
             // OWNER's own remote-links list, a different fact from one
-            // specific linked TARGET being unreadable).
-            events.push({ target: item.target, kind: item.kind, detail: "unreadable" });
+            // specific linked TARGET being unreadable). Only a fresh
+            // transition into unreadable triggers; a target already known
+            // unreadable is carried as context only — see this module's own
+            // top comment.
+            nowUnreadable.add(item.target);
+            const event: LinkedChangeEvent = { target: item.target, kind: item.kind, detail: "unreadable" };
+            if (wasUnreadable.has(item.target)) stillUnreadable.push(event);
+            else triggering.push(event);
             continue;
           }
+          if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(m.agentKey)?.delete(item.target)); // became readable again
           const snap = snapshotOf(issue);
           const bkey = baselineKey(m.agentKey, item.target);
           const before = baselines.get(bkey);
@@ -266,11 +308,22 @@ export function createLinkedEventingState(): LinkedEventingState {
             toAdvance.push(() => baselines.set(bkey, snap)); // own-write echo
             continue;
           }
-          events.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap) });
+          triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap) });
           toAdvance.push(() => baselines.set(bkey, snap));
         }
 
-        if (events.length) eventsByOwner.set(m.agentKey, events);
+        if (nowUnreadable.size) {
+          toAdvance.push(() => {
+            const set = unreadableOwners.get(m.agentKey) ?? new Set<string>();
+            for (const t of nowUnreadable) set.add(t);
+            unreadableOwners.set(m.agentKey, set);
+          });
+        }
+
+        // Still-unreadable context only ever rides a message some OTHER
+        // trigger already earns — an unreadable-only tick with no transition
+        // sends nothing (see this module's own top comment).
+        if (triggering.length) eventsByOwner.set(m.agentKey, [...triggering, ...stillUnreadable]);
         advanceByOwner.set(m.agentKey, () => {
           for (const fn of toAdvance) fn();
           watchSets.set(m.agentKey, new Map(kept.map((i) => [i.target, i.kind])));
@@ -292,8 +345,12 @@ export function createLinkedEventingState(): LinkedEventingState {
           history.push(now());
           turns.set(m.agentKey, history);
         }
-        advance();
+        // Advanced only AFTER a successful notify (review round 1, non-
+        // blocking note): a throwing notify leaves this owner's state
+        // unadvanced too, so "delayed, not lost" holds for a notify failure
+        // the same way it already does for a capped tick.
         await deps.notify(m.agentKey, m.agentKey, { linked: { events } });
+        advance();
       }
     },
   };
