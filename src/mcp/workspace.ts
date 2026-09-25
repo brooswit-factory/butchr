@@ -7,7 +7,9 @@ import { KEY_ONLY_PROVIDERS } from "./identity.js";
  * The global registration is shared; identity is local to each MCP child.
  * Two workspace shapes are accepted: a legacy direct child of the root
  * (`<root>/<ISSUE>`, identity = the directory name) and a rule-engine
- * workspace (`<root>/<provider>/<rule>/<ISSUE-or-"@query">`), whose metadata
+ * workspace (`<root>/<provider>/<rule>/<ISSUE-or-"%40query">` — the real,
+ * percent-escaped directory name; see `encodeQueryAgentKey`'s own doc
+ * comment, src/rules/agent-key.ts), whose metadata
  * must also name the agent key the path encodes. A `github-issue`,
  * `jira-idea` or `zendesk-ticket` workspace's metadata names its agent and
  * resource instead of an `issue`, and the bridge sends the agent key alone

@@ -72,7 +72,7 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
       // than the query agent's own key. Using `resourceKeyOf(agent)`
       // unconditionally (as before this ticket, when `about` was always
       // `agent` and so never mattered) would push the query agent's own
-      // bogus key (`github-issue:<rule>:@query`) as if it were a real issue
+      // bogus key (`github-issue:<rule>:%40query`) as if it were a real issue
       // ref — the exact hazard this ticket's `resourceKeyOf` audit exists to
       // close, here in notification text rather than a live API call.
       const resource = resourceKeyOf(about === agent ? agent : about);

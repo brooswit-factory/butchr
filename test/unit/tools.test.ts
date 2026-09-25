@@ -259,6 +259,27 @@ describe("comment identity tagging", () => {
     expect(bodies[0]).toBe("[KAN-7] status looks good");
     expect(bodies[1]).toBe("[KAN-7] already tagged");    // no double tag
   });
+
+  // BUTCHR-398 (review finding 2): a jira-work QUERY-LEVEL agent
+  // (`singleton`/`persistent`) sends `x-butchr-agent` alone, never
+  // `x-issue` (it has no single ticket to name one for). Before this fix,
+  // that left it untagged — indistinguishable, by this exact tool's own
+  // stated convention, from a human's own comment.
+  test("a caller with no x-issue but an x-butchr-agent (a query-level agent) is tagged with its agent key instead of posting untagged", async () => {
+    const { tools, calls } = rig();
+    const conn = { headers: { "x-butchr-agent": "jira-work:directors:%40query" } } as any;
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "status looks good" }, conn);
+    const args = calls.filter(([n]) => n === "addComment")[0]![1];
+    expect(args[1]).toBe("[jira-work:directors:%40query] status looks good");
+  });
+
+  test("a caller with neither x-issue nor x-butchr-agent still posts untagged (unattributable, unchanged)", async () => {
+    const { tools, calls } = rig();
+    const conn = { headers: {} } as any;
+    await tools.jira_add_comment!.handler({ key: "KAN-1", text: "status looks good" }, conn);
+    const args = calls.filter(([n]) => n === "addComment")[0]![1];
+    expect(args[1]).toBe("status looks good");
+  });
 });
 
 describe("jira_create_issue: role assignment, implements/parent resolution, orphan opt-out (KAN-802)", () => {

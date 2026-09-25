@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, ruleAgentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, buildWorkspace, agentIdOfWorkspacePath, mcpIdentityHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
 describe("workspace identity", () => {
@@ -68,6 +68,19 @@ describe("workspace identity", () => {
     expect(workspaceDirFor(agentIdOfWorkspacePath(queryDir, root)!, root)).toBe(queryDir);
   });
 
+  test("BUTCHR-398 (review finding 1): singleResourceOf is null for a query-level id — a caller that needs a real single resource to write to (e.g. an escalation comment) must never fall back to the bogus whole key resourceKeyOf itself falls back to", () => {
+    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+      const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
+      expect(singleResourceOf(key)).toBeNull();
+      // Never equal to resourceKeyOf's own fallback (the bogus whole key) — this is the actual bug being closed.
+      expect(resourceKeyOf(key)).toBe(key);
+    }
+  });
+  test("BUTCHR-398: singleResourceOf is unchanged for a per-resource id, of any provider — same as resourceKeyOf", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-1" });
+    expect(singleResourceOf(key)).toBe("BUTCHR-1");
+    expect(singleResourceOf(key)).toBe(resourceKeyOf(key));
+  });
   test("BUTCHR-398: mcpIdentityHeaders for a query-level spec sends x-butchr-agent alone, never x-issue, for every provider including jira-work", () => {
     for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });

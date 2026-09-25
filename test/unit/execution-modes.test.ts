@@ -7,8 +7,14 @@ import { parseRules, type Rule } from "../../src/rules/rules.js";
 import {
   createRuleEventRules, createRuleResourceType, ownsRuleAgent, relatedForRules, specForMatch, specForRuleQuery, specForUnit, uniqueIssues, type RuleMatch,
 } from "../../src/rules/resource-type.js";
-import { specForGithubIssueQuery, specForGithubIssueUnit, type GithubIssueMatch } from "../../src/rules/github-issue-type.js";
-import { specForZendeskTicketQuery, specForZendeskTicketUnit, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
+import { createGithubIssueEventRules, createGithubIssueResourceType, specForGithubIssueQuery, specForGithubIssueUnit, type GithubIssueMatch } from "../../src/rules/github-issue-type.js";
+import { createZendeskTicketEventRules, createZendeskTicketResourceType, specForZendeskTicketQuery, specForZendeskTicketUnit, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
+import { createJiraIdeaResourceType } from "../../src/rules/jira-idea-type.js";
+import type { ResourceType } from "../../src/resources/types.js";
+import type { GithubIssue } from "../../src/resources/github-issue.js";
+import { parseGithubIssueRef } from "../../src/resources/github-issue-ref.js";
+import type { ZendeskTicket } from "../../src/resources/zendesk-ticket.js";
+import { parseZendeskTicketRef } from "../../src/resources/zendesk-ticket-ref.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, scopeRelated, scopeRelatedResources, type ExecutionUnit } from "../../src/rules/execution.js";
 import { createAdmissionController, type AgentCapacityRole } from "../../src/agents/admission.js";
@@ -58,6 +64,7 @@ async function poll(herd: Herd, ruleSet: Rule[], search: (jql: string) => Promis
 }
 
 const queryKey = (ruleId: string) => encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId });
+const queryKey2 = (resourceProvider: "jira-work" | "github-issue" | "jira-idea" | "zendesk-ticket", ruleId: string) => encodeQueryAgentKey({ resourceProvider, ruleId });
 
 describe("groupExecutionUnits (BUTCHR-398) — the primary-item grouping every provider's discovery.search() shares", () => {
   const rule = (id: string, execution: Rule["execution"], enabled = true): Rule =>
@@ -482,5 +489,120 @@ describe("fleet capacity role: worker (default) | sentinel (BUTCHR-398)", () => 
     await ctrl.admit(["jira-work:task:B"], []);
     const line = lines.find((l) => l.startsWith("[admission2]"))!;
     expect(line).toContain("residency(workers)=1 sentinels=1");
+  });
+});
+
+describe("per-provider convergence and event delivery (BUTCHR-398 review finding 3): github-issue, zendesk-ticket, jira-idea", () => {
+  const gi = (ref: string, over: Partial<GithubIssue> = {}): GithubIssue => {
+    const r = parseGithubIssueRef(ref)!;
+    return { ref, owner: r.owner, repo: r.repo, number: r.number, title: `title ${ref}`, body: "body", state: "open", stateReason: null, issueType: "Bug", labels: [], comments: 0, updated: "2026-09-16T00:00:00Z", url: `https://github.com/${r.owner}/${r.repo}/issues/${r.number}`, ...over };
+  };
+  const zt = (ref: string, over: Partial<ZendeskTicket> = {}): ZendeskTicket => {
+    const r = parseZendeskTicketRef(ref)!;
+    return { ref, id: r.id, subject: "s", description: "d", status: "open", priority: null, ticketType: "incident", tags: [], updated: "2026-09-16T10:00:00Z", url: "x", ...over };
+  };
+  const idea = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
+    ({ key, summary: key, status: "Discovery", issuetype: "Idea", assignee: null, parent: null, updated: "2026-09-16T00:00:00Z", labels: [], projectType: "product_discovery", ...over });
+
+  /** One reconcile pass through a generic ResourceType, generic over `T` — mirrors jira-work's own `poll()` above. */
+  async function pollType<T>(herd: Herd, type: ResourceType<T>): Promise<void> {
+    const items = await type.discovery.search();
+    await reconcileNow(herd, desiredFrom(items, type));
+  }
+
+  test("github-issue: singleton converges 0 -> 1 -> 0 -> 1, never a duplicate, restart adoption included", async () => {
+    const ghRule = () => rules({ id: "bugs", resourceProvider: "github-issue", query: "is:open label:bug", execution: "singleton" })[0]!;
+    let matched: GithubIssue[] = [];
+    const herd = fakeHerd();
+    const type = createGithubIssueResourceType({ rules: [ghRule()], search: async () => matched });
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([]); // N=0
+    matched = [gi("acme/w#1"), gi("acme/w#2")];
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([queryKey2("github-issue", "bugs")]); // N>=1 -> exactly ONE
+    matched = [];
+    await pollType(herd, type);
+    expect(herd.stopped).toEqual([queryKey2("github-issue", "bugs")]);
+    matched = [gi("acme/w#3")];
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([queryKey2("github-issue", "bugs"), queryKey2("github-issue", "bugs")]); // spawned twice over its lifetime, never concurrently
+
+    // Restart adoption: an already-running query agent is never re-spawned.
+    const herd2 = fakeHerd([queryKey2("github-issue", "bugs")]);
+    const type2 = createGithubIssueResourceType({ rules: [ghRule()], search: async () => [gi("acme/w#1")] });
+    await pollType(herd2, type2);
+    expect(herd2.spawned).toEqual([]);
+  });
+
+  test("github-issue: a state change in scope is delivered to the query agent once, deduplicated across two tickets", async () => {
+    const [ghRule] = rules({ id: "bugs", resourceProvider: "github-issue", query: "is:open label:bug", execution: "singleton" });
+    const events = createGithubIssueEventRules({});
+    const m = (ref: string, over: Partial<GithubIssue> = {}): GithubIssueMatch => ({ agentKey: `github-issue:bugs:${encodeURIComponent(ref)}`, rule: ghRule!, issue: gi(ref, over) });
+    const snap = (ms: GithubIssueMatch[]) => ({ primary: [] as ReturnType<typeof scopeRelatedResources<GithubIssueMatch>>[number]["issue"][], related: scopeRelatedResources(ms) });
+    const ev = await events.poll(
+      snap([m("acme/w#1"), m("acme/w#2")]),
+      snap([m("acme/w#1", { state: "closed" }), m("acme/w#2", { title: "renamed" })]),
+    );
+    expect([...ev.changedRelated].sort()).toEqual(["github-issue:bugs:acme%2Fw%231", "github-issue:bugs:acme%2Fw%232"]);
+    expect(await ev.decide("github-issue:bugs:acme%2Fw%231", queryKey2("github-issue", "bugs"), "related")).toEqual({ deliver: true, reason: { status: { from: "open", to: "closed" } } });
+    expect(await ev.decide("github-issue:bugs:acme%2Fw%232", queryKey2("github-issue", "bugs"), "related")).toEqual({ deliver: true, reason: { summary: true } });
+  });
+
+  test("zendesk-ticket: persistent runs at N=0 and survives matches leaving; freeze (enabled:false) stops it", async () => {
+    const zdRule = (enabled = true) => rules({ id: "support", resourceProvider: "zendesk-ticket", query: "status:open", execution: "persistent", enabled })[0]!;
+    const herd = fakeHerd();
+    const type = createZendeskTicketResourceType({ rules: [zdRule()], search: async () => [], comments: async () => [] });
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([queryKey2("zendesk-ticket", "support")]);
+    const type2 = createZendeskTicketResourceType({ rules: [zdRule()], search: async () => [zt("acme#1")], comments: async () => [] });
+    await pollType(herd, type2);
+    expect(herd.spawned).toEqual([queryKey2("zendesk-ticket", "support")]); // still just the one
+    expect(herd.stopped).toEqual([]);
+    const off = createZendeskTicketResourceType({ rules: [zdRule(false)], search: async () => { throw new Error("a disabled rule must never be searched"); }, comments: async () => [] });
+    await pollType(herd, off);
+    expect(herd.stopped).toEqual([queryKey2("zendesk-ticket", "support")]);
+  });
+
+  test("zendesk-ticket: a status change in scope is delivered to the query agent, named", async () => {
+    const [zdRule] = rules({ id: "support", resourceProvider: "zendesk-ticket", query: "status:open", execution: "singleton" });
+    const events = createZendeskTicketEventRules({ comments: async () => [] });
+    const m = (over: Partial<ZendeskTicket> = {}): ZendeskTicketMatch => ({ agentKey: "zendesk-ticket:support:acme%237", rule: zdRule!, ticket: zt("acme#7", over) });
+    const snap = (ms: ZendeskTicketMatch[]) => ({ primary: [] as ReturnType<typeof scopeRelatedResources<ZendeskTicketMatch>>[number]["issue"][], related: scopeRelatedResources(ms) });
+    const ev = await events.poll(snap([m()]), snap([m({ status: "pending", updated: "later" })]));
+    expect(ev.changedRelated).toEqual(["zendesk-ticket:support:acme%237"]);
+    expect(await ev.decide("zendesk-ticket:support:acme%237", queryKey2("zendesk-ticket", "support"), "related")).toEqual({ deliver: true, reason: { status: { from: "open", to: "pending" } } });
+  });
+
+  test("jira-idea: singleton converges 0 -> 1 -> 0, a proven idea only (non-idea work items excluded)", async () => {
+    const ideaRule = () => rules({ id: "ideas", resourceProvider: "jira-idea", query: "project = IDEAS", execution: "singleton" })[0]!;
+    let matched: JiraIssue[] = [issue("BUTCHR-1")]; // a work item, NOT a proven idea — must be excluded
+    const herd = fakeHerd();
+    const type = createJiraIdeaResourceType({ rules: [ideaRule()], search: async () => matched });
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([]); // the work item was excluded, so N=0
+    matched = [idea("IDEA-1"), idea("IDEA-2")];
+    await pollType(herd, type);
+    expect(herd.spawned).toEqual([queryKey2("jira-idea", "ideas")]);
+    matched = [];
+    await pollType(herd, type);
+    expect(herd.stopped).toEqual([queryKey2("jira-idea", "ideas")]);
+  });
+
+  test("jira-idea: a status change to one of its own scoped ideas is delivered to the query agent", async () => {
+    const [ideaRule] = rules({ id: "ideas", resourceProvider: "jira-idea", query: "project = IDEAS", execution: "singleton" });
+    let matched: JiraIssue[] = [idea("IDEA-1")];
+    // `type` keeps its own internal `latest` state, advanced by each `search()`/`related()`
+    // call in sequence — exactly the (search, related) pairing `runResourceLoop` itself performs
+    // each poll — so driving ONE instance through two (search, related) rounds gives the real
+    // (prev, next) snapshot pair the daemon would actually produce, no hand-assembly.
+    const type = createJiraIdeaResourceType({ rules: [ideaRule!], search: async () => matched, comments: async () => [] });
+    const before = await type.discovery.search();
+    const relatedBefore = await type.discovery.related!([queryKey2("jira-idea", "ideas")]);
+    matched = [idea("IDEA-1", { status: "Explore", updated: "later" })];
+    const after = await type.discovery.search();
+    const relatedAfter = await type.discovery.related!([queryKey2("jira-idea", "ideas")]);
+    const ev = await type.eventRules.poll({ primary: before, related: relatedBefore }, { primary: after, related: relatedAfter });
+    expect(ev.changedRelated).toEqual(["jira-idea:ideas:IDEA-1"]);
+    expect(await ev.decide("jira-idea:ideas:IDEA-1", queryKey2("jira-idea", "ideas"), "related")).toEqual({ deliver: true, reason: { status: { from: "Discovery", to: "Explore" } } });
   });
 });

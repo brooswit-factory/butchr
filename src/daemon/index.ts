@@ -11,7 +11,7 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
-import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf } from "../agents/workspace.js";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -476,6 +476,23 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
   return id ? resourceKeyOf(id) : null;
 };
+/**
+ * BUTCHR-398 (review finding 1): the escalation-safe sibling of
+ * `resourceOfCwd` — `singleResourceOf` (src/agents/workspace.ts) instead of
+ * `resourceKeyOf`, so a query-level agent's pane resolves to `null` (routed
+ * through `escalation-loop.ts`'s own loud `issue === null` "cannot
+ * escalate" path) rather than its own bogus `@query`-suffixed key, which
+ * `speakOnOwnChannel`/`ops.addComment` would otherwise post a doomed Jira
+ * write against — a real escalation silently lost for exactly the
+ * long-lived (persistent/singleton) agents this ticket exists to support.
+ * `resourceOfCwd` itself is UNCHANGED and still used for the dashboard/
+ * label-sync status map, where the bogus fallback is a harmless, never-
+ * looked-up orphan entry, not a write.
+ */
+const escalationTargetOfCwd = (cwd: string | null | undefined): string | null => {
+  const id = ownedAgentOfCwd(cwd);
+  return id ? singleResourceOf(id) : null;
+};
 const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<string, string> => {
   const m = new Map<string, string>();
   for (const a of agents) {
@@ -646,7 +663,7 @@ const abandonedDetector = createAbandonedDetector({
 // Atlassian writer or reader.
 // BUTCHR-398 — the `resourceKeyOf` hazard (found in BUTCHR-397's review):
 // `resourceKeyOf` on a query-level id (a `singleton`/`persistent` rule's one
-// agent) returns the WHOLE bogus key (e.g. `jira-work:triage:@query`), never
+// agent) returns the WHOLE bogus key (e.g. `jira-work:triage:%40query`), never
 // a real ticket — `decodeAgentKey` deliberately rejects it (see
 // src/rules/agent-key.ts). A query-level agent has no single ticket to
 // comment on or read comments from, so every detector below that would
@@ -813,10 +830,18 @@ runResourceLoop(ruleResourceType, {
   herd,
   ownsId: ownsRuleAgent,
   notify: async (agent, about, reason) => {
+    // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
+    // for a query-level agent that's its own query key, shown as-is in
+    // `changeNudge`'s "related to your X" framing (there is no friendlier
+    // single ticket to name it by). `aboutIssue` is the CHANGED resource —
+    // for `notifyAgent`'s own `meta.issue`, that changed resource (not the
+    // agent's own identity) is what a notification is actually about, the
+    // same thing the other three provider loops already pass as their own
+    // `deliver(agent, resource, msg)` argument.
     const issue = resourceKeyOf(agent);
     const aboutIssue = resourceKeyOf(about);
     const msg = reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to) : changeNudge(issue, aboutIssue, reason);
-    void notifyAgent(mcp, agent, issue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    void notifyAgent(mcp, agent, aboutIssue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
     const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
     const reasonTag = notifyReasonTag(reason);
     const promptState = outcome.refusal
@@ -987,7 +1012,7 @@ const escalator = createEscalator({
 // both need it, and neither can assume the caller already has it.
 async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
-  return resourceOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
+  return escalationTargetOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes

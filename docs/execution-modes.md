@@ -74,7 +74,8 @@ across polls while the ONE agent must not.
 
 ```
 encodeQueryAgentKey({ resourceProvider, ruleId })
-  → <resourceProvider>:<ruleId>:@query        e.g. jira-work:triage:@query
+  → <resourceProvider>:<ruleId>:%40query      e.g. jira-work:triage:%40query
+  (the `@` is percent-escaped in the real, produced key — see encodeQueryAgentKey's own doc comment, src/rules/agent-key.ts)
 ```
 
 - **Derived from provider + rule id ALONE, never a matched resource.** The
@@ -86,7 +87,8 @@ encodeQueryAgentKey({ resourceProvider, ruleId })
   canonical re-encoding — so, as with the per-resource codec, no two distinct
   strings decode to the same tuple.
 - **Cannot collide with, or be mistaken for, a per-resource key of ANY
-  provider.** The literal `@query` in the resource-id slot can never be a
+  provider.** The literal `@query` marker (percent-escaped to `%40query` in the
+  real key — see the codec above) in the resource-id slot can never be a
   real resource id (proven, not assumed — see `test/unit/rules.test.ts`).
   `decodeAnyAgentKey(key)` decodes either shape, tagged `{ kind: "resource",
   ... }` or `{ kind: "query", ... }`, for code that must handle both.
@@ -95,13 +97,13 @@ encodeQueryAgentKey({ resourceProvider, ruleId })
 
 A per-resource workspace lives at `<root>/<provider>/<ruleId>/<resourceId>`
 (`workspaceDirFor`, `src/agents/workspace.ts`). A query-level workspace lives
-at `<root>/<provider>/<ruleId>/@query` — the same depth, a SIBLING inside
+at `<root>/<provider>/<ruleId>/%40query` — the same depth, a SIBLING inside
 that rule's own directory:
 
 ```
 <root>/jira-work/triage/BUTCHR-12/      ← a per-resource agent (swarm)
 <root>/jira-work/triage/BUTCHR-31/      ← another one
-<root>/jira-work/triage/@query/         ← the ONE singleton/persistent agent for this rule
+<root>/jira-work/triage/%40query/       ← the ONE singleton/persistent agent for this rule
 ```
 
 ## Reconciliation (BUTCHR-398)
@@ -186,7 +188,7 @@ A query-level agent has no single resource, so it identifies to the daemon's
 MCP endpoint with `x-butchr-agent` ALONE — never `x-issue` — for every
 provider, jira-work included (Task 1 left `jira-work` per-resource agents
 sending `x-issue`; a query-level jira-work agent is NOT one of those, and
-sending its own `@query`-suffixed key as `x-issue` would be exactly the
+sending its own `%40query`-suffixed key as `x-issue` would be exactly the
 bogus-resource hazard the next section closes, one layer earlier).
 `mcpIdentityHeaders`/`buildWorkspace` (`src/agents/workspace.ts`) check
 `isQuerySpec`/`decodeAnyAgentKey` BEFORE the existing `isKeyOnly`
@@ -207,17 +209,54 @@ surface is unchanged by this story — it uses the same per-provider
 read/comment tools any agent of its provider does, each already taking an
 explicit resource argument where one is needed.
 
+### What tools a query-level agent has (BUTCHR-398 review finding 2)
+
+A query-level agent's tool surface is DELIBERATELY narrower than a
+per-resource agent's, because most of what it lacks is a genuine consequence
+of having no single resource, no ticket, and no doc — not an oversight:
+
+- **Per-resource read/comment tools still work, unchanged**, because they
+  already take an explicit resource argument rather than resolving "my own
+  ticket" from the caller's identity: `jira_get_issue`, `jira_search`,
+  `jira_add_comment`, `jira_transition`, and the equivalent per-provider
+  tools (`github_get_issue`/`github_add_comment`, `jira_idea_get`/
+  `jira_idea_add_comment`, `zendesk_get_ticket`/`zendesk_add_internal_note`)
+  all take the resource they act on as an argument, so a query-level caller
+  uses them exactly as any other agent of its provider does — across every
+  resource in its scope, not just one.
+  - **`jira_add_comment`'s identity tag** (`src/tools/defs.ts`) is built
+    from the caller's `x-issue`, which a query-level agent never sends —
+    falls back to `x-butchr-agent` (the same precedence `audit()`'s writer
+    line and `src/tools/outcome.ts`'s caller field already use), so a
+    query-level agent's comment is tagged with its own agent key rather
+    than posting untagged (which, by this tool's own house convention, an
+    untagged comment on the shared account reads as a human's).
+- **`get_doc`/`set_doc` and every BUTCHR-35 relationship verb
+  (`new_worker`, `start_worker`, `report_to_boss`, `ask_boss`,
+  `submit_to_boss`, `tell_worker`, …) REFUSE a caller with no `x-issue`**
+  (`requireCaller`, `src/tools/defs.ts`) — a DELIBERATE, unchanged decision,
+  not a gap this story closes: a query-level agent genuinely has no single
+  ticket to own a doc on, no boss (an `Implements` link names a specific
+  ticket's boss), and nothing for `report_to_boss`/`ask_boss` to route to.
+  These verbs simply are not applicable to a query-level agent's own
+  identity; its own brief should not teach them.
+- **Its own Confluence doc**: because `set_doc`/`get_doc` are unreachable
+  for it (above), a query-level agent has no doc of its own — its own
+  brief/`SpawnSpec` (the "What the query-level agent is told at spawn"
+  design, Section A of this task) is its only durable instruction surface.
+
 ## The `resourceKeyOf` hazard — audited and closed (BUTCHR-398)
 
 `resourceKeyOf(id)` (`src/agents/workspace.ts`) is `decodeAgentKey(id)?.resourceId
 ?? id` — for a query-level id, `decodeAgentKey` always rejects it (by
 design), so `resourceKeyOf` falls back to the id ITSELF: the whole bogus key
-(e.g. `jira-work:triage:@query`). BUTCHR-397's review flagged every call
+(e.g. `jira-work:triage:%40query`). BUTCHR-397's review flagged every call
 site that could feed that fallback into a live Jira/GitHub/Zendesk lookup or
 a comment write. Re-audited for this task:
 
 | consumer | verdict |
 |---|---|
+| `src/daemon/index.ts`: `issueForPane` (feeds `escalator.onBlocked`/`onNoPrompt`) via `resourceOfCwd`/`ownedAgentOfCwd` | **fixed — the sharpest gap found in review.** A blocked persistent/singleton agent's dialog escalation would otherwise post `speakOnOwnChannel`'s `ops.addComment` against the bogus `@query` key (a doomed Jira write, silently 404ing and logged, never reaching anyone). New `escalationTargetOfCwd` uses `singleResourceOf` (`src/agents/workspace.ts`) instead of `resourceKeyOf`, so a query-level pane resolves to `null` — routed through `escalation-loop.ts`'s own PRE-EXISTING, loud `issue === null` → `"blocked with an unanswerable prompt but no issue key — cannot escalate"` path, verified live to already exist rather than assumed. `resourceOfCwd` itself is unchanged for the dashboard/label-sync status map, where the bogus fallback is a harmless orphan entry, not a write. |
 | `src/daemon/index.ts`: `issueCrashLoopDetector`/`issueReconcileFailureDetector`'s `addComment`/`comments` | fixed — a query-level id (`isQueryLevelAgent`) skips the Jira write/read entirely (logged, not silent) rather than acting on the bogus key. |
 | `src/daemon/index.ts`: the jira-work loop's `onRespawn` | fixed — a query-level agent's respawn notice is skipped (no ticket to post to). |
 | `src/daemon/github-issue-loop.ts`/`zendesk-ticket-loop.ts`/`jira-idea-loop.ts`: `notify` | fixed — each now derives the notified resource from `about` (the ticket that actually changed, via the related path) rather than unconditionally from `resourceKeyOf(agent)`, which for a query-level agent is its own bogus key, not a real resource — this was previously safe only because `about === agent` always held (no related delivery existed for these providers before this story). |
@@ -226,6 +265,7 @@ a comment write. Re-audited for this task:
 | `src/daemon/index.ts`: `isStaffed`, `resourceOfCwd`/`agentStatuses` (label-sync status map) | already safe, unchanged — a query-level id's bogus `resourceKeyOf` fallback never equality-matches a real ticket key, so it is either ignored (`isStaffed`) or becomes a harmless unread orphan map entry (label sync only ever looks up REAL ticket keys from search results). |
 | `src/agents/herd.ts`: `staleIssues()`'s internal `decodeAgentKey`, `resourceQuotaBlocked` | left as-is (BUTCHR-397's own verdict, reconfirmed): each degrades to its existing null-decode behaviour for a query-level key (no `resource` field passed to `spawnArgs`; never matches a real resource id) rather than crashing. |
 | `buildWorkspace`, `mcpIdentityHeaders`, `SpawnSpec` (`src/agents/workspace.ts`) | **implemented this task** — see "MCP identity for a query-level agent" above; this is exactly the follow-up BUTCHR-397 named. |
+| `src/tools/defs.ts`: `jira_add_comment`'s identity tag (built from `x-issue`) | fixed — falls back to `x-butchr-agent` when `x-issue` is absent (a query-level jira-work agent), so its comment is tagged with its own agent key rather than posting untagged (see "What tools a query-level agent has" above). |
 
 No lookup or write anywhere in this codebase now keys a live Jira/GitHub/Zendesk
 call off a query-level agent's own id — `test/unit/execution-modes.test.ts`
