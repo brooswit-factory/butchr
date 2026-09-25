@@ -187,3 +187,29 @@ export function sessionDefinitionsPath(env: SessionDefinitionsEnv = process.env)
   const xdg = env.XDG_CONFIG_HOME?.trim() || join(env.HOME?.trim() || homedir(), ".config");
   return join(xdg, "butchr", "session-definitions");
 }
+
+/**
+ * BUTCHR-455 review fix: `builtinManagedSessionsRule`'s own query
+ * (`{root, kind: "file", maxDepth: 1}`) has no name filter, and
+ * `listFilesystemResources` does not skip dotfiles — so a temp file a
+ * writer leaves in the ACTIVE directory mid-write (`writeFileAtomic`'s own
+ * `.<uuid>.tmp`, used by `create`, `freeze`/`unfreeze`'s manifest rewrite,
+ * and this ticket's own cross-filesystem `unarchive` fallback) is a
+ * CANDIDATE definition for the brief window between its write and its
+ * rename into the real name. If a poll lands in that window and the temp
+ * content happens to already be a valid, non-frozen manifest (true for
+ * every one of those writers, which all write/rewrite a full valid
+ * document), it would be staffed as a SECOND agent under a path-derived
+ * key that has no relationship to the real definition's own freeze state —
+ * breaking "one agent per eligible definition" and, worse, able to run
+ * un-frozen while the real definition is still store-frozen. Both
+ * `searchSessionDefinitions` (`src/rules/session-definition-type.ts`) and
+ * `listSessionDefinitions` (`src/resources/session-definition-manage.ts`)
+ * call this FIRST, before any oversized/parse/frozen check, and skip a
+ * hidden entry SILENTLY — never logged as invalid, never listed at all —
+ * because a hidden file was never offered as a definition in the first
+ * place; it's not a broken one.
+ */
+export function isHiddenDefinitionFile(basename: string): boolean {
+  return basename.startsWith(".");
+}

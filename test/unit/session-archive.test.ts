@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InstanceFreezeStore } from "@brooswit/drovr-events";
 import {
-  archiveSessionDefinition, assertArchiveDirDisjoint, defaultSessionArchiveIo, sessionArchiveDir,
-  unarchiveSessionDefinition, type OnArchived, type SessionArchiveIo,
+  archiveSessionDefinition, assertArchiveDirDisjoint, defaultSessionArchiveIo, definitionBasenameProblem,
+  sessionArchiveDir, unarchiveSessionDefinition, type OnArchived, type SessionArchiveIo,
 } from "../../src/resources/session-archive.js";
 import {
   freezeSessionDefinition, readFreezeGates, sessionAgentKey, sessionFreezeStoreKey,
@@ -62,6 +62,66 @@ describe("assertArchiveDirDisjoint", () => {
 
   test("does not throw for an unrelated directory entirely", () => {
     expect(() => assertArchiveDirDisjoint("/defs", "/somewhere/else")).not.toThrow();
+  });
+});
+
+describe("definitionBasenameProblem", () => {
+  test("accepts a plain basename", () => {
+    expect(definitionBasenameProblem("a.json")).toBeNull();
+    expect(definitionBasenameProblem("mud-player-1.json")).toBeNull();
+  });
+
+  test("rejects empty", () => {
+    expect(definitionBasenameProblem("")).toContain("must not be empty");
+  });
+
+  test('rejects "." and ".."', () => {
+    expect(definitionBasenameProblem(".")).toContain('must not be "." or ".."');
+    expect(definitionBasenameProblem("..")).toContain('must not be "." or ".."');
+  });
+
+  test("rejects a name containing a path separator (traversal, or a nested path)", () => {
+    expect(definitionBasenameProblem("../../etc/passwd")).toContain("bare file name");
+    expect(definitionBasenameProblem("sub/a.json")).toContain("bare file name");
+    expect(definitionBasenameProblem("a\\b.json")).toContain("bare file name");
+  });
+
+  test("rejects an absolute path (POSIX and Windows-style both contain a rejected separator)", () => {
+    expect(definitionBasenameProblem("/etc/passwd")).toContain("bare file name");
+    expect(definitionBasenameProblem("C:\\Windows\\a.json")).toContain("bare file name");
+  });
+
+  test("a leading dot alone (an ordinary hidden-looking name) is NOT rejected by this check — dotfiles are excluded elsewhere (listing-level), not here", () => {
+    expect(definitionBasenameProblem(".hidden.json")).toBeNull();
+  });
+});
+
+describe("archiveSessionDefinition / unarchiveSessionDefinition — name validation (BUTCHR-455 review fix)", () => {
+  test("archive refuses a traversal name before touching disk — the active file is untouched, nothing created in the archive dir", async () => {
+    const activeDir = await tmp("butchr-archive-badname-active-");
+    const archiveDir = join(activeDir, "..", "archive-badname-dst");
+    await writeFile(join(activeDir, "real.json"), "CONTENT");
+    const io: SessionArchiveIo = { activeDir, archiveDir, ...defaultSessionArchiveIo() };
+    const result = await archiveSessionDefinition(io, "../real.json");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("bare file name");
+    expect(await readFile(join(activeDir, "real.json"), "utf8")).toBe("CONTENT"); // untouched
+  });
+
+  test("unarchive refuses an absolute-looking name before touching disk", async () => {
+    const activeDir = await tmp("butchr-archive-badname-active-");
+    const archiveDir = await tmp("butchr-archive-badname-dst-");
+    const io: SessionArchiveIo = { activeDir, archiveDir, ...defaultSessionArchiveIo() };
+    const result = await unarchiveSessionDefinition(io, "/etc/passwd");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("bare file name");
+  });
+
+  test("archive refuses an empty name", async () => {
+    const { io } = fakeArchiveIo({ "/active/a.json": "X" });
+    const result = await archiveSessionDefinition(io, "");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("must not be empty");
   });
 });
 

@@ -84,6 +84,15 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
     expect(entries[0]!.problems[0]).toContain("workspace directory-name limit");
   });
 
+  test("BUTCHR-455 review fix: a hidden (dotfile) basename is never listed, even with a perfectly valid manifest — not shown as valid, not shown as invalid, not shown at all", async () => {
+    const { list, read } = fakeFiles({
+      "/defs/.abc123.tmp": JSON.stringify(goodDef()),
+      "/defs/good.json": JSON.stringify(goodDef()),
+    });
+    const entries = await listSessionDefinitions({ dir: "/defs", list, read, store: fakeStore() });
+    expect(entries.map((e) => e.name)).toEqual(["good.json"]);
+  });
+
   test("a mix of valid, invalid and frozen definitions all appear, none hidden", async () => {
     const { list, read } = fakeFiles({
       "/defs/good.json": JSON.stringify(goodDef()),

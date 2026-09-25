@@ -322,6 +322,22 @@ describe("butchr session archive / unarchive", () => {
     expect(io.err.join("\n")).toContain("expected exactly one argument");
   });
 
+  test("BUTCHR-455 review fix: archive refuses a traversal name, nothing moved", async () => {
+    const io = fakeIo({ "/defs/real.json": "CONTENT" });
+    const code = await runSessionCli(["archive", "../real"], io);
+    expect(code).toBe(1);
+    expect(io.err.join("\n")).toContain("bare file name");
+    expect(await io.read("/defs/real.json")).toBe("CONTENT");
+  });
+
+  test("BUTCHR-455 review fix: unarchive refuses a traversal name, nothing moved", async () => {
+    const io = fakeIo({ "/archive/real.json": "CONTENT" });
+    const code = await runSessionCli(["unarchive", "../real"], io);
+    expect(code).toBe(1);
+    expect(io.err.join("\n")).toContain("bare file name");
+    expect(await io.read("/archive/real.json")).toBe("CONTENT");
+  });
+
   test("refuses at startup when the resolved archive dir sits inside the definitions dir — nothing moved", async () => {
     const io = fakeIo({ "/defs/a.json": JSON.stringify(goodDef()) }, { archiveDir: "/defs/archive" });
     const code = await runSessionCli(["archive", "a"], io);

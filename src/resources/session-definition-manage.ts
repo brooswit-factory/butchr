@@ -22,7 +22,7 @@ import { join } from "node:path";
 import type { AgentRole, ExecutionMode } from "../rules/rules.js";
 import { builtinManagedSessionsRule } from "../rules/session-definition-type.js";
 import {
-  parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems,
+  isHiddenDefinitionFile, parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems,
   type SessionDefinitionVendor, type SessionTier,
 } from "./session-definition.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "./filesystem-ref.js";
@@ -102,6 +102,7 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
   for (const resource of resources) {
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
+    if (isHiddenDefinitionFile(resource.name)) continue; // BUTCHR-455 review fix: never a candidate, never listed — see isHiddenDefinitionFile's own doc comment.
     const identityPath = deps.identityDir !== undefined ? join(deps.identityDir, resource.name) : resource.path;
     if (!isFilesystemResourceId(identityPath)) {
       // Too long to ever become an agent key (`sessionAgentKey`/`encodeAgentKey`

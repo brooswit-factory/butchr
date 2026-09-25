@@ -187,19 +187,34 @@ decided once, in `searchSessionDefinitions` (`src/rules/session-definition-type.
 
 1. List every direct child file of the definitions directory (an ordinary
    `filesystem` query, `{root, kind: "file", maxDepth: 1}`).
-2. A path whose percent-encoded id would overflow the workspace
+2. **A hidden file (its basename starts with `.`) is never a candidate at
+   all — skipped SILENTLY, before any other check, never logged**
+   (`isHiddenDefinitionFile`, `src/resources/session-definition.ts`;
+   BUTCHR-455 review fix). The query above has no name filter, so without
+   this a definition writer's own temp file (`writeFileAtomic`'s
+   `.<uuid>.tmp` — used by `create`, `freeze`/`unfreeze`'s manifest
+   rewrite, and `unarchive`'s cross-filesystem fallback) would be a
+   candidate for the brief window it sits in the active directory: if a
+   poll landed there and the temp content happened to already be a valid,
+   non-frozen manifest (true for every one of those writers, which each
+   write/rewrite a full valid document), it would be staffed as a SECOND
+   agent under a key with no relationship to the real definition's own
+   freeze state. `listSessionDefinitions` (`butchr session list`) applies
+   the identical filter, for the identical reason — a hidden file is never
+   shown, valid or not, same as it's never staffed.
+3. A path whose percent-encoded id would overflow the workspace
    directory-name limit is skipped and logged once — the SAME 255-byte
    check and discipline `filesystem` already applies to every resource
    (`docs/filesystem.md`'s own "Resource identity" section).
-3. A file that fails to parse or validate is skipped and logged once
+4. A file that fails to parse or validate is skipped and logged once
    (`WARNING: [managed-sessions] <path> is not a valid definition, never
    staffed: <problems>`) — never staffed, never silently dropped, never
    crashes the poll; a sibling definition's own validity is unaffected.
-4. A file that parses and validates but is `frozen: true` is skipped and
+5. A file that parses and validates but is `frozen: true` is skipped and
    logged once, DISTINCTLY from an invalid one (`[managed-sessions] <path>
    is frozen — no agent runs`) — frozen is a property of a valid
    definition, not a kind of invalidity.
-5. Everything left is eligible: one `filesystem`-provider agent per
+6. Everything left is eligible: one `filesystem`-provider agent per
    definition file, under `swarm` execution (the built-in rule's own FIXED
    mode) — which is already "keeps exactly one agent per eligible
    definition" at the file granularity this ticket covers, no
@@ -398,6 +413,16 @@ the caller expected the same name back) or silently create a same-named
 collision waiting to happen on a future `unarchive`.
 
 Refused, nothing moved, in either direction:
+- `<name>` is not a plain basename — empty, `.`/`..`, or containing a path
+  separator (`definitionBasenameProblem`, `src/resources/session-archive.ts`;
+  BUTCHR-455 review fix). Checked FIRST, before either verb even builds a
+  source/destination path: unlike `show`/`freeze`/`unfreeze`, which all
+  resolve a name by first LISTING the directory and matching an entry
+  (inherently safe, since the result is always a path the listing itself
+  already reported), `archive`/`unarchive` build `join(dir, name)`
+  directly — an unchecked `../../etc/passwd` (or an absolute path) would
+  let either verb move a file from, or over, somewhere entirely outside
+  either directory.
 - the source file does not exist;
 - a file of that name already exists at the destination (the archive
   directory for `archive`, the active directory for `unarchive`);

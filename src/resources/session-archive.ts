@@ -104,6 +104,32 @@ export type ArchiveResult =
   | { ok: true; path: string; hookError?: string }
   | { ok: false; error: string };
 
+/**
+ * BUTCHR-455 review fix: `archive`/`unarchive` build `join(dir, fileName)`
+ * directly from a caller-supplied name, unlike every OTHER `butchr session`
+ * verb (`show`/`freeze`/`unfreeze`), which all resolve a name by first
+ * LISTING the directory and matching an entry — inherently safe, since the
+ * result is always a path the listing itself already reported. Called
+ * FIRST in both `archiveSessionDefinition`/`unarchiveSessionDefinition`,
+ * before either even builds `sourcePath`/`destPath`, let alone touches
+ * disk: an unvalidated `fileName` of `"../../etc/passwd"` (or an absolute
+ * path, which on POSIX also starts with `/`) would let `archive`/
+ * `unarchive` move a file from — or worse, over — somewhere entirely
+ * outside either the active or archive directory. Returns the problem
+ * string, or `null` when `fileName` is a plain, safe basename. A future
+ * MCP tool (BUTCHR-456 exposes freeze/unfreeze; a symmetrical archive tool
+ * is plausible) calling `archiveSessionDefinition`/`unarchiveSessionDefinition`
+ * directly gets this check for free — it lives in the core function, not
+ * the CLI layer.
+ */
+export function definitionBasenameProblem(fileName: string): string | null {
+  if (fileName === "") return "must not be empty";
+  if (fileName === "." || fileName === "..") return `must not be "." or ".."`;
+  // Covers "absolute" too: every absolute path, POSIX (`/a/b`) or Windows (`C:\a`, `\\a`), contains one of these.
+  if (fileName.includes("/") || fileName.includes("\\")) return `must be a bare file name, not a path (no "/" or "\\")`;
+  return null;
+}
+
 /** Same shape as `session-definition-manage.ts`'s/`session-cli.ts`'s own `defaultExists`/`realExists` — a fresh copy rather than an import across layers, since resources must not depend on the CLI. */
 const defaultExists = async (path: string): Promise<boolean> => {
   try {
@@ -164,9 +190,13 @@ async function moveFileAtomic(io: Pick<SessionArchiveIo, "rename" | "copyFile" |
  * both the result-adjacent hook call and any future caller is computed from
  * the definition's ACTIVE path (`sourcePath`) — the identity it carried
  * while eligible, which is what a store-freeze gate (if any) was ever keyed
- * to.
+ * to. Refuses BEFORE any of the above — see `definitionBasenameProblem` —
+ * when `fileName` is not a plain basename (empty, `.`/`..`, contains a path
+ * separator, or is otherwise absolute).
  */
 export async function archiveSessionDefinition(io: SessionArchiveIo, fileName: string): Promise<ArchiveResult> {
+  const basenameProblem = definitionBasenameProblem(fileName);
+  if (basenameProblem !== null) return { ok: false, error: `invalid definition name ${JSON.stringify(fileName)}: ${basenameProblem}` };
   const sourcePath = join(io.activeDir, fileName);
   const destPath = join(io.archiveDir, fileName);
   if (!(await io.exists(sourcePath))) return { ok: false, error: `${sourcePath} does not exist` };
@@ -197,9 +227,13 @@ export async function archiveSessionDefinition(io: SessionArchiveIo, fileName: s
  * the active directory; or the active directory cannot be created (it may
  * never have existed at all, e.g. every definition was ever only archived).
  * No hook — the post-archive hook seam is one-directional (S4's cleanup
- * runs on archive, never on restore).
+ * runs on archive, never on restore). Refuses BEFORE any of the above —
+ * see `definitionBasenameProblem` — when `fileName` is not a plain
+ * basename.
  */
 export async function unarchiveSessionDefinition(io: Pick<SessionArchiveIo, "activeDir" | "archiveDir" | "rename" | "copyFile" | "unlink" | "exists" | "mkdir">, fileName: string): Promise<ArchiveResult> {
+  const basenameProblem = definitionBasenameProblem(fileName);
+  if (basenameProblem !== null) return { ok: false, error: `invalid definition name ${JSON.stringify(fileName)}: ${basenameProblem}` };
   const sourcePath = join(io.archiveDir, fileName);
   const destPath = join(io.activeDir, fileName);
   if (!(await io.exists(sourcePath))) return { ok: false, error: `${sourcePath} does not exist` };
