@@ -22,9 +22,10 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
+import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
@@ -104,7 +105,9 @@ export interface Rule {
    * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
    * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
    * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
-   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts).
+   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
+   * a JSON object (not JQL) for `jira-project` — `{ leadAccountId?, keys?,
+   * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -118,15 +121,76 @@ export interface Rule {
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /** Operator-owned MCP config path (`jira-project` rules only); `{{KEY}}` expands to the resource key. Absolute path required. */
+  mcpConfigFile?: string;
+  /**
+   * BUTCHR-429 (epic BUTCHR-421, story 1/4): four additive, independently
+   * optional knobs for "linked-change eventing" — a change to anything
+   * LINKED to this rule's resources (a Jira issue link, parent Epic, remote
+   * link, Confluence page, GitHub issue/PR, or general webpage) becoming a
+   * turn-causing update, same as a change to the resource itself. Absent
+   * means exactly today's behaviour: this story's own link DISCOVERY still
+   * runs and logs (`[linked-discovery]`, src/jira-watch/linked-discovery-log.ts)
+   * regardless of these knobs — it is a cost-free pure parse of data a
+   * rule's poll already fetched — but nothing downstream of discovery exists
+   * yet (that is stories 2/3), so no knob here changes any agent's behaviour
+   * in this story. Kept as four independently optional fields, mirroring
+   * `agentPreferences`/`relationships` above rather than `execution`/
+   * `account`/`role`'s always-defaulted style, because "absent" and "false"
+   * are the same no-op here — there is no live default value to normalise
+   * onto every rule for a mechanism that does not run yet.
+   */
+  /** Opt in to linked-change eventing for this rule's agents. Absent/false: today's behaviour, exactly (see this field's own group comment above). Reserved for stories 2/3 to actually gate on; this story validates and plumbs it only. */
+  linkedEventing?: boolean;
+  /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
+  linkedPollIntervalMs?: number;
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  maxLinkedItems?: number;
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  maxLinkedTurnsPerHour?: number;
+  /**
+   * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's
+   * matched resources' Jira REMOTE links as an additional linked-Jira-item
+   * source, on top of issuelinks/parent/description (all free — they ride
+   * the existing search fields). Unlike those, a remote link costs one
+   * genuinely separate API call per resource
+   * (`AtlassianClient#remoteLinks`), so it is gated behind this own knob
+   * rather than folded into `linkedEventing` — a resource whose rule leaves
+   * this absent/false makes ZERO remote-link calls. Only meaningful when
+   * `linkedEventing` is also true; absent/false is today's behaviour
+   * exactly (no remote-link fetch, same as before this field existed).
+   */
+  linkedRemoteLinks?: boolean;
+  /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): opt in to LIVE POLLING of
+   * Confluence / GitHub-issue / GitHub-PR / webpage links found via
+   * DESCRIPTION-TEXT PARSING (`descriptionItems`, src/resources/linked-discovery.ts)
+   * — as opposed to a Jira remote link, which this knob does not gate (a
+   * non-Jira remote link's live polling is out of scope for this story; see
+   * `jiraKindLinkedItems`'s own doc comment, src/jira-watch/linked-eventing.ts).
+   * Absent/false: today's behaviour exactly — `linkedEventing` alone still
+   * enables Jira-kind polling, but none of these three pollers ever run, even
+   * for a resource whose description names a Confluence page or GitHub
+   * issue/PR. Only meaningful when `linkedEventing` is also true; mirrors
+   * `linkedRemoteLinks`'s own independently-optional, cost-gated shape (each
+   * of the three pollers this knob gates costs a genuinely separate network
+   * call per distinct linked target per tick, never free the way `issuelinks`/
+   * `parent`/description-derived Jira keys already are).
+   */
+  linkedDescriptionLinks?: boolean;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set([
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpConfigFile",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
+]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
+const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
 const unknownFields = (raw: Record<string, unknown>, allowed: Set<string>, at: string, errors: string[]): void => {
   for (const k of Object.keys(raw)) if (!allowed.has(k)) errors.push(`${at} has unknown field "${k}"`);
 };
@@ -198,6 +262,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
+    if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
+    if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
     // `execution` and `account` are independent of each other (any of the 9 combinations
@@ -207,10 +274,21 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
     // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
+    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
+    if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
+    if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
+    if (maxLinkedItems !== undefined && !isPositiveInt(maxLinkedItems)) errors.push(`${at}.maxLinkedItems must be a positive integer`);
+    if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
+    // BUTCHR-436: fifth linked-eventing knob, same independently-optional house style.
+    if (linkedRemoteLinks !== undefined && typeof linkedRemoteLinks !== "boolean") errors.push(`${at}.linkedRemoteLinks must be a boolean`);
+    // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
+    const { linkedDescriptionLinks } = raw;
+    if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -222,6 +300,13 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
+      ...(typeof raw.mcpConfigFile === "string" ? { mcpConfigFile: raw.mcpConfigFile } : {}),
+      ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
+      ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
+      ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
+      ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
+      ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
+      ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

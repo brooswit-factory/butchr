@@ -459,6 +459,8 @@ export interface ReconcileOptions {
  * case is untouched by this reversal.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const frozen = new Set(herd.frozen ? await herd.frozen([...desired.keys()]) : []);
+  desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
   const failures: ReconcileFailure[] = [];
   if (herd.recoverQuota) {
     await Promise.all([...desired.values()].map(async (spec) => {
@@ -474,6 +476,9 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
   const running = await herd.runningIssues();
+  if(herd.frozen) for(const id of await herd.frozen(running)) frozen.add(id);
+  desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
+  opts = {...opts, atRest:[...(opts.atRest ?? [])].filter(id=>!frozen.has(id))};
   // BUTCHR-305/BUTCHR-238: audible-only pinned-active detection, run BEFORE
   // `atRest` is ever touched and independent of it — `desired ∩ running` is
   // the shape `planReconcile` never puts in `spawn`/`stop`/`respawn` (see
@@ -789,6 +794,7 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
   // `Herd` ever gains a member, where the spread would have silently kept
   // dropping it.
   return {
+    ...(herd.frozen ? {frozen:(ids:readonly string[])=>herd.frozen!(ids.filter(ownsId))} : {}),
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
     staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
     // BUTCHR-334: `origin` threaded straight through, unchanged — dropping it

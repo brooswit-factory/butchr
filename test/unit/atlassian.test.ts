@@ -72,6 +72,34 @@ describe("AtlassianClient", () => {
     await c.search("x");
     expect(seen[0]!.url).toContain("issuelinks");
   });
+  // BUTCHR-431: `description` joined `SEARCH_FIELDS` so link discovery can
+  // see description-derived links without a second, per-issue call.
+  test("search requests description in fields", async () => {
+    const seen: { url: string; auth: string | undefined }[] = [];
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [] } }, seen));
+    await c.search("x");
+    expect(seen[0]!.url).toContain("description");
+  });
+  test("search flattens an ADF description to plain text on the mapped issue", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "K", fields: { summary: "s", description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "See BUTCHR-1" }] }] } } }] },
+    }));
+    expect((await c.search("x"))[0]!.description).toBe("See BUTCHR-1");
+  });
+  test("search tolerates a null or absent description without throwing", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "K1", fields: { summary: "s", description: null } }, { key: "K2", fields: { summary: "s" } }] },
+    }));
+    const issues = await c.search("x");
+    expect(issues[0]!.description).toBe("");
+    expect("description" in issues[1]!).toBe(false); // omitted from the response entirely -> unset, not a fabricated ""
+  });
+  test("search leaves description an unparseable odd shape without throwing — adfToText's own structural-walk tolerance", async () => {
+    const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
+      "/search/jql": { issues: [{ key: "K", fields: { summary: "s", description: "not actually ADF" } }] },
+    }));
+    expect((await c.search("x"))[0]!.description).toBe("");
+  });
   test("search maps issuelinks using the SAME direction convention as links() — same parser, one place to be right", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
       "/search/jql": { issues: [{ key: "KAN-757", fields: { summary: "s", issuelinks: [{ id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } }] } }] },

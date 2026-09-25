@@ -11,6 +11,7 @@ import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
 import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
+import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
 
@@ -194,7 +195,7 @@ describe("execution and account (BUTCHR-397)", () => {
   test("every valid value is accepted for every provider — the two fields are provider-generic", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       for (const execution of EXECUTION_MODES) for (const account of ACCOUNT_POLICIES) {
-        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : minimal.query;
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, execution, account }] });
         expect(r).toMatchObject({ resourceProvider, execution, account });
       }
@@ -248,7 +249,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
   test("both values are accepted for every provider, independent of execution and account", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : minimal.query;
       for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
         expect(r).toMatchObject({ resourceProvider, role, execution });
@@ -259,6 +260,76 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
     expect(() => parseRules({ rules: [{ ...minimal, role: "manager" }] }, "f.json")).toThrow("f.json: rules[0].role must be one of worker, sentinel");
   });
   test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
+describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default inert)", () => {
+  test("all five are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.linkedEventing).toBeUndefined();
+    expect(r!.linkedPollIntervalMs).toBeUndefined();
+    expect(r!.maxLinkedItems).toBeUndefined();
+    expect(r!.maxLinkedTurnsPerHour).toBeUndefined();
+    expect(r!.linkedRemoteLinks).toBeUndefined();
+  });
+
+  test("each is accepted when valid, independent of the others and of every other field", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true }] });
+    expect(r).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true });
+  });
+
+  test("linkedEventing: false is accepted and kept (distinct from omitted, even though both are inert today)", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: false }] });
+    expect(r!.linkedEventing).toBe(false);
+  });
+
+  // BUTCHR-436: linkedRemoteLinks is NOT inert — a resource whose rule sets
+  // it fetches remote links (src/jira-watch/linked-eventing.ts) — but its
+  // OWN validation/plumbing is exactly this same additive, independently-
+  // optional shape, so it is tested alongside its four siblings here rather
+  // than in a separate describe block.
+  test("linkedRemoteLinks: false is accepted and kept, distinct from omitted", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedRemoteLinks: false }] });
+    expect(r!.linkedRemoteLinks).toBe(false);
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true }] });
+      expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true });
+    }
+  });
+
+  test("rejects a non-boolean linkedEventing or linkedRemoteLinks", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, linkedEventing: "yes" }] }, "f.json")).toThrow("f.json: rules[0].linkedEventing must be a boolean");
+    expect(() => parseRules({ rules: [{ ...minimal, linkedRemoteLinks: "yes" }] }, "f.json")).toThrow("f.json: rules[0].linkedRemoteLinks must be a boolean");
+  });
+
+  test("rejects a non-positive-integer for each numeric knob, naming the rule and field", () => {
+    for (const field of ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const) {
+      for (const bad of [0, -1, 1.5, "5", null]) {
+        expect(() => parseRules({ rules: [{ ...minimal, [field]: bad }] }, "f.json")).toThrow(`f.json: rules[0].${field} must be a positive integer`);
+      }
+    }
+  });
+
+  test("all five bad at once are all reported together", () => {
+    let msg = "";
+    try { parseRules({ rules: [{ ...minimal, linkedEventing: 1, linkedPollIntervalMs: 0, maxLinkedItems: -5, maxLinkedTurnsPerHour: "many", linkedRemoteLinks: "no" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toContain("f.json: rules[0].linkedEventing must be a boolean");
+    expect(msg).toContain("f.json: rules[0].linkedPollIntervalMs must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedItems must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedTurnsPerHour must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].linkedRemoteLinks must be a boolean");
+  });
+
+  test("a pre-change rules document (none of the five set) loads unchanged — no existing rules file needs to opt in", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
@@ -358,7 +429,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -382,5 +453,6 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "jira-work": case "jira-idea": return "BUTCHR-12";
     case "github-issue": return "owner/repo#12";
     case "zendesk-ticket": return "acme#12";
+    case "jira-project": return "BUTCHR";
   }
 }

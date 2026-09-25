@@ -4,16 +4,17 @@
  * rule-file parsing. See `encodeAgentKey` for the format.
  */
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
-import { isIssueKey } from "../resources/id.js";
+import { isIssueKey, isProjectId } from "../resources/id.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
  * One provider per resource TYPE, not per vendor: Jira work items, GitHub
  * issues, Jira Product Discovery ideas (the same Jira API as work items,
- * still a separate provider) and Zendesk tickets. Only providers with an
- * adapter are listed.
+ * still a separate provider), Zendesk tickets, and free-form Jira project
+ * resources (`jira-project`, one agent per project key rather than per
+ * issue). Only providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket", "jira-project"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -42,14 +43,16 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
 
 /**
  * Provider-native resource id shape. `jira-work`: an issue key (`PROJ-1`);
- * project keys are not resources. `github-issue`: a canonical
- * `owner/repo#number` (lowercase owner and repo). `jira-idea`: the Jira
- * issue key of a Product Discovery idea (`IDEAS-7`). `zendesk-ticket`: a
- * canonical `<subdomain>#<id>` (`acme#123`).
+ * project keys are not resources there. `jira-project`: a Jira project key
+ * (`PROJ`) IS the resource id — the one case where a bare project key is
+ * valid. `github-issue`: a canonical `owner/repo#number` (lowercase owner
+ * and repo). `jira-idea`: the Jira issue key of a Product Discovery idea
+ * (`IDEAS-7`). `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  */
 export function isResourceId(provider: ResourceProvider, id: string): boolean {
   switch (provider) {
     case "jira-work": return isIssueKey(id);
+    case "jira-project": return isProjectId(id);
     case "github-issue": return isGithubIssueRef(id);
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);

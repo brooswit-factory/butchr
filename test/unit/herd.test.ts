@@ -574,6 +574,16 @@ describe("nudge", () => {
       read: async () => ({ read: { text: "no refusal here" } }),
     },
   });
+  test("Codex channel followups do not wait for Claude quota observation", async () => {
+    const prompts: any[] = []; const fixture = base(prompts);
+    const list = fixture.agent.list; const prompt = fixture.agent.prompt;
+    fixture.agent.list = async () => ({agents:(await list()).agents.map(a=>({...a,agent:"codex",agent_status:"working"}))});
+    fixture.agent.prompt = async p => ({agent:{...(await prompt(p)).agent,agent:"codex",agent_status:"working"}});
+    const waits:number[]=[];
+    const herd = new HerdrHerd(fixture as any,"http://x/mcp",async ms=>{waits.push(ms);});
+    expect(await herd.nudge("KAN-7","stop current work")).toEqual({delivered:true});
+    expect(prompts).toHaveLength(1);expect(waits).toEqual([]);
+  });
   test("delivers a prompt; still idle after the wait → submits the stranded composer", async () => {
     const prompts: any[] = []; const keys: any[] = [];
     const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);

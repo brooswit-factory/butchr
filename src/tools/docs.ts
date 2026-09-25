@@ -318,7 +318,8 @@ function siteFromSelf(self: unknown): string | null {
   return i === -1 ? null : s.slice(0, i);
 }
 
-function pageIdFromUrl(url: string): string | null {
+/** BUTCHR-437: exported so `src/jira-watch/external-poll.ts` can resolve a description-derived Confluence URL to a page id without a second regex disagreeing with this one. */
+export function pageIdFromUrl(url: string): string | null {
   const m = /\/pages\/(\d+)(?:\/|$)/.exec(url);
   return m?.[1] ?? null;
 }
