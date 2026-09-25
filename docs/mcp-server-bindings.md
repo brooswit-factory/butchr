@@ -138,10 +138,50 @@ tightened — see above); Codex argv is exactly such an "anywhere else", so
 `boundCodexServers` (`src/agents/argv.ts`) never calls
 `resolveMcpServerHeaders` at all. A binding with `headersEnvVar` set still
 reaches Codex — just with no extra headers, so an authenticated bridge
-connects unauthenticated from Codex specifically. If a bound server needs
-authentication AND Codex tool access, route Codex's connection through a
-mechanism that doesn't put the secret in argv (out of scope for this
-ticket) rather than relying on `headersEnvVar`.
+connects unauthenticated from Codex specifically.
+
+**Outbound-auth investigation (BUTCHR-420 Step 1 — a mechanism exists, not
+yet wired in):** Codex's own TOML `mcp_servers.<name>` table supports
+`bearer_token_env_var` (a single value, sent as `Authorization: Bearer
+<value>`) and `env_http_headers` (a map of HEADER NAME -> ENV VAR NAME,
+arbitrary headers). Codex resolves either from its OWN process
+environment at connect time — the env var's NAME is all that ever needs to
+reach Codex's config/argv; the VALUE never does. Verified empirically, not
+just from `codex --help`/`codex mcp add --help`/binary strings: against
+the installed `codex-cli 0.145.0`, in an isolated `CODEX_HOME`, pointed at
+a local stub HTTP MCP server, with `env_http_headers = { "X-Auth-Token" =
+"RC_TOKEN_VAR", "X-User-Id" = "RC_USERID_VAR" }` and those two env vars set
+in the shell (never passed as `-c`/config text) — the stub server's own
+request log shows it received the real header values, while every
+`-c mcp_servers...` string and `codex mcp list --json`'s own output named
+only the env vars. `env_http_headers` (not `bearer_token_env_var`) is the
+right shape for a bound server whose `headersEnvVar` resolves to more than
+one header (Rocket.Chat's `rocketr` needs both `X-Auth-Token` and
+`X-User-Id`).
+
+This mechanism is Codex's own, and reaching it from Butchr is NOT purely a
+Butchr-side change: `McpServerLaunchConfig` (`@brooswit/drovr`, pinned
+v0.11.1) has only `{name, url, headers?}` — no field for an env-var name.
+The REAL spawned process's argv is built by Drovr's own
+`buildAgentStartParams`, called directly inside
+`ManagedConversationLifecycle.start()` on the typed launch object; Butchr's
+own `agentStartParams`/`spawnArgs` (`src/agents/argv.ts`) is a *separate*
+function used only by `staleIssues()` for comparison, so hand-appending
+extra `--config` strings there (even though two separate `-c
+mcp_servers.<name>...` overrides for the same server were confirmed to
+merge at the TOML level) changes only what Butchr expects, never what
+Codex is actually launched with. Landing this needs `@brooswit/drovr`
+itself to grow `bearerTokenEnvVar`/`envHttpHeaders` fields on
+`McpServerLaunchConfig` (sibling to `headers`) so its Codex TOML renderer
+can emit them — then both the real spawn and the staleness check stay in
+sync automatically, same as `{name,url}` today. Tracked as a scope
+question on BUTCHR-420 (comment thread) rather than implemented
+unilaterally, since it touches a separately-versioned/released dependency.
+Until that lands, the paragraph above remains accurate: a binding with
+`headersEnvVar` set still reaches Codex with no extra headers. If a bound
+server needs authentication AND Codex tool access today, route Codex's
+connection through a mechanism that doesn't put the secret in argv rather
+than relying on `headersEnvVar`.
 
 ### AGY
 
