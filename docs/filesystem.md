@@ -52,7 +52,9 @@ string-typed for every provider, and `filesystem` alone puts JSON in it.
 
 - `{ "predicateKind": "extension", "value": ".ts" }` — "files whose extension
   is Y". Requires `kind: "file"`. `value` must start with `.`, contain no
-  `/` or whitespace.
+  `/` or whitespace. Matching is a case-sensitive suffix check
+  (`path.endsWith(value)`), so a file literally named `.ts` (no basename
+  before the dot) also matches `.ts`, and `.TS`/`.Ts` do not match `.ts`.
 - `{ "predicateKind": "hasEntry", "name": "README.md", "entryKind": "file" }`
   — "directories containing a file/directory named X". Requires
   `kind: "directory"`. `name` is a direct-child name (no `/`, not `.`/`..`);
@@ -81,6 +83,26 @@ or two rules naming the same real directory through different spellings,
 resolve to the SAME id and the same agent. The id is percent-encoded like
 every other provider's native id in the agent key
 (`filesystem:<rule>:%2Fhome%2F...`) and as the workspace directory segment.
+
+**The real limit is 255 encoded BYTES, not a raw character count.**
+`workspaceDirFor` makes the whole percent-encoded id ONE directory-name
+component, and every mainstream Linux filesystem caps a single component at
+`NAME_MAX` = 255 bytes. Percent-encoding inflates size — every `/` becomes
+`%2F` (3 bytes), every non-ASCII character becomes 6+ bytes — so a path that
+looks like a perfectly ordinary absolute path can still overflow that limit;
+a short but heavily non-ASCII path can overflow it even though a much longer
+plain-ASCII one might not. `isFilesystemResourceId` checks
+`Buffer.byteLength(encodeURIComponent(id), "utf8") <= MAX_ENCODED_SEGMENT_BYTES`
+directly (`src/resources/filesystem-ref.ts`) — this is the one check that
+matters; there is no separate raw-character-count cap, because one would
+either be laxer than this (and miss real overflows) or redundant with it.
+A resource whose id fails this check is **skipped, not staffed, and never
+crashes the poll**: `searchFilesystemRules` (`src/rules/filesystem-type.ts`)
+drops it before it ever reaches `encodeAgentKey`, logging
+`WARNING: [filesystem] rule <id> skips <path>: ...` once per (rule, path) —
+every other resource that rule's query matched is staffed normally. Deep
+trees (monorepos, `node_modules`, nested project directories) reach this
+realistically; narrow the rule's `root` or `namePattern` if you see it.
 
 ## Discovery, and what "matches" means
 
@@ -148,6 +170,10 @@ always answers `"active"`, same as `github-issue`/`zendesk-ticket`).
   read as a smaller true set" discipline `ZENDESK_SEARCH_LIMIT`/
   `GITHUB_SEARCH_LIMIT` already apply. Narrow the root, `namePattern` or
   `maxDepth` if a rule crosses either.
+- **A resource whose id can't fit a workspace directory name is skipped, not
+  crashed on** — a THIRD, per-resource limit (255 encoded bytes; see
+  "Resource identity" above), unlike the two caps above: it drops just that
+  one resource (logged), never the whole query.
 - A missing or unreadable `root` fails the POLL for that rule (logged,
   nothing stopped/spawned that poll) — the same "any one rule's failed
   search rejects the whole poll" doctrine every provider's `search*Rules`
