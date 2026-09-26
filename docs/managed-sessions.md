@@ -29,6 +29,13 @@ is not a directory", which still fails the poll loudly — see
 Root resolution happens once at daemon startup (a directory-var change
 takes effect on restart, not live), like every other provider's query.
 
+FACTORY-66: the daemon itself needs no Atlassian credentials to run this
+loop — `ATLASSIAN_SITE`/`ATLASSIAN_EMAIL`/`ATLASSIAN_TOKEN`(`_FILE`) are
+optional (`src/config/config.ts`), and this built-in query, like every other
+`filesystem`-provider rule, runs regardless. A host with a managed-session
+definitions directory and no `jira-work`/`jira-idea`/`jira-project` rule in
+its `rules.json` can leave Atlassian fully unset and still start.
+
 ## Manifest format
 
 ```json

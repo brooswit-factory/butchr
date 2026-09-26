@@ -70,6 +70,13 @@ export interface LinkCliIo {
  */
 export function jiraProjectStoreFromEnv(): LinkStore {
   const config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  // FACTORY-66: Atlassian credentials are now optional (src/config/config.ts)
+  // — a `jira-project` resource genuinely needs them regardless, so this
+  // throws its own clear, named error rather than a raw
+  // "Cannot read properties of undefined" one. Same "throws, never catches"
+  // contract as before (see this file's own header) — `tryStoreOp` still
+  // turns this into a clean stderr line.
+  if (!config.atlassian) throw new Error("butchr link: jira-project resources require Atlassian credentials, but none are configured on this host (set ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN or ATLASSIAN_TOKEN_FILE)");
   return createJiraProjectLinkStore(realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }));
 }
 

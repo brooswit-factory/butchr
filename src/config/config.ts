@@ -8,10 +8,30 @@ import { workspaceRoot } from "../agents/workspace.js";
  * (`email:token`). The token is read from `ATLASSIAN_TOKEN`, or — preferred —
  * from a file named by `ATLASSIAN_TOKEN_FILE`, so it never has to sit in the
  * process environment or a shell history.
+ *
+ * FACTORY-66: Atlassian is OPTIONAL — see `Config.atlassian`'s own doc
+ * comment. A managed-sessions-only host, or one staffed entirely by
+ * github-issue/zendesk-ticket/filesystem rules, needs none of
+ * `ATLASSIAN_SITE`/`ATLASSIAN_EMAIL`/`ATLASSIAN_TOKEN`(`_FILE`) to start.
  */
 export interface Config {
   agent?: import("../agents/argv.js").AgentConfig;
-  atlassian: { site: string; email: string; token: string };
+  /**
+   * FACTORY-66: OPTIONAL, same all-or-nothing shape as `github`/`rocketchat`
+   * below — present only when ALL THREE of `ATLASSIAN_SITE`, `ATLASSIAN_EMAIL`
+   * and `ATLASSIAN_TOKEN`(`_FILE`) are set; otherwise `undefined`, meaning
+   * Jira/Confluence are disabled for this daemon (a managed-sessions-only
+   * host, or one staffed entirely by github-issue/zendesk-ticket/filesystem
+   * rules). A PARTIAL setting (one or two of the three, never all three) is a
+   * startup error, not a silent disable — see `loadConfig`'s own comment on
+   * why: it's the shape of an operator typo, not a deliberate choice.
+   * `src/daemon/index.ts` additionally refuses to start when this is absent
+   * AND an enabled rule needs Jira (`jira-work`/`jira-idea`/`jira-project`) —
+   * a rule that can never be staffed is a louder, earlier failure than a
+   * daemon that boots and then can't do the one thing it was configured to
+   * do.
+   */
+  atlassian?: { site: string; email: string; token: string };
   /** Port the daemon serves the MCP endpoint and the live-view webapp on. */
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
@@ -386,12 +406,44 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     if (value !== undefined) roleProviders[role] = parseOrder(value, key);
   }
   const model = env.BUTCHR_AGENT_MODEL === undefined ? undefined : required(env.BUTCHR_AGENT_MODEL, "BUTCHR_AGENT_MODEL");
-  const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
-  const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
-  const token = env.ATLASSIAN_TOKEN_FILE
-    ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
-    : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
-  if (!token) throw new Error("Atlassian token is empty");
+  // FACTORY-66: same all-or-nothing shape as `github`/`rocketchat` below, but
+  // with one difference from both — a PARTIAL setting here throws rather
+  // than silently disabling. `github`/`rocketchat` are additive features no
+  // daemon depends on by default; Jira is what most rules in this codebase
+  // are FOR, so "site set, token forgotten" reads as an operator typo, not a
+  // choice to run without Jira — and a silent disable would hide that typo
+  // behind a daemon that boots looking healthy and simply never staffs
+  // anything. The fully-absent case (none of the three set) is the
+  // deliberate opt-out this ticket adds: `atlassian` is `undefined`, and
+  // every Jira-backed consumer (src/daemon/index.ts and friends) degrades
+  // instead of crashing. Presence is checked on the RAW env values, before
+  // any file read, so a missing var is reported before a missing/unreadable
+  // token FILE ever gets the chance to look like the real problem.
+  const atlassianSiteSpecified = Boolean(env.ATLASSIAN_SITE?.trim());
+  const atlassianEmailSpecified = Boolean(env.ATLASSIAN_EMAIL?.trim());
+  const atlassianTokenSpecified = Boolean(env.ATLASSIAN_TOKEN_FILE?.trim() || env.ATLASSIAN_TOKEN?.trim());
+  const atlassianSpecifiedCount = [atlassianSiteSpecified, atlassianEmailSpecified, atlassianTokenSpecified].filter(Boolean).length;
+  let atlassian: Config["atlassian"];
+  if (atlassianSpecifiedCount === 0) {
+    atlassian = undefined;
+  } else if (atlassianSpecifiedCount < 3) {
+    const missing = [
+      ...(atlassianSiteSpecified ? [] : ["ATLASSIAN_SITE"]),
+      ...(atlassianEmailSpecified ? [] : ["ATLASSIAN_EMAIL"]),
+      ...(atlassianTokenSpecified ? [] : ["ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)"]),
+    ];
+    throw new Error(
+      `Partial Atlassian configuration: missing ${missing.join(", ")} — set ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN(_FILE) together to enable Jira/Confluence, or leave all three unset to disable them`,
+    );
+  } else {
+    const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
+    const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
+    const token = env.ATLASSIAN_TOKEN_FILE
+      ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
+      : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
+    if (!token) throw new Error("Atlassian token is empty");
+    atlassian = { site, email, token };
+  }
 
   const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
@@ -476,7 +528,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
   return {
-    atlassian: { site, email, token },
+    ...(atlassian ? { atlassian } : {}),
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}) },
     port,
     stalledMinutes,
@@ -604,7 +656,7 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `provider=${c.agent?.provider ?? "claude"} model=${c.agent?.model ?? "provider-default"} ` +
   `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
-  `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
+  `atlassian=${c.atlassian ? `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars)` : "disabled"} port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +

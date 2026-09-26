@@ -1,6 +1,7 @@
 import { describe, expect, test, mock } from "bun:test";
 import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
 import type { ProjectResourceDeps } from "../../src/resources/project.js";
+import { ATLASSIAN_DISABLED_MESSAGE } from "../../src/atlassian/client.js";
 
 describe("realAtlassian confluence page ops", () => {
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {
@@ -671,5 +672,25 @@ describe("realAtlassian epic-axis pagination wired into the real project-tier de
     const [acme] = await createProjectResourceType(deps).discovery.search();
     expect(acme!.unseenEpicCommentIds["ACME-1"]).toEqual([]);
     expect(projectVerdict(acme!)).toBe("asleep");
+  });
+});
+
+describe("disabledAtlassianOps (FACTORY-66)", () => {
+  test("every method call rejects with the shared disabled message, never resolving or throwing synchronously", async () => {
+    const { disabledAtlassianOps } = await import("../../src/tools/atlassian-real.js");
+    const ops = disabledAtlassianOps();
+    await expect(ops.getIssue("KAN-1")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.search("project = KAN", 25)).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.addComment("KAN-1", "hi")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.createIssue({ projectKey: "KAN", issuetype: "Task", summary: "s" })).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.getPage("1")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.listSpaces()).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(ops.getProjectProperty("KAN", "butchr")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+  });
+
+  test("a made-up method also rejects the same way — a Proxy, so it never drifts out of sync with AtlassianOps's own surface", async () => {
+    const { disabledAtlassianOps } = await import("../../src/tools/atlassian-real.js");
+    const ops = disabledAtlassianOps() as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    await expect(ops.someFutureMethod!()).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
   });
 });

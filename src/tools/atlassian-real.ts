@@ -2,6 +2,7 @@ import { createCloudClient, isNotFoundError } from "jira.js";
 import { createV2Client, createV1Client } from "confluence.js";
 import { createClient as createConfluenceClient } from "confluence.js/core";
 import type { AtlassianOps } from "./atlassian.js";
+import { ATLASSIAN_DISABLED_MESSAGE } from "../atlassian/client.js";
 
 /** One paragraph of plain text as ADF (what Jira v3 wants for descriptions/comments). */
 export const adf = (text: string) => ({
@@ -526,4 +527,21 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       return { results };
     },
   };
+}
+
+/**
+ * FACTORY-66: a stand-in for `AtlassianOps` on a host with no Atlassian
+ * credentials configured. Registered exactly where `realAtlassian`'s result
+ * would be (the jira_ and confluence_ MCP tools, `butchr link`'s jira-project
+ * store, …), so those tools/commands stay REGISTERED rather than vanishing —
+ * calling one is a clear, named rejection ("Atlassian is not configured on
+ * this host"), never a missing-tool error that reads as "did I typo the
+ * name" or a raw "Cannot read properties of undefined" crash. A `Proxy`
+ * rather than a hand-written stub for the same reason `disabledAtlassianClient`
+ * (src/atlassian/client.ts) is one: `AtlassianOps` has ~28 methods and a
+ * Proxy can never drift out of sync with a newly added one.
+ */
+export function disabledAtlassianOps(): AtlassianOps {
+  const refuse = () => Promise.reject(new Error(ATLASSIAN_DISABLED_MESSAGE));
+  return new Proxy({}, { get: () => refuse }) as unknown as AtlassianOps;
 }

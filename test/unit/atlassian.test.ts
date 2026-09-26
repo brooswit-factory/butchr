@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AtlassianClient, AtlassianHttpError, adfToText } from "../../src/atlassian/client.js";
+import { AtlassianClient, AtlassianHttpError, adfToText, disabledAtlassianClient, ATLASSIAN_DISABLED_MESSAGE } from "../../src/atlassian/client.js";
 
 function fakeFetch(routes: Record<string, unknown>, seen: { url: string; auth: string | undefined }[] = []) {
   return async (url: string, init?: RequestInit): Promise<Response> => {
@@ -291,5 +291,24 @@ describe("adfToText", () => {
     expect(adfToText(undefined)).toBe("");
     expect(adfToText(null)).toBe("");
     expect(adfToText({ type: "doc" })).toBe("");
+  });
+});
+
+describe("disabledAtlassianClient (FACTORY-66)", () => {
+  test("every method call rejects with the shared disabled message, never resolving or throwing synchronously", async () => {
+    const c = disabledAtlassianClient();
+    await expect(c.search("assignee = currentUser()")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.comments("KAN-1")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.links("KAN-1")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.searchAll("project = KAN")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.searchProjects("status = live")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.remoteLinks("KAN-1")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.confluencePageVersion("123")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+    await expect(c.addComment("KAN-1", "hi")).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
+  });
+
+  test("a made-up method also rejects the same way — a Proxy, so it never drifts out of sync with AtlassianClient's own surface", async () => {
+    const c = disabledAtlassianClient() as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    await expect(c.someFutureMethod!()).rejects.toThrow(ATLASSIAN_DISABLED_MESSAGE);
   });
 });

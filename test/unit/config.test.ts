@@ -30,7 +30,10 @@ describe("loadConfig", () => {
   });
   test("reads the token from a file when ATLASSIAN_TOKEN_FILE is set", () => {
     const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t" }, (p) => { expect(p).toBe("/t"); return "filetok\n"; });
-    expect(c.atlassian.token).toBe("filetok");
+    // FACTORY-66: `atlassian` is now optional (`Config["atlassian"]`); `base` sets
+    // all three ATLASSIAN_* vars, so it is always present here — the `!` is a
+    // type-only accommodation for that, not a behavior change.
+    expect(c.atlassian!.token).toBe("filetok");
   });
   test("honours BUTCHR_PORT and HERDR_SOCKET", () => {
     const c = loadConfig({ ...base, BUTCHR_PORT: "9000", HERDR_SOCKET: "/s.sock" }, noRead);
@@ -43,9 +46,32 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN_FILE: "/t" }, () => "  \n")).toThrow(/empty/);
     expect(() => loadConfig({ ...base, BUTCHR_PORT: "notaport" }, noRead)).toThrow(/BUTCHR_PORT/);
   });
+  test("FACTORY-66: atlassian is absent when no ATLASSIAN_* vars are set at all (managed-sessions-only host)", () => {
+    const c = loadConfig({}, noRead);
+    expect(c.atlassian).toBeUndefined();
+    // The rest of config loading is unaffected — a managed-sessions-only
+    // host still gets every other default.
+    expect(c.port).toBe(7717);
+    expect(c.maxAgents).toBe(8);
+  });
+  test("FACTORY-66: a partial Atlassian configuration throws a clear, named error rather than silently disabling", () => {
+    expect(() => loadConfig({ ATLASSIAN_SITE: "https://x.atlassian.net" }, noRead)).toThrow(/Partial Atlassian configuration/);
+    expect(() => loadConfig({ ATLASSIAN_SITE: "https://x.atlassian.net" }, noRead)).toThrow(/ATLASSIAN_EMAIL/);
+    expect(() => loadConfig({ ATLASSIAN_EMAIL: "a@b.c" }, noRead)).toThrow(/ATLASSIAN_SITE/);
+    expect(() => loadConfig({ ATLASSIAN_SITE: "https://x.atlassian.net", ATLASSIAN_EMAIL: "a@b.c" }, noRead)).toThrow(/ATLASSIAN_TOKEN/);
+    // Never reads a token file when the config is only partially specified —
+    // the missing-var error must win over a missing/unreadable file.
+    expect(() => loadConfig({ ATLASSIAN_SITE: "https://x.atlassian.net" }, noRead)).not.toThrow(/should not read/);
+  });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
     expect(d).not.toContain("s3cr3t-VALUE"); expect(d).toContain("***"); expect(d).toContain("12 chars");
+  });
+
+  test("FACTORY-66: describeConfig prints atlassian=disabled when Atlassian is not configured, and the full site/email/token line otherwise", () => {
+    expect(describeConfig(loadConfig({}, noRead))).toContain("atlassian=disabled");
+    const d = describeConfig(loadConfig(base, noRead));
+    expect(d).toContain("atlassian=site=https://x.atlassian.net email=a@b.c token=***(3 chars)");
   });
 
   test("github is absent when GITHUB_TOKEN_FILE or BUTCHR_GITHUB_ORGS is missing", () => {

@@ -6,7 +6,7 @@ import { readFile, stat } from "node:fs/promises";
 import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
-import { AtlassianClient } from "../atlassian/client.js";
+import { AtlassianClient, disabledAtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
@@ -26,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
+import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, atlassianStaffing, type AccountPolicy, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -39,7 +39,7 @@ import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
-import { realAtlassian } from "../tools/atlassian-real.js";
+import { realAtlassian, disabledAtlassianOps } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
@@ -161,6 +161,33 @@ try {
 // startup warning for rules without a role").
 for (const r of rules) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
+}
+// FACTORY-66: Atlassian credentials are now optional (src/config/config.ts),
+// but a rule that can only ever be staffed over Jira is not — `atlassianStaffing`
+// (src/rules/rules.ts, independently unit-tested there) names exactly the
+// resourceProviders this codebase resolves through AtlassianClient/
+// AtlassianOps (see this file's own `atlassian`/`ops` construction just
+// below); github-issue/zendesk-ticket/filesystem need no Jira credential at
+// all. A rules.json that enables one of the Jira-dependent providers with no
+// Atlassian configured can never be staffed by any later config change short
+// of adding the credential — refusing to boot here, loudly and by name,
+// beats a daemon that starts, looks healthy, and simply never spawns
+// anything for that rule. This mirrors legacyAgentPreflight/
+// missingRulesPreflight below: a real misconfiguration refuses startup
+// rather than silently degrading.
+const staffing = atlassianStaffing(rules, Boolean(config.atlassian));
+if (!staffing.ok) {
+  console.error(`butchr: ${staffing.reason}`);
+  process.exit(1);
+}
+if (!config.atlassian) {
+  console.error(
+    "butchr: Atlassian disabled (ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN(_FILE) not configured) — " +
+    "Jira/Confluence-backed features are OFF: jira-work/jira-idea/jira-project rules cannot be staffed (none are enabled), " +
+    "the jira_*/confluence_* MCP tools and `butchr link` on a jira-project resource will refuse with a clear error if called, " +
+    "and dashboard links for a Jira resource cannot resolve. github-issue, zendesk-ticket, filesystem and managed-session " +
+    "features are unaffected.",
+  );
 }
 // BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
 // `Rule` per provider) — the built-in managed-sessions rule (never in
@@ -313,7 +340,18 @@ const zendeskTickets = zendeskStaffing.run
 // runs, reading the local disk directly (src/resources/filesystem.ts).
 const fsRules = filesystemRules(rules);
 
-const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// FACTORY-66: `disabledAtlassianClient()` when Atlassian is not configured —
+// see that factory's own doc comment (src/atlassian/client.ts) for why a
+// stand-in rather than `AtlassianClient | undefined` scattered across every
+// call site below. Every consumer of `atlassian` in this file is reachable
+// only through a jira-work/jira-idea/jira-project match (or a rule-presence
+// check gated the same way), and the fail-fast check above already refuses
+// to boot if one of those is enabled with no Atlassian configured — so in
+// the disabled case, this stand-in's methods are constructed but never
+// actually called.
+const atlassian = config.atlassian
+  ? new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`))
+  : disabledAtlassianClient();
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
 const ideaRules = jiraIdeaRules(rules);
@@ -324,7 +362,11 @@ const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined
 // and falls back to notifying writes — loudly, once — when it's absent.
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
-const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
+// `account` is used only in the remedy line of a permission warning this
+// gate logs when a quiet label write 403s — never reachable when Atlassian
+// is disabled (no jira-work matches ever flow through `labelWriter`, per the
+// fail-fast check above), so the fallback string below is never shown live.
+const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian?.email ?? "(atlassian disabled)", log: (line) => console.error(`  ${line}`) });
 const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
@@ -483,7 +525,13 @@ const dashboardFeed = createDashboardFeed({
   admission: () => admissionController.census(),
 });
 
-const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
+// FACTORY-66: `disabledAtlassianOps()` when Atlassian is not configured — the
+// jira_*/confluence_* MCP tools stay REGISTERED either way (see
+// `atlassianTools` below); calling one refuses with a clear "Atlassian is
+// not configured on this host" error instead of vanishing or crashing.
+const ops = config.atlassian
+  ? realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token })
+  : disabledAtlassianOps();
 
 // FACTORY-7/FACTORY-5: the local file store needs no credentials and works
 // for every ResourceRef kind; a `jira-project:` owner routes to the
@@ -672,9 +720,19 @@ const { app, mcp } = buildApp({
   // jira-project agents work a bare Jira project key, not a ticket
   // `resolveResourceLink` knows how to route — link straight to the
   // project's Jira browse page instead.
-  resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
-    ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
-    : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  // FACTORY-66: `resolveResourceLink`/the jira-project branch below both need
+  // `config.atlassian.site` — unreachable in practice with Atlassian disabled
+  // (no jira-work/jira-project agent can exist to produce a key either
+  // branch would act on — see the fail-fast startup check above), but this
+  // callback runs per dashboard-link click on a caller-supplied key, so it is
+  // guarded explicitly rather than relying on that invariant holding forever.
+  resourceLink: (key) => {
+    if (!config.atlassian) return Promise.resolve({ ok: false as const, error: "Atlassian is not configured on this host" });
+    const site = config.atlassian.site;
+    return decodeAgentKey(key)?.resourceProvider === "jira-project"
+      ? Promise.resolve({ ok: true as const, url: `${site}/browse/${resourceKeyOf(key)}` })
+      : resolveResourceLink(resourceKeyOf(key), { jiraSite: site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url });
+  },
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -695,9 +753,14 @@ const { app, mcp } = buildApp({
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // `config.atlassian!`: `jiraIdeas` is only ever truthy when an enabled
+  // jira-idea rule exists (see its own construction above), and the
+  // fail-fast startup check earlier in this file already refuses to boot
+  // exactly that combination with Atlassian unconfigured — so `jiraIdeas`
+  // truthy guarantees `config.atlassian` is set here.
+  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian!.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking needs both providers running: authorization reads both loops' latest matches.
-  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian!.site }) : {}),
   // BUTCHR-456: registered unconditionally, like resourceLinkTools above — a
   // managed-session agent needs no external credential to be authorized
   // (the grant lives in another definition's own manifest), and the SAME

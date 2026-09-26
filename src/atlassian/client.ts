@@ -292,6 +292,30 @@ export class AtlassianClient {
   }
 }
 
+/** FACTORY-66: one wording, shared by every disabled-Atlassian stand-in (this file and src/tools/atlassian-real.ts) — a caller sees the same message however it reached Jira. */
+export const ATLASSIAN_DISABLED_MESSAGE = "Atlassian is not configured on this host (ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN or ATLASSIAN_TOKEN_FILE are not set) — Jira/Confluence features are disabled";
+
+/**
+ * FACTORY-66: a stand-in for `AtlassianClient` on a host with no Atlassian
+ * credentials, so daemon-side wiring that closes over "the" Jira client (the
+ * jira-work/jira-idea/jira-project loops, the label writer, the stalled/
+ * parked/abandoned detectors, …) never has to null-check it at every call
+ * site. It is only ever actually invoked if one of those consumers runs with
+ * no matches to justify it — startup already refuses to boot when an
+ * enabled rule needs Jira and credentials are absent (src/daemon/index.ts),
+ * so in practice every method here is dead code, not a hot path — this
+ * exists so that IF it is ever reached anyway (a future wiring mistake), the
+ * failure is one clear rejected promise, not a "Cannot read properties of
+ * undefined" crash. A `Proxy` rather than a hand-written stub: `AtlassianClient`
+ * has ~15 public methods and a Proxy can never drift out of sync with a
+ * newly added one. No code in this repo does `instanceof AtlassianClient`
+ * (confirmed by grep) — this cast is safe only as long as that stays true.
+ */
+export function disabledAtlassianClient(): AtlassianClient {
+  const refuse = () => Promise.reject(new Error(ATLASSIAN_DISABLED_MESSAGE));
+  return new Proxy({}, { get: () => refuse }) as unknown as AtlassianClient;
+}
+
 /**
  * Shared by `links()` (single-issue endpoint) and `mapIssue` (search
  * results) — same raw Jira `issuelinks` array shape either way, so this is
