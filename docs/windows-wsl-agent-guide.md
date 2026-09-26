@@ -76,8 +76,9 @@ feature) — treat this as a judgment call, not a verified fact:
   `\`), which is rarely what you want when the string is meant for
   PowerShell or CMD to parse.
 - A literal Windows path with backslashes inside a *double*-quoted bash
-  string needs each backslash escaped for bash (`"C:\\\\temp\\\\foo.txt"`) or,
-  simpler, use a single-quoted bash string so bash does not touch the
+  string needs each backslash escaped for bash (`"C:\\temp\\foo.txt"` —
+  bash collapses each `\\` to one `\`, reaching Windows as `C:\temp\foo.txt`)
+  or, simpler, use a single-quoted bash string so bash does not touch the
   backslashes at all.
 - `notepad.exe "C:\temp\foo.txt"` and `notepad.exe C:\\temp\\foo.txt` both
   reach Windows correctly per filesystems.md's own examples — i.e. Windows
