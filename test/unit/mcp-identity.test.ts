@@ -12,6 +12,8 @@ describe("callerIdentity (BUTCHR-397: query-level keys)", () => {
       .toEqual({ provider: "jira-work", issue: "BUTCHR-1", agent: "jira-work:triage:BUTCHR-1" });
     expect(callerIdentity({ "x-butchr-agent": encodeAgentKey({ resourceProvider: "github-issue", ruleId: "triage", resourceId: "acme/web#42" }) }))
       .toEqual({ provider: "github-issue", agent: "github-issue:triage:acme%2Fweb%2342", ruleId: "triage", resource: "acme/web#42", ref: { owner: "acme", repo: "web", number: 42 } });
+    expect(callerIdentity({ "x-butchr-agent": encodeAgentKey({ resourceProvider: "github-pr", ruleId: "triage", resourceId: "acme/web#42" }) }))
+      .toEqual({ provider: "github-pr", agent: "github-pr:triage:acme%2Fweb%2342", ruleId: "triage", resource: "acme/web#42", ref: { owner: "acme", repo: "web", number: 42 } });
     expect(callerIdentity({ "x-butchr-agent": encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "ideas", resourceId: "IDEA-1" }) }))
       .toEqual({ provider: "jira-idea", agent: "jira-idea:ideas:IDEA-1", ruleId: "ideas", resource: "IDEA-1" });
     expect(callerIdentity({ "x-butchr-agent": encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: "acme#7" }) }))
@@ -26,7 +28,7 @@ describe("callerIdentity (BUTCHR-397: query-level keys)", () => {
   // ticket to name one for, the same double-identity refusal every
   // `KEY_ONLY_PROVIDERS` branch already applies.
   test("a query-level agent key resolves as its own CallerIdentity variant, for every provider; refused only alongside x-issue", () => {
-    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+    for (const resourceProvider of ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket"] as const) {
       const agent = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
       expect(callerIdentity({ "x-butchr-agent": agent })).toEqual({ provider: resourceProvider, agent, ruleId: "triage", query: true });
       expect(callerIdentity({ "x-issue": "BUTCHR-1", "x-butchr-agent": agent })).toBeNull();

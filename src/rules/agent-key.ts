@@ -5,18 +5,22 @@
  */
 import { isFilesystemResourceId } from "../resources/filesystem-ref.js";
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
+import { isGithubPrRef } from "../resources/github-pr-ref.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
  * One provider per resource TYPE, not per vendor: Jira work items, GitHub
- * issues, Jira Product Discovery ideas (the same Jira API as work items,
+ * issues, GitHub pull requests (FACTORY-57 — a SEPARATE provider from
+ * `github-issue` despite sharing GitHub's own owner/repo#number identity
+ * shape; see `../resources/github-pr-ref.ts`'s header for how the two never
+ * collide), Jira Product Discovery ideas (the same Jira API as work items,
  * still a separate provider), Zendesk tickets, free-form Jira project
  * resources (`jira-project`, one agent per project key rather than per
  * issue), and (BUTCHR-407) local filesystem resources (files/directories, no
  * external credential). Only providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -48,8 +52,13 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * project keys are not resources there. `jira-project`: a Jira project key
  * (`PROJ`) IS the resource id — the one case where a bare project key is
  * valid. `github-issue`: a canonical `owner/repo#number` (lowercase owner
- * and repo). `jira-idea`: the Jira issue key of a Product Discovery idea
- * (`IDEAS-7`). `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
+ * and repo). `github-pr`: the SAME `owner/repo#number` shape (GitHub issue
+ * and PR numbers share one counter per repo — see
+ * `../resources/github-pr-ref.ts`'s header) — the two providers never
+ * collide because an agent key's `resourceProvider` slot, not the id shape
+ * alone, is what a `github-issue` vs. `github-pr` agent is keyed by.
+ * `jira-idea`: the Jira issue key of a Product Discovery idea (`IDEAS-7`).
+ * `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  * `filesystem`: a canonical absolute path (`/home/butchr/repo/src/index.ts`),
  * resolved via `realpath` by discovery before it ever reaches this check
  * (src/resources/filesystem.ts).
@@ -59,6 +68,7 @@ export function isResourceId(provider: ResourceProvider, id: string): boolean {
     case "jira-work": return isIssueKey(id);
     case "jira-project": return isProjectId(id);
     case "github-issue": return isGithubIssueRef(id);
+    case "github-pr": return isGithubPrRef(id);
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);
     case "filesystem": return isFilesystemResourceId(id);
