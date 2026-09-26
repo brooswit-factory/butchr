@@ -46,21 +46,24 @@ so its own effort axis is simply named `effort`.
 
 ## The model-power tables
 
-Four equal 25-wide bands per vendor, covering 0-100 with no gaps or overlaps
-(swept exhaustively in `test/unit/power-scale.test.ts`):
+Four bands per vendor, covering 0-100 with no gaps or overlaps (swept
+exhaustively in `test/unit/power-scale.test.ts`) — the operator's FINAL
+split (FACTORY-73 comments 25036 and 25085, relayed by the director): Haiku
+is the bottom 10%, Fable is the top 15%, Opus is the 25% below Fable, and
+Sonnet fills the rest. Asymmetric widths, not four equal quarters:
 
 | range | claude | codex |
 |---|---|---|
-| 0-24 | `haiku` | `gpt-5.6-luna` |
-| 25-49 | `sonnet` | `gpt-5.6-terra` |
-| 50-74 | `opus` | `gpt-5.6-sol` |
-| 75-100 | `fable` | `gpt-6-astra` |
+| 0-10 | `haiku` | `gpt-5.6-luna` |
+| 11-59 | `sonnet` | `gpt-5.6-terra` |
+| 60-84 | `opus` | `gpt-5.6-sol` |
+| 85-100 | `fable` | `gpt-6-astra` |
 
 0 = Haiku, 100 = Fable — the operator's own framing (FACTORY-73 [director]
 comment, ~18:16Z), ordered by capability/cost. Codex's own table reuses
 the SAME 4 models the deprecated `tierToModel` table already named for
-tier1-4/5, in the same ascending order, for the same "equally granular"
-reason the ticket asked for.
+tier1-4/5, in the same ascending order, following the same boundaries as
+Claude's table.
 
 Model strings here are the SAME short aliases `tierToModel` already used
 (`"sonnet"`, `"opus"`, ...), not full model ids — `--model sonnet` (Claude)
@@ -259,7 +262,7 @@ config changes admin-assembly makes later, outside this ticket's scope.
 |---|---|---|---|
 | admin-agentcost / admin-agentvelocity (managed sessions, codey/zippy) | `100` | `70` | **Fable, `xhigh` effort** (sub-max — `100`/`max` is reserved for the true ceiling) |
 | Every other managed session (directors/admins, codey and zippy) — the canonical "Sonnet/medium" pair | `25` (`CANONICAL_SONNET_MODEL_POWER`) | `20` (`CANONICAL_MEDIUM_EFFORT`) | **Sonnet, `medium` effort** |
-| Servy Epic/Bug jira-work agents (rules) | `75` | `90` | **Fable, `max` effort** |
+| Servy Epic/Bug jira-work agents (rules) | `75` | `90` | **Opus, `max` effort** |
 | Servy task-level jira-work agents (Story/Task/Sub-task workers, rules) | `25` (the same canonical Sonnet value) | `90` | **Sonnet, `max` effort** |
 
 `CANONICAL_SONNET_MODEL_POWER`/`CANONICAL_MEDIUM_EFFORT` are mine to pick
