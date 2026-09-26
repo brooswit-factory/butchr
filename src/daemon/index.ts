@@ -37,6 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -1558,6 +1559,45 @@ const blockingEscalationTimer = setInterval(() => {
     .finally(() => { blockingEscalationPollInFlight = false; });
 }, 5_000);
 blockingEscalationTimer.unref?.();
+
+// DROVR-42 (host-wiring decision carried over from DROVR-41, under the
+// DROVR-37 epic): a THIRD, independent pane-scanning timer — see
+// src/agents/permission-answer-loop.ts's own header for the full reasoning
+// (why this is its own timer rather than folded into the Jira reconcile
+// loop above or `blockingEscalationTimer` immediately above, and why it
+// cannot collide with `chooseStartupAnswer`/`watchPrompts` below). Presses
+// keys (unlike `blockingEscalationTimer`, which never does — see that
+// timer's own comment) so it earns its own tighter isolation from every
+// other poll loop's failure modes, exactly like `blockingEscalationTimer`
+// already does for the same reason.
+//
+// CADENCE, chosen and measured against this daemon's own load rather than
+// copied from DROVR-41's order-of-magnitude suggestion unread: 20s lands
+// inside DROVR-41's own 15-30s recommendation, slower than the 5s
+// `blockingEscalationTimer`/`watchPrompts` timers (a pure-read status poll,
+// cheap to run often) but close to this daemon's own ~15s Jira reconcile
+// cadence under load (BUTCHR-117) — a blocked agent is now unblocked within
+// one tick of a bound already proven acceptable elsewhere in this same
+// daemon, without adding a fourth distinct polling rhythm to reason about.
+// `READ_TIMEOUT_MS` (8s) sits comfortably below `INTERVAL_MS` (20s) — see
+// `AutoAnswerPermissionsOptions.readTimeoutMs`'s own doc comment
+// (`@brooswit/drovr`) for why a pane's attempt must never still be in
+// flight when the next tick fires — with margin over drovr's own internal
+// approve-verify budget (5s default `verifyTimeoutMs`, measured against
+// `node_modules/@brooswit/drovr/dist/index.js`) rather than picked to
+// exactly match it.
+const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
+const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+startPermissionAnswerLoop(
+  {
+    client: herdr,
+    auditPath: config.permissionAuditPath,
+    operator: "butchr-daemon",
+    readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
+    log: (line) => console.error(`  ${line}`),
+  },
+  PERMISSION_ANSWER_INTERVAL_MS,
+);
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
 // whose text parses as a dialog, and whose trailing region isn't a recognized
