@@ -82,6 +82,16 @@ export interface RuleResourceDeps {
   confluenceVersion?: LinkedEventingDeps["confluenceVersion"];
   github?: LinkedEventingDeps["github"];
   webpage?: LinkedEventingDeps["webpage"];
+  /** FACTORY-9: `external-poll.ts`'s `pollFilesystem` needs. Passed straight through to `runTick`, same as the three deps immediately above — see `LinkedEventingDeps.filesystem`'s own doc comment for what an omitted dep resolves to. */
+  filesystem?: LinkedEventingDeps["filesystem"];
+  /**
+   * FACTORY-9 (epic FACTORY-3, story 3/3): the FACTORY-4 butchr-managed link
+   * store — see `LinkedEventingDeps.linkStore`'s own doc comment
+   * (src/jira-watch/linked-eventing.ts) for the full contract. Passed
+   * straight through to `runTick`, same as every other linked-eventing dep
+   * above; omitted, no managed link is ever reconciled into a watcher.
+   */
+  linkStore?: LinkedEventingDeps["linkStore"];
 }
 
 /**
@@ -534,6 +544,10 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
               ...(deps.confluenceVersion ? { confluenceVersion: deps.confluenceVersion } : {}),
               ...(deps.github ? { github: deps.github } : {}),
               ...(deps.webpage ? { webpage: deps.webpage } : {}),
+              // FACTORY-9
+              ...(deps.filesystem ? { filesystem: deps.filesystem } : {}),
+              ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
+              ...(deps.comments ? { comments: deps.comments } : {}),
             });
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] tick threw: ${(e as Error)?.message ?? e}`);

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  defaultIsBlockedHost, pollConfluencePage, pollGithubLink, pollWebpage,
-  type ConfluencePollDeps, type GithubConditionalDeps, type WebpagePollDeps,
+  defaultIsBlockedHost, pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
+  type ConfluencePollDeps, type FilesystemPollDeps, type GithubConditionalDeps, type WebpagePollDeps,
 } from "../../src/jira-watch/external-poll.js";
 
 describe("BUTCHR-437: pollConfluencePage", () => {
@@ -27,6 +27,13 @@ describe("BUTCHR-437: pollConfluencePage", () => {
 
     const down: ConfluencePollDeps = { getVersion: async () => ({ ok: false, transient: true }) };
     expect(await pollConfluencePage(CONF_URL, down)).toEqual({ status: "error" });
+  });
+
+  test("FACTORY-9: a BARE numeric page id (the confluence-page ResourceRef's own canonical form, from a managed link) resolves the same as a full URL, no second regex disagreeing", async () => {
+    let calls: string[] = [];
+    const deps: ConfluencePollDeps = { getVersion: async (pageId) => { calls.push(pageId); return { ok: true, version: 7 }; } };
+    expect(await pollConfluencePage("12484678", deps)).toEqual({ status: "ok", fingerprint: "7" });
+    expect(calls).toEqual(["12484678"]);
   });
 });
 
@@ -330,5 +337,33 @@ describe("BUTCHR-437: defaultIsBlockedHost (real DNS-based SSRF guard, IP litera
 
     const secondAddressPrivate = async () => [{ address: "2001:4860:4860::8888", family: 6 }, { address: "fc00::1", family: 6 }];
     expect(await defaultIsBlockedHost("multi.example.com", secondAddressPrivate)).toBe(true);
+  });
+});
+
+describe("FACTORY-9: pollFilesystem", () => {
+  const okStat = (mtimeMs: number, size: number, isDir = false): FilesystemPollDeps["stat"] => async () => ({ mtimeMs, size, isDirectory: () => isDir });
+
+  test("a readable file resolves ok with an mtime+size fingerprint", async () => {
+    expect(await pollFilesystem("/srv/notes.md", { stat: okStat(1000, 42) })).toEqual({ status: "ok", fingerprint: "1000:42" });
+  });
+
+  test("mtime alone changing (same size) still changes the fingerprint — a same-second rewrite is not invisible", async () => {
+    const before = await pollFilesystem("/srv/notes.md", { stat: okStat(1000, 42) });
+    const after = await pollFilesystem("/srv/notes.md", { stat: okStat(1001, 42) });
+    expect(before).not.toEqual(after);
+  });
+
+  test("ENOENT is unreadable, never error", async () => {
+    const stat: FilesystemPollDeps["stat"] = async () => { throw Object.assign(new Error("no such file"), { code: "ENOENT" }); };
+    expect(await pollFilesystem("/srv/gone.md", { stat })).toEqual({ status: "unreadable" });
+  });
+
+  test("any other stat failure (e.g. EACCES) is transient (error), never unreadable — this module cannot positively attribute it to 'gone'", async () => {
+    const stat: FilesystemPollDeps["stat"] = async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); };
+    expect(await pollFilesystem("/srv/locked.md", { stat })).toEqual({ status: "error" });
+  });
+
+  test("a directory is unreadable — this poller diffs one file's own content fingerprint, never a directory's", async () => {
+    expect(await pollFilesystem("/srv/adir", { stat: okStat(1000, 4096, true) })).toEqual({ status: "unreadable" });
   });
 });
