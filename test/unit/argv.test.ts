@@ -30,6 +30,24 @@ describe("spawnArgs", () => {
     ]);
   });
 
+  test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig produces --strict-mcp-config in a Claude launch's argv; absent produces no such flag", () => {
+    const withFlag = spawnArgs({ ...spec, strictMcpConfig: true }, "/w/KAN-783");
+    expect(withFlag).toEqual([
+      "follow your CLAUDE.md",
+      "--model", "sonnet",
+      "--effort", "high",
+      "--permission-mode", "bypassPermissions",
+      "--mcp-config", "/w/KAN-783/mcp.json",
+      "--strict-mcp-config",
+      "--dangerously-load-development-channels=server:butchr",
+    ]);
+    const without = spawnArgs(spec, "/w/KAN-783");
+    expect(without).not.toContain("--strict-mcp-config");
+    // Codex has no strict-MCP-config concept — never forwarded (see agentLaunchConfig's claude-only branch).
+    const codexArgs = spawnArgs({ ...spec, strictMcpConfig: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(codexArgs).not.toContain("--strict-mcp-config");
+  });
+
   test("PR #394 review fix (round 3): a spec with cwd set gets a kickoff that names its own working directory AND its own brief — both vendors — never the bare \"follow your CLAUDE.md/AGENTS.md\", which would be ambiguous about where the agent should actually work", () => {
     const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
     const claudeArgs = spawnArgs(cwdSpec, "/w/KAN-783");
