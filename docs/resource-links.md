@@ -49,6 +49,15 @@ first established by `src/resources/github-issue-ref.ts` and
 `zendesk-ticket-ref.ts`, reused rather than reinvented). `github-issue-ref.ts`
 itself is untouched; every other module is new.
 
+**FACTORY-57 (2026-09-26) added a SEVENTH kind, `github-pr`, outside this
+epic's original six-kind scope but requested by a later story** — `{ owner,
+repo, number }`, `src/resources/github-pr-ref.ts`. It shares its identity
+PAYLOAD shape byte-for-byte with `github-issue` (GitHub's own per-repo
+issue/PR number namespace — see that new module's own header for why), so
+the two are told apart by the canonical `github-issue:`/`github-pr:`
+provider prefix alone, never by the payload. `github-issue-ref.ts` itself
+stayed untouched by this addition too (only new exports).
+
 ## Decision 1 — Schema and versioning
 
 **A discriminated union on `provider`** (`src/resources/resource-ref.ts`),
@@ -210,6 +219,10 @@ built or wired:
 - `jira-work-item`/`jira-project`: `updated` timestamp + comment count.
 - `confluence-page`: `version.number`.
 - `github-issue`: `updated_at`, or the response ETag.
+- `github-pr` (FACTORY-57): same as `github-issue` — `updated_at`, or the
+  response ETag; `pollGithubLink` (`src/jira-watch/external-poll.ts`)
+  already implements this for the linked-eventing path, reading
+  `/pulls/<n>` in place of `/issues/<n>`.
 - `filesystem`: mtime + size.
 - `webpage`: `ETag`, falling back to `Last-Modified`.
 
@@ -489,6 +502,7 @@ that kind already uses:
 | `jira-work-item` | `jira-key` | the existing Jira batched-search status/summary/updated diff, now comment-aware (below) |
 | `confluence-page` | `confluence` | `pollConfluencePage` — extended to accept the ref's own BARE page id, not only a URL |
 | `github-issue` | `github-issue` | `pollGithubLink` unchanged — the canonical `owner/repo#n` string is already the exact identity it expects |
+| `github-pr` (FACTORY-57, NEW as a `ResourceRefProvider`) | `github-pr` | `pollGithubLink` unchanged too — it has accepted `kind: "github-pr"` (reading `/pulls/<n>`) since BUTCHR-436/437's own linked-eventing work, PREDATING this ticket's `github-pr` `ResourceRef` provider; only `resourceRefToLinkedItem`'s mapping (`src/resources/link-reconcile.ts`) needed a new case — see that module's own header for why this replaces its earlier "no distinct `github-pr` provider" note |
 | `webpage` | `webpage` | `pollWebpage` unchanged — the ref's own normalized URL is already what it expects |
 | `filesystem` | `filesystem` (NEW) | a new poller, `pollFilesystem` (`src/jira-watch/external-poll.ts`) — `fs.stat`'s mtime+size, no network |
 | `jira-project` (as a link **target**) | — | **still an explicit, documented scope gap**: no live Jira API call exists anywhere in this codebase for a PROJECT's own change signature (there is no project-level `updated`/comment-count endpoint), so a `jira-work-item` owner's managed link TO a project is still silently excluded from that owner's watch set — never a crash, logged once, the same effect as an omitted `ProviderAdapter.changeToken`. This is UNCHANGED by BUTCHR-469 below, which gives `jira-project` a watch of its own (as an OWNER), not this (as a TARGET) — the two are independent gaps/capabilities. |

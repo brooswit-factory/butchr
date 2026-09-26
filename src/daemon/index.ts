@@ -67,6 +67,10 @@ import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issu
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
+import { createGithubPrClient } from "../resources/github-pr.js";
+import { githubPrStaffing } from "../rules/github-pr-type.js";
+import { githubPrTools } from "../tools/github-pr.js";
+import { GITHUB_PR_POLL_MS, startGithubPrLoop } from "./github-pr-loop.js";
 import { createJiraIdeaClient } from "../resources/jira-idea.js";
 import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
@@ -313,6 +317,15 @@ const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
+// github-pr rules share the SAME token/org config as github-issue (see
+// Config["github"]'s own doc comment) but are their own provider, staffing
+// gate, client and loop — a rules file with github-issue rules and no
+// github-pr rules stays unaffected, and vice versa.
+const githubPrStaffingResult = githubPrStaffing(rules, config.github);
+const githubPrs = githubPrStaffingResult.run && config.github
+  ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
+  : undefined;
+
 // zendesk-ticket rules run only with ZENDESK_SUBDOMAIN and an owner-only
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
@@ -406,6 +419,7 @@ setInterval(codexChannelRelayTick, 15_000);
 // this daemon never calls `admissionController.admit` directly.
 const ADMISSION_SOURCE_ISSUE = "issue";
 const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
+const ADMISSION_SOURCE_GITHUB_PR = "github-pr";
 const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
 const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // BUTCHR-425: jira-project agents always classify as sentinels (see
@@ -436,7 +450,7 @@ const admissionController = createAdmissionController({
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -569,6 +583,13 @@ const githubIssueHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_ISSUE_POLL_MS),
   log: (line) => console.error(line),
 });
+const githubPrHealth = createResourceLoopHealth({
+  name: "github-pr",
+  enabled: Boolean(githubPrs),
+  ...(githubPrStaffingResult.run ? {} : { disabledReason: githubPrStaffingResult.reason ?? "no enabled github-pr rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_PR_POLL_MS),
+  log: (line) => console.error(line),
+});
 const jiraIdeaHealth = createResourceLoopHealth({
   name: "jira-idea",
   enabled: Boolean(jiraIdeas),
@@ -667,7 +688,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -693,7 +714,7 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
+  // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
   // provider-specific tool set below it — the local file store needs no
@@ -707,6 +728,7 @@ const { app, mcp } = buildApp({
     (line) => console.error(line),
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking needs both providers running: authorization reads both loops' latest matches.
@@ -1347,6 +1369,30 @@ startGithubIssueLoop({
   account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
   onError: (e) => githubIssueHealth.recordError(e),
+});
+
+// The github-pr rule loop: its own agents only, its own admission bucket
+// under the same host cap, and none of the Jira-writing detectors above —
+// same reasoning as the github-issue loop just above.
+if (githubPrs) console.error(`  github-pr rules: ${githubPrStaffingResult.rules.map((r) => r.id).join(", ")}`);
+startGithubPrLoop({
+  staffing: githubPrStaffingResult,
+  client: githubPrs ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_PR),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_PR),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_PR),
+  account: accountLifecycle,
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => githubPrHealth.recordSuccess(),
+  onError: (e) => githubPrHealth.recordError(e),
 });
 
 // The jira-idea rule loop: proven Product Discovery ideas only, its own
