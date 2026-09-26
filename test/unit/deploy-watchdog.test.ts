@@ -138,6 +138,16 @@ describe("watchdog CLI", () => {
     expect(code).toBe(2);
   });
 
+  test("arm requires --mode (every other flag given)", async () => {
+    const { io } = fakeIo();
+    const code = await runWatchdogCli(
+      ["arm", "--state-file", STATE_FILE, "--install-dir", "/opt/butchr", "--unit", "butchr.service",
+        "--port", "7717", "--prev-sha", PREV_SHA, "--expected-sha", NEW_SHA, "--window-sec", "300"],
+      io,
+    );
+    expect(code).toBe(2);
+  });
+
   test("check with no armed state exits 2 (nothing to check)", async () => {
     const { io } = fakeIo();
     const code = await runWatchdogCli(["check", "--state-file", STATE_FILE], io);
