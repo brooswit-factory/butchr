@@ -134,6 +134,12 @@ export interface EscalatorDeps {
    * it but an operator's hand transcription). Optional and injected, like
    * session-limit-watch's own CaptureSink: when absent, escalation behaves
    * exactly as it did before this ticket (comment only, no capture).
+   *
+   * FACTORY-50 (Part C): the SAME sink also lands a keyless managed-session
+   * pane's full text via `captureManagedSessionEscalationText` — a
+   * different filename shape (`MANAGED_ESCALATION_CAPTURE_NAME`), so the
+   * two capture kinds never collide in listing or eviction, but the same
+   * "optional, fails open, local disk only" contract.
    */
   captures?: CaptureSink;
   /**
@@ -363,6 +369,78 @@ async function captureEscalationText(deps: EscalatorDeps, paneId: string, issue:
 }
 
 /**
+ * FACTORY-50 (Part C): global cap on managed-session escalation capture
+ * files kept at once — same discipline as `ESCALATION_CAPTURE_MAX_FILES`
+ * just above and session-limit-watch's own `CAPTURE_MAX_FILES`, kept
+ * separate because it recognizes a different filename shape (there is no
+ * issue/project key here — a managed session has neither) and must never
+ * evict, or be evicted by, either sibling's captures.
+ */
+const MANAGED_ESCALATION_CAPTURE_MAX_FILES = 50;
+
+/**
+ * `<agentKey>-managed-escalation-<paneId>-<compact-UTC-timestamp>.txt` —
+ * recognizes exactly the filenames `captureManagedSessionEscalationText`
+ * writes. `agentKey` is already `encodeURIComponent`-escaped per component
+ * (`encodeAgentKey`, src/rules/agent-key.ts) and this ticket's own path is
+ * always the `filesystem` provider (see `ManagedSessionTarget`'s doc
+ * comment), so it is filename-safe as written — no extra sanitizing needed.
+ * Disjoint from `ESCALATION_CAPTURE_NAME` and session-limit-watch's
+ * `CAPTURE_NAME` by the literal `-managed-escalation-` segment: those two
+ * always key on an issue/project id, which this shape never has.
+ */
+const MANAGED_ESCALATION_CAPTURE_NAME = /^filesystem:[a-z0-9-]+:[A-Za-z0-9%._~-]+-managed-escalation-.+-(\d{8}T\d{6}Z)\.txt$/;
+
+/**
+ * FACTORY-50 (Part C): durably capture a keyless managed-session pane's
+ * full, UNREDACTED text the moment `markManagedSessionStalled` marks a
+ * genuinely NEW (pane, fingerprint) episode. Mirrors `captureEscalationText`
+ * above: local disk only (never Jira — a managed session has no ticket to
+ * post to), no redaction, fails open (a warning, never a throw — a failed
+ * capture must never block the `[managed-escalation]` journal line), and
+ * only the returned PATH — never the content — ever reaches that line.
+ */
+async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: string, target: ManagedSessionTarget, fp: string): Promise<string | null> {
+  const sink = deps.captures;
+  if (!sink) return null;
+  try {
+    const text = await deps.read(paneId);
+    const capturedAt = deps.now();
+    const name = `${target.agentKey}-managed-escalation-${paneId}-${compactUtc(capturedAt)}.txt`;
+    const header =
+      `# butchr managed-session escalation capture\n` +
+      `# agent-key: ${target.agentKey}\n` +
+      `# definition: ${target.definitionPath}\n` +
+      `# pane: ${paneId}\n` +
+      `# fingerprint: ${fp}\n` +
+      `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
+      `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
+      `\n`;
+    const all = await sink.list();
+    const ours = all
+      .map((n) => ({ n, m: MANAGED_ESCALATION_CAPTURE_NAME.exec(n) }))
+      .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
+      .map((x) => ({ name: x.n, ts: x.m[1]! }))
+      .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    while (ours.length >= MANAGED_ESCALATION_CAPTURE_MAX_FILES) {
+      const oldest = ours.shift()!;
+      await sink.remove(oldest.name);
+    }
+    return await sink.write(name, header + text);
+  } catch (e) {
+    // "WARNING: [managed-escalation] ..." — NOT bare `${MANAGED_ESCALATION_MARKER}
+    // ...` (matching `onDrovrUnknownDialog`'s own resolve-failure log just
+    // below): a bare `${MANAGED_ESCALATION_MARKER}`-prefixed line here would
+    // be indistinguishable, to any `startsWith(MANAGED_ESCALATION_MARKER)`
+    // reader (including this file's own tests), from the real stalled-mark
+    // line this same poll already logs — turning one escalation into two
+    // apparent ones.
+    deps.log(`WARNING: [managed-escalation] capture failed for pane ${paneId} (${target.agentKey}): ${(e as Error)?.message ?? e}`);
+    return null;
+  }
+}
+
+/**
  * The blocked-prompt escalation state machine: fingerprint a dialog, debounce
  * a transient block, escalate once per fingerprint to the blocked agent's own
  * ticket, watch for an `ANSWER` directive, verify it against the LIVE dialog
@@ -557,14 +635,21 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * episode can each log once under their own fingerprint — an extra
    * journal line, never a functional miss, and the mark still reads
    * "stalled" correctly either way.
+   *
+   * FACTORY-50 (Part C): also durably captures the pane's full text via
+   * `captureManagedSessionEscalationText` for a genuinely NEW episode
+   * (never on a no-op re-entry) — the state map entry above is set BEFORE
+   * that await, so an overlapping synchronous re-entry for the same fp
+   * still short-circuits on the guard above and never double-captures.
    */
-  function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): void {
+  async function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): Promise<void> {
     const prior = managedSessionStalled.get(paneId);
     if (prior?.fp === fp) return; // already logged + marked for this exact dialog this episode
     const since = new Date(deps.now()).toISOString();
     managedSessionStalled.set(paneId, { target, fp, since });
+    const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
     const optionsLine = options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
-    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}`);
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
   }
 
   /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. */
@@ -573,8 +658,8 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} ${reason} — clearing stalled mark`);
   }
 
-  function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): void {
-    markManagedSessionStalled(paneId, target, prompt.question, prompt.options, fingerprint(prompt));
+  async function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): Promise<void> {
+    await markManagedSessionStalled(paneId, target, prompt.question, prompt.options, fingerprint(prompt));
   }
 
   /**
@@ -600,7 +685,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       return;
     }
     if (!target) return;
-    markManagedSessionStalled(escalation.paneId, target, escalation.question, escalation.options, escalation.fingerprint);
+    await markManagedSessionStalled(escalation.paneId, target, escalation.question, escalation.options, escalation.fingerprint);
   }
 
   /** The resolution half of `onDrovrUnknownDialog` — drovr's own `hook.onDialogResolved`. Only clears an episode THIS fingerprint opened; a stale/foreign fingerprint (the episode already moved on, e.g. a newer one Butchr's own parser logged in the meantime) is left alone rather than clearing a live mark on a guess. */
@@ -903,7 +988,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       inFlight.add(paneId);
       try {
         const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
-        if (session) handleManagedSessionBlocked(paneId, session, prompt);
+        if (session) await handleManagedSessionBlocked(paneId, session, prompt);
         else log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
       } catch (e) {
         log(`error handling ${paneId}: ${(e as Error)?.message ?? e}`);

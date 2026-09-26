@@ -1827,6 +1827,131 @@ describe("createEscalator — escalation captures the full pane text (BUTCHR-16)
   });
 });
 
+// FACTORY-50 (Part C): a keyless managed-session pane has no ticket to post
+// the pane text to, so it reuses BUTCHR-16's own local-disk capture store —
+// same contract (optional, fails open, local-disk-only, unredacted), a
+// disjoint filename shape (no issue/project key to key on).
+describe("createEscalator — managed-session escalation captures the full pane text (FACTORY-50 Part C)", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+
+  test("with no captures dep configured, behaves exactly as before: no capture, no path in the journal line", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).not.toContain("capture:");
+  });
+
+  test("on a fresh episode, the FULL raw pane text is written to the capture store, unredacted, and the path reaches the journal line", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+    const SECRET_PANE = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n" + REAL;
+    h.setPaneText(SECRET_PANE);
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+
+    expect(cap.files.size).toBe(1);
+    const [name, contents] = [...cap.files.entries()][0]!;
+    expect(name).toMatch(/^filesystem:managed-sessions:.+-managed-escalation-p1-\d{8}T\d{6}Z\.txt$/);
+    expect(name).toContain(target.agentKey);
+    expect(contents).toContain(SECRET_PANE); // full pane text, UNREDACTED, on local disk
+    expect(contents).toContain("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI");
+    expect(contents).toContain(target.definitionPath);
+    expect(contents).toContain(fingerprint(prompt));
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1);
+    const path = `/fake-captures/${name}`;
+    expect(lines[0]).toContain(path);
+
+    // Never posted or sent anywhere — same as every other managed-session assertion.
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  test("the SAME fingerprint on a later poll does not write a second capture", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    expect(cap.files.size).toBe(1);
+  });
+
+  test("a NEW fingerprint on the same pane writes a new capture", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+    const prompt1 = parsePrompt(REAL)!;
+    const prompt2 = parsePrompt(TRUST)!;
+    await h.poll("p1", null, prompt1);
+    h.setClock(60_000); // distinct compact-UTC timestamp so the two capture names don't collide
+    await h.poll("p1", null, prompt2);
+    expect(cap.files.size).toBe(2);
+  });
+
+  test("drovr's own onUnknownDialog hook captures too, once per (pane, fingerprint)", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+    const escalation = { paneId: "p1", question: "Some dialog only drovr recognised", options: ["Opt A", "Opt B"], fingerprint: "drovrfp1" };
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    expect(cap.files.size).toBe(1);
+    const [name] = [...cap.files.keys()];
+    expect(name).toContain(target.agentKey);
+    expect(name).toMatch(/^filesystem:managed-sessions:.+-managed-escalation-p1-\d{8}T\d{6}Z\.txt$/);
+  });
+
+  test("a capture failure is logged and never blocks the [managed-escalation] journal line", async () => {
+    const failingSink = {
+      write: async (): Promise<string> => { throw new Error("disk full"); },
+      list: async () => [] as string[],
+      remove: async () => {},
+    };
+    const h = harness({ captures: failingSink, managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines[0]).not.toContain("capture:");
+    expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture failed"))).toBe(true);
+  });
+
+  test("evicts the oldest managed-session capture, by timestamp, once at the file cap — never touching the sibling issue-keyed shape", async () => {
+    const cap = fakeCaptureSink();
+    for (let i = 0; i < 50; i++) {
+      const ts = `202601${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`${target.agentKey}-managed-escalation-pOld-${ts}.txt`, "old capture");
+    }
+    // A sibling issue-keyed escalation capture must survive untouched.
+    cap.files.set("KAN-1-escalation-20260101T000000Z.txt", "foreign shape");
+    const oldestName = `${target.agentKey}-managed-escalation-pOld-20260101T000000Z.txt`;
+    expect(cap.files.has(oldestName)).toBe(true);
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt); // escalates immediately (no debounce on this path) — pushes past the cap
+    expect(cap.files.has(oldestName)).toBe(false); // evicted
+    expect(cap.files.has("KAN-1-escalation-20260101T000000Z.txt")).toBe(true); // foreign shape untouched
+    expect(cap.files.size).toBe(51); // 49 kept + 1 new + 1 untouched foreign
+  });
+
+  test("keyed and non-managed keyless behavior is unaffected: no capture, no journal line", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => null });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p1", "KAN-1", prompt);
+    await h.poll("p2", null, prompt); // no managedSessionOf match
+    expect(cap.files.size).toBe(1); // only KAN-1's own issue-keyed escalation capture
+    const [name] = [...cap.files.keys()];
+    expect(name).toMatch(/^KAN-1-escalation-\d{8}T\d{6}Z\.txt$/);
+  });
+});
+
 // BUTCHR-141/§2.6, acceptance criterion 6: "you are changing a branch that
 // gates two existing alarms, prove both alarms still fire." The
 // sustained-unresponsive alarm above is proven throughout this file against

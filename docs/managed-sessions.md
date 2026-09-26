@@ -1079,9 +1079,10 @@ anything beyond the plain log line happen:
    noisy the ordinary prompt log is — the unit name is in your own
    workspace's `ENVIRONMENT.md`, never hand-copied from someone else's). It
    names the agent key, the definition file's own path, the pane id, the
-   dialog's question and numbered options VERBATIM, and its fingerprint —
-   everything an operator needs to find the pane and decide what to do,
-   without a second lookup.
+   dialog's question and numbered options VERBATIM, its fingerprint, and
+   (FACTORY-50 Part C) the path of the pane-text capture just written, when
+   one was — everything an operator needs to find the pane and decide what
+   to do, without a second lookup.
 2. **A "stalled" mark on `/health`**: every currently-stalled managed
    session appears in a `managedSessionEscalations` array (a SIBLING field
    on the `/health` response, the same "additive, never flips `ok`" pattern
@@ -1110,6 +1111,54 @@ anything beyond the plain log line happen:
    is logged. The SAME fingerprint reappearing after a genuine clear is
    treated as a fresh episode (it escalates and logs again), never silently
    suppressed.
+5. **A durable pane-text capture** (FACTORY-50 Part C) — see "Pane-text
+   capture" just below.
+
+### Pane-text capture (FACTORY-50 Part C)
+
+A journal line alone can truncate or mis-parse the real screen — exactly
+what happened to the dialog that opened FACTORY-44 (pane gone, nothing but a
+hand transcription survived it). For a genuinely NEW (pane, fingerprint)
+episode — never a no-op re-entry on the same fingerprint — Butchr now also
+writes the pane's full, unredacted, ANSI-stripped text to the SAME local
+capture store BUTCHR-16 built for the keyed-issue escalation flow
+(`EscalatorDeps.captures`, real implementation `createCaptureStore`,
+`src/agents/capture-store.ts`; directory resolved by `config.captureDir` —
+`BUTCHR_CAPTURE_DIR` if set, else `<BUTCHR_WORKSPACES>/.captures`, printed by
+the daemon at startup and readable from your own workspace's
+`ENVIRONMENT.md`/journal, never hand-copied from someone else's).
+
+- **Filename**: `<agentKey>-managed-escalation-<paneId>-<compact-UTC-timestamp>.txt`,
+  e.g. `filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json-managed-escalation-w4:p4H-20260926T153100Z.txt`.
+  The agent key is already `encodeURIComponent`-escaped per component
+  (`encodeAgentKey`, src/rules/agent-key.ts), so it needs no further
+  sanitizing to be filename-safe. This shape is deliberately disjoint from
+  the keyed-issue escalation capture (`<ISSUE>-escalation-<ts>.txt`) and
+  session-limit-watch's own captures (`<ISSUE>-unrecognised-<ts>.txt` /
+  `<ISSUE>-no-reset-time-<ts>.txt`) — there is no issue/project key here at
+  all — so none of the three ever lists, evicts, or is evicted by, either
+  of the others.
+- **Contents**: a short `#`-commented header (agent key, definition path,
+  pane id, dialog fingerprint, capture time) followed by the pane's full
+  text verbatim, UNREDACTED — local disk only, never posted anywhere (there
+  is no ticket to post it to).
+- **Retention**: capped at 50 files of this shape at once (mirrors both
+  sibling capture kinds' own cap); the oldest, by the timestamp embedded in
+  the filename, is evicted first once a new capture would exceed it. Only
+  files matching this exact shape count toward the cap — a shared capture
+  directory holding the other two kinds' files, or anything else, is never
+  touched by this eviction.
+- **Failure handling**: a capture failure (disk full, permission error, …)
+  is logged once (`WARNING: [managed-escalation] capture failed for pane
+  ... `) and never blocks or delays the `[managed-escalation]` journal
+  line itself — the escalation is observational either way, so losing the
+  capture must never mean losing the alarm.
+- **How an operator uses it**: the `[managed-escalation]` journal line
+  names the capture's path directly (`... fingerprint: <fp> capture:
+  <path>`) whenever a capture was written; read that file to see exactly
+  what was on screen at the moment of escalation, instead of relying on the
+  journal line's own (necessarily shorter) question/options summary or
+  attaching to a pane that may have already moved on.
 
 ### Two detectors, one mark
 

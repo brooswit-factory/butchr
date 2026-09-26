@@ -1445,6 +1445,10 @@ const escalator = createEscalator({
   // dialog that opened this ticket. Shares config.captureDir with the
   // session-limit watcher's own captures (capture-store.ts); each recognizes
   // only its own filename shape, so neither ever evicts the other's files.
+  // FACTORY-50 (Part C): the SAME sink also lands a keyless managed-session
+  // pane's capture, under its own disjoint filename shape — no separate dep
+  // to wire, since `EscalatorDeps.captures` is already the one seam both
+  // paths funnel through inside escalation-loop.ts.
   captures: createCaptureStore(config.captureDir),
   coverage,
   // FACTORY-45: called only when `issueForPane` already resolved null for
