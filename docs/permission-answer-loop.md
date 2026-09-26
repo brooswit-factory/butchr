@@ -213,3 +213,81 @@ that is a natural, separable follow-up.
   `permissionMode: "auto"`, none setting `lizardMode`) load and behave
   unchanged. Deploys and any live cutover go through admin-assembly at the
   operator's direction.
+
+## Approval sound (FACTORY-100/FACTORY-103)
+
+An OPT-IN, OFF-by-default sound played on **this daemon's own host** every
+time this loop's `runPermissionAnswerTick` reports a pane `answered` —
+the operator's own request: a human in earshot of the host should hear each
+unattended approval as it happens, not just find it later in
+`permissionAuditPath`'s JSONL trail. Implemented in
+`src/agents/approval-sound.ts`, wired into `startPermissionAnswerLoop`'s
+`onApproved` dep (`src/daemon/index.ts`), called once per answered pane.
+
+**Why the hook sits here, not in drovr.** The "approval" audit record itself
+(`outcome: "approved"`) is written by `@brooswit/drovr`'s
+`approvePermission` — a separate published npm package, not this repo.
+`runPermissionAnswerTick`'s own `answered` filter is the EARLIEST point in
+BUTCHR'S OWN code that knows a prompt was just approved, and it already
+flows through this exact module on every tick — tailing drovr's audit file
+as an event source would be strictly later, more expensive (a file watch or
+poll on top of the poll this loop already is), and has no precedent
+anywhere in this codebase.
+
+**Config:** `Config.lizardApprovalSound?: { source: string }`
+(`BUTCHR_LIZARD_APPROVAL_SOUND`, `src/config/config.ts`) — absent/empty means
+disabled, today's behaviour exactly, same all-or-nothing shape as `github`'s
+own config section. `source` is either a local file path (`~` expanded) or
+an `http(s)://` URL. Daemon/host level, not per-managed-session: the sound
+plays on the HOST's own speakers regardless of which agent's pane triggered
+it, so one knob is the natural fit — a per-definition setting would imply a
+per-agent sound the host cannot actually produce independently.
+
+**Player selection** (`chooseSoundPlayer`): tries, in order, whichever of
+`paplay`, `pw-play`, `mpv`, `ffplay` (`-nodisp -autoexit -loglevel quiet`),
+`aplay`, `afplay` is first found on `PATH` (`Bun.which`, same detection
+primitive `detectTerminalPrefix` already uses for terminal emulators,
+`src/terminal/open.ts`). `aplay` (ALSA) cannot decode mp3, so it is
+restricted to `.wav` sources; every other player is tried against any
+format. No usable player at all logs ONE warning and disables the sound for
+the daemon's remaining lifetime — it is never re-checked.
+
+**Caching:** a URL source is downloaded once to a deterministic filename
+(sha256 of the URL) under `.lizard-sound-cache` in the workspace root —
+never re-fetched per approval, and reused across daemon restarts since the
+filename is derived from the URL itself, not a manifest. A failed download
+logs once and disables the sound for the daemon's remaining lifetime — no
+retry loop, and deliberately no effort to work around a source that refuses
+non-browser clients (see FACTORY-100's own live finding below).
+
+**Coalescing:** `DEFAULT_COALESCE_MS` (1500ms, `createApprovalSoundNotifier`'s
+`coalesceMs` option) — a burst of approvals inside that window plays at most
+one sound (a leading-edge throttle: the first approval in a quiet period
+plays immediately; every approval before the window elapses is coalesced
+away; the next approval after the window plays again).
+
+**Never touches the approval path.** `notifyApproved` is synchronous, never
+awaited by its caller, and wraps everything in `try`/`catch` — a throwing
+`onApproved` (or a throwing `now`/`has`/`spawn` dependency) cannot propagate
+into `runPermissionAnswerTick`, which ALSO wraps its own call to
+`deps.onApproved?.()` defensively (belt-and-suspenders). A player that fails
+to spawn (ENOENT), reports an async `"error"` event, or exits non-zero (the
+headless-host, no-audio-device case) each log at most one warning and are
+otherwise silent — this is a **deliberately different** failure mode from
+"no player found"/"source unresolvable" above: a playback-runtime failure
+does not disable the feature forever, since the underlying condition (no
+audio sink attached to a headless host) can never be distinguished here from
+a merely transient one, and the ticket's own requirement is "degrade
+silently after one warning", not "give up permanently".
+
+**Live finding (FACTORY-100, 2026-09-26T21:05Z):** the operator's suggested
+value, `https://www.myinstants.com/media/sounds/lizard-button.mp3`, returns
+a Cloudflare 403 to non-browser clients from this fleet's own hosts. The
+real deploy value is therefore a LOCAL FILE PATH the operator places on the
+host directly (e.g. `~/.local/share/butchr/sounds/lizard-button.mp3`) — see
+FACTORY-103's own PR description for the exact config line handed to
+admin-assembly. URL support is kept (it was cheap, and a working URL source
+is a legitimate config for a host that CAN reach it), but this module makes
+no attempt to work around Cloudflare (no fake browser headers, no retry) —
+a fetch failure of any kind is just one more instance of "download failed,
+disable, don't retry".

@@ -236,6 +236,17 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig({ ...base, BUTCHR_CAPTURE_DIR: "/tmp/captures" }, noRead))).toContain("captureDir=/tmp/captures");
   });
 
+  // FACTORY-100/FACTORY-103: OFF by default, same all-or-nothing optional-object shape as `github` — absent BUTCHR_LIZARD_APPROVAL_SOUND means the field is undefined, not merely empty.
+  test("lizardApprovalSound is absent by default; BUTCHR_LIZARD_APPROVAL_SOUND (trimmed) populates it", () => {
+    expect(loadConfig(base, noRead).lizardApprovalSound).toBeUndefined();
+    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "   " }, noRead).lizardApprovalSound).toBeUndefined();
+    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "  ~/.local/share/butchr/sounds/lizard-button.mp3  " }, noRead).lizardApprovalSound).toEqual({ source: "~/.local/share/butchr/sounds/lizard-button.mp3" });
+  });
+  test("describeConfig reports lizardApprovalSound as disabled or its source", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("lizardApprovalSound=disabled");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "/x/lizard.mp3" }, noRead))).toContain("lizardApprovalSound=source=/x/lizard.mp3");
+  });
+
   // BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope, default
   // OFF. Paired control, same shape as the github-orgs tests above: an
   // implementation that always returns [] (reject-everything) would pass

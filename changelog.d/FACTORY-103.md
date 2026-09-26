@@ -1,0 +1,4 @@
+bump: minor
+
+### Added
+- **Lizard mode can now play a sound on the daemon's own host every time an auto-answer approves a permission prompt.** Opt-in, OFF by default (`BUTCHR_LIZARD_APPROVAL_SOUND`, unset = no sound, today's behaviour exactly): a local file path (`~` expanded) or an `http(s)://` URL, played once per approval via whichever local player is found first (`paplay`, `pw-play`, `mpv`, `ffplay`, `aplay` — wav only, `afplay` on macOS), coalescing a burst of approvals into at most one sound per ~1.5s. A URL is downloaded once and cached under `.lizard-sound-cache` in the workspace root, never re-fetched per approval. Never blocks, delays, or fails an approval: no player found, an unreadable/missing source, or a failed download each log at most one warning and degrade to permanent silence rather than retrying or affecting the approval outcome (FACTORY-100/FACTORY-103). See `docs/permission-answer-loop.md`'s "Approval sound" section.

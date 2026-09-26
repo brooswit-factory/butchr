@@ -267,6 +267,24 @@ export interface Config {
    */
   permissionAuditPath: string;
   /**
+   * FACTORY-100/FACTORY-103: OPTIONAL, OFF by default (absent = disabled,
+   * today's behaviour exactly) — same all-or-nothing shape as `github`
+   * above, one field deep. Present only when `BUTCHR_LIZARD_APPROVAL_SOUND`
+   * is set to a non-empty value: a local file path (`~` expanded) or an
+   * `http(s)://` URL, played on THIS DAEMON'S OWN HOST every time lizard
+   * mode (`src/agents/permission-answer-loop.ts`) auto-approves a
+   * tool-permission prompt. Daemon/host level, not per-managed-session: the
+   * sound plays on the host's own speakers regardless of which agent's pane
+   * triggered it, so a single knob here is the natural fit — see
+   * `src/agents/approval-sound.ts`'s own doc comment for the player
+   * selection, caching, coalescing, and fail-silent behaviour this value
+   * feeds into. Validated only for non-emptiness here — a bad local path or
+   * an unreachable URL is a RUNTIME degrade-to-silence (logged once), never
+   * a startup crash, same "don't let an optional feature's misconfiguration
+   * take down an unrelated daemon" contract as `github`/`rocketchat` above.
+   */
+  lizardApprovalSound?: { source: string };
+  /**
    * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
    * project key must appear here to ever be staffed (see
    * `src/resources/project.ts`'s `ProjectResourceDeps.allowlist`, the one
@@ -381,6 +399,7 @@ export interface ConfigEnv {
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
   BUTCHR_PERMISSION_AUDIT_PATH?: string | undefined;
+  BUTCHR_LIZARD_APPROVAL_SOUND?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
 }
@@ -486,6 +505,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
   const permissionAuditPath = env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(workspaceRoot(), ".permission-audit.jsonl");
 
+  const lizardApprovalSoundSource = env.BUTCHR_LIZARD_APPROVAL_SOUND?.trim();
+  const lizardApprovalSound = lizardApprovalSoundSource ? { source: lizardApprovalSoundSource } : undefined;
+
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
   // BUTCHR-284: unlike the *_MINUTES knobs above (fractional is meaningless
@@ -521,6 +543,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     },
     captureDir,
     permissionAuditPath,
+    ...(lizardApprovalSound ? { lizardApprovalSound } : {}),
     projectAllowlist,
     maxAgents,
   };
@@ -631,5 +654,6 @@ export const describeConfig = (c: Config): string =>
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
+  `lizardApprovalSound=${c.lizardApprovalSound ? `source=${c.lizardApprovalSound.source}` : "disabled"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents}`;

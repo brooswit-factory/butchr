@@ -92,6 +92,17 @@ export interface PermissionAnswerLoopDeps {
   loggedSkips?: Set<string>;
   /** Test seam: the drovr pass to run. Defaults to `@brooswit/drovr`'s own `autoAnswerPermissions`. */
   autoAnswer?: typeof autoAnswerPermissions;
+  /**
+   * FACTORY-100/FACTORY-103: called once per newly-answered pane, purely as
+   * a side effect — see `src/agents/approval-sound.ts`'s own doc comment for
+   * why the "sound plays on approval" hook lives here rather than tailing
+   * drovr's audit file. NEVER awaited and NEVER allowed to affect this
+   * tick's own outcome: `createApprovalSoundNotifier`'s `notifyApproved`
+   * already catches everything internally, and the call site below wraps it
+   * again regardless, so a caller-supplied callback that throws synchronously
+   * still cannot fail an approval. Optional; omitted, nothing plays.
+   */
+  onApproved?: () => void;
 }
 
 /**
@@ -150,7 +161,10 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     const failed = results.filter((r) => r.outcome === "failed");
     if (answered.length || failed.length) {
       log(`[permission-answer] ${answered.length} answered, ${results.length - answered.length - failed.length} skipped, ${failed.length} failed`);
-      for (const a of answered) log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath})`);
+      for (const a of answered) {
+        log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath})`);
+        try { deps.onApproved?.(); } catch { /* FACTORY-100/FACTORY-103: a sound-notification failure must never affect this tick's own outcome */ }
+      }
       for (const f of failed) log(`[permission-answer] ${label(f.paneId)} (${f.paneId}) failed: ${f.reason} — ${f.detail}`);
     }
     for (const r of results) {

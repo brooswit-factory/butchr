@@ -38,6 +38,7 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
+import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -1713,6 +1714,20 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // exactly match it.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+// FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
+// (see Config.lizardApprovalSound's own doc comment) — `source: undefined`
+// makes `createApprovalSoundNotifier` return a no-op `notifyApproved`
+// before touching PATH, spawn, or the filesystem at all. `has`/`spawn` mirror
+// `terminalPrefix`'s own detection wiring above (`Bun.which`/`Bun.spawn`);
+// the cache dir follows `captureDir`/`permissionAuditPath`'s own
+// dot-prefixed-under-workspaceRoot convention.
+const approvalSoundNotifier = createApprovalSoundNotifier({
+  source: config.lizardApprovalSound?.source,
+  cacheDir: join(workspaceRoot(), ".lizard-sound-cache"),
+  has: (c) => Bun.which(c) != null,
+  spawn: (argv) => Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"] }),
+  log: (line) => console.error(`  ${line}`),
+});
 startPermissionAnswerLoop(
   {
     client: herdr,
@@ -1721,6 +1736,7 @@ startPermissionAnswerLoop(
     operator: "butchr-daemon",
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
+    onApproved: approvalSoundNotifier.notifyApproved,
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );
