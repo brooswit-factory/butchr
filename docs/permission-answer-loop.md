@@ -1,5 +1,17 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67)
 
+> **FACTORY-98 (FACTORY-97): a lizard-eligible pane is now usually answered
+> within about a second, not up to 20s.** The daemon opens a herdr push
+> subscription (`pane.agent_status_changed`) filtered to exactly the
+> currently-eligible pane ids, and answers a pane at once on a `blocked`
+> transition. The 20s scan below is unchanged and still runs as a fallback —
+> see "Event-driven: the fast path (FACTORY-98)" further down for what
+> changed, why it still needs the scan at all, and what stayed a scan-only
+> path (CPU sanity, respawn-loop safety). Text above and below that section
+> describing "the" 20s timer as the only mechanism predates this change but
+> is otherwise still accurate: the scan itself, its opt-in gate, its cadence,
+> and its audit/journal behavior are all unchanged.
+
 > **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
 > with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
 > "always allow" option.** Matching Claude's "always allow" wording was
@@ -154,6 +166,89 @@ proof nothing was pressed. `approvePermission` is not cancelled: it keeps
 running and may still press keys and record `approved` in the audit log
 after the tick that logged the timeout has already returned. Check the audit
 log for the pane, not just the console line.
+
+## Event-driven: the fast path (FACTORY-98)
+
+FACTORY-97 (the story this ticket implements) reported blocks up to 47s live
+on codey: every tool call needing permission waited for the next 20s tick,
+and a tool-heavy agent felt visibly slower for it. FACTORY-98 investigated
+what `@brooswit/herdr-sdk`/`@brooswit/drovr` actually offer for this —
+"pick what is real, not what is assumed" — and found a real one:
+`events.subscribe` (`HerdrClient.subscribe`, passed straight through by
+`DrovrClient.subscribe`) is a genuine long-lived push connection, and
+`pane.agent_status_changed` is one of its subscription kinds.
+
+**The catch, verified against the SDK's own generated types
+(`generated/params.d.ts`'s `Subscription` union), not assumed:**
+`pane.agent_status_changed` is one of exactly three subscription kinds that
+REQUIRE a specific `pane_id` filter — there is no "any pane" wildcard the
+way there is for, say, `pane.created`. So this cannot replace the scan
+above: something still has to read `agent.list()` and the `lizardMode` gate
+to learn WHICH panes are eligible before it can even ask herdr to push their
+status changes. What the push connection changes is WHEN an already-known
+eligible pane gets answered.
+
+**Wiring (`src/agents/permission-answer-watch.ts`,
+`startPermissionAnswerWatch`, replacing the bare
+`startPermissionAnswerLoop` call in `src/daemon/index.ts`):**
+
+- The 20s sweep keeps running exactly as described above — same
+  `eligiblePanes` gate, same `agent.list()` call, same `autoAnswerPermissions`
+  pass, same audit/journal output. It is now also the mechanism that keeps
+  the push subscription's pane-id filter in sync: `runPermissionAnswerTick`
+  gained an optional `onEligiblePaneIds` hook, called with the exact set
+  `eligiblePanes` returned THIS tick, before any screen is read. The watch
+  uses it to notice the eligible set changed and, only then, close the old
+  subscription and open a new one for the new set — no second `agent.list()`
+  call to notice topology change.
+- On a `pane.agent_status_changed` push frame reporting `blocked` for a pane
+  in the current set, the watch fires a tick immediately, the same
+  `runPermissionAnswerTick` call the sweep itself uses.
+- **One shared in-flight guard, coalescing rather than dropping.** The
+  event-triggered tick and the periodic sweep both go through the same
+  `inFlight` boolean `startPermissionAnswerLoop` already used for the
+  sweep-only case — they can never run concurrently against the same pane
+  set. A `fire()` that arrives mid-tick does NOT drop the request: it sets a
+  `pending` flag, and the running tick's own completion runs exactly one
+  more tick before going idle if it sees that flag set. This matters for the
+  exact case the story exists for — a tool-heavy agent whose own NEXT tool
+  call goes `blocked` again while the current tick is still mid-approve/
+  verify on the previous one; dropping that event would leave it to the 20s
+  fallback, missing the latency goal whenever more than one prompt is in
+  flight at a time. A burst of N such requests during one tick still costs
+  at most one trailing tick, never N — bounding the read-scan rate the same
+  way `startPermissionAnswerLoop`'s own "a slow tick just makes the next
+  firing a no-op" bound always did, just without discarding the request that
+  arrived during the busy window.
+- **A newly-eligible pane's first tick is still scan-driven.** A pane isn't
+  subscribed to until a sweep tick has seen it as eligible at least once —
+  so it gets the ≤20s bound (unchanged from before this ticket) on its first
+  tick as a lizard-mode pane, and the fast, sub-3s path from the second tick
+  onward. Not a regression: nothing before this ticket had a fast path at
+  all. This is the one latency gap the coalescing above does not close.
+- **Reconnection.** A subscription that ends on its own (herdr closed it, or
+  it errored — a real socket can drop) is reopened after `resubscribeDelayMs`
+  (default 2000ms) for the same pane-id set, unless a topology change has
+  already superseded it. A `subscribe()` call that fails outright is logged
+  (`[permission-answer] watch subscribe failed: …`) and retried the same way
+  — a dead push connection degrades to "sweep only, same as before this
+  ticket," never to "nothing answers."
+
+**CPU sanity for a large fleet (20+ panes):** the push connection is exactly
+one socket per DISTINCT pane-id SET, reopened only when that set changes —
+not a poll, not a per-second cost, and not one connection per pane. The
+`lizardMode` opt-in gate (above) is what actually bounds the set's size: an
+ordinary fleet with zero or a handful of lizard-mode panes among 20+ total
+panes pays for one small subscription and the same one `agent.list()` call
+every 20s the scan-only version always paid — nothing here scales with the
+TOTAL pane count, only with the lizard-eligible one.
+
+**Respawn-loop safety:** unchanged from the scan-only version — `lizardMode`
+still never reaches `SpawnSpec` or a launched process's argv (see "No argv,
+no stale-argv risk" above), and this ticket added no new persisted state a
+restart could see as stale. A `stop()`/restart of the watch simply closes
+whatever subscription is open and re-derives everything from the next
+`agent.list()` call, same as the scan-only version always did.
 
 ## The audit log
 
