@@ -28,6 +28,18 @@ import type { Rule } from "./rules.js";
 export const ownsJiraIdeaAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "jira-idea";
 
 /**
+ * FACTORY-95: `jira-idea`'s own short herdr-workspace-label id — same
+ * reasoning as `jiraWorkShortDisplayId` (src/rules/resource-type.ts): an
+ * idea's resourceId already IS its Jira issue key (`searchJiraIdeaRules`
+ * below), so this is the identity function, kept as its OWN named export per
+ * provider rather than reusing `jiraWorkShortDisplayId` — `jira-work` and
+ * `jira-idea` are independent providers (see this module's own top comment)
+ * that only coincidentally compute the same thing today; a future change to
+ * one must not silently reach into the other.
+ */
+export const jiraIdeaShortDisplayId = (resourceId: string): string => resourceId;
+
+/**
  * What the idea loop tracks: its own ideas — `ExecutionUnit<RuleMatch>`,
  * BUTCHR-398, PRIMARY only, `"resource"` (swarm) or `"query"`
  * (`singleton`/`persistent`) — and the GitHub issues its agents hear

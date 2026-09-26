@@ -57,6 +57,20 @@ export function githubIssueRefFromUrl(url: string): GithubIssueRef | null {
 }
 
 /**
+ * FACTORY-95 (epic FACTORY-83): the short human display id for an issue or
+ * pull request ref — drops the owner, keeps `<repo>#<number>` (e.g.
+ * `"brooswit-factory/butchr#42"` -> `"butchr#42"`). Shared by
+ * `github-issue-type.ts`'s and `github-pr-type.ts`'s own short-id methods
+ * (see `github-pr-ref.ts`'s header for why the two providers share this
+ * exact owner/repo#number shape) — one formatter, not two independently
+ * drifting copies, same discipline this module's header already applies to
+ * parsing/formatting the full ref.
+ */
+export function shortGithubRef(ref: GithubIssueRef): string {
+  return `${ref.repo}#${ref.number}`;
+}
+
+/**
  * BUTCHR-429: the pull request an `https://github.com/<owner>/<repo>/pull/<n>`
  * web URL names — `githubIssueRefFromUrl`'s twin, `/pull/` in place of
  * `/issues/`. Reuses `GithubIssueRef`'s shape (owner/repo/number is the same
