@@ -156,7 +156,29 @@ export type NotifyReason =
   | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
   | { summary: true }
   | { comment: string | null }
-  | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" };
+  | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
+  | { linked: { events: readonly LinkedChangeEvent[] } };
+
+/**
+ * BUTCHR-436 (epic BUTCHR-421, story 2/4): one line of a coalesced
+ * linked-change nudge — see `linkedChangeNudge` (src/agents/change-nudge.ts)
+ * for the rendering (`<target> (<kind>): <detail>`) and
+ * `src/jira-watch/linked-eventing.ts` for how one poll tick's worth of
+ * these, across every changed/unreadable/removed linked Jira item for ONE
+ * owning resource, are coalesced into a single `{ linked }` NotifyReason —
+ * this is the "genuinely new logic" the story's own per-tick coalescer
+ * produces, never one `NotifyReason` per link. `kind` is a `LinkedItemKind`
+ * (src/resources/linked-discovery.ts) as a bare string, not re-imported as
+ * the union type, so this module (which every resource type may depend on)
+ * never needs to import the Jira-work-specific linked-discovery module.
+ */
+export interface LinkedChangeEvent {
+  /** The linked item's own identity: a Jira issue key for every kind this story handles. */
+  target: string;
+  kind: string;
+  /** What happened, already rendered ("status changed from X to Y", "unreadable", "no longer linked", …) — see `src/jira-watch/linked-eventing.ts`'s own doc comment for the exact phrases used. */
+  detail: string;
+}
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };
 
