@@ -84,13 +84,15 @@ describe("sessionDefinitionProblems", () => {
     // permissionMode: "default" (manual mode) plus lizardMode: true is the operator's own "lizard mode" combination this field exists for.
     expect(sessionDefinitionProblems({ ...good(), permissionMode: "default", lizardMode: true }, "def")).toEqual([]);
   });
-  test("DROVR-42/FACTORY-67: lizardMode is rejected at manifest load for vendor codex — drovr's tool-permission dialog recognition is Claude-specific", () => {
-    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: true }, "def"))
-      .toEqual(['def.lizardMode is not supported for vendor "codex" — drovr\'s tool-permission dialog recognition is Claude-specific and never matches a Codex pane; omit this field for a Codex definition']);
-    // Even an explicit false is rejected — same "the field itself is unsupported" treatment as strictMcpConfig, not merely a truthy value.
-    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: false }, "def")[0])
-      .toContain('not supported for vendor "codex"');
+  test("FACTORY-108: lizardMode is now ACCEPTED at manifest load for vendor codex too — @brooswit/drovr >= 0.16.0's autoAnswerCodexApprovals gives it a Codex-specific counterpart to autoAnswerPermissions", () => {
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: true }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: false }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), vendor: "codex" }, "def")).toEqual([]);
+    // Still validated as a boolean, same as every other vendor.
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: "true" }, "def")).toEqual(["def.lizardMode must be a boolean"]);
+    // Unlike strictMcpConfig (still hard-rejected for codex — see the test above), lizardMode on a codex definition now reaches SpawnSpec.lizardMode
+    // (specForSessionDefinition, src/rules/session-definition-type.ts) — see that field's own doc comment (this file) for the full story.
+    expect(parseSessionDefinition({ ...good(), vendor: "codex", lizardMode: true }, "def", HOME).lizardMode).toBe(true);
   });
   test("execution: reuses Rule's ExecutionMode enum verbatim, invalid value rejected", () => {
     for (const execution of ["swarm", "singleton", "persistent"]) expect(sessionDefinitionProblems({ ...good(), execution }, "def")).toEqual([]);

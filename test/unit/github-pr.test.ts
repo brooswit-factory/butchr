@@ -221,14 +221,20 @@ describe("github pr resource type", () => {
   });
 
   // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
-  // reaches the spawn spec when the rule sets it; lizardMode never does.
-  test("permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+  // reaches the spawn spec when the rule sets it. FACTORY-108: lizardMode now
+  // does too — a rule-launched Codex agent has no permissionMode concept, so
+  // lizardMode is what agentLaunchConfig's Codex branch (src/agents/argv.ts)
+  // reads to drop --dangerously-bypass-approvals-and-sandbox; see
+  // Rule.lizardMode's own doc comment (src/rules/rules.ts) for the full story.
+  test("permissionMode and lizardMode are both forwarded onto the spawn spec when the rule sets them", () => {
     const [lizardRule] = prRules({ id: "prs", query: "is:open", permissionMode: "default", lizardMode: true });
     const m: GithubPrMatch = { agentKey: encodeAgentKey({ resourceProvider: "github-pr", ruleId: "prs", resourceId: "acme/w#1" }), rule: lizardRule!, pr: gp("acme/w#1") };
     const spec = specForGithubPr(m);
     expect(spec.permissionMode).toBe("default");
-    expect(spec).not.toHaveProperty("lizardMode");
-    expect(specForGithubPr(match("acme/w#1")).permissionMode).toBeUndefined();
+    expect(spec.lizardMode).toBe(true);
+    const plainSpec = specForGithubPr(match("acme/w#1"));
+    expect(plainSpec.permissionMode).toBeUndefined();
+    expect(plainSpec).not.toHaveProperty("lizardMode");
   });
 
   test("event rules: no notice on appear, disappear or updated-only; reasons for merge/state, comment, title, other", async () => {

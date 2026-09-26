@@ -1,4 +1,20 @@
 /**
+ * FACTORY-108: also calls `@brooswit/drovr`'s `autoAnswerCodexApprovals`
+ * every tick, against the SAME scoped, lizard-eligible pane set — the Codex
+ * twin of `autoAnswerPermissions` below (FACTORY-107). Safe to run both
+ * unconditionally over one pane set: each is filtered (by screen-content
+ * classification for Claude, by `agent.agent === "codex"` internally for
+ * Codex — see `scanPendingCodexApprovals`'s own doc comment, `@brooswit/drovr`)
+ * to its own vendor's panes, so enabling one can never change the other's
+ * behaviour, the same "no double-answerer hazard" property this module's
+ * own header already establishes for `chooseStartupAnswer`. A Codex agent
+ * only ever shows one of these dialogs when launched with
+ * `bypassApprovalsAndSandbox: false` (`SpawnSpec.lizardMode`,
+ * src/agents/argv.ts) — Butchr's own launch-flag decision, not this
+ * module's — so a Codex pane that never opted into lizard mode shows
+ * nothing for `autoAnswerCodexApprovals` to see, matching Claude's own
+ * "absent field means today's behaviour exactly" contract.
+ *
  * DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
  * under the DROVR-37 epic): a standalone interval timer that calls
  * `@brooswit/drovr`'s `autoAnswerPermissions` once per tick — but ONLY
@@ -42,7 +58,7 @@
  * doc comment) — nothing else on this fleet presses that dialog's keys.
  */
 import { basename } from "node:path";
-import { autoAnswerPermissions, type AutoAnswerPermissionResult, type DrovrClient } from "@brooswit/drovr";
+import { autoAnswerPermissions, autoAnswerCodexApprovals, type AutoAnswerPermissionResult, type AutoAnswerCodexApprovalResult, type DrovrClient } from "@brooswit/drovr";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { Rule } from "../rules/rules.js";
 
@@ -151,6 +167,8 @@ export interface PermissionAnswerLoopDeps {
   loggedSkips?: Set<string>;
   /** Test seam: the drovr pass to run. Defaults to `@brooswit/drovr`'s own `autoAnswerPermissions`. */
   autoAnswer?: typeof autoAnswerPermissions;
+  /** FACTORY-108: same test seam as `autoAnswer` above, for Codex. Defaults to `@brooswit/drovr`'s own `autoAnswerCodexApprovals`. */
+  autoAnswerCodex?: typeof autoAnswerCodexApprovals;
 }
 
 /**
@@ -180,7 +198,7 @@ export interface PermissionAnswerLoopDeps {
  * file's sibling module (`blockingEscalationTimer`, src/daemon/index.ts)
  * already follows.
  */
-export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): Promise<readonly AutoAnswerPermissionResult[]> {
+export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): Promise<readonly (AutoAnswerPermissionResult | AutoAnswerCodexApprovalResult)[]> {
   const log = deps.log ?? (() => {});
   try {
     const { agents } = await deps.client.agent.list();
@@ -219,8 +237,43 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
       deps.loggedSkips?.add(key);
       log(`[permission-answer] ${label(r.paneId)} (${r.paneId}) SKIPPED, left for a human: ${r.reason}`);
     }
+    // FACTORY-108: Codex lizard mode — same scoped, eligible pane set as
+    // above; `autoAnswerCodexApprovals` internally filters to `agent.agent
+    // === "codex"` panes only, so this is a pure no-op whenever nothing
+    // eligible this tick happens to be a Codex pane (see this module's own
+    // header for why running both passes over one set is safe).
+    const codexResults = await (deps.autoAnswerCodex ?? autoAnswerCodexApprovals)(scopedClient, {
+      auditPath: deps.auditPath,
+      ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
+      ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
+    });
+    const codexAnswered = codexResults.filter((r) => r.outcome === "answered");
+    const codexFailed = codexResults.filter((r) => r.outcome === "failed");
+    const codexUnrecognised = codexResults.filter((r) => r.outcome === "unrecognised");
+    const codexSkipped = codexResults.filter((r) => r.outcome === "skipped");
+    if (codexAnswered.length || codexFailed.length || codexUnrecognised.length) {
+      log(`[permission-answer] codex: ${codexAnswered.length} answered, ${codexSkipped.length} skipped, ${codexUnrecognised.length} unrecognised, ${codexFailed.length} failed`);
+      for (const a of codexAnswered) log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered (codex): ${a.kind} — "${a.detail.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath})`);
+      for (const f of codexFailed) log(`[permission-answer] ${label(f.paneId)} (${f.paneId}) failed (codex): ${f.reason} — ${f.detail}`);
+    }
+    for (const r of codexResults) {
+      if (r.outcome === "answered" || r.outcome === "failed") continue;
+      const unrecognised = r.outcome === "unrecognised";
+      // FACTORY-107/FACTORY-108: an approval-shaped Codex screen this module
+      // can't parse is loud, not invisible — never folded into "skipped" and
+      // never silently dropped — but still deduped per pane+reason (same
+      // FACTORY-93 discipline `skipped` already gets) so a persistently
+      // unrecognised pane doesn't flood the journal every tick.
+      const key = "codex " + r.paneId + " " + (unrecognised ? "unrecognised" : r.reason);
+      if (deps.loggedSkips?.has(key)) continue;
+      deps.loggedSkips?.add(key);
+      log(unrecognised
+        ? `[permission-answer] ${label(r.paneId)} (${r.paneId}) UNRECOGNISED (codex), left for a human: ${r.excerpt.replace(/\n/g, " ").slice(0, 200)}`
+        : `[permission-answer] ${label(r.paneId)} (${r.paneId}) SKIPPED (codex), left for a human: ${r.reason}`);
+    }
+
     if (deps.loggedSkips && deps.loggedSkips.size > 1000) deps.loggedSkips.clear();
-    return results;
+    return [...results, ...codexResults];
   } catch (e) {
     log(`[permission-answer] tick failed: ${(e as Error)?.message ?? e}`);
     return [];

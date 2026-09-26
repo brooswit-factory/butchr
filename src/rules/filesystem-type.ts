@@ -135,6 +135,7 @@ export function specForFilesystem({ agentKey, rule, resource }: FilesystemMatch)
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -152,6 +153,7 @@ export function specForFilesystemQuery(rule: Rule, agentKey: string): SpawnSpec 
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
