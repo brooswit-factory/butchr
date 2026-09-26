@@ -220,6 +220,17 @@ describe("github pr resource type", () => {
     });
   });
 
+  // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
+  // reaches the spawn spec when the rule sets it; lizardMode never does.
+  test("permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+    const [lizardRule] = prRules({ id: "prs", query: "is:open", permissionMode: "default", lizardMode: true });
+    const m: GithubPrMatch = { agentKey: encodeAgentKey({ resourceProvider: "github-pr", ruleId: "prs", resourceId: "acme/w#1" }), rule: lizardRule!, pr: gp("acme/w#1") };
+    const spec = specForGithubPr(m);
+    expect(spec.permissionMode).toBe("default");
+    expect(spec).not.toHaveProperty("lizardMode");
+    expect(specForGithubPr(match("acme/w#1")).permissionMode).toBeUndefined();
+  });
+
   test("event rules: no notice on appear, disappear or updated-only; reasons for merge/state, comment, title, other", async () => {
     const snap = (...m: GithubPrMatch[]) => ({ primary: m.map((match) => ({ kind: "resource" as const, match })), related: [] });
     const logs: string[] = [];

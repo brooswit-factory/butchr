@@ -157,6 +157,19 @@ describe("github issue resource type", () => {
     expect(specForGithubIssue(match("acme/w#2", { issueType: null })).issuetype).toBe("issue");
   });
 
+  // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
+  // reaches the spawn spec when the rule sets it; lizardMode never does — the
+  // same "no argv, no stale-argv risk" shape session-definition-type.test.ts
+  // asserts for SessionDefinition.lizardMode.
+  test("permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+    const [lizardRule] = ghRules({ id: "bugs", query: "type:Bug", permissionMode: "default", lizardMode: true });
+    const m: GithubIssueMatch = { agentKey: encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/w#1" }), rule: lizardRule!, issue: gi("acme/w#1") };
+    const spec = specForGithubIssue(m);
+    expect(spec.permissionMode).toBe("default");
+    expect(spec).not.toHaveProperty("lizardMode");
+    expect(specForGithubIssue(match("acme/w#1")).permissionMode).toBeUndefined();
+  });
+
   test("event rules: no notice on appear, disappear or updated-only; reasons for state, comment, title, other", async () => {
     // BUTCHR-398: `createGithubIssueEventRules` now operates over
     // `ExecutionUnit<GithubIssueMatch>` (swarm "resource"-kind primary

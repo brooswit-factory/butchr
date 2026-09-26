@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runPermissionAnswerTick, startPermissionAnswerLoop, type PermissionAnswerClient, type PermissionAnswerPane } from "../../src/agents/permission-answer-loop.js";
+import {
+  lizardModeLabelFor, ruleLizardModeOf, runPermissionAnswerTick, startPermissionAnswerLoop,
+  type PermissionAnswerClient, type PermissionAnswerPane, type RuleLizardModeDeps,
+} from "../../src/agents/permission-answer-loop.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
+import type { Rule } from "../../src/rules/rules.js";
 
 // Measured live against the REAL installed @brooswit/drovr 0.15.0
 // `classifyPermissionPrompt` (this file's own probe, run against
@@ -217,5 +222,133 @@ describe("startPermissionAnswerLoop", () => {
     expect(listCalls).toBeGreaterThan(1); // the guard let later ticks through once the first settled
 
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): the pane-
+// eligibility decision itself, extracted out of src/daemon/index.ts
+// (lizardModeLabel/ruleLizardModeOf there are now thin bindings of these two
+// functions to the daemon's own live state) per PR #478 review — that module
+// has no exports and cannot be imported by a test without running the whole
+// daemon's startup side effects, so this is the only place the decision can
+// be exercised directly.
+describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
+  const rule = (over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule =>
+    ({ enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over });
+
+  const noManagedSession = () => false;
+  const emptyMap = new Map<string, boolean>();
+
+  const cases: { label: string; resourceProvider: Rule["resourceProvider"]; resourceId: string }[] = [
+    { label: "jira-work", resourceProvider: "jira-work", resourceId: "BUTCHR-7" },
+    { label: "jira-project", resourceProvider: "jira-project", resourceId: "BUTCHR" },
+    { label: "github-issue", resourceProvider: "github-issue", resourceId: "acme/w#1" },
+    { label: "github-pr", resourceProvider: "github-pr", resourceId: "acme/w#1" },
+    { label: "filesystem", resourceProvider: "filesystem", resourceId: "/repo/a.md" },
+  ];
+
+  for (const { label, resourceProvider, resourceId } of cases) {
+    test(`positive (${label}): lizardMode: true on the owning rule makes the agent eligible, labelled by its resource id's basename`, () => {
+      const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
+      const deps: RuleLizardModeDeps = {
+        rules: [rule({ id: "lz", resourceProvider, lizardMode: true })],
+        isManagedSessionAgent: noManagedSession,
+        managedSessionLizardModes: emptyMap,
+      };
+      expect(ruleLizardModeOf(id, deps)).toBe(true);
+      expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
+    });
+
+    test(`negative (${label}): lizardMode absent on the owning rule leaves the agent untouched`, () => {
+      const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
+      const deps: RuleLizardModeDeps = {
+        rules: [rule({ id: "lz", resourceProvider })],
+        isManagedSessionAgent: noManagedSession,
+        managedSessionLizardModes: emptyMap,
+      };
+      expect(ruleLizardModeOf(id, deps)).toBe(false);
+      expect(lizardModeLabelFor(id, deps)).toBeUndefined();
+    });
+  }
+
+  test("negative: lizardMode: false explicitly is the same as absent", () => {
+    const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "lz", resourceId: "BUTCHR-7" });
+    const deps: RuleLizardModeDeps = {
+      rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: false })],
+      isManagedSessionAgent: noManagedSession,
+      managedSessionLizardModes: emptyMap,
+    };
+    expect(ruleLizardModeOf(id, deps)).toBe(false);
+  });
+
+  test("negative: an unknown rule id (no rule in the list matches) is never eligible, even with other lizard-mode rules present", () => {
+    const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "gone", resourceId: "BUTCHR-7" });
+    const deps: RuleLizardModeDeps = {
+      rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true }), rule({ id: "lz2", resourceProvider: "jira-work", lizardMode: true })],
+      isManagedSessionAgent: noManagedSession,
+      managedSessionLizardModes: emptyMap,
+    };
+    expect(ruleLizardModeOf(id, deps)).toBe(false);
+  });
+
+  test("negative: a resourceProvider mismatch (same rule id, different provider) is never eligible", () => {
+    // A github-issue agent under rule id "lz" — the only "lz" rule on file is a jira-work rule with lizardMode: true.
+    const id = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "lz", resourceId: "acme/w#1" });
+    const deps: RuleLizardModeDeps = {
+      rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true })],
+      isManagedSessionAgent: noManagedSession,
+      managedSessionLizardModes: emptyMap,
+    };
+    expect(ruleLizardModeOf(id, deps)).toBe(false);
+  });
+
+  test("negative: a legacy bare-issue id (no rule-engine key shape at all) is never eligible", () => {
+    const deps: RuleLizardModeDeps = {
+      rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true })],
+      isManagedSessionAgent: noManagedSession,
+      managedSessionLizardModes: emptyMap,
+    };
+    expect(ruleLizardModeOf("BUTCHR-7", deps)).toBe(false);
+    expect(lizardModeLabelFor("BUTCHR-7", deps)).toBeUndefined();
+  });
+
+  test("negative: undecodable/garbage input is never eligible, and a null id resolves undefined without throwing", () => {
+    const deps: RuleLizardModeDeps = { rules: [], isManagedSessionAgent: noManagedSession, managedSessionLizardModes: emptyMap };
+    expect(ruleLizardModeOf("not:even:close:to:valid", deps)).toBe(false);
+    expect(ruleLizardModeOf("", deps)).toBe(false);
+    expect(lizardModeLabelFor(null, deps)).toBeUndefined();
+  });
+
+  describe("the managed-session branch", () => {
+    const id = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/sessions/def.json" });
+
+    test("resolves from the live map, true only when the map says true — never from `rules`", () => {
+      const deps: RuleLizardModeDeps = {
+        // Even though a matching Rule with lizardMode: true is on file, the managed-session branch must never consult it.
+        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
+        isManagedSessionAgent: () => true,
+        managedSessionLizardModes: new Map([[id, true]]),
+      };
+      expect(ruleLizardModeOf(id, deps)).toBe(true);
+      expect(lizardModeLabelFor(id, deps)).toBe("def.json");
+    });
+
+    test("the map saying false wins over a matching Rule saying true", () => {
+      const deps: RuleLizardModeDeps = {
+        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
+        isManagedSessionAgent: () => true,
+        managedSessionLizardModes: new Map([[id, false]]),
+      };
+      expect(ruleLizardModeOf(id, deps)).toBe(false);
+    });
+
+    test("an id absent from the map (not yet observed this daemon's lifetime) is never eligible", () => {
+      const deps: RuleLizardModeDeps = {
+        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
+        isManagedSessionAgent: () => true,
+        managedSessionLizardModes: new Map(),
+      };
+      expect(ruleLizardModeOf(id, deps)).toBe(false);
+    });
   });
 });
