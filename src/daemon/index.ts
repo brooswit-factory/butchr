@@ -15,7 +15,8 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
-import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
+import { join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -24,7 +25,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AgentRole } from "../rules/rules.js";
+import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -81,6 +82,11 @@ import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
+import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
+import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
+import { createFileNexusManifestPublisher } from "../accounts/nexus-manifest.js";
+import { createAccountLifecycle } from "../agents/account-lifecycle.js";
+import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
@@ -215,6 +221,21 @@ const mcpBindingsOf = (id: string) => {
   if (!decoded) return undefined;
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.mcpServers;
+};
+
+/**
+ * BUTCHR-412 — same fail-safe classifier shape as `roleOfAgent` immediately
+ * above, one field over: this id's rule's Rocket.Chat account policy, or
+ * `"none"` for anything this daemon cannot resolve back to a rule (a legacy/
+ * bare-issue id, or a rule since removed) — an unrecognised agent must never
+ * provision an account for itself, mirroring `roleOfAgent`'s own "an
+ * unrecognised agent is always a worker" fail-safe.
+ */
+const accountPolicyOf = (id: string): AccountPolicy => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return "none";
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.account ?? "none";
 };
 
 // github-issue rules run only with GitHub auth and org scope configured and
@@ -821,6 +842,91 @@ const abandonedDetector = createAbandonedDetector({
 // key instead no-ops for one (and says so, once per id, rather than
 // silently swallowing it).
 const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== null;
+
+// BUTCHR-412 — the Rocket.Chat account lifecycle, wired into every rule loop
+// below as the SAME shared instance (one account manager/store for the whole
+// daemon, not one per tier — same reasoning as `admissionController` above):
+// see docs/rocketchat-accounts.md ("Wiring") for the full design and
+// docs/execution-modes.md's `account` section for what each policy means.
+//
+// DORMANT UNLESS AN ENABLED RULE ACTUALLY WANTS ONE: `accountLifecycle` stays
+// `undefined` — no `.butchr-rc-accounts.json` file is ever read or written,
+// no RC HTTP client is built, no orphan sweep timer runs — when no enabled
+// rule's `account` is not `"none"`, so a daemon with none behaves exactly as
+// it did before this ticket (docs/rocketchat-accounts.md's own "Config"
+// section states this contract; this is where it's honoured). When a rule
+// DOES want one but ROCKETCHAT_* is missing or invalid, `accountLifecycle` is
+// still built (a `null` client — `loadRocketChatAuth`'s own refusal) so that
+// every `ensureAccount` call for that rule visibly refuses (logged, and
+// withheld — see `ensure`'s own doc comment) rather than the daemon silently
+// staying dormant over a rule that explicitly asked for an account.
+const rcPolicyNeeded = rules.some((r) => r.enabled && r.account !== "none");
+let accountLifecycle: ReturnType<typeof createAccountLifecycle> | undefined;
+if (rcPolicyNeeded) {
+  const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
+  if (!rcAuth.ok) {
+    console.error(`  WARNING: [account] enabled rule(s) request a Rocket.Chat account policy but Rocket.Chat is not usable (${rcAuth.reason}) — every ensureAccount call will refuse until this is fixed`);
+  }
+  const rcClient = rcAuth.ok
+    ? createRocketChatClient({ fetchImpl: fetch, url: rcAuth.url, adminUserId: rcAuth.adminUserId, adminToken: rcAuth.adminToken, log: (line) => console.error(`  ${line}`) })
+    : null;
+  const accountManager = createAccountManager({
+    client: rcClient,
+    store: createFileAccountStore(),
+    userCapThreshold: config.rocketchat?.userCapThreshold ?? 45,
+    tempAccountCapThreshold: config.rocketchat?.temporaryAccountCapThreshold ?? 8,
+    tokenDir: config.rocketchat?.tokenDir ?? join(workspaceRoot(), ".butchr-rc-tokens"),
+    ...(config.rocketchat?.managedPrefix ? { managedPrefix: config.rocketchat.managedPrefix } : {}),
+  });
+  const manifestPublisher = createFileNexusManifestPublisher(config.rocketchat?.nexusManifestFile ?? join(workspaceRoot(), ".butchr-rc-nexus-manifest.json"));
+  accountLifecycle = createAccountLifecycle({
+    manager: accountManager,
+    policyOf: accountPolicyOf,
+    manifestPublisher,
+    log: (line) => console.error(`  ${line}`),
+    // Best-effort audible refusal beyond the log line above, for the two
+    // Jira-backed providers only (jira-work, jira-idea) — github-issue and
+    // zendesk-ticket have no generic `ops.addComment`-shaped route wired at
+    // this layer (see docs/rocketchat-accounts.md's own residual-gap note);
+    // a refusal for either of those is still visible in the journal.
+    notify: async (id, text) => {
+      if (isQueryLevelAgent(id)) return; // no single ticket to comment on — same discipline as issueCrashLoopDetector/issueReconcileFailureDetector above
+      const decoded = decodeAnyAgentKey(id);
+      if (decoded?.resourceProvider !== "jira-work" && decoded?.resourceProvider !== "jira-idea") return;
+      await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+    },
+  });
+  // BUTCHR-412 — the daemon-shutdown residual gap, named honestly rather than
+  // closed: daemon shutdown has NO stop handler at all (src/agents/herd.ts's
+  // callers never call herd.stop from a shutdown path; agents keep running
+  // under herdr regardless of this process's own lifetime), so nothing here
+  // needs to release an account on shutdown — an agent that is still running
+  // still legitimately holds its account. The gap this DOES leave is an
+  // account whose agent genuinely stopped existing with no reaper run in
+  // between (this daemon crashing before a reap poll ever observed it, or an
+  // account orphaned by an earlier bug) — `reconcileOrphans` is the read-only
+  // backstop `docs/rocketchat-accounts.md` names for exactly this.
+  // `createAccountOrphanSweep` (src/agents/account-orphan-sweep.ts) is the
+  // SAFE wrapper around it — see that module's own top comment for why a
+  // single `herd.runningIssues()` snapshot is NOT safe to act on directly
+  // (review finding, round 1): it uses `herd.residentIssues()` (a real
+  // per-pane liveness check) plus a minimum record age and a two-consecutive-
+  // sweep grace before ever releasing anything. Run once at startup, then on
+  // this interval — cheap enough (one file read, one herd read per sweep)
+  // that a dedicated poll loop would be overkill.
+  const orphanSweep = createAccountOrphanSweep({
+    now: () => Date.now(),
+    reconcileOrphans: (agentExists) => accountManager.reconcileOrphans(agentExists),
+    residentIssues: () => herd.residentIssues(),
+    release: (agentKey, reason) => accountLifecycle!.release(agentKey, reason),
+    publishBatch: () => accountLifecycle!.publishBatch(),
+    log: (line) => console.error(`  ${line}`),
+  });
+  const ACCOUNT_ORPHAN_SWEEP_MS = 30 * 60_000;
+  void orphanSweep.sweep();
+  setInterval(() => void orphanSweep.sweep(), ACCOUNT_ORPHAN_SWEEP_MS);
+}
+
 const issueCrashLoopDetector = createCrashLoopDetector({
   now: () => Date.now(),
   count: config.crashLoopCount,
@@ -868,6 +974,12 @@ const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
   close: (c) => herd.closeStranded(c),
+  // BUTCHR-412: the self-exit path's own account teardown — a reaped
+  // workspace's agent exited on its own (crash, `/exit`, quota) and never
+  // went through `HerdrHerd.stop()`/`reconcileNow`'s `plan.stop` at all, so
+  // nothing else in this daemon would otherwise release a temporary account
+  // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
+  ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-287: a live per-issue residency census, independent of
@@ -1050,6 +1162,7 @@ runResourceLoop(ruleResourceType, {
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ISSUE),
+  ...(accountLifecycle ? { account: accountLifecycle } : {}),
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -1079,6 +1192,7 @@ startGithubIssueLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
+  ...(accountLifecycle ? { account: accountLifecycle } : {}),
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
   onError: (e) => githubIssueHealth.recordError(e),
 });
@@ -1112,6 +1226,7 @@ startJiraIdeaLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_IDEA),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_JIRA_IDEA),
+  ...(accountLifecycle ? { account: accountLifecycle } : {}),
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
   onError: (e) => jiraIdeaHealth.recordError(e),
 });
@@ -1133,6 +1248,7 @@ startZendeskTicketLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
+  ...(accountLifecycle ? { account: accountLifecycle } : {}),
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
   onError: (e) => zendeskTicketHealth.recordError(e),

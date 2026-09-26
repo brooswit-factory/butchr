@@ -28,6 +28,7 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
           "type": "http",
           "url": "https://mud-bridge.internal/mcp",
           "headersEnvVar": "MUD_MCP_HEADERS",   // optional
+          "accountHeader": "x-rocketr-account", // optional, BUTCHR-412
           "channel": true
         }
       ]
@@ -42,6 +43,7 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
 | `type` | yes | `"http"` only, today |
 | `url` | yes | absolute `http:`/`https:` URL |
 | `headersEnvVar` | no | the NAME of an env var on **this daemon's own process** holding a JSON object of extra HTTP headers — see "Headers are by reference, never inline" below |
+| `accountHeader` | no | BUTCHR-412: a valid HTTP header name; that header's VALUE is filled in per-AGENT from `SpawnSpec.rocketchatAccount` (this agent's own Rocket.Chat account name — set only when the rule's `account` policy actually provisioned one) — see "Per-agent account headers" below. Never secret; combines with `headersEnvVar` on the same binding. |
 | `channel` | yes | `true`: Claude also receives this server's push notifications (one more `--dangerously-load-development-channels=server:<name>`); `false`: MCP tool access only |
 
 Validation (`parseRules`, same house style as every other rule field —
@@ -85,13 +87,36 @@ ever contained it in the first place.
 
 **`mcp.json` file permissions.** `buildWorkspace` `chmod`s `mcp.json` to
 `0600` (owner read/write only) whenever it embeds a bound server's resolved
-header — tightened explicitly with `chmodSync` after the write, not via
-`writeFileSync`'s own `mode` option, because that option only applies when
-the call CREATES the file; a rebuilt workspace's `mcp.json` already exists
-and would otherwise keep whatever permissions it had. A binding-less
-`mcp.json`, or one with bindings that carry no resolved header, keeps
-today's exact default permissions — untouched, byte-for-byte the same
-behaviour as before this ticket.
+`headersEnvVar` header — tightened explicitly with `chmodSync` after the
+write, not via `writeFileSync`'s own `mode` option, because that option only
+applies when the call CREATES the file; a rebuilt workspace's `mcp.json`
+already exists and would otherwise keep whatever permissions it had. A
+binding-less `mcp.json`, or one with bindings that carry no resolved
+`headersEnvVar` header, keeps today's exact default permissions — untouched,
+byte-for-byte the same behaviour as before this ticket. An `accountHeader`
+resolution alone (see below) never tightens permissions by itself — the
+value is a non-secret account name, not a credential.
+
+### Per-agent account headers (`accountHeader`, BUTCHR-412)
+
+`headersEnvVar` resolves ONE static value per RULE, from this daemon's own
+environment — every agent that rule spawns gets the same header value.
+`accountHeader` is the opposite shape: a DIFFERENT value per AGENT, filled
+in from `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`,
+`src/agents/workspace.ts`) — set only by `src/agents/account-lifecycle.ts`'s
+`ensure()`, after `ensureAccount` actually provisioned this agent's Rocket.Chat
+account for THIS launch (see `docs/rocketchat-accounts.md`'s "Credential
+design, corrected" section for the full mechanism this exists for: an agent
+naming only its own account, non-secret, to Nexus's `rocketr` bridge, which
+holds every actual token centrally). A binding with `accountHeader` set but
+no `spec.rocketchatAccount` for this launch (the rule's `account` policy is
+`"none"`, or provisioning didn't happen/wasn't needed) simply omits the
+header — same "absent means no extra header" discipline `headersEnvVar` has.
+Combines with `headersEnvVar` on the same binding: both are resolved
+independently and merged into one `headers` object.
+
+Not resolved for Codex today (see "Codex" below) — narrowing that is a later
+story's job, tracked in `docs/rocketchat-accounts.md`.
 
 ## Launch wiring
 
@@ -123,7 +148,12 @@ renders each as its own `--config mcp_servers.<name>={ url = "…", enabled =
 true }`. **What a Codex agent gets today, explicitly, per this ticket's own
 DoD:** MCP **tools**, yes — the bound server behaves exactly like any other
 Codex MCP server; channel **push**, no — there is no channel push to Codex
-at all, bound server or not.
+at all, bound server or not. `boundCodexServers` resolves NEITHER
+`headersEnvVar` NOR `accountHeader` (BUTCHR-412) — a Codex-launched binding
+gets no extra headers of either kind, so a Codex agent cannot yet call an
+authenticated bound server (including one whose only "credential" is a
+non-secret account name); narrowing that is a later story's job (see
+`docs/rocketchat-accounts.md`).
 
 **A bound server's `headersEnvVar` is NEVER sent to Codex, loudly by
 design** (review finding, PR #387): Drovr renders a Codex MCP server's
@@ -291,6 +321,7 @@ this ticket only decides WHICH server names get the flag, identically for
 
 BUTCHR-393 (the managed-session definition format) reuses this shape
 verbatim rather than defining its own. `McpServerBinding` (`src/rules/rules.ts`):
-`{ name, type: "http", url, headersEnvVar?, channel }`. See the coordination
-comment on BUTCHR-411 from the story agent (BUTCHR-395) and the reply
-posted on BUTCHR-393 once this branch was pushed.
+`{ name, type: "http", url, headersEnvVar?, accountHeader?, channel }`
+(`accountHeader` added by BUTCHR-412). See the coordination comment on
+BUTCHR-411 from the story agent (BUTCHR-395) and the reply posted on
+BUTCHR-393 once this branch was pushed.

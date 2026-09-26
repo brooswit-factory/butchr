@@ -1,20 +1,48 @@
 /**
- * The Rocket.Chat account lifecycle manager (BUTCHR-395/S4): a pure module
+ * The Rocket.Chat account lifecycle manager (BUTCHR-395/S4, corrected design
+ * BUTCHR-412/BUTCHR-391 comments 23997/23999/24003/24007): a pure module
  * over an INJECTED `RocketChatClient` (`../resources/rocketchat.ts`) and an
  * injected `AccountStore`, implementing the policies `docs/rocketchat-accounts.md`
  * and `docs/execution-modes.md`'s `account` field describe. Standalone by
- * design — nothing here reads `Rule`, the herd, or the reconciler; a
- * follow-up task wires `ensureAccount`/`releaseAccount` into agent
- * start/stop. See that doc for the full contract, the identity mapping, the
- * persistence location, and the guardrail's exact refusal shape.
+ * design — nothing here reads `Rule`, the herd, or the reconciler;
+ * `../agents/account-lifecycle.ts` wires `ensureAccount`/`releaseAccount`
+ * into agent start/stop, and batches this module's `manifestEntries()` into
+ * one Nexus publish per reconcile poll. See that doc for the full contract,
+ * the identity mapping, the persistence location, and the guardrail's exact
+ * refusal shape.
+ *
+ * CORRECTED CREDENTIAL DESIGN (BUTCHR-391 comment 24007 supersedes the
+ * original ticket's "hand the agent a token file it reads itself"): an agent
+ * never holds an RC credential. This module still mints and revokes the
+ * managed Personal Access Token exactly as before, but the token itself is
+ * now written ONLY to a 0600 file in a daemon-owned directory
+ * (`AccountManagerDeps.tokenDir`, never any agent's own workspace) and never
+ * returned to a caller — `EnsureAccountResult` carries `tokenFile` (a path)
+ * where it used to carry `token` (a value). `manifestEntries()` is the read
+ * path `account-lifecycle.ts` uses to hand Nexus the (account name, token
+ * file path) pairs it registers with rocketr — see
+ * `../accounts/nexus-manifest.ts`.
+ *
+ * TOKEN ROTATION, FIXED (BUTCHR-391 comment 24007 item 3): the ORIGINAL
+ * contract — every `ensureAccount` call revokes and reissues the token,
+ * unconditionally — conflicts with Nexus/rocketr having registered the
+ * token once: a routine re-ensure (a respawn, a permanent account's adopt-on-
+ * every-start) would silently invalidate what rocketr already has. Fixed
+ * here: `ensureAccount` reuses an existing, still-present, non-empty token
+ * file untouched (no RC token API calls at all) and only mints a fresh one
+ * when there is no recorded token file yet, or the recorded one is missing/
+ * unreadable/empty — see `tokenFileValid` below. `EnsureAccountResult.rotated`
+ * tells `account-lifecycle.ts` which happened, so it can decide whether this
+ * account needs to be (re-)announced to Nexus this batch.
  */
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import { isRcUserNotFoundError, type RocketChatClient } from "../resources/rocketchat.js";
 import type { AccountPolicy } from "../rules/rules.js";
 import { isManagedUsername, rcUsernameFor } from "./identity.js";
+import type { NexusManifestEntry } from "./nexus-manifest.js";
 
 export type { AccountPolicy };
 
@@ -33,6 +61,15 @@ export interface AccountRecord {
   policy: AccountPolicy;
   /** ISO timestamp of first creation; preserved across every later `ensureAccount` call for the same agent. */
   createdAt: string;
+  /**
+   * BUTCHR-412: path to the 0600 file this account's current managed token
+   * lives in (`AccountManagerDeps.tokenDir`) — never the token's own value.
+   * Absent only for a record persisted by a pre-BUTCHR-412 build (defensive;
+   * every record this module itself ever writes carries it) — treated
+   * exactly like a missing/invalid file (see `tokenFileValid`), so such a
+   * record just mints a fresh token and file on its next `ensureAccount`.
+   */
+  tokenFile?: string;
 }
 
 /** Injectable persistence — see `createFileAccountStore` for the default, workspace-root-anchored implementation and why it lives there. */
@@ -44,7 +81,7 @@ export interface AccountStore {
   list(): Promise<AccountRecord[]>;
 }
 
-export type AccountRefusalReason = "rc-not-configured" | "cap-reached" | "not-managed";
+export type AccountRefusalReason = "rc-not-configured" | "cap-reached" | "temporary-cap-reached" | "not-managed";
 
 export interface AccountRefusal {
   ok: false;
@@ -54,7 +91,7 @@ export interface AccountRefusal {
 
 export type EnsureAccountResult =
   | { ok: true; policy: "none" }
-  | { ok: true; policy: "temporary" | "permanent"; rcUserId: string; username: string; token: string; created: boolean }
+  | { ok: true; policy: "temporary" | "permanent"; rcUserId: string; username: string; tokenFile: string; created: boolean; rotated: boolean }
   | AccountRefusal;
 
 export type ReleaseAccountResult =
@@ -68,6 +105,26 @@ export interface AccountManagerDeps {
   store: AccountStore;
   /** The 50-user guardrail threshold; see `docs/rocketchat-accounts.md` for the default and why it sits below 50. */
   userCapThreshold: number;
+  /**
+   * BUTCHR-412 (BUTCHR-391 comment 23999): a SEPARATE, smaller cap on the
+   * number of CONCURRENTLY EXISTING `temporary` accounts (never `permanent`
+   * — see `EnsureAccountResult`'s own refusal shape below), because RC's
+   * ~10 free seats (of 50) are shared with S5's own `butchr-test-*` cap (5)
+   * and permanent accounts, which must never be starved by a busy swarm rule
+   * churning through temporary ones. Checked ONLY when `ensureAccount` is
+   * about to CREATE a new user for a `"temporary"` policy — never on an
+   * adopt/reuse path, which creates nothing.
+   */
+  tempAccountCapThreshold: number;
+  /**
+   * BUTCHR-412: a daemon-owned directory this module writes each managed
+   * account's 0600 token file into — never inside any agent's own workspace
+   * directory (`../agents/workspace.ts`'s `workspaceDirFor`). Created
+   * (recursively) on first write if absent.
+   */
+  tokenDir: string;
+  /** BUTCHR-412 (naming convention, BUTCHR-391 comment 24003 item 7): overrides `RC_MANAGED_PREFIX` when set — see `../accounts/identity.ts`. */
+  managedPrefix?: string;
   now?: () => string;
   /** Injectable for deterministic tests; RC requires a password at creation even though login never uses it (see the doc). */
   randomPassword?: () => string;
@@ -80,6 +137,15 @@ export interface AccountManager {
   releaseAccount(agentKey: string, reason: ReleaseReason): Promise<ReleaseAccountResult>;
   /** Every managed account whose `agentExists(agentKey)` reads false — a pure listing, no deletion (the follow-up task and S5 own the sweep itself). */
   reconcileOrphans(agentExists: (agentKey: string) => boolean | Promise<boolean>): Promise<AccountRecord[]>;
+  /**
+   * Every currently-recorded managed account with a token file on record —
+   * the (account name, token file path) pairs `../agents/account-lifecycle.ts`
+   * batches into one `NexusManifestPublisher.publish()` call per reconcile
+   * poll (BUTCHR-412, BUTCHR-391 comment 24007). Reads the SAME store
+   * `ensureAccount`/`releaseAccount` maintain — never a second source of
+   * truth, and never a token VALUE, only the path.
+   */
+  manifestEntries(): Promise<NexusManifestEntry[]>;
 }
 
 const defaultNow = () => new Date().toISOString();
@@ -106,10 +172,82 @@ function makeKeyedLock() {
   };
 }
 
+/** `path` names a token file this module itself is expected to have written — a missing, unreadable, or empty file all read as "no longer usable" and trigger a fresh mint, never a throw (a deleted/corrupted file must never wedge `ensureAccount`). */
+function tokenFileValid(path: string): boolean {
+  try {
+    return readFileSync(path, "utf8").trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Write-then-chmod, same belt-and-suspenders as `buildWorkspace`'s own credential-file writes (`src/agents/workspace.ts`): `writeFileSync`'s `mode` option only applies when the underlying `open()` call CREATES the file, so an explicit `chmodSync` covers the "this token file already existed" case too (a stale, invalid file being freshly re-minted). */
+function writeTokenFile(path: string, token: string): void {
+  // BUTCHR-412 review, non-blocking finding: `mode: 0o700` on the directory
+  // itself (not just 0600 on each file inside it) — every token FILE was
+  // already owner-only, but the directory's default umask mode (0755) let
+  // any other local user list which accounts have token files, i.e. every
+  // managed username, even though its contents stayed unreadable. Applied
+  // only when this call actually CREATES the directory (mkdirSync's own
+  // `mode` option, like writeFileSync's, is ignored for one that already
+  // exists) — a pre-existing directory's mode is left alone, same
+  // "chmod only what we just wrote" discipline this file's other writes use.
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, token, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+/** One file per managed account, named by its (already-unique, deterministic) RC username — never by agent key, so it stays stable across an agent key's own possible future renaming schemes and reads unambiguously on disk. */
+const tokenFilePath = (tokenDir: string, username: string): string => join(tokenDir, `${username}.token`);
+
 export function createAccountManager(deps: AccountManagerDeps): AccountManager {
   const now = deps.now ?? defaultNow;
   const randomPassword = deps.randomPassword ?? defaultPassword;
   const withLock = makeKeyedLock();
+  /**
+   * BUTCHR-412 review round 3, blocking finding: `reconcileNow` runs
+   * `ensure` for every admitted agent under one `Promise.all` — DIFFERENT
+   * agent keys, so `withLock`'s per-key serialization does nothing to
+   * protect a cap check shared ACROSS keys. Reading `client.countUsers()`/
+   * `deps.store.list()` and comparing against a threshold is not atomic
+   * with the `createUser` call that follows it: every concurrent caller can
+   * observe the SAME pre-creation count and all decide to proceed,
+   * overshooting either cap (reproduced: 12 concurrent temporary ensures
+   * against a cap of 8 created all 12).
+   *
+   * Fixed with an in-memory reservation, held only for the window between
+   * "decided to create" and "the new record is actually persisted" (or the
+   * attempt fails) — the exact gap a bare count-then-create misses.
+   * `reservedTotal` guards the RC-wide `userCapThreshold`; `reservedTemporary`
+   * guards the separate temporary-account cap. `reserveCapacitySlot` below
+   * reads the current count PLUS the in-flight reservations and increments
+   * atomically, serialized by `withLock`'s own `CAP_LOCK_KEY` chain (a
+   * reserved key no real agent key can ever collide with — agent keys are
+   * `provider:rule:resource`, never containing U+0000) — the same `withLock`
+   * instance used for per-agent serialization, just a different chain.
+   */
+  let reservedTotal = 0;
+  let reservedTemporary = 0;
+  const CAP_LOCK_KEY = "\u0000cap";
+
+  /** Atomically checks BOTH caps against (persisted count + in-flight reservations) and reserves a slot on success. `null` means reserved; anything else is the refusal to return verbatim. The caller MUST release the reservation exactly once (success or failure) via `releaseCapacitySlot`. */
+  function reserveCapacitySlot(client: RocketChatClient, policy: AccountPolicy): Promise<AccountRefusal | null> {
+    return withLock(CAP_LOCK_KEY, async (): Promise<AccountRefusal | null> => {
+      const count = await client.countUsers();
+      if (count + reservedTotal >= deps.userCapThreshold) {
+        return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users${reservedTotal ? ` (plus ${reservedTotal} creation(s) already in flight)` : ""}, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
+      }
+      if (policy === "temporary") {
+        const tempCount = (await deps.store.list()).filter((r) => r.policy === "temporary").length;
+        if (tempCount + reservedTemporary >= deps.tempAccountCapThreshold) {
+          return { ok: false, reason: "temporary-cap-reached", message: `${tempCount} temporary Rocket.Chat accounts already exist${reservedTemporary ? ` (plus ${reservedTemporary} creation(s) already in flight)` : ""}, at or over the configured limit (${deps.tempAccountCapThreshold}) — withholding this one; it will be retried next poll rather than exceeding the limit or starving a permanent account's seat` };
+        }
+        reservedTemporary++;
+      }
+      reservedTotal++;
+      return null;
+    });
+  }
 
   return {
     ensureAccount(agentKey, policy) {
@@ -117,7 +255,7 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
       return withLock(agentKey, async (): Promise<EnsureAccountResult> => {
         const client = deps.client;
         if (!client) return RC_NOT_CONFIGURED(policy);
-        const username = rcUsernameFor(agentKey);
+        const username = rcUsernameFor(agentKey, deps.managedPrefix);
 
         /**
          * `trustRecord: false` is used exactly once, recursively, when the
@@ -134,40 +272,90 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
           const existingRecord = trustRecord ? await deps.store.get(agentKey) : null;
           let user = existingRecord ? { id: existingRecord.rcUserId, username: existingRecord.username } : await client.getUserByUsername(username);
           let created = false;
-
-          if (!user) {
-            const count = await client.countUsers();
-            if (count >= deps.userCapThreshold) {
-              return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
-            }
-            try {
-              const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
-              user = { id: created_.id, username: created_.username };
-              created = true;
-            } catch (e) {
-              if (!isUsernameTakenError(e)) throw e;
-              // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
-              const found = await client.getUserByUsername(username);
-              if (!found) throw e;
-              user = { id: found.id, username: found.username };
-            }
-          }
-
-          if (!isManagedUsername(user.username)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
+          // Set true only once `reserveCapacitySlot` actually reserved a
+          // slot for THIS call — released exactly once, in `finally` below,
+          // whether this call succeeds (after the new record is persisted),
+          // fails outright, or recurses into a fresh `attempt(false)` (whose
+          // OWN reservation, if any, is that call's own to release).
+          let reserved = false;
 
           try {
-            // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
-            await client.revokeManagedToken(user.id);
-            const token = await client.generateManagedToken(user.id);
-            const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now() };
-            await deps.store.set(record);
-            return { ok: true, policy, rcUserId: user.id, username: user.username, token, created };
-          } catch (e) {
-            if (existingRecord && isRcUserNotFoundError(e)) {
-              await deps.store.delete(agentKey);
-              return attempt(false);
+            if (!user) {
+              const refusal = await reserveCapacitySlot(client, policy);
+              if (refusal) return refusal;
+              reserved = true;
+              try {
+                const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
+                user = { id: created_.id, username: created_.username };
+                created = true;
+              } catch (e) {
+                if (!isUsernameTakenError(e)) throw e;
+                // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
+                const found = await client.getUserByUsername(username);
+                if (!found) throw e;
+                user = { id: found.id, username: found.username };
+              }
             }
-            throw e;
+
+            if (!isManagedUsername(user.username, deps.managedPrefix)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
+
+            const tokenFile = tokenFilePath(deps.tokenDir, user.username);
+            // BUTCHR-412: reuse a still-valid recorded token untouched — no RC
+            // TOKEN api call at all (no revoke, no regenerate) — rather than
+            // the original contract's unconditional revoke-then-reissue, which
+            // would silently invalidate whatever Nexus/rocketr already
+            // registered for a routine re-ensure (respawn, permanent
+            // adopt-on-every-start, daemon restart). Only ever attempted when
+            // this SAME agent already had a record AND that record's own
+            // token file still reads back non-empty.
+            //
+            // STILL calls `getUserByUsername` — a READ, never a write — before
+            // trusting it: the ORIGINAL contract's unconditional revoke call
+            // was ALSO this module's only signal that the recorded RC user had
+            // been deleted out-of-band (revoke against a gone user fails with
+            // RC's "not found"), and removing that call without a replacement
+            // would silently break stale-record recovery (a KEEP behaviour —
+            // see docs/rocketchat-accounts.md) for exactly the "token file
+            // still present, but RC user is gone" case. A read-only lookup
+            // preserves the detection without ever touching (or risking
+            // invalidating) the token itself.
+            if (existingRecord?.tokenFile && tokenFileValid(existingRecord.tokenFile)) {
+              const stillThere = await client.getUserByUsername(user.username);
+              if (!stillThere) {
+                try { unlinkSync(existingRecord.tokenFile); } catch { /* already gone, or never existed — either way, nothing to clean up */ }
+                await deps.store.delete(agentKey);
+                return attempt(false);
+              }
+              const record: AccountRecord = { agentKey, rcUserId: stillThere.id, username: stillThere.username, policy, createdAt: existingRecord.createdAt, tokenFile: existingRecord.tokenFile };
+              await deps.store.set(record); // keeps `policy` in sync if the rule's own account policy changed since the last ensure (temporary <-> permanent)
+              return { ok: true, policy, rcUserId: stillThere.id, username: stillThere.username, tokenFile: existingRecord.tokenFile, created, rotated: false };
+            }
+
+            try {
+              // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
+              await client.revokeManagedToken(user.id);
+              const token = await client.generateManagedToken(user.id);
+              writeTokenFile(tokenFile, token);
+              const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now(), tokenFile };
+              await deps.store.set(record);
+              return { ok: true, policy, rcUserId: user.id, username: user.username, tokenFile, created, rotated: true };
+            } catch (e) {
+              if (existingRecord && isRcUserNotFoundError(e)) {
+                await deps.store.delete(agentKey);
+                return attempt(false);
+              }
+              throw e;
+            }
+          } finally {
+            // Released only AFTER the record above is persisted (a plain
+            // `return` inside a `try` still awaits every prior `await` in
+            // that block before `finally` runs) — never sooner, so a
+            // concurrent `reserveCapacitySlot` call can never observe a
+            // window where this slot is counted by neither the persisted
+            // store NOR the reservation. A call that never reserved (an
+            // adopt/reuse path, `existingRecord` truthy) leaves `reserved`
+            // false, making this a no-op.
+            if (reserved) { reservedTotal--; if (policy === "temporary") reservedTemporary--; }
           }
         };
 
@@ -184,7 +372,7 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
 
         const client = deps.client;
         if (!client) return RC_NOT_CONFIGURED(record.policy);
-        if (!isManagedUsername(record.username) || record.username !== rcUsernameFor(agentKey)) {
+        if (!isManagedUsername(record.username, deps.managedPrefix) || record.username !== rcUsernameFor(agentKey, deps.managedPrefix)) {
           return { ok: false, reason: "not-managed", message: `refusing to unprovision ${JSON.stringify(record.username)} for ${agentKey}: it does not carry butchr's own managed-account marker for this agent` };
         }
 
@@ -201,6 +389,10 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
           if (!isRcUserNotFoundError(e)) throw e;
         }
         await deps.store.delete(agentKey);
+        // Best-effort cleanup of the now-orphaned token file — never fails
+        // the release over it (a missing file is the common, expected case
+        // on a second/idempotent release call).
+        if (record.tokenFile) { try { unlinkSync(record.tokenFile); } catch { /* nothing to remove, or already gone */ } }
         return { ok: true, released: true };
       });
     },
@@ -210,6 +402,11 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
       const orphans: AccountRecord[] = [];
       for (const record of all) if (!(await agentExists(record.agentKey))) orphans.push(record);
       return orphans;
+    },
+
+    async manifestEntries() {
+      const all = await deps.store.list();
+      return all.filter((r): r is AccountRecord & { tokenFile: string } => Boolean(r.tokenFile)).map((r) => ({ account: r.username, tokenFile: r.tokenFile }));
     },
   };
 }

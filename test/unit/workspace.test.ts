@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -868,6 +868,76 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
         expect(mode(join(dir, "mcp.json"))).toBe(0o600);
       } finally { delete process.env.BUTCHR_TEST_WS_PERM_HEADERS2; }
     });
+  });
+
+  // BUTCHR-412 (BUTCHR-391 comment 24007): the corrected Rocket.Chat
+  // credential design — an agent never holds a credential; its MCP binding
+  // carries only its own (non-secret) account name, via `accountHeader`.
+  describe("accountHeader / spec.rocketchatAccount (BUTCHR-412)", () => {
+    const rocketr = { name: "rocketr", type: "http" as const, url: "https://rocketr.internal/mcp", accountHeader: "x-rocketr-account", channel: true };
+
+    test("spec.rocketchatAccount is injected under the binding's accountHeader name — never anywhere else", () => {
+      withRoot(() => {
+        const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_jira-work-triage-kan-30_deadbeef00" }, "http://x/mcp");
+        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+        expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "x-rocketr-account": "butchr_jira-work-triage-kan-30_deadbeef00" } });
+        for (const f of ["CLAUDE.md", "brief.md", "ENVIRONMENT.md"]) {
+          expect(readFileSync(join(dir, f), "utf8")).not.toContain("butchr_jira-work-triage-kan-30_deadbeef00");
+        }
+        // No token, no credential file of any kind — the account name is the ONLY thing that ever moves.
+        expect(existsSync(join(dir, ".butchr-rocketchat.json"))).toBe(false);
+      });
+    });
+
+    test("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
+      withRoot(() => {
+        const dir = buildWorkspace({ key: "KAN-31", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_x" }, "http://x/mcp");
+        expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
+      });
+    });
+
+    test("no rocketchatAccount on the spec (account policy \"none\", or ensureAccount hasn't run): the header is simply omitted", () => {
+      withRoot(() => {
+        const dir = buildWorkspace({ key: "KAN-32", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr] }, "http://x/mcp");
+        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+        expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp" });
+      });
+    });
+
+    test("a binding with no accountHeader ignores spec.rocketchatAccount entirely", () => {
+      withRoot(() => {
+        const dir = buildWorkspace({ key: "KAN-33", issuetype: "Task", summary: "s", parent: null, mcpServers: [mud], rocketchatAccount: "butchr_x" }, "http://x/mcp");
+        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+        expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp" });
+      });
+    });
+
+    test("accountHeader and headersEnvVar combine on the SAME binding — the secret one still tightens permissions, the account name doesn't need to", () => {
+      withRoot(() => {
+        process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS = JSON.stringify({ "X-Extra": "v" });
+        try {
+          const dir = buildWorkspace({ key: "KAN-34", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...rocketr, headersEnvVar: "BUTCHR_TEST_WS_ROCKETR_HEADERS" }], rocketchatAccount: "butchr_x" }, "http://x/mcp");
+          const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+          expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "X-Extra": "v", "x-rocketr-account": "butchr_x" } });
+          expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
+        } finally { delete process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS; }
+      });
+    });
+  });
+});
+
+describe("resolveAccountHeader (BUTCHR-412)", () => {
+  const rocketr = { name: "rocketr", type: "http" as const, url: "https://rocketr.internal/mcp", accountHeader: "x-rocketr-account", channel: true };
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("binding names accountHeader and an account is present -> resolves that one header", () => {
+    expect(resolveAccountHeader(rocketr, "butchr_x")).toEqual({ "x-rocketr-account": "butchr_x" });
+  });
+  test("binding names accountHeader but no account (undefined) -> undefined, never an empty-string header", () => {
+    expect(resolveAccountHeader(rocketr, undefined)).toBeUndefined();
+  });
+  test("no accountHeader on the binding -> undefined regardless of account", () => {
+    expect(resolveAccountHeader(mud, "butchr_x")).toBeUndefined();
   });
 });
 

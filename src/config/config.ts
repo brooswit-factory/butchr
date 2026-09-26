@@ -42,7 +42,30 @@ export interface Config {
    * at the point of use (`../accounts/manager.ts`), not a startup crash;
    * see `docs/rocketchat-accounts.md`.
    */
-  rocketchat?: { url: string; adminUserId: string; adminTokenFile: string; userCapThreshold: number };
+  rocketchat?: {
+    url: string;
+    adminUserId: string;
+    adminTokenFile: string;
+    userCapThreshold: number;
+    /**
+     * BUTCHR-412 (BUTCHR-391 comment 23999): a SEPARATE, tighter cap on
+     * concurrently-existing `temporary` accounts alone — see
+     * `../accounts/manager.ts`'s `AccountManagerDeps.tempAccountCapThreshold`
+     * for why this is not the same knob as `userCapThreshold` above. Default
+     * 8 (below `ROCKETCHAT_USER_CAP_THRESHOLD`'s own headroom): "about 10 of
+     * the 50 RC seats are free" is shared between auto-provisioned temporary
+     * accounts and S5's own `butchr-test-*` cap (5, Nexus's own limit, not
+     * enforced here), so 8 leaves room for a handful of those alongside a
+     * temporary-account swarm at its own cap.
+     */
+    temporaryAccountCapThreshold: number;
+    /** BUTCHR-412: daemon-owned directory each managed account's 0600 token file is written into — see `../accounts/manager.ts`'s `AccountManagerDeps.tokenDir`. Defaults under the workspace root, never inside any agent's own workspace directory. */
+    tokenDir: string;
+    /** BUTCHR-412: where the batched Nexus hand-off manifest is published — see `../accounts/nexus-manifest.ts`. Defaults under the workspace root. */
+    nexusManifestFile: string;
+    /** BUTCHR-412 (naming convention, BUTCHR-391 comment 24003 item 7): overrides `RC_MANAGED_PREFIX` (`../accounts/identity.ts`) when set. The convention itself is to be agreed with Nexus — this is only the knob, not that agreement. */
+    managedPrefix?: string;
+  };
   /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
@@ -320,6 +343,10 @@ export interface ConfigEnv {
   ROCKETCHAT_ADMIN_USER_ID?: string | undefined;
   ROCKETCHAT_ADMIN_TOKEN_FILE?: string | undefined;
   ROCKETCHAT_USER_CAP_THRESHOLD?: string | undefined;
+  ROCKETCHAT_TEMPORARY_CAP_THRESHOLD?: string | undefined;
+  ROCKETCHAT_TOKEN_DIR?: string | undefined;
+  ROCKETCHAT_NEXUS_MANIFEST_FILE?: string | undefined;
+  ROCKETCHAT_MANAGED_PREFIX?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
@@ -389,7 +416,16 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     // docs/rocketchat-accounts.md).
     const userCapThreshold = env.ROCKETCHAT_USER_CAP_THRESHOLD ? Number(env.ROCKETCHAT_USER_CAP_THRESHOLD) : 45;
     if (!Number.isInteger(userCapThreshold) || userCapThreshold <= 0 || userCapThreshold >= 50) throw new Error(`ROCKETCHAT_USER_CAP_THRESHOLD must be a positive integer below 50: ${env.ROCKETCHAT_USER_CAP_THRESHOLD}`);
-    rocketchat = { url: rcUrl, adminUserId: rcAdminUserId, adminTokenFile: rcAdminTokenFile, userCapThreshold };
+    // BUTCHR-412 (BUTCHR-391 comment 23999): a separate, tighter cap on
+    // concurrently-existing TEMPORARY accounts alone — see `Config.rocketchat`'s
+    // own doc comment for why 8, and why this is a different knob from
+    // `userCapThreshold` above.
+    const temporaryAccountCapThreshold = env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD ? Number(env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD) : 8;
+    if (!Number.isInteger(temporaryAccountCapThreshold) || temporaryAccountCapThreshold <= 0) throw new Error(`ROCKETCHAT_TEMPORARY_CAP_THRESHOLD must be a positive integer: ${env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD}`);
+    const tokenDir = env.ROCKETCHAT_TOKEN_DIR?.trim() || join(workspaceRoot(), ".butchr-rc-tokens");
+    const nexusManifestFile = env.ROCKETCHAT_NEXUS_MANIFEST_FILE?.trim() || join(workspaceRoot(), ".butchr-rc-nexus-manifest.json");
+    const managedPrefix = env.ROCKETCHAT_MANAGED_PREFIX?.trim();
+    rocketchat = { url: rcUrl, adminUserId: rcAdminUserId, adminTokenFile: rcAdminTokenFile, userCapThreshold, temporaryAccountCapThreshold, tokenDir, nexusManifestFile, ...(managedPrefix ? { managedPrefix } : {}) };
   }
 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
@@ -570,7 +606,7 @@ export const describeConfig = (c: Config): string =>
   `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
-  `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
+  `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +

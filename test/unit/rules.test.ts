@@ -298,6 +298,36 @@ describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a r
     expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", headersEnvVar: "MUD_MCP_HEADERS", channel: true }]);
   });
 
+  // BUTCHR-412 (BUTCHR-391 comment 24007): the per-AGENT, non-secret literal
+  // header extension — a Rocket.Chat/rocketr binding names the header the
+  // agent's own account name is injected into, never the value itself.
+  describe("accountHeader (BUTCHR-412)", () => {
+    test("accepted and normalised (trimmed)", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: " x-rocketr-account " }] }] });
+      expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", accountHeader: "x-rocketr-account", channel: true }]);
+    });
+
+    test("combines with headersEnvVar on the SAME binding", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, headersEnvVar: "MUD_MCP_HEADERS", accountHeader: "x-rocketr-account" }] }] });
+      expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", headersEnvVar: "MUD_MCP_HEADERS", accountHeader: "x-rocketr-account", channel: true }]);
+    });
+
+    test("rejects an invalid HTTP header name", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: "not a header name" }] }] }, "f.json"))
+        .toThrow("f.json: rules[0].mcpServers[0].accountHeader must be a valid HTTP header name");
+    });
+
+    test("rejects an empty accountHeader", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: "" }] }] }, "f.json"))
+        .toThrow("rules[0].mcpServers[0].accountHeader must be a valid HTTP header name");
+    });
+
+    test("absent means none — existing headersEnvVar-only bindings load unchanged", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [mud] }] });
+      expect(Object.keys(r!.mcpServers![0]!)).not.toContain("accountHeader");
+    });
+  });
+
   test("an empty array is rejected the same way agentPreferences is", () => {
     expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [] }] }, "f.json")).toThrow("f.json: rules[0].mcpServers must be a non-empty array");
   });

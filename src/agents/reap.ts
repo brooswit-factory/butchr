@@ -151,6 +151,20 @@ export interface ReaperDeps {
    * close catches its own rejection").
    */
   close: (candidate: StrandedCandidate) => Promise<boolean>;
+  /**
+   * BUTCHR-412: released after a candidate is actually closed — `candidate.label`
+   * IS the agent key (`strandedCandidates`' own ownership proof: a workspace's
+   * label pairs with a pane whose cwd is exactly `workspaceDirFor(label,
+   * root)`, so `label` is the same key `buildWorkspace`/`herd.spawn` use).
+   * This is the self-exit path's own account teardown (a crash, `/exit`, or a
+   * quota-exhaustion close that never goes through `HerdrHerd.stop()`/
+   * `reconcileNow`'s `plan.stop` at all) — see `docs/rocketchat-accounts.md`'s
+   * "Wiring" section. Optional; omitted, no account lifecycle runs for a
+   * reaped workspace (every caller before this ticket). Never awaited into a
+   * failed reap: a release failure is logged and swallowed, same fault
+   * isolation `check()` already gives every other candidate's close.
+   */
+  release?: (agentKey: string) => Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -191,6 +205,9 @@ export function createReaper(deps: ReaperDeps): Reaper {
           if (didClose) {
             closed++;
             log(`[reap] reclaimed workspace ${c.workspaceId} (${c.label})`);
+            if (deps.release) {
+              await deps.release(c.label).catch((e) => log(`WARNING: [reap] account release failed for ${c.label}: ${(e as Error)?.message ?? e}`));
+            }
           }
         } catch (e) {
           log(`WARNING: [reap] close failed for ${c.workspaceId} (${c.label}): ${(e as Error)?.message ?? e}`);

@@ -152,6 +152,150 @@ describe("reconcileNow", () => {
   });
 });
 
+describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+
+  function fakeHerdCapturingSpecs(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []) {
+    const running = new Set(initial);
+    const spawnedSpecs: Array<{ key: string; rocketchatAccount: unknown; origin: string | undefined }> = [];
+    const stopped: string[] = [];
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
+      async spawn(sp, origin) { spawnedSpecs.push({ key: sp.key, rocketchatAccount: sp.rocketchatAccount, origin }); running.add(sp.key); },
+      async stop(i) { stopped.push(i); running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    return { herd, running, spawnedSpecs, stopped };
+  }
+
+  test("ensure runs before spawn and the AUGMENTED spec (with the account NAME) is what herd.spawn actually receives", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const ensureCalledFor: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: {
+        ensure: async (s) => { ensureCalledFor.push(s.key); return { ...s, rocketchatAccount: "butchr_x" }; },
+        release: async () => {},
+        retryPendingReleases: async () => {},
+        publishBatch: async () => {},
+      },
+    });
+    expect(ensureCalledFor).toEqual(["NEW"]);
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchatAccount: "butchr_x", origin: undefined }]);
+  });
+
+  test("ensure refusing (null) WITHHOLDS the spawn: herd.spawn is never called, and the id is excluded from onAdmitted's succeeded set", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const admitted: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: { ensure: async () => null, release: async () => {}, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      onAdmitted: (succeeded) => admitted.push(...succeeded),
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(spawnedSpecs).toEqual([]);
+    expect(admitted).toEqual([]);
+    expect(failures).toEqual([{ id: "NEW", stage: "spawn", error: expect.any(Error) }]);
+  });
+
+  test("release is called for a genuine plan.stop id, AFTER herd.stop succeeds, with reason \"stop\"", async () => {
+    const { herd, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id, reason) => { released.push({ id, reason }); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+    });
+    expect(stopped).toEqual(["OLD"]);
+    expect(released).toEqual([{ id: "OLD", reason: "stop" }]);
+  });
+
+  test("release is never called when herd.stop itself throws — an agent that may still be running must not have its account released", async () => {
+    const herd: Herd = {
+      async runningIssues() { return ["OLD"]; },
+      async staleIssues() { return []; },
+      async spawn() {},
+      async stop() { throw new Error("herdr hiccup"); },
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(released).toEqual([]);
+    expect(failures).toEqual([{ id: "OLD", stage: "stop", error: expect.any(Error) }]);
+  });
+
+  test("respawn: ensure runs BEFORE the interim stop, release(\"respawn\") is called (documented no-op), and the augmented spec is what gets respawned", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const calls: string[] = [];
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: {
+        ensure: async (s) => { calls.push("ensure"); return { ...s, rocketchatAccount: "butchr_x" }; },
+        release: async (id, reason) => { calls.push("release"); released.push({ id, reason }); },
+        retryPendingReleases: async () => {},
+        publishBatch: async () => {},
+      },
+    });
+    expect(calls).toEqual(["ensure", "release"]); // ensure resolves before the interim stop/release
+    expect(released).toEqual([{ id: "STALE", reason: "respawn" }]);
+    expect(stopped).toEqual(["STALE"]);
+    expect(spawnedSpecs).toEqual([{ key: "STALE", rocketchatAccount: "butchr_x", origin: "respawn" }]);
+  });
+
+  test("respawn: ensure refusing leaves the stale-but-working agent running rather than stopping it with no replacement", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: { ensure: async () => null, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(stopped).toEqual([]); // never stopped
+    expect(spawnedSpecs).toEqual([]); // never respawned
+    expect(released).toEqual([]); // release("respawn") never reached — ensure refused first
+    expect(failures).toEqual([{ id: "STALE", stage: "respawn", error: expect.any(Error) }]);
+  });
+
+  test("retryPendingReleases is called exactly once per poll, before anything else, whether or not there is anything to spawn/stop", async () => {
+    const { herd } = fakeHerdCapturingSpecs();
+    let calls = 0;
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async () => {}, retryPendingReleases: async () => { calls++; }, publishBatch: async () => {} },
+    });
+    expect(calls).toBe(1);
+  });
+
+  // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): published
+  // exactly once, at the very end of the poll — after retryPendingReleases
+  // (top of the poll) AND every ensure/release call this poll made.
+  test("publishBatch is called exactly once per poll, after retryPendingReleases and every ensure/release", async () => {
+    const { herd } = fakeHerdCapturingSpecs(["OLD"]);
+    const order: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: {
+        ensure: async (s) => { order.push("ensure"); return s; },
+        release: async () => { order.push("release"); },
+        retryPendingReleases: async () => { order.push("retryPendingReleases"); },
+        publishBatch: async () => { order.push("publishBatch"); },
+      },
+    });
+    expect(order[0]).toBe("retryPendingReleases");
+    expect(order[order.length - 1]).toBe("publishBatch");
+    expect(order.filter((o) => o === "publishBatch")).toHaveLength(1);
+  });
+
+  test("no account hooks at all: behaves exactly as before this ticket (every SpawnSpec reaches herd.spawn unchanged)", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]));
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchatAccount: undefined, origin: undefined }]);
+    expect(stopped).toEqual(["OLD"]);
+  });
+});
+
 describe("reconcileNow storm guard (RespawnGuard)", () => {
   test("an issue that stays stale across many consecutive polls is respawned ONCE, then suppressed, with the WARNING logged and exactly ONE [butchr:respawn] notice for the window — then a NEW window opens once RESPAWN_SUPPRESS_POLLS have passed", async () => {
     // Same fake issue "stale" on every poll, forever — the shape a genuinely

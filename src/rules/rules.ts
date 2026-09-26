@@ -124,12 +124,36 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * from account policy, so an `account: "none"` rule (no Rocket.Chat account
  * — e.g. Candlestix's MUD players) still gets full event-driven channel
  * delivery for a bound server.
+ *
+ * `accountHeader`, not a second binding mechanism (BUTCHR-412, BUTCHR-391
+ * comment 24007): the corrected Rocket.Chat credential design has an agent's
+ * MCP binding carry only its OWN (non-secret) account name, in a header —
+ * `x-rocketr-account` for rocketr — which `headersEnvVar` above cannot
+ * express: that resolves ONE static value per RULE from the daemon's own
+ * env, while an account name is per-AGENT (this rule's every agent gets a
+ * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
+ * value, which is deliberately kept out of Codex argv entirely — see that
+ * field's own doc comment; `accountHeader`'s value has no such restriction
+ * in principle, but no caller resolves it for Codex today either — narrowing
+ * that is S6's, BUTCHR-419/420). Set to the literal header NAME (e.g.
+ * `"x-rocketr-account"`); the VALUE is resolved at launch time from
+ * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
+ * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
+ * `ensureAccount` actually provisioned this agent's account, never written
+ * into a rules file or a managed-session definition itself. A binding with
+ * `accountHeader` set but no `spec.rocketchatAccount` (this rule's `account`
+ * policy is `"none"`, or `ensureAccount` hasn't run for this spec) simply
+ * omits the header — same "absent means no extra header" discipline
+ * `headersEnvVar` already has. Combines with `headersEnvVar` on the SAME
+ * binding if both are set (rare, but not forbidden): the two are resolved
+ * independently and merged.
  */
 export interface McpServerBinding {
   name: string;
   type: McpServerBindingType;
   url: string;
   headersEnvVar?: string;
+  accountHeader?: string;
   channel: boolean;
 }
 
@@ -248,10 +272,12 @@ const RULE_FIELDS = new Set([
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
-const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "channel"]);
+const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+/** RFC 7230 `field-name` (token charset), lowercased-or-not — an HTTP header name. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -314,10 +340,13 @@ export function parseMcpServers(raw: unknown, at: string, errors: string[]): Mcp
     if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
     const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
     if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
+    const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
+    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be a valid HTTP header name`);
     if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
     return {
       name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
       ...(headersEnvVar ? { headersEnvVar } : {}),
+      ...(accountHeader ? { accountHeader } : {}),
       channel: s.channel as boolean,
     };
   });

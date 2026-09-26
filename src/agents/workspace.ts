@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -38,6 +38,24 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  /**
+   * Rocket.Chat account name for THIS launch (BUTCHR-412 S4 design
+   * correction — BUTCHR-391 comment 24007) — set only by the reconcile-layer
+   * account hook (`src/agents/account-lifecycle.ts`), never by a
+   * `specFor*` function, and only after `ensureAccount` actually succeeded
+   * for this agent's rule policy. Carries NO credential: rocketr (Nexus's
+   * bridge) holds every token centrally, and an agent's own MCP binding
+   * names only its account, non-secret, in the `x-rocketr-account` header —
+   * see `resolveAccountHeader`/`McpServerBinding.accountHeader` below for
+   * how a per-agent literal (as opposed to BUTCHR-411's per-RULE
+   * `headersEnvVar`) reaches that header, and `docs/rocketchat-accounts.md`'s
+   * "Wiring" section for why. Superseded design (kept only in history, never
+   * revived): an earlier round of this ticket delivered a per-agent token in
+   * a dedicated 0600 file (`RC_ACCOUNT_FILE`) that the agent itself read —
+   * removed per the corrected design, which forbids a token ever reaching an
+   * agent's workspace at all.
+   */
+  rocketchatAccount?: string;
   /** Operator-owned MCP config path (jira-project rules only); `{{KEY}}` expands to the resource key. */
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
@@ -363,16 +381,24 @@ Await direction if your brief does not assign work. Preserve sandbox and approva
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
   if (provider === "claude") {
-    // BUTCHR-408/BUTCHR-411: a bound server (spec.mcpServers) lands in
+    // BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
     // mcp.json alongside butchr's own and any externalMcpServers, `channel:
     // true` or not — mcp.json is what gives Claude MCP TOOL access; the
     // channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
     // additive decision about PUSH notifications. No bindings -> byte-identical
-    // to before (Object.fromEntries([]) spreads nothing).
+    // to before (Object.fromEntries([]) spreads nothing). A binding's headers
+    // are the union of its (per-RULE, env-resolved, potentially secret)
+    // `headersEnvVar` value and its (per-AGENT, always non-secret)
+    // `accountHeader` value — see `resolveMcpServerHeaders`/
+    // `resolveAccountHeader`'s own doc comments for why these are two
+    // different resolution mechanisms sharing one binding shape, not two
+    // competing ones.
     let hasSecretHeaders = false;
     const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const headers = resolveMcpServerHeaders(b);
-      if (headers) hasSecretHeaders = true;
+      const envHeaders = resolveMcpServerHeaders(b);
+      if (envHeaders) hasSecretHeaders = true;
+      const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
+      const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
       return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
     }));
     const mcpJsonPath = join(dir, "mcp.json");
@@ -384,7 +410,9 @@ Await direction if your brief does not assign work. Preserve sandbox and approva
     // exists), so this is an explicit chmod, not a write option, and only
     // when this write
     // actually carries a secret; a binding-less (or headers-less) mcp.json
-    // keeps its exact previous permissions, untouched.
+    // keeps its exact previous permissions, untouched. `accountHeader`'s own
+    // value (an account NAME, never a secret) never sets `hasSecretHeaders`
+    // by itself — only `headersEnvVar`'s resolution does.
     if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
   }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
@@ -514,6 +542,25 @@ const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
   } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
   return undefined;
 };
+
+/**
+ * The PER-AGENT half of a bound server's headers (BUTCHR-412, BUTCHR-391
+ * comment 24007) — `McpServerBinding.accountHeader`'s own doc comment
+ * (`src/rules/rules.ts`) explains why this is a second, deliberately
+ * separate resolution mechanism from `resolveMcpServerHeaders` above rather
+ * than a second reading of the same one: that one resolves ONE static value
+ * per RULE from the daemon's own env; this resolves a DIFFERENT value per
+ * AGENT from `spec.rocketchatAccount` (set only by
+ * `../agents/account-lifecycle.ts`'s `ensure`, after `ensureAccount`
+ * actually provisioned this agent's account). No binding names an env var
+ * here, and nothing is ever "malformed" — the value is either present
+ * (this agent has an account) or it is not (no `accountHeader` on the
+ * binding, or no account for this launch), so there is no failure mode to
+ * log, unlike `resolveMcpServerHeaders`'s own unset/malformed-env case.
+ */
+export function resolveAccountHeader(binding: McpServerBinding, account: string | undefined): Record<string, string> | undefined {
+  return binding.accountHeader && account ? { [binding.accountHeader]: account } : undefined;
+}
 
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
