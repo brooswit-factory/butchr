@@ -214,6 +214,22 @@ export interface Escalator {
    * is stalled, or when `EscalatorDeps.managedSessionOf` was never wired.
    */
   managedSessionEscalations: () => readonly ManagedSessionEscalation[];
+  /**
+   * FACTORY-45 Part B: the two halves of drovr's host-neutral escalation
+   * hook (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
+   * pass this pair as `{ onUnknownDialog: escalator.onDrovrUnknownDialog,
+   * onDialogResolved: escalator.onDrovrDialogResolved }` to that function
+   * (see src/daemon/index.ts). Deliberately independent of `onBlocked`/
+   * `onPoll`/`onNoPrompt` above: drovr's watcher carries its own
+   * (pane, fingerprint) episode state in its own closure, so these never
+   * touch the Jira-shaped `state` map or its pollSeq-based debounce — only
+   * `managedSessionEscalations`'s own tracking, which `onBlocked`'s
+   * Butchr-detected path (`handleManagedSessionBlocked`) also feeds. See
+   * `onDrovrUnknownDialog`'s own doc comment for why a keyed or non-managed
+   * keyless pane is a no-op here.
+   */
+  onDrovrUnknownDialog: (escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }) => Promise<void>;
+  onDrovrDialogResolved: (resolved: { paneId: string; fingerprint: string }) => void;
 }
 
 /** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
@@ -525,24 +541,73 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   const managedSessionStalled = new Map<string, ManagedSessionEntry>();
 
   /**
-   * Log + mark once per (pane, fingerprint) episode. Called every poll the
-   * pane is blocked on an unanswerable dialog with `issue === null` and
-   * `deps.managedSessionOf` resolved it as a managed session — a NO-OP on
-   * every poll after the first for the SAME fingerprint (dedupe is the
-   * in-memory map itself, never a re-read of anything external: there is no
-   * comment channel to adopt from, unlike `escalate`/`escalateUnresponsive`
-   * above, so a daemon restart mid-episode simply re-logs once — acceptable
-   * per this ticket's own reduced scope, unlike the Jira flow's restart-safe
-   * adoption).
+   * Log + mark once per (pane, fingerprint) episode — the shared core both
+   * `handleManagedSessionBlocked` (Butchr's own KAN-756-hardened dialog
+   * parser, below) and `onDrovrUnknownDialog` (FACTORY-45 Part B: drovr's
+   * `createBlockingEscalationWatcher` hook, src/daemon/index.ts) funnel
+   * into — two independent detectors, one mark. A NO-OP whenever the
+   * TRACKED fingerprint for this pane is unchanged (dedupe is the in-memory
+   * map itself, never a re-read of anything external: there is no comment
+   * channel to adopt from, unlike `escalate`/`escalateUnresponsive` above,
+   * so a daemon restart mid-episode simply re-logs once — acceptable per
+   * this ticket's own reduced scope, unlike the Jira flow's restart-safe
+   * adoption). KNOWN, ACCEPTED RESIDUAL: Butchr's own parser and drovr's
+   * may derive slightly different fingerprints for the SAME real dialog
+   * (different text-extraction), so the two detectors racing the same
+   * episode can each log once under their own fingerprint — an extra
+   * journal line, never a functional miss, and the mark still reads
+   * "stalled" correctly either way.
    */
-  function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): void {
-    const fp = fingerprint(prompt);
+  function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): void {
     const prior = managedSessionStalled.get(paneId);
     if (prior?.fp === fp) return; // already logged + marked for this exact dialog this episode
     const since = new Date(deps.now()).toISOString();
     managedSessionStalled.set(paneId, { target, fp, since });
-    const options = prompt.options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
-    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${prompt.question}" options: ${options} fingerprint: ${fp}`);
+    const optionsLine = options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}`);
+  }
+
+  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. */
+  function clearManagedSessionStalled(paneId: string, reason: string): void {
+    if (!managedSessionStalled.delete(paneId)) return;
+    deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} ${reason} — clearing stalled mark`);
+  }
+
+  function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): void {
+    markManagedSessionStalled(paneId, target, prompt.question, prompt.options, fingerprint(prompt));
+  }
+
+  /**
+   * FACTORY-45 Part B: the other end of drovr's host-neutral escalation
+   * hook (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
+   * wired in `src/daemon/index.ts`. Drovr's own watcher already dedupes a
+   * dialog to exactly one call per (pane, fingerprint) episode in ITS OWN
+   * closure (see that package's docs/blocking-escalation.md), so this never
+   * re-derives a fingerprint of its own; it only decides WHERE the episode
+   * goes. `deps.managedSessionOf` resolving to `null` — a keyed pane, or a
+   * keyless pane that isn't a managed session — is deliberately a no-op
+   * here: Butchr's OWN existing pipeline (`onBlocked`'s own `issue`/
+   * `managedSessionOf` resolution) stays the authoritative detector and
+   * escalator for both of those, completely unchanged by this ticket.
+   */
+  async function onDrovrUnknownDialog(escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }): Promise<void> {
+    if (!deps.managedSessionOf) return;
+    let target: ManagedSessionTarget | null;
+    try {
+      target = await deps.managedSessionOf(escalation.paneId);
+    } catch (e) {
+      deps.log(`WARNING: [managed-escalation] could not resolve managed-session identity for pane ${escalation.paneId} (drovr hook): ${(e as Error)?.message ?? e}`);
+      return;
+    }
+    if (!target) return;
+    markManagedSessionStalled(escalation.paneId, target, escalation.question, escalation.options, escalation.fingerprint);
+  }
+
+  /** The resolution half of `onDrovrUnknownDialog` — drovr's own `hook.onDialogResolved`. Only clears an episode THIS fingerprint opened; a stale/foreign fingerprint (the episode already moved on, e.g. a newer one Butchr's own parser logged in the meantime) is left alone rather than clearing a live mark on a guess. */
+  function onDrovrDialogResolved(resolved: { paneId: string; fingerprint: string }): void {
+    const prior = managedSessionStalled.get(resolved.paneId);
+    if (!prior || prior.fp !== resolved.fingerprint) return;
+    clearManagedSessionStalled(resolved.paneId, "no longer blocked (drovr)");
   }
 
   /** Every managed session CURRENTLY marked stalled — see `Escalator.managedSessionEscalations`'s own doc comment. */
@@ -907,10 +972,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // old entry and re-logs, satisfying "a new fingerprint escalates
     // again" without needing a separate clear step here).
     for (const [paneId] of managedSessionStalled) {
-      if (!blocked.has(paneId)) {
-        deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} no longer blocked — clearing stalled mark`);
-        managedSessionStalled.delete(paneId);
-      }
+      if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
   }
 
@@ -977,5 +1039,5 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     })();
   }
 
-  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations };
+  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved };
 }

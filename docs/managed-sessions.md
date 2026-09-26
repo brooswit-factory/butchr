@@ -1017,24 +1017,57 @@ happens THEN, for a managed session specifically; every other keyless pane
 keeps the plain `"... blocked with an unanswerable prompt but no issue key —
 cannot escalate"` log line it always had.
 
-**Dialog recognition and auto-answering are deliberately NOT this daemon's
-job.** Per the director's own steering on this ticket's story (FACTORY-44):
-"any blocking dialog is drovr's job to detect and handle" — `@brooswit/drovr`
-(this repo's own dependency) owns blocking-prompt detection and safe
-auto-answering (the dev-channels prompt today; the "fullscreen renderer
-didn't finish starting last time" startup dialog once FACTORY-46 ships it),
-and is expected to grow a host-neutral escalation hook for whatever it still
-can't recognize. Butchr keeps no dialog list of its own. What follows is
-deliberately the SMALL remainder: react to a dialog `watchPrompts`
-(`src/agents/prompt.ts`/`src/agents/prompt-watch.ts`) already decided it
-cannot auto-answer, for the one case (a managed session) that had no
-escalation target at all before this ticket.
+**Drovr's own auto-answering is deliberately NEVER USED here — Butchr's
+own dialog-answering remains the SOLE answerer, fleet-wide, unchanged by
+this ticket.** `@brooswit/drovr` (this repo's own dependency, pinned
+>= 0.15.0) DOES recognize and — left to its own devices — press several
+`startup` dialogs (trust, development-channels, auto-mode-onboarding, and
+its own SPECULATIVE `fullscreen-renderer` matcher for the "didn't finish
+starting" recovery notice — see that package's own
+`docs/blocking-escalation.md`, and NOT to be confused with the separate
+"Try the new fullscreen renderer?" opt-in offer, which Butchr's own
+`chooseStartupAnswer` already answers and drovr's release does not touch
+at all). Running that auto-answering fleet-wide, independently and on its
+own 5s cadence alongside Butchr's own `watchPrompts`, was measured as a
+real hazard during this ticket's own review, not a hypothetical one:
+startup dialogs arrive in sequence (trust, then development-channels), a
+slow redraw can let both answerers read the SAME still-visible dialog, and
+the second answerer's keys then land on the NEXT dialog instead — an
+identical `down`+`enter` that correctly picks "Yes, I trust this folder"
+on the trust dialog would instead move to and confirm "Exit" on
+development-channels, killing the launch. So `createManagedSessionEscalationWatcher`
+(`src/agents/managed-session-escalation-watcher.ts`) hands drovr's watcher
+a client whose `sendKeys` is UNCONDITIONALLY a no-op — `list`/`read` pass
+through to the real herdr client untouched, so drovr's own detection and
+classification still work exactly as documented, but NOTHING it recognizes
+is ever pressed. Only its ESCALATION half (the host-neutral hook, below)
+is consumed. Butchr keeps no dialog list of its own, and never presses one
+of drovr's own recognized dialogs on its behalf — see "Two detectors, one
+mark" further down for what "two" means once neither one is an answerer.
 
-**What happens.** `createEscalator`'s `EscalatorDeps.managedSessionOf`
-(injected in production as `managedSessionOfPane`, `src/daemon/index.ts`)
-resolves a keyless pane's cwd back to its herd id
-(`agentIdOfWorkspacePath`) and checks it against the built-in
-`managed-sessions` rule (`ownsManagedSessionAgent`,
+Two INDEPENDENT paths feed the SAME minimal escalation below:
+
+- **Butchr's own detection** (unchanged by this section): `watchPrompts`
+  (`src/agents/prompt.ts`/`src/agents/prompt-watch.ts`) already decided it
+  cannot auto-answer a dialog (via Butchr's own `chooseStartupAnswer` — the
+  SOLE answerer, per above), and calls `onBlocked` with `issue === null`.
+- **Drovr's own detection** (FACTORY-45 Part B): a separate poll loop
+  (`src/daemon/index.ts`) calls `createManagedSessionEscalationWatcher(escalator)`'s
+  `.poll(herdr)` every 5s over the WHOLE fleet; for a dialog its own
+  `classifyBlockingScreen` reads as genuinely `unknown` (with a verbatim
+  `question`/`options`), `hook.onUnknownDialog` fires exactly once per
+  (pane, fingerprint) episode in DROVR's OWN closure, and
+  `hook.onDialogResolved` fires once that episode clears. A `startup`/
+  `permission` dialog it also recognizes is reported internally to drovr
+  itself (never pressed, per above) but never reaches Butchr's hook at
+  all — only a genuinely `unknown` dialog does.
+
+Either path resolves the SAME one question — is this pane a managed
+session? — through the SAME seam: `createEscalator`'s
+`EscalatorDeps.managedSessionOf` (injected in production as
+`managedSessionOfPane`, `src/daemon/index.ts`), which resolves a keyless
+pane's cwd back to its herd id (`agentIdOfWorkspacePath`) and checks it
+against the built-in `managed-sessions` rule (`ownsManagedSessionAgent`,
 `src/rules/session-definition-type.ts`). Only when that resolves — i.e. the
 pane is genuinely a filesystem-provider managed-session agent — does
 anything beyond the plain log line happen:
@@ -1077,6 +1110,36 @@ anything beyond the plain log line happen:
    is logged. The SAME fingerprint reappearing after a genuine clear is
    treated as a fresh episode (it escalates and logs again), never silently
    suppressed.
+
+### Two detectors, one mark
+
+"Two" here means two independent DETECTORS of an escalation-worthy dialog
+on a managed-session pane — never two answerers. Drovr's own auto-answering
+is never used (see above: its `sendKeys` is permanently a no-op in this
+wiring), so there is no answering overlap to worry about, and Butchr's own
+`chooseStartupAnswer` (`src/agents/prompt.ts`) is the ONLY thing that ever
+presses a key, completely unchanged by this ticket — it still handles
+everything it always did (trust, development-channels,
+auto-mode-onboarding-shaped dialogs, resume-from-summary, the
+settings-warning/settings-recommendation dialogs, Bypass-Permissions), and
+drovr's own recognition of a `startup`/`permission` dialog never reaches
+Butchr's escalation hook at all (only a genuinely `unknown` one does — see
+above).
+
+What DOES coexist is detection: Butchr's own dialog parser
+(`src/agents/prompt.ts`) and drovr's (`classifyBlockingScreen`) are
+independent implementations that can derive slightly different
+fingerprints for the SAME real dialog (different text-extraction). Both
+funnel into the same shared core
+(`markManagedSessionStalled`/`clearManagedSessionStalled`,
+`src/agents/escalation-loop.ts`), keyed by pane id, so whichever detector
+sees a dialog FIRST wins the mark; if the other later computes a different
+fingerprint for what is really the same episode, it reads as "a new
+dialog" and re-logs once more under its own fingerprint. **This is a
+known, accepted residual, not a defect**: it can produce one extra
+`[managed-escalation]` line for a single real episode, but never a missed
+escalation, and `managedSessionEscalations()`'s mark still correctly reads
+"stalled" either way.
 
 **How an operator finds and answers a blocked managed session.** Check
 `/health`'s `managedSessionEscalations` field, or grep the journal for
