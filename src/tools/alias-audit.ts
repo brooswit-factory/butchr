@@ -75,11 +75,17 @@ import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
  *     — but `{key, assignee}` carries no signal distinguishing that from a
  *     call that should have been adopt_worker.
  *
- *   confluence_create_page / confluence_update_page / confluence_get_page
- *     — always AMBIGUOUS. Each keeps a "general-purpose" / "page that
- *     ISN'T a ticket's doc" use blessed as legitimate, but none of their
- *     arguments (a raw page id, a title, a body) say whether the page in
- *     question is a ticket's own doc or not.
+ *   confluence_update_page / confluence_get_page — always AMBIGUOUS. Each
+ *     keeps a "general-purpose" / "page that ISN'T a ticket's doc" use
+ *     blessed as legitimate, but none of their arguments (a raw page id, a
+ *     title, a body) say whether the page in question is a ticket's own
+ *     doc or not.
+ *
+ *   confluence_create_page — always SANCTIONED (changed by FACTORY-84/
+ *     FACTORY-86: `set_doc` no longer creates a page at all, for a ticket's
+ *     own doc or otherwise, so there is no successor call this one could be
+ *     drifting away from — every call to it is the legitimate, only way to
+ *     create a Confluence page through Butchr).
  */
 
 export type AliasClass = "drift" | "sanctioned" | "ambiguous";
