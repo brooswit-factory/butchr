@@ -168,3 +168,111 @@ describe("the wake matrix a stood-down agent is PROMISED (stand_down's descripti
     expect(asleepAfter).toBe(false);
   });
 });
+
+// ===========================================================================
+// FACTORY-39 (FACTORY-37): a Bug is a BOSS, the same tier as an Epic — its
+// child Story reaching In Review must wake it exactly the way an Epic's
+// child Story/Task does. The general classifier (src/resources/issue.ts)
+// never reads `issuetype` (confirmed reading its own source for this
+// ticket) — this is a Bug-specific instance of the SAME mechanism the
+// matrix above already pins for Story/Task, not a parallel one, added as
+// its own regression per this ticket's own acceptance criteria rather than
+// relying on the generic claim alone.
+// ===========================================================================
+
+const BUG_BOSS = "BUTCHR-910";
+const STORY_WORKER = "BUTCHR-911";
+
+const bugIss = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
+  key,
+  summary: `${key} summary`,
+  status: "In Progress",
+  issuetype: key === BUG_BOSS ? "Bug" : "Story",
+  labels: [],
+  updated: "2026-09-11T00:00:00.000Z",
+  issuelinks: [],
+  ...over,
+}) as JiraIssue;
+
+const BUG_LINKS: Record<string, IssueLink[]> = {
+  [BUG_BOSS]: [{ key: STORY_WORKER, type: "Implements", otherEnd: "outward" } as IssueLink],
+  [STORY_WORKER]: [{ key: BUG_BOSS, type: "Implements", otherEnd: "inward" } as IssueLink],
+};
+
+async function bugSleepsThen(mutate: (store: Record<string, JiraIssue>) => void): Promise<{ asleepBefore: boolean; asleepAfter: boolean }> {
+  const store: Record<string, JiraIssue> = {
+    [BUG_BOSS]: bugIss(BUG_BOSS, { labels: ["agent:working", "pr:open"] }),
+    [STORY_WORKER]: bugIss(STORY_WORKER, { labels: ["agent:working", "pr:open"] }),
+  };
+  const declared = new Set<string>();
+  const sd = createStandDownRegistry({
+    now: () => Date.now(),
+    maxSleepMinutes: 60,
+    yieldLoopCount: 5,
+    yieldLoopWindowMinutes: 5,
+    addComment: async () => {},
+    comments: async () => [],
+  });
+  const resourceType = createIssueResourceType({
+    search: async (jql: string) => {
+      if (jql.startsWith("key IN")) {
+        const keys = jql.slice(jql.indexOf("(") + 1, jql.lastIndexOf(")")).split(",").map((s) => s.trim());
+        return keys.flatMap((k) => (store[k] ? [store[k]!] : []));
+      }
+      return [store[BUG_BOSS]!, store[STORY_WORKER]!];
+    },
+    links: async (k: string) => BUG_LINKS[k] ?? [],
+    comments: async () => [{ id: "c1", body: "", created: "", authorEmail: null }],
+    standDown: sd,
+  });
+  const running = new Set<string>();
+  const stop = runResourceLoop(resourceType, {
+    herd: {
+      runningIssues: async () => [...running],
+      staleIssues: async () => [],
+      spawn: async (spec) => { running.add(spec.key); },
+      stop: async (issue) => { running.delete(issue); },
+      paneFor: async () => null,
+      nudge: async () => ({ delivered: true }),
+    },
+    ownsId: () => true,
+    notify: async () => {},
+    checkDeclaredDone: async (restingRunning) => {
+      const out = new Set<string>();
+      for (const id of restingRunning) if (declared.delete(id)) out.add(id);
+      return out;
+    },
+    invalidateDeclaredDone: (desired) => { for (const id of desired) declared.delete(id); },
+    intervalMs: 40,
+  });
+  try {
+    await wait(70);
+    sd.standDown(BUG_BOSS, new Map([[BUG_BOSS, ["c1"]], [STORY_WORKER, ["c1"]]]));
+    declared.add(BUG_BOSS);
+    await wait(120);
+    const asleepBefore = sd.isAsleep(BUG_BOSS);
+    mutate(store);
+    await wait(120);
+    return { asleepBefore, asleepAfter: sd.isAsleep(BUG_BOSS) };
+  } finally {
+    stop();
+  }
+}
+
+describe("FACTORY-39: a Bug boss wakes the same way an Epic/Story boss does", () => {
+  test("WAKES: a child Story's status change to In Review — the event this ticket's own acceptance criteria names", async () => {
+    const { asleepBefore, asleepAfter } = await bugSleepsThen((store) => {
+      store[STORY_WORKER] = { ...store[STORY_WORKER]!, status: "In Review", updated: "2026-09-11T02:00:00.000Z" };
+    });
+    expect(asleepBefore).toBe(true);
+    expect(asleepAfter).toBe(false);
+  });
+
+  test("WAKES: a summary edit on the Bug's own ticket", async () => {
+    const { asleepBefore, asleepAfter } = await bugSleepsThen((store) => {
+      store[BUG_BOSS] = { ...store[BUG_BOSS]!, summary: "renamed by a human", updated: "2026-09-11T02:00:00.000Z" };
+    });
+    expect(asleepBefore).toBe(true);
+    expect(asleepAfter).toBe(false);
+  });
+});

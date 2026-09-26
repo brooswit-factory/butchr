@@ -3,10 +3,17 @@ import { capacityRoleFor, UNCOUNTED_ISSUE_TYPES } from "../../src/agents/capacit
 import { createAdmissionController, type AgentCapacityRole } from "../../src/agents/admission.js";
 
 /**
- * BUTCHR-422 — the fleet cap counts only leaf work (Task, Sub-task, Bug).
- * Project agents and Epic/Story agents are classified "sentinel": never
+ * BUTCHR-422 — the fleet cap counts only leaf work (Task, Sub-task).
+ * Project agents and Epic/Story/Bug agents are classified "sentinel": never
  * counted toward `maxAgents`, never withheld. `capacity-role.ts` does not
  * exist before this change, so this whole file fails to load on prior main.
+ *
+ * FACTORY-39 (FACTORY-37, review fix): Bug moved from the counted set to
+ * the uncounted one here — a Bug is now a BOSS, the same tier as an Epic,
+ * so it idles while its Stories run exactly like an Epic does, and must be
+ * exempt from the cap the same way. The expectations this pinned for Bug as
+ * a worker are an intended spec change, authorized at review, not a
+ * weakening — Task and Sub-task stay counted.
  */
 
 const types: Record<string, string> = {
@@ -17,17 +24,17 @@ const noRuleRole = (): AgentCapacityRole | undefined => undefined;
 const roleOf = (id: string) => capacityRoleFor(id, noRuleRole, issuetypeOf);
 
 describe("capacityRoleFor (BUTCHR-422)", () => {
-  test("Epic and Story agents are uncounted (sentinel); Task, Sub-task and Bug are counted (worker)", () => {
+  test("Epic, Story and Bug agents are uncounted (sentinel); Task and Sub-task are counted (worker)", () => {
     expect(roleOf("jira-work:epics:BUTCHR-1")).toBe("sentinel");
     expect(roleOf("jira-work:stories:BUTCHR-2")).toBe("sentinel");
     expect(roleOf("jira-work:tasks:BUTCHR-3")).toBe("worker");
     expect(roleOf("jira-work:subtasks:BUTCHR-4")).toBe("worker");
-    expect(roleOf("jira-work:bugs:BUTCHR-5")).toBe("worker");
+    expect(roleOf("jira-work:bugs:BUTCHR-5")).toBe("sentinel"); // FACTORY-39: Bug is a boss now, not leaf work
   });
 
   test("issue type matching is case- and whitespace-insensitive", () => {
     expect(roleOf("jira-work:stories:BUTCHR-6")).toBe("sentinel");
-    expect([...UNCOUNTED_ISSUE_TYPES].sort()).toEqual(["epic", "story"]);
+    expect([...UNCOUNTED_ISSUE_TYPES].sort()).toEqual(["bug", "epic", "story"]);
   });
 
   test("project-tier agents (bare project key) are uncounted", () => {
@@ -52,8 +59,9 @@ describe("capacityRoleFor (BUTCHR-422)", () => {
     expect(capacityRoleFor("jira-work:tasks:BUTCHR-3", () => "worker", issuetypeOf)).toBe("worker");
   });
 
-  test("Epic/Story stay uncounted even if their rule says worker", () => {
+  test("Epic/Story/Bug stay uncounted even if their rule says worker", () => {
     expect(capacityRoleFor("jira-work:epics:BUTCHR-1", () => "worker", issuetypeOf)).toBe("sentinel");
+    expect(capacityRoleFor("jira-work:bugs:BUTCHR-5", () => "worker", issuetypeOf)).toBe("sentinel");
   });
 
   test("BUTCHR-425: jira-project agents are always sentinels, never workers, even when their rule's own role is \"worker\" (the default a rule file that omits `role` gets)", () => {
@@ -65,10 +73,10 @@ describe("capacityRoleFor (BUTCHR-422)", () => {
 });
 
 describe("admission with leaf-only capacity (BUTCHR-422)", () => {
-  test("with the cap full of Task agents, Epic and Story agents still start; another Task is withheld", async () => {
+  test("with the cap full of Task agents, Epic, Story and Bug agents still start; another Task is withheld", async () => {
     const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:tasks:BUTCHR-3"], roleOf });
     const admitted = await ctrl.admit(["jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2", "jira-work:bugs:BUTCHR-5"], []);
-    expect(admitted).toEqual(["jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2"]);
+    expect(admitted).toEqual(["jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2", "jira-work:bugs:BUTCHR-5"]);
   });
 
   test("resident Epic/Story/project agents consume no slots — only leaf work is counted", async () => {

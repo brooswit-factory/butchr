@@ -128,8 +128,16 @@ function summaryOf(issue: unknown): string | undefined {
   return (issue as { fields?: { summary?: string } })?.fields?.summary;
 }
 
-/** An Epic's children are Stories, a Story's children are Tasks. A Task is the bottom of the hierarchy — no child type. */
-const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task" };
+/**
+ * An Epic's children are Stories, a Story's children are Tasks. A Task is
+ * the bottom of the hierarchy — no child type. A Bug is a BOSS, the same
+ * tier as an Epic (FACTORY-37/FACTORY-39): it triages and creates Stories
+ * for the fix rather than fixing the code itself, so it gets the identical
+ * "Story" child type an Epic gets — never a new tier, never a new child
+ * shape, just another caller type landing on the same row Epic already
+ * occupies.
+ */
+const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task", Bug: "Story" };
 
 // ---------------------------------------------------------------------------
 // BUTCHR-244: what a disposition write DOES and DOES NOT establish.
@@ -204,7 +212,7 @@ function findDuplicateWorker(callerIssue: unknown, summary: string): WorkerRef |
 /** AccountIds are not secrets; truncated to match src/config/config.ts's own startup-banner format exactly (BUTCHR-110) — never invent a second truncation convention for the same value. */
 const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
 
-type CollisionTier = "project" | "epic" | "story" | "task";
+type CollisionTier = "project" | "epic" | "story" | "task" | "bug";
 
 /**
  * One side of a possible collision. `describe` is a FULL CLAUSE naming
@@ -245,7 +253,20 @@ function childSide(tier: "Epic" | "Story" | "Task", accountId: string | undefine
  * daemon's config says that tier's identity normally is" and is never told
  * to edit a variable that did not produce the collision.
  */
-function callerIssueSide(tier: "Epic" | "Story" | "Task", callerKey: string, roles: Roles, accountId: string | undefined): CollisionSide {
+function callerIssueSide(tier: "Epic" | "Story" | "Task" | "Bug", callerKey: string, roles: Roles, accountId: string | undefined): CollisionSide {
+  // A Bug has no role variable at all (unlike Story/Task/Epic, it is never
+  // staffed by this daemon's own role map — see `src/config/config.ts`'s
+  // `Config.assignees`; a Bug's assignee is whoever the bug was filed to).
+  // Naming BUTCHR_ASSIGNEE_EPIC here would be exactly the wrong-variable
+  // failure this function's own doc comment warns against, just for a new
+  // tier instead of a stale local value.
+  if (tier === "Bug") {
+    return {
+      tier: "bug",
+      describe: `the caller (bug tier, accountId observed on ${callerKey}'s own assignee — a Bug has no role variable on this daemon; its assignee is whoever the bug was filed to, never daemon-staffed)`,
+      accountId,
+    };
+  }
   const envVar = envVarFor(tier);
   const local = tier === "Story" ? roles.story : tier === "Task" ? roles.task : roles.epic;
   const localState = local ? `currently set to ${truncAccountId(local)} here` : "UNSET here";
@@ -665,9 +686,10 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // variable that governs the caller's tier: those can differ (a
   // hand-assigned ticket), and the observed value is the one that decides
   // whether GitHub will refuse the review. `callerType` is known to be
-  // "Story" or "Epic" here (childType resolved above via CHILD_TYPE).
+  // "Story", "Epic" or "Bug" here (childType resolved above via CHILD_TYPE;
+  // FACTORY-39 added the Bug row alongside Epic's).
   const collisionMsg = collisionBetween(
-    callerIssueSide(callerType as "Story" | "Epic", callerKey, roles, assigneeAccountIdOf(callerIssue)),
+    callerIssueSide(callerType as "Story" | "Epic" | "Bug", callerKey, roles, assigneeAccountIdOf(callerIssue)),
     childSide(childType, role),
   );
   const identityCollision = collisionMsg ? await traceCollision(ops, key, callerKey, collisionMsg) : undefined;
@@ -1311,7 +1333,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   // collision check did not exist. "Not checked" must never look like
   // "checked and clean".
   const callerRead = await resolveCollisionSide(() => ops.getIssue(callerKey), `reading ${callerKey}'s own assignee failed`);
-  const callerType = callerRead.value ? (issuetypeOf(callerRead.value) as "Story" | "Task" | "Epic" | undefined) : undefined;
+  const callerType = callerRead.value ? (issuetypeOf(callerRead.value) as "Story" | "Task" | "Epic" | "Bug" | undefined) : undefined;
   const callerAccountId = callerRead.value ? assigneeAccountIdOf(callerRead.value) : undefined;
   const collisionMsg = callerType
     ? collisionBetween(callerIssueSide(callerType, callerKey, roles, callerAccountId), childSide(issuetype, role))
