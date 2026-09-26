@@ -93,12 +93,20 @@ completes this column with:
 
 ```
 # For each of the 13 agents' workspaces (~/.local/state/candlestix/agents/<id>/):
-$ jq '{mcpServers: (.mcpServers // {} | to_entries | map({name: .key, command: .value.command, args: .value.args, transport: (.value.url // .value.command | if . then (if (.value.url) then "http" else "stdio" end) else null end)}))}' <id>/mcp.json
+$ jq '{mcpServers: (.mcpServers // {} | to_entries | map({name: .key, command: .value.command, args: .value.args, transport: (if (.value.url) then "http" elif (.value.command) then "stdio" else null end)}))}' <id>/mcp.json
 # For the 10 MUD players specifically, also read the pre-daemon file:
 $ cat <id>/mcp.wss-before-daemon.json | jq '{mcpServers: (.mcpServers // {} | keys)}'
 # Notification flags: whichever of the agent's own launch argv/config marks a server "notifying" —
 # cross-reference against the BAKR-63 inventory's own (n)/(q) convention (comment 23524) for consistency.
 ```
+
+(Tested above on a two-server sample `mcp.json` — one `url`-bearing http
+entry, one `command`-bearing stdio entry — both `transport` values resolve
+correctly; the earlier draft of this command re-piped `.` through
+`.value.url // .value.command` and then tried to re-index the resulting
+STRING as `.value.url` again, which `jq` rejects with `Cannot index string
+with string "value"`. This version reads `.value` directly in one
+expression, never re-piping through the extracted scalar.)
 
 Post the completed column as a new comment on CNDLX-45 (never edit the
 existing 23525 comment) — the same "append, don't rewrite" convention every
@@ -232,6 +240,7 @@ $ butchr session create <name> \
     --vendor claude --tier <tier> --permission-mode auto \
     --execution persistent --account <none|permanent> --role sentinel \
     --mcp-servers '<the mcpServers JSON array from the .example file, with real urls/env-vars>' \
+    [--frozen]                                     # MUD players only, set AT CREATION — see below
     [--freeze-controllers director-brooswit-mud]   # MUD players only
 ```
 
@@ -239,17 +248,19 @@ $ butchr session create <name> \
 already exists in either the active or archive directory —
 `docs/managed-sessions.md` "Archive/unarchive"'s own collision-check note —
 so a repeat run is safe to attempt and simply tells you if it's already
-there.) For a MUD-player definition, **immediately follow creation with**:
-
-```
-$ butchr session freeze <name>
-```
-
-so it starts life frozen (matching old Bakr `"off"` → Butchr `frozen`) —
-`create` itself has no `--frozen` flag to set this at creation time (verify
-against your own build's `butchr session create --help`; if one has been
-added since this runbook was written, use it instead and skip this second
-step).
+there.) **For the 10 MUD-player definitions, pass `--frozen` on the `create`
+call itself — never create-then-freeze as two separate steps.**
+`src/cli/session-cli.ts`'s own USAGE line lists `[--frozen]` as a `create`
+flag (it sets the manifest's `frozen: true` at write time, same as `freeze`'s
+own manifest-gate half — see `docs/managed-sessions.md` "Two freeze gates").
+A create-then-freeze sequence would leave a real window — up to one daemon
+poll, `MANAGED_SESSIONS_POLL_MS` = 15s — during which the definition is
+valid, unfrozen, and therefore ELIGIBLE: the built-in query could stage a
+live, unfrozen MUD-player agent in that window, exactly the outcome §2's own
+mapping (old Bakr/Candlestix `"off"` → Butchr `frozen`, no live agent) exists
+to prevent. `--frozen` at creation closes that window entirely — the
+manifest is written already-frozen, so it is never eligible for even one
+poll.
 
 **Expected**: `butchr session show <name>` prints the definition back with
 every field matching §2's table, and (once the daemon's next poll runs,
@@ -409,12 +420,14 @@ leaving both) while the discrepancy is investigated.
 
 ### 5.4 The 3 directors — LAST, gated on §4.4
 
-**Do not start this section until §4.4's BOTH conditions are met.** Then, per
-director (`director-brooswit-factory` first per its own "migrates last, with
-the other 2" note, remaining 2 in either order, `director-brooswit-factory`
-never before `director-brooswit-minecraft`/`director-brooswit-mud` per
-CNDLX-45's own per-row notes — verify no ordering constraint was added since
-this runbook was written):
+**Do not start this section until §4.4's BOTH conditions are met.** The 3
+directors migrate **as a group, after every other agent** — CNDLX-45's own
+per-row notes say `director-brooswit-factory` "migrates last" and the other
+two go "with the directors (last)," which is a claim about the GROUP's
+position relative to everything else, not a claim about internal order
+within the group. **No internal ordering among the 3 directors is decided**
+— see Open Question 5; do not infer one. Pick any order for the 3 that is
+operationally convenient, and, per director:
 
 1. Precondition: staged, `persistent`, `permanent` account, `auto` +
    verified-real strict-MCP (§4.4), rocketr + Atlassian MCP verified (§4.2).
@@ -492,7 +505,7 @@ still exists in the bundle above.
 # On Codey:
 $ ps -eo pid,ppid,args | grep -iE 'claude|codex' | grep -v grep   # every live agent process
 $ bakr status --json 2>/dev/null | jq '[.[] | select(.state=="on")]'         # every Bakr-supervised agent still "on"
-$ candlestix agents.json equivalent listing (verify Candlestix's own status command)
+$ jq '[.[] | select(.state=="on" or .state=="running")]' ~/.local/state/candlestix/agents.json  # every Candlestix-supervised agent still live (path/shape per CNDLX-45 c23525 — same file §1.2/§3 already read; CONFIRM Candlestix's own status command has no better live-state check before trusting a static file read for this)
 $ butchr session list                                                        # every Butchr-eligible managed-session agent
 ```
 
@@ -565,3 +578,14 @@ suffices — no live-agent state changed.
    BUTCHR-453/S7 had not landed as of this runbook being written; re-verify
    the field's real name and shape against `src/resources/session-
    definition.ts` once it does, rather than assuming a name.
+7. **`permissionMode: "auto"` on Nexus and the 10 MUD players is this
+   runbook's own inference, not a value the ticket/epic pins.** The ticket's
+   mapping only explicitly pins `auto` for the 3 directors ("permission mode
+   auto with strict MCP"); Nexus's and the MUD players' `auto` here is
+   carried over from BAKR-63/CNDLX-45's own read-only inventory of their OLD
+   effective permission mode (BAKR-63 c23524: "no `--permission-mode` flag...
+   BAKR-62 observed as auto mode"; CNDLX-45 c23525: "the spawn code gives
+   `auto` to channel agents") — a reasonable "preserve current behavior"
+   default, but confirm with admin-assembly/whoever owns each agent's actual
+   operating policy before treating it as settled, same as any other
+   placeholder in this document.
