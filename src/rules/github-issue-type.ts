@@ -71,6 +71,7 @@ export function specForGithubIssue({ agentKey, rule, issue }: GithubIssueMatch):
     parent: null,
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
   };
 }
 
@@ -91,6 +92,7 @@ export function specForGithubIssueQuery(rule: Rule, agentKey: string): SpawnSpec
     parent: null,
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
   };
 }
 

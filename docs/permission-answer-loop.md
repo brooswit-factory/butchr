@@ -1,4 +1,14 @@
-# The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67)
+# The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
+
+> **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
+> with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
+> "always allow" option.** Matching Claude's "always allow" wording was
+> fragile: the read-permission dialog says "Yes, allow reading … from this
+> project" and was silently skipped, freezing the codey canary. No stored
+> allow rules are written any more. Every skipped pane is now logged
+> (`[permission-answer] <label> (<pane>) SKIPPED, left for a human: <reason>`),
+> once per pane+reason. Text below describing the "always allow" option
+> predates this change.
 
 ## What it is
 
@@ -49,17 +59,32 @@ managed-sessions poll (`MANAGED_SESSIONS_POLL_MS`, 15s), same shape as the
 pre-existing `roles`/`accountPolicies` maps (BUTCHR-408/BUTCHR-460).
 
 The permission-answer timer's own `eligiblePanes` hook (`lizardModeLabel` in
-`src/daemon/index.ts`) consults that map fresh every 20s tick: for each pane
-herdr reports, resolve its managed-session agent id from `cwd`
-(`agentIdOfWorkspacePath` + `ownsManagedSessionAgent`, the same resolution
+`src/daemon/index.ts`) consults `ruleLizardModeOf`/`lizardModeLabelFor` fresh
+every 20s tick: for each pane herdr reports, resolve its rule-engine agent id
+from `cwd` (`agentIdOfWorkspacePath`, the same resolution
 `managedSessionOfPane` already uses for escalation), and include it only if
-`managedSessionLizardModes.get(id) === true`. A pane that resolves to
-anything else — an ordinary rule-launched agent, a managed session that
-never set the field, one not yet observed this daemon's lifetime — is
-excluded, matching "absent field means today's behaviour exactly" down to
-the herdr call count: a tick with nothing eligible costs exactly one
-`agent.list()` call and nothing else (see `runPermissionAnswerTick`'s own
-doc comment).
+that id's own lizard-mode opt-in is `true`. For a managed session
+(`ownsManagedSessionAgent`) that opt-in comes from the live
+`managedSessionLizardModes` map exactly as before; for every OTHER
+rule-engine agent id (FACTORY-87/FACTORY-76 — a `jira-work`, `jira-project`,
+`github-issue`, `github-pr`, or plain `filesystem` rule) it comes from that
+id's own `Rule.lizardMode`, looked up against the daemon's already-loaded
+`rules` list (see `docs/execution-modes.md`'s "`permissionMode` and
+`lizardMode`" section for why a rule needs no live poll the way a
+managed-session definition does). A pane that resolves to anything else — a
+legacy/bare-issue agent, a managed session or rule that never set the field,
+a managed session not yet observed this daemon's lifetime — is excluded,
+matching "absent field means today's behaviour exactly" down to the herdr
+call count: a tick with nothing eligible costs exactly one `agent.list()`
+call and nothing else (see `runPermissionAnswerTick`'s own doc comment).
+`ruleLizardModeOf`/`lizardModeLabelFor` themselves are pure, exported
+functions in `src/agents/permission-answer-loop.ts` (`src/daemon/index.ts`
+only binds them to its own live `rules`/`managedSessionLizardModes`/
+`ownsManagedSessionAgent`) — extracted there specifically so the decision has
+its own unit tests independent of `src/daemon/index.ts`, which has no
+exports and cannot itself be imported by a test without running the whole
+daemon's startup side effects (PR #478 review, `permission-answer-loop.test.ts`'s
+own "`ruleLizardModeOf` / `lizardModeLabelFor`" tests).
 
 **Toggling the field is live, no respawn.** Since it isn't part of argv, an
 operator can flip `lizardMode` in a manifest and see it take effect on the
@@ -85,7 +110,17 @@ see that module's own test asserting exactly this), so there is no argv for
 a stale-argv check to compare in the first place, and no persist/read-back
 pair to keep in sync. This is checked in, not merely asserted: see
 `session-definition-type.test.ts`'s "lizardMode is deliberately NEVER
-carried into the SpawnSpec" test.
+carried into the SpawnSpec" test. `Rule.lizardMode` (FACTORY-87) keeps the
+exact same shape: no `specFor*` builder ever puts it on its `SpawnSpec`
+output either, for the same reason.
+
+`Rule.permissionMode` (FACTORY-87) is the opposite case, and needed no new
+persist/read-back logic at all: `buildWorkspace()`/`staleIssues()`'s pair
+above already reads/writes `spec.permissionMode` generically, for any spawn —
+it was never gated on being a managed session — so a rule-launched agent
+setting `permissionMode` gets FACTORY-43's stale-argv safety for free. See
+`docs/execution-modes.md`'s "`permissionMode` and `lizardMode`" section for
+the full field story on the rule side.
 
 ## Why its own timer
 
@@ -192,14 +227,10 @@ that is a natural, separable follow-up.
 
 ## Not in this version
 
-- **Rule-launched agents** (jira-work / jira-project / github / filesystem
-  rules) do not get a `lizardMode`-equivalent switch here — FACTORY-76 is
-  the companion story extending the same mechanism to them, filed
-  separately so the two don't diverge on field name/shape. Coordinate with
-  that ticket rather than duplicating its work.
-- **No live definition was switched over.** Per FACTORY-67's own
-  constraint, this ticket is code + tests + docs only — no live runtime,
-  service, or definition was touched. The existing codey definitions (all
-  `permissionMode: "auto"`, none setting `lizardMode`) load and behave
-  unchanged. Deploys and any live cutover go through admin-assembly at the
-  operator's direction.
+- **No live definition or rule was switched over.** Per FACTORY-67's own
+  constraint, this ticket (and its rule-side companion, FACTORY-87/FACTORY-76)
+  is code + tests + docs only — no live runtime, service, definition, or rule
+  was touched. The existing codey definitions (all `permissionMode: "auto"`,
+  none setting `lizardMode`) and every existing rule (none setting either new
+  field) load and behave unchanged. Deploys and any live cutover go through
+  admin-assembly at the operator's direction.

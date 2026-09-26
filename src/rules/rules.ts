@@ -43,6 +43,28 @@ export type AgentHarness = (typeof AGENT_HARNESSES)[number];
  * for every existing importer of `rules.js`.
  */
 export { AGENT_EFFORTS, type AgentEffort };
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
+ * Claude permission-mode values `SessionDefinition.permissionMode` accepts
+ * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
+ * an INDEPENDENT copy here rather than imported: that module already imports
+ * `ExecutionMode`/`AccountPolicy`/`AgentRole`/`McpServerBinding` FROM this
+ * file, so importing its `SESSION_PERMISSION_MODES` back would cycle this
+ * file with it. Claude-only, like `SessionDefinition.permissionMode` —
+ * silently never forwarded to a Codex or Agy launch (`agentLaunchConfig`,
+ * src/agents/argv.ts, only ever reads `spec.permissionMode` on its Claude
+ * branch). Unlike `SessionDefinition`, a `Rule` has no single fixed `vendor`
+ * to validate this against — `agentPreferences` is a ranked FALLBACK list,
+ * not one committed choice, and the harness an individual agent actually
+ * gets is a runtime decision (`src/agents/herd.ts`) no validator here can
+ * see — so there is deliberately no Codex-vendor rejection for this field or
+ * for `Rule.lizardMode` below, unlike `SessionDefinition`'s hard rejection of
+ * both for `vendor: "codex"`: a rule that falls back to Codex/Agy for one
+ * launch simply gets the same silent no-op an absent `permissionMode`
+ * already gives that branch today.
+ */
+export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
 
 /**
  * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
@@ -297,11 +319,67 @@ export interface Rule {
    * `parent`/description-derived Jira keys already are).
    */
   linkedDescriptionLinks?: boolean;
+  /**
+   * FACTORY-87 — Claude `--permission-mode` for agents THIS rule launches,
+   * forwarded to `SpawnSpec.permissionMode` by every `specFor*` builder
+   * (`specForMatch`/`specForRuleQuery`, `specForProject`,
+   * `specForGithubIssue*`, `specForGithubPr*`, `specForFilesystem*`).
+   * `src/agents/workspace.ts`'s persist-at-spawn/read-back stale-argv pair
+   * (FACTORY-43) already reads `spec.permissionMode` generically for every
+   * provider, not just managed sessions, so no new wiring is needed there —
+   * only threading this field into each builder's own `SpawnSpec` output.
+   * Absent means today's behaviour exactly: no flag is sent, so Drovr's own
+   * default (`bypassPermissions`, `agentLaunchConfig`, src/agents/argv.ts)
+   * applies unchanged — INCLUDING for a `jira-project` rule, whose own
+   * unconditional `permissionMode: "auto"` default there is set BEFORE
+   * `spec.permissionMode`'s spread and so is overridden by this field only
+   * when present. See `lizardMode` immediately below: the two fields are
+   * independent (either may be set without the other), but pairing this with
+   * `"default"` and `lizardMode: true` is the combination FACTORY-76 exists
+   * for. See `RULE_PERMISSION_MODES`'s own doc comment for why there is no
+   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
+   */
+  permissionMode?: RulePermissionMode;
+  /**
+   * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42's
+   * `SessionDefinition.lizardMode`) — opts every agent THIS rule launches
+   * into the daemon's standalone permission-answer timer
+   * (`src/agents/permission-answer-loop.ts`, wired in `src/daemon/index.ts`):
+   * drovr's `autoAnswerPermissions` answers an unambiguous Claude
+   * tool-permission dialog on that agent's pane — see that module's own doc
+   * comment / `docs/permission-answer-loop.md` for exactly which option it
+   * presses and how it is logged, deliberately not restated here since that
+   * is drovr's own answering policy, not this field's concern (and is a
+   * moving target — FACTORY-93/FACTORY-67) — so a rule kept in
+   * `permissionMode: "default"` is never left frozen on that dialog for
+   * hours. Absent/false means today's behaviour exactly: this rule's panes
+   * are never scanned or touched by that timer, matching every rule that
+   * does not set this field. Resolved live from the loaded `rules` list
+   * (`ruleLizardModeOf`, an exported pure function in
+   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
+   * it to its own live state) — deliberately NEVER reaches `SpawnSpec`/argv,
+   * same as `SessionDefinition.lizardMode`: a daemon-side behaviour toggle
+   * only, so there is no stale-argv concern to get wrong. See
+   * `RULE_PERMISSION_MODES`'s own doc comment for why there is no
+   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
+   * FACTORY-87 wires this (and `permissionMode` above) for exactly the four
+   * rule kinds FACTORY-76 scopes — `jira-work`/`jira-project`/`github-issue`/
+   * `github-pr`/`filesystem` (every `specFor*` builder forwards
+   * `permissionMode`; `ruleLizardModeOf` covers every rule-engine agent id).
+   * Both fields validate for `jira-idea`/`zendesk-ticket` rules too — same
+   * "every provider accepts every value" house style `execution`/`account`/
+   * `role` already use above — but neither is wired into
+   * `specForJiraIdea`/`specForZendeskTicket` yet, so setting them on one of
+   * those two rule kinds is accepted at load and silently has no effect: a
+   * deliberate, documented scope boundary, not an oversight.
+   */
+  lizardMode?: boolean;
 }
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
+  "permissionMode", "lizardMode",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -488,6 +566,12 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
     const { linkedDescriptionLinks } = raw;
     if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
+    // FACTORY-87: independent of resourceProvider/execution/account/role/linked-eventing, same
+    // house style — see RULE_PERMISSION_MODES's own doc comment for why there is no Codex-vendor
+    // rejection here, unlike SessionDefinition's own permissionMode/lizardMode fields.
+    const { permissionMode, lizardMode } = raw;
+    if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
+    if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
@@ -512,6 +596,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
       ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
+      ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
+      ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

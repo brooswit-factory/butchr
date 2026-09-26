@@ -1,9 +1,11 @@
 import { Elysia } from "elysia";
 import type { McpHandle } from "@brooswit/thatch";
 import { renderDashboard, type DashboardHeaderInfo } from "./dashboard-page.js";
+import { renderConfigInventory, type ConfigInventoryFetchResult } from "./config-inventory-page.js";
 import type { HealthStatus } from "../daemon/health.js";
 import type { DashboardResponse } from "../agents/dashboard.js";
 import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
+import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -75,6 +77,31 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         header: deps.header(),
         terminalLinkHref: (pane) => `/agents/pane/${encodeURIComponent(pane)}/attach`,
         resourceLinkHref: (key) => `/resource/${encodeURIComponent(key)}/open`,
+        // FACTORY-81: a pure URL builder, same as the two above — adds NO
+        // I/O to this route (see dashboard-page.ts's own `configLinkHref`
+        // doc comment for why this back-link never needs the inventory).
+        configLinkHref: (anchor) => `/configurations#${anchor}`,
+      });
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    })
+    // FACTORY-81: the Configurations view — a pure, synchronous render
+    // (src/web/config-inventory-page.ts) of the SAME `/config-inventory`
+    // shape, plus the SAME poll-fed `/dashboard` rows `/` already reads, for
+    // the cross-link matching only. `configInventory()` DOES do real disk
+    // I/O (see that dep's own doc comment) — accepted here because this is
+    // a distinct, less-frequently-hit route, never added to `/`'s own
+    // request path. A rejected `configInventory()` is reported as a loud
+    // fetch-failure banner (requirement 4), never a thrown 500.
+    .get("/configurations", async () => {
+      const dashboard = await deps.dashboard();
+      let result: ConfigInventoryFetchResult;
+      try {
+        result = { ok: true, inventory: await deps.configInventory() };
+      } catch (e) {
+        result = { ok: false, error: (e as Error).message };
+      }
+      const html = renderConfigInventory(result, dashboard.rows, {
+        dashboardLinkHref: (resourceKey) => `/#${agentRowAnchorId(resourceKey)}`,
       });
       return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
     })

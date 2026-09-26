@@ -37,7 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
-import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
+import { ruleLizardModeOf as sharedRuleLizardModeOf, startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -206,12 +206,20 @@ const managedSessionResolvedAgents = new Map<string, { model: string; effort?: A
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
  * an eligible managed-session definition opted into "lizard mode"
- * (`SessionDefinition.lizardMode`). Consulted below by `lizardModeLabel`,
- * which the permission-answer timer's `eligiblePanes` hook is built from —
- * see `ManagedSessionResourceDeps.lizardModes`'s own doc comment
- * (src/rules/session-definition-type.ts) for why this is deliberately LIVE
- * rather than persisted-at-spawn the way `permissionMode`/`strictMcpConfig`
- * are (FACTORY-43): this field never reaches the launched process's argv.
+ * (`SessionDefinition.lizardMode`). Consulted below by `ruleLizardModeOf`,
+ * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
+ * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
+ * comment (src/rules/session-definition-type.ts) for why this is
+ * deliberately LIVE rather than persisted-at-spawn the way
+ * `permissionMode`/`strictMcpConfig` are (FACTORY-43): this field never
+ * reaches the launched process's argv. FACTORY-87: a RULE-launched agent
+ * (jira-work/jira-project/github/filesystem, as opposed to a managed
+ * session) has no per-file manifest of its own to rebuild a map like this
+ * from every poll — its `lizardMode` lives on its own `Rule`
+ * (src/rules/rules.ts), which is loaded once at startup, so `ruleLizardModeOf`
+ * below reads it straight from the already-loaded `rules` list instead of a
+ * second map, the same "rule-level fallback" shape `ruleRoleOfAgent` already
+ * uses for `role`.
  */
 const managedSessionLizardModes = new Map<string, boolean>();
 /**
@@ -235,6 +243,22 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — `lizardMode`'s
+ * own equivalent of `ruleRoleOfAgent` immediately above: true iff `id`'s
+ * agent should be scanned/answered by the permission-answer timer. The
+ * actual decision (`ruleLizardModeOf`, `src/agents/permission-answer-loop.ts`)
+ * is a pure, importable function — extracted there (PR #478 review) so it
+ * has its own unit tests independent of this module, which has no exports
+ * and cannot itself be imported by a test without running the whole
+ * daemon's startup side effects. This is just the daemon's own binding of
+ * that decision to its own live state (`rules`, `managedSessionLizardModes`,
+ * `ownsManagedSessionAgent`) — see `RuleLizardModeDeps`'s own doc comment for
+ * what each input means and why a managed session needs the live map while
+ * every other rule-launched agent reads straight off its own `Rule`.
+ */
+const ruleLizardModeOf = (id: string): boolean =>
+  sharedRuleLizardModeOf(id, { rules, isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
 // BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
 // (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
 // agents are classified "sentinel" here (see src/agents/capacity-role.ts).
@@ -1704,19 +1728,20 @@ blockingEscalationTimer.unref?.();
 //
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
-// only when its cwd resolves to a `managed-sessions` agent id AND that id's
-// LATEST poll of `managedSessionLizardModes` (rebuilt every managed-sessions
-// poll — see that map's own comment above) says `true`. Everything else —
-// an ordinary jira-work/rule agent, a managed session that never set
-// `lizardMode`, a managed session not yet observed this daemon's lifetime —
-// resolves `undefined` and is never touched, matching `lizardMode`'s own
-// "absent means today's behaviour exactly" contract. The label itself
-// (basename of the definition file) is what lets a log line name WHICH
-// AGENT got a prompt answered (FACTORY-67's own requirement), not just an
-// opaque pane id.
+// only when its cwd resolves to SOME rule-engine agent id (managed session or
+// rule-launched alike) AND `ruleLizardModeOf` says that id's own lizard-mode
+// opt-in (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87) is `true`. Everything
+// else — a legacy/bare-issue agent, a managed session or rule that never set
+// the field, a managed session not yet observed this daemon's lifetime —
+// resolves `false` and is never touched, matching `lizardMode`'s own "absent
+// means today's behaviour exactly" contract. The label itself (basename of
+// the resource id, e.g. the definition file or the Jira/GitHub/filesystem
+// resource) is what lets a log line name WHICH AGENT got a prompt answered
+// (FACTORY-67's own requirement), not just an opaque pane id.
 function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const id = agentIdOfWorkspacePath(cwd);
-  if (!id || !ownsManagedSessionAgent(id) || managedSessionLizardModes.get(id) !== true) return undefined;
+  if (!id || !ruleLizardModeOf(id)) return undefined;
   const decoded = decodeAnyAgentKey(id);
   return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
 }
