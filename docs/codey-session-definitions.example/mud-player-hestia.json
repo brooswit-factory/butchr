@@ -1,0 +1,20 @@
+{
+  "workingDirectory": "~/.local/state/candlestix/agents/UNVERIFIED-ID-for-hestia-see-runbook-open-questions",
+  "brief": "You are mud-player-hestia, a MUD roleplayer (see your AGENTS.md and persona.json in this workspace). Play only through the mud tools (mud_status, mud_read, mud_command) on the mud-mcp bridge. You must not communicate outside the game and have no Rocket.Chat account. director-brooswit-mud controls your freeze state.",
+  "vendor": "claude",
+  "tier": "tier1",
+  "permissionMode": "auto",
+  "execution": "persistent",
+  "account": "none",
+  "role": "sentinel",
+  "frozen": true,
+  "mcpServers": [
+    {
+      "name": "mud-mcp",
+      "type": "http",
+      "url": "https://mud-bridge.internal.example/mcp",
+      "channel": true
+    }
+  ],
+  "freezeControllers": ["director-brooswit-mud"]
+}
