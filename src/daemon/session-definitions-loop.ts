@@ -56,6 +56,17 @@ export interface ManagedSessionsLoopDeps {
   reserveAdmission?: (ids: readonly string[]) => void;
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /**
+   * FACTORY-47: same seam as `ReconcileOptions.checkCrashLoop`/
+   * `GenericLoopDeps.checkCrashLoop` (src/daemon/loop.ts) — audible-only
+   * detection of a managed-session agent that keeps dying and being spawned
+   * again (a startup crash, an MCP config that fails to load, a session-
+   * limit refusal that never clears, ...) with nothing else in this loop
+   * recording why. Threaded straight through to `runResourceLoop` below.
+   * Optional; omitted, no crash-loop detection runs for managed sessions —
+   * the gap this ticket reports.
+   */
+  checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -96,6 +107,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
+    ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? MANAGED_SESSIONS_POLL_MS,
     onError: (e) => {
