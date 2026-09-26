@@ -847,6 +847,108 @@ describe("staleIssues", () => {
     }
   });
 
+  // FACTORY-43: a managed session with `permissionMode: "auto"` respawn-looped
+  // forever — staleIssues()' reconstructed expected spec never carried
+  // `permissionMode` at all (only `mcpServers`/`externalMcpServers` were
+  // persisted and read back), so every poll compared the real `--permission-mode
+  // auto` argv against an expectation defaulting to `bypassPermissions` and
+  // killed+respawned the agent every time. Same read-the-workspace-back shape
+  // as the `.butchr-mcp-servers.json` pair above, extended to
+  // `.butchr-permission-mode.json`.
+  test("FACTORY-43: a managed-session agent launched with permissionMode \"auto\" (persisted at build time, workspacePermissionMode) is honoured, not flagged stale for a permission mode it was never launched without", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
+      // Built via the SAME spawnArgs a real spawn (and staleIssues' own
+      // "expected" reconstruction) uses, so the flag value is guaranteed
+      // consistent rather than hand-guessed here.
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", permissionMode: "auto" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("FACTORY-43: a running agent actually launched with the DEFAULT permission mode while its persisted definition calls for \"auto\" IS flagged stale — proves workspacePermissionMode is actually consulted, not just harmlessly absent", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-drift-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
+      // Missing the --permission-mode auto flag the persisted definition now calls for.
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("--permission-mode auto");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-43: same bug, `strictMcpConfig: true` — the directors' case
+  // named on this ticket's own "Done when". Same fix, same shape.
+  test("FACTORY-43: a managed-session agent launched with strictMcpConfig: true (persisted at build time, workspaceStrictMcpConfig) is honoured, not flagged stale for a flag it was actually launched with", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", strictMcpConfig: true }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("FACTORY-43: a running agent missing --strict-mcp-config while its persisted definition calls for strictMcpConfig: true IS flagged stale — proves workspaceStrictMcpConfig is actually consulted, not just harmlessly absent", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-drift-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("--strict-mcp-config");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("no cwd reported for the agent -> unknown, not stale (never even calls pane.process_info)", async () => {
     const { client, calls } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }], { "w1:p1": ok([{ pid: 1, argv: ["claude", "--resume", "x"], name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
