@@ -13,7 +13,7 @@ import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../sr
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { EXECUTION_MODES, parseRules, type Rule } from "../../src/rules/rules.js";
-import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, specForRuleQuery, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
@@ -86,6 +86,27 @@ describe("rule discovery", () => {
       key: "jira-work:task:BUTCHR-7", resource: "BUTCHR-7", issuetype: "Task", summary: "summary of BUTCHR-7", parent: "BUTCHR-1",
       brief: "do it", agents: [{ harness: "codex", model: "gpt-5" }, { harness: "claude", effort: "max" }],
     });
+  });
+
+  // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42's lizard mode):
+  // permissionMode is forwarded onto the spawn spec when the rule sets it —
+  // it's what actually puts a rule-launched Claude agent into
+  // permissionMode: "default" (manual/ask mode); lizardMode never reaches
+  // the spec — it stays a daemon-side-only opt-in (src/daemon/index.ts's
+  // `ruleLizardModeOf`), so there is no argv for a stale-argv check to
+  // compare, the same "no argv, no stale-argv risk" shape
+  // session-definition-type.test.ts asserts for SessionDefinition.lizardMode.
+  test("FACTORY-87: permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+    const [lizardRule] = rules({ id: "manual", query: "q", permissionMode: "default", lizardMode: true });
+    const spec = specForMatch({ agentKey: "jira-work:manual:BUTCHR-7", rule: lizardRule!, issue: issue("BUTCHR-7") });
+    expect(spec.permissionMode).toBe("default");
+    expect(spec).not.toHaveProperty("lizardMode");
+    const [plainRule] = rules({ id: "plain", query: "q" });
+    expect(specForMatch({ agentKey: "jira-work:plain:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") }).permissionMode).toBeUndefined();
+    // specForRuleQuery (singleton/persistent query-level agents) gets the same treatment.
+    const querySpec = specForRuleQuery(lizardRule!, "jira-work:manual:%40query");
+    expect(querySpec.permissionMode).toBe("default");
+    expect(querySpec).not.toHaveProperty("lizardMode");
   });
 });
 
@@ -996,7 +1017,7 @@ describe("rule workspaces", () => {
     expect(panesFor("jira-work:task:BUTCHR-12", panes, root).map((p: { pane_id: string }) => p.pane_id)).toEqual(["p1"]);
     expect([...groupOwnedPanes(panes, root).keys()].sort()).toEqual(["BUTCHR-12", "jira-work:task:BUTCHR-12"]);
     const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-12" }] as never[];
-    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
+    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", agentKey: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
   });
 });
 
