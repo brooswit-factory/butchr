@@ -1,4 +1,4 @@
-import { workspaceDirFor } from "./workspace.js";
+import { agentIdOfWorkspacePath } from "./workspace.js";
 import type { results } from "@brooswit/drovr";
 
 /**
@@ -26,7 +26,23 @@ import type { results } from "@brooswit/drovr";
 /** A workspace herdr reports that is butchr's own (ownership proven, see `strandedCandidates`) and currently has no herdr-known agent. */
 export interface StrandedCandidate {
   workspaceId: string;
+  /**
+   * Herdr's own free-text `workspace.label` — display/log only (FACTORY-92).
+   * NEVER used to prove ownership or to derive the account to release: it's
+   * free text a human can type, and a project-tier label is a bare project
+   * key that collides with anything. `agentKey` below is the field every
+   * ownership/account decision actually keys off.
+   */
   label: string;
+  /**
+   * The REAL agent key (FACTORY-92), derived from a pane's `cwd` via the
+   * shared `agentIdOfWorkspacePath` (src/agents/workspace.ts) — the same
+   * helper residency-census.ts's `groupOwnedPanes` already uses, so there is
+   * exactly ONE place that maps cwd -> agent key. This IS the ownership
+   * proof (see `strandedCandidates`' own doc comment) and what
+   * `ReaperDeps.release` is called with.
+   */
+  agentKey: string;
   paneIds: readonly string[];
 }
 
@@ -36,21 +52,22 @@ export interface StrandedCandidate {
  * and no live-process check (that's the separate `processInfo` layer,
  * deliberately never folded in here — see this file's own top comment).
  *
- * OWNERSHIP, proven by two facts that must agree, not by the label alone
- * (BUTCHR-245's own ruling): a workspace is butchr's iff its label `L`
- * pairs with a pane, IN THAT SAME workspace, whose `cwd` is exactly
- * `join(root, L)` — `buildWorkspace()`'s own convention
- * (src/agents/workspace.ts). The label alone is never enough: it's free
- * text a human can type, and a project-tier label is a bare project key
- * that collides with anything.
+ * OWNERSHIP (BUTCHR-245's own ruling, re-grounded by FACTORY-92): a
+ * workspace is butchr's iff one of its panes' `cwd` resolves, via the
+ * shared `agentIdOfWorkspacePath`, to a real agent key under `root` —
+ * `buildWorkspace()`'s own convention (src/agents/workspace.ts). Herdr's
+ * reported `label` is NEVER consulted for this: it's free text a human can
+ * type, and a project-tier label is a bare project key that collides with
+ * anything, so it settles nothing about ownership by itself — only the
+ * pane's actual cwd, run through the shared decoder, does.
  *
  * AGENTLESS: no `AgentInfo` in this poll's `agent.list()` names this
  * `workspace_id` — this is the independence the ticket requires: reachable
  * without going through `agent.list()` at all for the OWNERSHIP proof, and
  * consulting it only to ask "does anything herdr currently knows about live
  * here" — a fact `agent.list()` is perfectly suited to answer; what it
- * cannot answer is "did butchr create this," which the cwd/label pairing
- * above settles independently.
+ * cannot answer is "did butchr create this," which the cwd-derived agent
+ * key above settles independently.
  */
 export function strandedCandidates(
   workspaces: readonly results.WorkspaceInfo[],
@@ -69,9 +86,9 @@ export function strandedCandidates(
   for (const w of workspaces) {
     if (agentWorkspaceIds.has(w.workspace_id)) continue; // something herdr knows about lives here — never a candidate
     const wpanes = panesByWorkspace.get(w.workspace_id) ?? [];
-    const expectedCwd = workspaceDirFor(w.label, root);
-    if (!wpanes.some((p) => p.cwd === expectedCwd)) continue; // ownership not proven — never a candidate, whatever else is true
-    out.push({ workspaceId: w.workspace_id, label: w.label, paneIds: wpanes.map((p) => p.pane_id) });
+    const agentKey = wpanes.map((p) => agentIdOfWorkspacePath(p.cwd, root)).find((k): k is string => k !== null);
+    if (!agentKey) continue; // ownership not proven — never a candidate, whatever the label says
+    out.push({ workspaceId: w.workspace_id, label: w.label, agentKey, paneIds: wpanes.map((p) => p.pane_id) });
   }
   return out;
 }
@@ -152,15 +169,16 @@ export interface ReaperDeps {
    */
   close: (candidate: StrandedCandidate) => Promise<boolean>;
   /**
-   * BUTCHR-412: released after a candidate is actually closed — `candidate.label`
-   * IS the agent key (`strandedCandidates`' own ownership proof: a workspace's
-   * label pairs with a pane whose cwd is exactly `workspaceDirFor(label,
-   * root)`, so `label` is the same key `buildWorkspace`/`herd.spawn` use).
-   * This is the self-exit path's own account teardown (a crash, `/exit`, or a
-   * quota-exhaustion close that never goes through `HerdrHerd.stop()`/
-   * `reconcileNow`'s `plan.stop` at all) — see `docs/rocketchat-accounts.md`'s
-   * "Wiring" section. Optional; omitted, no account lifecycle runs for a
-   * reaped workspace (every caller before this ticket). Never awaited into a
+   * BUTCHR-412: released after a candidate is actually closed — called with
+   * `candidate.agentKey` (FACTORY-92), the real agent key
+   * `strandedCandidates` derived from a pane's cwd via the shared
+   * `agentIdOfWorkspacePath` — NEVER `candidate.label`, which is free text a
+   * human (or a later herdr) can set to anything. This is the self-exit
+   * path's own account teardown (a crash, `/exit`, or a quota-exhaustion
+   * close that never goes through `HerdrHerd.stop()`/`reconcileNow`'s
+   * `plan.stop` at all) — see `docs/rocketchat-accounts.md`'s "Wiring"
+   * section. Optional; omitted, no account lifecycle runs for a reaped
+   * workspace (every caller before this ticket). Never awaited into a
    * failed reap: a release failure is logged and swallowed, same fault
    * isolation `check()` already gives every other candidate's close.
    */
@@ -206,7 +224,7 @@ export function createReaper(deps: ReaperDeps): Reaper {
             closed++;
             log(`[reap] reclaimed workspace ${c.workspaceId} (${c.label})`);
             if (deps.release) {
-              await deps.release(c.label).catch((e) => log(`WARNING: [reap] account release failed for ${c.label}: ${(e as Error)?.message ?? e}`));
+              await deps.release(c.agentKey).catch((e) => log(`WARNING: [reap] account release failed for ${c.agentKey}: ${(e as Error)?.message ?? e}`));
             }
           }
         } catch (e) {
