@@ -59,15 +59,23 @@ interface Channel { label: string; text: string }
 
 // BRIEFS — the actual files `buildWorkspace()` writes into a real agent
 // workspace (CLAUDE.md + the interpolated brief.md), for every issue type
-// `briefFor()` maps explicitly PLUS one representative ("Bug") of the
+// `briefFor()` maps explicitly PLUS one representative ("Sub-task") of the
 // DEFAULT fallback every unmapped type gets. The mapped types are DERIVED
 // from `knownBriefTypes()` (workspace.ts's own table), not hand-copied here
 // as a literal list — BUTCHR-149: a hardcoded four-element array
 // (["Epic","Story","Task","Bug"]) is exactly how `briefs/project.md` went
 // unbuilt, unread, and unasserted-against when the `project` tier was added
-// to that table but not to this one. "Bug" stays a literal on purpose: it
-// isn't a tracked key, it's a stand-in for "any type nobody mapped", so
-// there is nothing for it to derive from. Reading the files
+// to that table but not to this one. "Sub-task" stays a literal on purpose:
+// it isn't a tracked key, it's a stand-in for "any type nobody mapped", so
+// there is nothing for it to derive from — a REAL, unmapped Jira issue type
+// (see test/unit/capacity-role.test.ts), not a synthetic name. FACTORY-40:
+// this used to be "Bug", back when `bug` wasn't yet a member of
+// `knownBriefTypes()` — now that it is (`briefs/bug.md` ships real,
+// asserted content, see REVIEW_LINE_INSTRUCTING_BRIEFS below), reusing
+// "Bug" here would silently duplicate the real `brief:Bug:*` channels
+// `types` already derives from `knownBriefTypes()`, inflating every count
+// below by one. "Sub-task" is a genuinely unmapped type today, so it
+// exercises DEFAULT the way this probe always meant to. Reading the files
 // buildWorkspace() writes, rather than the brief.md template alone, is what
 // makes this channel catch CLAUDE.md too — the first instruction file an
 // agent reads, and a real, separate delivered artifact from brief.md.
@@ -77,7 +85,7 @@ function briefChannels(): Channel[] {
   process.env.BUTCHR_WORKSPACES = root;
   try {
     const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-    const types = [...knownBriefTypes().map(capitalize), "Bug"];
+    const types = [...knownBriefTypes().map(capitalize), "Sub-task"];
     return types.flatMap((t) => {
       const dir = buildWorkspace({ key: `MCG-${t}`, issuetype: t, summary: "verify merge-check coverage", parent: null }, "http://localhost:7717/mcp");
       return [
@@ -199,12 +207,16 @@ const MERGE_INSTRUCTING_DOCS = ["agent-model.md"];
 // is broken. Do not delete this assertion to get green; fix the text.
 const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 
-// BUTCHR-149 (project.md) + BUTCHR-165 (epic.md, story.md): all three are
-// pure REVIEWERS of the tier below them (project reviews epic's PR, epic
-// reviews story's PR, story reviews task's PR) — none of the three merges a
-// PR of its own, so none belongs in MERGE_INSTRUCTING_BRIEFS (that list
+// BUTCHR-149 (project.md) + BUTCHR-165 (epic.md, story.md) + FACTORY-40
+// (bug.md): all four are pure REVIEWERS of the tier below them (project
+// reviews epic's PR, epic reviews story's PR, story reviews task's PR, and
+// bug — a boss the same tier as epic, never a worker — reviews a story's
+// PR too) — none of the four merges a PR of its own (bug.md owns no repo
+// branch at all: it decomposes into Stories the same ownerless way an epic
+// does, never authoring code itself), so none belongs in
+// MERGE_INSTRUCTING_BRIEFS (that list
 // asserts the AUTHOR-side stale-approval check: reviews[].commit.oid,
-// last-decisive ordering, base-merge caveat). What each of these three DOES
+// last-decisive ordering, base-merge caveat). What each of these four DOES
 // carry, and must keep carrying, is a narrower reviewer-side instruction:
 // the `[review] APPROVED|CHANGES_REQUESTED <pr-url> @ <sha>` line it sends
 // DOWN to its worker, with the sha sourced correctly. This is not
@@ -218,7 +230,15 @@ const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 // it correctly. briefs/task.md is deliberately NOT here — see EXCLUSIONS:
 // it only ever READS a `[review]` line (author-side), it never emits one,
 // because a task has no worker below it to review.
-const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:brief.md", "brief:Story:brief.md"];
+//
+// FACTORY-40: briefs/bug.md joined this list once `bug.md` was rewritten
+// from a worker-tier stub into the boss-tier brief `knownBriefTypes()`
+// already carried the key for — a Bug reviews each Story it files the same
+// way an Epic reviews each Story IT files (bug.md's own text says so
+// explicitly, close to verbatim with epic.md's), so it carries the exact
+// same reviewer-side `[review]` instruction as project/epic/story above, not
+// a Bug-specific variant of it.
+const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:brief.md", "brief:Story:brief.md", "brief:Bug:brief.md"];
 
 // ---------------------------------------------------------------------
 // BUTCHR-225: TOTAL COVERAGE OF THE DERIVED brief FAMILY, BY CONSTRUCTION
@@ -251,25 +271,26 @@ const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:br
 // knownBriefTypes()'s own doc comment says so explicitly). An exclusion
 // entry naming "default" here would itself be flagged STALE by the test
 // below, which is the discipline working as intended, not a bug: don't add
-// one. (briefChannels() above separately builds a literal "Bug" channel as
-// a stand-in for "any unmapped type" — that's a DEFAULT-fallback probe for
-// the existing merge-check/review-line assertions, not a member of the
-// derived family this section accounts for.)
+// one. (briefChannels() above separately builds a literal "Sub-task"
+// channel as a stand-in for "any unmapped type" — that's a DEFAULT-fallback
+// probe for the existing merge-check/review-line assertions, not a member
+// of the derived family this section accounts for. It used to be "Bug",
+// before `bug` joined `knownBriefTypes()` — see briefChannels()'s own
+// comment for why that changed.)
 
 interface TypeExclusion { readonly type: string; readonly reason: string }
 
 // Empty today: every member of the derived family is already covered by
 // the UNION of MERGE_INSTRUCTING_BRIEFS (task, story) and
-// REVIEW_LINE_INSTRUCTING_BRIEFS (project, epic, story) above — together,
-// epic/story/task/project, i.e. all four of knownBriefTypes(). Left as an
+// REVIEW_LINE_INSTRUCTING_BRIEFS (project, epic, story, bug) above —
+// together, bug/epic/story/task/project, i.e. all five of
+// knownBriefTypes(). Left as an
 // explicit, typed, empty list — same precedent
 // test/unit/family-scan.test.ts's own KNOWN_FAMILY_COLLISION_EXCLUSIONS
 // sets for an empty-but-checked list — rather than omitted, so the
 // "every exclusion still matches a real family member" test below has
 // something to iterate that isn't vacuously true by omission.
-const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [
-  { type: "bug", reason: "bug.md owns defect reproduction and verification; it has no worker below it whose pull request it reviews or merges" },
-];
+const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [];
 
 const labelToType = (label: string): string => {
   const m = /^brief:([A-Za-z]+):brief\.md$/.exec(label);
