@@ -63,6 +63,7 @@ takes effect on restart, not live), like every other provider's query.
 | `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
 | `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
 | `unfreezeControllers` | no | Same shape, for `unfreeze_session` — an INDEPENDENT list; a name in `freezeControllers` grants nothing here, and vice versa. |
+| `linkedEventingProjects` | no | FACTORY-52. Non-empty array of canonical `jira-project:<KEY>` references naming the Jira project(s) this definition opts into linked eventing for. See "`linkedEventingProjects`: per-definition linked-eventing project opt-in" below. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
@@ -127,6 +128,64 @@ is still out of scope for this ticket — see "Not in this version"
 (BUTCHR-413 later added a daemon-side relay that delivers `channel: true`
 push as a `herd.nudge` prompt instead, without Codex's own connection ever
 receiving it — see `docs/codex-channel-relay.md`).
+
+### `linkedEventingProjects`: per-definition linked-eventing project opt-in
+
+FACTORY-52 (epic FACTORY-51, story implementing FACTORY-52). An optional
+field naming one or more Jira projects this definition's agent should get
+linked eventing for, in the canonical `jira-project:<KEY>` vocabulary
+`src/resources/resource-ref.ts` (`parseResourceRef`/`formatResourceRef`)
+already defines and every other resource ref in this codebase already
+reuses:
+
+```json
+{
+  "workingDirectory": "~/code/brooswit-factory/some-project",
+  "brief": "Keep this repo's docs and dependency versions current.",
+  "vendor": "claude",
+  "tier": "tier1",
+  "permissionMode": "default",
+  "linkedEventingProjects": ["jira-project:FACTORY"]
+}
+```
+
+- **Shape:** a non-empty array of strings; each entry must parse as a
+  canonical `jira-project:<KEY>` reference — a bare key with no provider
+  prefix (`"FACTORY"`) is rejected, same as everywhere else this codebase
+  requires the canonical form rather than a shorthand. Only the
+  `jira-project` provider is accepted; naming any other kind of resource
+  (`jira-work-item:...`, `github-issue:...`, ...) is rejected with a message
+  naming the provider it actually parsed as.
+- **Validation, not silent correction:** a malformed key, the wrong
+  provider, a non-array value, an empty array, or a non-string entry each
+  produce a clear load-time problem (collected alongside every other
+  problem on the manifest, same one-pass discipline as every other field).
+  Duplicate entries — compared by CANONICAL form, so the same project
+  written twice, or written once upper-case and once lower-case, collides —
+  are rejected outright rather than silently deduped, the same "reject,
+  never silently drop" choice `freezeControllers`/`unfreezeControllers`
+  already make for their own duplicate entries.
+- **Exposed value:** `SessionDefinition.linkedEventingProjects` (when
+  present) is the array of CANONICAL `jira-project:<KEY>` strings — not bare
+  project keys — so a consumer already working in `ResourceRef`/canonical-
+  string terms elsewhere in the codebase needs no separate parsing step to
+  use it.
+- **Additive, parse-only:** a definition WITHOUT this field parses and
+  behaves exactly as it did before this field existed — no key materialises
+  on the parsed object at all. This ticket (FACTORY-54) is schema +
+  parsing + validation only: nothing in the daemon reads
+  `linkedEventingProjects` yet to actually nudge, notify, rate-cap, or watch
+  anything. That wiring — making a managed-session agent's own project
+  opt-in actually DO something, mirroring what `Rule.linkedEventing`
+  (`src/rules/rules.ts`) already does for rule-owned resources — is
+  FACTORY-53's own scope.
+- **Deliberately not a reuse of `Rule.linkedEventing`:** that field is a
+  per-RULE boolean with no project of its own to name (a `Rule` already
+  owns whichever resources its query matches); a managed-session definition
+  has no owning `Rule` in the same sense and needs to say WHICH project(s),
+  not merely whether — hence a dedicated, project-naming field here instead
+  of trying to bolt a boolean onto a definition that has nothing for it to
+  apply to.
 
 ## Tier -> model mapping
 
@@ -754,6 +813,12 @@ What each kind of mismatch actually does:
 
 ## Working directory wiring
 
+For a Windows host running Butchr inside WSL specifically, see
+[`docs/windows-wsl-agent-guide.md`](windows-wsl-agent-guide.md) for how to
+choose `workingDirectory` between the WSL home and `/mnt/c/...`, and how to
+translate paths between them — this section covers the mechanism, not that
+host-specific choice.
+
 `SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) carries a
 definition's own `workingDirectory` through the shared spawn machinery —
 but, as of PR #394's THIRD review round, it is **not** the spawned
@@ -1003,3 +1068,218 @@ managed-session agent does its own Jira/Confluence work (if any) directly
 through an operator-configured Atlassian MCP connection, never through
 butchr's `jira_*`/`confluence_*` tools or the boss verbs — butchr's
 hierarchy verbs are for jira-work ticket agents (Epic/Story/Task) only.
+
+## Escalating an unanswerable startup dialog (FACTORY-45)
+
+The daemon's existing prompt-escalation machinery (`onBlocked`,
+`src/agents/escalation-loop.ts`) posts an unanswerable Claude Code dialog as
+a comment on the blocked agent's own Jira/GitHub/Zendesk issue. A
+managed-session agent has no such issue — it is identified only by its
+definition file's own path — so `onBlocked` is called with `issue === null`
+for it, same as for any other keyless pane. This section is about what
+happens THEN, for a managed session specifically; every other keyless pane
+(an unowned/legacy workspace, a query-level agent, …) is unaffected and
+keeps the plain `"... blocked with an unanswerable prompt but no issue key —
+cannot escalate"` log line it always had.
+
+**Drovr's own auto-answering is deliberately NEVER USED here — Butchr's
+own dialog-answering remains the SOLE answerer, fleet-wide, unchanged by
+this ticket.** `@brooswit/drovr` (this repo's own dependency, pinned
+>= 0.15.0) DOES recognize and — left to its own devices — press several
+`startup` dialogs (trust, development-channels, auto-mode-onboarding, and
+its own SPECULATIVE `fullscreen-renderer` matcher for the "didn't finish
+starting" recovery notice — see that package's own
+`docs/blocking-escalation.md`, and NOT to be confused with the separate
+"Try the new fullscreen renderer?" opt-in offer, which Butchr's own
+`chooseStartupAnswer` already answers and drovr's release does not touch
+at all). Running that auto-answering fleet-wide, independently and on its
+own 5s cadence alongside Butchr's own `watchPrompts`, was measured as a
+real hazard during this ticket's own review, not a hypothetical one:
+startup dialogs arrive in sequence (trust, then development-channels), a
+slow redraw can let both answerers read the SAME still-visible dialog, and
+the second answerer's keys then land on the NEXT dialog instead — an
+identical `down`+`enter` that correctly picks "Yes, I trust this folder"
+on the trust dialog would instead move to and confirm "Exit" on
+development-channels, killing the launch. So `createManagedSessionEscalationWatcher`
+(`src/agents/managed-session-escalation-watcher.ts`) hands drovr's watcher
+a client whose `sendKeys` is UNCONDITIONALLY a no-op — `list`/`read` pass
+through to the real herdr client untouched, so drovr's own detection and
+classification still work exactly as documented, but NOTHING it recognizes
+is ever pressed. Only its ESCALATION half (the host-neutral hook, below)
+is consumed. Butchr keeps no dialog list of its own, and never presses one
+of drovr's own recognized dialogs on its behalf — see "Two detectors, one
+mark" further down for what "two" means once neither one is an answerer.
+
+Two INDEPENDENT paths feed the SAME minimal escalation below:
+
+- **Butchr's own detection** (unchanged by this section): `watchPrompts`
+  (`src/agents/prompt.ts`/`src/agents/prompt-watch.ts`) already decided it
+  cannot auto-answer a dialog (via Butchr's own `chooseStartupAnswer` — the
+  SOLE answerer, per above), and calls `onBlocked` with `issue === null`.
+- **Drovr's own detection** (FACTORY-45 Part B): a separate poll loop
+  (`src/daemon/index.ts`) calls `createManagedSessionEscalationWatcher(escalator)`'s
+  `.poll(herdr)` every 5s over the WHOLE fleet; for a dialog its own
+  `classifyBlockingScreen` reads as genuinely `unknown` (with a verbatim
+  `question`/`options`), `hook.onUnknownDialog` fires exactly once per
+  (pane, fingerprint) episode in DROVR's OWN closure, and
+  `hook.onDialogResolved` fires once that episode clears. A `startup`/
+  `permission` dialog it also recognizes is reported internally to drovr
+  itself (never pressed, per above) but never reaches Butchr's hook at
+  all — only a genuinely `unknown` dialog does.
+
+Either path resolves the SAME one question — is this pane a managed
+session? — through the SAME seam: `createEscalator`'s
+`EscalatorDeps.managedSessionOf` (injected in production as
+`managedSessionOfPane`, `src/daemon/index.ts`), which resolves a keyless
+pane's cwd back to its herd id (`agentIdOfWorkspacePath`) and checks it
+against the built-in `managed-sessions` rule (`ownsManagedSessionAgent`,
+`src/rules/session-definition-type.ts`). Only when that resolves — i.e. the
+pane is genuinely a filesystem-provider managed-session agent — does
+anything beyond the plain log line happen:
+
+1. **A greppable journal line**, logged once per (pane, dialog fingerprint)
+   episode, prefixed `[managed-escalation]` (`MANAGED_ESCALATION_MARKER`,
+   distinct from this module's ordinary `[prompts]` line so it survives a
+   `journalctl --user -u <unit> | grep managed-escalation` regardless of how
+   noisy the ordinary prompt log is — the unit name is in your own
+   workspace's `ENVIRONMENT.md`, never hand-copied from someone else's). It
+   names the agent key, the definition file's own path, the pane id, the
+   dialog's question and numbered options VERBATIM, its fingerprint, and
+   (FACTORY-50 Part C) the path of the pane-text capture just written, when
+   one was — everything an operator needs to find the pane and decide what
+   to do, without a second lookup.
+2. **A "stalled" mark on `/health`**: every currently-stalled managed
+   session appears in a `managedSessionEscalations` array (a SIBLING field
+   on the `/health` response, the same "additive, never flips `ok`" pattern
+   `admission`/`coverage`/`unresolvedRelationships` already use —
+   `src/daemon/health.ts`) — `{ agentKey, definitionPath, paneId,
+   fingerprint, since }` per entry. This is the status SURFACE an operator
+   finds a blocked managed session on without grepping the journal first;
+   `Escalator.managedSessionEscalations()` (the in-memory tracker this
+   reads) is the single source of truth for it — no separate storage was
+   invented for this ticket.
+3. **Dedupe**: once logged/marked for a given (pane, fingerprint), a later
+   poll with the SAME fingerprint is a no-op — neither re-logs nor
+   re-marks. A NEW fingerprint on the same pane (the dialog changed while
+   still blocked) escalates again, overwriting the stale entry. Unlike the
+   keyed-issue flow's own restart-safe adoption (which re-reads its Jira
+   comment to recognize its own prior escalation), this dedupe is in-memory
+   only: a daemon restart mid-episode re-logs once for a dialog that is
+   still up. Accepted deliberately, given this ticket's reduced scope — a
+   duplicate journal line costs nothing a Jira rate cap would need to guard
+   against.
+4. **Resolution**: when the herd no longer reports the pane blocked AT ALL
+   (`Escalator.onPoll`'s existing per-tick reset, which already ends every
+   other debounce/episode tracker in this module the same way), the entry is
+   removed from `managedSessionEscalations()` and one more
+   `[managed-escalation] ... no longer blocked — clearing stalled mark` line
+   is logged. The SAME fingerprint reappearing after a genuine clear is
+   treated as a fresh episode (it escalates and logs again), never silently
+   suppressed.
+5. **A durable pane-text capture** (FACTORY-50 Part C) — see "Pane-text
+   capture" just below.
+
+### Pane-text capture (FACTORY-50 Part C)
+
+A journal line alone can truncate or mis-parse the real screen — exactly
+what happened to the dialog that opened FACTORY-44 (pane gone, nothing but a
+hand transcription survived it). For a genuinely NEW (pane, fingerprint)
+episode — never a no-op re-entry on the same fingerprint — Butchr now also
+writes the pane's full, unredacted, ANSI-stripped text to the SAME local
+capture store BUTCHR-16 built for the keyed-issue escalation flow
+(`EscalatorDeps.captures`, real implementation `createCaptureStore`,
+`src/agents/capture-store.ts`; directory resolved by `config.captureDir` —
+`BUTCHR_CAPTURE_DIR` if set, else `<BUTCHR_WORKSPACES>/.captures`, printed by
+the daemon at startup and readable from your own workspace's
+`ENVIRONMENT.md`/journal, never hand-copied from someone else's).
+
+- **Filename**: `<agentKey>-managed-escalation-<paneId>-<compact-UTC-timestamp>.txt`,
+  e.g. `filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json-managed-escalation-w4:p4H-20260926T153100Z.txt`.
+  The agent key is already `encodeURIComponent`-escaped per component
+  (`encodeAgentKey`, src/rules/agent-key.ts), so it needs no further
+  sanitizing to be filename-safe. This shape is deliberately disjoint from
+  the keyed-issue escalation capture (`<ISSUE>-escalation-<ts>.txt`) and
+  session-limit-watch's own captures (`<ISSUE>-unrecognised-<ts>.txt` /
+  `<ISSUE>-no-reset-time-<ts>.txt`) — there is no issue/project key here at
+  all — so none of the three ever lists, evicts, or is evicted by, either
+  of the others. A definition path deep/long enough to push the full
+  filename past the filesystem's own 255-byte name limit fails the write —
+  handled the same as any other write failure (see "Failure handling"
+  below), never a crash.
+- **Contents**: a short `#`-commented header (agent key, definition path,
+  pane id, dialog fingerprint, capture time) followed by the pane's full
+  text verbatim, UNREDACTED — local disk only, never posted anywhere (there
+  is no ticket to post it to).
+- **Retention**: capped at 50 files of this shape at once (mirrors both
+  sibling capture kinds' own cap); the oldest, by the timestamp embedded in
+  the filename, is evicted first once a new capture would exceed it. Only
+  files matching this exact shape count toward the cap — a shared capture
+  directory holding the other two kinds' files, or anything else, is never
+  touched by this eviction.
+- **Failure handling, and the timeout that bounds it**: a capture that
+  ERRORS (disk full, permission error, …) is logged once (`WARNING:
+  [managed-escalation] capture failed for pane ...`) and never blocks or
+  delays the `[managed-escalation]` journal line itself. A capture that
+  instead HANGS — the pane read this reuses (`herdr.pane.read`) carries no
+  deadline of its own, the same reason drovr's own escalation watcher has
+  DROVR-33 — is bounded by a separate timeout (`MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS`,
+  a few seconds): past it, the capture is treated as failed (a distinct
+  `WARNING: ... capture timed out after ...` line) and the escalation
+  proceeds with no capture path, exactly like an outright error. The
+  underlying read/list/write is not cancelled — if it eventually completes
+  after losing the race, its file may still land on disk, but that
+  resolution is discarded and never changes the journal line or any state
+  already committed to. Either way — error or timeout — the escalation is
+  observational regardless, so losing the capture must never mean losing
+  the alarm.
+- **How an operator uses it**: the `[managed-escalation]` journal line
+  names the capture's path directly (`... fingerprint: <fp> capture:
+  <path>`) whenever a capture was written; read that file to see exactly
+  what was on screen at the moment of escalation, instead of relying on the
+  journal line's own (necessarily shorter) question/options summary or
+  attaching to a pane that may have already moved on. No path in the line
+  means either no `captures` dep configured, or the capture errored/timed
+  out — check the journal around that same line for a `WARNING:
+  [managed-escalation]` line either way.
+
+### Two detectors, one mark
+
+"Two" here means two independent DETECTORS of an escalation-worthy dialog
+on a managed-session pane — never two answerers. Drovr's own auto-answering
+is never used (see above: its `sendKeys` is permanently a no-op in this
+wiring), so there is no answering overlap to worry about, and Butchr's own
+`chooseStartupAnswer` (`src/agents/prompt.ts`) is the ONLY thing that ever
+presses a key, completely unchanged by this ticket — it still handles
+everything it always did (trust, development-channels,
+auto-mode-onboarding-shaped dialogs, resume-from-summary, the
+settings-warning/settings-recommendation dialogs, Bypass-Permissions), and
+drovr's own recognition of a `startup`/`permission` dialog never reaches
+Butchr's escalation hook at all (only a genuinely `unknown` one does — see
+above).
+
+What DOES coexist is detection: Butchr's own dialog parser
+(`src/agents/prompt.ts`) and drovr's (`classifyBlockingScreen`) are
+independent implementations that can derive slightly different
+fingerprints for the SAME real dialog (different text-extraction). Both
+funnel into the same shared core
+(`markManagedSessionStalled`/`clearManagedSessionStalled`,
+`src/agents/escalation-loop.ts`), keyed by pane id, so whichever detector
+sees a dialog FIRST wins the mark; if the other later computes a different
+fingerprint for what is really the same episode, it reads as "a new
+dialog" and re-logs once more under its own fingerprint. **This is a
+known, accepted residual, not a defect**: it can produce one extra
+`[managed-escalation]` line for a single real episode, but never a missed
+escalation, and `managedSessionEscalations()`'s mark still correctly reads
+"stalled" either way.
+
+**How an operator finds and answers a blocked managed session.** Check
+`/health`'s `managedSessionEscalations` field, or grep the journal for
+`[managed-escalation]` — either names the pane id and the definition's own
+path. From there: `herdr agent attach` (via butchr's own live-view web app)
+onto the named pane to see the dialog directly, decide the answer, and send
+it — butchr's escalation here is deliberately observational, never
+answerable through Jira the way a keyed issue's `ANSWER <n> <fingerprint>`
+reply is (there is no ticket to reply on). If the SAME definition keeps
+re-blocking on the SAME dialog shape, that is exactly the signal to file it
+against FACTORY-46 (or whatever succeeds it) for drovr to learn to
+recognize.

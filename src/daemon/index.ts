@@ -36,6 +36,7 @@ import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
+import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -674,7 +675,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1527,8 +1528,17 @@ const escalator = createEscalator({
   // dialog that opened this ticket. Shares config.captureDir with the
   // session-limit watcher's own captures (capture-store.ts); each recognizes
   // only its own filename shape, so neither ever evicts the other's files.
+  // FACTORY-50 (Part C): the SAME sink also lands a keyless managed-session
+  // pane's capture, under its own disjoint filename shape — no separate dep
+  // to wire, since `EscalatorDeps.captures` is already the one seam both
+  // paths funnel through inside escalation-loop.ts.
   captures: createCaptureStore(config.captureDir),
   coverage,
+  // FACTORY-45: called only when `issueForPane` already resolved null for
+  // this pane (see the wiring below) — a real managed-session identity
+  // widens the keyless path to a loud journal line + a `/health` stalled
+  // mark; anything else keeps today's log-only behavior.
+  managedSessionOf: managedSessionOfPane,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
@@ -1537,6 +1547,63 @@ async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
   return escalationTargetOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
+
+/**
+ * FACTORY-45: `escalator`'s own `managedSessionOf` dep — resolves a pane's
+ * managed-session identity, called ONLY when `issueForPane` already
+ * returned null for it (see the escalator wiring below). `agentIdOfWorkspacePath`
+ * decodes the pane's cwd back to its herd id regardless of provider;
+ * `ownsManagedSessionAgent` narrows that to exactly the filesystem-provider
+ * `managed-sessions` built-in rule (src/rules/session-definition-type.ts) —
+ * every OTHER keyless pane (an unowned/legacy workspace, a query-level
+ * agent, a plain `filesystem` agent under some OTHER rule, ...) resolves
+ * `null` here, which keeps today's log-only behavior for them exactly (see
+ * `EscalatorDeps.managedSessionOf`'s own doc comment). A second
+ * `herdr.agent.list()` call, separate from `issueForPane`'s own: only paid
+ * for a keyless pane, which is the uncommon case, and keeps this a small,
+ * independent seam rather than reshaping `issueForPane`'s existing contract.
+ */
+async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string; definitionPath: string } | null> {
+  const { agents } = await herdr.agent.list();
+  const cwd = agents.find((a) => a.pane_id === paneId)?.cwd;
+  const id = agentIdOfWorkspacePath(cwd);
+  if (!id || !ownsManagedSessionAgent(id)) return null;
+  const decoded = decodeAnyAgentKey(id);
+  // The built-in managed-sessions rule always runs `swarm` execution (one
+  // agent per definition file — see builtinManagedSessionsRule's own doc
+  // comment, src/rules/session-definition-type.ts), so it never produces a
+  // query-level ("@query") agent key; this is defensive, not expected to be
+  // exercised.
+  if (!decoded || decoded.kind !== "resource") return null;
+  return { agentKey: id, definitionPath: decoded.resourceId };
+}
+
+// FACTORY-45 Part B: drovr's own host-neutral escalation hook
+// (`createManagedSessionEscalationWatcher`, src/agents/managed-session-escalation-watcher.ts,
+// wrapping `@brooswit/drovr` >= 0.15.0's `createBlockingEscalationWatcher`)
+// — deliberately a SEPARATE poll loop, own timer, own read of the fleet:
+// the watcher's own contract ("never call poll concurrently on the same
+// instance") is exactly the same "no overlapping polls" discipline
+// watchBlocked already gives its own caller, so this loop earns it the
+// same way rather than borrowing that one's cadence. Feeds ONLY the
+// managed-session minimal escalation (`escalator.onDrovrUnknownDialog`/
+// `onDrovrDialogResolved`) — a keyed pane, or a keyless pane that is not a
+// managed session, is a no-op there (see that method's own doc comment,
+// src/agents/escalation-loop.ts): Butchr's EXISTING `watchPrompts` pipeline
+// below stays the SOLE answerer and authoritative detector/escalator for
+// both, unchanged by this ticket — drovr's own `sendKeys` is a permanent
+// no-op here (see `createManagedSessionEscalationWatcher`'s own doc
+// comment for why: it detects and escalates, but never presses).
+const blockingEscalationWatcher = createManagedSessionEscalationWatcher(escalator);
+let blockingEscalationPollInFlight = false;
+const blockingEscalationTimer = setInterval(() => {
+  if (blockingEscalationPollInFlight) return;
+  blockingEscalationPollInFlight = true;
+  blockingEscalationWatcher.poll(herdr)
+    .catch((e) => console.error(`  [blocking-escalation] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { blockingEscalationPollInFlight = false; });
+}, 5_000);
+blockingEscalationTimer.unref?.();
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
 // whose text parses as a dialog, and whose trailing region isn't a recognized

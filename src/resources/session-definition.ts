@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { expandHome } from "./filesystem-query.js";
 import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
+import { formatResourceRef, parseResourceRef } from "./resource-ref.js";
 
 /** Agent vendors a managed-session definition may name. Narrower than `AGENT_HARNESSES` (src/rules/rules.ts) — `agy` is not a Bakr/Candlestix vendor and is deliberately excluded here, not merely unused. */
 export const SESSION_DEFINITION_VENDORS = ["claude", "codex"] as const;
@@ -155,11 +156,39 @@ export interface SessionDefinition {
    * grant fields must never be merged into one list.
    */
   unfreezeControllers?: string[];
+  /**
+   * FACTORY-52 (epic FACTORY-51) — opt one or more Jira projects into
+   * linked eventing for THIS definition's agent, in the same canonical
+   * `jira-project:<KEY>` vocabulary every other resource ref in this
+   * codebase already uses (`parseResourceRef`/`formatResourceRef`,
+   * ./resource-ref.js), reused verbatim rather than reimplemented — a
+   * malformed key fails at manifest LOAD time with the same message an
+   * operator would get anywhere else. Deliberately its own field, not a
+   * reuse of `Rule.linkedEventing` (src/rules/rules.ts): that field is a
+   * per-RULE boolean naming no project, whereas a managed-session
+   * definition has no owning `Rule` of its own to hang an opt-in off of and
+   * needs to name WHICH project(s), not merely whether. Non-empty array of
+   * canonical `jira-project:<KEY>` strings when present; only the
+   * `jira-project` provider is accepted (any other — `jira-work-item:...`,
+   * `github-issue:...`, ... — is rejected), and duplicate entries (compared
+   * by canonical form) are rejected rather than silently deduped, matching
+   * `freezeControllers`/`unfreezeControllers`'s own "reject, never silently
+   * drop" discipline above. The parsed value is the array of CANONICAL
+   * refs (not bare project keys) — same shape a caller would get back from
+   * `formatResourceRef` on each entry — so a consumer that already deals in
+   * `ResourceRef`/canonical strings elsewhere needs no separate parsing
+   * here. Absent means today's behaviour exactly: no project(s) opted in,
+   * no key materialises on the parsed definition. Pure additive and
+   * PARSE-ONLY — this field is not consulted by any nudge/notify/watch
+   * mechanism yet; that wiring is FACTORY-53's own scope (see
+   * docs/managed-sessions.md).
+   */
+  linkedEventingProjects?: string[];
 }
 
 const DEFINITION_FIELDS = new Set([
   "workingDirectory", "brief", "vendor", "tier", "permissionMode", "strictMcpConfig", "execution", "account", "role", "frozen",
-  "mcpServers", "freezeControllers", "unfreezeControllers",
+  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects",
 ]);
 
 const MAX_CONTROLLERS_PER_FIELD = 100;
@@ -193,6 +222,35 @@ function controllerListProblems(raw: unknown, at: string): string[] {
     const canonical = controllerCanonicalName(name);
     if (!canonical) { problems.push(`${pat} "${name}" is not a valid file name`); return; }
     if (seen.has(canonical)) { problems.push(`${pat} "${name}" duplicates an earlier entry in the same list`); return; }
+    seen.add(canonical);
+  });
+  return problems;
+}
+
+/**
+ * `linkedEventingProjects`: each entry must parse as a canonical
+ * `jira-project:<KEY>` reference via the shared `parseResourceRef` — a bare
+ * project key with no provider prefix (e.g. `"FACTORY"`) is REJECTED, same
+ * as everywhere else `ResourceRef`'s canonical form is required, not merely
+ * accepted. Duplicates (by canonical form, so the same key written twice,
+ * even with different casing before parsing, collides) are rejected rather
+ * than silently deduped — see this field's own doc comment on the
+ * `SessionDefinition` interface above.
+ */
+function linkedEventingProjectsProblems(raw: unknown, at: string): string[] {
+  if (!Array.isArray(raw)) return [`${at} must be an array of strings`];
+  if (raw.length === 0) return [`${at} must not be empty`];
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  raw.forEach((v, i) => {
+    const pat = `${at}[${i}]`;
+    if (typeof v !== "string" || v.trim() === "") { problems.push(`${pat} must be a non-empty string`); return; }
+    let ref;
+    try { ref = parseResourceRef(v.trim()); }
+    catch (e) { problems.push(`${pat} ${(e as Error).message}`); return; }
+    if (ref.provider !== "jira-project") { problems.push(`${pat} "${v.trim()}" must be a jira-project reference (got provider "${ref.provider}")`); return; }
+    const canonical = formatResourceRef(ref);
+    if (seen.has(canonical)) { problems.push(`${pat} "${v.trim()}" duplicates an earlier entry in the same list (${canonical})`); return; }
     seen.add(canonical);
   });
   return problems;
@@ -233,6 +291,7 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.mcpServers !== undefined) parseMcpServers(doc.mcpServers, `${at}.mcpServers`, problems);
   if (doc.freezeControllers !== undefined) problems.push(...controllerListProblems(doc.freezeControllers, `${at}.freezeControllers`));
   if (doc.unfreezeControllers !== undefined) problems.push(...controllerListProblems(doc.unfreezeControllers, `${at}.unfreezeControllers`));
+  if (doc.linkedEventingProjects !== undefined) problems.push(...linkedEventingProjectsProblems(doc.linkedEventingProjects, `${at}.linkedEventingProjects`));
   return problems;
 }
 
@@ -255,6 +314,9 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     ...(d.mcpServers !== undefined ? { mcpServers: parseMcpServers(d.mcpServers, `${at}.mcpServers`, []) as McpServerBinding[] } : {}),
     ...(d.freezeControllers !== undefined ? { freezeControllers: (d.freezeControllers as string[]).map((s) => s.trim()) } : {}),
     ...(d.unfreezeControllers !== undefined ? { unfreezeControllers: (d.unfreezeControllers as string[]).map((s) => s.trim()) } : {}),
+    ...(d.linkedEventingProjects !== undefined
+      ? { linkedEventingProjects: (d.linkedEventingProjects as string[]).map((s) => formatResourceRef(parseResourceRef(s.trim()))) }
+      : {}),
   };
 }
 
