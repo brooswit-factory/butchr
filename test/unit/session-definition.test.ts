@@ -74,6 +74,24 @@ describe("sessionDefinitionProblems", () => {
     // Unlike permissionMode, which is silently stored-but-unforwarded for Codex (docs/managed-sessions.md), this is a hard rejection.
     expect(sessionDefinitionProblems({ ...good(), vendor: "codex" }, "def")).toEqual([]);
   });
+  test("DROVR-42/FACTORY-67: lizardMode — optional boolean, absent means today's behaviour exactly", () => {
+    expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), lizardMode: true }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), lizardMode: false }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), lizardMode: "true" }, "def")).toEqual(["def.lizardMode must be a boolean"]);
+    expect(parseSessionDefinition(good(), "def", HOME).lizardMode).toBeUndefined();
+    expect(parseSessionDefinition({ ...good(), lizardMode: true }, "def", HOME).lizardMode).toBe(true);
+    // permissionMode: "default" (manual mode) plus lizardMode: true is the operator's own "lizard mode" combination this field exists for.
+    expect(sessionDefinitionProblems({ ...good(), permissionMode: "default", lizardMode: true }, "def")).toEqual([]);
+  });
+  test("DROVR-42/FACTORY-67: lizardMode is rejected at manifest load for vendor codex — drovr's tool-permission dialog recognition is Claude-specific", () => {
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: true }, "def"))
+      .toEqual(['def.lizardMode is not supported for vendor "codex" — drovr\'s tool-permission dialog recognition is Claude-specific and never matches a Codex pane; omit this field for a Codex definition']);
+    // Even an explicit false is rejected — same "the field itself is unsupported" treatment as strictMcpConfig, not merely a truthy value.
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", lizardMode: false }, "def")[0])
+      .toContain('not supported for vendor "codex"');
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex" }, "def")).toEqual([]);
+  });
   test("execution: reuses Rule's ExecutionMode enum verbatim, invalid value rejected", () => {
     for (const execution of ["swarm", "singleton", "persistent"]) expect(sessionDefinitionProblems({ ...good(), execution }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), execution: "bogus" }, "def")[0]).toContain("execution must be one of");

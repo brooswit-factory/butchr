@@ -36,6 +36,8 @@ export interface ManagedSessionsLoopDeps {
   roles?: Map<string, AgentRole>;
   /** See `ManagedSessionResourceDeps.accountPolicies` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no per-definition account policy is surfaced (existing behaviour unchanged). */
   accountPolicies?: Map<string, AccountPolicy>;
+  /** See `ManagedSessionResourceDeps.lizardModes` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no lizard-mode information is surfaced (existing behaviour unchanged). */
+  lizardModes?: Map<string, boolean>;
   /**
    * BUTCHR-460 — the SAME shared `AccountLifecycleHooks` instance every
    * other rule loop is wired against (src/daemon/index.ts), wrapped here
@@ -89,6 +91,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     log: deps.log,
     ...(deps.roles ? { roles: deps.roles } : {}),
     ...(deps.accountPolicies ? { accountPolicies: deps.accountPolicies } : {}),
+    ...(deps.lizardModes ? { lizardModes: deps.lizardModes } : {}),
   });
   const account = deps.account
     ? wireManagedSessionArchiveRelease(deps.account, { exists: deps.exists ?? realPathExists, ...(deps.env ? { env: deps.env } : {}), ruleId: rule.id })

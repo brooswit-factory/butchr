@@ -272,6 +272,25 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * fail-safe `"none"` default — same brief, documented window `roles` has.
    */
   accountPolicies?: Map<string, AccountPolicy>;
+  /**
+   * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `roles`/
+   * `accountPolicies` immediately above, one field over: whether an eligible
+   * definition opted into "lizard mode" (`SessionDefinition.lizardMode`).
+   * The permission-answer timer (`src/agents/permission-answer-loop.ts`,
+   * wired in `src/daemon/index.ts`) consults this map every tick to decide
+   * which panes it may scan/answer at all — a definition absent from this
+   * map (not yet observed this daemon's lifetime, or simply never setting
+   * the field) is never touched, matching `lizardMode`'s own "absent means
+   * today's behaviour exactly" contract. Deliberately live, not
+   * persisted-at-spawn like `permissionMode`/`strictMcpConfig` (FACTORY-43)
+   * — this field never reaches the launched process's argv, so there is
+   * nothing for a stale-argv check to compare and no respawn-loop risk to
+   * guard against; toggling it in the manifest takes effect on this loop's
+   * very next poll, live, with no agent restart. Optional; omitted, no
+   * lizard-mode information is surfaced (today's behaviour — every caller
+   * before this ticket, and any direct call that does not opt in).
+   */
+  lizardModes?: Map<string, boolean>;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
@@ -291,6 +310,10 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
         if (deps.accountPolicies) {
           deps.accountPolicies.clear();
           for (const m of matches) deps.accountPolicies.set(m.agentKey, m.definition.account);
+        }
+        if (deps.lizardModes) {
+          deps.lizardModes.clear();
+          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? false);
         }
         return groupExecutionUnits([deps.rule], matches);
       },
