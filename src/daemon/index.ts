@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createBlockingEscalationWatcher } from "@brooswit/drovr";
+import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -36,6 +36,7 @@ import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
+import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -1491,9 +1492,10 @@ async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string;
 }
 
 // FACTORY-45 Part B: drovr's own host-neutral escalation hook
-// (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
-// deliberately a SEPARATE poll loop, own timer, own read of the fleet: the
-// watcher's own contract ("never call poll concurrently on the same
+// (`createManagedSessionEscalationWatcher`, src/agents/managed-session-escalation-watcher.ts,
+// wrapping `@brooswit/drovr` >= 0.15.0's `createBlockingEscalationWatcher`)
+// — deliberately a SEPARATE poll loop, own timer, own read of the fleet:
+// the watcher's own contract ("never call poll concurrently on the same
 // instance") is exactly the same "no overlapping polls" discipline
 // watchBlocked already gives its own caller, so this loop earns it the
 // same way rather than borrowing that one's cadence. Feeds ONLY the
@@ -1501,14 +1503,11 @@ async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string;
 // `onDrovrDialogResolved`) — a keyed pane, or a keyless pane that is not a
 // managed session, is a no-op there (see that method's own doc comment,
 // src/agents/escalation-loop.ts): Butchr's EXISTING `watchPrompts` pipeline
-// below stays the authoritative detector/escalator for both, unchanged by
-// this ticket. `herdr` itself already satisfies drovr's own
-// `{ agent: Pick<DrovrClient["agent"], "list" | "read" | "sendKeys"> }`
-// client shape — it IS a `DrovrClient`.
-const blockingEscalationWatcher = createBlockingEscalationWatcher({
-  onUnknownDialog: (escalation) => escalator.onDrovrUnknownDialog(escalation),
-  onDialogResolved: (resolved) => escalator.onDrovrDialogResolved(resolved),
-});
+// below stays the SOLE answerer and authoritative detector/escalator for
+// both, unchanged by this ticket — drovr's own `sendKeys` is a permanent
+// no-op here (see `createManagedSessionEscalationWatcher`'s own doc
+// comment for why: it detects and escalates, but never presses).
+const blockingEscalationWatcher = createManagedSessionEscalationWatcher(escalator);
 let blockingEscalationPollInFlight = false;
 const blockingEscalationTimer = setInterval(() => {
   if (blockingEscalationPollInFlight) return;
