@@ -7,7 +7,8 @@ access, no live Rocket.Chat (RC) access, and no live-daemon access
 verified by reading the merged source on `origin/BUTCHR-395`, cited inline,
 never by running it against a real RC. It is **executed later, in S5 Codey
 staging, by manager-factory-butchr**, who does have Codey and RC access
-(BUTCHR-391 comments 23817/23819/23821/23824). If anything below disagrees
+(BUTCHR-391 comments 23817/23821; BUTCHR-395 comments 23819/23824 — verify
+each citation on the ticket it actually names, not by assumption). If anything below disagrees
 with the code on the branch you are actually running, the code wins — verify
 the citation yourself before acting on it, per this factory's own working
 agreement (`docs/../CLAUDE.md`'s "Writing for another agent" section, and the
@@ -28,13 +29,20 @@ line number or file path cited here — line numbers rot, symbol names and
 ## 0. What "verified" means here, and what this runbook does not cover
 
 There is no staging Rocket.Chat — only production, `https://chat.brooswit.nexus`
-(BUTCHR-391 comments 23817/23819; ~33-40 of 50 seats in use depending on
-which comment you read — **re-count live yourself in Step 3**, do not trust
-either number as current). "Verified against a real Rocket.Chat" therefore
-means: temporary, clearly-named test accounts on that live system, cleaned up
-afterwards, approved in advance (BUTCHR-391 comment 23821/23824). Every step
-below that touches RC is a live-system action against production — treat it
-with the same care you would any other production change.
+(BUTCHR-391 comment 23817, BUTCHR-395 comment 23819; ~33-40 of 50 seats in use
+depending on which comment you read — **re-count live yourself in Step 3**, do
+not trust either number as current). "Verified against a real Rocket.Chat"
+therefore means: temporary, clearly-named test accounts on that live system,
+cleaned up afterwards, approved in advance (BUTCHR-391 comment 23821,
+BUTCHR-395 comment 23824). Every step below that touches RC is a live-system
+action against production — treat it with the same care you would any other
+production change.
+
+**BUTCHR-460 (archive → account release, PR #428) has now MERGED** into
+`BUTCHR-395` (`d7aa251`, merged 2026-09-26) — verify this is still true for
+whatever commit you are actually running (`gh pr view 428 --repo
+brooswit-factory/butchr --json state,mergedAt`) before trusting Step 4's
+archive subsection below, which is written against that merged code.
 
 **Design docs this runbook is written against** (read them yourself before
 running anything — they are the actual contract, this is a walkthrough of
@@ -47,15 +55,14 @@ managed-session definitions, for the Nexus/directors/MUD-player identities
 S5's own mapping names), `docs/execution-modes.md` (BUTCHR-397/398 —
 `execution`/`account`/`role`).
 
-**BUTCHR-460 (archive → account release, PR #428) is NOT merged into
-`BUTCHR-395` as of this writing** (`gh pr view 428` reports `state: OPEN`,
-`CHANGES_REQUESTED` on the story's `[review]` comment) — verify this
-yourself (`gh pr view 428 --repo brooswit-factory/butchr --json
-state,mergedAt` or read BUTCHR-460's own Jira comments) before trusting
-anything this runbook says about archive-triggered release or managed-session
-account provisioning. Every place below that depends on it is marked
-**PENDING BUTCHR-460** explicitly, and describes the fallback that already
-works without it.
+**BUTCHR-460 (archive → account release, PR #428) merged into `BUTCHR-395`
+as `d7aa251`** — Step 4's archive subsection is written against that merged
+code (`src/agents/managed-session-account-release.ts`,
+`docs/rocketchat-accounts.md`'s "Archive release (BUTCHR-460)" section,
+`docs/managed-sessions.md`'s "Archive/unarchive" section). If you are running
+against a checkout where 460 has since been reverted or materially changed,
+that subsection no longer applies as written — re-verify against your own
+checkout's code before trusting it.
 
 ## 1. Preconditions and credentials
 
@@ -105,7 +112,7 @@ not met, in order):
   printable ASCII (`/[^\x21-\x7e]/` rejects it) — i.e. exactly one token, no
   trailing structure, no JSON wrapper, no second line.
 
-**How to ask Nexus for it** (per BUTCHR-391 comments 23821/23824, and the
+**How to ask Nexus for it** (per BUTCHR-391 comment 23821, BUTCHR-395 comment 23824, and the
 epic's `#ask-helpdesk` convention): request it there, as a **file path or
 environment variable only** — never ask for the token value to be pasted
 into this ticket, a PR, a comment, or chat. Nexus creates the provisioner
@@ -203,7 +210,7 @@ cap overrides ARE the test mode for this run.
 
 ## 2. Tell Nexus before any test account exists
 
-BUTCHR-391 comment 23821 (director, corrected in 23824): **Nexus is told
+BUTCHR-391 comment 23821 (director, corrected in BUTCHR-395 comment 23824): **Nexus is told
 before any test account is created** — post in `#ask-helpdesk` that you are
 about to run the S4 real-RC verification gate, naming the `butchr-test-`
 prefix, the account count you expect to create (at most 5, per Step 4/7/8's
@@ -315,19 +322,21 @@ this runbook does not prescribe which provider, since it cannot see your
 daemon's own `rules.json`; pick whichever is least disruptive to stage
 against on Codey). Add `"mcpServers"` naming rocketr per Step 6's shape.
 
-**PENDING BUTCHR-460**: a managed-session definition (`docs/managed-sessions.md`)
-with `"account": "temporary"` does **not** yet provision a real account —
-today the field is validated and stored only for that provider (that doc's
-own "Not in this version" language, still true on `origin/BUTCHR-395` as of
-this writing). If BUTCHR-460 has merged by the time you run this, re-read
-`docs/managed-sessions.md`'s "Post-archive hook seam"/wiring section and
-`docs/rocketchat-accounts.md`'s "Archive release" section (names to look for
-once merged — confirm they exist before trusting this sentence) — the
-managed-session route (needed for the real Nexus/directors/MUD-player
-identities named in the S5 mapping, BUTCHR-391 comment 23527) becomes
-available at that point and this runbook's rule-based path becomes the
-*fallback* for provider types managed-sessions doesn't cover, not the only
-option.
+**Managed-session accounts are wired too** (BUTCHR-460, merged as `d7aa251`):
+a managed-session definition (`docs/managed-sessions.md`) with `"account":
+"temporary"|"permanent"` provisions a real account through the identical
+`ensure`/`release` contract described below — `accountPolicyOf`
+(`src/daemon/index.ts`) resolves each eligible definition's own `account`
+field via the per-poll `managedSessionAccountPolicies` map, and
+`accountLifecycle` is now ALWAYS constructed (the RC HTTP client itself still
+stays `null`, and every `ensureAccount` call for a policy other than
+`"none"` still visibly refuses with `"rc-not-configured"`, when
+`ROCKETCHAT_*` is unconfigured — `docs/rocketchat-accounts.md`'s "Wiring"
+section). **Use this route** — `butchr session create <name> --account
+temporary|permanent ...` (`src/cli/session-cli.ts`) — for the real
+Nexus/directors/MUD-player identities named in the S5 mapping (BUTCHR-391
+comment 23527); the rule-based path above remains the one to use for any
+provider a managed-session definition doesn't cover.
 
 ### Create on first start, once
 
@@ -410,16 +419,56 @@ lost" — a thrown release is queued in-memory and retried every poll
 periodic orphan sweep (Step 9) is the slow backstop. Confirm which one
 actually cleaned it up rather than assuming either did.
 
-### Archive: PENDING BUTCHR-460
+### Archive: released with reason `"archive"`, not just `"stop"` (BUTCHR-460, merged `d7aa251`)
 
-Once BUTCHR-460 merges, re-verify `releaseAccount(agentKey, "archive")`'s own
-wiring point (its name and `ReleaseReason` shape are stable per
-`docs/rocketchat-accounts.md`'s "The four policies" table) and confirm
-`butchr session archive <name>` actually triggers it end-to-end for a real
-managed-session `temporary` account. **Until then, this step cannot be
-verified against real code and must not be claimed as covered** — mark it
-open in your S5 evidence (Step 10) if you reach this point before BUTCHR-460
-lands.
+Archiving a managed-session definition (`butchr session archive <name>`, or
+hand-moving its file into the archive directory) moves the file out of the
+active definitions directory; the daemon's own next poll (within
+`MANAGED_SESSIONS_POLL_MS` = 15s, `docs/managed-sessions.md`'s
+"Archive/unarchive" section) no longer lists it, so it drops out of
+`desired` and is released through the SAME shared `AccountLifecycleHooks`
+every other provider uses. `src/agents/managed-session-account-release.ts`'s
+`wireManagedSessionArchiveRelease` upgrades that release's reason from the
+generic `"stop"` to `releaseAccount`'s own named entry point, `"archive"`
+(`ReleaseReason`, `docs/rocketchat-accounts.md`'s "The four policies"), the
+moment it can positively confirm a file of the definition's exact original
+basename now exists in the archive directory (`sessionArchiveDir`,
+`src/resources/session-archive.ts`) — this also catches an archive done by
+hand-moving the file, not only one done through the CLI. `stop` and
+`archive` behave IDENTICALLY in `releaseAccount` itself (both unprovision a
+`temporary` account, retain a `permanent` one) — the distinction is purely
+for the audit trail.
+
+**Observable**: archive a `temporary`-account definition; within one poll,
+confirm (a) the daemon journal's `[account] ... released (archive)` line
+(not `(stop)`), and (b) the same RC-user-deleted / token-file-gone /
+manifest-entry-removed result Step 4's "Unprovision on every stop path"
+already checks — same commands, same expected result, only the audit-line
+reason differs. Archive a `permanent`-account definition: confirm the
+account is retained (same check as Step 5). `unarchive <name>` moves the
+file back under its exact original basename; confirm the SAME agent (the
+same derived RC username — identity is keyed off the file path,
+`docs/managed-sessions.md`'s "The identity rule, and why it's load-bearing")
+is recreated on the next poll, never a second, duplicate one. Repeat
+archive → unarchive → archive once more; confirm no double-release and no
+leaked account on any cycle.
+
+**A named, non-blocking limitation** (`docs/rocketchat-accounts.md`'s
+"Archive release (BUTCHR-460)" section): the archive-vs-stop check has no
+memory of WHICH move put a file at the archive path — only that one is
+there right now. A stale copy left in the archive directory some other way
+(an operator's own copy, a leftover from an interrupted move) can make a
+LATER, genuinely-ordinary stop of the same basename (deleted/invalidated/
+frozen, not archived) mis-log as `"archive"`. This never changes WHETHER a
+`temporary` account is released — only the audit line's accuracy in that
+narrow case — worth noting in your evidence if you see it, not a reason to
+distrust the release itself.
+
+**Fails as**: the RC user surviving past one poll after archive means either
+the definition didn't actually leave the active directory's listing (check
+`sessionArchiveDir`/`assertArchiveDirDisjoint` didn't refuse, and that the
+basename matches exactly) or a genuine regression in the release wiring —
+file it, don't work around it.
 
 ## 5. Permanent account lifecycle
 
@@ -434,7 +483,21 @@ reason including stop/archive"). Confirm by stopping and restarting a
 manifest entry are all still present and **unchanged** across the cycle —
 same byte-identical-token-file check as Step 4's respawn case, since a
 permanent account's "adopt on every start" path reuses the same still-valid
-token check. **Fails as**: the RC user disappearing on any stop/archive
+token check:
+
+```
+$ curl -sS -H "X-Auth-Token: $(cat "$ROCKETCHAT_ADMIN_TOKEN_FILE")" \
+       -H "X-User-Id: $ROCKETCHAT_ADMIN_USER_ID" \
+       "$ROCKETCHAT_URL/api/v1/users.info?username=<derived-permanent-username>" | jq .user.active
+$ sha256sum "$ROCKETCHAT_TOKEN_DIR/<derived-permanent-username>.token"   # before
+# ... stop, restart the agent ...
+$ curl -sS -H "X-Auth-Token: $(cat "$ROCKETCHAT_ADMIN_TOKEN_FILE")" \
+       -H "X-User-Id: $ROCKETCHAT_ADMIN_USER_ID" \
+       "$ROCKETCHAT_URL/api/v1/users.info?username=<derived-permanent-username>" | jq .user.active
+$ sha256sum "$ROCKETCHAT_TOKEN_DIR/<derived-permanent-username>.token"   # after — must match the "before" hash
+```
+
+**Fails as**: the RC user disappearing on any stop/archive
 reason is a policy-matrix regression — `permanent` must never be deleted by
 butchr, ever, under any `ReleaseReason`.
 
@@ -648,18 +711,32 @@ For every account this runbook created (Steps 4, 5's test instances if any
 were made non-permanently for this gate, 7, 8):
 
 1. Stop the agent (the same mechanism Step 4 verified releases a temporary
-   account). Wait for the release to actually land — check
-   `GET /api/v1/users.info?username=<derived>` returns not-found, not just
-   that the stop command returned.
+   account). Wait for the release to actually land — check:
+   ```
+   $ curl -sS -H "X-Auth-Token: $(cat "$ROCKETCHAT_ADMIN_TOKEN_FILE")" \
+          -H "X-User-Id: $ROCKETCHAT_ADMIN_USER_ID" \
+          "$ROCKETCHAT_URL/api/v1/users.info?username=<derived>"
+   ```
+   **Expected**: `{"success":false,"error":"User not found."}` (or
+   equivalent RC "not found" body) — not just that the stop command
+   returned.
 2. If any release failed and was queued (Step 4's retry path), wait for the
    next poll and re-check, or force it by restarting the daemon (the orphan
    sweep, below, is the backstop if this still doesn't clear it).
 3. Confirm the token file at `$ROCKETCHAT_TOKEN_DIR/<username>.token` is
-   gone.
+   gone: `test -e "$ROCKETCHAT_TOKEN_DIR/<username>.token" && echo STILL THERE || echo gone`.
 4. Confirm the account no longer appears in
-   `$ROCKETCHAT_NEXUS_MANIFEST_FILE` after the next batch publish.
+   `$ROCKETCHAT_NEXUS_MANIFEST_FILE` after the next batch publish:
+   `jq '.[] | select(.account == "<username>")' "$ROCKETCHAT_NEXUS_MANIFEST_FILE"`
+   should print nothing.
 5. Re-run Step 3's count command; **the total must equal the Step 3
-   baseline**, exactly. A mismatch means an account this runbook created (or
+   baseline**, exactly:
+   ```
+   $ curl -sS -H "X-Auth-Token: $(cat "$ROCKETCHAT_ADMIN_TOKEN_FILE")" \
+          -H "X-User-Id: $ROCKETCHAT_ADMIN_USER_ID" \
+          "$ROCKETCHAT_URL/api/v1/users.list?count=1" | jq .total
+   ```
+   A mismatch means an account this runbook created (or
    one it didn't — see the orphan sweep below) was not actually cleaned up;
    do not close this gate until it matches.
 6. **Tell Nexus to unregister the cleaned-up accounts from rocketr** —
@@ -709,9 +786,10 @@ before concluding it's stuck).
 ## 10. Evidence
 
 **Destination**: per BUTCHR-391's own comment history (23593/23596: fleet
-cutover oversight and its evidence moved to admin-assembly; 23821/23824:
-"Creation and cleanup are both recorded in the S5 evidence" — S5 is
-BUTCHR-396), post evidence against **BUTCHR-396's evidence list**, and check
+cutover oversight and its evidence moved to admin-assembly; 23821, and
+BUTCHR-395 comment 23824: "Creation and cleanup are both recorded in the S5
+evidence" — S5 is BUTCHR-396), post evidence against **BUTCHR-396's evidence
+list**, and check
 BUTCHR-396's own current comments for whether admin-assembly wants a copy
 posted anywhere else by the time you run this — the ownership changed once
 already (23585 → 23593) and may have moved again since this runbook was
@@ -760,8 +838,8 @@ cleanup runs** — Nexus's own term (BUTCHR-391 comment 24007): a DM to a
 | BUTCHR-413 (PR #392) | No RC credential in `ps`/argv/journal/`mcp.json` permissions | 6 |
 | BUTCHR-411 (PR #387) | A live, no-further-input wake for a Claude agent bound to a channel server, from outside the daemon, without touching it — NOT closed by #387 itself | 8 |
 | BUTCHR-391 comments 23997/23999/24007 | Test-account terms: prefix, cap, no DM/room origination by test accounts, DM reception allowed | 1.4, 2, 4 |
-| BUTCHR-391 comments 23821/23824 | Nexus told before creation; headroom checked; explicit cleanup with verification; creation+cleanup recorded as evidence | 2, 3, 9, 10 |
-| BUTCHR-460 (PR #428, unmerged) | Archive triggers temporary-account release | 4 ("PENDING BUTCHR-460") |
+| BUTCHR-391 comment 23821, BUTCHR-395 comment 23824 | Nexus told before creation; headroom checked; explicit cleanup with verification; creation+cleanup recorded as evidence | 2, 3, 9, 10 |
+| BUTCHR-460 (PR #428, merged as `d7aa251`) | Archive triggers temporary-account release (reason `"archive"`, not just `"stop"`) | 4 |
 
 ## Open questions (do not guess — ask, then record the answer here before relying on it)
 
@@ -772,12 +850,8 @@ cleanup runs** — Nexus's own term (BUTCHR-391 comment 24007): a DM to a
 2. **The provisioner's exact RC permission names** (Step 1.2): this repo can
    name the six REST calls needing coverage but not RC's own internal
    permission-name mapping for the version Nexus runs — confirm with Nexus
-   directly against her own admin panel.
-3. **Whether BUTCHR-460 has merged by the time you run this** (Step 4) —
-   re-check `gh pr view 428 --repo brooswit-factory/butchr --json
-   state,mergedAt` before trusting this runbook's "PENDING" markers as still
-   accurate.
-4. **The steady-state managed-username prefix convention** — out of scope
+   directly against Nexus's own admin panel.
+3. **The steady-state managed-username prefix convention** — out of scope
    for this gate (Step 1.4 only overrides it for this run), but still an
    open conversation with Nexus per BUTCHR-391 comment 24003; do not confuse
    this run's `butchr-test-` override with a settled production answer.
