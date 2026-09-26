@@ -15,6 +15,43 @@ const CLOCK_SKEW_GRACE_MS = 120_000;
 export interface CommentRow { id: string; body: string; created: string }
 
 /**
+ * FACTORY-45: journal-line prefix for a KEYLESS managed-session pane's own
+ * escalation (`issue === null`, filesystem-provider `managed-sessions` rule
+ * — see docs/managed-sessions.md) — deliberately distinct from `[prompts]`
+ * (this module's ordinary log wrapper) so an operator can `journalctl --user
+ * -u <unit> | grep managed-escalation` and find every such event regardless
+ * of how noisy the ordinary prompt log is. Real dialog recognition/auto-
+ * answer is drovr's own job (FACTORY-46) — this fires only for a dialog
+ * `watchPrompts` already decided it cannot auto-answer.
+ */
+export const MANAGED_ESCALATION_MARKER = "[managed-escalation]";
+
+/**
+ * FACTORY-45: a keyless pane's managed-session identity, resolved fresh on
+ * every poll from the pane's own workspace path (`EscalatorDeps.managedSessionOf`)
+ * — never persisted by this module. `agentKey` is the filesystem agent key
+ * butchr's own managed-sessions rule assigned this definition
+ * (`filesystem:managed-sessions:<encoded path>`, src/rules/agent-key.ts);
+ * `definitionPath` is that key's decoded resource id — the definition
+ * file's own path — which is what the journal line and the `/health`
+ * sibling actually name for an operator.
+ */
+export interface ManagedSessionTarget {
+  agentKey: string;
+  definitionPath: string;
+}
+
+/** One currently-"stalled" managed session — the `/health` sibling `EscalatorDeps.log`'s journal line is paired with (see `Escalator.managedSessionEscalations`). */
+export interface ManagedSessionEscalation {
+  agentKey: string;
+  definitionPath: string;
+  paneId: string;
+  fingerprint: string;
+  /** ISO timestamp of this episode's first escalated poll. */
+  since: string;
+}
+
+/**
  * BUTCHR-124: marker for the sustained-blocked-and-unparseable alarm —
  * deliberately distinct from escalate.ts's `MARKER` (`[butchr:blocked]`) so a
  * reader can tell the two apart at a glance: `[butchr:blocked]` means "here
@@ -113,6 +150,18 @@ export interface EscalatorDeps {
    * declining call sites in this one).
    */
   coverage?: CoverageRecorder;
+  /**
+   * FACTORY-45: resolves `paneId` -> its managed-session identity, called
+   * ONLY when `onBlocked` was given `issue === null` — never for a keyed
+   * pane. Returns `null` for any OTHER keyless pane (an unowned/legacy
+   * workspace, a query-level agent, …), which keeps today's log-only
+   * behavior exactly for those — this ticket widens the keyless path only
+   * for a pane that is genuinely a filesystem-provider `managed-sessions`
+   * agent (see docs/managed-sessions.md). Optional: absent means no
+   * managed-session awareness at all, byte-for-byte the same log-only
+   * behavior as before this ticket.
+   */
+  managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>;
 }
 
 interface PaneState {
@@ -154,6 +203,17 @@ export interface Escalator {
    * silently sitting stuck (KAN-682, applied to the parser).
    */
   onNoPrompt: (paneId: string, issue: string | null, text: string, pollSeq: number) => void;
+  /**
+   * FACTORY-45: every managed-session pane CURRENTLY marked stalled — an
+   * escalated (logged), not-yet-resolved dialog on a keyless managed-session
+   * pane. Read by `src/daemon/index.ts`'s `/health` wiring (a sibling field,
+   * same "additive, never flips `ok`" pattern `admission`/`coverage` already
+   * use — see src/daemon/health.ts) so an operator has a status SURFACE to
+   * find a blocked managed session on, not only the journal line. A pure
+   * snapshot of this instance's own in-memory tracking; empty when nothing
+   * is stalled, or when `EscalatorDeps.managedSessionOf` was never wired.
+   */
+  managedSessionEscalations: () => readonly ManagedSessionEscalation[];
 }
 
 /** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
@@ -442,6 +502,56 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     return deps.now();
   }
 
+  // ===========================================================================
+  // FACTORY-45: the KEYLESS managed-session escalation — a fully separate
+  // tracker from `state`/PaneState above, deliberately, same precedent
+  // BUTCHR-124's `unresponsive` tracker sets just above: there is no issue
+  // to comment on, no ANSWER directive to read back, and no 15-minute
+  // follow-up for a managed session (docs/managed-sessions.md: no Implements
+  // links, no boss/worker model) — reusing PaneState's Jira-shaped fields
+  // for a concept that has none of them would only risk the very regression
+  // this whole file's own precedent (item D7, KAN-756) forbids: a change to
+  // the Jira flow's behaviour. Real dialog recognition/auto-answer is
+  // drovr's job (FACTORY-46); this only logs + marks a dialog `watchPrompts`
+  // ALREADY decided it cannot auto-answer.
+  // ===========================================================================
+
+  interface ManagedSessionEntry {
+    target: ManagedSessionTarget;
+    fp: string;
+    /** ISO timestamp of this episode's first escalated poll — carried into `ManagedSessionEscalation.since`. */
+    since: string;
+  }
+  const managedSessionStalled = new Map<string, ManagedSessionEntry>();
+
+  /**
+   * Log + mark once per (pane, fingerprint) episode. Called every poll the
+   * pane is blocked on an unanswerable dialog with `issue === null` and
+   * `deps.managedSessionOf` resolved it as a managed session — a NO-OP on
+   * every poll after the first for the SAME fingerprint (dedupe is the
+   * in-memory map itself, never a re-read of anything external: there is no
+   * comment channel to adopt from, unlike `escalate`/`escalateUnresponsive`
+   * above, so a daemon restart mid-episode simply re-logs once — acceptable
+   * per this ticket's own reduced scope, unlike the Jira flow's restart-safe
+   * adoption).
+   */
+  function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): void {
+    const fp = fingerprint(prompt);
+    const prior = managedSessionStalled.get(paneId);
+    if (prior?.fp === fp) return; // already logged + marked for this exact dialog this episode
+    const since = new Date(deps.now()).toISOString();
+    managedSessionStalled.set(paneId, { target, fp, since });
+    const options = prompt.options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${prompt.question}" options: ${options} fingerprint: ${fp}`);
+  }
+
+  /** Every managed session CURRENTLY marked stalled — see `Escalator.managedSessionEscalations`'s own doc comment. */
+  function managedSessionEscalations(): readonly ManagedSessionEscalation[] {
+    return [...managedSessionStalled.entries()].map(([paneId, e]) => ({
+      agentKey: e.target.agentKey, definitionPath: e.target.definitionPath, paneId, fingerprint: e.fp, since: e.since,
+    }));
+  }
+
   /**
    * BUTCHR-159: the dedupe/adoption read routes through `deps.
    * ownChannelComments` — the tier-aware reader (an issue's Jira comments,
@@ -713,7 +823,28 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
 
   async function onBlocked(paneId: string, issue: string | null, prompt: Prompt, pollSeq: number): Promise<void> {
     if (issue === null) {
-      log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
+      // FACTORY-45: widen the keyless path ONLY for a pane that is
+      // genuinely a filesystem-provider `managed-sessions` agent — every
+      // OTHER keyless pane (an unowned/legacy workspace, a query-level
+      // agent, ...) keeps today's log-only behavior exactly (5.: "do not
+      // widen the change"). `managedSessionOf` is called fresh every poll
+      // rather than cached: it is cheap (one herd.agent.list() the caller
+      // already needed to resolve `issue` itself — see daemon/index.ts's
+      // `issueForPane`), and a pane's own identity cannot change mid-life.
+      if (inFlight.has(paneId)) {
+        log(`skipped overlapping poll for ${paneId} — no issue key, a previous poll is still in flight`);
+        return;
+      }
+      inFlight.add(paneId);
+      try {
+        const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
+        if (session) handleManagedSessionBlocked(paneId, session, prompt);
+        else log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
+      } catch (e) {
+        log(`error handling ${paneId}: ${(e as Error)?.message ?? e}`);
+      } finally {
+        inFlight.delete(paneId);
+      }
       return;
     }
     if (inFlight.has(paneId)) {
@@ -767,6 +898,19 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // NEXT time onNoPrompt happens to fire for it, if ever).
     for (const paneId of unresponsive.keys()) {
       if (!blocked.has(paneId)) unresponsive.delete(paneId);
+    }
+    // FACTORY-45: "clear the stalled mark when the dialog clears" — the
+    // herd no longer reporting this pane blocked AT ALL is the resolution
+    // signal (mirrors the `unresponsive` cleanup just above); a fingerprint
+    // CHANGE while still blocked is handled inline in
+    // `handleManagedSessionBlocked` itself (a new fp simply overwrites the
+    // old entry and re-logs, satisfying "a new fingerprint escalates
+    // again" without needing a separate clear step here).
+    for (const [paneId] of managedSessionStalled) {
+      if (!blocked.has(paneId)) {
+        deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} no longer blocked — clearing stalled mark`);
+        managedSessionStalled.delete(paneId);
+      }
     }
   }
 
@@ -833,5 +977,5 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     })();
   }
 
-  return { onBlocked, onPoll, onNoPrompt };
+  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations };
 }
