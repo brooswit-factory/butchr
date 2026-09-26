@@ -318,9 +318,13 @@ export interface Rule {
    * `SessionDefinition.lizardMode`) — opts every agent THIS rule launches
    * into the daemon's standalone permission-answer timer
    * (`src/agents/permission-answer-loop.ts`, wired in `src/daemon/index.ts`):
-   * drovr's `autoAnswerPermissions` presses the "Yes, and always allow …"
-   * stored-rule option on an unambiguous Claude tool-permission dialog, so a
-   * rule kept in `permissionMode: "default"` is never left frozen on one for
+   * drovr's `autoAnswerPermissions` answers an unambiguous Claude
+   * tool-permission dialog on that agent's pane — see that module's own doc
+   * comment / `docs/permission-answer-loop.md` for exactly which option it
+   * presses and how it is logged, deliberately not restated here since that
+   * is drovr's own answering policy, not this field's concern (and is a
+   * moving target — FACTORY-93/FACTORY-67) — so a rule kept in
+   * `permissionMode: "default"` is never left frozen on that dialog for
    * hours. Absent/false means today's behaviour exactly: this rule's panes
    * are never scanned or touched by that timer, matching every rule that
    * does not set this field. Resolved live from the loaded `rules` list

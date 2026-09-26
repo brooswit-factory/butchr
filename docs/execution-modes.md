@@ -110,11 +110,13 @@ other and of every other field):
 `permissionMode: "default"` (Claude's manual/ask mode — a prompt before every
 tool call) with `lizardMode: true`: the daemon's standalone permission-answer
 timer (`src/agents/permission-answer-loop.ts`, see
-`docs/permission-answer-loop.md`) then presses the "Yes, and always allow …"
-option on an unambiguous tool-permission dialog for every agent this rule
-launches, so manual mode's own safety never means an agent frozen on that one
-dialog for hours. Either field may be set without the other — they are
-independent — but this pairing is the combination the mechanism exists for.
+`docs/permission-answer-loop.md` for exactly which option it presses and how
+that is logged — deliberately not restated here, since it is drovr's own
+answering policy, not this field's concern) then answers an unambiguous
+tool-permission dialog for every agent this rule launches, so manual mode's
+own safety never means an agent frozen on that one dialog for hours. Either
+field may be set without the other — they are independent — but this pairing
+is the combination the mechanism exists for.
 DROVR-42 shipped the identical pair of concepts (`SessionDefinition.permissionMode`/
 `.lizardMode`) for managed-session definitions first; this is the rule-side
 extension, reusing the SAME daemon timer rather than a second one.
