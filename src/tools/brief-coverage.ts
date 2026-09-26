@@ -132,7 +132,8 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
   },
   confluence_create_page: {
     taught: false,
-    reason: "raw Confluence page CRUD for a page that ISN'T a ticket's own doc; a brief teaches set_doc for the ticket-doc case, which covers what an agent actually needs.",
+    reason:
+      "the explicit, on-request page-creation path (FACTORY-84/FACTORY-86) — used only when an agent is explicitly asked to write a Confluence page, never as part of ordinary ticket workflow, so no brief teaches it as a routine call.",
   },
   confluence_update_page: {
     taught: false,
