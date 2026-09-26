@@ -297,8 +297,16 @@ const DEFINITION_FIELDS = new Set([
 const MAX_CONTROLLERS_PER_FIELD = 100;
 const MAX_CONTROLLER_NAME_CHARS = 200;
 
-/** Strips a trailing ".json" so "foo" and "foo.json" are recognised as the same controller — the same with-or-without-extension convenience `butchr session show/freeze/unfreeze` already extend to a CLI-supplied name. */
-const controllerCanonicalName = (raw: string): string => (raw.endsWith(".json") ? raw.slice(0, -5) : raw);
+/**
+ * Strips a trailing ".json" so "foo" and "foo.json" are recognised as the
+ * same controller — the same with-or-without-extension convenience `butchr
+ * session show/freeze/unfreeze` already extend to a CLI-supplied name.
+ * Exported (FACTORY-95) for `session-definition-type.ts`'s own
+ * `managedSessionShortDisplayId` — the "bare definition name" a managed
+ * session displays as (e.g. "admin-assembly" from "admin-assembly.json") is
+ * exactly this same stripping, reused rather than reimplemented.
+ */
+export const controllerCanonicalName = (raw: string): string => (raw.endsWith(".json") ? raw.slice(0, -5) : raw);
 
 /**
  * `freezeControllers`/`unfreezeControllers`: an array of non-empty file-name

@@ -39,6 +39,7 @@
 import type { SpawnSpec } from "../agents/workspace.js";
 import { scopedPrQuery, type GithubComment, type GithubPr } from "../resources/github-pr.js";
 import { parseGithubPrRef, type GithubPrRef } from "../resources/github-pr-ref.js";
+import { shortGithubRef } from "../resources/github-issue-ref.js";
 import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, logExecutionModeSwitches, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
@@ -66,6 +67,21 @@ export interface GithubPrResourceDeps {
 
 /** True for exactly the herd ids this type owns — a per-resource key or a query-level one alike. */
 export const ownsGithubPrAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "github-pr";
+
+/**
+ * FACTORY-95: `github-pr`'s own short herdr-workspace-label id — same
+ * `<repo>#<number>` shape as `githubIssueShortDisplayId`
+ * (github-issue-type.ts), reusing the SAME `shortGithubRef` formatter (see
+ * that function's own doc comment, github-issue-ref.ts, for why one shared
+ * formatter rather than two copies) but kept as its OWN named export per
+ * this ticket's "one method on each provider" instruction — `github-issue`
+ * and `github-pr` are independent providers (this module's own top comment)
+ * that only coincidentally share an identity shape.
+ */
+export function githubPrShortDisplayId(resourceId: string): string {
+  const ref = parseGithubPrRef(resourceId);
+  return ref ? shortGithubRef(ref) : resourceId;
+}
 
 /** Every enabled `github-pr` rule's matches. Any failed search rejects the whole poll. */
 export async function searchGithubPrRules(deps: Pick<GithubPrResourceDeps, "rules" | "search">): Promise<GithubPrMatch[]> {

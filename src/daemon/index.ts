@@ -438,6 +438,14 @@ if (missingRulesPath !== null) {
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
 const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf, resolvedAgentOf);
+// FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): relabel every
+// currently-running, butchr-owned herdr workspace to its short display label
+// on every daemon startup — no agent restart. Idempotent (see
+// `relabelOwnedWorkspaces`'s own doc comment, src/agents/herd.ts), so running
+// it again on the next restart is exactly as safe as running it here once.
+// Fire-and-forget: a slow or failing herdr must never delay the rest of
+// startup, and the method itself never throws.
+void herd.relabelOwnedWorkspaces();
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
 // binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the

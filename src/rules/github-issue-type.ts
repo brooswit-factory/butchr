@@ -15,7 +15,7 @@
  */
 import type { SpawnSpec } from "../agents/workspace.js";
 import { scopedIssueQuery, type GithubComment, type GithubIssue } from "../resources/github-issue.js";
-import { parseGithubIssueRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
+import { parseGithubIssueRef, shortGithubRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
 import type { EventPoll, EventRules, EventVerdict, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, logExecutionModeSwitches, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
@@ -45,6 +45,20 @@ export interface GithubIssueResourceDeps {
 
 /** True for exactly the herd ids this type owns — a per-resource key or a query-level one (BUTCHR-397) alike. */
 export const ownsGithubIssueAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "github-issue";
+
+/**
+ * FACTORY-95: `github-issue`'s own short herdr-workspace-label id — the
+ * operator's spec: "github-issue / github-pr: e.g. repo#123" (owner
+ * dropped). `resourceId` is the canonical `owner/repo#number`
+ * (`GithubIssueRef`); an id that somehow fails to parse (never produced by
+ * this provider's own `searchGithubIssueRules`, defensive only) falls back
+ * to the raw id rather than throwing — a label must never be the reason a
+ * spawn or relabel fails.
+ */
+export function githubIssueShortDisplayId(resourceId: string): string {
+  const ref = parseGithubIssueRef(resourceId);
+  return ref ? shortGithubRef(ref) : resourceId;
+}
 
 /** Every enabled `github-issue` rule's matches. Any failed search rejects the whole poll. */
 export async function searchGithubIssueRules(deps: Pick<GithubIssueResourceDeps, "rules" | "search">): Promise<GithubIssueMatch[]> {
