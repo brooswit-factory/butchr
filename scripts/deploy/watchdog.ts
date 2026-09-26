@@ -58,21 +58,50 @@
  * terms.
  *
  * Exit codes: 0 healthy/no-op, 1 rolled back and VERIFIED healthy on
- * `prevSha` (or would have, under `--dry-run`), 3 rolled back but
- * verification itself failed (post-rollback `/health` still not
- * matching `prevSha`/not `ok` — the more serious case: even the known-good
- * build won't come up, which is not this watchdog's to fix any further,
- * only to report loudly) — deliberately non-zero so a real (non-dry-run)
- * rollback shows up as a failed systemd unit in the journal, the same
- * "loud on its own" discipline `src/daemon/health.ts` documents for stale
- * loops. 2 is a usage/state error (bad flags, missing state file) —
- * distinguishable from "checked and rolled back" by exit code alone,
- * never by parsing stdout.
+ * `prevSha` (or would have, under `--dry-run`), 3 EITHER rolled back but
+ * verification never confirmed health within `--verify-sec` (see below),
+ * OR a rollback step itself failed partway (a usage/environment problem,
+ * not a code problem — see below) — both are "needs a human now", so both
+ * share the one code; the state file's own `disarmedReason` (and, for the
+ * CLI's own stdout/stderr, the printed message) is how you tell which —
+ * deliberately non-zero so a real (non-dry-run) rollback shows up as a
+ * failed systemd unit in the journal, the same "loud on its own"
+ * discipline `src/daemon/health.ts` documents for stale loops. 2 is a
+ * usage/state error (bad flags, missing state file) — distinguishable
+ * from "checked and rolled back" by exit code alone, never by parsing
+ * stdout.
+ *
+ * POST-ROLLBACK VERIFICATION POLLS, IT DOES NOT FETCH ONCE (PR #436 review
+ * round 2 fix): `systemctl restart` returns as soon as the unit is
+ * STARTED, not once the daemon inside it is actually answering `/health` —
+ * a single fetch immediately after would routinely see connection-refused
+ * on a perfectly good rollback and misreport it as unverified. `check`
+ * instead polls `/health` every `POLL_INTERVAL_MS` until it reports
+ * healthy on `prevSha` OR `--verify-sec` (recorded in state, default
+ * `DEFAULT_VERIFY_SEC`) elapses — using the injected `io.now`/`io.sleep`
+ * so tests can fake time passing instantly instead of actually waiting.
+ *
+ * EACH ROLLBACK STEP CAN FAIL, AND IS CAUGHT (PR #436 review round 2 fix):
+ * `git reset --hard`, `bun install --frozen-lockfile`, `bun run build`
+ * (built mode) and `systemctl --user restart` run in that fixed order;
+ * `bunInstall`/`bunBuild` invoke `io.bunExecPath()`, never a bare `bun` —
+ * the same PATH problem `arm`'s printed command was fixed for in round 1
+ * applies just as much here, since `check` runs under the SAME
+ * `systemd-run --user` environment. If any step throws, the remaining
+ * steps are skipped ENTIRELY — deliberately no restart after a failed
+ * reset/install/build, since restarting on a half-restored checkout would
+ * only make the state harder to reason about by hand — the failure and
+ * which step it was are recorded in the state file and reported, and
+ * `check` still exits (code 3), never lets the exception escape (this
+ * file's own USAGE text promises "never throws").
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 import { decideRollback, type HealthSnapshot } from "./rollback-decision.js";
+
+const POLL_INTERVAL_MS = 3_000;
+const DEFAULT_VERIFY_SEC = 60;
 
 export type DeployMode = "source" | "built";
 
@@ -83,6 +112,8 @@ export interface WatchdogState {
   prevSha: string;
   expectedSha: string;
   windowSec: number;
+  /** How long, in seconds, "check" polls /health after a rollback's mechanical steps succeed before giving up and reporting NOT verified. Default DEFAULT_VERIFY_SEC. Separate from windowSec: windowSec is when the OUTER timer fires at all; verifySec is the INNER budget for confirming the rollback itself worked once it's running. */
+  verifySec: number;
   /** "source": `ExecStart=` runs straight from a source checkout (e.g. `bun run src/daemon/index.ts`) — sha is read git-at-start, no build artifact to restore. "built": `ExecStart=` runs `dist/butchr.js` — sha is baked in, so a rollback must also rebuild `dist/` (gitignored, so `git reset --hard` alone leaves the bad build in place). See §1.1 of docs/codey-deploy-runbook.md. */
   mode: DeployMode;
   armedAt: string;
@@ -91,8 +122,10 @@ export interface WatchdogState {
   disarmedReason: string | null;
   rolledBack: boolean;
   rolledBackAt: string | null;
-  /** null until a rollback has been attempted; true/false once `check` re-verified /health after rolling back. See exit code 3 in this file's own doc comment. */
+  /** null until a rollback has been attempted; true/false once `check` re-verified /health after rolling back (by polling — see POLL_INTERVAL_MS/verifySec above). See exit code 3 in this file's own doc comment. */
   rollbackVerified: boolean | null;
+  /** Set only when a rollback step itself threw (git reset, bun install, bun build, or systemctl restart) — names which step and the error, distinct from "steps all ran but health never confirmed". null otherwise. */
+  rollbackFailedStep: string | null;
 }
 
 export interface WatchdogIo {
@@ -104,9 +137,11 @@ export interface WatchdogIo {
   bunBuild: (installDir: string) => void;
   systemctlRestart: (unit: string) => void;
   systemctlStopTimer: (timerUnit: string) => void;
-  /** Absolute path to the `bun` executable this process is running under (`process.execPath`) — printed in the `systemd-run` command `arm` suggests, since a transient unit runs in the user systemd instance's own PATH, which frequently does not include a bare `bun` (see docs/codey-deploy-runbook.md §3.2's rehearsal). */
+  /** Absolute path to the `bun` executable this process is running under (`process.execPath`) — used for BOTH the `systemd-run` command `arm` suggests AND (round 2 fix) internally by `bunInstall`/`bunBuild`, since a transient unit runs in the user systemd instance's own PATH, which frequently does not include a bare `bun` (see docs/codey-deploy-runbook.md §3.2's rehearsal). */
   bunExecPath: () => string;
   now: () => Date;
+  /** Injected so tests can fake time passing (advance a fake clock) instead of actually waiting `POLL_INTERVAL_MS` between /health polls. */
+  sleep: (ms: number) => Promise<void>;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
@@ -142,10 +177,10 @@ export function defaultIo(): WatchdogIo {
       execFileSync("git", ["-C", installDir, "reset", "--hard", sha], { stdio: "inherit" });
     },
     bunInstall(installDir) {
-      execFileSync("bun", ["install", "--frozen-lockfile"], { cwd: installDir, stdio: "inherit" });
+      execFileSync(process.execPath, ["install", "--frozen-lockfile"], { cwd: installDir, stdio: "inherit" });
     },
     bunBuild(installDir) {
-      execFileSync("bun", ["run", "build"], { cwd: installDir, stdio: "inherit" });
+      execFileSync(process.execPath, ["run", "build"], { cwd: installDir, stdio: "inherit" });
     },
     systemctlRestart(unit) {
       execFileSync("systemctl", ["--user", "restart", unit], { stdio: "inherit" });
@@ -155,6 +190,7 @@ export function defaultIo(): WatchdogIo {
     },
     bunExecPath: () => process.execPath,
     now: () => new Date(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     stdout: (line) => console.log(line),
     stderr: (line) => console.error(line),
   };
@@ -164,6 +200,7 @@ const USAGE = `usage: bun run scripts/deploy/watchdog.ts arm --state-file <path>
                                             --unit <systemd-unit> --port <n>
                                             --prev-sha <sha> --expected-sha <sha>
                                             --window-sec <n> --mode source|built
+                                            [--verify-sec <n>]  (default ${DEFAULT_VERIFY_SEC})
        bun run scripts/deploy/watchdog.ts check --state-file <path> [--dry-run]
        bun run scripts/deploy/watchdog.ts disarm --state-file <path> [--timer-unit <name>] [--reason <text>]
        bun run scripts/deploy/watchdog.ts status --state-file <path>
@@ -174,14 +211,16 @@ a transient unit; run that command yourself. "check" is what the scheduled
 timer runs: it fetches /health, decides healthy/rollback
 (scripts/deploy/rollback-decision.ts), and on rollback runs, in order,
 "git reset --hard <prevSha>", "bun install --frozen-lockfile", "bun run
-build" (only when --mode built), "systemctl --user restart <unit>", then
-re-fetches /health to VERIFY the rollback itself landed healthy on
-<prevSha> — unless --dry-run, which only logs what it would do and touches
-nothing. "disarm" cancels a still-pending watchdog (e.g. the manager
-already confirmed health another way). "status" is always read-only.
-Only /health is ever checked automatically — a manager agent not
-confirming in chat is a separate, human-paced escalation (see the
-runbook's own §5), not something this watchdog observes or acts on.`;
+build" (only when --mode built), "systemctl --user restart <unit>" — ANY
+step throwing skips the rest and reports the failure, never a silent
+partial rollback — then POLLS /health (every 3s, up to --verify-sec) to
+VERIFY the rollback itself landed healthy on <prevSha> — unless --dry-run,
+which only logs what it would do and touches nothing. "disarm" cancels a
+still-pending watchdog (e.g. the manager already confirmed health another
+way). "status" is always read-only. Only /health is ever checked
+automatically — a manager agent not confirming in chat is a separate,
+human-paced escalation (see the runbook's own §5), not something this
+watchdog observes or acts on.`;
 
 function parseFlags(rest: string[]): Map<string, string | true> {
   const flags = new Map<string, string | true>();
@@ -254,22 +293,52 @@ async function cmdArm(rest: string[], io: WatchdogIo): Promise<number> {
     io.stderr(`--prev-sha and --expected-sha are identical (${prevSha}) — arming a watchdog for a no-op deploy is almost certainly a mistake; if this deploy really is a restart-only no-op, there is nothing to roll back to and this watchdog should not be armed`);
     return 2;
   }
+  const verifySecFlag = flags.get("verify-sec");
+  const verifySec = typeof verifySecFlag === "string" ? Number(verifySecFlag) : DEFAULT_VERIFY_SEC;
+  if (!Number.isInteger(verifySec) || verifySec <= 0) {
+    io.stderr(`--verify-sec must be a positive integer, got ${JSON.stringify(verifySecFlag)}`);
+    return 2;
+  }
 
   const state: WatchdogState = {
-    installDir, unit, port, prevSha, expectedSha, windowSec, mode,
+    installDir, unit, port, prevSha, expectedSha, windowSec, verifySec, mode,
     armedAt: io.now().toISOString(),
     disarmed: false, disarmedAt: null, disarmedReason: null,
-    rolledBack: false, rolledBackAt: null, rollbackVerified: null,
+    rolledBack: false, rolledBackAt: null, rollbackVerified: null, rollbackFailedStep: null,
   };
   await saveState(stateFile, state, io);
 
   const timerUnit = timerUnitFor(state);
   io.stdout(`armed: ${stateFile}`);
-  io.stdout(`  prevSha=${prevSha} expectedSha=${expectedSha} unit=${unit} port=${port} windowSec=${windowSec} mode=${mode}`);
+  io.stdout(`  prevSha=${prevSha} expectedSha=${expectedSha} unit=${unit} port=${port} windowSec=${windowSec} mode=${mode} verifySec=${verifySec}`);
   io.stdout("");
   io.stdout("now schedule the check by running exactly this:");
   io.stdout(`  systemd-run --user --on-active=${windowSec} --unit=${timerUnit} -- ${io.bunExecPath()} run ${installDir}/scripts/deploy/watchdog.ts check --state-file ${stateFile}`);
   return 0;
+}
+
+/** Polls /health every POLL_INTERVAL_MS, up to verifySec, until it reports healthy on targetSha. Always makes at least one attempt, even if verifySec is very small. Uses io.now()/io.sleep() so tests can fake time passing instead of waiting. */
+async function pollForHealthy(io: WatchdogIo, port: number, targetSha: string, verifySec: number): Promise<{ verified: boolean; lastReason: string }> {
+  const deadline = io.now().getTime() + verifySec * 1000;
+  let lastReason = "no health check attempted";
+  for (;;) {
+    const health = await io.fetchHealth(port);
+    const decision = decideRollback({ expectedSha: targetSha, health, disarmed: false });
+    lastReason = decision.reason;
+    if (decision.action === "healthy") return { verified: true, lastReason };
+    if (io.now().getTime() >= deadline) return { verified: false, lastReason };
+    await io.sleep(POLL_INTERVAL_MS);
+  }
+}
+
+/** One rollback step, run and caught individually so a thrown error (a bare command that isn't there, a non-zero exit) is reported instead of escaping this CLI's "never throws" contract. */
+async function runRollbackStep(name: string, fn: () => void): Promise<string | null> {
+  try {
+    fn();
+    return null;
+  } catch (e) {
+    return `${name}: ${(e as Error).message}`;
+  }
 }
 
 async function cmdCheck(rest: string[], io: WatchdogIo): Promise<number> {
@@ -313,28 +382,47 @@ async function cmdCheck(rest: string[], io: WatchdogIo): Promise<number> {
   }
 
   io.stderr(`ROLLING BACK: ${decision.reason}`);
-  io.gitResetHard(state.installDir, state.prevSha);
-  io.bunInstall(state.installDir);
-  if (state.mode === "built") io.bunBuild(state.installDir);
-  io.systemctlRestart(state.unit);
 
-  const postHealth = await io.fetchHealth(state.port);
-  const postDecision = decideRollback({ expectedSha: state.prevSha, health: postHealth, disarmed: false });
-  const rollbackVerified = postDecision.action === "healthy";
+  const steps: Array<[string, () => void]> = [
+    ["git reset --hard", () => io.gitResetHard(state.installDir, state.prevSha)],
+    ["bun install --frozen-lockfile", () => io.bunInstall(state.installDir)],
+    ...(state.mode === "built" ? [["bun run build", () => io.bunBuild(state.installDir)] as [string, () => void]] : []),
+    ["systemctl --user restart", () => io.systemctlRestart(state.unit)],
+  ];
+  let failedStep: string | null = null;
+  for (const [name, fn] of steps) {
+    failedStep = await runRollbackStep(name, fn);
+    if (failedStep) break; // deliberately no further steps — see this file's own doc comment on why not
+  }
+
+  if (failedStep) {
+    state.rolledBack = false;
+    state.rollbackVerified = false;
+    state.rollbackFailedStep = failedStep;
+    state.disarmed = true;
+    state.disarmedAt = io.now().toISOString();
+    state.disarmedReason = `rollback ABORTED — ${failedStep}. No further rollback steps were attempted; the checkout may now be partially reset and needs a human, not another automatic retry.`;
+    await saveState(stateFile, state, io);
+    io.stderr(state.disarmedReason);
+    return 3;
+  }
+
+  const { verified, lastReason } = await pollForHealthy(io, state.port, state.prevSha, state.verifySec);
 
   state.rolledBack = true;
   state.rolledBackAt = io.now().toISOString();
-  state.rollbackVerified = rollbackVerified;
+  state.rollbackVerified = verified;
+  state.rollbackFailedStep = null;
   state.disarmed = true;
   state.disarmedAt = state.rolledBackAt;
   state.disarmedReason = `rolled back: ${decision.reason}`;
   await saveState(stateFile, state, io);
 
-  if (rollbackVerified) {
-    io.stderr(`rolled back to ${state.prevSha} and restarted ${state.unit} — VERIFIED healthy on the restored build`);
+  if (verified) {
+    io.stderr(`rolled back to ${state.prevSha} and restarted ${state.unit} — VERIFIED healthy on the restored build (within ${state.verifySec}s)`);
     return 1;
   }
-  io.stderr(`rolled back to ${state.prevSha} and restarted ${state.unit} — NOT VERIFIED: post-rollback /health check says ${postDecision.reason}. The known-good build did not come back up cleanly either — this needs a human now, not another automatic retry.`);
+  io.stderr(`rolled back to ${state.prevSha} and restarted ${state.unit} — NOT VERIFIED after polling /health for ${state.verifySec}s: ${lastReason}. The known-good build did not come back up cleanly either — this needs a human now, not another automatic retry.`);
   return 3;
 }
 

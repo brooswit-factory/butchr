@@ -267,13 +267,26 @@ not conflate the two when explaining a failure in your evidence.
 **only** when this deploy is in built mode (§1.1) — `bun run build`
 (`dist/` is gitignored, so a bare reset leaves the just-built BAD
 `dist/butchr.js` in place and a restart would just reload the same broken
-build), then `systemctl --user restart <unit>`, then a SECOND `/health`
-fetch to verify the rollback itself actually landed on a healthy
-`prevSha` — recorded in the state file as `rollbackVerified`, and signalled
-by the watchdog's own exit code: `1` means rolled back and verified; `3`
-(more serious) means the rollback ran but the restored build still isn't
-healthy either, which needs a human immediately (see §6's "if this does
-not match" for what to do when you observe a `3`).
+build), then `systemctl --user restart <unit>`, then it **polls** `/health`
+(every 3s) to verify the rollback itself actually landed on a healthy
+`prevSha`, up to `--verify-sec` (an `arm`-time flag, default 60s, recorded
+in state as `verifySec` — separate from `$WINDOW_SEC`: that's when the
+outer check fires at all, this is the inner budget for confirming the
+rollback afterward, since `systemctl restart` returns as soon as the unit
+STARTS, not once the daemon inside is actually answering `/health`) —
+recorded in the state file as `rollbackVerified`, and signalled by the
+watchdog's own exit code: `1` means rolled back and verified; `3` means
+EITHER the rollback ran but never verified healthy within `--verify-sec`,
+OR one of the four steps above itself failed partway (a bare command not
+found, a non-zero exit) — in the latter case **no further steps are
+attempted at all** (a failed reset never proceeds to install/build/
+restart, a failed install never proceeds to build/restart, etc. — restarting
+on a half-restored checkout would only make the state harder to reason
+about by hand) and the state file's `rollbackFailedStep` names exactly
+which command failed and why, distinct from a plain verification timeout
+(`rollbackFailedStep: null` there). Either way, `3` needs a human
+immediately (see §6's "if this does not match" for what to do when you
+observe a `3`, and how to tell the two `3` cases apart from `state`).
 
 ### 3.1 Choose the state file path and the window
 
@@ -502,15 +515,24 @@ so the still-pending timer doesn't fire a second, redundant rollback later.
 **If instead you're reading this because the ARMED WATCHDOG ALREADY FIRED**
 (you see its journal entry, or `disarm` reports the state is already
 disarmed with a `rolled back: ...` reason): check `state.rollbackVerified`
+AND `state.rollbackFailedStep`
 (`bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" status --state-file
-"$STATE_FILE"` prints the whole state file). **`true`/exit code `1`:** the
-known-good build is back and confirmed healthy — proceed to §7. **`false`/
-exit code `3`:** the rollback ran but even `$PREV_SHA` isn't coming up
-healthy — this is no longer a deploy problem this runbook can resolve
-automatically; STOP, do not retry the watchdog or re-run any command in
-this document speculatively, and escalate to `admin-assembly` immediately
-with the full `/health` output (or lack of one) and the watchdog's own
-journal (`journalctl --user -u butchr-deploy-watchdog-butchr`).
+"$STATE_FILE"` prints the whole state file). **`rollbackVerified: true`/
+exit code `1`:** the known-good build is back and confirmed healthy —
+proceed to §7. **`rollbackVerified: false`/exit code `3` — two distinct
+cases, tell them apart by `rollbackFailedStep`:** `rollbackFailedStep:
+null` means every rollback step (reset/install/[build]/restart) ran, but
+`/health` never confirmed `$PREV_SHA` healthy within the armed
+`--verify-sec` — the daemon may just need longer, or may genuinely be
+broken even on the known-good build. A non-null `rollbackFailedStep`
+names exactly which command failed (e.g. a bare-`bun`-not-on-PATH ENOENT,
+or a non-zero exit) and means the rollback did NOT complete — the
+checkout may be left partially reset. **Either case is no longer a deploy
+problem this runbook can resolve automatically; STOP, do not retry the
+watchdog or re-run any command in this document speculatively, and
+escalate to `admin-assembly` immediately** with the full `/health` output
+(or lack of one), the `status` output, and the watchdog's own journal
+(`journalctl --user -u butchr-deploy-watchdog-butchr`).
 **Evidence:** the full `/health` JSON (or the `status` output, if the
 watchdog already acted on its own), and — if you rolled back manually —
 the disarm command's output too.
@@ -711,10 +733,15 @@ git/bun/systemctl functions; a real (non-dry-run) unhealthy check in
 `source` mode calls `git reset --hard` → `bun install --frozen-lockfile` →
 `systemctl --user restart`, in that order, and never calls the build step;
 the same in `built` mode ALSO calls the build step, between install and
-restart; a rollback that re-verifies healthy on `prevSha` sets
-`rollbackVerified: true` and exits `1`; a rollback whose post-rollback
-`/health` is still bad sets `rollbackVerified: false` and exits `3`
-(distinctly, not conflated with a verified rollback); and `arm` prints its
+restart; verification actually POLLS (a fake clock/sleep, not real time) —
+one test is unhealthy for several polls after restart before going
+healthy (proving a single immediate fetch would have been a false alarm),
+another never goes healthy within `--verify-sec` and gets
+`rollbackVerified: false`/exit `3` with `rollbackFailedStep: null`; each of
+the four rollback steps throwing is tested separately (reset, install,
+build, restart) — confirming no later step runs after an earlier one
+fails, `rollbackFailedStep` names the right one, and the CLI still returns
+a code rather than letting the exception escape; and `arm` prints its
 suggested `systemd-run` command using an ABSOLUTE bun path, never a bare
 `bun`. `bun run check` (this repo's full gate) passes with these included.
 §3.2 of this runbook additionally rehearses the real `systemd-run`
