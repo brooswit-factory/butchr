@@ -140,11 +140,13 @@ sets it.
 and mostly plumbing to reuse.** It is resolved live, not persisted: the
 permission-answer timer's `eligiblePanes` hook (`lizardModeLabel` in
 `src/daemon/index.ts`) already resolved a managed-session pane's opt-in from a
-live map; `ruleLizardModeOf` extends the SAME hook to every OTHER rule-engine
-agent id by looking its owning `Rule` up in the already-loaded `rules` list
-(no live poll needed — unlike a managed-session definition, which is its own
-file discovered fresh every poll, a rule's `lizardMode` is fixed for the
-daemon's process lifetime, the same as every other `Rule` field) and reading
+live map; `ruleLizardModeOf`/`lizardModeLabelFor` (exported, pure functions in
+`src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds them
+to its own live state) extend the SAME hook to every OTHER rule-engine agent
+id by looking its owning `Rule` up in the already-loaded `rules` list (no live
+poll needed — unlike a managed-session definition, which is its own file
+discovered fresh every poll, a rule's `lizardMode` is fixed for the daemon's
+process lifetime, the same as every other `Rule` field) and reading
 `Rule.lizardMode` straight off it — the same "rule-level fallback" shape
 `ruleRoleOfAgent` already uses for `role`. No second timer, no second prompt
 parser: dialog recognition stays drovr's job (FACTORY-49) end to end.

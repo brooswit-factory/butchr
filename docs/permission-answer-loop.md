@@ -59,23 +59,32 @@ managed-sessions poll (`MANAGED_SESSIONS_POLL_MS`, 15s), same shape as the
 pre-existing `roles`/`accountPolicies` maps (BUTCHR-408/BUTCHR-460).
 
 The permission-answer timer's own `eligiblePanes` hook (`lizardModeLabel` in
-`src/daemon/index.ts`) consults `ruleLizardModeOf` fresh every 20s tick: for
-each pane herdr reports, resolve its rule-engine agent id from `cwd`
-(`agentIdOfWorkspacePath`, the same resolution `managedSessionOfPane` already
-uses for escalation), and include it only if that id's own lizard-mode opt-in
-is `true`. For a managed session (`ownsManagedSessionAgent`) that opt-in comes
-from the live `managedSessionLizardModes` map exactly as before; for every
-OTHER rule-engine agent id (FACTORY-87/FACTORY-76 — a `jira-work`,
-`jira-project`, `github-issue`, `github-pr`, or plain `filesystem` rule) it
-comes from that id's own `Rule.lizardMode`, looked up against the daemon's
-already-loaded `rules` list (see `docs/execution-modes.md`'s "`permissionMode`
-and `lizardMode`" section for why a rule needs no live poll the way a
+`src/daemon/index.ts`) consults `ruleLizardModeOf`/`lizardModeLabelFor` fresh
+every 20s tick: for each pane herdr reports, resolve its rule-engine agent id
+from `cwd` (`agentIdOfWorkspacePath`, the same resolution
+`managedSessionOfPane` already uses for escalation), and include it only if
+that id's own lizard-mode opt-in is `true`. For a managed session
+(`ownsManagedSessionAgent`) that opt-in comes from the live
+`managedSessionLizardModes` map exactly as before; for every OTHER
+rule-engine agent id (FACTORY-87/FACTORY-76 — a `jira-work`, `jira-project`,
+`github-issue`, `github-pr`, or plain `filesystem` rule) it comes from that
+id's own `Rule.lizardMode`, looked up against the daemon's already-loaded
+`rules` list (see `docs/execution-modes.md`'s "`permissionMode` and
+`lizardMode`" section for why a rule needs no live poll the way a
 managed-session definition does). A pane that resolves to anything else — a
 legacy/bare-issue agent, a managed session or rule that never set the field,
 a managed session not yet observed this daemon's lifetime — is excluded,
 matching "absent field means today's behaviour exactly" down to the herdr
 call count: a tick with nothing eligible costs exactly one `agent.list()`
 call and nothing else (see `runPermissionAnswerTick`'s own doc comment).
+`ruleLizardModeOf`/`lizardModeLabelFor` themselves are pure, exported
+functions in `src/agents/permission-answer-loop.ts` (`src/daemon/index.ts`
+only binds them to its own live `rules`/`managedSessionLizardModes`/
+`ownsManagedSessionAgent`) — extracted there specifically so the decision has
+its own unit tests independent of `src/daemon/index.ts`, which has no
+exports and cannot itself be imported by a test without running the whole
+daemon's startup side effects (PR #478 review, `permission-answer-loop.test.ts`'s
+own "`ruleLizardModeOf` / `lizardModeLabelFor`" tests).
 
 **Toggling the field is live, no respawn.** Since it isn't part of argv, an
 operator can flip `lizardMode` in a manifest and see it take effect on the

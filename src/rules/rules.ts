@@ -328,10 +328,12 @@ export interface Rule {
    * hours. Absent/false means today's behaviour exactly: this rule's panes
    * are never scanned or touched by that timer, matching every rule that
    * does not set this field. Resolved live from the loaded `rules` list
-   * (`ruleLizardModeOf`, src/daemon/index.ts) — deliberately NEVER reaches
-   * `SpawnSpec`/argv, same as `SessionDefinition.lizardMode`: a daemon-side
-   * behaviour toggle only, so there is no stale-argv concern to get wrong.
-   * See `RULE_PERMISSION_MODES`'s own doc comment for why there is no
+   * (`ruleLizardModeOf`, an exported pure function in
+   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
+   * it to its own live state) — deliberately NEVER reaches `SpawnSpec`/argv,
+   * same as `SessionDefinition.lizardMode`: a daemon-side behaviour toggle
+   * only, so there is no stale-argv concern to get wrong. See
+   * `RULE_PERMISSION_MODES`'s own doc comment for why there is no
    * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
    * FACTORY-87 wires this (and `permissionMode` above) for exactly the four
    * rule kinds FACTORY-76 scopes — `jira-work`/`jira-project`/`github-issue`/

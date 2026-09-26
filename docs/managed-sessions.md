@@ -1079,7 +1079,7 @@ rule-launched agents — same `permissionMode`/`lizardMode` names, same daemon
 timer, no second mechanism. See `docs/execution-modes.md`'s "`permissionMode`
 and `lizardMode`" section for the rule-side field story, and
 `docs/permission-answer-loop.md` for how `ruleLizardModeOf`
-(`src/daemon/index.ts`) extends `eligiblePanes` to cover them.
+(`src/agents/permission-answer-loop.ts`) extends `eligiblePanes` to cover them.
 
 **Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
 manifest load rather than silently storing-and-dropping it — see

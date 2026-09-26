@@ -37,7 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
-import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
+import { ruleLizardModeOf as sharedRuleLizardModeOf, startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -236,26 +236,19 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
 /**
  * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — `lizardMode`'s
  * own equivalent of `ruleRoleOfAgent` immediately above: true iff `id`'s
- * agent should be scanned/answered by the permission-answer timer. A managed
- * session (`ownsManagedSessionAgent`) is resolved from the live, rebuilt-
- * every-poll `managedSessionLizardModes` map (that field's own doc comment,
- * just above `ruleRoleOfAgent`, explains why a managed session needs a live
- * map rather than this rule-level fallback); every OTHER rule-launched agent
- * (jira-work/jira-project/github-issue/github-pr/filesystem) is resolved
- * straight from its own `Rule.lizardMode`, looked up the SAME way
- * `ruleRoleOfAgent` looks up `Rule.role` — `rules` is loaded once at startup
- * (no per-rule live poll the way managed-session definitions get one), so a
- * second map here would just be a slower copy of what `rules` already holds.
- * `undefined`/anything `decodeAnyAgentKey` cannot decode resolves `false`,
- * matching `lizardMode`'s own "absent means never touched" contract.
+ * agent should be scanned/answered by the permission-answer timer. The
+ * actual decision (`ruleLizardModeOf`, `src/agents/permission-answer-loop.ts`)
+ * is a pure, importable function — extracted there (PR #478 review) so it
+ * has its own unit tests independent of this module, which has no exports
+ * and cannot itself be imported by a test without running the whole
+ * daemon's startup side effects. This is just the daemon's own binding of
+ * that decision to its own live state (`rules`, `managedSessionLizardModes`,
+ * `ownsManagedSessionAgent`) — see `RuleLizardModeDeps`'s own doc comment for
+ * what each input means and why a managed session needs the live map while
+ * every other rule-launched agent reads straight off its own `Rule`.
  */
-const ruleLizardModeOf = (id: string): boolean => {
-  const decoded = decodeAnyAgentKey(id);
-  if (!decoded) return false;
-  if (ownsManagedSessionAgent(id)) return managedSessionLizardModes.get(id) === true;
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
-  return rule?.lizardMode === true;
-};
+const ruleLizardModeOf = (id: string): boolean =>
+  sharedRuleLizardModeOf(id, { rules, isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
 // BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
 // (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
 // agents are classified "sentinel" here (see src/agents/capacity-role.ts).
