@@ -157,8 +157,8 @@ every ticket you write.
    You are meant to end.
 
 ## Confluence pages: on request only
-Butchr does not create a Confluence doc for {{KEY}} — it never has, since
-FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is
+Butchr does not create a Confluence doc for {{KEY}} — FACTORY-84/FACTORY-86
+retired the automatic per-ticket page it used to create. There is
 nothing to "keep current": your closing summary (step 5) goes on {{KEY}}
 itself via `report_to_boss`, same as a story's own findings live on the
 story's ticket — Jira comments are the record, not a doc most epics will

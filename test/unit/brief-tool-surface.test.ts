@@ -292,6 +292,13 @@ describe("FACTORY-112: briefs stop teaching per-ticket doc maintenance; on-reque
       /already linked, already nested/i,
       /created together with it/i,
       /nests? under your (?:root|own) doc automatically/i,
+      // FACTORY-112 review round 1: Butchr DID auto-create a per-ticket doc
+      // before FACTORY-84/FACTORY-86 retired that path — "it never has" is a
+      // false historical claim, not merely stale prose, and the very same
+      // sections go on to describe a leftover doc from before this change,
+      // which directly contradicts "never". Say it stopped, not that it
+      // never happened.
+      /it never has\b/i,
     ];
     for (const file of issueTierFiles) {
       const text = readFileSync(join(BRIEFS_DIR, file), "utf8");

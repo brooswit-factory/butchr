@@ -194,8 +194,8 @@ in every Story you file.
    You are meant to end.
 
 ## Confluence pages: on request only
-Butchr does not create a Confluence doc for {{KEY}} — it never has, since
-FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is
+Butchr does not create a Confluence doc for {{KEY}} — FACTORY-84/FACTORY-86
+retired the automatic per-ticket page it used to create. There is
 nothing to "keep current": your diagnosis (step 1) and your closing summary
 (step 5) both go on {{KEY}} itself via `report_to_boss`, and a Story's own
 findings live on the Story's ticket the same way — Jira comments and PR

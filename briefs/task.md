@@ -147,8 +147,8 @@ half the job; saying where it should live is the other half** — a ticket
 filed with nowhere to live is exactly as lost as one nobody filed at all.
 
 ## Confluence pages: on request only
-Butchr does not create a Confluence doc for {{KEY}} — it never has, since
-FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is no
+Butchr does not create a Confluence doc for {{KEY}} — FACTORY-84/FACTORY-86
+retired the automatic per-ticket page it used to create. There is no
 working doc to keep current: progress, findings and handoffs go in Jira
 comments (`report_to_boss`/`ask_boss`, and your story's `tell_worker`
 replies) and in your PR description, which already exist for exactly that.

@@ -30,8 +30,8 @@ path or line number.
 
 ## Confluence pages: on request only
 
-Butchr does not create a Confluence doc for your ticket — it never has,
-since FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is
+Butchr does not create a Confluence doc for your ticket — FACTORY-84/
+FACTORY-86 retired the automatic per-ticket page it used to create. There is
 no working doc to keep current: progress, findings and a closing summary all
 go in Jira comments (`report_to_boss`/`ask_boss`/whatever channel applies)
 and PR descriptions, which already exist for exactly that.
