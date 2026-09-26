@@ -14,6 +14,7 @@ import {
 } from "../../src/rules/session-definition-type.js";
 import { listFilesystemResources } from "../../src/resources/filesystem.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
+import { startFilesystemLoop } from "../../src/daemon/filesystem-loop.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
@@ -581,5 +582,60 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
     await tick(); await tick();
     stop();
     expect(spawned.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("FACTORY-47 root cause: startFilesystemLoop must never stop a managed-session agent", () => {
+  /**
+   * A real herd, not a stub that always reports "not running": `spawn`
+   * actually adds the key to `running`, `stop` actually removes it — the
+   * exact shape needed to prove startFilesystemLoop's own `runningIds`/
+   * `ownsId` (both `ownsFilesystemAgent`) never claims a managed-session id
+   * as one of its own leftover agents and stops it out from under the
+   * managed-sessions loop, which is the bug assembly found live on codey:
+   * `ownsFilesystemAgent` returned `true` for a `filesystem:managed-sessions:…`
+   * id, so a daemon with ZERO enabled filesystem rules treated every
+   * running managed-session agent as a leftover from a since-removed rule
+   * and stopped it every poll, immediately followed by the managed-sessions
+   * loop spawning it again — repeating forever, `[spawn] … origin=spawn`
+   * only, no `[reconcile] … respawned:` line, exactly FACTORY-47's report.
+   */
+  function fakeSharedHerd(): { herd: Herd; spawned: string[]; stopped: string[] } {
+    const running = new Set<string>();
+    const spawned: string[] = [], stopped: string[] = [];
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
+      async stop(i) { stopped.push(i); running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    return { herd, spawned, stopped };
+  }
+
+  test("a daemon with zero filesystem rules and one managed-session definition never stops the managed session — it stays running, spawned exactly once", async () => {
+    const { herd, spawned, stopped } = fakeSharedHerd();
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/nexus.json" });
+    const stopManaged = startManagedSessionsLoop({
+      root: "/defs", herd, deliver: async () => {},
+      list: async () => [res("/defs/nexus.json")],
+      read: async () => JSON.stringify(goodDef()),
+      log: () => {}, intervalMs: 5,
+    });
+    // ZERO enabled filesystem rules — the exact codey shape ("startFilesystemLoop"'s
+    // own doc comment: "still stops filesystem agents left over from an earlier run").
+    const stopFilesystem = startFilesystemLoop({
+      rules: [], herd, deliver: async () => {}, log: () => {}, intervalMs: 5,
+    });
+    try {
+      await tick(); await tick(); await tick(); await tick(); await tick();
+      expect(stopped).toEqual([]);
+      expect(spawned).toEqual([key]); // exactly one spawn, never respawned/re-spawned
+      expect(await herd.runningIssues()).toEqual([key]);
+    } finally {
+      stopManaged();
+      stopFilesystem();
+    }
   });
 });

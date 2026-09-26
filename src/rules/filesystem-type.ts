@@ -54,8 +54,48 @@ export interface FilesystemResourceDeps {
   runningIds?: () => Promise<readonly string[]>;
 }
 
-/** True for exactly the herd ids this type owns. */
-export const ownsFilesystemAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "filesystem";
+/**
+ * FACTORY-47: the literal `MANAGED_SESSIONS_RULE_ID` id
+ * (`src/rules/session-definition-type.ts`) — duplicated here, not imported,
+ * because that module already imports `onceOversized` from THIS one
+ * (`session-definition-type.ts` -> `filesystem-type.ts`); importing it back
+ * would be a cycle. The two must stay equal; `test/unit/filesystem.test.ts`'s
+ * `ownsFilesystemAgent` suite builds a real managed-session key via
+ * `encodeAgentKey`/`MANAGED_SESSIONS_RULE_ID` (the real one, from
+ * session-definition-type.ts) and asserts this function rejects it, and
+ * `test/unit/session-definition-type.test.ts` runs `startFilesystemLoop`
+ * and `startManagedSessionsLoop` together against one herd, so a drift
+ * between the two literals fails loudly in either place rather than
+ * resurfacing silently as this exact bug.
+ */
+const MANAGED_SESSIONS_RULE_ID = "managed-sessions";
+
+/**
+ * True for exactly the herd ids this type owns: a `filesystem`-provider id
+ * whose rule is an ORDINARY `filesystem` rule — never the built-in
+ * `managed-sessions` one (BUTCHR-407/408), which reuses the same
+ * `resourceProvider` for an unrelated resource shape but is owned
+ * exclusively by `startManagedSessionsLoop`/`ownsManagedSessionAgent`
+ * (session-definition-type.ts).
+ *
+ * FACTORY-47: before this exclusion, `ownsFilesystemAgent` returned `true`
+ * for a managed-session id too, so a daemon with zero enabled `filesystem`
+ * rules — this loop's own `startFilesystemLoop` doc comment already
+ * promises "still stops filesystem agents left over from an earlier run…
+ * never leaves them running with no loop to stop them" — treated every
+ * running managed-session agent as exactly such a leftover and stopped it
+ * on the very next poll. The managed-sessions loop then saw it gone and
+ * spawned it again (never a respawn, since nothing was ever stale), and the
+ * two loops repeated this every ~12-15s: the managed-session pane vanishing
+ * and respawning with `[spawn] … origin=spawn` and nothing else logged,
+ * exactly FACTORY-47's reported symptom. Never the `%2F` workspace-path
+ * encoding, a duplicate Nexus, or the kickoff `cd` — all ruled out on codey
+ * before this was found.
+ */
+export const ownsFilesystemAgent = (id: string): boolean => {
+  const decoded = decodeAnyAgentKey(id);
+  return decoded?.resourceProvider === "filesystem" && decoded.ruleId !== MANAGED_SESSIONS_RULE_ID;
+};
 
 /**
  * Told about a resource whose canonical path is otherwise a valid absolute

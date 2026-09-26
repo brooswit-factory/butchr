@@ -23,6 +23,7 @@ import {
 } from "../../src/rules/filesystem-type.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
+import { MANAGED_SESSIONS_RULE_ID } from "../../src/rules/session-definition-type.js";
 
 const HOME = "/home/tester";
 
@@ -411,6 +412,30 @@ describe("ownsFilesystemAgent", () => {
     expect(ownsFilesystemAgent(encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "docs" }))).toBe(true);
     expect(ownsFilesystemAgent(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "docs", resourceId: "BUTCHR-1" }))).toBe(false);
     expect(ownsFilesystemAgent("not a key")).toBe(false);
+  });
+
+  // FACTORY-47: a managed-session id (BUTCHR-407/408's built-in rule)
+  // reuses the SAME `resourceProvider: "filesystem"` for an unrelated
+  // resource shape, owned exclusively by startManagedSessionsLoop's own
+  // `ownsManagedSessionAgent` — never by this ordinary filesystem-rule
+  // loop. Before this exclusion, ownsFilesystemAgent claimed it too, so a
+  // daemon with zero enabled filesystem rules stopped every running
+  // managed-session agent as a "leftover", which the managed-sessions loop
+  // then immediately spawned again — repeating every poll, forever, with
+  // nothing ever logged as a respawn (see startFilesystemLoop's own "still
+  // stops filesystem agents left over from an earlier run" doc comment for
+  // the exact mechanism this real MANAGED_SESSIONS_RULE_ID case must not
+  // trigger).
+  test("FACTORY-47: does NOT own a managed-session agent, per- or query-level, even though it shares the filesystem provider", () => {
+    const perResource = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: "/etc/defs/a.json" });
+    expect(ownsFilesystemAgent(perResource)).toBe(false);
+    const queryLevel = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID });
+    expect(ownsFilesystemAgent(queryLevel)).toBe(false);
+    // An ordinary filesystem rule that happens to be NAMED "managed-sessions"
+    // is impossible in practice (MANAGED_SESSIONS_RULE_ID is reserved — see
+    // that constant's own doc comment) but is not what this exclusion is
+    // checking anyway: it excludes by RULE ID, not by provenance, exactly as
+    // intended.
   });
 });
 
