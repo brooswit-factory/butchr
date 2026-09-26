@@ -52,6 +52,7 @@ import { mergeEffectiveLinks } from "./managed-links.js";
 import { listLinks, type LinkStore } from "./link-store.js";
 import { canonicalKey, type ResourceRef } from "./resource-ref.js";
 import { formatGithubIssueRef } from "./github-issue-ref.js";
+import { formatGithubPrRef } from "./github-pr-ref.js";
 
 /** This owner's own `jira-work-item` `ResourceRef` — the identity `listLinks`/`mergeEffectiveLinks` key managed/native links against. */
 export function jiraWorkItemOwnerRef(issue: Pick<JiraIssue, "key">): ResourceRef {
@@ -116,12 +117,18 @@ export function nativeJiraRefs(issue: Pick<JiraIssue, "key" | "issuelinks" | "pa
  *   addition to that function.
  * - `github-issue` → `"github-issue"`: `target` is the canonical
  *   `owner/repo#n` string, the SAME identity `pollGithubLink` already
- *   expects — no adaptation needed. (FACTORY-4 has no distinct `github-pr`
- *   ResourceRef provider — GitHub's issue/PR numbers share one per-repo
- *   namespace, and a managed `github-issue` link to a PR number still polls
- *   correctly via `pollGithubLink`'s own `kind: "github-issue"` REST path,
- *   which reads `/issues/<n>` — GitHub serves a PR through that same
- *   endpoint too, just without PR-specific fields this poller never reads.)
+ *   expects — no adaptation needed.
+ * - `github-pr` → `"github-pr"` (FACTORY-57: `github-pr` is now its OWN
+ *   distinct `ResourceRef` provider — this replaces the earlier decision,
+ *   recorded here before this ticket, that FACTORY-4 had no such provider
+ *   and a managed `github-issue` link to a PR number merely happened to
+ *   poll correctly via `pollGithubLink`'s `"github-issue"` REST path):
+ *   `target` is the same canonical `owner/repo#n` string, and
+ *   `pollGithubLink` already accepts `kind: "github-pr"` explicitly (it has
+ *   since BUTCHR-437/436's own linked-eventing work — see
+ *   `src/jira-watch/external-poll.ts`), reading `/pulls/<n>` instead of
+ *   `/issues/<n>`. No poller change was needed for this ticket; only this
+ *   mapping.
  * - `webpage` → `"webpage"`: `target` is the ref's own normalized URL,
  *   already exactly what `pollWebpage` expects.
  * - `filesystem` → `"filesystem"` (FACTORY-9's new kind/poller, see
@@ -145,6 +152,7 @@ export function resourceRefToLinkedItem(ref: ResourceRef): LinkedItem | null {
     case "jira-work-item": return { kind: "jira-key", target: ref.key };
     case "confluence-page": return { kind: "confluence", target: ref.pageId };
     case "github-issue": return { kind: "github-issue", target: formatGithubIssueRef(ref) };
+    case "github-pr": return { kind: "github-pr", target: formatGithubPrRef(ref) };
     case "webpage": return { kind: "webpage", target: ref.url };
     case "filesystem": return { kind: "filesystem", target: ref.path };
     case "jira-project": return null;
@@ -153,7 +161,7 @@ export function resourceRefToLinkedItem(ref: ResourceRef): LinkedItem | null {
 }
 
 /** Every kind `resourceRefToLinkedItem` can produce — used by `linked-eventing.ts` to route a managed-link item to the right diff/poll path, same as it already does for `jiraKindLinkedItems`/`descriptionLinkedItems` output. */
-export const MANAGED_LINK_KINDS: ReadonlySet<LinkedItemKind> = new Set(["jira-key", "confluence", "github-issue", "webpage", "filesystem"]);
+export const MANAGED_LINK_KINDS: ReadonlySet<LinkedItemKind> = new Set(["jira-key", "confluence", "github-issue", "github-pr", "webpage", "filesystem"]);
 
 /**
  * `ownerRef`'s butchr-MANAGED links (`store`), merged against `nativeRefs`

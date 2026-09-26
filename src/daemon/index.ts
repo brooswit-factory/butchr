@@ -17,7 +17,7 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -26,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -37,6 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -66,6 +67,10 @@ import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issu
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
+import { createGithubPrClient } from "../resources/github-pr.js";
+import { githubPrStaffing } from "../rules/github-pr-type.js";
+import { githubPrTools } from "../tools/github-pr.js";
+import { GITHUB_PR_POLL_MS, startGithubPrLoop } from "./github-pr-loop.js";
 import { createJiraIdeaClient } from "../resources/jira-idea.js";
 import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
@@ -80,6 +85,8 @@ import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-de
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { sessionArchiveDir } from "../resources/session-archive.js";
+import { buildQueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
@@ -195,6 +202,18 @@ const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
  * function's own comment for the full shape.
  */
 const managedSessionResolvedAgents = new Map<string, { model: string; effort?: AgentEffort }>();
+/**
+ * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` immediately above, one field over: whether
+ * an eligible managed-session definition opted into "lizard mode"
+ * (`SessionDefinition.lizardMode`). Consulted below by `lizardModeLabel`,
+ * which the permission-answer timer's `eligiblePanes` hook is built from —
+ * see `ManagedSessionResourceDeps.lizardModes`'s own doc comment
+ * (src/rules/session-definition-type.ts) for why this is deliberately LIVE
+ * rather than persisted-at-spawn the way `permissionMode`/`strictMcpConfig`
+ * are (FACTORY-43): this field never reaches the launched process's argv.
+ */
+const managedSessionLizardModes = new Map<string, boolean>();
 /**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
@@ -337,6 +356,15 @@ const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
+// github-pr rules share the SAME token/org config as github-issue (see
+// Config["github"]'s own doc comment) but are their own provider, staffing
+// gate, client and loop — a rules file with github-issue rules and no
+// github-pr rules stays unaffected, and vice versa.
+const githubPrStaffingResult = githubPrStaffing(rules, config.github);
+const githubPrs = githubPrStaffingResult.run && config.github
+  ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
+  : undefined;
+
 // zendesk-ticket rules run only with ZENDESK_SUBDOMAIN and an owner-only
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
@@ -430,6 +458,7 @@ setInterval(codexChannelRelayTick, 15_000);
 // this daemon never calls `admissionController.admit` directly.
 const ADMISSION_SOURCE_ISSUE = "issue";
 const ADMISSION_SOURCE_GITHUB_ISSUE = "github-issue";
+const ADMISSION_SOURCE_GITHUB_PR = "github-pr";
 const ADMISSION_SOURCE_JIRA_IDEA = "jira-idea";
 const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // BUTCHR-425: jira-project agents always classify as sentinels (see
@@ -460,7 +489,7 @@ const admissionController = createAdmissionController({
   roleOf: roleOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -593,6 +622,13 @@ const githubIssueHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_ISSUE_POLL_MS),
   log: (line) => console.error(line),
 });
+const githubPrHealth = createResourceLoopHealth({
+  name: "github-pr",
+  enabled: Boolean(githubPrs),
+  ...(githubPrStaffingResult.run ? {} : { disabledReason: githubPrStaffingResult.reason ?? "no enabled github-pr rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_PR_POLL_MS),
+  log: (line) => console.error(line),
+});
 const jiraIdeaHealth = createResourceLoopHealth({
   name: "jira-idea",
   enabled: Boolean(jiraIdeas),
@@ -691,13 +727,33 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
+  // FACTORY-72: every configured rule and managed-session definition,
+  // staffed or not — see src/agents/query-agent-inventory.ts's own top
+  // comment for the reuse this is built from. `rulesFile`/`configReasonFor`
+  // are this daemon's own already-computed values (loaded/decided once at
+  // startup above), never a second load or a second staffing decision.
+  configInventory: () =>
+    buildQueryAgentInventory({
+      rulesFile: { path: rulesPath(), rules, error: null },
+      dashboard: dashboardFeed.snapshot(),
+      configReasonFor: (rule) => {
+        if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
+        return null;
+      },
+      sessionDefinitions: {
+        activeDir: sessionDefinitionsPath(),
+        archiveDir: sessionArchiveDir(),
+        store: defaultSessionFreezeIo().store,
+      },
+    }),
   // BUTCHR-339: the dashboard page's header info — the SAME `build`/`currency`
   // values `/health` already reads via `toBuildReport(buildIdentity)` and
   // `currency.snapshot()` (see `health` above), never a second derivation.
@@ -717,7 +773,7 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
+  // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
   ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
   // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
   // provider-specific tool set below it — the local file store needs no
@@ -731,6 +787,7 @@ const { app, mcp } = buildApp({
     (line) => console.error(line),
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking needs both providers running: authorization reads both loops' latest matches.
@@ -1373,6 +1430,30 @@ startGithubIssueLoop({
   onError: (e) => githubIssueHealth.recordError(e),
 });
 
+// The github-pr rule loop: its own agents only, its own admission bucket
+// under the same host cap, and none of the Jira-writing detectors above —
+// same reasoning as the github-issue loop just above.
+if (githubPrs) console.error(`  github-pr rules: ${githubPrStaffingResult.rules.map((r) => r.id).join(", ")}`);
+startGithubPrLoop({
+  staffing: githubPrStaffingResult,
+  client: githubPrs ?? { searchAll: async () => [], comments: async () => [] },
+  herd,
+  deliver: async (agent, resource, msg) => {
+    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
+    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+  },
+  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_PR),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_PR),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_PR),
+  account: accountLifecycle,
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => githubPrHealth.recordSuccess(),
+  onError: (e) => githubPrHealth.recordError(e),
+});
+
 // The jira-idea rule loop: proven Product Discovery ideas only, its own
 // agents and admission bucket, and none of the work-item detectors above.
 if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
@@ -1459,6 +1540,7 @@ startManagedSessionsLoop({
   roles: managedSessionRoles,
   accountPolicies: managedSessionAccountPolicies,
   resolvedAgents: managedSessionResolvedAgents,
+  lizardModes: managedSessionLizardModes,
   account: accountLifecycle,
   herd,
   deliver: async (agent, resource, msg) => {
@@ -1474,6 +1556,15 @@ startManagedSessionsLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
+  // FACTORY-53/FACTORY-71: linked-change eventing for a managed session that
+  // opts in via `linkedEventingProjects` — the SAME `searchAll`/`comments`/
+  // `notifyRuleAgent`/routed link store/`herd.frozen` seams the `jira-project`
+  // rule loop's own linked-eventing wiring already uses above.
+  searchIssues: (jql) => atlassian.searchAll(jql),
+  comments: (key) => atlassian.comments(key),
+  linkStore: routingLinkStore,
+  notify: notifyRuleAgent,
+  isFrozen: async (id) => (await herd.frozen([id])).has(id),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
@@ -1596,6 +1687,81 @@ const blockingEscalationTimer = setInterval(() => {
     .finally(() => { blockingEscalationPollInFlight = false; });
 }, 5_000);
 blockingEscalationTimer.unref?.();
+
+// DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
+// under the DROVR-37 epic — narrowed to an explicit opt-in field by
+// FACTORY-67's director before merge; see that ticket if this looks
+// different from DROVR-41's original "sweep every pane" recommendation): a
+// THIRD, independent pane-scanning timer — see
+// src/agents/permission-answer-loop.ts's own header for the full reasoning
+// (why this is its own timer rather than folded into the Jira reconcile
+// loop above or `blockingEscalationTimer` immediately above, and why it
+// cannot collide with `chooseStartupAnswer`/`watchPrompts` below). Presses
+// keys (unlike `blockingEscalationTimer`, which never does — see that
+// timer's own comment) so it earns its own tighter isolation from every
+// other poll loop's failure modes, exactly like `blockingEscalationTimer`
+// already does for the same reason.
+//
+// `lizardModeLabel` is this timer's `eligiblePanes` hook (see
+// `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
+// only when its cwd resolves to a `managed-sessions` agent id AND that id's
+// LATEST poll of `managedSessionLizardModes` (rebuilt every managed-sessions
+// poll — see that map's own comment above) says `true`. Everything else —
+// an ordinary jira-work/rule agent, a managed session that never set
+// `lizardMode`, a managed session not yet observed this daemon's lifetime —
+// resolves `undefined` and is never touched, matching `lizardMode`'s own
+// "absent means today's behaviour exactly" contract. The label itself
+// (basename of the definition file) is what lets a log line name WHICH
+// AGENT got a prompt answered (FACTORY-67's own requirement), not just an
+// opaque pane id.
+function lizardModeLabel(cwd: string | null | undefined): string | undefined {
+  const id = agentIdOfWorkspacePath(cwd);
+  if (!id || !ownsManagedSessionAgent(id) || managedSessionLizardModes.get(id) !== true) return undefined;
+  const decoded = decodeAnyAgentKey(id);
+  return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
+}
+const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: string | null | undefined }[]): ReadonlyMap<string, string> => {
+  const out = new Map<string, string>();
+  for (const a of agents) {
+    const label = lizardModeLabel(a.cwd);
+    if (label) out.set(a.pane_id, label);
+  }
+  return out;
+};
+//
+// CADENCE, chosen and measured against this daemon's own load rather than
+// copied from DROVR-41's order-of-magnitude suggestion unread: 20s lands
+// inside DROVR-41's own 15-30s recommendation, slower than the 5s
+// `blockingEscalationTimer`/`watchPrompts` timers (a pure-read status poll,
+// cheap to run often) but close to this daemon's own ~15s Jira reconcile
+// cadence under load (BUTCHR-117) — a blocked agent is now unblocked within
+// one tick of a bound already proven acceptable elsewhere in this same
+// daemon, without adding a fourth distinct polling rhythm to reason about.
+// The lizard-mode opt-in gate above only shrinks this timer's real workload
+// (a tick with zero eligible panes costs one `agent.list()` call and
+// nothing else — see `runPermissionAnswerTick`'s own doc comment), so the
+// original cost/cadence tradeoff this value was chosen against still holds
+// even more comfortably now than when every pane was in scope.
+// `READ_TIMEOUT_MS` (8s) sits comfortably below `INTERVAL_MS` (20s) — see
+// `AutoAnswerPermissionsOptions.readTimeoutMs`'s own doc comment
+// (`@brooswit/drovr`) for why a pane's attempt must never still be in
+// flight when the next tick fires — with margin over drovr's own internal
+// approve-verify budget (5s default `verifyTimeoutMs`, measured against
+// `node_modules/@brooswit/drovr/dist/index.js`) rather than picked to
+// exactly match it.
+const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
+const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+startPermissionAnswerLoop(
+  {
+    client: herdr,
+    eligiblePanes: permissionAnswerEligiblePanes,
+    auditPath: config.permissionAuditPath,
+    operator: "butchr-daemon",
+    readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
+    log: (line) => console.error(`  ${line}`),
+  },
+  PERMISSION_ANSWER_INTERVAL_MS,
+);
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
 // whose text parses as a dialog, and whose trailing region isn't a recognized
