@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runPermissionAnswerTick, startPermissionAnswerLoop, type PermissionAnswerClient } from "../../src/agents/permission-answer-loop.js";
+import { runPermissionAnswerTick, startPermissionAnswerLoop, type PermissionAnswerClient, type PermissionAnswerPane } from "../../src/agents/permission-answer-loop.js";
 
 // Measured live against the REAL installed @brooswit/drovr 0.15.0
 // `classifyPermissionPrompt` (this file's own probe, run against
@@ -68,14 +68,21 @@ function fakeClient(screensByPaneInit: Record<string, string>): { client: Permis
   return { client, sendKeysCalls };
 }
 
+/** Marks every pane eligible, labelled by its own pane id — the "lizard mode is on for everything" test shape, standing in for a real per-agent gate. */
+const allEligible = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+  new Map(agents.map((a) => [a.pane_id, a.pane_id]));
+
+/** Marks nothing eligible — the default/"lizard mode never opted in" shape every real pane starts in. */
+const noneEligible = (): ReadonlyMap<string, string> => new Map();
+
 describe("runPermissionAnswerTick", () => {
-  test("presses the unambiguous always-allow option and writes an audit record", async () => {
+  test("presses the unambiguous always-allow option on an eligible pane and writes an audit record", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
     const { client, sendKeysCalls } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
     const lines: string[] = [];
 
-    const results = await runPermissionAnswerTick({ client, auditPath, operator: "test-op", log: (l) => lines.push(l) });
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, operator: "test-op", log: (l) => lines.push(l) });
 
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ paneId: "p1", outcome: "answered", tool: "Bash command" });
@@ -84,7 +91,36 @@ describe("runPermissionAnswerTick", () => {
     expect(audit).toHaveLength(2); // "approving" then "approved" — approvePermission's own two-record contract
     expect(audit.every((r) => r.operator === "test-op")).toBe(true);
     expect(lines.some((l) => l.includes("1 answered"))).toBe(true);
+    // FACTORY-67: the journal line must name which agent (the eligiblePanes label) and which tool — not just an opaque pane id.
+    expect(lines.some((l) => l.includes("p1") && l.includes("answered") && l.includes("Bash command"))).toBe(true);
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("DROVR-42/FACTORY-67 opt-in gate: a pane NOT returned by eligiblePanes is never scanned or answered, even with an always-allow dialog on screen — the default for every real pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: noneEligible, auditPath });
+
+    expect(results).toEqual([]);
+    expect(sendKeysCalls).toEqual([]); // never pressed — the pane was never even scanned
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("opt-in gate is per-pane: only the pane eligiblePanes names is scanned, a sibling pane with the identical dialog is left untouched", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN, p2: ALWAYS_ALLOW_SCREEN });
+    const onlyP1 = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.filter((a) => a.pane_id === "p1").map((a) => [a.pane_id, "lizard-def.json"]));
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: onlyP1, auditPath });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.paneId).toBe("p1");
+    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["down", "enter"] }]); // p2 never touched
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -93,7 +129,7 @@ describe("runPermissionAnswerTick", () => {
     const auditPath = join(dir, "audit.jsonl");
     const { client, sendKeysCalls } = fakeClient({ p1: NO_ALWAYS_SCREEN });
 
-    const results = await runPermissionAnswerTick({ client, auditPath });
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath });
 
     expect(results).toHaveLength(1);
     expect(results[0]?.outcome).toBe("skipped");
@@ -102,13 +138,13 @@ describe("runPermissionAnswerTick", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("no pane is showing a permission prompt at all — empty result, nothing pressed, nothing logged", async () => {
+  test("no pane is eligible at all — empty result, nothing pressed, nothing logged, and agent.list is the ONLY herdr call made", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
     const { client, sendKeysCalls } = fakeClient({ p1: "some ordinary working pane, nothing pending here" });
     const lines: string[] = [];
 
-    const results = await runPermissionAnswerTick({ client, auditPath, log: (l) => lines.push(l) });
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: noneEligible, auditPath, log: (l) => lines.push(l) });
 
     expect(results).toEqual([]);
     expect(sendKeysCalls).toEqual([]);
@@ -128,7 +164,7 @@ describe("runPermissionAnswerTick", () => {
     };
     const lines: string[] = [];
 
-    const results = await runPermissionAnswerTick({ client, auditPath: "/dev/null", log: (l) => lines.push(l) });
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath: "/dev/null", log: (l) => lines.push(l) });
 
     expect(results).toEqual([]);
     expect(lines.some((l) => l.includes("tick failed") && l.includes("herdr socket down"))).toBe(true);
@@ -139,7 +175,7 @@ describe("runPermissionAnswerTick", () => {
     const auditPath = join(dir, "audit.jsonl");
     const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
 
-    await runPermissionAnswerTick({ client, auditPath, operator: "butchr-daemon", readTimeoutMs: 8_000 });
+    await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, operator: "butchr-daemon", readTimeoutMs: 8_000 });
 
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(audit[0]?.operator).toBe("butchr-daemon");
@@ -171,7 +207,7 @@ describe("startPermissionAnswerLoop", () => {
       },
     };
 
-    const timer = startPermissionAnswerLoop({ client, auditPath }, 5);
+    const timer = startPermissionAnswerLoop({ client, eligiblePanes: noneEligible, auditPath }, 5);
     await new Promise((r) => setTimeout(r, 100));
     clearInterval(timer);
 

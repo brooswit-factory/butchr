@@ -17,7 +17,7 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -186,6 +186,18 @@ const managedSessionRoles = new Map<string, AgentRole>();
  * src/rules/session-definition-type.ts) from that poll's eligible matches.
  */
 const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
+/**
+ * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` immediately above, one field over: whether
+ * an eligible managed-session definition opted into "lizard mode"
+ * (`SessionDefinition.lizardMode`). Consulted below by `lizardModeLabel`,
+ * which the permission-answer timer's `eligiblePanes` hook is built from —
+ * see `ManagedSessionResourceDeps.lizardModes`'s own doc comment
+ * (src/rules/session-definition-type.ts) for why this is deliberately LIVE
+ * rather than persisted-at-spawn the way `permissionMode`/`strictMcpConfig`
+ * are (FACTORY-43): this field never reaches the launched process's argv.
+ */
+const managedSessionLizardModes = new Map<string, boolean>();
 /**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
@@ -1422,6 +1434,7 @@ console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
   accountPolicies: managedSessionAccountPolicies,
+  lizardModes: managedSessionLizardModes,
   account: accountLifecycle,
   herd,
   deliver: async (agent, resource, msg) => {
@@ -1560,8 +1573,11 @@ const blockingEscalationTimer = setInterval(() => {
 }, 5_000);
 blockingEscalationTimer.unref?.();
 
-// DROVR-42 (host-wiring decision carried over from DROVR-41, under the
-// DROVR-37 epic): a THIRD, independent pane-scanning timer — see
+// DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
+// under the DROVR-37 epic — narrowed to an explicit opt-in field by
+// FACTORY-67's director before merge; see that ticket if this looks
+// different from DROVR-41's original "sweep every pane" recommendation): a
+// THIRD, independent pane-scanning timer — see
 // src/agents/permission-answer-loop.ts's own header for the full reasoning
 // (why this is its own timer rather than folded into the Jira reconcile
 // loop above or `blockingEscalationTimer` immediately above, and why it
@@ -1571,6 +1587,33 @@ blockingEscalationTimer.unref?.();
 // other poll loop's failure modes, exactly like `blockingEscalationTimer`
 // already does for the same reason.
 //
+// `lizardModeLabel` is this timer's `eligiblePanes` hook (see
+// `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
+// only when its cwd resolves to a `managed-sessions` agent id AND that id's
+// LATEST poll of `managedSessionLizardModes` (rebuilt every managed-sessions
+// poll — see that map's own comment above) says `true`. Everything else —
+// an ordinary jira-work/rule agent, a managed session that never set
+// `lizardMode`, a managed session not yet observed this daemon's lifetime —
+// resolves `undefined` and is never touched, matching `lizardMode`'s own
+// "absent means today's behaviour exactly" contract. The label itself
+// (basename of the definition file) is what lets a log line name WHICH
+// AGENT got a prompt answered (FACTORY-67's own requirement), not just an
+// opaque pane id.
+function lizardModeLabel(cwd: string | null | undefined): string | undefined {
+  const id = agentIdOfWorkspacePath(cwd);
+  if (!id || !ownsManagedSessionAgent(id) || managedSessionLizardModes.get(id) !== true) return undefined;
+  const decoded = decodeAnyAgentKey(id);
+  return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
+}
+const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: string | null | undefined }[]): ReadonlyMap<string, string> => {
+  const out = new Map<string, string>();
+  for (const a of agents) {
+    const label = lizardModeLabel(a.cwd);
+    if (label) out.set(a.pane_id, label);
+  }
+  return out;
+};
+//
 // CADENCE, chosen and measured against this daemon's own load rather than
 // copied from DROVR-41's order-of-magnitude suggestion unread: 20s lands
 // inside DROVR-41's own 15-30s recommendation, slower than the 5s
@@ -1579,6 +1622,11 @@ blockingEscalationTimer.unref?.();
 // cadence under load (BUTCHR-117) — a blocked agent is now unblocked within
 // one tick of a bound already proven acceptable elsewhere in this same
 // daemon, without adding a fourth distinct polling rhythm to reason about.
+// The lizard-mode opt-in gate above only shrinks this timer's real workload
+// (a tick with zero eligible panes costs one `agent.list()` call and
+// nothing else — see `runPermissionAnswerTick`'s own doc comment), so the
+// original cost/cadence tradeoff this value was chosen against still holds
+// even more comfortably now than when every pane was in scope.
 // `READ_TIMEOUT_MS` (8s) sits comfortably below `INTERVAL_MS` (20s) — see
 // `AutoAnswerPermissionsOptions.readTimeoutMs`'s own doc comment
 // (`@brooswit/drovr`) for why a pane's attempt must never still be in
@@ -1591,6 +1639,7 @@ const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
 startPermissionAnswerLoop(
   {
     client: herdr,
+    eligiblePanes: permissionAnswerEligiblePanes,
     auditPath: config.permissionAuditPath,
     operator: "butchr-daemon",
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
