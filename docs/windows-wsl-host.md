@@ -390,6 +390,131 @@ default to) belong.
   at a file outside this repo's own checkout, same as `.env.example`
   already recommends for the Linux path.
 
+## Coexisting with another supervisor (e.g. usrr) on the same host
+
+FACTORY-62 (story of epic FACTORY-58). Everything installed by this doc can
+share a Windows host with a **different** supervisor — some other tool that
+also manages its own agents/processes on that machine, `usrr` being one
+concrete example named on the epic. Butchr does not replace such a
+supervisor, does not know it exists, and this install must never modify,
+stop, or rename anything belonging to it.
+
+### Ownership boundaries
+
+| | Butchr's install owns | The other supervisor owns |
+|---|---|---|
+| Inside WSL | `butchr.service` and `herdr.service` (+ its `LimitNOFILE` drop-in) as **user** units under `~/.config/systemd/user`, plus `butchr.env`/`managed-sessions.env` (see "The systemd units" and "Token/secret handling" above) | Whatever it runs inside WSL, if anything — not this install's concern either way |
+| On Windows | Exactly one scheduled task, registered by `Register-WslHostTask.ps1`, named `Butchr-WSL` **by default and overridable via `-TaskName`** — never assume a fixed name (see "The Windows autostart task" above) | Its own scheduled task(s)/services/scope, under whatever name(s) it chooses |
+| Credentials | Its own token files only (`butchr.env`, `managed-sessions.env`) | Its own separate credential store — never point the two supervisors at the same secret file |
+
+`Register-WslHostTask.ps1` only ever registers, unregisters, or replaces a
+task matching the exact `-TaskName` it is given (default `Butchr-WSL`); it
+never enumerates or touches any other task on the host, by construction —
+there is no code path in that script that lists tasks other than the one
+name it was invoked with.
+
+### Avoiding collisions
+
+- **Scheduled task name collisions.** `Register-ScheduledTask` cannot hold
+  two tasks of the same name, and `Register-WslHostTask.ps1` treats an
+  existing task under its target name as *its own* to replace (see "The
+  Windows autostart task" above) — it has no way to tell "a task I created
+  earlier" apart from "a same-named task something else created." On a host
+  that already runs, or will run, another supervisor, pass an explicit,
+  host- or install-scoped `-TaskName` (the worked example below uses
+  `Butchr-WSL-Zippy`) rather than trusting the generic default, and check
+  the other supervisor's own task name first with `Get-ScheduledTask` from
+  Windows.
+- **The WSL VM's lifetime is shared infrastructure, not Butchr's alone.**
+  Butchr's own boot task holds the WSL VM up by keeping one `wsl.exe`
+  process alive indefinitely (`exec sleep infinity` — see "The Windows
+  autostart task" above); as long as that process is alive, the VM does not
+  idle-shut-down, which benefits anything else running inside the *same*
+  distro, not just Butchr. The reverse also holds: running `wsl --shutdown`
+  from Windows (to troubleshoot the other supervisor, or to apply a
+  `wsl.conf` change) kills Butchr's held process along with the whole VM;
+  if `Butchr-WSL`'s task is registered and its restart budget (999 restarts,
+  1 minute apart — see "The Windows autostart task" above) isn't exhausted,
+  it restarts the VM within roughly a minute, but there is a real gap where
+  the VM, and anything inside it, is down. If the other supervisor also
+  depends on this same WSL distro being up, a `wsl --shutdown` an operator
+  runs for Butchr's sake affects it too, and vice versa.
+- **Port and resource considerations.** The daemon's own default port is
+  `7717` (`BUTCHR_PORT` in `.env.example`; `scripts/wsl-host/cli.ts`'s
+  `install`/`verify` default `--port` to the same `7717` — verify both
+  against your own checkout and `ENVIRONMENT.md`, since either can be
+  overridden). Because WSL2 here is **NAT**, not mirrored (see "Networking"
+  above), this port is reachable from `127.0.0.1` only *inside* the distro —
+  a same-host Windows-native process (the other supervisor's own, if it
+  runs on Windows directly) cannot collide with it by binding the "same"
+  port on the Windows side, since the two are on different network
+  namespaces entirely. A real collision is only possible if the other
+  supervisor *also* runs a process inside this same WSL distro that happens
+  to bind the same port — pick non-overlapping ports if so. Two independent
+  footguns worth naming here even without a second supervisor involved:
+  changing `BUTCHR_PORT` in `butchr.env` without also passing the matching
+  `--port` to `cli.ts verify` (or `Verify-WslHost.ps1`, which forwards to
+  it) makes `verify` query the wrong port and misreport a healthy daemon as
+  `daemon-down`; and herdr's own `LimitNOFILE` drop-in (raised to 65536 by
+  default, see "The systemd units" above) applies only to `herdr.service` —
+  a different supervisor's own pane-holding process inside the same distro
+  needs its own equivalent limit raised independently, since a per-unit
+  `LimitNOFILE` drop-in does not affect any other systemd unit.
+- **No shared credential files.** Butchr's secrets live only in its own
+  `butchr.env`/`managed-sessions.env` (0600, "Token/secret handling" above).
+  The other supervisor should keep its own, separate credential store —
+  never point both supervisors' configuration at the same secret file:
+  doing so couples their rotation/permissions together and defeats each
+  side's own "secrets stay in this supervisor's own files" boundary.
+
+### Diagnosing whose problem it is
+
+Read `cli.ts verify` / `Verify-WslHost.ps1`'s three states ("Health check"
+above — `WSL: DOWN` exit 2, `WSL: UP, daemon: DOWN` exit 1, `WSL: UP,
+daemon: UP` exit 0) as an elimination step for which side of the coexistence
+boundary a problem is on:
+
+- **`WSL: DOWN`** means the shared VM itself isn't up — this is not
+  specifically "Butchr's problem," since nothing inside the distro (not
+  Butchr's units, not anything the other supervisor might run there) can be
+  running either. Check whether the `Butchr-WSL` task's held `wsl.exe`
+  process is still alive (see "WSL idle shutdown" in Troubleshooting below)
+  and, separately, whether the other supervisor's own task (if it also
+  expects this VM up) is registered and functioning.
+- **`WSL: UP, daemon: DOWN`** isolates the problem to Butchr specifically:
+  WSL itself is confirmed up, so whatever's wrong is inside Butchr's own
+  systemd units, env files, or the daemon process — read the printed
+  journal tail (see "Health check" above) before assuming the other
+  supervisor is involved at all.
+- **`WSL: UP, daemon: UP`** says Butchr's own side is healthy and nothing
+  more — it says nothing about the other supervisor's own state one way or
+  the other. If something is still misbehaving once this check passes, look
+  at the other supervisor's own diagnostics, not Butchr's.
+
+### Worked example: zippy (illustrative, secondhand — not verified)
+
+The following is relayed from admin-assembly's own comment on the epic
+(FACTORY-58), presented here as an illustrative pattern, not as a verified
+fact about any live host — this repo's own checkout was never used to
+inspect zippy, and this ticket's own hard constraint is that zippy is never
+a target for any action, only a documented example. It predates
+`Register-WslHostTask.ps1` (zippy was hand-assembled before this story's
+scripts existed), so treat it as showing the same keep-alive *pattern* this
+doc's automation reproduces, not as this script's own literal output.
+
+Per that report: a Windows host named zippy runs Butchr + herdr inside WSL
+Ubuntu, with Butchr's own boot task registered under a host-scoped name,
+`Butchr-WSL-Zippy` (not the generic default — exactly the override
+"Scheduled task name collisions" above recommends), trigger `AtLogOn`,
+reported as holding the WSL VM up via a held `wsl.exe` invocation ending in
+a long-lived `sleep infinity`. Alongside it, a separately-patched
+`USRR-Zippy` Windows scheduled task — a different supervisor's own task,
+deliberately left untouched by Butchr's install. The two coexist as two
+distinctly-named scheduled tasks with neither installer touching the
+other's task, no shared credential file between them, and (per the
+ownership-boundaries table above) no overlap in which systemd units or
+Windows task each one manages.
+
 ## Troubleshooting
 
 - **`systemd not enabled inside WSL`** — symptom: `systemctl --user ...`
