@@ -53,9 +53,47 @@ that field's own note below.
 
 Rocket.Chat account lifecycle for a rule's agent(s), independent of
 `execution`: `none` (nothing — today's behaviour, exactly), `temporary`, or
-`permanent`. **Not yet implemented (a later story, S4):** creating,
-attaching, or tearing down an actual Rocket.Chat account. The field is
-validated and stored only.
+`permanent`. **The lifecycle module exists (BUTCHR-410, S4):** an RC REST
+client and an idempotent, race-safe account manager
+(`src/resources/rocketchat.ts`, `src/accounts/manager.ts`,
+`src/accounts/identity.ts`) implementing create-if-missing, unprovision, and
+a configurable guardrail below RC's 50-user allowance. **Wired into agent
+start/stop (BUTCHR-412, S4 follow-up):** `src/agents/account-lifecycle.ts`
+calls `ensureAccount`/`releaseAccount` from `reconcileNow`
+(`src/daemon/loop.ts`) at exactly the ids about to be spawned/stopped, for
+every rule loop and every execution mode alike — `execution` and `account`
+are genuinely independent axes; the account layer never inspects which
+execution mode produced an id. See `docs/rocketchat-accounts.md`'s "Wiring"
+section for the full design: which stop paths release a temporary account
+and which don't (respawn, daemon-restart and a session-limit close never
+do), and what happens when either cap (the RC-wide guardrail, or the
+separate temporary-account cap) refuses (the spawn is withheld, not
+degraded).
+
+**Corrected credential design (BUTCHR-412, BUTCHR-391 comment 24007): an
+agent never holds a Rocket.Chat credential.** Butchr mints and stores the
+account's token itself (a 0600 file, never inside any agent's workspace) and
+hands Nexus a batched manifest of (account name, token file path) pairs;
+Nexus registers each account with rocketr, the central bridge that actually
+holds every token. An agent's own MCP binding to rocketr names only its
+account, non-secret, in a header (`x-rocketr-account` by convention) — see
+`McpServerBinding.accountHeader` below and `docs/rocketchat-accounts.md`'s
+"Credential design, corrected" section for the full mechanism.
+
+**`account` is not a prerequisite for event-driven delivery.** A rule's
+`mcpServers` bindings (BUTCHR-411, see docs/mcp-server-bindings.md) bind
+Claude to push notifications from ANY MCP channel server, independent of
+`account` — an `account: "none"` rule (e.g. Candlestix's MUD players, who
+get no Rocket.Chat account at all under S4) still gets full, non-polling
+channel delivery from its own bound server(s). The two fields share a rule
+but nothing else: `mcpServers`-derived launch argv never reads `account`.
+
+## `mcpServers`: binding a rule to additional MCP servers (BUTCHR-411)
+
+Separate from the three fields above — see docs/mcp-server-bindings.md for
+the full field, launch-argv, and staleness story. Noted here only because a
+reader of this page's `account` section is likely to ask exactly the
+question the previous paragraph answers.
 
 ## The vendor selector: already there, not duplicated
 

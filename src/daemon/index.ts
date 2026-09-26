@@ -15,7 +15,9 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
-import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf } from "../agents/workspace.js";
+import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
+import { join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -24,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AgentRole } from "../rules/rules.js";
+import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -81,6 +83,12 @@ import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
+import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
+import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
+import { rcUsernameFor } from "../accounts/identity.js";
+import { createFileNexusManifestPublisher } from "../accounts/nexus-manifest.js";
+import { createAccountLifecycle } from "../agents/account-lifecycle.js";
+import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
@@ -167,6 +175,16 @@ for (const r of rules) {
 // default below — documented here, not silently relied upon.
 const managedSessionRoles = new Map<string, AgentRole>();
 /**
+ * BUTCHR-460 — same seam as `managedSessionRoles` immediately above, one
+ * field over: `accountPolicyOf` below is RULE-level only, same reason
+ * `roleOfAgent` needed `managedSessionRoles` — the built-in managed-sessions
+ * rule is ONE shared `Rule` (fixed `account: "none"`) for every
+ * heterogeneous definition file. Rebuilt every poll by the managed-sessions
+ * loop itself (`ManagedSessionResourceDeps.accountPolicies`,
+ * src/rules/session-definition-type.ts) from that poll's eligible matches.
+ */
+const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
+/**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
  * derived from its rule (provider + rule id, `decodeAnyAgentKey`) looked up
@@ -200,6 +218,77 @@ const roleOfAgent = (id: string): AgentCapacityRole =>
 // unresolvedRelationships so they can never disagree.
 const unresolvedRuleRelationships = unresolvedRelationships(rules);
 for (const u of unresolvedRuleRelationships) console.error(`  ${formatUnresolvedRelationshipWarning(u)}`);
+
+/**
+ * BUTCHR-411 — `HerdrHerd.staleIssues()`'s own `mcpBindingsOf` seam (see that
+ * constructor param's doc comment, src/agents/herd.ts): same
+ * decode-then-look-up-by-ruleId shape as `roleOfAgent` just above, for the
+ * SAME reason (HerdrHerd is one flat instance with no rule state of its
+ * own). `undefined` for anything unresolved — a legacy/bare-issue agent, or
+ * a rule since removed/disabled — means "no bindings", which is exactly
+ * today's argv; a rule that never sets `mcpServers` is unaffected.
+ */
+const mcpBindingsOf = (id: string) => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.mcpServers;
+};
+
+/**
+ * BUTCHR-412 — same fail-safe classifier shape as `roleOfAgent` immediately
+ * above, one field over: this id's rule's Rocket.Chat account policy, or
+ * `"none"` for anything this daemon cannot resolve back to a rule (a legacy/
+ * bare-issue id, or a rule since removed) — an unrecognised agent must never
+ * provision an account for itself, mirroring `roleOfAgent`'s own "an
+ * unrecognised agent is always a worker" fail-safe.
+ * BUTCHR-460: a managed-session agent's OWN `account` (its manifest field)
+ * IS read here — via `managedSessionAccountPolicies`, checked before the
+ * rule-level fallback — same precedent as `ruleRoleOfAgent`'s own
+ * `managedSessionRoles` lookup just above, for the identical reason (the
+ * built-in managed-sessions rule cannot carry a per-file account policy
+ * itself).
+ */
+const accountPolicyOf = (id: string): AccountPolicy => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return "none";
+  if (ownsManagedSessionAgent(id)) {
+    const manifestPolicy = managedSessionAccountPolicies.get(id);
+    if (manifestPolicy) return manifestPolicy;
+  }
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.account ?? "none";
+};
+
+/**
+ * BUTCHR-413 — this id's own non-secret Rocket.Chat account name
+ * (`spec.rocketchatAccount`'s source, see that field's own doc comment,
+ * src/agents/workspace.ts), for the two callers that have no live,
+ * `ensure()`-populated `SpawnSpec` to read it from at all:
+ * `HerdrHerd.spawn`/`HerdrHerd.staleIssues`' own fallback (only when
+ * `account-lifecycle.ts`'s `ensure` never ran for a launch — no
+ * accountLifecycle wired at all) and `createCodexChannelRelayPool`'s own
+ * daemon-side connection (which reconciles against a bare issue id, never a
+ * spec). `undefined` for an id whose rule grants it none
+ * (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
+ * `accountLifecycle` itself is gated on immediately below).
+ *
+ * REVIEW FINDING (BUTCHR-413 round 3): the first version of this called
+ * `rcUsernameFor(id)` with no prefix, silently assuming the DEFAULT managed
+ * prefix — wrong once BUTCHR-412's configurable `Config.rocketchat.managedPrefix`
+ * (`ROCKETCHAT_MANAGED_PREFIX`) is set to anything else, since
+ * `ensureAccount` (`src/accounts/manager.ts`) derives the REAL provisioned
+ * username with THAT prefix. Naming a different account than the one
+ * actually provisioned would have pointed Codex's own reply header and this
+ * relay's own connection at an account that doesn't exist, while
+ * `staleIssues()` (recomputing this same wrong value) would never agree
+ * with what `HerdrHerd.spawn` actually launched with whenever `ensure()`'s
+ * real value WAS used — a respawn loop. Fixed: pass THE SAME configured
+ * prefix `createAccountManager` below is given, so this can never name a
+ * different account than `ensureAccount` actually provisions.
+ */
+const accountNameOf = (id: string): string | undefined =>
+  accountPolicyOf(id) === "none" ? undefined : rcUsernameFor(id, config.rocketchat?.managedPrefix);
 
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
@@ -257,7 +346,32 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf);
+// BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
+// binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
+// Claude agent bound to one needs nothing here (its own CLI opens the
+// notification stream directly, per BUTCHR-411's launch wiring); a Codex
+// agent has no development-channel concept and would otherwise receive
+// nothing for it at all, so this daemon opens that stream on its behalf and
+// turns each push into a `herd.nudge()` prompt — see
+// src/notify/codex-channel-relay.ts's own top comment for the full account,
+// including exactly what BUTCHR-359 should replace this with.
+const codexChannelRelays = createCodexChannelRelayPool({
+  nudge: (issue, text) => herd.nudge(issue, text),
+  providerOf: (issue) => herd.providerOf!(issue),
+  bindingsOf: mcpBindingsOf,
+  runningIssues: () => herd.runningIssues(),
+  log: (line) => console.error(`  ${line}`),
+  // BUTCHR-413 (review finding 2): the SAME per-agent, non-secret account
+  // name `herd` above uses for Codex's own bound-server headers — one
+  // identity, two consumers, so a message aimed at this agent's account
+  // reaches it however it is running, and the two paths can never disagree
+  // about who this agent is.
+  accountNameOf,
+});
+const codexChannelRelayTick = () => codexChannelRelays.reconcile().catch((e) => console.error(`  WARNING: [notify] codex channel relay reconcile failed: ${(e as Error)?.message ?? e}`));
+void codexChannelRelayTick();
+setInterval(codexChannelRelayTick, 15_000);
 // BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts for
 // the full mechanism. ONE SHARED instance (unlike issueReaper/projectReaper
 // below, which are deliberately two SEPARATE instances) wired into BOTH
@@ -805,6 +919,105 @@ const abandonedDetector = createAbandonedDetector({
 // key instead no-ops for one (and says so, once per id, rather than
 // silently swallowing it).
 const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== null;
+
+// BUTCHR-412 — the Rocket.Chat account lifecycle, wired into every rule loop
+// below as the SAME shared instance (one account manager/store for the whole
+// daemon, not one per tier — same reasoning as `admissionController` above):
+// see docs/rocketchat-accounts.md ("Wiring") for the full design and
+// docs/execution-modes.md's `account` section for what each policy means.
+//
+// ALWAYS BUILT (BUTCHR-460 review finding, round 1, blocking — superseding
+// this ticket's own first round, which gated this behind a `rcPolicyNeeded`
+// computed once at startup from `rules.json` PLUS a startup-time snapshot of
+// the session-definitions directory). That gate was correct for `rules.json`
+// alone (loaded once, fixed for the daemon's whole life — a real "nothing
+// will EVER want one" fact) but wrong for managed sessions: the built-in
+// managed-sessions rule ALWAYS runs (no staffing gate — BUTCHR-408), and
+// `butchr session create` can add a definition with `account: "temporary"`/
+// `"permanent"` at ANY time while the daemon is running, no restart involved
+// — so "nothing wants an account" is never a fact this daemon can know in
+// advance, only "nothing wants one YET". Gating `accountLifecycle` itself
+// behind that unknowable fact meant a definition created after a false
+// startup snapshot would spawn with NO account hooks wired at all — not a
+// visible refusal, a SILENT unaccounted spawn, exactly what BUTCHR-412's own
+// "withheld, not degraded" doctrine forbids. Fixed by always building it: the
+// RC HTTP client itself still stays `null` (and every `ensureAccount` call
+// for a policy other than `"none"` still visibly refuses, logged and
+// withheld — see `ensure`'s own doc comment) whenever `ROCKETCHAT_*` is
+// unconfigured — this reuses that EXISTING refusal path rather than adding a
+// second, managed-sessions-only one. `ensureAccount(id, "none")` still never
+// touches the store or client at all (the policy table's own first row), so
+// the ordinary, all-`"none"` daemon pays only for the (cheap: one keyed-lock
+// check, no I/O) synchronous no-op path, not the store/client machinery
+// itself — the one real, accepted cost of this fix is the orphan-sweep timer
+// (below) now always runs, a `.butchr-rc-accounts.json` read every 30
+// minutes, even on a daemon that will never provision anything.
+const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
+if (!rcAuth.ok && rules.some((r) => r.enabled && r.account !== "none")) {
+  console.error(`  WARNING: [account] enabled rule(s) request a Rocket.Chat account policy but Rocket.Chat is not usable (${rcAuth.reason}) — every ensureAccount call will refuse until this is fixed`);
+}
+const rcClient = rcAuth.ok
+  ? createRocketChatClient({ fetchImpl: fetch, url: rcAuth.url, adminUserId: rcAuth.adminUserId, adminToken: rcAuth.adminToken, log: (line) => console.error(`  ${line}`) })
+  : null;
+const accountManager = createAccountManager({
+  client: rcClient,
+  store: createFileAccountStore(),
+  userCapThreshold: config.rocketchat?.userCapThreshold ?? 45,
+  tempAccountCapThreshold: config.rocketchat?.temporaryAccountCapThreshold ?? 8,
+  tokenDir: config.rocketchat?.tokenDir ?? join(workspaceRoot(), ".butchr-rc-tokens"),
+  ...(config.rocketchat?.managedPrefix ? { managedPrefix: config.rocketchat.managedPrefix } : {}),
+});
+const manifestPublisher = createFileNexusManifestPublisher(config.rocketchat?.nexusManifestFile ?? join(workspaceRoot(), ".butchr-rc-nexus-manifest.json"));
+const accountLifecycle = createAccountLifecycle({
+  manager: accountManager,
+  policyOf: accountPolicyOf,
+  manifestPublisher,
+  log: (line) => console.error(`  ${line}`),
+  // Best-effort audible refusal beyond the log line above, for the two
+  // Jira-backed providers only (jira-work, jira-idea) — github-issue and
+  // zendesk-ticket have no generic `ops.addComment`-shaped route wired at
+  // this layer (see docs/rocketchat-accounts.md's own residual-gap note);
+  // a refusal for either of those is still visible in the journal.
+  notify: async (id, text) => {
+    if (isQueryLevelAgent(id)) return; // no single ticket to comment on — same discipline as issueCrashLoopDetector/issueReconcileFailureDetector above
+    const decoded = decodeAnyAgentKey(id);
+    if (decoded?.resourceProvider !== "jira-work" && decoded?.resourceProvider !== "jira-idea") return;
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+});
+// BUTCHR-412 — the daemon-shutdown residual gap, named honestly rather than
+// closed: daemon shutdown has NO stop handler at all (src/agents/herd.ts's
+// callers never call herd.stop from a shutdown path; agents keep running
+// under herdr regardless of this process's own lifetime), so nothing here
+// needs to release an account on shutdown — an agent that is still running
+// still legitimately holds its account. The gap this DOES leave is an
+// account whose agent genuinely stopped existing with no reaper run in
+// between (this daemon crashing before a reap poll ever observed it, or an
+// account orphaned by an earlier bug) — `reconcileOrphans` is the read-only
+// backstop `docs/rocketchat-accounts.md` names for exactly this.
+// `createAccountOrphanSweep` (src/agents/account-orphan-sweep.ts) is the
+// SAFE wrapper around it — see that module's own top comment for why a
+// single `herd.runningIssues()` snapshot is NOT safe to act on directly
+// (review finding, round 1): it uses `herd.residentIssues()` (a real
+// per-pane liveness check) plus a minimum record age and a two-consecutive-
+// sweep grace before ever releasing anything. Run once at startup, then on
+// this interval — cheap enough (one file read, one herd read per sweep)
+// that a dedicated poll loop would be overkill. BUTCHR-460: this timer now
+// always runs (see "ALWAYS BUILT" above) — a `.butchr-rc-accounts.json` read
+// every 30 minutes even for a daemon that never provisions anything, the one
+// accepted cost of closing the silent-unaccounted-spawn gap.
+const orphanSweep = createAccountOrphanSweep({
+  now: () => Date.now(),
+  reconcileOrphans: (agentExists) => accountManager.reconcileOrphans(agentExists),
+  residentIssues: () => herd.residentIssues(),
+  release: (agentKey, reason) => accountLifecycle.release(agentKey, reason),
+  publishBatch: () => accountLifecycle.publishBatch(),
+  log: (line) => console.error(`  ${line}`),
+});
+const ACCOUNT_ORPHAN_SWEEP_MS = 30 * 60_000;
+void orphanSweep.sweep();
+setInterval(() => void orphanSweep.sweep(), ACCOUNT_ORPHAN_SWEEP_MS);
+
 const issueCrashLoopDetector = createCrashLoopDetector({
   now: () => Date.now(),
   count: config.crashLoopCount,
@@ -852,6 +1065,12 @@ const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
   close: (c) => herd.closeStranded(c),
+  // BUTCHR-412: the self-exit path's own account teardown — a reaped
+  // workspace's agent exited on its own (crash, `/exit`, quota) and never
+  // went through `HerdrHerd.stop()`/`reconcileNow`'s `plan.stop` at all, so
+  // nothing else in this daemon would otherwise release a temporary account
+  // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
+  ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-287: a live per-issue residency census, independent of
@@ -1034,6 +1253,7 @@ runResourceLoop(ruleResourceType, {
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ISSUE),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
@@ -1063,6 +1283,7 @@ startGithubIssueLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
   onError: (e) => githubIssueHealth.recordError(e),
 });
@@ -1096,6 +1317,7 @@ startJiraIdeaLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_IDEA),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_JIRA_IDEA),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
   onError: (e) => jiraIdeaHealth.recordError(e),
 });
@@ -1117,6 +1339,7 @@ startZendeskTicketLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
   onError: (e) => zendeskTicketHealth.recordError(e),
@@ -1149,6 +1372,8 @@ startFilesystemLoop({
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
+  accountPolicies: managedSessionAccountPolicies,
+  account: accountLifecycle,
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));

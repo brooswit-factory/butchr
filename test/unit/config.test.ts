@@ -266,4 +266,55 @@ describe("loadConfig", () => {
   test("describeConfig includes maxAgents", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("maxAgents=8");
   });
+
+  // BUTCHR-395/S4: rocketchat is optional, same all-or-nothing shape as github.
+  test("rocketchat is absent when any of the three required settings is missing", () => {
+    expect(loadConfig(base, noRead).rocketchat).toBeUndefined();
+    expect(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x" }, noRead).rocketchat).toBeUndefined();
+    expect(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1" }, noRead).rocketchat).toBeUndefined();
+    expect(loadConfig({ ...base, ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" }, noRead).rocketchat).toBeUndefined();
+  });
+  test("rocketchat is populated when all three are set; adminTokenFile is the PATH, never file contents (loadConfig's readFile is never called for it)", () => {
+    const c = loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x/", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/etc/rc-token" }, noRead);
+    expect(c.rocketchat).toMatchObject({ url: "https://chat.x/", adminUserId: "a1", adminTokenFile: "/etc/rc-token", userCapThreshold: 45, temporaryAccountCapThreshold: 8 });
+    expect(c.rocketchat?.managedPrefix).toBeUndefined();
+    expect(c.rocketchat?.tokenDir).toEndWith(".butchr-rc-tokens");
+    expect(c.rocketchat?.nexusManifestFile).toEndWith(".butchr-rc-nexus-manifest.json");
+  });
+  test("userCapThreshold defaults to 45, honours ROCKETCHAT_USER_CAP_THRESHOLD, and rejects anything not a positive integer below 50", () => {
+    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
+    expect(loadConfig({ ...base, ...rc }, noRead).rocketchat?.userCapThreshold).toBe(45);
+    expect(loadConfig({ ...base, ...rc, ROCKETCHAT_USER_CAP_THRESHOLD: "30" }, noRead).rocketchat?.userCapThreshold).toBe(30);
+    for (const bad of ["0", "-1", "50", "51", "nope", "3.5"]) {
+      expect(() => loadConfig({ ...base, ...rc, ROCKETCHAT_USER_CAP_THRESHOLD: bad }, noRead)).toThrow(/ROCKETCHAT_USER_CAP_THRESHOLD/);
+    }
+  });
+  // BUTCHR-412 item 5 (BUTCHR-391 comment 23999): a separate, tighter cap on concurrently-existing TEMPORARY accounts alone.
+  test("temporaryAccountCapThreshold defaults to 8, honours ROCKETCHAT_TEMPORARY_CAP_THRESHOLD, and rejects a non-positive/non-integer value", () => {
+    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
+    expect(loadConfig({ ...base, ...rc }, noRead).rocketchat?.temporaryAccountCapThreshold).toBe(8);
+    expect(loadConfig({ ...base, ...rc, ROCKETCHAT_TEMPORARY_CAP_THRESHOLD: "3" }, noRead).rocketchat?.temporaryAccountCapThreshold).toBe(3);
+    for (const bad of ["0", "-1", "nope", "3.5"]) {
+      expect(() => loadConfig({ ...base, ...rc, ROCKETCHAT_TEMPORARY_CAP_THRESHOLD: bad }, noRead)).toThrow(/ROCKETCHAT_TEMPORARY_CAP_THRESHOLD/);
+    }
+  });
+  test("tokenDir/nexusManifestFile/managedPrefix are configurable and never crash when absent", () => {
+    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
+    const c = loadConfig({ ...base, ...rc, ROCKETCHAT_TOKEN_DIR: "/var/lib/butchr/rc-tokens", ROCKETCHAT_NEXUS_MANIFEST_FILE: "/var/lib/butchr/nexus.json", ROCKETCHAT_MANAGED_PREFIX: "acme_" }, noRead);
+    expect(c.rocketchat?.tokenDir).toBe("/var/lib/butchr/rc-tokens");
+    expect(c.rocketchat?.nexusManifestFile).toBe("/var/lib/butchr/nexus.json");
+    expect(c.rocketchat?.managedPrefix).toBe("acme_");
+  });
+  test("a stray ROCKETCHAT_USER_CAP_THRESHOLD never crashes a daemon that otherwise has no Rocket.Chat config", () => {
+    expect(() => loadConfig({ ...base, ROCKETCHAT_USER_CAP_THRESHOLD: "not-a-number-at-all" }, noRead)).not.toThrow();
+    expect(loadConfig({ ...base, ROCKETCHAT_USER_CAP_THRESHOLD: "not-a-number-at-all" }, noRead).rocketchat).toBeUndefined();
+  });
+  test("describeConfig reports rocketchat as disabled or its URL/admin id/thresholds, and never reads (or could leak) the token file", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("rocketchat=disabled");
+    const d = describeConfig(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/etc/rc-token" }, noRead));
+    expect(d).toContain("url=https://chat.x");
+    expect(d).toContain("userCapThreshold=45");
+    expect(d).toContain("temporaryAccountCapThreshold=8");
+    expect(d).toContain("adminTokenFile=/etc/rc-token");
+  });
 });

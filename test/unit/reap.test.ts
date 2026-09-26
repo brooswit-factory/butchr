@@ -316,4 +316,66 @@ describe("createReaper", () => {
     await reaper.check(); // first observation only — not eligible yet
     expect(calls).toBe(0);
   });
+
+  // BUTCHR-412: the self-exit path's own account teardown.
+  test("release is called with the closed workspace's OWN label (the agent key) after a successful close", async () => {
+    const released: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      release: async (agentKey) => { released.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(released).toEqual(["jira-work:triage:BUTCHR-9"]);
+  });
+
+  test("release is never called for a candidate that was NOT actually closed (verified live/unknown)", async () => {
+    const released: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => false,
+      release: async (agentKey) => { released.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN * 10);
+    await reaper.check();
+    expect(released).toEqual([]);
+  });
+
+  test("a release failure is logged and swallowed — never fails the poll or the reclaim count", async () => {
+    const logs: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      release: async () => { throw new Error("RC unreachable"); },
+      log: (l) => logs.push(l),
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await expect(reaper.check()).resolves.toBeUndefined();
+    expect(logs.some((l) => l.includes("reclaimed workspace w1"))).toBe(true);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("account release failed"))).toBe(true);
+  });
+
+  test("release omitted entirely: reaping still works exactly as before this ticket", async () => {
+    const closes: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async (c) => { closes.push(c.workspaceId); return true; },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(closes).toEqual(["w1"]);
+  });
 });

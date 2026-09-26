@@ -153,6 +153,122 @@ describe("checkArgv", () => {
   });
 });
 
+// BUTCHR-411: a rule binds any MCP channel server; `server:butchr` remains
+// bound exactly as today, and a bound server's own `channel` flag decides
+// whether it also joins the (variadic) channel flag.
+describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("a rule with no mcpServers produces byte-identical argv to before — the deploy-day no-op case", () => {
+    expect(spawnArgs(spec, "/w/KAN-783")).toEqual(spawnArgs({ ...spec, mcpServers: [] }, "/w/KAN-783"));
+  });
+
+  test("a bound channel server appends its own --dangerously-load-development-channels flag, kickoff still first", () => {
+    const args = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
+    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).toContain("--dangerously-load-development-channels=server:mud");
+    // server:butchr's own flag precedes the bound one — order follows spec.mcpServers, butchr always first.
+    expect(args.indexOf("--dangerously-load-development-channels=server:butchr")).toBeLessThan(args.indexOf("--dangerously-load-development-channels=server:mud"));
+  });
+
+  test("two channel servers both appear", () => {
+    const second = { name: "second", type: "http" as const, url: "https://second.example/mcp", channel: true };
+    const args = spawnArgs({ ...spec, mcpServers: [mud, second] }, "/w/KAN-783");
+    for (const flag of ["--dangerously-load-development-channels=server:butchr", "--dangerously-load-development-channels=server:mud", "--dangerously-load-development-channels=server:second"]) expect(args).toContain(flag);
+  });
+
+  test("channel: false reaches mcp.json (see workspace.test.ts) but never the channel flag", () => {
+    const args = spawnArgs({ ...spec, mcpServers: [{ ...mud, channel: false }] }, "/w/KAN-783");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).not.toContain("--dangerously-load-development-channels=server:mud");
+    expect(args.filter((a) => a.startsWith("--dangerously-load-development-channels"))).toHaveLength(1);
+  });
+
+  test("a Claude rule bound to a second channel server produces argv the pre-BUTCHR-411 checkArgv still accepts as itself, and a running agent launched WITHOUT the binding reads as stale against it", () => {
+    const withBinding = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
+    const withoutBinding = spawnArgs(spec, "/w/KAN-783");
+    expect(checkArgv(withBinding, withBinding)).toEqual({ ok: true });
+    const check = checkArgv(withBinding, withoutBinding);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.reason).toContain("--dangerously-load-development-channels server:mud");
+  });
+
+  test("codex gets every bound server as an MCP tool server, butchr first — never a channel flag (BUTCHR-359 is out of scope here)", () => {
+    const withHeaders = { ...mud, headersEnvVar: "MUD_MCP_HEADERS" };
+    const args = spawnArgs({ ...spec, mcpServers: [withHeaders] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args.filter((a) => a.startsWith("--dangerously-load-development-channels"))).toHaveLength(0);
+    const butchrIdx = args.findIndex((a) => a.includes("mcp_servers.butchr="));
+    const mudIdx = args.findIndex((a) => a.includes("mcp_servers.mud="));
+    expect(butchrIdx).toBeGreaterThanOrEqual(0);
+    expect(mudIdx).toBeGreaterThan(butchrIdx);
+    expect(args[mudIdx]).toContain('url = "https://mud.example/mcp"');
+    expect(args[mudIdx]).not.toContain("http_headers");
+  });
+
+  // Review finding, PR #387 (BLOCKING): a bound server's resolved header
+  // VALUE (often a bearer token) must never reach Codex argv — a real
+  // process command line other local users can read via ps/procfs — and
+  // must therefore never reach anything downstream that echoes argv
+  // verbatim (staleIssues()'s observedArgv, the respawn journal line).
+  test("a bound server's headersEnvVar is NEVER resolved for Codex, even when the env var holds a real secret — argv contains no trace of it", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE" });
+    try {
+      const args = spawnArgs({ ...spec, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS" }] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+      expect(mudArg).toBeDefined();
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(mudArg).not.toContain("http_headers");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE");
+    } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS; }
+  });
+
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): unlike headersEnvVar's
+  // secret value, a binding's non-secret `accountHeader` reaches Codex argv
+  // — this is what lets a Codex agent's own mcp.json tool calls to a bridge
+  // like rocketr identify which account is replying at all, after the
+  // BUTCHR-411 fix above (still true, still tested immediately above) struck
+  // every OTHER header from a Codex launch.
+  test("a binding's accountHeader reaches Codex argv when this launch carries an rocketchatAccount — a non-secret account name, not a credential", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount], rocketchatAccount: "butchr_jira-work-triage-kan-9_deadbeef00" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).toContain("http_headers");
+    expect(mudArg).toContain("x-rocketr-account");
+    expect(mudArg).toContain("butchr_jira-work-triage-kan-9_deadbeef00");
+  });
+
+  test("accountHeader configured but no rocketchatAccount on this launch (an account:\"none\" rule, or a provisioning refusal) — no headers at all, same as before this field existed", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).not.toContain("http_headers");
+  });
+
+  test("both headersEnvVar (secret) and accountHeader (non-secret) configured together: Codex argv carries the account name but never the secret", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS_2 = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE-2" });
+    try {
+      const both = { ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS_2", accountHeader: "x-rocketr-account" };
+      const args = spawnArgs({ ...spec, mcpServers: [both], rocketchatAccount: "butchr_acct" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+      expect(mudArg).toBeDefined();
+      expect(mudArg).toContain("x-rocketr-account");
+      expect(mudArg).toContain("butchr_acct");
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE-2");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE-2");
+    } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS_2; }
+  });
+
+  test("agy's launch is unaffected by mcpServers — bindings must not break it", () => {
+    const launch = agentStartParams({ ...spec, mcpServers: [mud] }, "/w/KAN-783", "pane", "worker", { provider: "agy" });
+    expect(launch).toEqual(agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy" }));
+  });
+});
+
 describe("project-manager Claude permissions", () => {
   // No human answers a project manager's prompts; Claude's auto mode is the
   // counterpart of the Codex launch's on-request + auto_review policy.

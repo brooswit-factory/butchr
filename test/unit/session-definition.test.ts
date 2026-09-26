@@ -95,6 +95,14 @@ describe("sessionDefinitionProblems", () => {
     expect(parseSessionDefinition({ ...good(), mcpServers: [withEnvVar] }, "def", HOME).mcpServers).toEqual([withEnvVar]);
     expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...withEnvVar, headersEnvVar: "lower-case" }] }, "def")[0]).toContain(".headersEnvVar must be an env var name");
   });
+
+  // BUTCHR-412: accountHeader (the per-agent, non-secret literal extension) rides the same shared parseMcpServers this definition type already reuses verbatim.
+  test("mcpServers: accountHeader is accepted, never resolved here", () => {
+    const withAccountHeader = { name: "rocketr", type: "http" as const, url: "https://rocketr.internal/mcp", accountHeader: "x-rocketr-account", channel: true };
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [withAccountHeader] }, "def")).toEqual([]);
+    expect(parseSessionDefinition({ ...good(), mcpServers: [withAccountHeader] }, "def", HOME).mcpServers).toEqual([withAccountHeader]);
+    expect(sessionDefinitionProblems({ ...good(), mcpServers: [{ ...withAccountHeader, accountHeader: "not a header" }] }, "def")[0]).toContain(".accountHeader must be a valid HTTP header name");
+  });
   test("channels: not a real field — S4's shape folds the per-MCP notification flag into mcpServers[].channel, not a sibling field", () => {
     expect(sessionDefinitionProblems({ ...good(), channels: [] }, "def")).toEqual(['def has unknown field "channels"']);
   });

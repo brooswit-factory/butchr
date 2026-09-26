@@ -1,5 +1,5 @@
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { effortFor, mcpIdentityHeaders, modelFor, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -68,37 +68,57 @@ export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string =>
 
 /**
  * `server:<name>` for every `spec.mcpServers` entry with `channel: true`
- * (BUTCHR-408, type ported from S4's BUTCHR-395 branch — see
- * `McpServerBinding`'s own doc comment, src/rules/rules.ts) — the same
- * channel-naming convention `server:butchr` already uses. Order follows
- * `spec.mcpServers`, so it's deterministic for argv comparison
- * (`checkArgv`/`staleIssues`). Empty when `spec.mcpServers` is
- * absent/empty — unaffected.
+ * (BUTCHR-408/BUTCHR-411 — the type landed independently on the main line
+ * and on the BUTCHR-395 branch, then merged here; see `McpServerBinding`'s
+ * own doc comment, src/rules/rules.ts) — the same channel-naming convention
+ * `server:butchr` already uses. Order follows `spec.mcpServers`, so it's
+ * deterministic for argv comparison (`checkArgv`/`staleIssues`). Empty when
+ * `spec.mcpServers` is absent/empty — unaffected.
  */
 const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).filter((s) => s.channel).map((s) => `server:${s.name}`);
 
 /**
- * Codex `McpServerLaunchConfig` entries for `spec.mcpServers` — every
- * binding, `channel` or not: Codex has no development-channel concept, so a
- * bound server reaches Codex as MCP TOOLS only, never push.
+ * Codex `McpServerLaunchConfig` entries for `spec.mcpServers`
+ * (BUTCHR-408/BUTCHR-411) — every binding, `channel` or not: Codex has no
+ * development-channel concept (BUTCHR-359, out of scope here), so a bound
+ * server reaches Codex as MCP TOOLS only, never push.
  *
- * DELIBERATELY never `headers`, unlike `spec.externalMcpServers` above:
- * Drovr renders a Codex `McpServerLaunchConfig`'s `headers` as `--config
+ * DELIBERATELY never `headersEnvVar`'s resolved value, unlike
+ * `spec.externalMcpServers` above: Drovr renders a Codex
+ * `McpServerLaunchConfig`'s `headers` as `--config
  * mcp_servers.<name>={ ..., http_headers = {...} }` — a real process
  * command-line argument, visible to any other local user via `ps`/`/proc`,
  * and also the exact text `staleIssues()`/`onRespawn` echo verbatim into
- * `observedArgv` and the daemon journal (S4/PR #387 review finding, ported
- * here with the type). `headersEnvVar` exists precisely so a header VALUE
- * (often a bearer token) is never written anywhere that isn't the daemon's
- * own process environment and the agent's own `mcp.json` (Claude only, see
- * `buildWorkspace`'s 0600 handling) — Codex argv is exactly such an
- * "anywhere else". A binding that names `headersEnvVar` simply connects
- * Codex to the bound server with no extra headers; docs/managed-sessions.md
- * says so loudly, and BUTCHR-408's own Codex example definition never
- * depends on an authenticated bound server.
+ * `observedArgv` and the daemon journal (S4/PR #387 review finding).
+ * `headersEnvVar` exists precisely so a header VALUE (often a bearer token)
+ * is never written anywhere that isn't the daemon's own process environment
+ * and the agent's own `mcp.json` (Claude only, see `buildWorkspace`'s 0600
+ * handling) — Codex argv is exactly such an "anywhere else". A binding that
+ * names ONLY `headersEnvVar` simply connects Codex to the bound server with
+ * no extra headers; docs/managed-sessions.md and docs/mcp-server-bindings.md
+ * both say so loudly, since an authenticated bridge then fails to
+ * authenticate otherwise (`resolveMcpServerHeaders` itself, used only by
+ * the Claude/`mcp.json` path below, already logs when a named var resolves
+ * to nothing).
+ *
+ * BUTCHR-413 (review finding 1) IS an exception, deliberately: a binding's
+ * `accountHeader` (see that field's own doc comment, src/rules/rules.ts)
+ * carries only an account NAME, `spec.rocketchatAccount` — never a
+ * bearer token — so `resolveAccountHeader` (src/agents/workspace.ts, the
+ * SAME function `buildWorkspace` calls for Claude's `mcp.json`, reused here
+ * verbatim rather than a second copy) reaches Codex argv here where
+ * `headersEnvVar`'s own resolved value never does. This is what makes a
+ * Codex agent's own reply through `rocketr`'s tools possible at all after
+ * this same review's earlier fix (BUTCHR-411) struck every bound-server
+ * header from a Codex launch: that fix is unweakened — `headersEnvVar`
+ * still never reaches here — this only adds a second, narrower, non-secret
+ * channel the earlier review never considered.
  */
-const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
-  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string; headers?: Record<string, string> }> =>
+  (spec.mcpServers ?? []).map((s) => {
+    const headers = resolveAccountHeader(s, spec.rocketchatAccount);
+    return { name: s.name, url: s.url, ...(headers ? { headers } : {}) };
+  });
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process
@@ -137,11 +157,18 @@ export function agentLaunchConfig(
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
       ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {bypassApprovalsAndSandbox:false}: {}),
-      mcpServers: [{
-        name: "butchr",
-        url: mcpUrl,
-        headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
-      }, ...(spec.externalMcpServers ?? []), ...boundCodexServers(spec)],
+      mcpServers: [
+        {
+          name: "butchr",
+          url: mcpUrl,
+          headers: { ...mcpIdentityHeaders(spec), "x-butchr-provider": "codex" },
+        },
+        ...(spec.externalMcpServers ?? []),
+        // BUTCHR-411: a rule's bound servers give a Codex agent the same MCP
+        // TOOL access a Claude agent gets from mcp.json — never a channel
+        // (Codex push is BUTCHR-359, out of scope here).
+        ...boundCodexServers(spec),
+      ],
       disabledMcpServers: agent.disabledMcpServers ?? [],
     };
   }
@@ -156,6 +183,11 @@ export function agentLaunchConfig(
     model: agent.model ?? modelFor(spec.issuetype),
     effort: agent.effort ?? effortFor(spec.issuetype),
     mcpConfigPath: dir + "/mcp.json",
+    // BUTCHR-411: `server:butchr` remains bound exactly as today, first;
+    // a rule's `channel: true` bindings are additive. Drovr emits each as
+    // its own `--dangerously-load-development-channels=server:x` flag (the
+    // variadic form this file's own doc comment below warns about), so
+    // multiple channel servers just work.
     developmentChannels: ["server:butchr", ...boundChannels(spec)],
     ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
   };

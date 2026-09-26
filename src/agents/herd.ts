@@ -4,7 +4,9 @@ import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderO
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
+import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import type { McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -76,6 +78,19 @@ export interface Herd {
    * but the pane shows a session-limit refusal rather than a started turn.
    */
   nudge(issue: string, text: string): Promise<NudgeResult>;
+  /**
+   * The provider actually running an issue's agent right now, resolved from
+   * its pane's OWN foreground process (the same source `staleIssues()`
+   * already trusts) — never from static config, which under ordered
+   * provider fallback (BUTCHR-238/docs/agent-providers.md) can differ from
+   * what is actually running. `null` when no agent is running, or its
+   * provider can't be determined from the pane (a starting shell, a process
+   * that already exited, a pane blocked on a dialog). Optional so no
+   * existing `Herd` fake needs updating (BUTCHR-413's Codex channel relay is
+   * its only caller so far). See `HerdrHerd`'s implementation for reuse with
+   * `staleIssues()`'s identical lookup.
+   */
+  providerOf?(issue: string): Promise<ManagedAgentProvider | null>;
 }
 
 export interface ManagedHerdAgent {
@@ -206,6 +221,39 @@ export class HerdrHerd implements Herd {
     private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareFactoryWorkspace,
     /** Monotonic readiness clock; paired with the injected wait in tests. */
     private readonly monotonicNow: () => number = () => performance.now(),
+    /**
+     * BUTCHR-411 — the design decision the ticket calls out by name: how
+     * `staleIssues()` sees a rule's MCP server bindings without HerdrHerd
+     * itself holding any rule state (it is one flat instance shared by every
+     * rule/provider — see src/daemon/index.ts). The caller resolves an
+     * issue id to its rule's current `mcpServers` (or `undefined`); this
+     * mirrors `roleOfAgent` in src/daemon/index.ts, the same
+     * decode-then-look-up-by-ruleId shape that field already uses for a
+     * different rule-level property. Optional and defaulting to "no
+     * bindings for anyone" is exactly what keeps a rule that never opts into
+     * `mcpServers` producing byte-identical expected argv to before this
+     * ticket — the deploy-day fleet-wide-respawn hazard the ticket's own
+     * survey flagged stays closed.
+     */
+    private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
+    /**
+     * BUTCHR-413 — same shape and same reason as `mcpBindingsOf` immediately
+     * above, one field over: this issue's own non-secret account-identifying
+     * name for `McpServerBinding.accountHeader` (`spec.rocketchatAccount`, see
+     * that field's own doc comment, src/agents/workspace.ts), or `undefined`
+     * for none (an `account: "none"` rule, or no Rocket.Chat configured at
+     * all). Called from BOTH `spawnExclusive` (augments the real spec before
+     * `buildWorkspace`/`agentLaunchConfig`) and `staleIssues()` (augments the
+     * reconstructed comparison spec) — the SAME callback both times, so a
+     * value that is deterministic in its caller (as `rcUsernameFor(issue)`
+     * is, src/accounts/identity.ts) can never drift between what an agent
+     * was actually launched with and what a later poll expects, with no
+     * persistence required. Optional and defaulting to "no account name for
+     * anyone" keeps a daemon with no Rocket.Chat configured, or a rule with
+     * no `accountHeader` binding, at byte-identical expected argv to before
+     * this field existed.
+     */
+    private readonly accountNameOf?: (issue: string) => string | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -335,6 +383,36 @@ export class HerdrHerd implements Herd {
     return [...(await this.byIssue())].map(([issue, agent]) => ({ issue, ...agent }));
   }
 
+  /**
+   * The pane's own foreground provider, or `undefined` when it can't be
+   * determined (herdr hiccup/pane gone, a starting shell, an exited process,
+   * a pane blocked on a dialog) — shared by `staleIssues()` and `providerOf()`
+   * so both trust exactly the same evidence.
+   */
+  private async providerOfPane(pane: string): Promise<{ provider: ManagedAgentProvider; proc: results.PaneProcessInfoProcess & { argv: string[] } } | undefined> {
+    let info: results.PaneProcessInfo | undefined;
+    try {
+      info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
+    } catch {
+      return undefined; // herdr hiccup / pane gone — unknown
+    }
+    // foreground_processes/argv are both optional/nullable on the wire: a
+    // shell still starting, a claude that already exited, or a pane
+    // blocked on a dialog can all report none of this — every such gap is
+    // UNKNOWN (a fresh respawn must never itself be respawned every poll —
+    // the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
+    const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
+    if (!proc?.argv) return undefined; // no claude in the foreground, or the matched claude reported no argv
+    return { provider: managedAgentProviderOfProcess(proc)!, proc: proc as results.PaneProcessInfoProcess & { argv: string[] } };
+  }
+
+  async providerOf(issue: string): Promise<ManagedAgentProvider | null> {
+    const entry = (await this.byIssue()).get(issue);
+    if (!entry) return null;
+    const found = await this.providerOfPane(entry.pane);
+    return found?.provider ?? null;
+  }
+
   async staleIssues(): Promise<StaleAgent[]> {
     // Reconciliation stops stale workers before spawning replacements.
     if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
@@ -343,23 +421,12 @@ export class HerdrHerd implements Herd {
     for (const [issue, { pane, cwd }] of await this.byIssue()) {
       if (this.refused.has(issue)) continue;
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
-      let info: results.PaneProcessInfo | undefined;
-      try {
-        info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
-      } catch {
-        continue; // herdr hiccup / pane gone — unknown, not stale — and this issue alone, not the whole sweep
-      }
-      // foreground_processes/argv are both optional/nullable on the wire: a
-      // shell still starting, a claude that already exited, or a pane
-      // blocked on a dialog can all report none of this — every such gap is
-      // UNKNOWN, never stale (a fresh respawn must never itself be
-      // respawned every poll — the 7-leaked-workspaces shape, CHANGELOG 0.5.6).
-      const proc = info?.foreground_processes?.find((p) => managedAgentProviderOfProcess(p));
-      if (!proc?.argv) continue; // no claude in the foreground, or the matched claude reported no argv
+      const found = await this.providerOfPane(pane);
+      if (!found) continue;
+      const { provider, proc } = found;
       // issuetype/summary/parent don't matter here: --model and --effort
       // (the only things issuetype affects) are both deliberately excluded
       // from the comparison.
-      const provider = managedAgentProviderOfProcess(proc)!;
       if (provider === "agy" && this.agent.agySpawnBlocked) continue;
       const disabledMcpServers = this.agent.disabledMcpServers ?? workspaceIsolation(cwd);
       if (provider === "codex" && disabledMcpServers === undefined) {
@@ -367,12 +434,28 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      // BUTCHR-408: mcpServers is read back the SAME way externalMcpServers
-      // (jira-project) is above — see workspaceMcpServers's own doc comment
-      // (src/agents/workspace.ts) for why staleIssues needs this at all
-      // (channel flags/Codex tool list are part of argv, unlike mcp.json's
-      // own contents, which argv comparison never sees).
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [], mcpServers: workspaceMcpServers(cwd) ?? [] } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // BUTCHR-408/BUTCHR-411: two independent sources feed a spec's
+      // mcpServers, kept apart by POPULATION so neither shadows the other's
+      // staleness signal. A managed-session agent (filesystem provider,
+      // MANAGED_SESSIONS_RULE_ID, BUTCHR-408) has no entry in `rules` at
+      // all, so `mcpBindingsOf` could only ever answer "no bindings" for
+      // it — its real mcpServers is whatever buildWorkspace last persisted
+      // for this workspace (workspaceMcpServers, src/agents/workspace.ts,
+      // the SAME read-the-workspace-back shape externalMcpServers below
+      // already uses). A rule-engine agent's mcpServers (BUTCHR-411), by
+      // contrast, must come from the RULE's CURRENT config, not a persisted
+      // file, or an admin removing a binding from rules.json would never
+      // read as stale — see the constructor's own doc comment on
+      // mcpBindingsOf for why this lookup exists instead of caching the
+      // original spawn's SpawnSpec.
+      const isManagedSession = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID;
+      const mcpServers = isManagedSession ? (workspaceMcpServers(cwd) ?? []) : this.mcpBindingsOf?.(issue);
+      // BUTCHR-413: same `accountNameOf` callback `spawn()` itself uses —
+      // see that constructor param's own doc comment for why recomputing it
+      // fresh here, rather than caching the original spawn's spec, is what
+      // keeps this comparison from drifting.
+      const accountName = this.accountNameOf?.(issue);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -431,7 +514,21 @@ export class HerdrHerd implements Herd {
    * reach zero lines on a rejecting `agent.list()`, at this method's
    * pre-fix shape, before this fix landed.
    */
-  async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
+  async spawn(specIn: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
+    // BUTCHR-413: a fallback fill only, never an overwrite — BUTCHR-412's
+    // own `account-lifecycle.ts` `ensure()` already sets `rocketchatAccount`
+    // on `desired`/`toSpawn` BEFORE `herd.spawn` is ever called, from the
+    // REAL `ensureAccount` outcome for this launch (respecting a cap
+    // refusal, a not-managed collision, etc. — cases where `ensure` instead
+    // returns `null` and this method is never reached at all). Both
+    // producers derive the identical value from the same agent key
+    // (`rcUsernameFor`, src/accounts/identity.ts), so this is never a
+    // disagreement — only a fallback for a launch path that never went
+    // through `ensure` at all (no accountLifecycle wired, e.g. RC not
+    // configured for any rule). See `staleIssues()` below for the SAME
+    // callback used to keep its own reconstruction in sync.
+    const accountName = specIn.rocketchatAccount ?? this.accountNameOf?.(specIn.key);
+    const spec: SpawnSpec = accountName ? { ...specIn, rocketchatAccount: accountName } : specIn;
     return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
   }
 

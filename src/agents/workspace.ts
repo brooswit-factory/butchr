@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -24,7 +24,11 @@ import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
  * legacy/test callers that predate rules — a bare resource key. The optional
  * fields are set only for rule-engine agents: `resource` is the Jira key the
  * agent works (what MCP tools see as `x-issue`), `brief` replaces the
- * issue-type brief, and `agents` is the rule's ranked harness preference.
+ * issue-type brief, `agents` is the rule's ranked harness preference, and
+ * `mcpServers` is the rule's additional MCP server bindings (BUTCHR-411,
+ * `Rule.mcpServers` — src/rules/rules.ts), each launched alongside butchr's
+ * own server and (for `channel: true` entries) added to Claude's development
+ * channels. Absent/empty means none — today's behaviour exactly.
  */
 export interface SpawnSpec {
   key: string;
@@ -34,6 +38,37 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  /**
+   * Rocket.Chat account name for THIS launch (BUTCHR-412 S4 design
+   * correction — BUTCHR-391 comment 24007) — set only by the reconcile-layer
+   * account hook (`src/agents/account-lifecycle.ts`), never by a
+   * `specFor*` function, and only after `ensureAccount` actually succeeded
+   * for this agent's rule policy. Carries NO credential: rocketr (Nexus's
+   * bridge) holds every token centrally, and an agent's own MCP binding
+   * names only its account, non-secret, in the `x-rocketr-account` header —
+   * see `resolveAccountHeader`/`McpServerBinding.accountHeader` below for
+   * how a per-agent literal (as opposed to BUTCHR-411's per-RULE
+   * `headersEnvVar`) reaches that header, and `docs/rocketchat-accounts.md`'s
+   * "Wiring" section for why. Superseded design (kept only in history, never
+   * revived): an earlier round of this ticket delivered a per-agent token in
+   * a dedicated 0600 file (`RC_ACCOUNT_FILE`) that the agent itself read —
+   * removed per the corrected design, which forbids a token ever reaching an
+   * agent's workspace at all.
+   *
+   * BUTCHR-413's own consumers of this SAME field, outside any one launch's
+   * spec: `HerdrHerd.spawn`/`HerdrHerd.staleIssues` (src/agents/herd.ts) fill
+   * this in ONLY when `ensure()` above never ran for a launch at all (no
+   * accountLifecycle wired — RC not configured for any rule), and never
+   * overwrite an already-set value; `createCodexChannelRelayPool`'s own
+   * daemon-side connection (src/notify/codex-channel-relay.ts) has no live
+   * spec to read at all and always derives it. Both use the exact same
+   * `rcUsernameFor(agentKey, prefix)` this field's own real producer
+   * (`ensureAccount`) uses internally, with the SAME configured
+   * `Config.rocketchat.managedPrefix` — one function, one prefix, so a
+   * derived answer can never name a different account than the one actually
+   * provisioned.
+   */
+  rocketchatAccount?: string;
   /** Operator-owned MCP config path (jira-project rules only); `{{KEY}}` expands to the resource key. */
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
@@ -359,27 +394,38 @@ Await direction if your brief does not assign work. Preserve sandbox and approva
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
   if (provider === "claude") {
-    // BUTCHR-408: a bound server (spec.mcpServers) lands in mcp.json
-    // alongside butchr's own and any externalMcpServers, `channel: true` or
-    // not — mcp.json is what gives Claude MCP TOOL access; the channel flag
-    // (`boundChannels`, src/agents/argv.ts) is the separate, additive
-    // decision about PUSH notifications. No bindings -> byte-identical to
-    // before (Object.fromEntries([]) spreads nothing).
+    // BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
+    // mcp.json alongside butchr's own and any externalMcpServers, `channel:
+    // true` or not — mcp.json is what gives Claude MCP TOOL access; the
+    // channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
+    // additive decision about PUSH notifications. No bindings -> byte-identical
+    // to before (Object.fromEntries([]) spreads nothing). A binding's headers
+    // are the union of its (per-RULE, env-resolved, potentially secret)
+    // `headersEnvVar` value and its (per-AGENT, always non-secret)
+    // `accountHeader` value — see `resolveMcpServerHeaders`/
+    // `resolveAccountHeader`'s own doc comments for why these are two
+    // different resolution mechanisms sharing one binding shape, not two
+    // competing ones.
     let hasSecretHeaders = false;
     const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const headers = resolveMcpServerHeaders(b);
-      if (headers) hasSecretHeaders = true;
+      const envHeaders = resolveMcpServerHeaders(b);
+      if (envHeaders) hasSecretHeaders = true;
+      const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
+      const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
       return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
     }));
     const mcpJsonPath = join(dir, "mcp.json");
     writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
-    // A bound server's resolved header VALUE (often a bearer token) must
-    // never sit in a group/other-readable file at the default umask —
-    // `writeFileSync`'s own `mode` option only ever applies when it CREATES
-    // the file (a rebuilt workspace's mcp.json already exists), so this is
-    // an explicit chmod, not a write option, and only when this write
+    // Review finding, PR #387: a bound server's resolved header VALUE (often
+    // a bearer token) must never sit in a group/other-readable file at the
+    // default umask. `writeFileSync`'s own `mode` option only ever applies
+    // when it CREATES the file (a rebuilt workspace's mcp.json already
+    // exists), so this is an explicit chmod, not a write option, and only
+    // when this write
     // actually carries a secret; a binding-less (or headers-less) mcp.json
-    // keeps its exact previous permissions, untouched.
+    // keeps its exact previous permissions, untouched. `accountHeader`'s own
+    // value (an account NAME, never a secret) never sets `hasSecretHeaders`
+    // by itself — only `headersEnvVar`'s resolution does.
     if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
   }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
@@ -474,6 +520,69 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }
 
+/**
+ * Header VALUES for a bound MCP server (BUTCHR-408/BUTCHR-411, type ported
+ * to main from S4's BUTCHR-395 branch — see `McpServerBinding`'s own doc
+ * comment, src/rules/rules.ts), resolved from THIS DAEMON's own
+ * environment — never from the rules/session-definition file, which only
+ * ever names the env var (`McpServerBinding.headersEnvVar`). `env` defaults
+ * to `process.env` for every real caller; tests pass an explicit map
+ * instead of touching the process environment. Missing var, empty value,
+ * invalid JSON, or JSON that isn't a flat string-valued object all resolve
+ * to `undefined` (connect with no extra headers) rather than throwing — a
+ * malformed/unset secret must not crash workspace building or launch.
+ *
+ * Review finding, PR #387: a `headersEnvVar` that resolves to nothing used
+ * to fail this silently — for an authenticated bridge that is an agent that
+ * connects unauthenticated and only fails later, with nothing pointing back
+ * at the cause. `log` (default `console.error`, overridable for tests)
+ * prints exactly one line naming the BINDING and the ENV VAR — never the
+ * value, never the raw env content — whenever `headersEnvVar` was named but
+ * produced no usable headers.
+ */
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
+  if (!binding.headersEnvVar) return undefined;
+  const raw = env[binding.headersEnvVar];
+  const parsed = raw ? tryParseHeaders(raw) : undefined;
+  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+  return parsed;
+}
+
+const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
+  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
+  return undefined;
+};
+
+/**
+ * The PER-AGENT half of a bound server's headers (BUTCHR-412, BUTCHR-391
+ * comment 24007) — `McpServerBinding.accountHeader`'s own doc comment
+ * (`src/rules/rules.ts`) explains why this is a second, deliberately
+ * separate resolution mechanism from `resolveMcpServerHeaders` above rather
+ * than a second reading of the same one: that one resolves ONE static value
+ * per RULE from the daemon's own env; this resolves a DIFFERENT value per
+ * AGENT from `spec.rocketchatAccount` (set only by
+ * `../agents/account-lifecycle.ts`'s `ensure`, after `ensureAccount`
+ * actually provisioned this agent's account). No binding names an env var
+ * here, and nothing is ever "malformed" — the value is either present
+ * (this agent has an account) or it is not (no `accountHeader` on the
+ * binding, or no account for this launch), so there is no failure mode to
+ * log, unlike `resolveMcpServerHeaders`'s own unset/malformed-env case.
+ *
+ * BUTCHR-413 reuses this SAME function, unmodified, for Codex's own
+ * bound-server config (`boundCodexServers`, src/agents/argv.ts) — safe
+ * there in a way `resolveMcpServerHeaders`'s own resolved value never is,
+ * because an account name grants no capability by itself (see
+ * `McpServerBinding.accountHeader`'s own doc comment for why). One function,
+ * two callers (Claude's mcp.json here, Codex's argv there), never a second
+ * copy of the same one-line lookup.
+ */
+export function resolveAccountHeader(binding: McpServerBinding, account: string | undefined): Record<string, string> | undefined {
+  return binding.accountHeader && account ? { [binding.accountHeader]: account } : undefined;
+}
+
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
   try {
@@ -500,36 +609,3 @@ export function workspaceMcpServers(dir: string): SpawnSpec["mcpServers"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }
-
-/**
- * Header VALUES for a bound MCP server (BUTCHR-408, type ported from S4's
- * BUTCHR-395 branch — see `McpServerBinding`'s own doc comment,
- * src/rules/rules.ts), resolved from THIS DAEMON's own environment — never
- * from a session-definition file, which only ever names the env var
- * (`McpServerBinding.headersEnvVar`). `env` defaults to `process.env` for
- * every real caller; tests pass an explicit map instead of touching the
- * process environment. Missing var, empty value, invalid JSON, or JSON
- * that isn't a flat string-valued object all resolve to `undefined`
- * (connect with no extra headers) rather than throwing — a malformed/unset
- * secret must not crash workspace building or launch. `log` (default
- * `console.error`, overridable for tests) prints exactly one line naming
- * the BINDING and the ENV VAR — never the value, never the raw env content
- * — whenever `headersEnvVar` was named but produced no usable headers, so
- * an authenticated bridge that silently connects unauthenticated has
- * something pointing back at the cause.
- */
-export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
-  if (!binding.headersEnvVar) return undefined;
-  const raw = env[binding.headersEnvVar];
-  const parsed = raw ? tryParseHeaders(raw) : undefined;
-  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
-  return parsed;
-}
-
-const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
-  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
-  return undefined;
-};

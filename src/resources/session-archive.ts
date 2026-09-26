@@ -84,13 +84,20 @@ export interface SessionArchiveIo {
   /** Creates a directory (and any missing parents) if it does not already exist; a no-op if it does. */
   mkdir: (path: string) => Promise<void>;
   /**
-   * Run after a successful archive move, default no-op. S4 (BUTCHR-395)
-   * owns Rocket.Chat account cleanup (`releaseAccount(agentKey, "archive")`,
-   * `src/accounts/manager.ts` on the BUTCHR-395 story branch, not on `main`
-   * yet) and will wire itself in here through a follow-up task — this
-   * module imports nothing from that branch. A hook failure is reported
-   * back to the caller (`ArchiveResult.hookError`) but NEVER undoes the
-   * move: the definition is already out of the eligible set by the time
+   * Run after a successful archive move, default no-op. Built for S4
+   * (BUTCHR-395), which owns Rocket.Chat account cleanup
+   * (`releaseAccount(agentKey, "archive")`, `src/accounts/manager.ts`) — but
+   * BUTCHR-460 (the follow-up task this seam was always for) deliberately
+   * left this hook a no-op in production: the caller that would set it
+   * (`butchr session archive`, `src/cli/session-cli.ts`) is a credential-free,
+   * daemon-free CLI process with no Rocket.Chat client/store/manifest
+   * publisher to act with, so the real release runs daemon-side instead
+   * (`src/agents/managed-session-account-release.ts` — see that module's own
+   * top comment for the full reasoning). This hook still exists, and still
+   * works exactly as documented, for any FUTURE caller with real credentials
+   * to inject (e.g. a hypothetical MCP archive tool). A hook failure is
+   * reported back to the caller (`ArchiveResult.hookError`) but NEVER undoes
+   * the move: the definition is already out of the eligible set by the time
    * the hook runs, and rolling the move back on a hook failure would put it
    * back in the eligible set out from under an operator who asked for it to
    * be archived, for a reason (account cleanup) that has nothing to do with
