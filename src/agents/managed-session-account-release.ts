@@ -63,6 +63,18 @@
  * `"stop"` release unchanged — a deleted, invalidated, or frozen definition
  * is still released, just logged as an ordinary stop, exactly as it already
  * is for every other provider today.
+ *
+ * NAMED, NON-BLOCKING LIMITATION (review round 1): the check has no memory
+ * of WHICH move put a file at that archive path — only that one is there
+ * right now. A stale copy left in the archive directory some OTHER way (an
+ * operator's own copy rather than move, a leftover from an interrupted
+ * cross-filesystem fallback) can make a later, otherwise-ordinary stop of
+ * the SAME basename (deleted/invalidated/frozen, not archived) mis-log as
+ * `"archive"`. This never changes WHETHER a `temporary` account is released
+ * — `stop` and `archive` are behaviourally identical in `releaseAccount` —
+ * only the audit line's accuracy in this narrow, out-of-band-caused case.
+ * See `docs/rocketchat-accounts.md`'s "Archive release" section for the
+ * fuller writeup.
  */
 import { basename, dirname, join } from "node:path";
 import { access } from "node:fs/promises";

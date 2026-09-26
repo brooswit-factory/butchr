@@ -424,17 +424,40 @@ A managed-session definition's own `account` field (validated the same way a
 definition's own `account` field — the same seam `managedSessionRoles`
 already uses for `role`) rather than from a `Rule`, since the built-in
 managed-sessions rule is ONE shared `Rule` (fixed `account: "none"`) for
-every heterogeneous definition file. **One STARTUP-TIME caveat, honestly
-named rather than left implicit:** whether `accountLifecycle` is built AT
-ALL (see "DORMANT UNLESS..." above this section in the source) is decided
-ONCE, from a snapshot of the definitions directory taken at daemon start —
-same "root resolution happens once at daemon startup, not live" precedent
-`docs/managed-sessions.md`'s own root-resolution section already documents.
-A definition ADDED (or edited to newly request an account) after that
-snapshot, on a daemon where no `rules.json` rule ALSO wants Rocket.Chat,
-does not retroactively wake the subsystem up until the next restart — same
-class of gap as any other definitions-directory change needing a restart to
-be picked up by anything that isn't the poll loop itself.
+every heterogeneous definition file.
+
+**`accountLifecycle` is now ALWAYS built (BUTCHR-460 review round 1,
+blocking — superseding this ticket's own first round).** The first round
+gated its construction behind a `rcPolicyNeeded` computed once at daemon
+startup from `rules.json` PLUS a one-time snapshot of the session-
+definitions directory — correct for `rules.json` alone (loaded once, fixed
+for the daemon's whole life) but wrong for managed sessions: the built-in
+managed-sessions rule always runs (no staffing gate, BUTCHR-408) and
+`butchr session create` can add a definition with `account: "temporary"`/
+`"permanent"` at any time the daemon is running, no restart involved — so
+"nothing wants an account" is never a fact knowable in advance for this
+provider, only "nothing wants one yet". Gating the hooks themselves behind
+that unknowable fact meant a definition created after a false startup
+snapshot got NO account hooks at all — not a visible refusal, a SILENT
+unaccounted spawn, exactly what "withheld, not degraded" (below) forbids.
+Fixed by always constructing `accountLifecycle`: the RC HTTP CLIENT itself
+still stays `null` (and every `ensureAccount` call for a policy other than
+`"none"` still visibly refuses with `"rc-not-configured"`, logged and
+withheld) whenever `ROCKETCHAT_*` is unconfigured — this reuses that
+EXISTING refusal path rather than adding a second, managed-sessions-only
+one, and `ensureAccount(id, "none")` still never touches the store or client
+at all, so an all-`"none"` daemon still pays no I/O for it. The one accepted
+cost: the periodic orphan sweep (`ACCOUNT_ORPHAN_SWEEP_MS`, below) now always
+runs — a `.butchr-rc-accounts.json` read every 30 minutes even for a daemon
+that will never provision anything.
+
+**Recovering from `"rc-not-configured"` still needs a restart** (unchanged
+by this fix): `ROCKETCHAT_URL`/`ROCKETCHAT_ADMIN_USER_ID`/
+`ROCKETCHAT_ADMIN_TOKEN_FILE` are read once at daemon startup
+(`loadRocketChatAuth`) — the RC client itself, once built (or left `null`),
+is fixed for the daemon's whole life; there is no per-poll re-check. A
+withheld definition is picked up the FIRST poll after a restart with valid
+config, never by a later poll of the SAME still-running process.
 
 **`ensure(spec)`** runs for exactly the ids about to be spawned — the
 ordinary spawn loop's `admitted` set (already excludes every resident agent,
@@ -517,6 +540,27 @@ distinction is purely for the audit trail (the `[account] ... released
 which this wrapper does not change at all: a queued/retried archive release
 is still retried by the SAME `retryPendingReleases` mechanism, with reason
 `"archive"` preserved through the retry).
+
+**A named, non-blocking limitation (review round 1): a stale copy left in the
+archive directory can mis-attribute an unrelated stop as `"archive"`.** The
+check is purely "does a file of this basename exist in the archive
+directory right now" — it has no memory of WHICH move actually put it there.
+If a file of the same basename ends up in the archive directory some OTHER
+way than this specific stop causing it (an operator's own copy rather than
+move, a stray leftover from an interrupted or hand-run cross-filesystem
+fallback — see "Move mechanics" in `docs/managed-sessions.md` — or simply a
+second definition that happens to share a basename with an unrelated one
+that was genuinely archived earlier), a LATER, otherwise-ordinary stop of
+that id (the definition deleted outright, edited invalid, or frozen) will
+also read as `"archive"` in the log, even though nothing was archived this
+time. This never affects WHETHER a `temporary` account is released — `stop`
+and `archive` are behaviourally identical in `releaseAccount` — only the
+audit line's own accuracy in this one specific, narrow scenario. Closing it
+properly would need the daemon to remember which basenames it itself
+archived (a small persisted set, keyed like the account store) rather than
+inferring intent from a point-in-time file check; not built here, since the
+current false-positive requires an out-of-band cause and only ever
+mislabels an already-correct release, never mishandles one.
 
 **Why not `archiveSessionDefinition`'s own `onArchived` hook instead.**
 `butchr session archive` is a credential-free, daemon-free CLI process

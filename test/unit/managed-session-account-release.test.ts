@@ -244,3 +244,115 @@ describe("BUTCHR-460 end to end: managed-session archive release through the rea
     expect(logs.some((l) => l.includes("[account]") && l.includes("released (archive)"))).toBe(true);
   });
 });
+
+/**
+ * BUTCHR-460 review round 1, blocking finding: a managed-session definition
+ * with `account != "none"` must never spawn silently unaccounted just
+ * because the daemon's Rocket.Chat client happens to be dormant (unconfigured)
+ * — it must be WITHHELD and LOGGED, exactly like any other provider's rule
+ * that asks for an account it can't get (`docs/rocketchat-accounts.md`'s own
+ * "withheld, not degraded" doctrine). Fixed in `src/daemon/index.ts` by
+ * always wiring `AccountLifecycleHooks` into the managed-sessions loop
+ * (previously gated behind a startup-time `rcPolicyNeeded` snapshot that
+ * could never account for a definition — or a policy edit — arriving later
+ * via `butchr session create`, with no restart involved) — the RC HTTP
+ * client itself still stays `null` when unconfigured, so `ensureAccount`
+ * reuses its EXISTING `"rc-not-configured"` refusal path (already unit-
+ * tested generically in `test/unit/account-lifecycle.test.ts`) rather than a
+ * second, managed-sessions-only one. These tests exercise that path THROUGH
+ * a managed-session-shaped id specifically, proving the wiring itself (not
+ * just the underlying refusal mechanism) is correct.
+ */
+describe("BUTCHR-460 review round 1: a managed-session definition is never silently unaccounted", () => {
+  const KEY = managedSessionId("/defs/needs-account.json");
+
+  function fakeHerd(): Herd & { spawnedSpecs: Map<string, SpawnSpec> } {
+    const running = new Set<string>();
+    const spawnedSpecs = new Map<string, SpawnSpec>();
+    return {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(spec) { spawnedSpecs.set(spec.key, spec); running.add(spec.key); },
+      async stop(id) { running.delete(id); },
+      async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
+      async nudge() { return { delivered: true }; },
+      spawnedSpecs,
+    };
+  }
+
+  test("permanent, RC unconfigured: withheld, never spawned, and a log line names the id and the refusal reason", async () => {
+    const store = fakeStore();
+    const manager = createAccountManager(baseAccountManagerDeps({ client: null, store }));
+    const logs: string[] = [];
+    const rawHooks = createAccountLifecycle({ manager, policyOf: () => "permanent", manifestPublisher: fakeManifestPublisher(), log: (l) => logs.push(l) });
+    const account = wireManagedSessionArchiveRelease(rawHooks, { exists: async () => false });
+    const herd = fakeHerd();
+    const spec: SpawnSpec = { key: KEY, issuetype: "managed-session", summary: "s", parent: null };
+
+    await reconcileNow(herd, new Map([[KEY, spec]]), { account });
+
+    expect(herd.spawnedSpecs.has(KEY)).toBe(false); // withheld — never started unaccounted
+    expect(logs.some((l) => l.includes("WARNING") && l.includes(KEY) && l.includes("rc-not-configured"))).toBe(true);
+  });
+
+  test("temporary, RC unconfigured: withheld, never spawned, and a log line names the id and the refusal reason", async () => {
+    const store = fakeStore();
+    const manager = createAccountManager(baseAccountManagerDeps({ client: null, store }));
+    const logs: string[] = [];
+    const rawHooks = createAccountLifecycle({ manager, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher(), log: (l) => logs.push(l) });
+    const account = wireManagedSessionArchiveRelease(rawHooks, { exists: async () => false });
+    const herd = fakeHerd();
+    const spec: SpawnSpec = { key: KEY, issuetype: "managed-session", summary: "s", parent: null };
+
+    await reconcileNow(herd, new Map([[KEY, spec]]), { account });
+
+    expect(herd.spawnedSpecs.has(KEY)).toBe(false);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes(KEY) && l.includes("rc-not-configured"))).toBe(true);
+  });
+
+  test("none, RC unconfigured: still starts exactly as today — no RC client interaction, no refusal", async () => {
+    const store = fakeStore();
+    const { calls } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client: null, store }));
+    const logs: string[] = [];
+    const rawHooks = createAccountLifecycle({ manager, policyOf: () => "none", manifestPublisher: fakeManifestPublisher(), log: (l) => logs.push(l) });
+    const account = wireManagedSessionArchiveRelease(rawHooks, { exists: async () => false });
+    const herd = fakeHerd();
+    const spec: SpawnSpec = { key: KEY, issuetype: "managed-session", summary: "s", parent: null };
+
+    await reconcileNow(herd, new Map([[KEY, spec]]), { account });
+
+    expect(herd.spawnedSpecs.has(KEY)).toBe(true); // spawned normally
+    expect(calls).toEqual([]); // the RC client (had one even been built) is never touched for "none"
+    expect(logs.some((l) => l.includes("WARNING"))).toBe(false);
+  });
+
+  test("once Rocket.Chat is configured (a restart with a real client, same persisted store), a previously-withheld definition is picked up and provisioned on the next poll", async () => {
+    const store = fakeStore(); // shared across the "restart" — the store is what persists, per docs/rocketchat-accounts.md
+    const spec: SpawnSpec = { key: KEY, issuetype: "managed-session", summary: "s", parent: null };
+
+    // Before: RC unconfigured — withheld.
+    const managerBefore = createAccountManager(baseAccountManagerDeps({ client: null, store }));
+    const logsBefore: string[] = [];
+    const hooksBefore = createAccountLifecycle({ manager: managerBefore, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher(), log: (l) => logsBefore.push(l) });
+    const accountBefore = wireManagedSessionArchiveRelease(hooksBefore, { exists: async () => false });
+    const herdBefore = fakeHerd();
+    await reconcileNow(herdBefore, new Map([[KEY, spec]]), { account: accountBefore });
+    expect(herdBefore.spawnedSpecs.has(KEY)).toBe(false);
+
+    // After ("restart"): RC now configured — a fresh manager/hooks instance over the SAME store,
+    // exactly what a real daemon restart with ROCKETCHAT_* now set would produce (the RC client
+    // itself is fixed for a daemon's whole life — see daemon/index.ts's own "ALWAYS BUILT" comment
+    // — so recovery from a bad/missing config genuinely does need a restart, not just a later poll
+    // of the SAME process; this models that honestly rather than claiming an in-process fix-up).
+    const { client } = fakeRcClient();
+    const managerAfter = createAccountManager(baseAccountManagerDeps({ client, store }));
+    const hooksAfter = createAccountLifecycle({ manager: managerAfter, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher() });
+    const accountAfter = wireManagedSessionArchiveRelease(hooksAfter, { exists: async () => false });
+    const herdAfter = fakeHerd();
+    await reconcileNow(herdAfter, new Map([[KEY, spec]]), { account: accountAfter });
+
+    expect(herdAfter.spawnedSpecs.get(KEY)?.rocketchatAccount).toBe(rcUsernameFor(KEY));
+    expect(await store.get(KEY)).toMatchObject({ policy: "temporary" });
+  });
+});
