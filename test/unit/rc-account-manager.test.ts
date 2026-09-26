@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isManagedUsername, rcUsernameFor, RC_MANAGED_PREFIX, RC_USERNAME_MAX } from "../../src/accounts/identity.js";
@@ -63,17 +63,35 @@ describe("ensureAccount", () => {
     }
   });
 
-  test("create-if-missing creates exactly once and returns usable connection material", async () => {
+  test("create-if-missing creates exactly once and mints a token to a 0600 file, never returning the value itself", async () => {
     const { client, calls } = fakeRcClient();
     const store = fakeStore();
     const manager = createAccountManager(baseDeps({ client, store }));
     const r = await manager.ensureAccount(AGENT, "temporary");
-    expect(r).toMatchObject({ ok: true, policy: "temporary", created: true });
+    expect(r).toMatchObject({ ok: true, policy: "temporary", created: true, rotated: true });
     if (!r.ok || r.policy === "none") throw new Error("unreached");
     expect(r.username).toBe(rcUsernameFor(AGENT));
-    expect(typeof r.token).toBe("string");
+    expect("token" in r).toBe(false); // BUTCHR-412: never returned — only the 0600 file's path is
+    expect(typeof r.tokenFile).toBe("string");
+    expect(readFileSync(r.tokenFile, "utf8").trim().length).toBeGreaterThan(0);
+    expect(statSync(r.tokenFile).mode & 0o777).toBe(0o600);
     expect(calls.filter((c) => c.method === "createUser")).toHaveLength(1);
-    expect(await store.get(AGENT)).toMatchObject({ agentKey: AGENT, rcUserId: r.rcUserId, username: r.username, policy: "temporary" });
+    expect(await store.get(AGENT)).toMatchObject({ agentKey: AGENT, rcUserId: r.rcUserId, username: r.username, policy: "temporary", tokenFile: r.tokenFile });
+  });
+
+  // BUTCHR-412 review round 3, non-blocking finding: the token directory
+  // itself (not just each file inside it) should be 0700 — otherwise every
+  // managed account NAME is listable by another local user even though each
+  // token's contents stay unreadable.
+  test("the token directory is created at 0700 when this call actually creates it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rc-tokendir-"));
+    try {
+      const tokenDir = join(dir, "nested", "tokens");
+      const { client } = fakeRcClient();
+      const manager = createAccountManager(baseDeps({ client, store: fakeStore(), tokenDir }));
+      await manager.ensureAccount(AGENT, "temporary");
+      expect(statSync(tokenDir).mode & 0o777).toBe(0o700);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   test("second and concurrent ensure calls for the same agent create no duplicate", async () => {
@@ -208,6 +226,239 @@ describe("ensureAccount", () => {
     const r = await manager.ensureAccount(AGENT, "permanent");
     expect(r).toMatchObject({ ok: false, reason: "not-managed" });
   });
+
+  // BUTCHR-412 item 3 (BUTCHR-391 comment 24007): the ORIGINAL contract
+  // (every ensureAccount revokes-then-reissues) conflicts with Nexus/rocketr
+  // having registered the token once — a routine re-ensure must reuse it.
+  describe("token rotation (BUTCHR-412 item 3)", () => {
+    test("a second ensureAccount for the SAME agent with a still-valid token file reuses it untouched — no revoke, no regenerate", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore();
+      const manager = createAccountManager(baseDeps({ client, store }));
+      const first = await manager.ensureAccount(AGENT, "temporary");
+      if (!first.ok || first.policy === "none") throw new Error("unreached");
+      expect(first.rotated).toBe(true);
+      const tokenBefore = readFileSync(first.tokenFile, "utf8");
+      calls.length = 0;
+
+      const second = await manager.ensureAccount(AGENT, "temporary");
+      expect(second).toMatchObject({ ok: true, created: false, rotated: false, tokenFile: first.tokenFile });
+      expect(calls.filter((c) => c.method === "revokeManagedToken" || c.method === "generateManagedToken")).toHaveLength(0);
+      expect(readFileSync(first.tokenFile, "utf8")).toBe(tokenBefore); // byte-identical — never rewritten
+    });
+
+    test("a MISSING token file (deleted out-of-band) triggers a fresh mint rather than silently reusing nothing", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore();
+      const manager = createAccountManager(baseDeps({ client, store }));
+      const first = await manager.ensureAccount(AGENT, "temporary");
+      if (!first.ok || first.policy === "none") throw new Error("unreached");
+      rmSync(first.tokenFile);
+      calls.length = 0;
+
+      const second = await manager.ensureAccount(AGENT, "temporary");
+      expect(second).toMatchObject({ ok: true, created: false, rotated: true });
+      expect(calls.filter((c) => c.method === "generateManagedToken")).toHaveLength(1);
+      if (!second.ok || second.policy === "none") throw new Error("unreached");
+      expect(readFileSync(second.tokenFile, "utf8").trim().length).toBeGreaterThan(0);
+    });
+
+    test("an EMPTY (corrupted) token file is treated exactly like a missing one — fresh mint, never trusted as valid", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore();
+      const manager = createAccountManager(baseDeps({ client, store }));
+      const first = await manager.ensureAccount(AGENT, "temporary");
+      if (!first.ok || first.policy === "none") throw new Error("unreached");
+      writeFileSync(first.tokenFile, "");
+      calls.length = 0;
+
+      const second = await manager.ensureAccount(AGENT, "temporary");
+      expect(second).toMatchObject({ ok: true, rotated: true });
+      expect(calls.filter((c) => c.method === "generateManagedToken")).toHaveLength(1);
+    });
+
+    test("a PERMANENT account's adopt-on-every-start also reuses a still-valid token, never rotating a token Nexus already registered", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore();
+      const manager = createAccountManager(baseDeps({ client, store }));
+      const first = await manager.ensureAccount(AGENT, "permanent");
+      if (!first.ok || first.policy === "none") throw new Error("unreached");
+      for (let i = 0; i < 3; i++) {
+        calls.length = 0;
+        const r = await manager.ensureAccount(AGENT, "permanent");
+        expect(r).toMatchObject({ ok: true, created: false, rotated: false, tokenFile: first.tokenFile });
+        // A read-only liveness check (getUserByUsername) is still made — see
+        // the "STALE persisted record" test above for why — but never a
+        // token-rotating call (revoke/generate).
+        expect(calls.map((c) => c.method)).toEqual(["getUserByUsername"]);
+      }
+    });
+  });
+
+  // BUTCHR-412 item 5 (BUTCHR-391 comment 23999): a separate, tighter cap on
+  // concurrently-existing TEMPORARY accounts alone.
+  describe("temporary-account cap (BUTCHR-412 item 5)", () => {
+    test("withholds a NEW temporary account once the cap is reached, logging why, without touching the RC client", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore([
+        { agentKey: "jira-work:triage:T-1", rcUserId: "u1", username: rcUsernameFor("jira-work:triage:T-1"), policy: "temporary", createdAt: "t" },
+        { agentKey: "jira-work:triage:T-2", rcUserId: "u2", username: rcUsernameFor("jira-work:triage:T-2"), policy: "temporary", createdAt: "t" },
+      ]);
+      const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 2 }));
+      const r = await manager.ensureAccount(AGENT, "temporary");
+      expect(r).toEqual({ ok: false, reason: "temporary-cap-reached", message: expect.stringContaining("2") });
+      expect(calls.filter((c) => c.method === "createUser")).toHaveLength(0);
+    });
+
+    test("never withholds a PERMANENT account, even once the temporary cap is reached", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore([
+        { agentKey: "jira-work:triage:T-1", rcUserId: "u1", username: rcUsernameFor("jira-work:triage:T-1"), policy: "temporary", createdAt: "t" },
+      ]);
+      const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 1 }));
+      const r = await manager.ensureAccount(AGENT, "permanent");
+      expect(r).toMatchObject({ ok: true, created: true });
+      void calls;
+    });
+
+    test("a PERMANENT account already on record never counts against the temporary cap", async () => {
+      const { client } = fakeRcClient();
+      const store = fakeStore([
+        { agentKey: "jira-work:triage:P-1", rcUserId: "u1", username: rcUsernameFor("jira-work:triage:P-1"), policy: "permanent", createdAt: "t" },
+      ]);
+      const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 1 }));
+      const r = await manager.ensureAccount(AGENT, "temporary");
+      expect(r).toMatchObject({ ok: true, created: true }); // only 0 temporary accounts exist so far — the 1 permanent one doesn't count
+    });
+
+    test("below the cap, a temporary account is created normally", async () => {
+      const { client } = fakeRcClient();
+      const manager = createAccountManager(baseDeps({ client, store: fakeStore(), tempAccountCapThreshold: 5 }));
+      const r = await manager.ensureAccount(AGENT, "temporary");
+      expect(r).toMatchObject({ ok: true, created: true });
+    });
+
+    test("never checked on an ADOPT/REUSE path — only when actually about to create a new user", async () => {
+      const { client, calls } = fakeRcClient();
+      const store = fakeStore();
+      const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 1 }));
+      const first = await manager.ensureAccount(AGENT, "temporary");
+      expect(first).toMatchObject({ ok: true, created: true });
+      calls.length = 0;
+      // Cap is now "reached" (1 of 1), but re-ensuring the SAME agent adopts its own existing record — never refused.
+      const second = await manager.ensureAccount(AGENT, "temporary");
+      expect(second).toMatchObject({ ok: true, created: false });
+    });
+
+    // BUTCHR-412 review round 3, blocking finding: `reconcileNow` runs
+    // `ensure` for every admitted agent under one `Promise.all` — DIFFERENT
+    // agent keys, so `ensureAccount`'s own per-key lock does nothing here.
+    // The cap check must be atomic across concurrent calls for different
+    // keys, not merely correct for one call at a time.
+    describe("concurrency (BUTCHR-412 review round 3)", () => {
+      test("12 concurrent NEW temporary ensures against a cap of 8 create exactly 8, refuse exactly 4 — never overshoots", async () => {
+        const { client, calls } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 8 }));
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => manager.ensureAccount(`jira-work:triage:T-${i}`, "temporary")),
+        );
+        const created = results.filter((r) => r.ok && r.policy !== "none" && r.created);
+        const refused = results.filter((r) => !r.ok && r.reason === "temporary-cap-reached");
+        expect(created).toHaveLength(8);
+        expect(refused).toHaveLength(4);
+        expect(calls.filter((c) => c.method === "createUser")).toHaveLength(8);
+        expect((await store.list()).filter((r) => r.policy === "temporary")).toHaveLength(8); // never more than the cap, even transiently
+      });
+
+      test("a failed create/mint releases its reservation — a throw never leaks a slot", async () => {
+        const store = fakeStore();
+        let failNext = true;
+        const flaky: RocketChatClient = {
+          async getUserByUsername() { return null; },
+          async countUsers() { return 0; },
+          async createUser(input) {
+            if (failNext) { failNext = false; throw new RocketChatHttpError(503, "user create"); }
+            return { id: `id-${input.username}`, username: input.username, active: true };
+          },
+          async deleteUser() {},
+          async generateManagedToken() { return "tok"; },
+          async revokeManagedToken() {},
+        };
+        const manager = createAccountManager(baseDeps({ client: flaky, store, tempAccountCapThreshold: 1 }));
+        await expect(manager.ensureAccount("jira-work:triage:FAIL", "temporary")).rejects.toBeInstanceOf(RocketChatHttpError);
+        // The failed attempt's reservation must have been released — a
+        // second call (still under the SAME cap of 1) succeeds.
+        const second = await manager.ensureAccount("jira-work:triage:OK", "temporary");
+        expect(second).toMatchObject({ ok: true, created: true });
+      });
+
+      test("concurrent PERMANENT ensures are never refused by the temporary limit, even while temporary ensures are simultaneously at their own cap", async () => {
+        const { client } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 2 }));
+        const results = await Promise.all([
+          ...Array.from({ length: 4 }, (_, i) => manager.ensureAccount(`jira-work:triage:TMP-${i}`, "temporary")),
+          ...Array.from({ length: 4 }, (_, i) => manager.ensureAccount(`jira-work:triage:PERM-${i}`, "permanent")),
+        ]);
+        const permanentResults = results.slice(4);
+        expect(permanentResults.every((r) => r.ok && r.policy !== "none" && r.created)).toBe(true);
+        const temporaryCreated = results.slice(0, 4).filter((r) => r.ok && r.policy !== "none" && r.created);
+        expect(temporaryCreated).toHaveLength(2); // the temporary cap still holds, independently
+      });
+
+      // BUTCHR-412 review round 3: "the same window exists for the RC-wide
+      // userCapThreshold check ... cover both."
+      test("12 concurrent ensures (mixed temporary/permanent) against the RC-WIDE cap of 8 create exactly 8 total, never overshoot", async () => {
+        // `countUsers()` here reflects `byUsername.size` LIVE (no override) —
+        // same as a real RC server, whose own user count is immediately
+        // consistent with a `createUser` that already completed on it. The
+        // race this guards against is concurrent READS racing each other
+        // BEFORE any of them has created anything yet (every concurrent
+        // caller seeing the SAME pre-creation count) — not RC itself being
+        // stale, which no in-process reservation could fix anyway.
+        const { client, calls } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, userCapThreshold: 8, tempAccountCapThreshold: 100 }));
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => manager.ensureAccount(`jira-work:triage:U-${i}`, i % 2 === 0 ? "temporary" : "permanent")),
+        );
+        const created = results.filter((r) => r.ok && r.policy !== "none" && r.created);
+        const refused = results.filter((r) => !r.ok && r.reason === "cap-reached");
+        expect(created).toHaveLength(8);
+        expect(refused).toHaveLength(4);
+        expect(calls.filter((c) => c.method === "createUser")).toHaveLength(8);
+      });
+    });
+  });
+});
+
+describe("manifestEntries (BUTCHR-412, Nexus hand-off)", () => {
+  test("lists every managed account with a token file, never a token VALUE", async () => {
+    const { client } = fakeRcClient();
+    const store = fakeStore();
+    const manager = createAccountManager(baseDeps({ client, store }));
+    const a = await manager.ensureAccount(AGENT, "temporary");
+    const b = await manager.ensureAccount(AGENT2, "permanent");
+    if (!a.ok || a.policy === "none" || !b.ok || b.policy === "none") throw new Error("unreached");
+
+    const entries = await manager.manifestEntries();
+    expect(entries.sort((x, y) => x.account.localeCompare(y.account))).toEqual(
+      [{ account: a.username, tokenFile: a.tokenFile }, { account: b.username, tokenFile: b.tokenFile }].sort((x, y) => x.account.localeCompare(y.account)),
+    );
+    for (const e of entries) expect(JSON.stringify(e)).not.toMatch(/tok-/); // no fake-client token value leaks in
+  });
+
+  test("empty store -> empty manifest", async () => {
+    const manager = createAccountManager(baseDeps({ store: fakeStore() }));
+    expect(await manager.manifestEntries()).toEqual([]);
+  });
+
+  test('policy "none" never appears (ensureAccount("none") never touches the store)', async () => {
+    const manager = createAccountManager(baseDeps({ store: fakeStore() }));
+    await manager.ensureAccount(AGENT, "none");
+    expect(await manager.manifestEntries()).toEqual([]);
+  });
 });
 
 describe("releaseAccount", () => {
@@ -217,7 +468,7 @@ describe("releaseAccount", () => {
     const manager = createAccountManager(baseDeps({ client, store }));
     const ensured = await manager.ensureAccount(AGENT, policy);
     if (!ensured.ok || ensured.policy === "none") throw new Error("unreached");
-    return { manager, client, calls, store, removeUserExternally, rcUserId: ensured.rcUserId, username: ensured.username };
+    return { manager, client, calls, store, removeUserExternally, rcUserId: ensured.rcUserId, username: ensured.username, tokenFile: ensured.tokenFile };
   }
 
   test("no managed account on record is a no-op that says so", async () => {
@@ -225,16 +476,18 @@ describe("releaseAccount", () => {
     expect(await manager.releaseAccount(AGENT, "stop")).toMatchObject({ ok: true, released: false, note: expect.stringContaining("no managed") });
   });
 
-  test("temporary: stop/archive delete the user and clean up its managed token", async () => {
+  test("temporary: stop/archive delete the user and clean up its managed token (RC token AND the local 0600 file)", async () => {
     for (const reason of ["stop", "archive"] as const) {
-      const { manager, client, calls, store, rcUserId } = await provision("temporary");
+      const { manager, client, calls, store, rcUserId, tokenFile } = await provision("temporary");
       const revokesBefore = calls.filter((c) => c.method === "revokeManagedToken").length; // ensureAccount already issued one best-effort revoke+generate
+      expect(existsSync(tokenFile)).toBe(true);
       const r = await manager.releaseAccount(AGENT, reason);
       expect(r).toEqual({ ok: true, released: true });
       expect(calls.filter((c) => c.method === "revokeManagedToken")).toHaveLength(revokesBefore + 1);
       expect(calls.filter((c) => c.method === "deleteUser" && c.args[0] === rcUserId)).toHaveLength(1);
       expect(await store.get(AGENT)).toBeNull();
       expect(await client.getUserByUsername(rcUsernameFor(AGENT))).toBeNull();
+      expect(existsSync(tokenFile)).toBe(false); // the orphaned token file is cleaned up too, not just the store record
     }
   });
 

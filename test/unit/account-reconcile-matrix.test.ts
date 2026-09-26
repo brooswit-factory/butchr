@@ -18,7 +18,8 @@ import { createAccountManager } from "../../src/accounts/manager.js";
 import { createAccountLifecycle } from "../../src/agents/account-lifecycle.js";
 import { encodeAgentKey, encodeQueryAgentKey, decodeAnyAgentKey } from "../../src/rules/agent-key.js";
 import type { AccountPolicy, ExecutionMode } from "../../src/rules/rules.js";
-import { fakeStore, fakeRcClient } from "../fixtures/rocketchat-fakes.js";
+import { fakeStore, fakeRcClient, fakeManifestPublisher, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
+import { rcUsernameFor } from "../../src/accounts/identity.js";
 import type { Herd, SpawnSpec } from "../../src/agents/herd.js";
 
 interface TestRule { id: string; execution: ExecutionMode; account: AccountPolicy }
@@ -53,13 +54,13 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
   test("every cell independently: temporary provisions on spawn and unprovisions on stop; permanent provisions and is retained; none never touches RC — regardless of execution mode", async () => {
     const store = fakeStore();
     const { client, calls } = fakeRcClient();
-    const manager = createAccountManager({ client, store, userCapThreshold: 45, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" });
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" }));
     const policyOf = (id: string): AccountPolicy => {
       const decoded = decodeAnyAgentKey(id);
       const rule = RULES.find((r) => r.id === decoded?.ruleId);
       return rule?.account ?? "none";
     };
-    const account = createAccountLifecycle({ manager, policyOf, url: "https://chat.example.com" });
+    const account = createAccountLifecycle({ manager, policyOf, manifestPublisher: fakeManifestPublisher() });
     const herd = fakeHerd();
     const specFor = (rule: TestRule): SpawnSpec => ({ key: keyFor(rule), issuetype: "task", summary: rule.id, parent: null });
 
@@ -76,9 +77,9 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       const spawnedSpec = herd.spawnedSpecs.get(key);
       expect(spawnedSpec).toBeDefined();
       if (rule.account === "none") {
-        expect(spawnedSpec!.rocketchat).toBeUndefined();
+        expect(spawnedSpec!.rocketchatAccount).toBeUndefined();
       } else {
-        expect(spawnedSpec!.rocketchat).toMatchObject({ url: "https://chat.example.com" });
+        expect(spawnedSpec!.rocketchatAccount).toBe(rcUsernameFor(key));
         expect(await store.get(key)).toMatchObject({ policy: rule.account });
       }
     }
@@ -110,8 +111,8 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       const key = keyFor(rule);
       const store = fakeStore();
       const { client, calls } = fakeRcClient();
-      const manager = createAccountManager({ client, store, userCapThreshold: 45 });
-      const account = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com" });
+      const manager = createAccountManager(baseAccountManagerDeps({ client, store }));
+      const account = createAccountLifecycle({ manager, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher() });
       const herd: Herd = {
         async runningIssues() { return [key]; },
         async staleIssues() { return [{ issue: key, reason: "stale argv", observedArgv: [] }]; },
@@ -133,5 +134,51 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       expect(calls.filter((c) => c.method === "deleteUser")).toHaveLength(0);
       expect(calls.filter((c) => c.method === "createUser")).toHaveLength(1); // only the ORIGINAL ensureAccount call above — the respawn adopted
     }
+  });
+
+  // BUTCHR-412 review round 3, blocking finding, required test 2: the
+  // 12-concurrent/cap-8 race, through the REAL reconciler (reconcileNow runs
+  // every admitted agent's `ensure` under one `Promise.all` — exactly the
+  // shape that exposed the bug).
+  test("N agents admitted in ONE poll, temporary cap below N: exactly the cap is spawned, the rest withheld and logged, and a later poll picks up the withheld ones once a slot frees", async () => {
+    const store = fakeStore();
+    const { client } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store, tempAccountCapThreshold: 8 }));
+    const logs: string[] = [];
+    const account = createAccountLifecycle({ manager, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher(), log: (l) => logs.push(l) });
+    const running = new Set<string>();
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(spec) { running.add(spec.key); },
+      async stop(id) { running.delete(id); },
+      async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ids = Array.from({ length: 12 }, (_, i) => `jira-work:triage:T-${i}`);
+    const desired = new Map(ids.map((id) => [id, { key: id, issuetype: "task", summary: "s", parent: null }]));
+
+    await reconcileNow(herd, desired, { account });
+    expect(running.size).toBe(8);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("temporary-cap-reached"))).toBe(true);
+    const spawnedFirstPoll = [...running];
+    const toFree = spawnedFirstPoll[0]!;
+
+    // Poll 2: `toFree`'s rule no longer desires it (dropped out of `desired`)
+    // — a genuine plan.stop. `reconcileNow`'s own spawn loop runs BEFORE its
+    // stop loop within one poll, so THIS poll's spawn attempts still see the
+    // cap exactly as full (toFree's account is not released until after);
+    // its release lands at the very end of this poll.
+    const desired2 = new Map(desired);
+    desired2.delete(toFree);
+    await reconcileNow(herd, desired2, { account });
+    expect(running.has(toFree)).toBe(false);
+    expect(running.size).toBe(7); // toFree stopped; nothing new admitted yet this same poll
+
+    // Poll 3, same desired2: NOW the freed slot is visible to the spawn
+    // loop, and exactly ONE of the still-withheld ids is admitted into it.
+    await reconcileNow(herd, desired2, { account });
+    expect(running.size).toBe(8); // still exactly at the cap: 7 originals + 1 newly admitted
+    for (const id of spawnedFirstPoll.slice(1)) expect(running.has(id)).toBe(true); // the other 7 originals were never disturbed
   });
 });

@@ -28,6 +28,7 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
           "type": "http",
           "url": "https://mud-bridge.internal/mcp",
           "headersEnvVar": "MUD_MCP_HEADERS",   // optional
+          "accountHeader": "x-rocketr-account", // optional, BUTCHR-412
           "channel": true
         }
       ]
@@ -42,7 +43,7 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
 | `type` | yes | `"http"` only, today |
 | `url` | yes | absolute `http:`/`https:` URL |
 | `headersEnvVar` | no | the NAME of an env var on **this daemon's own process** holding a JSON object of extra HTTP headers — see "Headers are by reference, never inline" below. **Never reaches Codex argv.** |
-| `accountHeader` | no | (BUTCHR-413) an HTTP header NAME that should carry this agent's own non-secret Rocket.Chat account name (`spec.rocketchatAccount`) — e.g. `"x-rocketr-account"`. Unlike `headersEnvVar`, this one **does** reach Codex argv/mcp.json — see "Codex" below |
+| `accountHeader` | no | BUTCHR-412: a valid HTTP header name; that header's VALUE is filled in per-AGENT from `SpawnSpec.rocketchatAccount` (this agent's own Rocket.Chat account name — set only when the rule's `account` policy actually provisioned one) — see "Per-agent account headers" below. Never secret; combines with `headersEnvVar` on the same binding. **Unlike `headersEnvVar`, this one DOES reach Codex argv/mcp.json (BUTCHR-413)** — see "Codex" below. |
 | `channel` | yes | `true`: Claude also receives this server's push notifications (one more `--dangerously-load-development-channels=server:<name>`); `false`: MCP tool access only |
 
 Validation (`parseRules`, same house style as every other rule field —
@@ -86,13 +87,36 @@ ever contained it in the first place.
 
 **`mcp.json` file permissions.** `buildWorkspace` `chmod`s `mcp.json` to
 `0600` (owner read/write only) whenever it embeds a bound server's resolved
-header — tightened explicitly with `chmodSync` after the write, not via
-`writeFileSync`'s own `mode` option, because that option only applies when
-the call CREATES the file; a rebuilt workspace's `mcp.json` already exists
-and would otherwise keep whatever permissions it had. A binding-less
-`mcp.json`, or one with bindings that carry no resolved header, keeps
-today's exact default permissions — untouched, byte-for-byte the same
-behaviour as before this ticket.
+`headersEnvVar` header — tightened explicitly with `chmodSync` after the
+write, not via `writeFileSync`'s own `mode` option, because that option only
+applies when the call CREATES the file; a rebuilt workspace's `mcp.json`
+already exists and would otherwise keep whatever permissions it had. A
+binding-less `mcp.json`, or one with bindings that carry no resolved
+`headersEnvVar` header, keeps today's exact default permissions — untouched,
+byte-for-byte the same behaviour as before this ticket. An `accountHeader`
+resolution alone (see below) never tightens permissions by itself — the
+value is a non-secret account name, not a credential.
+
+### Per-agent account headers (`accountHeader`, BUTCHR-412)
+
+`headersEnvVar` resolves ONE static value per RULE, from this daemon's own
+environment — every agent that rule spawns gets the same header value.
+`accountHeader` is the opposite shape: a DIFFERENT value per AGENT, filled
+in from `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`,
+`src/agents/workspace.ts`) — set only by `src/agents/account-lifecycle.ts`'s
+`ensure()`, after `ensureAccount` actually provisioned this agent's Rocket.Chat
+account for THIS launch (see `docs/rocketchat-accounts.md`'s "Credential
+design, corrected" section for the full mechanism this exists for: an agent
+naming only its own account, non-secret, to Nexus's `rocketr` bridge, which
+holds every actual token centrally). A binding with `accountHeader` set but
+no `spec.rocketchatAccount` for this launch (the rule's `account` policy is
+`"none"`, or provisioning didn't happen/wasn't needed) simply omits the
+header — same "absent means no extra header" discipline `headersEnvVar` has.
+Combines with `headersEnvVar` on the same binding: both are resolved
+independently and merged into one `headers` object.
+
+Not resolved for Codex today (see "Codex" below) — narrowing that is a later
+story's job, tracked in `docs/rocketchat-accounts.md`.
 
 ## Launch wiring
 
@@ -124,7 +148,13 @@ renders each as its own `--config mcp_servers.<name>={ url = "…", enabled =
 true }`. **What a Codex agent gets today, explicitly, per this ticket's own
 DoD:** MCP **tools**, yes — the bound server behaves exactly like any other
 Codex MCP server; channel **push**, no — there is no channel push to Codex
-at all, bound server or not.
+at all, bound server or not. `boundCodexServers` resolves `headersEnvVar`
+for NEITHER Claude-style secret headers — never, on any binding — but DOES
+resolve `accountHeader` (BUTCHR-413, see below): a Codex-launched binding
+gets its own non-secret account name when its binding sets `accountHeader`,
+letting it call an authenticated bound server whose only "credential" is
+that name; a binding relying on `headersEnvVar` alone still gets no extra
+headers for Codex.
 
 **A bound server's `headersEnvVar` is NEVER sent to Codex, loudly by
 design** (review finding, PR #387): Drovr renders a Codex MCP server's
@@ -145,10 +175,11 @@ field entirely from `headersEnvVar`: it names a header (Rocket.Chat's
 `rocketr` uses `"x-rocketr-account"`) that carries this agent's own
 non-secret account NAME, `spec.rocketchatAccount` (`rcUsernameFor(agentKey)`,
 `src/accounts/identity.ts` — a deterministic public identifier, never a
-credential). `boundCodexServers` calls `resolveCodexSafeMcpServerHeaders`
-(`src/agents/workspace.ts`) for exactly this value and only this value — it
-has no access to `headersEnvVar`'s resolved secret at all, by construction,
-not by discipline. Reading an account name off `ps`/`/proc` or a daemon log
+credential). `boundCodexServers` calls `resolveAccountHeader`
+(`src/agents/workspace.ts` — the SAME function `buildWorkspace` calls for
+Claude's `mcp.json`, reused verbatim) for exactly this value and only this
+value — it has no access to `headersEnvVar`'s resolved secret at all, by
+construction, not by discipline. Reading an account name off `ps`/`/proc` or a daemon log
 line tells an observer WHICH account an agent is, never lets them ACT as
 it: only `rocketr`'s own centrally-held token, which never travels over
 this header, grants any authority. This is what lets a Codex agent
@@ -156,9 +187,11 @@ authenticate to `rocketr` for its own outbound tool calls (a reply) at all
 — see `docs/codex-channel-relay.md`'s "How it answers back" for the full
 account, and BUTCHR-418 (filed by BUTCHR-413's first round, before this
 design existed) for the now-resolved "Codex cannot authenticate" framing. A
-binding can set `headersEnvVar`, `accountHeader`, both, or neither; the two
-merge in `resolveMcpServerHeaders` (Claude/this daemon's own connections)
-and stay independent in `boundCodexServers` (Codex: `accountHeader` only).
+binding can set `headersEnvVar`, `accountHeader`, both, or neither; for
+Claude/this daemon's own connections, `resolveMcpServerHeaders` (the
+`headersEnvVar` half) and `resolveAccountHeader` (the `accountHeader` half)
+are resolved independently and merged (`buildWorkspace`, src/agents/workspace.ts);
+`boundCodexServers` (Codex) calls `resolveAccountHeader` alone.
 
 ### AGY
 
@@ -308,6 +341,7 @@ this ticket only decides WHICH server names get the flag, identically for
 
 BUTCHR-393 (the managed-session definition format) reuses this shape
 verbatim rather than defining its own. `McpServerBinding` (`src/rules/rules.ts`):
-`{ name, type: "http", url, headersEnvVar?, channel }`. See the coordination
-comment on BUTCHR-411 from the story agent (BUTCHR-395) and the reply
-posted on BUTCHR-393 once this branch was pushed.
+`{ name, type: "http", url, headersEnvVar?, accountHeader?, channel }`
+(`accountHeader` added by BUTCHR-412). See the coordination comment on
+BUTCHR-411 from the story agent (BUTCHR-395) and the reply posted on
+BUTCHR-393 once this branch was pushed.

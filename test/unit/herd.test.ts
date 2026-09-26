@@ -10,6 +10,7 @@ import { workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
+import { rcUsernameFor } from "../../src/accounts/identity.js";
 
 const clearQuota = () => {
   processProviderAvailability.clear({ provider: "claude", accountId: "default" });
@@ -1026,6 +1027,34 @@ describe("staleIssues — mcpBindingsOf / MCP server bindings (BUTCHR-411)", () 
     const stale = await herd.staleIssues();
     expect(stale.length).toBe(1);
     expect(stale[0]!.reason).toContain("x-rocketr-account");
+  });
+
+  // Review round 3, blocking finding 2: an EARLIER version of `accountNameOf`
+  // (src/daemon/index.ts) called `rcUsernameFor(id)` with no prefix,
+  // silently assuming the DEFAULT managed prefix — wrong once BUTCHR-412's
+  // configurable `Config.rocketchat.managedPrefix` names a NON-default one,
+  // since `ensureAccount` (src/accounts/manager.ts) derives the REAL
+  // provisioned username with THAT prefix. This proves the actual contract
+  // `HerdrHerd` depends on: whatever prefix the injected `accountNameOf`
+  // uses, `spawn()`'s Codex argv header and `staleIssues()`'s own
+  // reconstruction always agree (same callback, same prefix) and the agent
+  // is never respawned — the same property must hold for src/daemon/index.ts's
+  // own `accountNameOf`, which threads `config.rocketchat?.managedPrefix`
+  // into this exact `rcUsernameFor` call for exactly this reason.
+  test("a NON-DEFAULT managedPrefix: the Codex argv header and staleIssues() both carry the SAME prefixed account name, and the agent is not respawned", async () => {
+    const acctBinding = { name: "rocketr", type: "http" as const, url: "https://rocketr.example/mcp", channel: false, accountHeader: "x-rocketr-account" };
+    const customPrefix = "acme_rc_";
+    const provisionedName = rcUsernameFor(issue, customPrefix); // what ensureAccount would ACTUALLY have provisioned with this prefix configured
+    expect(provisionedName.startsWith(customPrefix)).toBe(true);
+    const accountNameOf = (id: string) => rcUsernameFor(id, customPrefix);
+    const argv = ["codex", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1", mcpServers: [acctBinding], rocketchatAccount: provisionedName }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+    // Prove the argv actually carries the prefixed name, under this prefix — not the default one.
+    expect(argv.join(" ")).toContain(provisionedName);
+    expect(argv.join(" ")).not.toContain(rcUsernameFor(issue)); // the DEFAULT-prefix name never appears
+    const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
+    client.pane.processInfo = async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv, name: "codex" }] } });
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] }, undefined, undefined, undefined, () => [acctBinding], accountNameOf);
+    expect(await herd.staleIssues()).toEqual([]); // no respawn: staleIssues() derives the SAME prefixed name
   });
 });
 

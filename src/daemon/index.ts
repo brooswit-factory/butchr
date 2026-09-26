@@ -16,7 +16,8 @@ import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
-import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
+import { join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { projectRootDoc } from "../tools/docs.js";
@@ -85,7 +86,9 @@ import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
 import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
 import { rcUsernameFor } from "../accounts/identity.js";
+import { createFileNexusManifestPublisher } from "../accounts/nexus-manifest.js";
 import { createAccountLifecycle } from "../agents/account-lifecycle.js";
+import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
@@ -240,19 +243,32 @@ const accountPolicyOf = (id: string): AccountPolicy => {
 /**
  * BUTCHR-413 — this id's own non-secret Rocket.Chat account name
  * (`spec.rocketchatAccount`'s source, see that field's own doc comment,
- * src/agents/workspace.ts), or `undefined` for an id whose rule grants it
- * none (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
- * `accountLifecycle` itself is gated on immediately below). Deliberately
- * `rcUsernameFor` directly, never a read of `spec.rocketchat`/
- * `RC_ACCOUNT_FILE` (BUTCHR-412's own credential bundle, still mid-rework at
- * time of writing): the username half of that bundle IS this same
- * deterministic value (`src/accounts/manager.ts`'s `ensureAccount` computes
- * it identically), so computing it directly here needs no coordination with
- * however BUTCHR-412 ends up delivering the credential half, and gives
- * `HerdrHerd`/`createCodexChannelRelayPool` an identical answer on every
- * call with no file read and no risk of ever going stale.
+ * src/agents/workspace.ts), for the two callers that have no live,
+ * `ensure()`-populated `SpawnSpec` to read it from at all:
+ * `HerdrHerd.spawn`/`HerdrHerd.staleIssues`' own fallback (only when
+ * `account-lifecycle.ts`'s `ensure` never ran for a launch — no
+ * accountLifecycle wired at all) and `createCodexChannelRelayPool`'s own
+ * daemon-side connection (which reconciles against a bare issue id, never a
+ * spec). `undefined` for an id whose rule grants it none
+ * (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
+ * `accountLifecycle` itself is gated on immediately below).
+ *
+ * REVIEW FINDING (BUTCHR-413 round 3): the first version of this called
+ * `rcUsernameFor(id)` with no prefix, silently assuming the DEFAULT managed
+ * prefix — wrong once BUTCHR-412's configurable `Config.rocketchat.managedPrefix`
+ * (`ROCKETCHAT_MANAGED_PREFIX`) is set to anything else, since
+ * `ensureAccount` (`src/accounts/manager.ts`) derives the REAL provisioned
+ * username with THAT prefix. Naming a different account than the one
+ * actually provisioned would have pointed Codex's own reply header and this
+ * relay's own connection at an account that doesn't exist, while
+ * `staleIssues()` (recomputing this same wrong value) would never agree
+ * with what `HerdrHerd.spawn` actually launched with whenever `ensure()`'s
+ * real value WAS used — a respawn loop. Fixed: pass THE SAME configured
+ * prefix `createAccountManager` below is given, so this can never name a
+ * different account than `ensureAccount` actually provisions.
  */
-const accountNameOf = (id: string): string | undefined => (accountPolicyOf(id) === "none" ? undefined : rcUsernameFor(id));
+const accountNameOf = (id: string): string | undefined =>
+  accountPolicyOf(id) === "none" ? undefined : rcUsernameFor(id, config.rocketchat?.managedPrefix);
 
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
@@ -915,11 +931,15 @@ if (rcPolicyNeeded) {
     client: rcClient,
     store: createFileAccountStore(),
     userCapThreshold: config.rocketchat?.userCapThreshold ?? 45,
+    tempAccountCapThreshold: config.rocketchat?.temporaryAccountCapThreshold ?? 8,
+    tokenDir: config.rocketchat?.tokenDir ?? join(workspaceRoot(), ".butchr-rc-tokens"),
+    ...(config.rocketchat?.managedPrefix ? { managedPrefix: config.rocketchat.managedPrefix } : {}),
   });
+  const manifestPublisher = createFileNexusManifestPublisher(config.rocketchat?.nexusManifestFile ?? join(workspaceRoot(), ".butchr-rc-nexus-manifest.json"));
   accountLifecycle = createAccountLifecycle({
     manager: accountManager,
     policyOf: accountPolicyOf,
-    ...(rcAuth.ok ? { url: rcAuth.url } : {}),
+    manifestPublisher,
     log: (line) => console.error(`  ${line}`),
     // Best-effort audible refusal beyond the log line above, for the two
     // Jira-backed providers only (jira-work, jira-idea) — github-issue and
@@ -942,27 +962,26 @@ if (rcPolicyNeeded) {
   // account whose agent genuinely stopped existing with no reaper run in
   // between (this daemon crashing before a reap poll ever observed it, or an
   // account orphaned by an earlier bug) — `reconcileOrphans` is the read-only
-  // backstop `docs/rocketchat-accounts.md` names for exactly this, and a
-  // small periodic sweep (never gated on any rule loop's own poll) is wired
-  // here: run once at startup, then on this interval, for as long as this
-  // check exists cheaply (one file read plus one `herd.runningIssues()` per
-  // sweep) that a dedicated poll loop would be overkill for.
-  const sweepAccountOrphans = async (): Promise<void> => {
-    try {
-      const running = new Set(await herd.runningIssues());
-      const orphans = await accountManager.reconcileOrphans((agentKey) => running.has(agentKey));
-      for (const o of orphans) {
-        const result = await accountManager.releaseAccount(o.agentKey, "stop");
-        if (result.ok && result.released) console.error(`  [account] orphan sweep released ${o.agentKey} (no live agent found for its recorded Rocket.Chat account)`);
-        else if (!result.ok) console.error(`  WARNING: [account] orphan sweep release refused for ${o.agentKey}: ${result.reason} — ${result.message}`);
-      }
-    } catch (e) {
-      console.error(`  WARNING: [account] orphan sweep failed: ${(e as Error)?.message ?? e}`);
-    }
-  };
+  // backstop `docs/rocketchat-accounts.md` names for exactly this.
+  // `createAccountOrphanSweep` (src/agents/account-orphan-sweep.ts) is the
+  // SAFE wrapper around it — see that module's own top comment for why a
+  // single `herd.runningIssues()` snapshot is NOT safe to act on directly
+  // (review finding, round 1): it uses `herd.residentIssues()` (a real
+  // per-pane liveness check) plus a minimum record age and a two-consecutive-
+  // sweep grace before ever releasing anything. Run once at startup, then on
+  // this interval — cheap enough (one file read, one herd read per sweep)
+  // that a dedicated poll loop would be overkill.
+  const orphanSweep = createAccountOrphanSweep({
+    now: () => Date.now(),
+    reconcileOrphans: (agentExists) => accountManager.reconcileOrphans(agentExists),
+    residentIssues: () => herd.residentIssues(),
+    release: (agentKey, reason) => accountLifecycle!.release(agentKey, reason),
+    publishBatch: () => accountLifecycle!.publishBatch(),
+    log: (line) => console.error(`  ${line}`),
+  });
   const ACCOUNT_ORPHAN_SWEEP_MS = 30 * 60_000;
-  void sweepAccountOrphans();
-  setInterval(() => void sweepAccountOrphans(), ACCOUNT_ORPHAN_SWEEP_MS);
+  void orphanSweep.sweep();
+  setInterval(() => void orphanSweep.sweep(), ACCOUNT_ORPHAN_SWEEP_MS);
 }
 
 const issueCrashLoopDetector = createCrashLoopDetector({

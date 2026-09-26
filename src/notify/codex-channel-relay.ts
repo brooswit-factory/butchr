@@ -67,7 +67,7 @@
  */
 import { keepChannelSource, renderInboxTurn, type InboxMessage, type DeliveryOutcome, type ChannelSourceStatus, type KeepChannelSourceOptions } from "@brooswit/drovr";
 import type { McpServerBinding } from "../rules/rules.js";
-import { resolveMcpServerHeaders } from "../agents/workspace.js";
+import { resolveAccountHeader, resolveMcpServerHeaders } from "../agents/workspace.js";
 
 /**
  * A corrected, minimal stand-in for `@brooswit/drovr`'s `InboxRelay` queue —
@@ -228,20 +228,25 @@ export function startCodexChannelRelay(issue: string, binding: McpServerBinding,
   // route a message to "this agent alone" — every Codex agent sharing that
   // rule's connection would look identical to it. This daemon's OWN
   // connection now carries the SAME per-agent, non-secret account name
-  // (`binding.accountHeader`, `spec.rocketchat/rules.ts`'s own doc comment)
-  // that reaches Codex's own bound-server config for the reply path
-  // (`boundCodexServers`, src/agents/argv.ts) — one account identity, two
-  // consumers, never two mechanisms. `resolveMcpServerHeaders` (not the
-  // codex-safe subset) is correct here: THIS process is the daemon itself,
-  // never a launched child whose argv another local user can read, so a
+  // (`binding.accountHeader`, `McpServerBinding`'s own doc comment,
+  // src/rules/rules.ts) that reaches Codex's own bound-server config for the
+  // reply path (`boundCodexServers`, src/agents/argv.ts) — one account
+  // identity, two consumers, via the SAME `resolveAccountHeader`
+  // (src/agents/workspace.ts) both call, never two mechanisms.
+  // `resolveMcpServerHeaders`'s own `headersEnvVar` resolution is ALSO used
+  // here, merged with it: THIS process is the daemon itself, never a
+  // launched child whose argv another local user can read, so a
   // `headersEnvVar`-resolved shared secret is exactly as safe here as it
-  // already is for Claude's own direct connection. Header NAME assumed to
-  // match Rocket.Chat's own convention when no `accountHeader` is
-  // configured (`src/resources/rocketchat.ts`'s client uses the same pair)
-  // — unverified against a real `rocketr`, which does not exist in this
-  // repo; see docs/codex-channel-relay.md.
+  // already is for Claude's own direct connection (`buildWorkspace`'s own
+  // mcp.json write does the identical merge). Header NAME assumed to match
+  // Rocket.Chat's own convention when no `accountHeader` is configured
+  // (`src/resources/rocketchat.ts`'s client uses the same pair) —
+  // unverified against a real `rocketr`, which does not exist in this repo;
+  // see docs/codex-channel-relay.md.
   const accountNameOf = deps.accountNameOf ?? (() => undefined);
-  const headers = resolveMcpServerHeaders(binding, undefined, log, accountNameOf(issue));
+  const envHeaders = resolveMcpServerHeaders(binding, undefined, log);
+  const accountHeaders = resolveAccountHeader(binding, accountNameOf(issue));
+  const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
   const source = connect({
     name: binding.name,
     url: binding.url,

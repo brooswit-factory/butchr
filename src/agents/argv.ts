@@ -1,5 +1,5 @@
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { effortFor, mcpIdentityHeaders, modelFor, resolveCodexSafeMcpServerHeaders, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -104,18 +104,19 @@ const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).fil
  * BUTCHR-413 (review finding 1) IS an exception, deliberately: a binding's
  * `accountHeader` (see that field's own doc comment, src/rules/rules.ts)
  * carries only an account NAME, `spec.rocketchatAccount` — never a
- * bearer token — so `resolveCodexSafeMcpServerHeaders` (the codex-safe
- * subset of `resolveMcpServerHeaders`, src/agents/workspace.ts) reaches
- * Codex argv here where `headersEnvVar`'s own resolved value never does.
- * This is what makes a Codex agent's own reply through `rocketr`'s tools
- * possible at all after this same review's earlier fix (BUTCHR-411) struck
- * every bound-server header from a Codex launch: that fix is unweakened —
- * `headersEnvVar` still never reaches here — this only adds a second,
- * narrower, non-secret channel the earlier review never considered.
+ * bearer token — so `resolveAccountHeader` (src/agents/workspace.ts, the
+ * SAME function `buildWorkspace` calls for Claude's `mcp.json`, reused here
+ * verbatim rather than a second copy) reaches Codex argv here where
+ * `headersEnvVar`'s own resolved value never does. This is what makes a
+ * Codex agent's own reply through `rocketr`'s tools possible at all after
+ * this same review's earlier fix (BUTCHR-411) struck every bound-server
+ * header from a Codex launch: that fix is unweakened — `headersEnvVar`
+ * still never reaches here — this only adds a second, narrower, non-secret
+ * channel the earlier review never considered.
  */
 const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string; headers?: Record<string, string> }> =>
   (spec.mcpServers ?? []).map((s) => {
-    const headers = resolveCodexSafeMcpServerHeaders(s, spec.rocketchatAccount);
+    const headers = resolveAccountHeader(s, spec.rocketchatAccount);
     return { name: s.name, url: s.url, ...(headers ? { headers } : {}) };
   });
 

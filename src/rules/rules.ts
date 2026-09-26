@@ -125,27 +125,31 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * — e.g. Candlestix's MUD players) still gets full event-driven channel
  * delivery for a bound server.
  *
- * `accountHeader` (BUTCHR-413, the small explicit extension this ticket's
- * review found necessary): the NAME of a header that should carry THIS
- * AGENT'S OWN account-identifying value — for Rocket.Chat's `rocketr`
- * bridge, `"x-rocketr-account"` and `spec.rocketchat.username` (the
- * account's Rocket.Chat username, already documented as non-secret —
- * BUTCHR-410/412 never treat it as one). Unlike `headersEnvVar`, this is
- * safe on EVERY launch surface, Codex argv/mcp.json included
- * (`boundCodexServers`, src/agents/argv.ts): the value is an account NAME,
- * not a bearer token — reading it off a process command line or a daemon
- * log line lets an observer see WHICH account an agent is, never lets them
- * ACT as it, because rocketr (not this header) is the only thing that ever
- * resolves a name to real Rocket.Chat authority, over a channel this
- * header never travels. Absent, or present with no `spec.rocketchat` for
- * this launch (an `account: "none"` rule, or a provisioning refusal), the
- * binding connects with no extra header from this field — falling back to
- * `headersEnvVar`'s shared credential when the rule names one, exactly as
- * before this field existed. This is what makes finding 1 of the
- * CHANGES_REQUESTED review ("a Codex agent cannot authenticate to rocketr
- * to reply") answerable: give Codex's own bound `rocketr` server this
- * header and rocketr can identify the replying account without Codex ever
- * touching a secret.
+ * `accountHeader`, not a second binding mechanism (BUTCHR-412, BUTCHR-391
+ * comment 24007): the corrected Rocket.Chat credential design has an agent's
+ * MCP binding carry only its OWN (non-secret) account name, in a header —
+ * `x-rocketr-account` for rocketr — which `headersEnvVar` above cannot
+ * express: that resolves ONE static value per RULE from the daemon's own
+ * env, while an account name is per-AGENT (this rule's every agent gets a
+ * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
+ * value, which is deliberately kept out of Codex argv entirely — see that
+ * field's own doc comment; `accountHeader`'s value has no such restriction,
+ * and BUTCHR-413 does resolve it for Codex, via `resolveAccountHeader`
+ * reused directly in `boundCodexServers`, src/agents/argv.ts — the small,
+ * explicit extension that review's finding 1 needed, proven by a test that
+ * a Codex agent's own bound `rocketr` server carries its account name with
+ * no secret ever alongside it). Set to the literal header NAME (e.g.
+ * `"x-rocketr-account"`); the VALUE is resolved at launch time from
+ * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
+ * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
+ * `ensureAccount` actually provisioned this agent's account, never written
+ * into a rules file or a managed-session definition itself. A binding with
+ * `accountHeader` set but no `spec.rocketchatAccount` (this rule's `account`
+ * policy is `"none"`, or `ensureAccount` hasn't run for this spec) simply
+ * omits the header — same "absent means no extra header" discipline
+ * `headersEnvVar` already has. Combines with `headersEnvVar` on the SAME
+ * binding if both are set (rare, but not forbidden): the two are resolved
+ * independently and merged.
  */
 export interface McpServerBinding {
   name: string;
@@ -275,7 +279,7 @@ const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
-/** HTTP header field-name token chars (RFC 7230 `token`, ASCII-restricted) — same charset used for `x-rocketr-account`, `x-issue`, etc. throughout this codebase. */
+/** RFC 7230 `field-name` (token charset), lowercased-or-not — an HTTP header name. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -340,7 +344,7 @@ export function parseMcpServers(raw: unknown, at: string, errors: string[]): Mcp
     const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
     if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
     const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
-    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be an HTTP header name`);
+    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be a valid HTTP header name`);
     if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
     return {
       name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",

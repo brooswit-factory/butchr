@@ -7,6 +7,7 @@ import {
   type CodexChannelRelayHandle, type CodexChannelRelayPool, type RelayNudge,
 } from "../../src/notify/codex-channel-relay.js";
 import type { McpServerBinding } from "../../src/rules/rules.js";
+import { rcUsernameFor } from "../../src/accounts/identity.js";
 
 /**
  * BUTCHR-413's own "fake Rocket.Chat" harness: a real thatch MCP server (the
@@ -197,6 +198,27 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     await Bun.sleep(150);
     expect(callsA).toEqual(["AGENT-A"]);
     expect(callsB).toEqual([]);
+  });
+
+  // Review round 3, blocking finding 2: this relay's own connection identity
+  // must carry the SAME account name `ensureAccount` actually provisioned —
+  // under a NON-DEFAULT `managedPrefix`, that name is NOT `rcUsernameFor(issue)`
+  // (the default-prefix value); an `accountNameOf` that ignored the
+  // configured prefix would connect under a name rocketr never registered.
+  test("review round 3: with a non-default managedPrefix, the relay's connection carries the SAME prefixed account name ensureAccount would provision — never the default-prefix one", async () => {
+    const server = fakeChannelServer();
+    cleanups.push(server.stop);
+    const customPrefix = "acme_rc_";
+    const provisionedName = rcUsernameFor("ISS-PREFIX", customPrefix);
+    const nudge: RelayNudge = async () => ({ delivered: true });
+    let seenHeaders: Record<string, string> | undefined;
+    const connect = (options: { headers?: Record<string, string> }) => { seenHeaders = options.headers; return { stop: async () => {} }; };
+    const relay = startCodexChannelRelay("ISS-PREFIX", binding({ url: server.url, accountHeader: "x-rocketr-account" }), {
+      nudge, connect: connect as never, accountNameOf: (id) => rcUsernameFor(id, customPrefix),
+    });
+    cleanups.push(relay.stop);
+    expect(seenHeaders?.["x-rocketr-account"]).toBe(provisionedName);
+    expect(seenHeaders?.["x-rocketr-account"]).not.toBe(rcUsernameFor("ISS-PREFIX")); // never the default-prefix name
   });
 });
 
