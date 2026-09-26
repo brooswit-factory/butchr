@@ -352,6 +352,13 @@ const STYLE = `
  * itself. The route (`src/web/view.ts`) calls this and returns the string
  * as-is; the browser re-fetches the whole page on the `<meta refresh>`
  * interval rather than any client-side re-rendering logic existing to test.
+ *
+ * FACTORY-81 review fix: the page's own `.hint` line ALWAYS carries a link to
+ * `/configurations`, regardless of `rows` — a config entry with no live
+ * agent (a disabled rule, an unstaffed rule, an archived session) has no
+ * per-row back-link at all, and the whole point of the Configurations view
+ * is to show exactly those, so an operator on an empty (or all-withheld)
+ * `/` must still have a way in that isn't typing the URL by hand.
  */
 export function renderDashboard(response: DashboardResponse, opts: RenderDashboardOpts): string {
   const stale = !response.checked;
@@ -371,6 +378,6 @@ ${renderBuildHeader(opts.header, opts.now)}
 ${renderPageBanner(response, opts.now)}
 ${renderAdmission(response.admission, opts.now)}
 <div id="rows">${rowsHtml}</div>
-<div class="hint">"open terminal" attaches a terminal to that agent (fire-and-forget — a launch is not a confirmation a window appeared) · "resource" opens its Jira issue or Confluence project doc · refreshes every ${refresh}s</div>
+<div class="hint">"open terminal" attaches a terminal to that agent (fire-and-forget — a launch is not a confirmation a window appeared) · "resource" opens its Jira issue or Confluence project doc · refreshes every ${refresh}s · <a class="link" href="/configurations">configurations</a></div>
 </body></html>`;
 }

@@ -850,3 +850,31 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     expect(html).not.toContain(">config</a>");
   });
 });
+
+// ---------------------------------------------------------------------------
+// FACTORY-81 review fix: a stable, always-rendered entry point into the
+// Configurations view — the per-row back-link only exists on a row with a
+// live agent, but the whole point of that view is to show configs with NO
+// running agent (disabled/unstaffed rules, archived/frozen sessions), so an
+// operator looking at an empty (or all-withheld) `/` still needs a way in
+// that isn't typing the URL by hand.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: a stable link to /configurations is always present (FACTORY-81 review fix)", () => {
+  test("present with real agent rows in the response", () => {
+    const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "w1:p3")], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
+  });
+
+  test("present on a genuinely empty fleet (checked:true, rows:[]) — exactly the case a config-with-no-agent needs it most", () => {
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
+  });
+
+  test("present even on a declined poll (checked:false)", () => {
+    const response: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
+  });
+});

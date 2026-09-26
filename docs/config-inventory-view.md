@@ -149,3 +149,20 @@ Per this ticket's own note (FACTORY-74 may change managed-session `tier`'s
 shape): `tier`/`vendor` are rendered as `String(value)`, never assumed to be
 one of today's known enum values — an unexpected future shape renders as
 whatever value is present rather than hard-failing.
+
+## Known limit: two session definitions sharing an `agentKey`
+
+An archived definition's `agentKey` is deliberately derived from the ACTIVE
+path it would be restored to, not its current archive-directory path
+(BUTCHR-455's own identity rule — see `query-agent-inventory.ts`'s top
+comment). If an active definition and an archived one both resolve to the
+same identity path (e.g. the same basename present in both the active and
+archive directories at once — an unusual, but not rejected, on-disk state),
+their two rows on this page render the SAME `id` (`sessionAnchorId`) and both
+match the same running-agent row. Nothing crashes and nothing renders wrong
+data, but the anchor is no longer unique, and the browser resolves `#<id>`
+to whichever such row is first in document order. Not fixed here (raised as
+non-blocking in this ticket's own review) — a future fix would suffix the
+anchor for whichever of the two is `archived`, distinct from the correlation
+`agentKey` itself, which must stay untouched for the freeze-state matching
+to remain correct.
