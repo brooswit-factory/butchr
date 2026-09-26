@@ -115,8 +115,10 @@ header — same "absent means no extra header" discipline `headersEnvVar` has.
 Combines with `headersEnvVar` on the same binding: both are resolved
 independently and merged into one `headers` object.
 
-Not resolved for Codex today (see "Codex" below) — narrowing that is a later
-story's job, tracked in `docs/rocketchat-accounts.md`.
+Resolved for Codex too, as of BUTCHR-413 (see "Codex" below, and
+`docs/rocketchat-accounts.md`'s "Credential design, corrected" section for
+the same fact told from the account-design side) — `headersEnvVar` remains
+the one thing that never reaches a Codex launch; `accountHeader` does.
 
 ## Launch wiring
 
@@ -147,8 +149,16 @@ true or false, the flag is meaningless to Codex — is added to the launch's
 renders each as its own `--config mcp_servers.<name>={ url = "…", enabled =
 true }`. **What a Codex agent gets today, explicitly, per this ticket's own
 DoD:** MCP **tools**, yes — the bound server behaves exactly like any other
-Codex MCP server; channel **push**, no — there is no channel push to Codex
-at all, bound server or not. `boundCodexServers` resolves `headersEnvVar`
+Codex MCP server; channel **push through Codex's OWN connection**, no —
+that connection has no push concept and this ticket adds none, bound server
+or not. That is not the whole story: a Codex agent bound to a `channel:
+true` server is not left with nothing. BUTCHR-413's daemon-side relay
+(`src/notify/codex-channel-relay.ts`) holds that server's notification
+stream open on the agent's behalf instead and delivers each push as a
+`herd.nudge` prompt — a deliberate stopgap for BUTCHR-359 (Codex's own
+push/wake path) to subsume, not built here; see
+`docs/codex-channel-relay.md` for the full mechanism. `boundCodexServers`
+resolves `headersEnvVar`
 for NEITHER Claude-style secret headers — never, on any binding — but DOES
 resolve `accountHeader` (BUTCHR-413, see below): a Codex-launched binding
 gets its own non-secret account name when its binding sets `accountHeader`,

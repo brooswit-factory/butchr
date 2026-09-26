@@ -696,11 +696,17 @@ key that already appear in every log line and every workspace file today.
 `buildWorkspace`'s own `hasSecretHeaders`/chmod-0600 logic (below) reflects
 this: an `accountHeader` resolution alone never tightens `mcp.json`'s
 permissions, only a `headersEnvVar` resolution does. **Narrowed scope,
-stated honestly**: no caller resolves EITHER kind of header for a Codex
-launch today (`boundCodexServers`, `src/agents/argv.ts`, never resolves
-headers for either mechanism) — allowing `accountHeader` through Codex's own
-argv-stripping specifically is S6's to design (BUTCHR-419/420, per BUTCHR-391
-comment 24007's own "what this changes elsewhere" list), not built here.
+stated honestly (as of this task, BUTCHR-412)**: no caller resolves EITHER
+kind of header for a Codex launch yet (`boundCodexServers`,
+`src/agents/argv.ts`, never resolves headers for either mechanism) —
+allowing `accountHeader` through Codex's own argv-stripping specifically is
+S6's to design (BUTCHR-419/420, per BUTCHR-391 comment 24007's own "what
+this changes elsewhere" list), not built here. **BUTCHR-413 built exactly
+that**: `boundCodexServers` now calls `resolveAccountHeader` too, so a
+Codex-launched binding gets `accountHeader`'s non-secret account name the
+same way Claude's `mcp.json` does; `headersEnvVar` remains the one thing
+that never reaches Codex argv, by design — see
+`docs/mcp-server-bindings.md`'s "Codex" section for the shipped mechanism.
 
 **mcp.json permission tightening, unchanged in spirit.** `buildWorkspace`
 still chmods `mcp.json` to 0600 whenever ANY binding resolves a
