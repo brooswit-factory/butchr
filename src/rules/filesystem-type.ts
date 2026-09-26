@@ -74,6 +74,34 @@ export const ownsFilesystemAgent = (id: string): boolean => {
 };
 
 /**
+ * FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): the generic
+ * `filesystem` provider's own short herdr-workspace-label id — the
+ * operator's naming spec, verbatim: "for directories, its the directory and
+ * parent directory (brooswit-factory:rinth)". `resourceId` here is always
+ * the canonical, already-`realpath`-resolved absolute path
+ * `isFilesystemResourceId` validates (see that function's own doc comment,
+ * src/resources/filesystem-ref.ts) — never a relative or symlinked one — so
+ * splitting on `/` and taking the last two segments is safe and needs no
+ * further normalization. A path with only one segment below root (e.g.
+ * `/rinth`) has no parent to name; its bare basename is used alone rather
+ * than inventing a placeholder parent.
+ *
+ * NOT used for a managed-session definition file, despite that resource
+ * ALSO being a `filesystem`-provider match: `MANAGED_SESSIONS_RULE_ID`'s own
+ * short id (`managedSessionShortDisplayId`, session-definition-type.ts) is
+ * a deliberately different method, per FACTORY-83's own recorded decision —
+ * see that function's own doc comment, and `src/rules/display-label.ts`'s
+ * dispatch, for how the two are told apart (by rule id, never by provider
+ * alone).
+ */
+export function filesystemShortDisplayId(resourceId: string): string {
+  const segments = resourceId.split("/").filter(Boolean);
+  const name = segments.at(-1) ?? resourceId;
+  const parent = segments.length > 1 ? segments.at(-2) : undefined;
+  return parent ? `${parent}:${name}` : name;
+}
+
+/**
  * Told about a resource whose canonical path is otherwise a valid absolute
  * path but whose percent-encoded form would overflow the workspace
  * directory-name limit (`isFilesystemResourceId`'s own `MAX_ENCODED_SEGMENT_BYTES`

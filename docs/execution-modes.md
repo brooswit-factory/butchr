@@ -363,6 +363,150 @@ loaded `rules` list, so it works across every provider) into the single
 shared `AdmissionController` instance every rule loop's admission bucket
 already draws from.
 
+## Herdr workspace labels: short display ids, collisions, and full-key metadata (FACTORY-95, implementing FACTORY-90, epic FACTORY-83)
+
+Before this ticket, `HerdrHerd.spawn()` (`src/agents/herd.ts`) set the herdr
+workspace's visible `label` to the RAW agent key, e.g.
+`filesystem:managed-sessions:%2Fhome%2Fbrooswit%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-assembly.json`
+— unreadable in `herdr workspace list` and the herdr UI, where a long shared
+prefix truncates every agent to the same-looking string. **This label was
+never anything other than free text** — nothing in butchr's own ownership or
+reconcile logic ever matched on it (FACTORY-89 confirmed and locked that in
+first: reap/residency key exclusively on the pane's `cwd`, via
+`agentIdOfWorkspacePath`, never on `workspace.label`), so changing it here
+carries no correctness risk of its own.
+
+### The naming spec (operator, verbatim — FACTORY-83's 2026-09-26T19:47Z comment)
+
+> for query resource agents, its the resource ID of the resource they are
+> associated with. Every provider decides what that resource id is. For jira
+> issues, its the issue id (FACTORY-20). For directories, its the directory
+> and parent directory (brooswit-factory:rinth).
+
+### One method per provider, not a central switch
+
+`src/rules/display-label.ts` is the module this ticket adds. Its job is
+narrow: **dispatch** a decoded agent key's `resourceProvider` to that
+provider's OWN short-id method, then combine the result with the rule id.
+It is not itself a second implementation of any provider's logic — each
+provider/rule-type module owns its own named export:
+
+| provider | method | module | shape |
+|---|---|---|---|
+| `jira-work` | `jiraWorkShortDisplayId` | `resource-type.ts` | identity — the resourceId already IS the issue key, e.g. `FACTORY-20` |
+| `jira-idea` | `jiraIdeaShortDisplayId` | `jira-idea-type.ts` | identity, same shape as `jira-work`, independently |
+| `jira-project` | `jiraProjectShortDisplayId` | `jira-project-type.ts` | identity — the resourceId already IS the project key |
+| `filesystem` (ordinary dirs/files) | `filesystemShortDisplayId` | `filesystem-type.ts` | `<parent>:<name>`, e.g. `brooswit-factory:rinth` |
+| `filesystem` + `MANAGED_SESSIONS_RULE_ID` (managed sessions) | `managedSessionShortDisplayId` | `session-definition-type.ts` | the bare definition name, `.json` stripped, e.g. `admin-assembly` — see below |
+| `github-issue` | `githubIssueShortDisplayId` | `github-issue-type.ts` | `<repo>#<number>`, owner dropped, e.g. `butchr#42` |
+| `github-pr` | `githubPrShortDisplayId` | `github-pr-type.ts` | same shape as `github-issue`, independently, sharing `shortGithubRef` (`github-issue-ref.ts`) |
+| `zendesk-ticket` | `zendeskTicketShortDisplayId` | `zendesk-ticket-type.ts` | `#<id>`, subdomain dropped, e.g. `#4567` |
+
+A query-level agent (BUTCHR-397 `singleton`/`persistent` — no single
+resource) has no short id to compute at all: it displays its bare `ruleId`.
+
+### The managed-sessions exception, and why
+
+A managed-session agent is, underneath, a `filesystem`-provider resource
+(BUTCHR-407/BUTCHR-408) — but it does NOT use the generic
+`filesystemShortDisplayId` `<parent>:<name>` rule. Applied literally to a
+definition file's path, that rule would give
+`session-definitions:admin-assembly.json` (the well-known definitions
+directory is always its parent). FACTORY-83 recorded the deliberate call:
+a managed session is memorable by its own name alone — the parent is always
+the same fixed root, so naming it on every label adds noise, not
+information, unlike an arbitrary filesystem resource where the parent is
+exactly what disambiguates "which `rinth` is this." `display-label.ts`'s one
+dispatch point tells the two apart by **rule id**
+(`MANAGED_SESSIONS_RULE_ID`), never by provider alone. A managed session's
+label also has no `· <ruleId>` suffix — every session shares the same
+reserved rule id, so appending it would be pure noise.
+
+### Combining a short id with the rule id
+
+An ordinary resource agent displays `"<shortId> · <ruleId>"`, e.g.
+`"FACTORY-51 · jira-work"`.
+
+### Collisions: deterministic and loud
+
+Two different resources can legitimately reduce to the same short id — the
+same `<parent>:<name>` reached under two different roots, or two
+query-level rules from different providers that happen to share a rule id.
+`resolveDisplayLabels(agentKeys, log?)` computes every key's label in one
+pass and disambiguates any group that collides:
+
+- The lexicographically **smallest agent key** of a colliding group keeps
+  the bare label; every other member gets a `-<hash>` suffix, where `<hash>`
+  is the first 6 hex characters of that key's OWN SHA-256 (the same "hash
+  the exact key" mechanism `nameFor` in `herd.ts` already uses for herdr's
+  32-character agent-name limit).
+- The tie-break is a pure function of the full key set, never of spawn
+  order or discovery order — this is what makes it reproduce identically at
+  spawn time and at relabel-in-place time, and across a daemon restart
+  (FACTORY-90's own "stable ... both ways" requirement). It does not, and
+  cannot, promise a label never changes: adding or removing a colliding
+  resource can shift a group's tie-break, which is exactly why
+  relabel-in-place (below) is safe, and meant, to be re-run.
+- One WARNING line is logged per colliding GROUP, naming every member —
+  never once per key, so an N-way collision doesn't spam N lines.
+
+### Wiring: spawn time and relabel-in-place
+
+`HerdrHerd.labelFor(key)` (`src/agents/herd.ts`) computes a fresh spawn's
+label by adding `key` to every OTHER currently-running, butchr-owned agent's
+key (`ownedWorkspaceIds()`) and running `resolveDisplayLabels` over that
+set — so a brand new spawn is checked for collisions against the fleet as it
+exists right now. This value replaces the old `label: spec.key` at the one
+call site FACTORY-90 named (`this.lifecycle(spec.key).start({..., label,
+...})`).
+
+**Review fix, round 1 — a spawn-time collision must not wait for a restart
+to resolve.** `resolveDisplayLabels`'s tie-break (the lexicographically
+smallest key of a group keeps the bare label) is independent of spawn
+order by design — but that independence means a NEW key that happens to
+sort BEFORE an already-running colliding key would otherwise be handed the
+same bare label the running workspace already visibly carries: two live
+workspaces sharing one label until the next `relabelOwnedWorkspaces()` pass,
+which only runs at daemon startup. `labelFor` closes this by also
+reasserting every OTHER running member of `key`'s own collision group's own
+correct label, right then, via the same `relabelRunningAgent` path
+`relabelOwnedWorkspaces` uses (unconditionally, not only the members whose
+label actually changed — both herdr calls are cheap, idempotent overwrites,
+and this way never depends on trusting that herdr's own stored value
+already agrees). The result: no two live workspaces ever share a label,
+regardless of which key sorts first.
+
+`HerdrHerd.relabelOwnedWorkspaces()` does the equivalent for every
+ALREADY-RUNNING, butchr-owned workspace in one pass: ownership is proven the
+same way `reap.ts`'s `strandedCandidates` proves it for its own purpose — a
+pane's `cwd`, run through `agentIdOfWorkspacePath`, resolving to a real agent
+key — **never** via herdr's own current label (the label is exactly what is
+about to change, so trusting it as an identity source here would be
+circular). `herdr.workspace.rename({workspace_id, label})` moves the visible
+name with no agent restart. This is idempotent (a plain overwrite, safe to
+call repeatedly) and, as of this ticket, called once at daemon startup
+(`src/daemon/index.ts`) — cheap enough that running it again on the next
+restart is exactly as safe as running it the first time; `labelFor`'s own
+mid-spawn sibling fix-up (above) is what covers the gap between restarts.
+
+### Full-key metadata
+
+The visible label never carries the full agent key — that stays in herdr's
+own per-workspace metadata bag, `workspace.reportMetadata`. Both write
+sites (`HerdrHerd.reportFullAgentKey` after a successful spawn, and
+`relabelOwnedWorkspaces` for an already-running workspace) use the same two
+constants from `display-label.ts`:
+
+- **field name**: `FULL_AGENT_KEY_METADATA_FIELD = "agentKey"`
+- **source tag**: `METADATA_SOURCE = "butchr"`
+
+so `herdr workspace list`'s `tokens.agentKey` is the full, machine-usable
+key for any butchr-owned workspace, spawned before or after this ticket
+(relabel-in-place backfills it for every pre-existing one on the next daemon
+restart). A metadata-write failure is logged as its own WARNING and
+swallowed — it must never read as a failed spawn (the agent is already
+running) or block another workspace's own relabel.
+
 ## Tests
 
 `test/unit/rules.test.ts` covers `execution`/`account` (BUTCHR-397, unchanged)
@@ -386,3 +530,28 @@ in that file fails to even load against pre-change `BUTCHR-392` (`git show
 origin/BUTCHR-392:src/rules/execution.ts` does not exist) — verified live by
 copying the file into a worktree checked out at that commit and running it
 there: 0 pass, 1 fail (module not found).
+
+`test/unit/display-label.test.ts` (FACTORY-95, new) covers every provider's
+own short-id method directly (including the managed-sessions special case
+proven to differ from the generic filesystem `<parent>:<name>` rule applied
+to the same path), `baseDisplayLabel`'s combination rule for an ordinary
+resource agent / a managed session / a query-level agent / a legacy id, and
+`resolveDisplayLabels`'s collision handling (no false positives, a two-way
+collision disambiguated with one warning and a stable suffix, a three-way
+collision leaving exactly one bare winner, cross-provider query-level
+collisions, and determinism regardless of input order or of which "universe"
+of keys — spawn-time vs. relabel-in-place — a key is resolved against).
+`test/unit/herd.test.ts` adds the wiring-level coverage: a spawn's label is
+its short display id rather than the bare key (legacy ids unaffected); a
+spawn colliding with an already-running agent is proven in BOTH sort
+orders — when the incoming key sorts after the running one, the new
+workspace is suffixed and the running one's own already-correct bare label
+is reasserted; when it sorts before, the new workspace gets the bare label
+AND the running workspace is relabeled to the suffix in the same call, so
+no two live workspaces ever share a label regardless of ordering (the
+review-round-1 fix); a successful spawn's full key lands in herdr metadata
+(a failed one reports none); and `relabelOwnedWorkspaces` renames/reports
+metadata for every owned running workspace (never an unowned one, proven
+via cwd, never via herdr's own label), disambiguates the same way
+spawn-time does, is idempotent, and never lets a herdr hiccup or one
+workspace's own failure block the rest.

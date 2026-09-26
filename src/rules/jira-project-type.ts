@@ -8,6 +8,8 @@ import type { Rule } from './rules.js';
 export interface ProjectMatch { agentKey: string; rule: Rule; project: JiraProject; spec?: SpawnSpec; }
 /** True for exactly the herd ids this type owns — a per-resource key or a query-level one (BUTCHR-397) alike, same convention as every other provider's owns*Agent predicate. */
 export const ownsJiraProjectAgent = (id: string) => decodeAnyAgentKey(id)?.resourceProvider === 'jira-project';
+/** FACTORY-95: `jira-project`'s own short herdr-workspace-label id — the operator's spec names this case as "the project key", and a `jira-project` resourceId already IS that key (`encodeAgentKey`'s `resourceId`, set from `project.key` below), so this is the identity function — see `jiraWorkShortDisplayId` (src/rules/resource-type.ts) for why every provider keeps its own named export rather than sharing one. */
+export const jiraProjectShortDisplayId = (resourceId: string): string => resourceId;
 export function specForProject(m: ProjectMatch): SpawnSpec {
  return m.spec ?? { key:m.agentKey,resource:m.project.key,issuetype:'project',summary:m.project.name,parent:null,brief:m.rule.brief,
  ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}) };
