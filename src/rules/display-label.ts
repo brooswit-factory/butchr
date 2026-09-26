@@ -77,11 +77,14 @@ function shortDisplayId(provider: ResourceProvider, ruleId: string, resourceId: 
 }
 
 /**
- * The un-disambiguated label for one agent key. Never call this outside
- * `resolveDisplayLabels` below in production code — a herdr-facing label
- * must always go through collision resolution; this is exported only for
- * this module's own tests to exercise each provider's combination rule in
- * isolation.
+ * The un-disambiguated label for one agent key. Never use this AS a
+ * herdr-facing label — that must always go through `resolveDisplayLabels`'s
+ * own collision resolution. Exported for two things: this module's own
+ * tests exercising each provider's combination rule in isolation, and
+ * `HerdrHerd.labelFor` (src/agents/herd.ts), which uses it purely to find
+ * WHICH other already-running agents share a spawning key's own collision
+ * group (never to label anything directly) — see that call site's own doc
+ * comment (FACTORY-95 review fix) for why.
  */
 export function baseDisplayLabel(agentKey: string): string {
   const decoded = decodeAnyAgentKey(agentKey);

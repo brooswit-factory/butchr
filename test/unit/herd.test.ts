@@ -1299,14 +1299,45 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
     expect(f.creates[0].label).toBe("KAN-7");
   });
 
-  test("spawning a colliding key against an already-running agent disambiguates the NEW one, never the running one (loud, deterministic)", async () => {
+  // FACTORY-95 review fix (round 1): no two LIVE workspaces may ever share a
+  // label, in EITHER sort order — not just the case where the incoming key
+  // happens to sort after the running one. `resolveDisplayLabels`'s
+  // tie-break (the lexicographically smallest key of a colliding group)
+  // does not care which key is "new"; when the incoming key sorts BEFORE an
+  // already-running colliding key, the running workspace's OWN label must
+  // be fixed up too, right now — not left to share the incoming spawn's
+  // bare label until the next `relabelOwnedWorkspaces()` restart pass.
+  test("spawning a colliding key that sorts AFTER an already-running one: the new workspace is suffixed, the running one keeps its bare label (reasserted, not left stale)", async () => {
     // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
     const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
     const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    expect(incoming > running).toBe(true); // pins the ordering this test relies on
     const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
     expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    // `labelFor` unconditionally reasserts every OTHER member of the group's own
+    // correct label whenever the group has more than one member — cheap, idempotent,
+    // and never relies on knowing whether herdr's own stored value already agrees.
+    expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
+    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
+  });
+
+  test("spawning a colliding key that sorts BEFORE an already-running one: the new workspace gets the bare label AND the running workspace is relabeled to the suffix, so the two never share a label", async () => {
+    const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+    expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
+    const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
+    expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
+    // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
+    expect(f.renamed).toHaveLength(1);
+    expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
+    expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
+    // The one invariant that matters: no two live workspaces ever share a label.
+    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
   });
 
   test("a successful spawn preserves the full agent key in herdr metadata, keyed by the started workspace id", async () => {

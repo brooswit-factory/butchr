@@ -453,23 +453,41 @@ pass and disambiguates any group that collides:
 ### Wiring: spawn time and relabel-in-place
 
 `HerdrHerd.labelFor(key)` (`src/agents/herd.ts`) computes a fresh spawn's
-label by adding `key` to every OTHER currently-running agent's key
-(`byIssue()`) and running `resolveDisplayLabels` over that set — so a brand
-new spawn is checked for collisions against the fleet as it exists right
-now. This value replaces the old `label: spec.key` at the one call site
-FACTORY-90 named (`this.lifecycle(spec.key).start({..., label, ...})`).
+label by adding `key` to every OTHER currently-running, butchr-owned agent's
+key (`ownedWorkspaceIds()`) and running `resolveDisplayLabels` over that
+set — so a brand new spawn is checked for collisions against the fleet as it
+exists right now. This value replaces the old `label: spec.key` at the one
+call site FACTORY-90 named (`this.lifecycle(spec.key).start({..., label,
+...})`).
+
+**Review fix, round 1 — a spawn-time collision must not wait for a restart
+to resolve.** `resolveDisplayLabels`'s tie-break (the lexicographically
+smallest key of a group keeps the bare label) is independent of spawn
+order by design — but that independence means a NEW key that happens to
+sort BEFORE an already-running colliding key would otherwise be handed the
+same bare label the running workspace already visibly carries: two live
+workspaces sharing one label until the next `relabelOwnedWorkspaces()` pass,
+which only runs at daemon startup. `labelFor` closes this by also
+reasserting every OTHER running member of `key`'s own collision group's own
+correct label, right then, via the same `relabelRunningAgent` path
+`relabelOwnedWorkspaces` uses (unconditionally, not only the members whose
+label actually changed — both herdr calls are cheap, idempotent overwrites,
+and this way never depends on trusting that herdr's own stored value
+already agrees). The result: no two live workspaces ever share a label,
+regardless of which key sorts first.
 
 `HerdrHerd.relabelOwnedWorkspaces()` does the equivalent for every
-ALREADY-RUNNING, butchr-owned workspace: ownership is proven the same way
-`reap.ts`'s `strandedCandidates` proves it for its own purpose — a pane's
-`cwd`, run through `agentIdOfWorkspacePath`, resolving to a real agent key —
-**never** via herdr's own current label (the label is exactly what is about
-to change, so trusting it as an identity source here would be circular).
-`herdr.workspace.rename({workspace_id, label})` moves the visible name with
-no agent restart. This is idempotent (a plain overwrite, safe to call
-repeatedly) and, as of this ticket, called once at daemon startup
+ALREADY-RUNNING, butchr-owned workspace in one pass: ownership is proven the
+same way `reap.ts`'s `strandedCandidates` proves it for its own purpose — a
+pane's `cwd`, run through `agentIdOfWorkspacePath`, resolving to a real agent
+key — **never** via herdr's own current label (the label is exactly what is
+about to change, so trusting it as an identity source here would be
+circular). `herdr.workspace.rename({workspace_id, label})` moves the visible
+name with no agent restart. This is idempotent (a plain overwrite, safe to
+call repeatedly) and, as of this ticket, called once at daemon startup
 (`src/daemon/index.ts`) — cheap enough that running it again on the next
-restart is exactly as safe as running it the first time.
+restart is exactly as safe as running it the first time; `labelFor`'s own
+mid-spawn sibling fix-up (above) is what covers the gap between restarts.
 
 ### Full-key metadata
 
@@ -524,11 +542,16 @@ collision leaving exactly one bare winner, cross-provider query-level
 collisions, and determinism regardless of input order or of which "universe"
 of keys — spawn-time vs. relabel-in-place — a key is resolved against).
 `test/unit/herd.test.ts` adds the wiring-level coverage: a spawn's label is
-its short display id rather than the bare key (legacy ids unaffected), a
-spawn colliding with an already-running agent disambiguates the NEW one
-only, a successful spawn's full key lands in herdr metadata (a failed one
-reports none), and `relabelOwnedWorkspaces` renames/reports metadata for
-every owned running workspace (never an unowned one, proven via cwd, never
-via herdr's own label), disambiguates the same way spawn-time does, is
-idempotent, and never lets a herdr hiccup or one workspace's own failure
-block the rest.
+its short display id rather than the bare key (legacy ids unaffected); a
+spawn colliding with an already-running agent is proven in BOTH sort
+orders — when the incoming key sorts after the running one, the new
+workspace is suffixed and the running one's own already-correct bare label
+is reasserted; when it sorts before, the new workspace gets the bare label
+AND the running workspace is relabeled to the suffix in the same call, so
+no two live workspaces ever share a label regardless of ordering (the
+review-round-1 fix); a successful spawn's full key lands in herdr metadata
+(a failed one reports none); and `relabelOwnedWorkspaces` renames/reports
+metadata for every owned running workspace (never an unowned one, proven
+via cwd, never via herdr's own label), disambiguates the same way
+spawn-time does, is idempotent, and never lets a herdr hiccup or one
+workspace's own failure block the rest.
