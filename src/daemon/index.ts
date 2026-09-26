@@ -485,6 +485,19 @@ const dashboardFeed = createDashboardFeed({
 
 const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
 
+// FACTORY-7/FACTORY-5: the local file store needs no credentials and works
+// for every ResourceRef kind; a `jira-project:` owner routes to the
+// project-property-backed store instead (this daemon already has Jira
+// credentials loaded, so the factory is cheap and side-effect-free rather
+// than genuinely lazy) — see `src/resources/link-store-router.ts` for the
+// routing decision itself. BUTCHR-469: hoisted out of the MCP tool wiring
+// below (its original, still-only-other, call site) so the SAME instance
+// (stateless per call, so a second handle would be equivalent anyway — see
+// `createLinkStore`'s own doc comment) can also be handed to the
+// `jira-project` resource type's own linked-eventing wiring further down,
+// without constructing a second routing store for no reason.
+const routingLinkStore = createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: () => createJiraProjectLinkStore(ops) });
+
 // The own-write ledger (src/jira-watch/own-writes.ts): every daemon-side
 // write (agent tool calls, and this daemon's own label sync) records the
 // target's read-back `updated` here, so startLoop can recognize its own
@@ -677,7 +690,7 @@ const { app, mcp } = buildApp({
   // below is cheap and side-effect-free rather than genuinely lazy) — see
   // `src/resources/link-store-router.ts` for the routing decision itself.
   ...resourceLinkTools(
-    createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: () => createJiraProjectLinkStore(ops) }),
+    routingLinkStore,
     (line) => console.error(line),
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -1029,6 +1042,29 @@ const issueCrashLoopDetector = createCrashLoopDetector({
     await speakOnOwnChannel(ops, resourceKeyOf(id), text);
   },
   comments: (id) => (isQueryLevelAgent(id) ? Promise.resolve([]) : ownChannelComments(resourceKeyOf(id))),
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-47: a managed-session agent (built-in `managed-sessions` rule,
+// BUTCHR-408) has NO Jira ticket to comment on at all — unlike
+// `issueCrashLoopDetector` above, every id this instance ever sees IS one of
+// these filesystem-provider ids (this is wired ONLY into
+// `startManagedSessionsLoop` below), never conditionally, so there is no
+// `isQueryLevelAgent`-style branch here: `addComment`/`comments` always
+// bypass Jira and log instead. Before this, a managed session whose agent
+// kept dying and being respawned (a startup crash, an MCP config that
+// failed to load, a session-limit refusal that never cleared, ...) had
+// NOTHING recording why — see `createCrashLoopDetector`'s own top comment
+// ("nothing to stop it and NOTHING TO SAY SO"), which this ticket found
+// applied to managed sessions exactly as much as to an ordinary rule agent,
+// just never wired up for them. Its own instance (never shared with
+// `issueCrashLoopDetector`), same reasoning as that detector's own doc
+// comment on why each `runResourceLoop` call needs its own tracker.
+const managedSessionCrashLoopDetector = createCrashLoopDetector({
+  now: () => Date.now(),
+  count: config.crashLoopCount,
+  windowMinutes: config.crashLoopWindowMinutes,
+  addComment: async (id, text) => { console.error(`  [managed-sessions:crash-loop] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
+  comments: () => Promise.resolve([]),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
@@ -1396,6 +1432,7 @@ startManagedSessionsLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  checkCrashLoop: managedSessionCrashLoopDetector.check,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
@@ -1611,6 +1648,17 @@ const projectType = createJiraProjectResourceType({
   search: (q) => atlassian.searchProjects(q),
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
   prepare: (spec) => resourceConnections.prepare(spec),
+  // BUTCHR-469: linked-change eventing (member discovery + managed links) —
+  // the SAME `searchAll`/`comments`/`notifyRuleAgent` seams the jira-work
+  // rule loop's own linked-eventing wiring already uses above, plus the
+  // SAME routed link store `resourceLinkTools` is wired with (a
+  // `jira-project:` owner key routes to the `brooswit.butchr.links`
+  // project-property store — see `routingLinkStore`'s own doc comment).
+  searchIssues: (jql) => atlassian.searchAll(jql),
+  comments: (key) => atlassian.comments(key),
+  linkStore: routingLinkStore,
+  notify: notifyRuleAgent,
+  log: (line) => console.error(`  [jira-project] ${line}`),
 });
 runResourceLoop(projectType, {
   herd,

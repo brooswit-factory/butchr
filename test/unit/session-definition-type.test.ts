@@ -516,3 +516,70 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     expect(mudDirector.mcpServers).toEqual([{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }]);
   });
 });
+
+describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop", () => {
+  /**
+   * A herd whose `spawn()` never actually makes the id show up as running —
+   * every poll's discovery finds the definition eligible, `runningIssues()`
+   * keeps reporting nothing, and `plan.spawn` keeps naming the same id again.
+   * This is the shape a managed session actually takes when its OWN agent
+   * process dies right after spawning (a startup crash, an MCP config that
+   * fails to load, ...): nothing here is a "stale" agent needing a respawn
+   * (`staleIssues()` never fires) — herdr genuinely reports no live agent for
+   * it, so it is `spawn`ed again, forever, with the `[reconcile] respawned:`
+   * line never once appearing. Before FACTORY-47, `startManagedSessionsLoop`
+   * had no `checkCrashLoop` seam at all, so this pattern produced no audible
+   * signal whatsoever — this is the exact gap the ticket reports ("nothing
+   * records why the previous pane went away").
+   */
+  function fakeCrashLoopingHerd(): { herd: Herd; spawned: SpawnSpec[] } {
+    const spawned: SpawnSpec[] = [];
+    const herd: Herd = {
+      async runningIssues() { return []; },
+      async staleIssues() { return []; },
+      async spawn(sp) { spawned.push(sp); },
+      async stop() {},
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+    };
+    return { herd, spawned };
+  }
+
+  test("a managed session repeatedly spawned (its agent keeps dying) is reported through checkCrashLoop — never silent", async () => {
+    const { herd, spawned } = fakeCrashLoopingHerd();
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/nexus.json" });
+    const calls: { spawning: readonly string[]; desired: readonly string[] }[] = [];
+    const stop = startManagedSessionsLoop({
+      root: "/defs", herd, deliver: async () => {},
+      list: async () => [res("/defs/nexus.json")],
+      read: async () => JSON.stringify(goodDef({ tier: "tier4", permissionMode: "auto", execution: "persistent", account: "none", role: "sentinel" })),
+      checkCrashLoop: async (spawning, desired) => { calls.push({ spawning, desired }); },
+      log: () => {}, intervalMs: 5,
+    });
+    await tick(); await tick(); await tick();
+    stop();
+    // The SAME id was handed to checkCrashLoop on more than one poll — the
+    // detector (never exercised here; see crash-loop.test.ts for its own
+    // rolling-window/threshold behaviour) is what turns repeated occurrences
+    // like this into an audible complaint.
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) {
+      expect(call.spawning).toEqual([key]);
+      expect(call.desired).toEqual([key]);
+    }
+    expect(spawned.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("omitting checkCrashLoop is unaffected — today's exact behaviour for every caller that doesn't opt in", async () => {
+    const { herd, spawned } = fakeCrashLoopingHerd();
+    const stop = startManagedSessionsLoop({
+      root: "/defs", herd, deliver: async () => {},
+      list: async () => [res("/defs/nexus.json")],
+      read: async () => JSON.stringify(goodDef()),
+      log: () => {}, intervalMs: 5,
+    });
+    await tick(); await tick();
+    stop();
+    expect(spawned.length).toBeGreaterThanOrEqual(1);
+  });
+});

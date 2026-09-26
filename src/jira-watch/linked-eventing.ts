@@ -21,16 +21,19 @@
  * Every seam this widening touches is called out at its own site below
  * ("BUTCHR-437"); everything else in this file is story 2's, unmodified.
  *
- * SCOPE, STATED ONCE HERE (do not re-litigate — see BUTCHR-436's own ticket
- * history): child/project-member discovery (the ticket's own item 7b) is
- * DESCOPED — no live `jira-project` resourceProvider exists in the rules
- * engine today (`RESOURCE_PROVIDERS`, src/rules/agent-key.ts), so there is
- * no live agent for a project-member watch to notify. `jiraKindLinkedItems`
- * below is deliberately a per-MATCH function returning a plain `LinkedItem[]`
- * so a future project-member source (once a live project-owning agent
- * exists, likely BUTCHR-433's job) can be unioned in alongside issuelinks/
- * parent/description/remote-links with no rework to the coalescer, rate cap,
- * or delivery below — none of which know or care where an item came from.
+ * SCOPE, UPDATED (BUTCHR-469 — the paragraph below is intentionally no
+ * longer what it once said; see git history if the earlier "descoped"
+ * framing is wanted): child/project-member discovery, deferred in BUTCHR-436
+ * for lack of a live `jira-project` resourceProvider, now HAS one
+ * (BUTCHR-425/BUTCHR-444, PR #407) and is implemented here as
+ * `ProjectLinkedEventingMatch` — a second, `JiraIssue`-free match shape
+ * `runTick` accepts via its own optional third parameter, reusing the EXACT
+ * SAME coalescer/rate-cap/notify below with no forked delivery path.
+ * `jiraKindLinkedItems` below was deliberately kept a per-MATCH function
+ * returning a plain `LinkedItem[]`, exactly so this project-member source
+ * could be unioned in without rework — see `ProjectLinkedEventingMatch`'s
+ * own doc comment for the full design (member-discovery watermark, managed
+ * links, and the member/managed-link dedup and removal-tracking rules).
  *
  * ONE HOP ONLY (epic decision, not re-litigated here either): a linked
  * item's OWN further links are never chased. This module only ever diffs
@@ -149,7 +152,7 @@ import type { JiraComment, JiraIssue, JiraRemoteLink } from "../atlassian/types.
 import type { Rule } from "../rules/rules.js";
 import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
-import { jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
+import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
 import type { LinkStore } from "../resources/link-store.js";
 import { isDaemonLabelOnlyDiff } from "./diff.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
@@ -163,6 +166,99 @@ export interface LinkedEventingMatch {
   agentKey: string;
   rule: Rule;
   issue: JiraIssue;
+}
+
+/**
+ * BUTCHR-469: a `jira-project` owning resource's own match shape — no
+ * `JiraIssue` (a project has none of its own); `projectKey` names the Jira
+ * project this owner watches. The project-owner analogue of
+ * `LinkedEventingMatch` — reuses the EXACT SAME `runTick` (coalescer, rate
+ * cap, notify) via `runTick`'s own optional third parameter, never a forked
+ * delivery path (the DoD's own instruction). Two item sources feed a
+ * project owner's watch, both unioned into the same per-(owner,target)
+ * diff/notify machinery `jiraKindLinkedItems`/`managedLinkedItems` already
+ * feed for an issue owner:
+ *
+ * 1. MEMBER DISCOVERY: `project = <projectKey> AND updated >= "-<N>m"` (a
+ *    JQL RELATIVE date literal, never an absolute one — see `runTick`'s own
+ *    per-project-owner item gathering for why: it lets Jira itself resolve
+ *    "N minutes ago" in whatever timezone it likes, so this module never has
+ *    to reproduce that computation or risk skewing it), one watermark per
+ *    project owner (`createLinkedEventingState`'s own `projectWatermarks`
+ *    map, in-memory only — reset by a daemon restart, same "in-memory,
+ *    lost-on-restart" shape `baselines`/`watchSets` already have).
+ *    NO HISTORICAL FLOOD: a project owner's FIRST sighting (no watermark
+ *    yet — true on first tick and after every restart) seeds the watermark
+ *    to "now" and searches NOTHING that tick; only from the next tick
+ *    onward does the search run at all. DELAYED, NOT LOST: the watermark
+ *    only actually advances (`runTick`'s own deferred `toAdvance` — this
+ *    owner's `advance()` closure) once this tick's events are genuinely
+ *    delivered or safely consumed (not rate-capped away, not lost to a
+ *    search failure or to `maxLinkedItems` capping a member away — see
+ *    "CAPPING" below) — a failed member search leaves it unadvanced, fails
+ *    open, is logged, and never blocks any other owner or this owner's OWN
+ *    managed-link source.
+ *    A MEMBER'S FIRST APPEARANCE IS ITSELF THE CHANGE: unlike a managed or
+ *    native link (silently seeded on first sighting, since simply being
+ *    watched carries no implication that it just changed), the window
+ *    search above only EVER returns a target whose `updated` is at or after
+ *    the watermark — so a member target with no existing per-(owner,target)
+ *    baseline is reported as a genuine event (`"updated since <watermark>"`,
+ *    or a real field diff if a later tick's re-appearance already has one
+ *    to diff against), never seeded silently. Silently seeding it would
+ *    swallow the very change that made it appear in the search at all —
+ *    permanently, since it may never satisfy a later `updated >= <window>`
+ *    again if nothing further changes it. See `runTick`'s own
+ *    `memberTargetsByOwner` for the per-item mechanism.
+ *    CAPPING: a MANAGED link `maxLinkedItems` capped away is safe to drop
+ *    for just this tick (the full managed-link collection is re-listed
+ *    every tick regardless of any cap, so a capped one is simply a
+ *    candidate again next tick). A MEMBER capped away is NOT, unless it is
+ *    already stale (baselined, nothing new): it only appeared because it
+ *    fell inside this tick's watermark window, and once the watermark
+ *    advances past that window it may never reappear. So a FRESH-OR-CHANGED
+ *    member capped away holds this owner's ENTIRE watermark advance for the
+ *    tick (not merely its own item) — the next tick re-runs the identical
+ *    window. `ORDER BY updated ASC` alone does NOT prevent starvation here
+ *    (an already-delivered member's own `updated` never moves, so it keeps
+ *    sorting right back to the front of the still-over-inclusive held
+ *    window) — every member candidate is additionally RANKED by whether it
+ *    already has a matching baseline, so a genuinely fresh-or-changed
+ *    member always wins a scarce slot over an already-known, unchanged one.
+ *    This makes the backlog drain monotonically under sustained cap
+ *    pressure, never starve a tail forever. See `runTick`'s own
+ *    `freshOrChangedMembers`/`freshOrChangedTargets`.
+ * 2. MANAGED LINKS: `brooswit.butchr.links` (FACTORY-8's project-property
+ *    link store), reconciled via the SAME `managedLinkedItems` FACTORY-9
+ *    already built for an issue owner, with `nativeRefs: []` (a project has
+ *    no structural native links of its own — no issuelinks/parent) so
+ *    every managed link is "managed"-origin and watched. A failed
+ *    link-store read fails open (logged), independent of member discovery.
+ *
+ * DEDUP: a target that is BOTH a project member and a managed-link target
+ * is de-duplicated to ONE `LinkedItem`/ONE event line per tick (first
+ * occurrence wins, same convention `discoverLinkedItems` already uses).
+ *
+ * REMOVAL TRACKING IS SCOPED TO MANAGED LINKS ONLY: a member issue that
+ * simply falls outside the current watermark window (nothing changed
+ * recently) is NOT "no longer linked" — it is still a project member,
+ * just not recently touched — so member-sourced items never participate in
+ * `runTick`'s watch-set-based removal detection; only managed-link-sourced
+ * items do (a genuine removal from `brooswit.butchr.links` still fires
+ * "no longer linked", exactly as it does for an issue owner's managed
+ * links). See `runTick`'s own `managedTargetsByOwner`/`trackedKept`.
+ *
+ * COMMENT EVENTS: a "comment event" for a project owner is the SAME
+ * per-target comment-cursor diff FACTORY-9 already built for any Jira-kind
+ * linked target (`JiraSnapshot.commentCursor`, `deps.comments`), applied
+ * uniformly to both member issues and managed-link targets — reusing the
+ * existing mechanism unchanged rather than inventing a new "project
+ * comment" concept (Jira itself has none; see `docs/provider-capabilities.md`).
+ */
+export interface ProjectLinkedEventingMatch {
+  agentKey: string;
+  rule: Rule;
+  projectKey: string;
 }
 
 /** Of every kind `discoverLinkedItems` can produce, only these are Jira-kind for THIS module's Jira-diffing path (Confluence/GitHub/webpage are BUTCHR-437's, driven by the external-poll.ts path below). */
@@ -352,8 +448,16 @@ export interface LinkedEventingState {
    * `notify` call included) before returning, so a caller's own try/catch
    * (see `createRuleResourceType`) sees a failure from `notify` itself, not
    * a dangling promise.
+   *
+   * BUTCHR-469: `projectMatches` is a third, OPTIONAL parameter — every
+   * existing call site (and every existing test) that passes only
+   * `(matches, deps)` keeps compiling and behaving byte-for-byte
+   * identically (defaults to `[]`, filtered to nothing). See
+   * `ProjectLinkedEventingMatch`'s own doc comment for what it adds and
+   * `createJiraProjectResourceType` (src/rules/jira-project-type.ts) for the
+   * one caller that supplies it.
    */
-  runTick(matches: readonly LinkedEventingMatch[], deps: LinkedEventingDeps): Promise<void>;
+  runTick(matches: readonly LinkedEventingMatch[], deps: LinkedEventingDeps, projectMatches?: readonly ProjectLinkedEventingMatch[]): Promise<void>;
 }
 
 /**
@@ -422,6 +526,27 @@ async function pollExternalItem(item: LinkedItem, priorFingerprint: string | und
   }
 }
 
+/**
+ * BUTCHR-469: how many whole minutes ago `watermark` was, for a JQL
+ * RELATIVE date literal (`updated >= "-<N>m"`). Deliberately RELATIVE, never
+ * an absolute `"yyyy-MM-dd HH:mm"` literal: Jira resolves an unqualified
+ * absolute JQL date-time in the REQUESTING ACCOUNT's own configured
+ * timezone, which this daemon does not know and must not guess at — a
+ * relative literal sidesteps that entirely, since Jira itself computes
+ * "N minutes before now" server-side. `Math.ceil`, never `round` or
+ * `floor`, and a floor of 1: rounding UP means the window is always at
+ * least as wide as the true elapsed time (over-inclusive, never
+ * under-inclusive) — a redundant re-check of an already-seen, unchanged
+ * issue costs nothing (the per-target baseline diff below silently no-ops
+ * it), while under-covering could silently miss a genuine change. The
+ * minimum of 1 guarantees a non-degenerate window even when `now` and
+ * `watermark` are the same poll tick's own two timestamps a few
+ * milliseconds apart.
+ */
+function jqlRelativeMinutesSince(watermark: number, now: number): number {
+  return Math.max(1, Math.ceil((now - watermark) / 60_000));
+}
+
 /** A fresh, empty linked-eventing state — one instance per daemon lifetime (mirrors `createLinkedDiscoveryTracker`/`createOwnWriteLedger`'s own "one instance, closed over, reused every poll" shape). */
 export function createLinkedEventingState(): LinkedEventingState {
   const baselines = new Map<string, Baseline>();
@@ -433,15 +558,57 @@ export function createLinkedEventingState(): LinkedEventingState {
   // lost") for why this is intentionally NOT part of the rate-cap's
   // "advance only on success" discipline.
   const lastExternalPollAt = new Map<string, number>();
+  // BUTCHR-469: per-project-owner member-discovery watermark (ms since
+  // epoch, this daemon's own clock) — see `ProjectLinkedEventingMatch`'s own
+  // doc comment for the full "no historical flood, delayed not lost"
+  // contract. In-memory only, same as every other map here: lost on daemon
+  // restart, which is exactly what makes the "first sighting" branch below
+  // also cover a restart, not only a genuinely new project owner.
+  const projectWatermarks = new Map<string, number>();
   const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
 
   return {
-    async runTick(matches, deps) {
+    async runTick(matches, deps, projectMatches = []) {
       const now = deps.now ?? Date.now;
       const opted = matches.filter((m) => m.rule.linkedEventing === true);
-      if (!opted.length) return;
+      const projectOpted = projectMatches.filter((m) => m.rule.linkedEventing === true);
+      if (!opted.length && !projectOpted.length) return;
 
       const perOwnerItems = new Map<string, LinkedItem[]>();
+      // BUTCHR-469: which of a PROJECT owner's kept targets came from its
+      // MANAGED links specifically — the only subset that may ever
+      // participate in "no longer linked" removal detection below. Absent
+      // (an issue owner) means "everything in `kept` is removal-tracked",
+      // unchanged pre-BUTCHR-469 behaviour — see `trackedKept` below.
+      const managedTargetsByOwner = new Map<string, Set<string>>();
+      // BUTCHR-469 (review round 1 fix): which of a project owner's kept
+      // targets came from the MEMBER-DISCOVERY search THIS TICK — the only
+      // subset for which a missing baseline must be reported as a genuine
+      // change rather than seeded silently. See the per-item diff loop's own
+      // comment on `!before` for why: `project = <key> AND updated >=
+      // "-<N>m"` only ever returns a target that has ALREADY changed since
+      // the watermark, so a member's first appearance IS the change, not a
+      // neutral "now I know about this link" the way a managed/native link's
+      // first sighting is.
+      const memberTargetsByOwner = new Map<string, Set<string>>();
+      // BUTCHR-469 (review round 1 fix): the watermark actually USED for
+      // this tick's member search, per owner — carried through to the
+      // per-item diff loop purely to phrase a first-appearance event's
+      // detail text ("updated since <watermark>"). Absent for an owner on
+      // its very first sighting (no search ran) or on a failed search.
+      const usedWatermarkByOwner = new Map<string, number>();
+      // BUTCHR-469 (review round 1 fix): every JiraIssue the member-discovery
+      // search(es) already fetched, THIS TICK, across every project owner —
+      // reused directly as the shared batched-fetch's own data (see
+      // `byKey` below) instead of re-requesting the same keys via a second
+      // `key in (...)` call. Scratch, per tick only — never persisted.
+      const memberFetchedByKey = new Map<string, JiraIssue>();
+      // BUTCHR-469: this tick's own project-watermark advance, deferred
+      // exactly like every other piece of state here (`toAdvance` below) —
+      // committed only inside a genuinely-delivered-or-consumed owner's own
+      // `advance()`, never on a rate-capped or failed tick.
+      const nextProjectWatermark = new Map<string, number>();
+
       for (const m of opted) {
         let remoteLinks: JiraRemoteLink[] | undefined;
         if (m.rule.linkedRemoteLinks === true && deps.remoteLinks) {
@@ -477,9 +644,177 @@ export function createLinkedEventingState(): LinkedEventingState {
         perOwnerItems.set(m.agentKey, kept);
       }
 
-      // ONE combined batched fetch for every Jira-kind linked target across every opted owner this tick — never one call per linked item, never one per owner. BUTCHR-437: filtered to Jira-kind targets only — external-kind targets never ride this call (see this module's own top comment for why they are polled individually instead).
+      // BUTCHR-469: a project owner's own two item sources — see
+      // `ProjectLinkedEventingMatch`'s own doc comment for the full design.
+      // Member items come back already as `LinkedItem`s (kind "jira-key",
+      // one of `JIRA_DISCOVERY_KINDS`), so they ride the EXACT SAME shared
+      // batched fetch / diff / comment-cursor machinery below with zero
+      // special-casing — this loop's only job is DISCOVERY, exactly like
+      // `jiraKindLinkedItems` is for an issue owner.
+      for (const m of projectOpted) {
+        const priorWatermark = projectWatermarks.get(m.agentKey);
+        let memberItems: LinkedItem[] = [];
+        // BUTCHR-469 (review round 2 fix): the targets among THIS tick's
+        // member candidates that genuinely need a slot — no baseline yet, or
+        // a real field change against their existing one. Populated below;
+        // used both to rank the cap (fresh/changed first) and to decide
+        // whether a capped-away member actually costs anything (see
+        // `freshOrChangedTargets` at the bottom of this loop iteration).
+        let freshOrChangedMembers: LinkedItem[] = [];
+        if (priorWatermark === undefined) {
+          // First sighting (true on the very first tick, and again after
+          // every daemon restart, since this state is in-memory only): seed
+          // the watermark to now and search NOTHING this tick — searching
+          // this project's full unwatermarked history here would flood
+          // every member ever touched. See this owner's own doc comment.
+          nextProjectWatermark.set(m.agentKey, now());
+        } else {
+          const searchStartedAt = now();
+          try {
+            const minutes = jqlRelativeMinutesSince(priorWatermark, searchStartedAt);
+            // `ORDER BY updated ASC`: a REQUEST for the oldest-first order,
+            // but NOT what actually protects a capped tail from starvation —
+            // see the fresh/stale partition just below for that (review
+            // round 2 found that ordering ALONE still starves the tail,
+            // since an already-delivered member that keeps re-matching this
+            // deliberately over-inclusive window sorts right back to the
+            // front next tick).
+            const members = await deps.search(`project = ${m.projectKey} AND updated >= "-${minutes}m" ORDER BY updated ASC`);
+            // BUTCHR-469 (review round 2 fix): partition into "genuinely
+            // needs a slot" vs. "already known, nothing new" — a stale
+            // member only reappears here because the window is deliberately
+            // over-inclusive (`jqlRelativeMinutesSince`'s own doc comment),
+            // never because anything changed. Without this split, a
+            // persistently-at-cap project would let an already-delivered
+            // member re-consume the one scarce slot every tick forever
+            // (ORDER BY updated ASC sorts it right back to the front, since
+            // its own `updated` never moves) while a genuinely still-pending
+            // member starves — exactly review round 2's own reproduction.
+            // `updated` alone (not the full snapshot) is the freshness
+            // check: comment-only changes always bump `updated` too (see
+            // `JiraSnapshot.commentCursor`'s own doc comment), so this needs
+            // no separate comment lookup to stay a reasonable proxy — this
+            // is a RANKING heuristic, not a correctness gate; the real diff
+            // (including comment-cursor) still runs unconditionally on
+            // whatever wins a slot below.
+            const staleMembers: LinkedItem[] = [];
+            for (const issue of members) {
+              const item: LinkedItem = { kind: "jira-key", target: issue.key };
+              // Reused directly by the shared batched fetch below instead of
+              // a second `key in (...)` call for the same key (review round
+              // 1) — this search already returned full issue data.
+              memberFetchedByKey.set(issue.key, issue);
+              const beforeRaw = baselines.get(baselineKey(m.agentKey, issue.key));
+              const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
+              const looksUnchanged = before !== undefined && before.updated === issue.updated;
+              (looksUnchanged ? staleMembers : freshOrChangedMembers).push(item);
+            }
+            memberItems = [...freshOrChangedMembers, ...staleMembers];
+            usedWatermarkByOwner.set(m.agentKey, priorWatermark);
+            // Captured BEFORE the search ran, not after: a member updated
+            // WHILE the search was in flight still has `updated` at or after
+            // this timestamp, so the NEXT tick's `>=` window still covers it
+            // — capturing after the search would risk missing exactly that
+            // race window.
+            nextProjectWatermark.set(m.agentKey, searchStartedAt);
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] project-member search failed for ${m.agentKey} (${m.projectKey}), skipping member discovery this tick: ${(e as Error)?.message ?? e}`);
+            // Fails open: no member items this tick, watermark NOT advanced
+            // (no entry in `nextProjectWatermark`) — delayed, not lost, and
+            // this owner's OWN managed-link source below is unaffected.
+          }
+        }
+
+        // FACTORY-8/FACTORY-9: this project's own managed links
+        // (`brooswit.butchr.links`), reconciled via the SAME
+        // `managedLinkedItems` an issue owner already uses — `nativeRefs: []`
+        // because a project has no structural native links of its own, so
+        // every managed link here is "managed"-origin and watched. Fails
+        // open, independent of the member search above.
+        let managedItems: LinkedItem[] = [];
+        if (deps.linkStore) {
+          try {
+            managedItems = await managedLinkedItems(jiraProjectOwnerRef(m.projectKey), [], deps.linkStore, deps.log);
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.projectKey}): ${(e as Error)?.message ?? e}`);
+          }
+        }
+        managedTargetsByOwner.set(m.agentKey, new Set(managedItems.map((i) => i.target)));
+
+        // De-duplicated by target, first occurrence wins — an issue that is
+        // both a member and a managed-link target must yield ONE item,
+        // never two (DoD: no duplicate event lines). BUTCHR-469 (review
+        // round 2 fix): genuinely fresh/changed members rank FIRST (ahead of
+        // managed links, which are never starved by a cap — see below),
+        // stale/already-known members rank LAST, so a persistently-at-cap
+        // project's scarce slots always go to whatever still needs one.
+        // Combined BEFORE `maxLinkedItems` caps, same uniform-cap convention
+        // the issue-owner loop above already uses.
+        const seen = new Set<string>();
+        const combinedProjectItems: LinkedItem[] = [];
+        for (const item of [...memberItems, ...managedItems]) {
+          if (seen.has(item.target)) continue;
+          seen.add(item.target);
+          combinedProjectItems.push(item);
+        }
+        const { kept: projectKept, skipped: projectSkipped } = capLinkedItems(combinedProjectItems, m.rule.maxLinkedItems);
+        perOwnerItems.set(m.agentKey, projectKept);
+        memberTargetsByOwner.set(m.agentKey, new Set(memberItems.map((i) => i.target)));
+
+        // BUTCHR-469 (review round 1 fix, refined in round 2): a MANAGED
+        // link skipped by the cap is safe to lose just this tick —
+        // `managedLinkedItems` re-lists the FULL managed-link collection
+        // every tick regardless of any cap, so a skipped one is simply a
+        // candidate again next tick, no different from how an issue owner's
+        // own capped-away link already behaves. A member skipped by the cap
+        // is NOT safe the same way UNLESS it is already stale (baselined,
+        // nothing new): a fresh-or-changed member skipped this tick only
+        // appeared because it fell inside the current watermark window, and
+        // once the watermark advances past that window it may never
+        // reappear — silently losing it, not merely delaying it. Round 2's
+        // own finding: checking ANY member (not just fresh/changed ones)
+        // held the watermark forever once at least one member existed at
+        // all, which is exactly what let an already-delivered member
+        // re-consume the scarce slot every tick — so this checks
+        // `freshOrChangedMembers` specifically, never the full member set.
+        // Holding the watermark (never committing this tick's
+        // `nextProjectWatermark` entry) means the next tick re-runs the SAME
+        // window; as soon as no fresh-or-changed member is skipped (either
+        // none are, or the backlog has fully drained), the watermark
+        // resumes advancing normally.
+        const freshOrChangedTargets = new Set(freshOrChangedMembers.map((i) => i.target));
+        if (projectSkipped.some((i) => freshOrChangedTargets.has(i.target))) {
+          nextProjectWatermark.delete(m.agentKey);
+          deps.log?.(`  WARNING: [linked-eventing] project-member cap: ${m.agentKey} (${m.projectKey}) has more changed members than maxLinkedItems (${m.rule.maxLinkedItems}) allows this tick; watermark held so the skipped member(s) are retried next tick, not lost`);
+        }
+      }
+
+      // BUTCHR-469: from here on, an issue owner and a project owner are
+      // handled UNIFORMLY — the coalescer, rate cap and notify below never
+      // fork on which kind of match produced an owner's items. `label` is
+      // only ever used for a log line (`rateCappedSuppressedLine`); every
+      // other decision reads `perOwnerItems`/`managedTargetsByOwner` by
+      // `agentKey` alone.
+      const ownerEntries: Array<{ agentKey: string; rule: Rule; label: string }> = [
+        ...opted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.issue.key })),
+        ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey })),
+      ];
+      // The subset of `kept` that participates in watch-set/removal
+      // tracking: everything, for an issue owner (unchanged pre-BUTCHR-469
+      // behaviour — every item it discovers is a real, structural or
+      // managed link that can genuinely be "removed"). For a project owner,
+      // only its MANAGED-link items: a member item aging out of the
+      // watermark window is not a removal (the issue is still a project
+      // member, just not recently touched) — see `ProjectLinkedEventingMatch`'s
+      // own doc comment.
+      const trackedKept = (agentKey: string, kept: readonly LinkedItem[]): LinkedItem[] => {
+        const managedTargets = managedTargetsByOwner.get(agentKey);
+        return managedTargets ? kept.filter((i) => managedTargets.has(i.target)) : [...kept];
+      };
+
+      // ONE combined batched fetch for every Jira-kind linked target across every opted owner this tick — never one call per linked item, never one per owner. BUTCHR-437: filtered to Jira-kind targets only — external-kind targets never ride this call (see this module's own top comment for why they are polled individually instead). BUTCHR-469 (review round 1 fix): a target already fetched by a project owner's own member-discovery search this tick (`memberFetchedByKey`) is excluded here — that search already returned full, fresh issue data, so re-requesting the same key via `key in (...)` would be a redundant second Jira call for data already in hand.
       const allTargets = new Set<string>();
-      for (const items of perOwnerItems.values()) for (const i of items) if (JIRA_DISCOVERY_KINDS.has(i.kind)) allTargets.add(i.target);
+      for (const items of perOwnerItems.values()) for (const i of items) if (JIRA_DISCOVERY_KINDS.has(i.kind) && !memberFetchedByKey.has(i.target)) allTargets.add(i.target);
       let fetched: JiraIssue[] = [];
       let searchFailed = false;
       if (allTargets.size) {
@@ -500,9 +835,17 @@ export function createLinkedEventingState(): LinkedEventingState {
       // kind of misleading): the next tick's fetch, if it succeeds, diffs
       // against the SAME unadvanced state and re-derives whatever was
       // genuinely outstanding, so nothing is lost, only delayed, exactly
-      // like a rate-capped tick.
+      // like a rate-capped tick. This intentionally ALSO discards a
+      // successful member-discovery search's own already-fetched data for
+      // this same tick — a partial tick that reports member changes while
+      // dropping every managed/native-link one would be its own kind of
+      // misleading. Nothing is lost here either: every project owner's
+      // watermark advance is committed only inside `advance()` further
+      // below, which this early `return` never reaches, so the next tick's
+      // member search re-derives the SAME window (plus anything new) rather
+      // than skipping past whatever this tick already (uncommitted-ly) saw.
       if (searchFailed) return;
-      const byKey = new Map(fetched.map((i) => [i.key, i]));
+      const byKey = new Map<string, JiraIssue>([...memberFetchedByKey, ...fetched.map((i) => [i.key, i] as const)]);
 
       // FACTORY-9: newest comment id per DISTINCT Jira-kind target actually
       // returned by the batched search above — one extra REST call per
@@ -532,15 +875,15 @@ export function createLinkedEventingState(): LinkedEventingState {
         targets.forEach((key, i) => { const c = cursors[i]; if (c !== undefined) commentCursorByTarget.set(key, c); });
       }
 
-      // Removed-link candidates, against each owner's watch set as of the LAST poll this ran for it — read before anything below mutates that set.
+      // Removed-link candidates, against each owner's watch set as of the LAST poll this ran for it — read before anything below mutates that set. BUTCHR-469: compared against `trackedKept`, not raw `kept` — see that helper's own doc comment for why a project owner's member-sourced items must never surface here.
       const removedByOwner = new Map<string, LinkedChangeEvent[]>();
-      for (const m of opted) {
-        const prevSet = watchSets.get(m.agentKey);
+      for (const entry of ownerEntries) {
+        const prevSet = watchSets.get(entry.agentKey);
         if (!prevSet) continue;
-        const keptTargets = new Set(perOwnerItems.get(m.agentKey)!.map((i) => i.target));
+        const keptTargets = new Set(trackedKept(entry.agentKey, perOwnerItems.get(entry.agentKey)!).map((i) => i.target));
         const gone: LinkedChangeEvent[] = [];
         for (const [target, kind] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind, detail: "no longer linked" });
-        if (gone.length) removedByOwner.set(m.agentKey, gone);
+        if (gone.length) removedByOwner.set(entry.agentKey, gone);
       }
 
       // BUTCHR-437 (PR #401 review round 1): poll-cadence gate for the THREE
@@ -553,12 +896,12 @@ export function createLinkedEventingState(): LinkedEventingState {
       // comment for why this is deliberately outside the rate-cap's
       // "advance only on success" discipline.
       const dueForExternalByOwner = new Map<string, boolean>();
-      for (const m of opted) {
-        const interval = m.rule.linkedPollIntervalMs;
-        const lastPoll = lastExternalPollAt.get(m.agentKey);
+      for (const entry of ownerEntries) {
+        const interval = entry.rule.linkedPollIntervalMs;
+        const lastPoll = lastExternalPollAt.get(entry.agentKey);
         const due = interval === undefined || lastPoll === undefined || now() - lastPoll >= interval;
-        dueForExternalByOwner.set(m.agentKey, due);
-        if (due) lastExternalPollAt.set(m.agentKey, now());
+        dueForExternalByOwner.set(entry.agentKey, due);
+        if (due) lastExternalPollAt.set(entry.agentKey, now());
       }
 
       // BUTCHR-437 (PR #401 review round 1): every due owner's external-kind
@@ -572,14 +915,14 @@ export function createLinkedEventingState(): LinkedEventingState {
       // key via `byKey`.
       interface ExternalTask { agentKey: string; item: LinkedItem; bkey: string; priorFingerprint: string | undefined }
       const externalTasks: ExternalTask[] = [];
-      for (const m of opted) {
-        if (!dueForExternalByOwner.get(m.agentKey)) continue;
-        for (const item of perOwnerItems.get(m.agentKey)!) {
+      for (const entry of ownerEntries) {
+        if (!dueForExternalByOwner.get(entry.agentKey)) continue;
+        for (const item of perOwnerItems.get(entry.agentKey)!) {
           if (JIRA_DISCOVERY_KINDS.has(item.kind)) continue;
-          const bkey = baselineKey(m.agentKey, item.target);
+          const bkey = baselineKey(entry.agentKey, item.target);
           const beforeRaw = baselines.get(bkey);
           const priorFingerprint = beforeRaw?.kind === "external" ? beforeRaw.fingerprint : undefined;
-          externalTasks.push({ agentKey: m.agentKey, item, bkey, priorFingerprint });
+          externalTasks.push({ agentKey: entry.agentKey, item, bkey, priorFingerprint });
         }
       }
       const externalVerdicts = new Map<string, PollVerdict>();
@@ -591,15 +934,15 @@ export function createLinkedEventingState(): LinkedEventingState {
       const eventsByOwner = new Map<string, LinkedChangeEvent[]>();
       const advanceByOwner = new Map<string, () => void>();
 
-      for (const m of opted) {
-        const kept = perOwnerItems.get(m.agentKey)!;
-        const wasUnreadable = unreadableOwners.get(m.agentKey) ?? new Set<string>();
-        const removedThisTick = removedByOwner.get(m.agentKey) ?? [];
+      for (const entry of ownerEntries) {
+        const kept = perOwnerItems.get(entry.agentKey)!;
+        const wasUnreadable = unreadableOwners.get(entry.agentKey) ?? new Set<string>();
+        const removedThisTick = removedByOwner.get(entry.agentKey) ?? [];
         const triggering: LinkedChangeEvent[] = [...removedThisTick];
         const stillUnreadable: LinkedChangeEvent[] = [];
         const toAdvance: Array<() => void> = [];
         const nowUnreadable = new Set<string>();
-        const dueForExternal = dueForExternalByOwner.get(m.agentKey) === true;
+        const dueForExternal = dueForExternalByOwner.get(entry.agentKey) === true;
 
         // FACTORY-9 (ticket scope item 2, "drops its cached snapshot so a
         // later re-add does not produce a spurious change"): a removed
@@ -617,8 +960,8 @@ export function createLinkedEventingState(): LinkedEventingState {
         // every other event this module coalesces.
         for (const ev of removedThisTick) {
           toAdvance.push(() => {
-            baselines.delete(baselineKey(m.agentKey, ev.target));
-            unreadableOwners.get(m.agentKey)?.delete(ev.target); // same leak, same fix: a re-added target must not inherit a stale unreadable/readable transition state
+            baselines.delete(baselineKey(entry.agentKey, ev.target));
+            unreadableOwners.get(entry.agentKey)?.delete(ev.target); // same leak, same fix: a re-added target must not inherit a stale unreadable/readable transition state
           });
         }
 
@@ -642,12 +985,33 @@ export function createLinkedEventingState(): LinkedEventingState {
               else triggering.push(event);
               continue;
             }
-            if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(m.agentKey)?.delete(item.target)); // became readable again
+            if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(entry.agentKey)?.delete(item.target)); // became readable again
             const snap = snapshotOf(issue, commentCursorByTarget.get(item.target));
-            const bkey = baselineKey(m.agentKey, item.target);
+            const bkey = baselineKey(entry.agentKey, item.target);
             const beforeRaw = baselines.get(bkey);
             const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
             if (!before) {
+              // BUTCHR-469 (review round 1 fix): a MEMBER-sourced target with
+              // no baseline is NOT a neutral "first sighting" to seed
+              // silently the way a managed/native link is — the
+              // member-discovery search (`project = <key> AND updated >=
+              // "-<N>m"`) only ever returns a target that has ALREADY
+              // changed since the watermark, so its first appearance IS the
+              // change. Silently seeding it here would swallow that change
+              // forever (the exact bug this fix addresses — reproduced by a
+              // real Jira window search, which never re-returns an
+              // unchanged issue the way this module's own OLD fake test
+              // double did). A target that is ALSO a managed link, or that
+              // already has a baseline from an earlier tick, is unaffected —
+              // this branch only ever runs when `before` is genuinely
+              // absent.
+              if (memberTargetsByOwner.get(entry.agentKey)?.has(item.target)) {
+                const watermark = usedWatermarkByOwner.get(entry.agentKey);
+                const detail = watermark === undefined ? "updated" : `updated since ${new Date(watermark).toISOString()}`;
+                triggering.push({ target: item.target, kind: item.kind, detail });
+                toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
+                continue;
+              }
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // first sighting: seed silently, no event (commentCursor included — see JiraSnapshot's own doc comment)
               continue;
             }
@@ -669,7 +1033,7 @@ export function createLinkedEventingState(): LinkedEventingState {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // real move, but daemon-label-only — not a real change here either
               continue;
             }
-            if (deps.suppress?.(item.target, snap.updated, m.agentKey)) {
+            if (deps.suppress?.(item.target, snap.updated, entry.agentKey)) {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // own-write echo
               continue;
             }
@@ -679,13 +1043,16 @@ export function createLinkedEventingState(): LinkedEventingState {
           }
 
           // BUTCHR-437: EXTERNAL kind (confluence / github-issue / github-pr /
-          // webpage) — only ever reachable when `m.rule.linkedDescriptionLinks
-          // === true` (see how `kept` is built above); skipped entirely off
-          // its own poll cadence. Already polled (concurrently, bounded) in
+          // webpage) — for an issue owner, only ever reachable when
+          // `entry.rule.linkedDescriptionLinks === true` (see how `kept` is
+          // built above); for a project owner, only ever reachable via a
+          // managed link to an external target (BUTCHR-469 — project owners
+          // have no description to scan). Skipped entirely off its own poll
+          // cadence either way. Already polled (concurrently, bounded) in
           // the pre-pass above — this is a synchronous lookup, exactly like
           // the Jira-kind branch's own `byKey.get` above.
           if (!dueForExternal) continue;
-          const bkey = baselineKey(m.agentKey, item.target);
+          const bkey = baselineKey(entry.agentKey, item.target);
           const beforeRaw = baselines.get(bkey);
           const before = beforeRaw?.kind === "external" ? beforeRaw : undefined;
           const verdict = externalVerdicts.get(bkey)!;
@@ -697,7 +1064,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             else triggering.push(event);
             continue;
           }
-          if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(m.agentKey)?.delete(item.target)); // became readable again
+          if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(entry.agentKey)?.delete(item.target)); // became readable again
           if (verdict.status === "not-modified") continue; // the server itself confirmed no change — fingerprint unchanged by definition, nothing to advance beyond the unreadable-recovery above
           if (!before) {
             toAdvance.push(() => baselines.set(bkey, { kind: "external", fingerprint: verdict.fingerprint })); // first sighting: seed silently, no event
@@ -710,43 +1077,50 @@ export function createLinkedEventingState(): LinkedEventingState {
 
         if (nowUnreadable.size) {
           toAdvance.push(() => {
-            const set = unreadableOwners.get(m.agentKey) ?? new Set<string>();
+            const set = unreadableOwners.get(entry.agentKey) ?? new Set<string>();
             for (const t of nowUnreadable) set.add(t);
-            unreadableOwners.set(m.agentKey, set);
+            unreadableOwners.set(entry.agentKey, set);
           });
         }
 
         // Still-unreadable context only ever rides a message some OTHER
         // trigger already earns — an unreadable-only tick with no transition
         // sends nothing (see this module's own top comment).
-        if (triggering.length) eventsByOwner.set(m.agentKey, [...triggering, ...stillUnreadable]);
-        advanceByOwner.set(m.agentKey, () => {
+        if (triggering.length) eventsByOwner.set(entry.agentKey, [...triggering, ...stillUnreadable]);
+        advanceByOwner.set(entry.agentKey, () => {
           for (const fn of toAdvance) fn();
-          watchSets.set(m.agentKey, new Map(kept.map((i) => [i.target, i.kind])));
+          watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, i.kind])));
+          // BUTCHR-469: commit this tick's project-watermark advance too,
+          // deferred exactly like every other piece of state above — never
+          // on a rate-capped tick (the loop below only calls `advance()`
+          // once a tick is genuinely delivered or has nothing to deliver).
+          // A no-op for an issue owner (never present in this map).
+          const wm = nextProjectWatermark.get(entry.agentKey);
+          if (wm !== undefined) projectWatermarks.set(entry.agentKey, wm);
         });
       }
 
-      for (const m of opted) {
-        const advance = advanceByOwner.get(m.agentKey)!;
-        const events = eventsByOwner.get(m.agentKey);
+      for (const entry of ownerEntries) {
+        const advance = advanceByOwner.get(entry.agentKey)!;
+        const events = eventsByOwner.get(entry.agentKey);
         if (!events?.length) { advance(); continue; }
-        const max = m.rule.maxLinkedTurnsPerHour;
+        const max = entry.rule.maxLinkedTurnsPerHour;
         if (max !== undefined) {
-          const history = (turns.get(m.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
+          const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
           if (history.length >= max) {
-            turns.set(m.agentKey, history);
-            deps.log?.(rateCappedSuppressedLine(m.issue.key, m.agentKey, history.length, max));
+            turns.set(entry.agentKey, history);
+            deps.log?.(rateCappedSuppressedLine(entry.label, entry.agentKey, history.length, max));
             continue; // NOT advanced — next allowed tick re-detects everything still outstanding
           }
           history.push(now());
-          turns.set(m.agentKey, history);
+          turns.set(entry.agentKey, history);
         }
         // Advanced only AFTER a successful notify (review round 1, non-
         // blocking note): a throwing notify leaves this owner's state
         // unadvanced too, so "delayed, not lost" holds for a notify failure
         // the same way it already does for a capped tick. (`lastExternalPollAt`
         // is the one exception — see this module's own top comment.)
-        await deps.notify(m.agentKey, m.agentKey, { linked: { events } });
+        await deps.notify(entry.agentKey, entry.agentKey, { linked: { events } });
         advance();
       }
     },
