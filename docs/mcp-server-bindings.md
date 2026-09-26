@@ -203,6 +203,55 @@ Claude/this daemon's own connections, `resolveMcpServerHeaders` (the
 are resolved independently and merged (`buildWorkspace`, src/agents/workspace.ts);
 `boundCodexServers` (Codex) calls `resolveAccountHeader` alone.
 
+### The general pattern beyond rocketr, and its one open gap (BUTCHR-419/462)
+
+`accountHeader` is not a rocketr-specific mechanism — it is the general, safe
+pattern for ANY future authenticated bound server whose "credential" is a
+non-secret identifier: a value that tells the server WHO is asking, never
+one that grants the ask by itself. Any such server can set `accountHeader`
+on its binding today and get a working, per-agent identifier through to both
+Claude's `mcp.json` and Codex's argv (`resolveAccountHeader`, above) — no
+new Butchr mechanism is needed to add another one; rocketr's
+`"x-rocketr-account"` is simply the first instance of it.
+
+That pattern stops at the boundary above: a bound server whose Codex
+connection needs an actual SECRET — a bearer token, an API key, anything
+that grants authority by itself — has no equivalent path today.
+`headersEnvVar` is precisely the mechanism that never reaches Codex, on
+purpose (see above), and nothing replaces it for Codex specifically.
+BUTCHR-420 (`butchr:shelved`; branch `origin/BUTCHR-420`, investigation at
+its head) confirmed a mechanism exists on Codex's OWN side: Codex's
+`mcp_servers.<name>` TOML table supports `bearer_token_env_var` and
+`env_http_headers`, both resolved by Codex from its own process environment
+at connect time, so a secret VALUE would never need to reach Codex's argv or
+config — only an env var NAME would. Verified empirically there against a
+real `codex` binary and a stub HTTP MCP server, not just from Codex's docs
+or `--help` output.
+
+Wiring that in is not a Butchr-only change, which is exactly why it wasn't
+built here: `@brooswit/drovr` (pinned in `package.json`) builds Codex's real
+launch argv from a typed `McpServerLaunchConfig` object, and that type has
+only `{name, url, headers?}` today — no field for an env-var name. Reaching
+the real spawned process needs `@brooswit/drovr` extended first (sibling
+`bearerTokenEnvVar`/`envHttpHeaders` fields, per BUTCHR-420's own
+investigation write-up on its branch) so its Codex renderer can emit them;
+appending raw `--config` strings on the Butchr side alone was tried and
+rejected on that branch, because the real spawn path never goes through the
+Butchr-side argv helper that a hand-appended string would land in — see the
+branch's own comment thread for why. That branch was deliberately shelved,
+not merged or rebased here, because no concrete consumer needs a
+secret-carrying Codex header today — the only authenticated bound server in
+this epic's scope (rocketr) is fully served by `accountHeader` alone. File
+the `@brooswit/drovr` extension (and the Butchr-side wiring on top of it)
+only once a real bound server needs it, building on BUTCHR-420's
+investigation rather than repeating it.
+
+Plainly, so this isn't read as more settled than it is: **a secret-carrying
+header for a Codex connection does not work today.** A Codex-launched
+binding that sets `headersEnvVar` still reaches Codex with no extra headers
+from it, `accountHeader` alone excepted, same as everywhere else in this
+doc.
+
 ### AGY
 
 Unaffected. AGY's launch (`agentLaunchConfig`'s `agy` branch) never reads
