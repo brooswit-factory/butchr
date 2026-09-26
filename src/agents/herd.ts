@@ -5,6 +5,7 @@ import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
+import { FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import type { McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
@@ -575,12 +576,28 @@ export class HerdrHerd implements Herd {
     }
   }
 
+  /**
+   * FACTORY-95: this agent's own display label, collision-safe against every
+   * OTHER currently-running agent — see `resolveDisplayLabels`'s own doc
+   * comment (src/rules/display-label.ts) for why passing the same kind of
+   * "current universe of keys" from both this call site and
+   * `relabelOwnedWorkspaces` below is what keeps the two paths agreeing on
+   * one agent's label. `byIssue()` never includes `key` itself before this
+   * spawn succeeds, so it is added explicitly rather than assumed present.
+   */
+  private async labelFor(key: string): Promise<string> {
+    const running = [...(await this.byIssue()).keys()];
+    const keys = running.includes(key) ? running : [...running, key];
+    return resolveDisplayLabels(keys, this.log).get(key) ?? key;
+  }
+
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
     await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
     if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
+    const label = await this.labelFor(spec.key);
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
-      label: spec.key,
+      label,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
@@ -606,8 +623,10 @@ export class HerdrHerd implements Herd {
         return { launch, ...(home ? { env: { HOME: home }, home } : {}) };
       },
     });
-    if (result.status === "success") this.refused.delete(spec.key);
-    else {
+    if (result.status === "success") {
+      this.refused.delete(spec.key);
+      await this.reportFullAgentKey(spec.key);
+    } else {
       if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);
       const current = await this.lifecycle(spec.key).resolveCurrent();
       if ((current?.agent === "claude" || current?.agent === "codex") && (current.agent_status === "idle" || current.agent_status === "done")) {
@@ -615,6 +634,99 @@ export class HerdrHerd implements Herd {
       }
     }
     return result;
+  }
+
+  /**
+   * FACTORY-95: preserves the full agent key in herdr's own per-workspace
+   * metadata bag, keyed by `FULL_AGENT_KEY_METADATA_FIELD` — the herdr-facing
+   * label carries only the short display id (`labelFor` above), so this is
+   * the one place the FULL key is retrievable from herdr for a given
+   * workspace. `resolveCurrent()` re-resolves this agent's own live identity
+   * (pane id AND `workspace_id`) rather than trusting anything cached — the
+   * SAME re-resolution `startProviders`' own failure branch already does a
+   * few lines up. Never throws and never logged as a SPAWN_TAG outcome: a
+   * metadata-write hiccup must never read as a failed spawn (the agent is
+   * already running) — logged as its own WARNING, swallowed, exactly like
+   * `relabelOwnedWorkspaces` below treats the same two herdr calls.
+   */
+  private async reportFullAgentKey(key: string): Promise<void> {
+    try {
+      const current = await this.lifecycle(key).resolveCurrent();
+      if (!current) return; // resolved away already (e.g. immediately stopped) — nothing to tag
+      await this.herdr.workspace.reportMetadata({
+        workspace_id: current.workspace_id,
+        source: METADATA_SOURCE,
+        tokens: { [FULL_AGENT_KEY_METADATA_FIELD]: key },
+      });
+    } catch (e) {
+      this.log?.(`WARNING: [spawn] ${key} metadata report failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  /**
+   * FACTORY-95 (implementing FACTORY-90): every currently-running,
+   * butchr-owned workspace's own `workspace_id`, keyed by its REAL agent key
+   * — derived from a pane's `cwd` via the shared `agentIdOfWorkspacePath`
+   * (src/agents/workspace.ts), NEVER via herdr's own current label (that is
+   * exactly the thing `relabelOwnedWorkspaces` below is about to change, so
+   * it can never double as an identity source — the same ownership
+   * discipline `reap.ts`'s `strandedCandidates` already documents for its
+   * own, differently-scoped join). Deliberately its OWN small join over
+   * `agent.list()`, not a `byIssue()` reuse: `byIssue()`'s map feeds the
+   * public `managedAgents()`/`ManagedHerdAgent` shape, which has no
+   * `workspaceId` field — duplicating this ambiguity-safe loop here keeps
+   * that public contract unchanged. "Ambiguous" (more than one live pane at
+   * one owned cwd) is dropped rather than guessed, same rule `byIssue()`
+   * already applies for the identical reason.
+   */
+  private async ownedWorkspaceIds(): Promise<Map<string, string>> {
+    const { agents } = await this.herdr.agent.list();
+    const map = new Map<string, string>();
+    const ambiguous = new Set<string>();
+    for (const a of agents) {
+      const key = agentIdOfWorkspacePath(a.cwd ?? null);
+      if (!key || !a.workspace_id) continue;
+      if (map.has(key)) { map.delete(key); ambiguous.add(key); }
+      else if (!ambiguous.has(key)) map.set(key, a.workspace_id);
+    }
+    return map;
+  }
+
+  /**
+   * FACTORY-95 (implementing FACTORY-90): relabels every currently-running,
+   * butchr-owned herdr workspace to its short display label
+   * (`resolveDisplayLabels`, src/rules/display-label.ts) and refreshes its
+   * metadata with the full agent key — no agent restart, `workspace.rename`/
+   * `workspace.reportMetadata` alone. Idempotent: safe to call repeatedly
+   * (today's only caller runs it once at daemon startup — src/daemon/index.ts)
+   * since both calls are themselves plain overwrites, never additive.
+   * Never throws: an overall failure (a herdr hiccup on `agent.list()`) or
+   * one workspace's own rename/metadata failure are both logged and
+   * swallowed — the same fault isolation `reap.ts`'s own `Reaper.check()`
+   * gives its per-candidate work, so one bad workspace never blocks the rest
+   * or the caller.
+   */
+  async relabelOwnedWorkspaces(): Promise<void> {
+    try {
+      const owned = await this.ownedWorkspaceIds();
+      if (!owned.size) return;
+      const labels = resolveDisplayLabels([...owned.keys()], this.log);
+      for (const [agentKey, workspaceId] of owned) {
+        const label = labels.get(agentKey) ?? agentKey;
+        try {
+          await this.herdr.workspace.rename({ workspace_id: workspaceId, label });
+          await this.herdr.workspace.reportMetadata({
+            workspace_id: workspaceId,
+            source: METADATA_SOURCE,
+            tokens: { [FULL_AGENT_KEY_METADATA_FIELD]: agentKey },
+          });
+        } catch (e) {
+          this.log?.(`WARNING: [relabel] ${agentKey} failed: ${(e as Error)?.message ?? e}`);
+        }
+      }
+    } catch (e) {
+      this.log?.(`WARNING: [relabel] detector error: ${(e as Error)?.message ?? e}`);
+    }
   }
 
   private async readPane(paneId: string): Promise<string> {
