@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems, sessionDefinitionsPath,
-  tierToModel, SESSION_DEFINITION_VENDORS, SESSION_PERMISSION_MODES, SESSION_TIERS,
+  tierToModel, effectiveAgent, SESSION_DEFINITION_VENDORS, SESSION_PERMISSION_MODES, SESSION_TIERS,
 } from "../../src/resources/session-definition.js";
 
 const HOME = "/home/tester";
@@ -51,6 +51,43 @@ describe("sessionDefinitionProblems", () => {
   test("tier: one of SESSION_TIERS", () => {
     for (const tier of SESSION_TIERS) expect(sessionDefinitionProblems({ ...good(), tier }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), tier: "tier99" }, "def")[0]).toContain("tier must be one of");
+  });
+  // FACTORY-75: `tier` (deprecated) and `modelPower`+`effort` (the new
+  // two-axis mechanism) are mutually exclusive ways to say the same thing.
+  describe("modelPower/effort (FACTORY-75 two-axis mechanism) vs deprecated tier — mutual exclusivity", () => {
+    const withoutTier = () => { const d: Record<string, unknown> = { ...good() }; delete d.tier; return d; };
+    test("modelPower+effort alone (no tier) is valid", () => {
+      expect(sessionDefinitionProblems({ ...withoutTier(), modelPower: 25, effort: 20 }, "def")).toEqual([]);
+    });
+    test("combining tier with modelPower/effort is rejected", () => {
+      expect(sessionDefinitionProblems({ ...good(), modelPower: 25 }, "def")).toEqual(['def must not combine deprecated "tier" with "modelPower"/"effort" — use one or the other']);
+      expect(sessionDefinitionProblems({ ...good(), effort: 20 }, "def")).toEqual(['def must not combine deprecated "tier" with "modelPower"/"effort" — use one or the other']);
+      expect(sessionDefinitionProblems({ ...good(), modelPower: 25, effort: 20 }, "def")).toEqual(['def must not combine deprecated "tier" with "modelPower"/"effort" — use one or the other']);
+    });
+    test("neither tier nor modelPower/effort is rejected", () => {
+      expect(sessionDefinitionProblems(withoutTier(), "def")).toEqual(['def must set either "tier" (deprecated) or both "modelPower" and "effort"']);
+    });
+    test("modelPower without effort (and vice versa) is rejected", () => {
+      expect(sessionDefinitionProblems({ ...withoutTier(), modelPower: 25 }, "def")).toEqual(['def.effort is required when "tier" is absent']);
+      expect(sessionDefinitionProblems({ ...withoutTier(), effort: 20 }, "def")).toEqual(['def.modelPower is required when "tier" is absent']);
+    });
+    test("modelPower/effort out of range or non-integer are rejected, collected alongside each other", () => {
+      const problems = sessionDefinitionProblems({ ...withoutTier(), modelPower: 101, effort: -1 }, "def");
+      expect(problems).toEqual(["def.modelPower must be between 0 and 100", "def.effort must be between 0 and 100"]);
+      expect(sessionDefinitionProblems({ ...withoutTier(), modelPower: 25.5, effort: 20 }, "def")).toEqual(["def.modelPower must be an integer"]);
+    });
+    test("parseSessionDefinition stores modelPower/effort verbatim, tier absent", () => {
+      const parsed = parseSessionDefinition({ ...withoutTier(), modelPower: 25, effort: 20 }, "def", HOME);
+      expect(parsed.modelPower).toBe(25);
+      expect(parsed.effort).toBe(20);
+      expect(parsed.tier).toBeUndefined();
+    });
+    test("parseSessionDefinition stores tier verbatim, modelPower/effort absent (the deprecated path, unchanged)", () => {
+      const parsed = parseSessionDefinition(good(), "def", HOME);
+      expect(parsed.tier).toBe("tier1");
+      expect(parsed.modelPower).toBeUndefined();
+      expect(parsed.effort).toBeUndefined();
+    });
   });
   test("permissionMode: one of SESSION_PERMISSION_MODES, including auto", () => {
     expect(SESSION_PERMISSION_MODES).toContain("auto");
@@ -269,6 +306,33 @@ describe("tierToModel", () => {
     for (const tier of SESSION_TIERS) {
       expect(tierToModel("claude", tier).length).toBeGreaterThan(0);
       expect(tierToModel("codex", tier).length).toBeGreaterThan(0);
+    }
+  });
+});
+
+// FACTORY-75 — the ONE resolver specForSessionDefinition/staleIssues'
+// resolvedAgentOf both read; see its own doc comment for why the tier path
+// deliberately bypasses the modelPower/effort tables entirely.
+describe("effectiveAgent", () => {
+  test("tier path (deprecated): resolves via tierToModel verbatim, NO effort at all — reproduces today's launch exactly", () => {
+    expect(effectiveAgent({ vendor: "claude", tier: "tier1" })).toEqual({ model: "sonnet" });
+    expect(effectiveAgent({ vendor: "claude", tier: "tier4" })).toEqual({ model: "opus" });
+    expect(effectiveAgent({ vendor: "codex", tier: "tier2" })).toEqual({ model: "gpt-5.6-terra" });
+  });
+  test("tier path never returns an `effort` key — not even undefined-but-present", () => {
+    const result = effectiveAgent({ vendor: "codex", tier: "tier1" });
+    expect("effort" in result).toBe(false);
+  });
+  test("modelPower/effort path: resolves both axes through power-scale.ts", () => {
+    expect(effectiveAgent({ vendor: "claude", modelPower: 100, effort: 70 })).toEqual({ model: "fable", effort: "xhigh" });
+    expect(effectiveAgent({ vendor: "claude", modelPower: 0, effort: 0 })).toEqual({ model: "haiku", effort: "low" });
+    expect(effectiveAgent({ vendor: "codex", modelPower: 0, effort: 20 })).toEqual({ model: "gpt-5.6-luna", effort: "medium" });
+  });
+  test("back-compat: every tier resolves to the SAME model tierToModel names — a table/logic change here can never silently move a live tier-based definition's model", () => {
+    for (const tier of SESSION_TIERS) {
+      for (const vendor of ["claude", "codex"] as const) {
+        expect(effectiveAgent({ vendor, tier }).model).toBe(tierToModel(vendor, tier));
+      }
     }
   });
 });

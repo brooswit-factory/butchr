@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { expandHome } from "./filesystem-query.js";
 import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
 import { formatResourceRef, parseResourceRef } from "./resource-ref.js";
+import { powerValueProblems, resolveModelPower, resolveEffortPower, type AgentEffort } from "./power-scale.js";
 
 /** Agent vendors a managed-session definition may name. Narrower than `AGENT_HARNESSES` (src/rules/rules.ts) — `agy` is not a Bakr/Candlestix vendor and is deliberately excluded here, not merely unused. */
 export const SESSION_DEFINITION_VENDORS = ["claude", "codex"] as const;
@@ -72,6 +73,45 @@ export function tierToModel(vendor: SessionDefinitionVendor, tier: SessionTier):
   return (vendor === "codex" ? CODEX_TIER_MODEL : CLAUDE_TIER_MODEL)[tier];
 }
 
+/**
+ * FACTORY-75 — the ONE exported resolver `specForSessionDefinition`
+ * (src/rules/session-definition-type.ts), `buildWorkspace`'s stale-check
+ * seam (src/agents/herd.ts's `resolvedAgentOf`), and this ticket's own
+ * "visibility" requirement (an exported resolver, not buried in the launch
+ * path) all read from — never a second, independently-recomputed copy of
+ * this logic anywhere else in this codebase.
+ *
+ * Deliberately BYPASSES the `modelPower`/`effort` tables entirely for a
+ * `tier`-based (deprecated) definition, rather than mapping `tier` onto a
+ * scale POINT that happens to resolve to the same model: `tierToModel`
+ * above is reused verbatim (byte-identical to before this ticket), and NO
+ * `effort` is returned at all for that path (`effort: undefined`) — this is
+ * the ONLY way to reproduce today's launch behaviour EXACTLY, not merely
+ * approximately:
+ *   - Claude: today's managed-session launch already always sends
+ *     `--effort` (`ClaudeAgentLaunch.effort` is a REQUIRED field in
+ *     `@brooswit/drovr`), defaulting through `agentLaunchConfig`'s own
+ *     `agent.effort ?? effortFor(spec.issuetype)` fallback chain
+ *     (src/agents/argv.ts/workspace.ts) whenever nothing sets `agent.effort`
+ *     — exactly what leaving `effort` unset here preserves, byte-for-byte,
+ *     including honouring any global `config.agent.effort` override a
+ *     daemon might have configured (a hardcoded "high" here would silently
+ *     override that instead).
+ *   - Codex: today's managed-session launch sends NO reasoning-effort
+ *     override at all (no `.codex/config.toml` `model_reasoning_effort`
+ *     line is ever written for a non-`jira-project` spec — see
+ *     `buildWorkspace`, src/agents/workspace.ts). Resolving `tier` through
+ *     the effort table would ALWAYS produce SOME value and start emitting a
+ *     flag that has never been sent before — a real behaviour change this
+ *     ticket's own back-compat requirement forbids.
+ * A `modelPower`/`effort`-based (new) definition has no such constraint —
+ * both axes always resolve to a concrete value, exactly as designed.
+ */
+export function effectiveAgent(definition: Pick<SessionDefinition, "vendor" | "tier" | "modelPower" | "effort">): { model: string; effort?: AgentEffort } {
+  if (definition.tier !== undefined) return { model: tierToModel(definition.vendor, definition.tier) };
+  return { model: resolveModelPower(definition.vendor, definition.modelPower!), effort: resolveEffortPower(definition.effort!) };
+}
+
 export interface SessionDefinition {
   /**
    * Where the managed agent actually works — a Bakr agent's own project
@@ -88,7 +128,33 @@ export interface SessionDefinition {
   /** The agent's prompt/role. Non-empty; no `@builtin:` resolution (that shorthand is a `Rule` convenience — a definition's brief is always literal). */
   brief: string;
   vendor: SessionDefinitionVendor;
-  tier: SessionTier;
+  /**
+   * FACTORY-75: DEPRECATED in favour of `modelPower`/`effort` below — kept
+   * working, never removed, for the 8 live codey definitions and any other
+   * definition still written this way (`sessionDefinitionProblems` logs a
+   * deprecation note once per path when this is used, via
+   * `onceDeprecatedTier`, src/rules/session-definition-type.ts). A
+   * definition sets EITHER `tier` alone OR both `modelPower`/`effort`,
+   * never a mix — see `sessionDefinitionProblems`'s own validation for the
+   * exact rule and `effectiveAgent` below for how each path resolves.
+   */
+  tier?: SessionTier;
+  /**
+   * FACTORY-75 (src/resources/power-scale.ts) — 0-100, which model this
+   * definition's agent launches, resolved through that vendor's own table.
+   * Required together with `effort` when `tier` is absent; see this
+   * interface's own `tier` doc comment for the exclusivity rule.
+   */
+  modelPower?: number;
+  /**
+   * FACTORY-75 (src/resources/power-scale.ts) — 0-100, how hard that model
+   * thinks, resolved through the shared effort table then translated to
+   * this vendor's own CLI/config surface at launch time
+   * (`codexReasoningEffortFlag` for Codex; Claude's own `--effort` accepts
+   * the resolved `AgentEffort` value directly). Required together with
+   * `modelPower` when `tier` is absent.
+   */
+  effort?: number;
   permissionMode: SessionPermissionMode;
   /**
    * BUTCHR-453/BUTCHR-463 — reaches a Claude launch's
@@ -187,7 +253,7 @@ export interface SessionDefinition {
 }
 
 const DEFINITION_FIELDS = new Set([
-  "workingDirectory", "brief", "vendor", "tier", "permissionMode", "strictMcpConfig", "execution", "account", "role", "frozen",
+  "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "execution", "account", "role", "frozen",
   "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects",
 ]);
 
@@ -278,7 +344,29 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   problems.push(...workingDirectoryProblems(doc.workingDirectory, home).map((p) => `${at}.${p}`));
   if (!nonEmpty(doc.brief)) problems.push(`${at}.brief must be a non-empty string`);
   if (!oneOf(SESSION_DEFINITION_VENDORS, doc.vendor)) problems.push(`${at}.vendor must be one of ${SESSION_DEFINITION_VENDORS.join(", ")}`);
-  if (!oneOf(SESSION_TIERS, doc.tier)) problems.push(`${at}.tier must be one of ${SESSION_TIERS.join(", ")}`);
+  // FACTORY-75: `tier` (deprecated) and `modelPower`+`effort` (the new
+  // two-axis mechanism, src/resources/power-scale.ts) are mutually
+  // exclusive ways to say the same thing — exactly one of the two shapes
+  // must be present, never both (ambiguous precedence) and never neither
+  // (every definition must resolve to SOME model). See `effectiveAgent`
+  // below for how each shape resolves once valid.
+  {
+    const hasTier = doc.tier !== undefined;
+    const hasModelPower = doc.modelPower !== undefined;
+    const hasEffort = doc.effort !== undefined;
+    if (hasTier && (hasModelPower || hasEffort)) {
+      problems.push(`${at} must not combine deprecated "tier" with "modelPower"/"effort" — use one or the other`);
+    } else if (hasTier) {
+      if (!oneOf(SESSION_TIERS, doc.tier)) problems.push(`${at}.tier must be one of ${SESSION_TIERS.join(", ")}`);
+    } else if (!hasModelPower && !hasEffort) {
+      problems.push(`${at} must set either "tier" (deprecated) or both "modelPower" and "effort"`);
+    } else {
+      if (!hasModelPower) problems.push(`${at}.modelPower is required when "tier" is absent`);
+      else problems.push(...powerValueProblems(doc.modelPower, `${at}.modelPower`));
+      if (!hasEffort) problems.push(`${at}.effort is required when "tier" is absent`);
+      else problems.push(...powerValueProblems(doc.effort, `${at}.effort`));
+    }
+  }
   if (!oneOf(SESSION_PERMISSION_MODES, doc.permissionMode)) problems.push(`${at}.permissionMode must be one of ${SESSION_PERMISSION_MODES.join(", ")}`);
   if (doc.strictMcpConfig !== undefined) {
     if (typeof doc.strictMcpConfig !== "boolean") problems.push(`${at}.strictMcpConfig must be a boolean`);
@@ -304,7 +392,9 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     workingDirectory: expandHome((d.workingDirectory as string).trim(), home)!,
     brief: (d.brief as string).trim(),
     vendor: d.vendor as SessionDefinitionVendor,
-    tier: d.tier as SessionTier,
+    ...(d.tier !== undefined ? { tier: d.tier as SessionTier } : {}),
+    ...(d.modelPower !== undefined ? { modelPower: d.modelPower as number } : {}),
+    ...(d.effort !== undefined ? { effort: d.effort as number } : {}),
     permissionMode: d.permissionMode as SessionPermissionMode,
     ...(d.strictMcpConfig !== undefined ? { strictMcpConfig: d.strictMcpConfig as boolean } : {}),
     execution: (d.execution as ExecutionMode | undefined) ?? "swarm",

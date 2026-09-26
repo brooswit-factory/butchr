@@ -2,11 +2,11 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
-import type { McpServerBinding } from "../rules/rules.js";
+import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -180,6 +180,22 @@ export const PANE_BUSY_MAX_RETRIES = 4;
 export const SPAWN_TAG = "[spawn]";
 
 /**
+ * FACTORY-75 (PR #473 review fix) — `staleIssues()`'s own argv fallback for
+ * `--model`/`--effort`, used ONLY when `workspaceModel`/`workspaceEffort`
+ * (src/agents/workspace.ts) find no persisted file: a workspace spawned by
+ * a build before this ticket never wrote one, so this recovers what the
+ * ALREADY-RUNNING process was actually launched with directly from its own
+ * argv, rather than treating "no persisted file" as "no model/effort at
+ * all" — see `staleIssues()`'s own doc comment on this exact seam for the
+ * mass-restart-on-deploy bug this closes. Same `argv.indexOf(flag)` shape
+ * Drovr's own internal (unexported) `flagValue` uses.
+ */
+const argvFlagValue = (argv: readonly string[], flag: string): string | undefined => {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] : undefined;
+};
+
+/**
  * BUTCHR-334: which reconcile loop produced a given `spawn()` attempt — see
  * `SPAWN_TAG`'s own doc comment for the cross-instrument rule this exists to
  * close. `spawn()` itself cannot know this (both loops call the same
@@ -254,6 +270,26 @@ export class HerdrHerd implements Herd {
      * this field existed.
      */
     private readonly accountNameOf?: (issue: string) => string | undefined,
+    /**
+     * FACTORY-75 — this issue's CURRENTLY resolved `(model, effort)` pair
+     * for the given provider, from the `modelPower`/`effort` two-axis
+     * mechanism (src/resources/power-scale.ts): a managed-session
+     * definition's own field, or a rule's `agentPreferences` entry
+     * (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
+     * own doc comment, src/rules/rules.ts, for why nothing downstream of
+     * that needed to change). `undefined` for anything this daemon cannot
+     * resolve (a legacy/bare-issue id, a rule/definition since removed, or
+     * one that sets neither `model`/`modelPower` nor `effort`/`effortPower`
+     * for this provider) — `staleIssues()` below then skips the
+     * comparison entirely, the same fail-safe "nothing to compare, so
+     * nothing is stale" shape `mcpBindingsOf`'s own absence already has.
+     * Called ONLY from `staleIssues()`, never from `spawn()` — a real
+     * launch already gets its resolved agent straight from `spec.agents`
+     * (`specForSessionDefinition`/`rule.agentPreferences`), so this seam
+     * exists purely for the comparison side, unlike `mcpBindingsOf`/
+     * `accountNameOf` above (which augment a real spawn too).
+     */
+    private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -468,7 +504,76 @@ export class HerdrHerd implements Herd {
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
-      if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
+      if (!check.ok) { out.push({ issue, reason: check.reason, observedArgv: proc.argv }); continue; }
+      // FACTORY-75: `--model`/`--effort` are deliberately excluded from
+      // `checkArgv`/`checkManagedAgentArgv`'s own comparison just above
+      // (this method's own top comment: "issuetype/summary/parent don't
+      // matter here" — Drovr never diffs those two flags at all, for ANY
+      // spec), so the two-axis (`modelPower`/`effort`) mechanism's own
+      // auto-reconcile-on-change requirement needs its OWN comparison here:
+      // whatever this workspace was ACTUALLY spawned with
+      // (`workspaceModel`/`workspaceEffort`, read back from what
+      // `buildWorkspace` persisted at spawn time) against what the
+      // definition/rule CURRENTLY resolves to (`resolvedAgentOf`, live —
+      // not persisted, so a definition/rule edit OR a table edit shipped in
+      // a new daemon build is caught on the very next poll after whichever
+      // of those actually took effect). `resolvedAgentOf` returning
+      // `undefined` (nothing this daemon can resolve for this issue), or a
+      // model/effort of `undefined` (this provider's own preference sets
+      // neither), means nothing to compare — never flagged, the same
+      // fail-safe shape `mcpBindingsOf`'s own absence already has.
+      //
+      // REVIEW FIX (PR #473, first review): a workspace spawned by a build
+      // BEFORE this ticket never wrote `.butchr-model.json`/`.butchr-effort.json`
+      // at all — `workspaceModel`/`workspaceEffort` return `undefined` for
+      // every already-running managed session (tier-based, so `liveResolved.model`
+      // is always defined) and every already-running rule agent whose
+      // `agentPreferences` already set an explicit `model`/`effort` (unrelated
+      // to `modelPower`/`effortPower`). Comparing that `undefined` directly
+      // against `liveResolved.model` (always defined for those cases) would
+      // flag EVERY one of them stale on the very first poll after deploy — a
+      // fleet-wide mass restart, exactly the "unexpected behaviour change on
+      // deploy" this ticket's own back-compat requirement forbids, and the
+      // same bug SHAPE FACTORY-43 fixed (a stale-check expectation that does
+      // not match what the previous launch actually persisted).
+      //
+      // Fixed by falling back to what `proc.argv` shows the process was
+      // ACTUALLY launched with, when the persisted file is absent — Claude
+      // always emits both `--model` and `--effort` unconditionally
+      // (`agentLaunchConfig`'s claude branch: both fields are non-optional,
+      // always resolved via a default), so `argvFlagValue` recovers the
+      // real value with no `buildWorkspace` change needed for THIS build to
+      // read back a PREVIOUS build's launch. Codex has no `--effort` flag at
+      // all (its reasoning effort lives in `.codex/config.toml`, never
+      // argv — see `codexReasoningEffortFlag`'s own doc comment,
+      // src/resources/power-scale.ts) and `--model` only when explicitly
+      // set; with NO persisted file and NO argv signal for Codex effort,
+      // there is nothing to compare against, so `?? liveResolved.effort`
+      // makes that comparison trivially equal (never flagged) rather than
+      // guessing a value — the same "unknown, not stale" fail-safe this
+      // file's own `staleIssues()` already uses for a pane that reports
+      // nothing (see "no cwd reported" / "pane.process_info rejects" tests).
+      // Once a respawn actually happens (this comparison flags a REAL
+      // change, or any other reason), the NEW build's `buildWorkspace`
+      // persists real values and every later poll compares persisted-vs-live
+      // exactly as designed, with no more argv fallback needed.
+      const liveResolved = this.resolvedAgentOf?.(issue, provider);
+      if (liveResolved) {
+        const persistedModel = workspaceModel(cwd) ?? argvFlagValue(proc.argv, "--model");
+        // Claude's `--effort` value is always one of AgentEffort's own literals (agentLaunchConfig
+        // never emits anything else) — safe to widen back to that type here.
+        const observedClaudeEffort = provider === "claude" ? argvFlagValue(proc.argv, "--effort") as AgentEffort | undefined : undefined;
+        const persistedEffort = workspaceEffort(cwd) ?? (provider === "claude" ? observedClaudeEffort : liveResolved.effort);
+        const modelChanged = liveResolved.model !== undefined && liveResolved.model !== persistedModel;
+        const effortChanged = liveResolved.effort !== undefined && liveResolved.effort !== persistedEffort;
+        if (modelChanged || effortChanged) {
+          out.push({
+            issue,
+            reason: `argv lacks --model/--effort matching the current definition/rule (model: ${persistedModel ?? "(default)"} -> ${liveResolved.model ?? persistedModel ?? "(default)"}, effort: ${persistedEffort ?? "(default)"} -> ${liveResolved.effort ?? persistedEffort ?? "(default)"})`,
+            observedArgv: proc.argv,
+          });
+        }
+      }
     }
     return out;
   }
@@ -568,7 +673,14 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
         return;
       }
-      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}`);
+      // FACTORY-75 visibility requirement: the resolved (model, effort)
+      // pair this spawn intended (`spec.agents`, whatever
+      // `specForSessionDefinition`/`rule.agentPreferences` resolved via the
+      // two-axis mechanism, src/resources/power-scale.ts) rides on the SAME
+      // journal line every other spawn outcome already gets — never a
+      // separate log call that could land out of order with this one.
+      const agentsNote = spec.agents?.length ? ` agents=${JSON.stringify(spec.agents)}` : "";
+      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}${agentsNote}`);
     } catch (e) {
       this.log?.(`${SPAWN_TAG} ${issue} failed origin=${origin} — ${(e as Error)?.message ?? e}`);
       throw e;

@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } 
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -734,6 +734,86 @@ describe("buildWorkspace", () => {
       expect(workspaceStrictMcpConfig(dir)).toBeUndefined();
       expect(workspacePermissionMode("/does/not/exist")).toBeUndefined();
       expect(workspaceStrictMcpConfig("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-75: `spec.agents[].model`/`.effort` (the two-axis mechanism's
+  // resolved value for whichever provider this workspace launches under)
+  // are persisted the SAME shape as `permissionMode`/`strictMcpConfig`
+  // above — `HerdrHerd.staleIssues()`'s own `resolvedAgentOf` seam
+  // (src/agents/herd.ts) reads them back to compare against what the
+  // definition/rule CURRENTLY resolves to.
+  test("workspaceModel/workspaceEffort round-trip what buildWorkspace persisted, keyed by the launch's own provider", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-model-effort-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }] }, "http://x/mcp", "claude");
+      expect(readFileSync(join(dir, ".butchr-model.json"), "utf8")).toBe(JSON.stringify("fable"));
+      expect(readFileSync(join(dir, ".butchr-effort.json"), "utf8")).toBe(JSON.stringify("xhigh"));
+      expect(workspaceModel(dir)).toBe("fable");
+      expect(workspaceEffort(dir)).toBe("xhigh");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceModel/workspaceEffort persist the entry matching the ACTUAL launch provider, not just spec.agents[0] — a fallback chain's other entries are ignored", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-model-effort-provider-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const spec: SpawnSpec = { key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }, { harness: "codex", model: "gpt-6-astra" }] };
+      const dirCodex = buildWorkspace(spec, "http://x/mcp", "codex");
+      expect(workspaceModel(dirCodex)).toBe("gpt-6-astra");
+      expect(workspaceEffort(dirCodex)).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceModel/workspaceEffort are undefined for a workspace where neither was ever set (no spec.agents entry for this provider), never throws", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-model-effort-none-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
+      expect(workspaceModel(dir)).toBeUndefined();
+      expect(workspaceEffort(dir)).toBeUndefined();
+      expect(workspaceModel("/does/not/exist")).toBeUndefined();
+      expect(workspaceEffort("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-75: Codex has no `--effort`/`--reasoning` CLI flag at all
+  // (`CodexAgentLaunch`, @brooswit/drovr, has no effort field) — its own
+  // `model_reasoning_effort` config key is emitted into the SAME
+  // per-workspace `.codex/config.toml` the freeform (jira-project) path
+  // already writes `approval_policy`/`sandbox_mode` into (see
+  // `codexReasoningEffortFlag`'s own doc comment, src/resources/power-scale.ts,
+  // for how the config key itself was confirmed and its caveats).
+  test("a codex managed-session launch with a resolved effort gets .codex/config.toml's model_reasoning_effort — a tier-based (back-compat) launch, which never resolves an effort, gets no such file at all", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-codex-effort-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const withEffort = buildWorkspace({ key: "KAN-10", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-6-astra", effort: "xhigh" }] }, "http://x/mcp", "codex");
+      const configToml = readFileSync(join(withEffort, ".codex/config.toml"), "utf8");
+      expect(configToml).toBe('model_reasoning_effort = "xhigh"\n'); // live-verified passthrough — see codexReasoningEffortFlag's own doc comment.
+      const tierBased = buildWorkspace({ key: "KAN-11", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-5.6-luna" }] }, "http://x/mcp", "codex");
+      expect(existsSync(join(tierBased, ".codex", "config.toml"))).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

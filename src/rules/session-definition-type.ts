@@ -27,12 +27,12 @@
 import { readFile } from "node:fs/promises";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, resourceMatches, unitAgentKey, type ExecutionUnit } from "./execution.js";
-import type { AccountPolicy, AgentRole, Rule } from "./rules.js";
+import type { AccountPolicy, AgentEffort, AgentRole, Rule } from "./rules.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
-import { isHiddenDefinitionFile, parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
+import { isHiddenDefinitionFile, parseSessionDefinitionFile, effectiveAgent, type SessionDefinition } from "../resources/session-definition.js";
 import type { EventPoll, EventRules, PollSnapshot, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
 import { onceOversized } from "./filesystem-type.js";
@@ -104,6 +104,19 @@ export function onceFrozenDefinition(log: ((line: string) => void) | undefined):
   };
 }
 
+/** Told about a definition still using the deprecated `tier` field, distinctly from an invalid or frozen one — logged, never rejected (see `SessionDefinition.tier`'s own doc comment, src/resources/session-definition.ts). */
+export type DeprecatedTierDefinition = (path: string) => void;
+
+/** Logs a deprecated-`tier` definition once per path — never respammed while it keeps using `tier`. Same dedup shape as `onceFrozenDefinition`. */
+export function onceDeprecatedTier(log: ((line: string) => void) | undefined): DeprecatedTierDefinition {
+  const logged = new Set<string>();
+  return (path) => {
+    if (logged.has(path)) return;
+    logged.add(path);
+    log?.(`[managed-sessions] ${path} uses deprecated "tier" — migrate to "modelPower"/"effort" (docs/power-scale.md)`);
+  };
+}
+
 export interface SessionDefinitionSearchDeps {
   rule: Rule;
   /** Every filesystem resource the built-in query's root currently lists (src/resources/filesystem.ts, injectable for tests). */
@@ -148,6 +161,7 @@ export async function searchSessionDefinitions(
   onInvalid?: InvalidDefinition,
   onFrozen?: FrozenDefinition,
   onMissingRoot?: MissingRoot,
+  onDeprecatedTier?: DeprecatedTierDefinition,
 ): Promise<SessionDefinitionMatch[]> {
   const query = parseFilesystemQuery(deps.rule.query);
   let resources: FilesystemResource[];
@@ -172,6 +186,7 @@ export async function searchSessionDefinitions(
       continue;
     }
     if (definition.frozen) { onFrozen?.(resource.path); continue; }
+    if (definition.tier !== undefined) onDeprecatedTier?.(resource.path);
     out.push({
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: deps.rule.id, resourceId: resource.path }),
       rule: deps.rule, resource, definition,
@@ -202,7 +217,7 @@ export function specForSessionDefinition({ agentKey, resource, definition }: Ses
     summary: `managed session (${definition.vendor}, ${definition.tier}) — ${resource.name}`,
     parent: null,
     brief: definition.brief,
-    agents: [{ harness: definition.vendor, model: tierToModel(definition.vendor, definition.tier) }],
+    agents: [{ harness: definition.vendor, ...effectiveAgent(definition) }],
     cwd: definition.workingDirectory,
     permissionMode: definition.permissionMode,
     ...(definition.strictMcpConfig !== undefined ? { strictMcpConfig: definition.strictMcpConfig } : {}),
@@ -272,6 +287,22 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * fail-safe `"none"` default — same brief, documented window `roles` has.
    */
   accountPolicies?: Map<string, AccountPolicy>;
+  /**
+   * FACTORY-75 — same rebuilt-every-poll seam as `roles`/`accountPolicies`
+   * above, one field over: this poll's eligible definitions' resolved
+   * `(model, effort)` pair (`effectiveAgent`, src/resources/session-definition.ts),
+   * keyed identically. `HerdrHerd.staleIssues()`'s own `resolvedAgentOf`
+   * seam (src/agents/herd.ts) consults this map for a managed-session id
+   * to learn what the definition CURRENTLY resolves to — as opposed to
+   * `workspaceModel`/`workspaceEffort` (src/agents/workspace.ts), which
+   * read what a workspace was ACTUALLY spawned with — so an edit to a
+   * definition's `modelPower`/`effort`/`tier` (or a table edit shipped in a
+   * new daemon build) is exactly the mismatch that seam is built to catch.
+   * Before this loop's first poll completes, an already-running
+   * managed-session agent has no entry yet — `resolvedAgentOf` falls back
+   * to treating it as unresolvable, i.e. no comparison, no false positive.
+   */
+  resolvedAgents?: Map<string, { model: string; effort?: AgentEffort }>;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
@@ -279,11 +310,12 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
   const onInvalid = onceInvalidDefinition(deps.log);
   const onFrozen = onceFrozenDefinition(deps.log);
   const onMissingRoot = onceMissingRoot(deps.log);
+  const onDeprecatedTier = onceDeprecatedTier(deps.log);
   return {
     discovery: {
       idOf: unitAgentKey,
       search: async () => {
-        const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot);
+        const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot, onDeprecatedTier);
         if (deps.roles) {
           deps.roles.clear();
           for (const m of matches) deps.roles.set(m.agentKey, m.definition.role);
@@ -291,6 +323,10 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
         if (deps.accountPolicies) {
           deps.accountPolicies.clear();
           for (const m of matches) deps.accountPolicies.set(m.agentKey, m.definition.account);
+        }
+        if (deps.resolvedAgents) {
+          deps.resolvedAgents.clear();
+          for (const m of matches) deps.resolvedAgents.set(m.agentKey, effectiveAgent(m.definition));
         }
         return groupExecutionUnits([deps.rule], matches);
       },

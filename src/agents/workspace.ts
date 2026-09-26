@@ -17,6 +17,7 @@ import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
+import { codexReasoningEffortFlag } from "../resources/power-scale.js";
 
 /**
  * `key` is the herd identity: a rule-engine agent key
@@ -375,14 +376,42 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // respawned every poll forever.
   if (spec.permissionMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-permission-mode.json"),JSON.stringify(spec.permissionMode)); }
   if (spec.strictMcpConfig !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-strict-mcp-config.json"),JSON.stringify(spec.strictMcpConfig)); }
+  // FACTORY-75: same "persist non-secret spawn intent, re-derive it at
+  // staleness-check time" shape as `.butchr-permission-mode.json` above —
+  // the two-axis (`modelPower`/`effort`) mechanism resolves to a concrete
+  // `(model, effort)` pair PER PROVIDER this spec is actually launched
+  // with (`spec.agents`, keyed by `harness`), so this reads the SAME entry
+  // `startProviders`'s own `prepare()` callback picks (src/agents/herd.ts)
+  // rather than assuming `spec.agents[0]`. `workspaceModel`/`workspaceEffort`
+  // below are `staleIssues()`'s own read-back — what this workspace was
+  // ACTUALLY spawned with, compared there against what the definition/rule
+  // CURRENTLY resolves to (`resolvedAgentOf`), never against each other.
+  const launchPreference = spec.agents?.find((p) => p.harness === provider);
+  if (launchPreference?.model !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-model.json"),JSON.stringify(launchPreference.model)); }
+  if (launchPreference?.effort !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-effort.json"),JSON.stringify(launchPreference.effort)); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
   if (provider === "codex") writeFileSync(join(dir, ".butchr-codex-isolation.json"), JSON.stringify(disabledMcpServers));
   const freeform = providerOf(spec) === "jira-project";
-  if (freeform && provider === "codex") {
+  if (provider === "codex" && (freeform || launchPreference?.effort !== undefined)) {
     mkdirSync(join(dir, ".codex"), { recursive: true });
-    writeFileSync(join(dir, ".codex/config.toml"), 'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n');
+    // FACTORY-75: `model_reasoning_effort` is Codex's own config key for
+    // reasoning effort (no CLI flag exists — see `codexReasoningEffortFlag`'s
+    // own doc comment, src/resources/power-scale.ts, for how this was
+    // confirmed and its caveats) — appended to the SAME per-workspace
+    // config.toml the freeform (jira-project) path already writes
+    // `approval_policy`/`sandbox_mode` into, rather than a second file, so
+    // Codex only ever has ONE config source to reconcile here. Written
+    // ONLY when this launch actually resolved an effort (the two-axis
+    // `modelPower`/`effort` mechanism) — a `tier`-based (back-compat)
+    // definition never reaches this line at all (`effectiveAgent` never
+    // returns an `effort` for a Codex `tier` path — see that function's own
+    // doc comment for why), which is what keeps a tier-based Codex
+    // definition's launch free of any reasoning-effort override, exactly
+    // as before this ticket.
+    const reasoningEffortLine = launchPreference?.effort !== undefined ? `model_reasoning_effort = "${codexReasoningEffortFlag(launchPreference.effort)}"\n` : "";
+    writeFileSync(join(dir, ".codex/config.toml"), (freeform ? 'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n' : "") + reasoningEffortLine);
   }
   if (provider === "agy") {
     // BUTCHR-398: a query-level spec (no single resource, ANY provider) gets
@@ -636,5 +665,29 @@ export function workspacePermissionMode(dir: string): SpawnSpec["permissionMode"
 /** Same shape as `workspacePermissionMode` above, for `spec.strictMcpConfig` (`.butchr-strict-mcp-config.json`). */
 export function workspaceStrictMcpConfig(dir: string): SpawnSpec["strictMcpConfig"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-strict-mcp-config.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-75 — same read-the-workspace-back shape as `workspacePermissionMode`
+ * above, for the model this workspace was ACTUALLY launched with
+ * (`.butchr-model.json`, `buildWorkspace`). `HerdrHerd.staleIssues()`'s own
+ * `resolvedAgentOf` seam (src/agents/herd.ts) compares this against what
+ * the definition/rule CURRENTLY resolves to, never against `proc.argv`
+ * directly — `--model`/`--effort` are deliberately excluded from
+ * `checkManagedAgentArgv`'s own comparison (`@brooswit/drovr`; see this
+ * file's own `spawnArgs`/`agentLaunchConfig` doc comments and
+ * `staleIssues()`'s doc comment for why issuetype-driven model/effort was
+ * always excluded there), so this ticket's auto-reconcile-on-change
+ * requirement needed its OWN comparison, not an extension of that one.
+ */
+export function workspaceModel(dir: string): string | undefined {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-model.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/** Same shape as `workspaceModel` immediately above, for the effort this workspace was ACTUALLY launched with (`.butchr-effort.json`). */
+export function workspaceEffort(dir: string): AgentPreference["effort"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-effort.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }

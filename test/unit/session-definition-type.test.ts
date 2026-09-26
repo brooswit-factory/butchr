@@ -8,7 +8,7 @@ import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import {
   builtinManagedSessionsRule, createManagedSessionResourceType, createSessionDefinitionEventRules,
-  MANAGED_SESSIONS_RULE_ID, onceFrozenDefinition, onceInvalidDefinition, onceMissingRoot, ownsManagedSessionAgent,
+  MANAGED_SESSIONS_RULE_ID, onceDeprecatedTier, onceFrozenDefinition, onceInvalidDefinition, onceMissingRoot, ownsManagedSessionAgent,
   searchSessionDefinitions, specForSessionDefinition, specForSessionDefinitionUnit,
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
@@ -133,6 +133,21 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
     await expect(searchSessionDefinitions({ rule, list, read: async () => "" })).rejects.toThrow("ENOTDIR");
   });
 
+  // FACTORY-75: a tier-based (deprecated) definition is still ELIGIBLE
+  // (never excluded, never invalid) but reported via onDeprecatedTier,
+  // distinctly from onInvalid/onFrozen — a modelPower/effort-based
+  // definition (the new mechanism) never triggers it.
+  test("a tier-based definition is eligible AND reported via onDeprecatedTier; a modelPower/effort-based one is eligible and NOT reported", async () => {
+    const { list, read } = fakeFiles({
+      "/defs/old.json": JSON.stringify(goodDef()),
+      "/defs/new.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 25, effort: 20 })),
+    });
+    const deprecated: string[] = [];
+    const matches = await searchSessionDefinitions({ rule, list, read }, undefined, undefined, undefined, undefined, (p) => deprecated.push(p));
+    expect(matches.map((m) => m.resource.path).sort()).toEqual(["/defs/new.json", "/defs/old.json"]);
+    expect(deprecated).toEqual(["/defs/old.json"]);
+  });
+
   test("mixed: one valid, one invalid, one frozen — only the valid one is eligible, nothing crashes", async () => {
     const { list, read } = fakeFiles({
       "/defs/ok.json": JSON.stringify(goodDef()),
@@ -166,6 +181,17 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("not an error");
   });
+  // FACTORY-75: `tier` is deprecated in favour of `modelPower`/`effort` —
+  // a definition still using it is logged, distinctly from invalid/frozen,
+  // once per path, same dedup shape as onceFrozenDefinition.
+  test("the same tier-using path logs only once", () => {
+    const lines: string[] = [];
+    const onDeprecatedTier = onceDeprecatedTier((l) => lines.push(l));
+    onDeprecatedTier("/defs/a.json"); onDeprecatedTier("/defs/a.json");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("deprecated");
+    expect(lines[0]).toContain("modelPower");
+  });
 });
 
 describe("PR #394 review fix 3, end-to-end: a genuinely nonexistent well-known directory never fails the poll", () => {
@@ -197,6 +223,20 @@ describe("specForSessionDefinition", () => {
     expect(spec.parent).toBeNull();
     expect(spec.mcpServers).toBeUndefined();
     expect(spec.strictMcpConfig).toBeUndefined();
+  });
+
+  // FACTORY-75: the new modelPower/effort two-axis mechanism resolves
+  // through effectiveAgent() the SAME way — spec.agents carries BOTH model
+  // and effort for this path (unlike the deprecated tier path above, which
+  // never carries an effort at all — see effectiveAgent's own doc comment).
+  test("FACTORY-75: builds a SpawnSpec carrying the modelPower/effort-resolved model+effort, not tierToModel", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const match: SessionDefinitionMatch = {
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"),
+      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", modelPower: 100, effort: 70, permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
+    };
+    expect(specForSessionDefinition(match).agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]);
   });
 
   test("BUTCHR-453/BUTCHR-463: carries the definition's own strictMcpConfig through to the SpawnSpec", () => {
@@ -297,6 +337,32 @@ describe("createManagedSessionResourceType", () => {
     await type.discovery.search();
     expect(accountPolicies.get(keyA)).toBe("temporary");
     expect(accountPolicies.has(keyB)).toBe(false);
+  });
+
+  // FACTORY-75 — same rebuilt-every-poll seam as `roles`/`accountPolicies`
+  // above, one field over: this poll's eligible definitions' resolved
+  // (model, effort) pair, keyed by agent key. `HerdrHerd.staleIssues()`'s
+  // own `resolvedAgentOf` seam (src/agents/herd.ts) reads this to learn
+  // what a managed-session definition CURRENTLY resolves to.
+  test("FACTORY-75: `resolvedAgents` is cleared and rebuilt every search from each eligible match's OWN effectiveAgent() — a frozen/removed definition's entry does not linger", async () => {
+    let files: Record<string, string> = {
+      "/defs/tier.json": JSON.stringify(goodDef()), // tier1 -> sonnet, no effort
+      "/defs/power.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70 })), // -> fable/xhigh
+    };
+    const { list } = fakeFiles(files);
+    const rule = builtinManagedSessionsRule("/defs");
+    const resolvedAgents = new Map<string, { model: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" }>();
+    const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, resolvedAgents });
+    const keyTier = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/tier.json" });
+    const keyPower = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/power.json" });
+    await type.discovery.search();
+    expect(resolvedAgents.get(keyTier)).toEqual({ model: "sonnet" });
+    expect(resolvedAgents.get(keyPower)).toEqual({ model: "fable", effort: "xhigh" });
+    // power.json goes frozen (still valid, but ineligible) — its entry must not linger.
+    files = { "/defs/tier.json": files["/defs/tier.json"]!, "/defs/power.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70, frozen: true })) };
+    await type.discovery.search();
+    expect(resolvedAgents.get(keyTier)).toEqual({ model: "sonnet" });
+    expect(resolvedAgents.has(keyPower)).toBe(false);
   });
 
   test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {

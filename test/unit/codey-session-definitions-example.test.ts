@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseSessionDefinitionFile } from "../../src/resources/session-definition.js";
+import { parseSessionDefinitionFile, effectiveAgent, tierToModel } from "../../src/resources/session-definition.js";
 
 /**
  * BUTCHR-466 (task of story BUTCHR-396, epic BUTCHR-391): the 14 staged
@@ -132,6 +132,23 @@ describe("docs/codey-session-definitions.example/", () => {
     for (const name of ["director-brooswit-factory.json", "director-brooswit-minecraft.json", "director-brooswit-mud.json"]) {
       const raw = readFileSync(join(EXAMPLES_DIR, name), "utf8");
       expect(raw).toMatch(/"strictMcpConfig"\s*:\s*true/);
+    }
+  });
+
+  // FACTORY-75 DoD item 3: every one of these 14 staged, tier-based
+  // definitions (the closest faithful proxy available for the 8 LIVE codey
+  // ones this ticket could not reach directly — see this ticket's own PR
+  // description for that gap) resolves to the EXACT SAME model before vs.
+  // after this ticket's change: `effectiveAgent`'s tier path bypasses the
+  // new modelPower/effort tables entirely and calls the pre-existing
+  // `tierToModel` directly (see that function's own doc comment).
+  test("FACTORY-75: every staged definition's resolved model is UNCHANGED by this ticket — effectiveAgent(def).model === tierToModel(vendor, tier) for all 14", () => {
+    for (const name of EXPECTED_FILES) {
+      const def = load(name);
+      expect(def.tier).toBeDefined(); // every staged example still uses the deprecated field — none has been migrated.
+      const resolved = effectiveAgent(def);
+      expect(resolved.model).toBe(tierToModel(def.vendor, def.tier!));
+      expect(resolved.effort).toBeUndefined(); // tier path never carries an effort override — see effectiveAgent's own doc comment.
     }
   });
 });
