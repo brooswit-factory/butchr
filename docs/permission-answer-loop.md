@@ -1,5 +1,15 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
+> with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
+> "always allow" option.** Matching Claude's "always allow" wording was
+> fragile: the read-permission dialog says "Yes, allow reading … from this
+> project" and was silently skipped, freezing the codey canary. No stored
+> allow rules are written any more. Every skipped pane is now logged
+> (`[permission-answer] <label> (<pane>) SKIPPED, left for a human: <reason>`),
+> once per pane+reason. Text below describing the "always allow" option
+> predates this change.
+
 ## What it is
 
 DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs? })`

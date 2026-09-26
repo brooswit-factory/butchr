@@ -585,10 +585,11 @@ temporary account for an agent that is coming right back.
 **The self-exit path** (`HerdrHerd.closeStranded`, a crash/`/exit`/quota
 close that never goes through `herd.stop()`/`plan.stop` at all) gets its own
 release call from `createReaper`'s new optional `release` hook
-(`src/agents/reap.ts`), fired with the closed workspace's own label (its
-agent key) right after a successful close, reason `"stop"` — a reap IS a
-genuine stop. A release failure there is logged and swallowed, never fails
-the reap.
+(`src/agents/reap.ts`), fired with the real agent key derived from the
+closed workspace's pane cwd (FACTORY-92) — never the workspace's own
+`label`, which is free text — right after a successful close, reason
+`"stop"` — a reap IS a genuine stop. A release failure there is logged and
+swallowed, never fails the reap.
 
 **Daemon shutdown**: still no stop handler — confirmed unchanged by this
 task, and correctly so: agents keep running under herdr regardless of this
