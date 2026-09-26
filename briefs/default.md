@@ -28,30 +28,25 @@ Point at the authoritative source instead: your own workspace's
 `ENVIRONMENT.md` for environment facts, and "verify it yourself" for a repo
 path or line number.
 
-## Keep your doc current
+## Confluence pages: on request only
 
-Your ticket already has a Confluence doc — created together with it, already
-linked, already nested under your boss's doc. There's nothing to remember to
-create. The instruction is simply: **keep it current.** A task whose doc is
-current means nobody has to fire an ancient agent back up to ask what
-happened.
+Butchr does not create a Confluence doc for your ticket — it never has,
+since FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is
+no working doc to keep current: progress, findings and a closing summary all
+go in Jira comments (`report_to_boss`/`ask_boss`/whatever channel applies)
+and PR descriptions, which already exist for exactly that.
 
-The doc holds what is **true now**; ticket comments stay the event stream
-that wakes people (a report, a question, the `[review]` line — those still go
-through `report_to_boss`/`ask_boss`/whatever channel applies). Don't conflate
-the two: a closing summary belongs in the doc as its final state, not as one
-more comment.
-
-`get_doc()` reads your own doc; `set_doc(body, title?)` is a **FULL-BODY REPLACE**
-of your own doc, not an append — call `get_doc()` first, edit the
-body you got back, and write the whole thing, or you will destroy your own
-page on the very first call, permanently, in a corpus where nothing is ever
-archived. A freshly created doc carries a provisional marker in its title
-(read the exact literal from this repo's doc-binding source rather than
-guessing it), and `set_doc` refuses to write real content while that marker
-is still there — you must pass a real, outcome-shaped `title` on your first
-real write. That refusal is the feature: it's what makes "retitle it once it
-means something" a call that fails instead of an instruction nobody follows.
+If — and only if — the operator, a director, or {{KEY}}'s own text explicitly
+asks you to write a Confluence page, use `confluence_create_page` with an
+explicit `spaceId` and, optionally, a `parentId` named by whoever asked (or a
+conventions page) — Butchr adds no placement logic of its own, so never guess
+a space or parent. The page you create stands alone: nothing binds it back to
+{{KEY}}'s `get_doc`/`set_doc`. `set_doc` REFUSES when {{KEY}} has no existing
+doc — it never creates one. If {{KEY}} already carries a doc from before this
+change, `get_doc()`/`set_doc(body, title?)` (a **FULL-BODY REPLACE**, not an
+append — call `get_doc()` first, edit the body you got back, and write the
+whole thing, or you will destroy the page permanently, in a corpus where
+nothing is ever archived) keep working on it exactly as before.
 
 The assistant documents how this factory works, how to verify a claim in it,
 and how it fails, in the ASSIST Confluence space:

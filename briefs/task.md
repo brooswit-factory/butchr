@@ -146,28 +146,27 @@ one-line reason it needs a new epic). **Filing a ticket outside your epic is
 half the job; saying where it should live is the other half** — a ticket
 filed with nowhere to live is exactly as lost as one nobody filed at all.
 
-## Keep your doc current
-Your ticket already has a Confluence doc — created together with it, already
-linked, already nested under your story's doc. There's nothing to remember to
-create. The instruction is simply: **keep it current.** A task whose doc is
-current means nobody has to fire an ancient agent back up to ask what
-happened.
+## Confluence pages: on request only
+Butchr does not create a Confluence doc for {{KEY}} — it never has, since
+FACTORY-84/FACTORY-86 retired that automatic per-ticket page. There is no
+working doc to keep current: progress, findings and handoffs go in Jira
+comments (`report_to_boss`/`ask_boss`, and your story's `tell_worker`
+replies) and in your PR description, which already exist for exactly that.
 
-The doc holds what is **true now**; ticket comments stay the event stream
-that wakes people — a report, a question, a `[review]` line still go through
-`report_to_boss`/`ask_boss`/`tell_worker`. Don't conflate the two.
-
-`get_doc()` reads your own doc; `set_doc(body, title?)` is a **FULL-BODY REPLACE**
-of your own doc, not an append — call `get_doc()` first, edit the
-body you got back, and write the whole thing, or you will destroy your own
-page on the very first call, permanently, in a corpus where nothing is ever
-archived. A freshly created doc carries a provisional marker in its title
-(read the exact literal from this repo's doc-binding source rather than
-guessing it), and `set_doc` refuses to write real content while that marker
-is still there — your first real write must carry a real, outcome-shaped
-`title`. That refusal is the feature, not friction: it's what makes
-"retitle it once it means something" a call that fails instead of an
-instruction nobody follows.
+If — and only if — the operator, a director, or {{KEY}}'s own text explicitly
+asks you to write a Confluence page, use `confluence_create_page` with an
+explicit `spaceId` and, optionally, a `parentId` named by whoever asked (or a
+conventions page) — Butchr adds no placement logic of its own, so never guess
+a space or parent. The page you create stands alone: nothing binds it back to
+{{KEY}}'s `get_doc`/`set_doc`. `set_doc` REFUSES when {{KEY}} has no existing
+doc — it never creates one. If {{KEY}} already carries a doc from before this
+change (possibly still carrying its original provisional title — read the
+exact literal from this repo's doc-binding source rather than guessing it),
+`get_doc()`/`set_doc(body, title?)`
+(a **FULL-BODY REPLACE**, not an append — call `get_doc()` first, edit the
+body you got back, and write the whole thing, or you will destroy the page
+permanently, in a corpus where nothing is ever archived) keep working on it
+exactly as before.
 
 ## Writing for another agent
 If you write a ticket, a comment, or a brief that another agent will read:
