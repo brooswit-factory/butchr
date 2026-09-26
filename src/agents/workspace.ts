@@ -366,6 +366,15 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // spawn intent, re-derive it at staleness-check time" shape
   // `.butchr-external-mcp.json`/`workspaceExternalMcp` already established.
   if (spec.mcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-mcp-servers.json"),JSON.stringify(spec.mcpServers)); }
+  // FACTORY-43: same "persist non-secret spawn intent, re-derive it at
+  // staleness-check time" shape as `.butchr-mcp-servers.json` above —
+  // `staleIssues()` was silently omitting `permissionMode`/`strictMcpConfig`
+  // from its reconstructed expected argv (they were never persisted
+  // anywhere it could read them back from), so a managed session launched
+  // with a non-default permission mode was flagged stale, killed, and
+  // respawned every poll forever.
+  if (spec.permissionMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-permission-mode.json"),JSON.stringify(spec.permissionMode)); }
+  if (spec.strictMcpConfig !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-strict-mcp-config.json"),JSON.stringify(spec.strictMcpConfig)); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
@@ -609,5 +618,23 @@ export function workspaceExternalMcp(dir:string):SpawnSpec['externalMcpServers']
  */
 export function workspaceMcpServers(dir: string): SpawnSpec["mcpServers"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-43: same read-the-workspace-back shape as `workspaceMcpServers`
+ * above, for `spec.permissionMode` (`.butchr-permission-mode.json`,
+ * `buildWorkspace`) — lets `staleIssues()` compare a managed-session agent's
+ * argv against the permission mode it was ACTUALLY launched with, instead of
+ * silently treating every such agent as if none had been requested.
+ */
+export function workspacePermissionMode(dir: string): SpawnSpec["permissionMode"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-permission-mode.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/** Same shape as `workspacePermissionMode` above, for `spec.strictMcpConfig` (`.butchr-strict-mcp-config.json`). */
+export function workspaceStrictMcpConfig(dir: string): SpawnSpec["strictMcpConfig"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-strict-mcp-config.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }

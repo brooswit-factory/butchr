@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } 
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -695,6 +695,45 @@ describe("buildWorkspace", () => {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceMcpServers(dir)).toBeUndefined();
       expect(workspaceMcpServers("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-43: `permissionMode`/`strictMcpConfig` are persisted at build
+  // time and read back the same way `mcpServers` is above — staleIssues()
+  // (src/agents/herd.ts) previously had no way to recover either field,
+  // which respawn-looped every managed session launched with a non-default
+  // permission mode (or strictMcpConfig) forever.
+  test("workspacePermissionMode/workspaceStrictMcpConfig round-trip what buildWorkspace persisted", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-permission-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, permissionMode: "auto", strictMcpConfig: true }, "http://x/mcp");
+      expect(readFileSync(join(dir, ".butchr-permission-mode.json"), "utf8")).toBe(JSON.stringify("auto"));
+      expect(readFileSync(join(dir, ".butchr-strict-mcp-config.json"), "utf8")).toBe(JSON.stringify(true));
+      expect(workspacePermissionMode(dir)).toBe("auto");
+      expect(workspaceStrictMcpConfig(dir)).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspacePermissionMode/workspaceStrictMcpConfig are undefined for a workspace where neither was ever set, never throws", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-permission-none-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
+      expect(workspacePermissionMode(dir)).toBeUndefined();
+      expect(workspaceStrictMcpConfig(dir)).toBeUndefined();
+      expect(workspacePermissionMode("/does/not/exist")).toBeUndefined();
+      expect(workspaceStrictMcpConfig("/does/not/exist")).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
