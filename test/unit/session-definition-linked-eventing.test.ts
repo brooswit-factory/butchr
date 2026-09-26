@@ -105,6 +105,13 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
     expect(new Set(matches.map((x) => x.agentKey)).size).toBe(2);
     expect(matches.every((x) => x.notifyAgentKey === m.agentKey)).toBe(true);
   });
+
+  test("PR review (FACTORY-71): the produced rule carries no maxLinkedTurnsPerHour — a managed session's linked-eventing nudges are UNCAPPED BY DEFAULT today, the same 'absent means uncapped' behaviour an unconfigured jira-project rule already has. There is no per-definition or shared-constant cap value in production; a real default cap for managed-session directors is a known, deliberately-deferred gap tracked in FACTORY-78, not something this ticket invents.", () => {
+    const m = match("/defs/a.json", { linkedEventingProjects: ["jira-project:BUTCHR"] });
+    const [matched] = sessionDefinitionProjectMatches(m);
+    expect(matched!.rule.maxLinkedTurnsPerHour).toBeUndefined();
+    expect(matched!.rule.maxLinkedItems).toBeUndefined();
+  });
 });
 
 describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/FACTORY-71)", () => {
@@ -211,7 +218,20 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
   });
 });
 
-describe("rate cap: the SAME sliding-window mechanism runTick already has, keyed by the state-owning agentKey, delivered to notifyAgentKey", () => {
+/**
+ * PR review (FACTORY-71): this describe block proves the BUTCHR-469 rate-cap
+ * MECHANISM works correctly when a match's state-owning `agentKey` differs
+ * from its `notifyAgentKey` — it does NOT prove managed sessions are
+ * rate-capped in production. The match below hand-sets
+ * `rule.maxLinkedTurnsPerHour: 1` directly, bypassing `sessionDefinitionProjectMatches`
+ * entirely: that function never produces a rule with this field set (see
+ * "the produced rule carries no maxLinkedTurnsPerHour" above) — in
+ * production, a managed session's linked-eventing nudges are UNCAPPED BY
+ * DEFAULT, same as an unconfigured `jira-project` rule owner. A real default
+ * cap for managed-session directors is a known, deliberately-deferred gap —
+ * see FACTORY-78 — not something this ticket invents.
+ */
+describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window logic runTick already has still works correctly when keyed by a synthetic state-owning agentKey and delivered to a different notifyAgentKey", () => {
   test("a capped tick is suppressed and retried later, and every delivered notify still targets notifyAgentKey, never the synthetic agentKey", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };

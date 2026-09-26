@@ -183,13 +183,23 @@ reuses:
 - **Wired (FACTORY-53/FACTORY-71, epic FACTORY-51):** naming a project here
   actually nudges this definition's agent now — see
   `docs/resource-links.md`'s "Managed-session linked eventing" section for
-  the full behaviour (what fires a nudge, the rate cap, and how a frozen
-  session is excluded). `createManagedSessionResourceType`'s own `related`
-  hook (`src/rules/session-definition-type.ts`) builds one
+  the full behaviour (what fires a nudge, and how a frozen session is
+  excluded). `createManagedSessionResourceType`'s own `related` hook
+  (`src/rules/session-definition-type.ts`) builds one
   `ProjectLinkedEventingMatch` per opted-in project and feeds it straight
   into the SAME `createLinkedEventingState`/`runTick` machinery
   (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
   already use — no second watcher, no separate rate cap.
+- **Uncapped by default (known gap, FACTORY-78):** these nudges reuse the
+  BUTCHR-469 rate-cap MECHANISM, but this definition has no field to
+  configure a cap VALUE, and the wiring's own fixed `Rule`-shaped gate never
+  sets one — so today, a managed session's linked-eventing nudges are
+  uncapped, the same "absent means uncapped" behaviour an unconfigured
+  `jira-project` rule owner already has, not a real per-session or
+  per-project budget. A real default (or a per-definition setting) is an
+  open operator decision, deliberately deferred rather than invented
+  unilaterally — see `docs/resource-links.md`'s own section for the full
+  reasoning and FACTORY-78 for the tracked gap.
 
 ## Tier -> model mapping
 

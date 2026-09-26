@@ -720,6 +720,26 @@ on it (`maxLinkedItems`, `maxLinkedTurnsPerHour`, `linkedRemoteLinks`,
 `linkedDescriptionLinks`) is left absent — the same "absent means
 uncapped/off" default an unconfigured `jira-project` rule already has.
 
+**Known, deliberately-deferred gap: no default rate cap (FACTORY-78).**
+Stated plainly, not implied: because `MANAGED_SESSION_LINKED_EVENTING_RULE`
+never sets `maxLinkedTurnsPerHour`, a managed session's linked-eventing
+nudges are **UNCAPPED BY DEFAULT in production today**, and a managed-session
+definition has no schema field to configure one — this is the exact same
+"absent means uncapped" behaviour an unconfigured `jira-project` rule owner
+already has, not a regression, but also not a real cap. FACTORY-51 (epic
+FACTORY-51, reviewing this ticket) accepted shipping this parity rather than
+inventing a cap-value decision unilaterally; a real default (or a
+per-definition setting, and whether the budget should be per-session or
+per-project given the N-independent-buckets note above) is an open operator
+decision tracked on FACTORY-78, filed as a deliberate orphan pending an
+epic/owner. `test/unit/session-definition-linked-eventing.test.ts`'s own
+"rate-cap MECHANISM" tests prove the underlying BUTCHR-469 cap logic still
+works correctly once a match's state-owning `agentKey` differs from its
+`notifyAgentKey` — they do NOT claim managed sessions are capped in
+production (that test hand-sets `maxLinkedTurnsPerHour` on its own fixture,
+bypassing `sessionDefinitionProjectMatches` entirely); a separate test in
+the same file pins that the function's real output carries no such field.
+
 **Frozen sessions.** `herd.nudge`'s own `assertRunnable` freeze check
 (`instanceFreezeStore`, `src/resources/session-freeze.ts`) is the ONLY
 freeze enforcement a `jira-project` owner's own linked-eventing nudge gets
