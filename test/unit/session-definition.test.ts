@@ -171,6 +171,54 @@ describe("sessionDefinitionProblems", () => {
     expect(sessionDefinitionProblems({ ...good(), freezeControllers: ["a"], unfreezeControllers: ["a"] }, "def")).toEqual([]);
   });
 
+  test("linkedEventingProjects: absent means today's behaviour exactly", () => {
+    expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
+    expect(parseSessionDefinition(good(), "def", HOME).linkedEventingProjects).toBeUndefined();
+  });
+  test("linkedEventingProjects: a definition WITH the field parses and exposes the named project(s), including multiple", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["jira-project:FACTORY"] }, "def")).toEqual([]);
+    const parsed = parseSessionDefinition({ ...good(), linkedEventingProjects: ["jira-project:FACTORY", "jira-project:BUTCHR"] }, "def", HOME);
+    expect(parsed.linkedEventingProjects).toEqual(["jira-project:FACTORY", "jira-project:BUTCHR"]);
+  });
+  test("linkedEventingProjects: not an array is rejected", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: "jira-project:FACTORY" }, "def"))
+      .toEqual(["def.linkedEventingProjects must be an array of strings"]);
+  });
+  test("linkedEventingProjects: an empty array is rejected", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: [] }, "def"))
+      .toEqual(["def.linkedEventingProjects must not be empty"]);
+  });
+  test("linkedEventingProjects: a non-string entry is rejected", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: [7] }, "def"))
+      .toEqual(["def.linkedEventingProjects[0] must be a non-empty string"]);
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: [""] }, "def"))
+      .toEqual(["def.linkedEventingProjects[0] must be a non-empty string"]);
+  });
+  test("linkedEventingProjects: a malformed jira-project key is rejected with a clear message", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["jira-project:not a key"] }, "def")[0])
+      .toContain("invalid jira-project reference");
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["no-provider-prefix"] }, "def")[0])
+      .toContain("invalid resource reference");
+  });
+  test("linkedEventingProjects: only the jira-project provider is accepted — any other provider is rejected", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["jira-work-item:FACTORY-1"] }, "def")[0])
+      .toContain('must be a jira-project reference (got provider "jira-work-item")');
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["github-issue:brooswit-factory/butchr#42"] }, "def")[0])
+      .toContain('must be a jira-project reference (got provider "github-issue")');
+  });
+  test("linkedEventingProjects: duplicate entries (by canonical form) are rejected, never silently deduped", () => {
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["jira-project:FACTORY", "jira-project:FACTORY"] }, "def")[0])
+      .toContain("duplicates an earlier entry");
+    expect(sessionDefinitionProblems({ ...good(), linkedEventingProjects: ["jira-project:FACTORY", "jira-project:factory"] }, "def")[0])
+      .toContain("duplicates an earlier entry");
+  });
+  test("linkedEventingProjects: every problem is collected in one pass, alongside other field problems", () => {
+    const problems = sessionDefinitionProblems({ ...good(), vendor: "bogus", linkedEventingProjects: ["bad", "jira-project:FACTORY", "jira-project:FACTORY"] }, "def");
+    expect(problems.some((p) => p.includes("vendor must be one of"))).toBe(true);
+    expect(problems.some((p) => p.includes("linkedEventingProjects[0]"))).toBe(true);
+    expect(problems.some((p) => p.includes("linkedEventingProjects[2]") && p.includes("duplicates"))).toBe(true);
+  });
+
   test("every problem is collected in one pass", () => {
     const problems = sessionDefinitionProblems({ workingDirectory: "", brief: "", vendor: "bogus", tier: "bogus", permissionMode: "bogus" }, "def");
     expect(problems.length).toBeGreaterThanOrEqual(5);
