@@ -11,24 +11,53 @@
  * this exercises (see that file's own header) — a real `AccountManager`
  * (`src/accounts/manager.ts`) over a fake `RocketChatClient`/`AccountStore`,
  * never a hand-rolled stand-in.
+ *
+ * BUTCHR-464 extends this 3x3 with the third, independent BUTCHR-398 `role`
+ * axis ({worker, sentinel}), making RULES a genuine 3x3x2 = 18-cell cross
+ * product, generated (never hand-copied) below. `role` only changes WHETHER
+ * an id counts toward the fleet-wide admission cap at all
+ * (`src/agents/admission.ts`'s `roleOf`) — it is not read anywhere in the
+ * account layer, so the account-behaviour half of each cell (asserted in the
+ * first `describe` block below, same shape BUTCHR-412 already established)
+ * is expected to be completely unaffected by it; the capacity half (the
+ * second `describe` block) is where `role` actually matters. Every
+ * `expect(...)`/count this file already had is KEPT — cardinalities that
+ * were correct for 9 rules (e.g. "6 temporary+permanent rules") are updated
+ * to their correct value for 18 (12), never removed or weakened.
  */
 import { describe, expect, test } from "bun:test";
 import { reconcileNow } from "../../src/daemon/loop.js";
 import { createAccountManager } from "../../src/accounts/manager.js";
 import { createAccountLifecycle } from "../../src/agents/account-lifecycle.js";
 import { encodeAgentKey, encodeQueryAgentKey, decodeAnyAgentKey } from "../../src/rules/agent-key.js";
-import type { AccountPolicy, ExecutionMode } from "../../src/rules/rules.js";
+import type { AccountPolicy, AgentRole, ExecutionMode } from "../../src/rules/rules.js";
 import { fakeStore, fakeRcClient, fakeManifestPublisher, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
 import type { Herd, SpawnSpec } from "../../src/agents/herd.js";
+import { createAdmissionController, type AgentCapacityRole } from "../../src/agents/admission.js";
 
-interface TestRule { id: string; execution: ExecutionMode; account: AccountPolicy }
+interface TestRule { id: string; execution: ExecutionMode; account: AccountPolicy; role: AgentRole }
 
 const EXECUTIONS: readonly ExecutionMode[] = ["swarm", "singleton", "persistent"];
 const POLICIES: readonly AccountPolicy[] = ["none", "temporary", "permanent"];
+const ROLES: readonly AgentRole[] = ["worker", "sentinel"];
 
-/** One rule per (execution, account) cell — 9 total, mirroring what a real rules.json would declare. */
-const RULES: TestRule[] = EXECUTIONS.flatMap((execution) => POLICIES.map((account) => ({ id: `${execution}-${account}`, execution, account })));
+/** One rule per (execution, account, role) cell — 3x3x2 = 18 total (BUTCHR-464), mirroring what a real rules.json would declare. */
+const RULES: TestRule[] = EXECUTIONS.flatMap((execution) => POLICIES.flatMap((account) => ROLES.map((role) => ({ id: `${execution}-${account}-${role}`, execution, account, role }))));
+
+/** Shared (id -> account policy) lookup, used by every test below — every RULES id is unique, so a global lookup is valid for both the combined-poll test and the isolated per-cell test alike. */
+const policyOf = (id: string): AccountPolicy => {
+  const decoded = decodeAnyAgentKey(id);
+  const rule = RULES.find((r) => r.id === decoded?.ruleId);
+  return rule?.account ?? "none";
+};
+
+/** Shared (id -> capacity role) lookup — BUTCHR-398's `AdmissionControllerDeps.roleOf` shape, same "unique id" reasoning as `policyOf` above. */
+const roleOf = (id: string): AgentCapacityRole => {
+  const decoded = decodeAnyAgentKey(id);
+  const rule = RULES.find((r) => r.id === decoded?.ruleId);
+  return rule?.role ?? "worker";
+};
 
 /** The one agent key each rule's agent runs under — a swarm rule's single matched ticket, or a singleton/persistent rule's one query-level agent. */
 const keyFor = (rule: TestRule): string =>
@@ -50,19 +79,22 @@ function fakeHerd(): Herd & { running: Set<string>; spawnedSpecs: Map<string, Sp
   };
 }
 
-describe("BUTCHR-412: the 3x3 execution x account matrix, through the real reconciler with a fake RC", () => {
-  test("every cell independently: temporary provisions on spawn and unprovisions on stop; permanent provisions and is retained; none never touches RC — regardless of execution mode", async () => {
+describe("BUTCHR-412/BUTCHR-464: the 3x3x2 execution x account x role matrix, through the real reconciler with a fake RC", () => {
+  test("every cell independently: temporary provisions on spawn and unprovisions on stop; permanent provisions and is retained; none never touches RC — regardless of execution mode OR role, and a sufficient cap admits every worker cell alongside every sentinel cell", async () => {
     const store = fakeStore();
     const { client, calls } = fakeRcClient();
     const manager = createAccountManager(baseAccountManagerDeps({ client, store, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" }));
-    const policyOf = (id: string): AccountPolicy => {
-      const decoded = decodeAnyAgentKey(id);
-      const rule = RULES.find((r) => r.id === decoded?.ruleId);
-      return rule?.account ?? "none";
-    };
     const account = createAccountLifecycle({ manager, policyOf, manifestPublisher: fakeManifestPublisher() });
     const herd = fakeHerd();
     const specFor = (rule: TestRule): SpawnSpec => ({ key: keyFor(rule), issuetype: "task", summary: rule.id, parent: null });
+    const workerCount = RULES.filter((r) => r.role === "worker").length; // 9
+    const sentinelCount = RULES.length - workerCount; // 9
+    // Cap set to EXACTLY the worker count: enough for every worker cell to
+    // be admitted, with no headroom to spare — proves capacity behaviour
+    // for the matrix as a whole, not just each cell's account behaviour:
+    // if a sentinel consumed a worker slot (the bug BUTCHR-398 exists to
+    // prevent), one worker cell below would come up un-spawned.
+    const admissionCtrl = createAdmissionController({ cap: workerCount, residency: () => herd.runningIssues(), roleOf });
 
     // Poll 1: every rule's agent is desired (this is a swarm rule's matched
     // ticket, or a singleton/persistent rule's query agent at N>=1 or N=0
@@ -70,44 +102,48 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
     // execution mode is already resolved into "this id is in `desired`" by
     // the time it reaches the reconciler; see docs/execution-modes.md).
     const desired1 = new Map(RULES.map((r) => [keyFor(r), specFor(r)]));
-    await reconcileNow(herd, desired1, { account });
+    await reconcileNow(herd, desired1, { account, admission: admissionCtrl.admit.bind(admissionCtrl) });
 
     for (const rule of RULES) {
       const key = keyFor(rule);
       const spawnedSpec = herd.spawnedSpecs.get(key);
-      expect(spawnedSpec).toBeDefined();
+      expect(spawnedSpec, `cell ${rule.id}: every worker fits exactly at cap=${workerCount} and every sentinel rides along uncapped, so this cell must have spawned`).toBeDefined();
       if (rule.account === "none") {
-        expect(spawnedSpec!.rocketchatAccount).toBeUndefined();
+        expect(spawnedSpec!.rocketchatAccount, `cell ${rule.id}`).toBeUndefined();
       } else {
-        expect(spawnedSpec!.rocketchatAccount).toBe(rcUsernameFor(key));
-        expect(await store.get(key)).toMatchObject({ policy: rule.account });
+        expect(spawnedSpec!.rocketchatAccount, `cell ${rule.id}`).toBe(rcUsernameFor(key));
+        expect(await store.get(key), `cell ${rule.id}`).toMatchObject({ policy: rule.account });
       }
     }
-    // Exactly the 6 temporary+permanent rules created a Rocket.Chat user — never the 3 "none" ones.
-    expect(calls.filter((c) => c.method === "createUser")).toHaveLength(6);
+    // Exactly the 12 temporary+permanent rules (3 executions x 2 policies x 2 roles) created a Rocket.Chat user — never the 6 "none" ones.
+    expect(calls.filter((c) => c.method === "createUser")).toHaveLength(12);
+    // Capacity confirms the 9/9 split held exactly after this poll's spawns landed: no sentinel ate into the worker budget, and no worker snuck in as a sentinel (`admissionCtrl.snapshot()` itself reads the census taken BEFORE this poll's own spawns, so it is not the right read here — the herd's own post-spawn residency is).
+    const residents = await herd.runningIssues();
+    expect(residents.filter((id) => roleOf(id) === "worker")).toHaveLength(workerCount);
+    expect(residents.filter((id) => roleOf(id) === "sentinel")).toHaveLength(sentinelCount);
 
     // Poll 2: NOTHING is desired any more (every swarm ticket left its
     // query; every singleton dropped to zero matches; every persistent rule
-    // was frozen via enabled:false) — all 9 agents fall into plan.stop.
-    await reconcileNow(herd, new Map(), { account });
+    // was frozen via enabled:false) — all 18 agents fall into plan.stop.
+    await reconcileNow(herd, new Map(), { account, admission: admissionCtrl.admit.bind(admissionCtrl) });
 
     for (const rule of RULES) {
       const key = keyFor(rule);
       const record = await store.get(key);
       if (rule.account === "temporary") {
-        expect(record).toBeNull(); // unprovisioned
+        expect(record, `cell ${rule.id}`).toBeNull(); // unprovisioned
       } else if (rule.account === "permanent") {
-        expect(record).not.toBeNull(); // retained
+        expect(record, `cell ${rule.id}`).not.toBeNull(); // retained
       } else {
-        expect(record).toBeNull(); // never had one
+        expect(record, `cell ${rule.id}`).toBeNull(); // never had one
       }
     }
-    expect(calls.filter((c) => c.method === "deleteUser")).toHaveLength(3); // exactly the 3 temporary rules, one per execution mode
+    expect(calls.filter((c) => c.method === "deleteUser")).toHaveLength(6); // exactly the 6 temporary rules (3 executions x 2 roles)
   });
 
   test("respawn never unprovisions a temporary account, for every execution mode alike", async () => {
     for (const execution of EXECUTIONS) {
-      const rule: TestRule = { id: `${execution}-respawn`, execution, account: "temporary" };
+      const rule: TestRule = { id: `${execution}-respawn`, execution, account: "temporary", role: "worker" };
       const key = keyFor(rule);
       const store = fakeStore();
       const { client, calls } = fakeRcClient();
@@ -180,5 +216,64 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
     await reconcileNow(herd, desired2, { account });
     expect(running.size).toBe(8); // still exactly at the cap: 7 originals + 1 newly admitted
     for (const id of spawnedFirstPoll.slice(1)) expect(running.has(id)).toBe(true); // the other 7 originals were never disturbed
+  });
+});
+
+/**
+ * BUTCHR-464: the capacity half of each of the SAME 18 cells above, taken to
+ * the opposite extreme — cap:0. The combined-poll test above already proves
+ * account behaviour is identical across every cell and that a SUFFICIENT cap
+ * (exactly the worker count) admits every worker alongside every sentinel;
+ * this proves the complementary claim per cell, in isolation, through the
+ * same real `reconcileNow` + fake RC: with NO worker budget available at
+ * all, a worker cell is withheld (never spawns, never touches the account
+ * store, regardless of its own account policy) while a sentinel cell of the
+ * SAME execution/account combination starts anyway and its account
+ * behaviour proceeds exactly as it did at a sufficient cap — proving
+ * capacity and account behaviour are independent axes for a sentinel just as
+ * they already are for a worker. `test.each` (not a hand-rolled loop) so a
+ * failing cell is named in the test's own title, not just inside an
+ * assertion message.
+ */
+describe("BUTCHR-464: role capacity behaviour, per cell (fleet-wide cap fully saturated)", () => {
+  test.each(RULES.map((r) => [r.id, r] as const))("cell %s: a worker is withheld and a sentinel starts, when the fleet-wide worker cap is 0", async (_id, rule) => {
+    const key = keyFor(rule);
+    const store = fakeStore();
+    const { client } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" }));
+    const account = createAccountLifecycle({ manager, policyOf, manifestPublisher: fakeManifestPublisher() });
+    const herd = fakeHerd();
+    // cap:0 with a cold-start census (nothing was ever trusted positive
+    // before this first read, so a readable 0 is trusted immediately, not
+    // the BUTCHR-282 implausible-zero shape — see admission.test.ts's own
+    // "cold start" case): budget = 0 - 0 = 0 for every WORKER candidate.
+    // Sentinels bypass the budget check entirely (src/agents/admission.ts).
+    const admissionCtrl = createAdmissionController({ cap: 0, residency: () => herd.runningIssues(), roleOf });
+    const spec: SpawnSpec = { key, issuetype: "task", summary: rule.id, parent: null };
+
+    await reconcileNow(herd, new Map([[key, spec]]), { account, admission: admissionCtrl.admit.bind(admissionCtrl) });
+
+    if (rule.role === "worker") {
+      expect(herd.spawnedSpecs.get(key), `cell ${rule.id}: a worker must be withheld when the worker cap is 0`).toBeUndefined();
+      expect(await store.get(key), `cell ${rule.id}: a withheld worker must never touch the account store, regardless of its own account policy`).toBeNull();
+      return;
+    }
+
+    expect(herd.spawnedSpecs.get(key), `cell ${rule.id}: a sentinel must start even when the worker cap is 0`).toBeDefined();
+    if (rule.account === "none") {
+      expect(herd.spawnedSpecs.get(key)!.rocketchatAccount, `cell ${rule.id}`).toBeUndefined();
+    } else {
+      expect(herd.spawnedSpecs.get(key)!.rocketchatAccount, `cell ${rule.id}`).toBe(rcUsernameFor(key));
+      expect(await store.get(key), `cell ${rule.id}`).toMatchObject({ policy: rule.account });
+    }
+
+    // Poll 2: this sentinel's agent stops — same account-lifecycle
+    // assertion as the combined matrix test's own poll 2, now exercised at
+    // cap:0 too.
+    await reconcileNow(herd, new Map(), { account, admission: admissionCtrl.admit.bind(admissionCtrl) });
+    const record = await store.get(key);
+    if (rule.account === "temporary") expect(record, `cell ${rule.id}`).toBeNull();
+    else if (rule.account === "permanent") expect(record, `cell ${rule.id}`).not.toBeNull();
+    else expect(record, `cell ${rule.id}`).toBeNull();
   });
 });
