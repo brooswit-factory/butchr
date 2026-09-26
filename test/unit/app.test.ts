@@ -14,6 +14,7 @@ import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
 // DashboardResponse literal below that predates the admission view and isn't
@@ -382,6 +383,64 @@ describe("GET /config-inventory (FACTORY-72): every configured rule and managed-
     try {
       const b = `http://localhost:${app.server!.port}`;
       expect(await (await fetch(`${b}/config-inventory`)).json()).toEqual(inventory);
+    } finally {
+      app.stop();
+    }
+  });
+});
+
+// FACTORY-81: the Configurations VIEW — end-to-end through a real, listening
+// app, never a hardcoded/presumed-correct href (same discipline as the "GET /
+// (BUTCHR-344)" block above): reads each cross-link OUT OF the served HTML on
+// one page and fetches it back through the SAME app, in both directions.
+describe("GET /configurations (FACTORY-81): the Configurations view, wired end-to-end", () => {
+  test("serves the render of deps.configInventory()/dashboard(), and the forward/back cross-links actually round-trip through the real app", async () => {
+    const liveKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
+    const rows = buildDashboardRows([{ name: "x", resource_key: liveKey, agent_status: "working", pane_id: "w1:p3" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const dashboard: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+    const inventory = {
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }],
+      sessionDefinitions: [], errors: [],
+    };
+    const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const configHtml = await (await fetch(`${b}/configurations`)).text();
+      expect(configHtml).toContain("butchr — configurations");
+      expect(configHtml).toContain("task");
+
+      // Forward: the config entry's own link to its running agent row.
+      const fwdMatch = configHtml.match(/href="(\/#[^"]+)">/);
+      if (!fwdMatch) throw new Error("expected a forward link from the rule row to its running agent row");
+      const anchor = fwdMatch[1]!.slice(2); // strip the leading "/#"
+      const dashHtml = await (await fetch(`${b}/`)).text();
+      expect(dashHtml).toContain(`id="${anchor}"`);
+
+      // Back: that same agent row's own link back to the config entry.
+      const backMatch = dashHtml.match(/href="([^"]+)">config<\/a>/);
+      if (!backMatch) throw new Error("expected a back-link on the agent row");
+      const backRes = await fetch(`${b}${backMatch[1]}`);
+      expect(backRes.status).toBe(200);
+      expect(await backRes.text()).toContain("task");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("a rejected configInventory() renders a loud fetch-failure banner, never a 500 or an empty-looking table", async () => {
+    const { app } = buildApp({ ...view, configInventory: async () => { throw new Error("disk read failed"); } });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const r = await fetch(`${b}/configurations`);
+      expect(r.status).toBe(200);
+      const html = await r.text();
+      expect(html).toContain("COULD NOT CHECK");
+      expect(html).toContain("disk read failed");
+      expect(html).not.toContain('id="rules"');
     } finally {
       app.stop();
     }

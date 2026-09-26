@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { renderDashboard, type RenderDashboardOpts } from "../../src/web/dashboard-page.js";
+import { agentRowAnchorId, configAnchorForResourceKey, ruleAnchorId, sessionAnchorId } from "../../src/agents/config-inventory-links.js";
+import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
+import { sessionAgentKey } from "../../src/resources/session-freeze.js";
 import {
   buildDashboardRows,
   buildAdmissionView,
@@ -764,5 +767,86 @@ describe("renderDashboard: esc() actually escapes, verified with a pane containi
     expect(paneHtml).toBe("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;");
     // the raw '<'/'>' must never survive unescaped — that would open a real tag
     expect(paneHtml).not.toContain("<img");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-81: the ONLY change to this existing view — an additive back-link
+// (and its supporting `id` attribute) on an agent row, per that ticket's own
+// requirement 7 ("existing agent view ... unchanged. Add tests that pin the
+// existing behaviour ... the only change to the agent view is the additive
+// back-link"). Every test ABOVE this point in the file already pins that the
+// pre-existing rendering (key/tier/status/pane/floor/freshness/terminal-link/
+// resource-link) is untouched — none of them were edited to accommodate this
+// feature, and all still pass verbatim.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the additive Configurations back-link on an agent row (FACTORY-81)", () => {
+  test("carries an id anchor matching agentRowAnchorId, and a 'config' link to the default /configurations#<anchor> href for a rule-driven row", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
+    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(html).toContain(`id="${agentRowAnchorId(key)}"`);
+    expect(html).toContain(`href="/configurations#${ruleAnchorId("jira-work", "task")}">config</a>`);
+  });
+
+  test("a singleton/persistent rule's query-level agent row also gets the same rule anchor a per-resource row would", () => {
+    const key = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" });
+    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(html).toContain(`href="/configurations#${ruleAnchorId("filesystem", "director")}">config</a>`);
+  });
+
+  test("a managed-session row's back-link points at its OWN session anchor — never the generic managed-sessions rule anchor", () => {
+    const key = sessionAgentKey("/home/butchr/defs/foo.json");
+    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(html).toContain(`href="/configurations#${sessionAnchorId(key)}">config</a>`);
+    expect(html).not.toContain(`href="/configurations#${ruleAnchorId("filesystem", "managed-sessions")}">config</a>`);
+  });
+
+  test("a caller-supplied configLinkHref is used instead of the default — same pattern as terminalLinkHref/resourceLinkHref", () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
+    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts({ configLinkHref: (anchor) => `/custom/${anchor}` }));
+    expect(html).toContain(`href="/custom/${ruleAnchorId("jira-work", "task")}">config</a>`);
+    expect(html).not.toContain("/configurations#");
+  });
+
+  test("a resourceKey that fails to decode entirely renders no config link at all — never a broken href", () => {
+    expect(configAnchorForResourceKey("not-a-real-key")).toBeNull(); // sanity on the shared helper this row rendering relies on
+    const rows = buildDashboardRows([{ name: "x", resource_key: "not-a-real-key", agent_status: "working", pane_id: "p1" }], {
+      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(html).not.toContain(">config</a>");
+  });
+
+  test("a withheld row gets NO config back-link — requirement 3 speaks of the 'running agent row' only", () => {
+    const html = renderDashboard(
+      {
+        checked: true, confirmedAt: new Date(0).toISOString(), admission: NO_ADMISSION,
+        rows: [{
+          kind: "withheld", resourceKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" }),
+          tier: { kind: "project" }, source: "issue",
+          waiting: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true },
+          confirmedAt: new Date(0).toISOString(), agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" },
+        }],
+      },
+      opts(),
+    );
+    expect(html).not.toContain(">config</a>");
   });
 });
