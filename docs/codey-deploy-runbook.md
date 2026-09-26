@@ -30,8 +30,8 @@ permission error — always use `journalctl --user -u <unit>`).
 
 **If any step's actual output does not match its stated expected output:
 STOP. Do not proceed to the next step. Roll back per that step's own
-rollback instructions (or, once armed, let the watchdog in §4 do it).**
-Record the failure in the evidence template (§12) exactly as it happened —
+rollback instructions (or, once armed, let the watchdog in §3 do it).**
+Record the failure in the evidence template (§10) exactly as it happened —
 a failed step with an honest "FAIL: <what actually happened>" is useful
 evidence; a silently-skipped or fudged step is not.
 
@@ -76,8 +76,9 @@ below applies:**
   part of the deploy, not just `git pull` + `bun install`.
 
 **If `ExecStart=` names neither shape recognisably, STOP and record it as an
-Open Question (§13) rather than guessing which mode applies** — the two
-modes need different deploy commands (§3).
+Open Question (§12) rather than guessing which mode applies** — the two
+modes need different deploy commands (§2), and this decides `watchdog.ts
+arm`'s own required `--mode source|built` flag (§3.3).
 
 **Rollback for this step:** none needed — this is read-only.
 **Evidence:** paste both commands' full output.
@@ -96,7 +97,7 @@ git -C "$INSTALL_DIR" status --porcelain
 40-character sha; **`status --porcelain` prints NOTHING** — an empty
 result confirms the checkout is clean. **If `status --porcelain` prints
 anything, STOP** — this checkout has uncommitted local changes, and `git
-reset --hard` (the rollback mechanism in §4) would destroy them silently.
+reset --hard` (the rollback mechanism in §3) would destroy them silently.
 Do not proceed until this is resolved (commit, stash, or escalate — do not
 guess which).
 
@@ -116,13 +117,13 @@ daemon has BUTCHR-54/329 (everything on `main` as of this writing does),
 `build: {sha, shaProvenance, version, pid, unit, journalctl}` and
 `currency: {checkedAt, verdict: {status: "current"|"stale"|"unknown", ...}}`.
 **Record the pre-deploy `build.sha` — this is `PREV_SHA`, the rollback
-target for §4.** `config.ts`'s own documented default is `BUTCHR_PORT=7717`
+target for §3.** `config.ts`'s own documented default is `BUTCHR_PORT=7717`
 when unset (see `.env.example`) — a plausible fallback to TRY, never a
 value to assume without the `curl` above actually answering on it.
 
 **Rollback:** none — read-only.
 **Evidence:** paste the full `/health` JSON; state `PREV_SHA` explicitly in
-your evidence (§12) — every later step's rollback depends on this exact
+your evidence (§10) — every later step's rollback depends on this exact
 value being right.
 
 ### 1.4 The user account this unit runs as, and systemd-run availability
@@ -135,10 +136,10 @@ loginctl show-user "$(whoami)" -p Linger
 ```
 
 **Expected output:** a username; `systemd-run --version` succeeds (needed
-for §4's automatic rollback — a transient scheduled unit); `Linger=yes` is
+for §3's automatic rollback — a transient scheduled unit); `Linger=yes` is
 what lets the user's systemd instance (and therefore a pending watchdog
 timer) keep running across a logout — **if it prints `Linger=no`, record
-this as an Open Question: the automatic rollback in §4 may not survive a
+this as an Open Question: the automatic rollback in §3 may not survive a
 logout of this account, which is exactly the "must not depend on the
 manager surviving" property this whole mechanism exists for.** This is not
 this document's call to silently work around — flag it.
@@ -152,14 +153,14 @@ verbatim.
 - **Evidence and deploy/cutover timing → `admin-assembly`** (BUTCHR-396's
   Execution model, "Ownership and evidence").
 - **Heads-up immediately before the restart → `#team-brooswit-factory`**
-  (§6 below gives the exact text).
+  (§4.1 below gives the exact text).
 
 ---
 
 ## 2. Build
 
 Set `$INSTALL_DIR` from §1.2. **Do this from a directory you can afford to
-have `git reset --hard` applied to later (§4) — that is precisely why §1.2
+have `git reset --hard` applied to later (§3) — that is precisely why §1.2
 made you confirm the tree is clean first.**
 
 ### 2.1 Fetch and fast-forward
@@ -178,7 +179,7 @@ echo "PREV_SHA=$PREV_SHA  NEW_SHA=$NEW_SHA"
 list is worth a second look before proceeding); `pull --ff-only` succeeds
 silently or prints a fast-forward summary; `NEW_SHA` is a real, different
 sha from `PREV_SHA` (identical shas means nothing changed — see the Open
-Question in §13 about whether that should still trigger a restart).
+Question in §12 about whether that should still trigger a restart).
 **This is the exact command form measured as this repo's own real-world
 deploy mechanism** (`docs/deploy-delivery-mechanism.md` §2) — deliberately
 reused rather than a fresh invention.
@@ -235,7 +236,7 @@ proceed with a stale-looking build).
 This is the mechanism BUTCHR-396 requires: **automatic rollback that does
 not depend on the manager surviving the restart.** The restart takes down
 every Codey project manager, including whichever one is running this
-runbook (§6) — so the thing that decides "did this deploy actually work"
+runbook (§4) — so the thing that decides "did this deploy actually work"
 and acts on it must be a *separate* piece of real init infrastructure, not
 this agent's own process. `scripts/deploy/watchdog.ts` (added by this task,
 tested in `test/unit/deploy-watchdog.test.ts` and
@@ -243,6 +244,36 @@ tested in `test/unit/deploy-watchdog.test.ts` and
 `systemd-run --user --on-active=...` timer** — ordinary systemd, answering
 to the user's own systemd instance, not to butchr.service or to this
 agent — is that mechanism.
+
+**Trigger conditions, stated explicitly (only one of the two things the
+story's own wording names is actually automated here):** the watchdog
+checks **`/health` only** — `ok`, and `build.sha` matching the deployed
+sha — exactly once, at `$WINDOW_SEC` after arming. It does **not** check
+"manager check-in": whether `manager-factory-butchr` (or Bakr's or
+Candlestix's manager) has confirmed in the `#team-brooswit-factory` thread
+is a separate, human-paced signal, handled by §5's ~10-minute
+director-escalation instead — this process has no reliable way to observe
+a chat confirmation, and folding it into a 5-minute automatic timer would
+either fire far too early (a manager can legitimately take longer than 5
+minutes to respawn and post) or not at all. **So: a broken daemon build
+rolls back automatically and fast (within `$WINDOW_SEC`); a manager that
+doesn't check in escalates to a human, on its own, slower timeline.** Do
+not conflate the two when explaining a failure in your evidence.
+
+**What actually gets restored on a rollback, restated from
+`scripts/deploy/watchdog.ts`'s own doc comment so it isn't taken as "just a
+`git reset`":** `git reset --hard <prevSha>`, then `bun install
+--frozen-lockfile` (dependencies are never restored by git alone), then —
+**only** when this deploy is in built mode (§1.1) — `bun run build`
+(`dist/` is gitignored, so a bare reset leaves the just-built BAD
+`dist/butchr.js` in place and a restart would just reload the same broken
+build), then `systemctl --user restart <unit>`, then a SECOND `/health`
+fetch to verify the rollback itself actually landed on a healthy
+`prevSha` — recorded in the state file as `rollbackVerified`, and signalled
+by the watchdog's own exit code: `1` means rolled back and verified; `3`
+(more serious) means the rollback ran but the restored build still isn't
+healthy either, which needs a human immediately (see §6's "if this does
+not match" for what to do when you observe a `3`).
 
 ### 3.1 Choose the state file path and the window
 
@@ -261,59 +292,99 @@ over that measurement without leaving Codey on a broken build for long.
 accordingly and say why in your evidence — this is a judgement call this
 runbook deliberately leaves to you, the one actually watching it happen.**
 
-### 3.2 Rehearse it first, on a THROWAWAY state file, before touching the real one
+### 3.2 Rehearse it first, on a THROWAWAY state file, through a REAL transient timer, before touching the real one
 
-**Do this before §3.3 and before the real restart in §6 — this is the
-"test it before the real restart" requirement.**
+**Do this before §3.3 and before the real restart in §4 — this is the
+"test it before the real restart" requirement.** Two things need proving,
+separately: (a) the decision logic behaves — covered by `--dry-run`
+directly; (b) the actual scheduling path (`systemd-run` → the user's
+systemd instance → your `bun` binary, found via ITS OWN PATH, not this
+shell's) works at all. **(b) is the part a bare `check --dry-run` from
+your own shell can never prove** — a transient unit runs in the user
+manager's environment, where `bun` (often installed under `~/.bun/bin`) is
+frequently NOT on `PATH`; if that's the case, the real timer would fire,
+fail with "command not found", and silently roll back nothing. This
+runbook does not assume your shell's `PATH` matches systemd's — it proves
+it, once, here.
+
+**(a) Decision logic, via `--dry-run` directly:**
 
 ```
 TEST_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/butchr/deploy-watchdog/REHEARSAL.json"
 bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" arm \
   --state-file "$TEST_STATE_FILE" --install-dir "$INSTALL_DIR" --unit butchr.service \
   --port "$PORT" --prev-sha "$PREV_SHA" --expected-sha 0000000000000000000000000000000000dead \
-  --window-sec 300
+  --window-sec 300 --mode "<source|built, from §1.1>"
 bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" check --state-file "$TEST_STATE_FILE" --dry-run
 ```
 
-**Expected output:** the `arm` call prints the state file path and the
-`systemd-run` command it would use (ignore that printed command for the
-rehearsal — do not actually schedule it against the real unit); the `check
---dry-run` call prints `decision: rollback — running build sha ... does not
-match the deployed sha 0000...dead` (this is deliberate — the fake expected
-sha can never match the real running build, forcing the rollback branch on
-purpose) followed by two lines starting `DRY RUN — would run:` naming
-exactly the `git reset --hard` and `systemctl --user restart` commands it
-would have run for real, and exits with code `1`. **Confirm those two
-printed commands look right (correct `$INSTALL_DIR`, correct `$PREV_SHA`,
-correct unit name) — this is your proof the mechanism is wired correctly
-before it ever gets to touch the real deploy.**
+**Expected output:** `check --dry-run` prints `decision: rollback —
+running build sha ... does not match the deployed sha 0000...dead` (the
+fake expected sha can never match the real running build, forcing the
+rollback branch on purpose), followed by `DRY RUN — would run:` lines for
+`git reset --hard`, `bun install --frozen-lockfile`, `bun run build` (only
+if `--mode built`), and `systemctl --user restart` — **confirm all of them
+name the right `$INSTALL_DIR`/`$PREV_SHA`/unit** — and exits `1`.
+
+**(b) The real scheduling path, through an actual `systemd-run` transient
+timer, with a short delay and `--dry-run` on the scheduled job itself so
+nothing real happens even if everything fires correctly:**
 
 ```
+REHEARSAL_UNIT=butchr-deploy-watchdog-REHEARSAL
+systemd-run --user --on-active=10 --unit="$REHEARSAL_UNIT" -- \
+  "$(command -v bun)" run "$INSTALL_DIR/scripts/deploy/watchdog.ts" check --state-file "$TEST_STATE_FILE" --dry-run
+sleep 15
+journalctl --user -u "$REHEARSAL_UNIT" --no-pager
+```
+
+**Expected output:** the journal for `$REHEARSAL_UNIT` contains the SAME
+`decision: rollback — ...` and `DRY RUN — would run: ...` lines as (a)
+above — proving the transient unit found `bun`, resolved the script path,
+and ran it to completion. **If the journal instead shows
+`/usr/bin/env: 'bun': No such file or directory` (or `$REHEARSAL_UNIT`
+never appears in `systemctl --user list-units --all` at all): STOP —**
+this is exactly the PATH failure mode this rehearsal exists to catch. Do
+not proceed to §3.3 until this rehearsal passes; `arm` (§3.3) prints its
+`systemd-run` command using this SAME process's own absolute `bun` path
+(`process.execPath`, never a bare `bun`) for exactly this reason, but that
+alone does not prove the user manager can reach that absolute path either
+— this rehearsal is the actual proof.
+
+```
+systemctl --user stop "$REHEARSAL_UNIT" 2>/dev/null   # in case it's still listed as a completed transient unit
 rm -f "$TEST_STATE_FILE"   # cleanup — this was a rehearsal only
 ```
 
-**Rollback:** none needed — `--dry-run` never touches git or systemctl by
-construction (see `test/unit/deploy-watchdog.test.ts`'s
-`"check --dry-run: ... NEVER calls git/systemctl"` test).
-**Evidence:** paste both commands' full output, and state explicitly that
-you deleted the rehearsal state file afterward.
+**Rollback:** none needed — `--dry-run` never touches git, bun-install,
+bun-build, or systemctl by construction (see
+`test/unit/deploy-watchdog.test.ts`'s `"check --dry-run: ... NEVER calls
+git/bun/systemctl"` test) — that is true whether it runs directly or,
+as in (b), through a real transient systemd unit.
+**Evidence:** paste (a)'s and (b)'s full output (including the journal
+capture), and state explicitly that you deleted the rehearsal state file
+and confirmed no `$REHEARSAL_UNIT` remains pending afterward.
 
 ### 3.3 Arm for real
 
 ```
 bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" arm \
   --state-file "$STATE_FILE" --install-dir "$INSTALL_DIR" --unit butchr.service \
-  --port "$PORT" --prev-sha "$PREV_SHA" --expected-sha "$NEW_SHA" --window-sec "$WINDOW_SEC"
+  --port "$PORT" --prev-sha "$PREV_SHA" --expected-sha "$NEW_SHA" --window-sec "$WINDOW_SEC" \
+  --mode "<source|built, from §1.1 — SAME value you rehearsed with in §3.2>"
 ```
 
-**Expected output:** `armed: $STATE_FILE` followed by the field summary and
-a `systemd-run --user --on-active=$WINDOW_SEC --unit=butchr-deploy-watchdog-butchr -- bun run $INSTALL_DIR/scripts/deploy/watchdog.ts check --state-file $STATE_FILE`
-line — **copy that exact printed command, do not retype it by hand.**
+**Expected output:** `armed: $STATE_FILE` followed by the field summary
+(including `mode=...`) and a
+`systemd-run --user --on-active=$WINDOW_SEC --unit=butchr-deploy-watchdog-butchr -- <absolute path to bun> run $INSTALL_DIR/scripts/deploy/watchdog.ts check --state-file $STATE_FILE`
+line — **the bun path is printed as `arm`'s own `process.execPath`, an
+absolute path, never a bare `bun` (this is what §3.2(b) rehearsed working);
+copy that exact printed command, do not retype it by hand.**
 
 **If `arm` refuses** (identical prev/expected sha, a non-numeric
-`--window-sec`, an out-of-range `--port`): fix the input named in the error
-and re-run; this is a usage error, not a deploy failure — nothing has
-restarted yet.
+`--window-sec`, an out-of-range `--port`, a `--mode` that isn't exactly
+`source` or `built`): fix the input named in the error and re-run; this is
+a usage error, not a deploy failure — nothing has restarted yet.
 **Rollback:** none — arming only writes a state file; delete it
 (`rm -f "$STATE_FILE"`) if you decide not to proceed with this deploy at
 all.
@@ -333,7 +404,7 @@ systemctl --user list-timers --all | grep butchr-deploy-watchdog
 from now.
 
 **Rollback:** `systemctl --user stop butchr-deploy-watchdog-butchr.timer`
-cancels it outright (also done automatically by §8's `disarm` step on
+cancels it outright (also done automatically by §7's `disarm` step on
 success).
 **Evidence:** both commands' output.
 
@@ -372,9 +443,9 @@ systemctl --user restart butchr.service
 
 **Rollback:** do nothing manually — §3's armed watchdog is already
 scheduled to check and, if needed, roll back automatically at
-`$WINDOW_SEC`. (You may also roll back manually and immediately, per §7's
-"if it fails" instructions, if you observe a failure before the timer
-fires and are still around to act on it.)
+`$WINDOW_SEC`. (You may also roll back manually and immediately, per §6's
+"if this does not match" instructions, if you observe a failure before the
+timer fires and are still around to act on it.)
 **Evidence:** `status` output, and the restart timestamp.
 
 ---
@@ -390,8 +461,10 @@ plainly in your evidence whether escalation was needed and, if so, that you
 notified the director.
 
 **Rollback:** N/A — this step is observational. A manager that never comes
-back is itself evidence a rollback may be needed; defer to §7's health
-check for the actual verdict.
+back is itself evidence a rollback may be needed; defer to §6's health
+check for the actual verdict (see §3's "Trigger conditions" note — this
+step's own ~10-minute escalation and the watchdog's `$WINDOW_SEC` auto-check
+are deliberately separate mechanisms, not the same thing).
 **Evidence:** screenshot or copy of the thread showing all three
 confirmations (or the escalation, if it came to that) with timestamps.
 
@@ -415,12 +488,31 @@ firms up to `"current"`.
 **If this does not match:** do nothing manually — let §3's watchdog fire at
 `$WINDOW_SEC` and roll back on its own. **If you want to resolve it sooner
 than the window** (you can already tell it's broken, e.g. `curl` gets
-connection-refused): you may run the rollback commands yourself right now
-(`git -C "$INSTALL_DIR" reset --hard "$PREV_SHA"` then
-`systemctl --user restart butchr.service`), and then run
+connection-refused): you may run the FULL rollback sequence yourself right
+now — not just a bare reset (§3's own "what actually gets restored" note
+explains why `dist/`/`node_modules` need restoring too):
+`git -C "$INSTALL_DIR" reset --hard "$PREV_SHA"`, then
+`bun install --frozen-lockfile` (in `$INSTALL_DIR`), then — mode `built`
+only — `bun run build`, then `systemctl --user restart butchr.service`,
+then re-`curl` `/health` yourself to confirm it's actually healthy on
+`$PREV_SHA` before calling it done. Either way, run
 `bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" disarm --state-file "$STATE_FILE" --timer-unit butchr-deploy-watchdog-butchr.timer --reason "manual rollback before window"`
 so the still-pending timer doesn't fire a second, redundant rollback later.
-**Evidence:** the full `/health` JSON, and — if you rolled back manually —
+
+**If instead you're reading this because the ARMED WATCHDOG ALREADY FIRED**
+(you see its journal entry, or `disarm` reports the state is already
+disarmed with a `rolled back: ...` reason): check `state.rollbackVerified`
+(`bun run "$INSTALL_DIR/scripts/deploy/watchdog.ts" status --state-file
+"$STATE_FILE"` prints the whole state file). **`true`/exit code `1`:** the
+known-good build is back and confirmed healthy — proceed to §7. **`false`/
+exit code `3`:** the rollback ran but even `$PREV_SHA` isn't coming up
+healthy — this is no longer a deploy problem this runbook can resolve
+automatically; STOP, do not retry the watchdog or re-run any command in
+this document speculatively, and escalate to `admin-assembly` immediately
+with the full `/health` output (or lack of one) and the watchdog's own
+journal (`journalctl --user -u butchr-deploy-watchdog-butchr`).
+**Evidence:** the full `/health` JSON (or the `status` output, if the
+watchdog already acted on its own), and — if you rolled back manually —
 the disarm command's output too.
 
 ---
@@ -614,11 +706,22 @@ unreachable `/health`, `ok: false`, a sha mismatch, a missing `build.sha`,
 and an already-disarmed state. `scripts/deploy/watchdog.ts`'s CLI (`arm`,
 `check`, `disarm`, `status`) is unit-tested in
 `test/unit/deploy-watchdog.test.ts` against a fake in-memory IO —
-including, specifically, that `--dry-run` NEVER calls the injected
-git/systemctl functions, and that a real (non-dry-run) unhealthy check
-calls `git reset --hard` **then** `systemctl --user restart`, in that
-order, exactly once. `bun run check` (this repo's full gate) passes with
-these included.
+including, specifically: `--dry-run` NEVER calls the injected
+git/bun/systemctl functions; a real (non-dry-run) unhealthy check in
+`source` mode calls `git reset --hard` → `bun install --frozen-lockfile` →
+`systemctl --user restart`, in that order, and never calls the build step;
+the same in `built` mode ALSO calls the build step, between install and
+restart; a rollback that re-verifies healthy on `prevSha` sets
+`rollbackVerified: true` and exits `1`; a rollback whose post-rollback
+`/health` is still bad sets `rollbackVerified: false` and exits `3`
+(distinctly, not conflated with a verified rollback); and `arm` prints its
+suggested `systemd-run` command using an ABSOLUTE bun path, never a bare
+`bun`. `bun run check` (this repo's full gate) passes with these included.
+§3.2 of this runbook additionally rehearses the real `systemd-run`
+scheduling path itself (not just the decision logic) before every actual
+deploy — the unit tests prove the code's logic; that rehearsal proves the
+Codey-specific environment (PATH, systemd-run availability) the code
+actually has to run in.
 
 ---
 
