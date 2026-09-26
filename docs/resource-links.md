@@ -456,13 +456,18 @@ notification mechanism was built; every piece below extends that module's
 existing coalescer, per-(owner,target) baseline store, and
 `maxLinkedTurnsPerHour` rate cap in place.
 
-**Scope, today: `jira-work-item` owners only.** The only live owner
-`createRuleResourceType`'s `runTick` call runs for is a `jira-work-item`
-(`RuleMatch`) — FACTORY-5's `jira-project` resource type is a separate,
-not-yet-merged resource type (its own poll loop), untouched by this story.
-The reconciliation itself (`src/resources/link-reconcile.ts`) is
-provider-agnostic on the TARGET side, so a future `jira-project` (or any
-other) owner can reuse `managedLinkedItems` unchanged once it exists.
+**Scope, as of FACTORY-9: `jira-work-item` owners only — since widened.** At
+the time this story shipped, the only live owner `createRuleResourceType`'s
+`runTick` call ran for was a `jira-work-item` (`RuleMatch`); `jira-project`
+was a separate, not-yet-merged resource type (its own poll loop) with no
+live agent for a managed link to notify. The reconciliation itself
+(`src/resources/link-reconcile.ts`) is provider-agnostic on the TARGET side
+specifically so a future `jira-project` (or any other) owner could reuse
+`managedLinkedItems` unchanged once one existed — see **BUTCHR-469 below**
+for that widening: a `jira-project` owner now reconciles its own managed
+links via `jiraProjectOwnerRef` + `managedLinkedItems` (`nativeRefs: []`,
+since a project has no structural native links of its own), through the
+SAME `runTick`, unchanged from what this section describes.
 
 **How a managed link becomes a watcher.** Each opted-in (`linkedEventing:
 true`) owner's own native Jira links (`nativeJiraRefs`: its `issuelinks` and
@@ -486,7 +491,7 @@ that kind already uses:
 | `github-issue` | `github-issue` | `pollGithubLink` unchanged — the canonical `owner/repo#n` string is already the exact identity it expects |
 | `webpage` | `webpage` | `pollWebpage` unchanged — the ref's own normalized URL is already what it expects |
 | `filesystem` | `filesystem` (NEW) | a new poller, `pollFilesystem` (`src/jira-watch/external-poll.ts`) — `fs.stat`'s mtime+size, no network |
-| `jira-project` | — | **explicit, documented scope gap**: no live Jira API call exists anywhere in this codebase for a PROJECT's own change signature, and FACTORY-5 (which would give one a live agent) is not merged. Silently excluded from every owner's watch set — never a crash, logged once, the same effect as an omitted `ProviderAdapter.changeToken` |
+| `jira-project` (as a link **target**) | — | **still an explicit, documented scope gap**: no live Jira API call exists anywhere in this codebase for a PROJECT's own change signature (there is no project-level `updated`/comment-count endpoint), so a `jira-work-item` owner's managed link TO a project is still silently excluded from that owner's watch set — never a crash, logged once, the same effect as an omitted `ProviderAdapter.changeToken`. This is UNCHANGED by BUTCHR-469 below, which gives `jira-project` a watch of its own (as an OWNER), not this (as a TARGET) — the two are independent gaps/capabilities. |
 
 **Reconcile is idempotent, every tick.** Managed items are combined with
 native/description items BEFORE `maxLinkedItems` caps (one uniform budget
@@ -551,6 +556,70 @@ forwarded into `runTick`. Every one of these is optional, following this
 module's existing "omitted dep ⇒ feature silently never runs" convention —
 a daemon that doesn't wire `linkStore` reconciles no managed links at all,
 byte-for-byte the pre-FACTORY-9 behaviour.
+
+## BUTCHR-469: `jira-project` as an owner — member discovery + managed links
+
+Widens FACTORY-9's scope note above: `jira-project` now has a live owner
+(BUTCHR-425/BUTCHR-444, PR #407 — `createJiraProjectResourceType`,
+`src/rules/jira-project-type.ts`), so the "future `jira-project` owner"
+FACTORY-9 anticipated is this ticket. Two item sources feed a
+`linkedEventing`-opted project owner's watch, both delivered through the
+EXACT SAME `runTick` (coalescer, per-(owner,target) baseline, rate cap,
+notify) FACTORY-9 describes above — no forked delivery path, no second
+notification mechanism:
+
+1. **Member discovery**: `project = <key> AND updated >= "-<N>m"`, one
+   watermark per project owner. The watermark is a JQL RELATIVE date literal
+   (minutes elapsed since the last successful search, rounded up), never an
+   absolute timestamp — Jira resolves a relative literal itself, so this
+   avoids reproducing (or skewing) the requesting account's own timezone
+   computation. A project owner's first sighting (first tick, or after any
+   daemon restart — this state is in-memory only) seeds the watermark to
+   "now" and searches nothing that tick, so there is no historical flood.
+   The watermark only advances once a tick's events are genuinely delivered
+   or safely consumed, never on a rate-capped tick or a failed search
+   (fails open, logged, this owner's managed-link source unaffected).
+2. **Managed links**: `brooswit.butchr.links` (Decision 9's project-property
+   store), reconciled via the SAME `managedLinkedItems` this section
+   describes, called with `nativeRefs: []` — a project has no structural
+   native links of its own (no `issuelinks`/`parent`) — so every managed
+   link on a project is `"managed"`-origin.
+
+**Dedup and removal-tracking scope.** A target that is both a member and a
+managed-link target is de-duplicated to ONE `LinkedItem`/ONE event line, the
+same "first occurrence wins" convention `discoverLinkedItems` already uses.
+Removal detection (`"no longer linked"`) is scoped to MANAGED links only —
+a member issue that simply falls outside the current watermark window is
+NOT a removal (it is still a project member, just not recently touched);
+only a genuine removal from `brooswit.butchr.links` fires that event.
+
+**Comment events.** A "comment event" for a project owner reuses the exact
+same per-target comment-cursor diff FACTORY-9 built for any Jira-kind
+linked target (`JiraSnapshot.commentCursor`), applied uniformly to member
+issues and managed-link targets alike — not a new "project comment" concept
+(Jira has none; see `docs/provider-capabilities.md`).
+
+**Seam.** `ProjectMatch` (`src/rules/jira-project-type.ts`) has no
+`JiraIssue` (a project has none of its own), so it cannot satisfy
+`LinkedEventingMatch` as-is. Rather than fork `runTick`, it grew a second,
+optional parameter (`projectMatches: readonly ProjectLinkedEventingMatch[]`)
+— every existing call site that passes only `(matches, deps)` keeps
+compiling and behaving identically. `createJiraProjectResourceType` runs the
+tick from its own `discovery.related` (mirroring `createRuleResourceType`'s
+placement: after `reconcileNow`, so a just-spawned owner already exists
+before this ever tries to nudge it), and, like that path, only when both
+`notify` and `searchIssues` (the JQL search dep, separately named to avoid
+colliding with this type's own project-JSON-query `search`) are wired.
+`jira-project`'s own `related` still always returns `[]` — it has no
+related-resource concept of its own, unchanged.
+
+**Wiring.** `src/daemon/index.ts` hoists the routed link store
+(`routingLinkStore` — `createRoutingLinkStore` over the local file store and
+`createJiraProjectLinkStore(ops)`) so both the MCP `resourceLinkTools` and
+`createJiraProjectResourceType` share one instance, and passes
+`searchIssues: atlassian.searchAll`, `comments: atlassian.comments`,
+`notify: notifyRuleAgent` — the SAME seams the jira-work rule loop's own
+linked-eventing wiring already uses.
 
 ## Verification
 
