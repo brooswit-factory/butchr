@@ -196,12 +196,20 @@ const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
  * an eligible managed-session definition opted into "lizard mode"
- * (`SessionDefinition.lizardMode`). Consulted below by `lizardModeLabel`,
- * which the permission-answer timer's `eligiblePanes` hook is built from —
- * see `ManagedSessionResourceDeps.lizardModes`'s own doc comment
- * (src/rules/session-definition-type.ts) for why this is deliberately LIVE
- * rather than persisted-at-spawn the way `permissionMode`/`strictMcpConfig`
- * are (FACTORY-43): this field never reaches the launched process's argv.
+ * (`SessionDefinition.lizardMode`). Consulted below by `ruleLizardModeOf`,
+ * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
+ * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
+ * comment (src/rules/session-definition-type.ts) for why this is
+ * deliberately LIVE rather than persisted-at-spawn the way
+ * `permissionMode`/`strictMcpConfig` are (FACTORY-43): this field never
+ * reaches the launched process's argv. FACTORY-87: a RULE-launched agent
+ * (jira-work/jira-project/github/filesystem, as opposed to a managed
+ * session) has no per-file manifest of its own to rebuild a map like this
+ * from every poll — its `lizardMode` lives on its own `Rule`
+ * (src/rules/rules.ts), which is loaded once at startup, so `ruleLizardModeOf`
+ * below reads it straight from the already-loaded `rules` list instead of a
+ * second map, the same "rule-level fallback" shape `ruleRoleOfAgent` already
+ * uses for `role`.
  */
 const managedSessionLizardModes = new Map<string, boolean>();
 /**
@@ -224,6 +232,29 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   }
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
+};
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — `lizardMode`'s
+ * own equivalent of `ruleRoleOfAgent` immediately above: true iff `id`'s
+ * agent should be scanned/answered by the permission-answer timer. A managed
+ * session (`ownsManagedSessionAgent`) is resolved from the live, rebuilt-
+ * every-poll `managedSessionLizardModes` map (that field's own doc comment,
+ * just above `ruleRoleOfAgent`, explains why a managed session needs a live
+ * map rather than this rule-level fallback); every OTHER rule-launched agent
+ * (jira-work/jira-project/github-issue/github-pr/filesystem) is resolved
+ * straight from its own `Rule.lizardMode`, looked up the SAME way
+ * `ruleRoleOfAgent` looks up `Rule.role` — `rules` is loaded once at startup
+ * (no per-rule live poll the way managed-session definitions get one), so a
+ * second map here would just be a slower copy of what `rules` already holds.
+ * `undefined`/anything `decodeAnyAgentKey` cannot decode resolves `false`,
+ * matching `lizardMode`'s own "absent means never touched" contract.
+ */
+const ruleLizardModeOf = (id: string): boolean => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return false;
+  if (ownsManagedSessionAgent(id)) return managedSessionLizardModes.get(id) === true;
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.lizardMode === true;
 };
 // BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
 // (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
@@ -1666,19 +1697,20 @@ blockingEscalationTimer.unref?.();
 //
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
-// only when its cwd resolves to a `managed-sessions` agent id AND that id's
-// LATEST poll of `managedSessionLizardModes` (rebuilt every managed-sessions
-// poll — see that map's own comment above) says `true`. Everything else —
-// an ordinary jira-work/rule agent, a managed session that never set
-// `lizardMode`, a managed session not yet observed this daemon's lifetime —
-// resolves `undefined` and is never touched, matching `lizardMode`'s own
-// "absent means today's behaviour exactly" contract. The label itself
-// (basename of the definition file) is what lets a log line name WHICH
-// AGENT got a prompt answered (FACTORY-67's own requirement), not just an
-// opaque pane id.
+// only when its cwd resolves to SOME rule-engine agent id (managed session or
+// rule-launched alike) AND `ruleLizardModeOf` says that id's own lizard-mode
+// opt-in (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87) is `true`. Everything
+// else — a legacy/bare-issue agent, a managed session or rule that never set
+// the field, a managed session not yet observed this daemon's lifetime —
+// resolves `false` and is never touched, matching `lizardMode`'s own "absent
+// means today's behaviour exactly" contract. The label itself (basename of
+// the resource id, e.g. the definition file or the Jira/GitHub/filesystem
+// resource) is what lets a log line name WHICH AGENT got a prompt answered
+// (FACTORY-67's own requirement), not just an opaque pane id.
 function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const id = agentIdOfWorkspacePath(cwd);
-  if (!id || !ownsManagedSessionAgent(id) || managedSessionLizardModes.get(id) !== true) return undefined;
+  if (!id || !ruleLizardModeOf(id)) return undefined;
   const decoded = decodeAnyAgentKey(id);
   return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
 }

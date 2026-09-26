@@ -1072,10 +1072,14 @@ the full detail and the reasoning for why this module never re-parses a
 pane's dialog itself to recover the exact rule text (dialog recognition
 stays drovr's job — FACTORY-49/FACTORY-67).
 
-**Rule-launched agents are a separate, dependent story.** FACTORY-76 extends
-the same field/mechanism to jira-work / jira-project / github / filesystem
-rule agents — not this ticket's scope, coordinated on field name and
-daemon-wiring shape rather than diverging.
+**Rule-launched agents get the same mechanism too (FACTORY-87/FACTORY-76).**
+`Rule.permissionMode`/`Rule.lizardMode` (`src/rules/rules.ts`) extend this
+exact field/mechanism to jira-work / jira-project / github / filesystem
+rule-launched agents — same `permissionMode`/`lizardMode` names, same daemon
+timer, no second mechanism. See `docs/execution-modes.md`'s "`permissionMode`
+and `lizardMode`" section for the rule-side field story, and
+`docs/permission-answer-loop.md` for how `ruleLizardModeOf`
+(`src/daemon/index.ts`) extends `eligiblePanes` to cover them.
 
 **Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
 manifest load rather than silently storing-and-dropping it — see

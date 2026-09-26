@@ -10,7 +10,9 @@ export interface ProjectMatch { agentKey: string; rule: Rule; project: JiraProje
 export const ownsJiraProjectAgent = (id: string) => decodeAnyAgentKey(id)?.resourceProvider === 'jira-project';
 export function specForProject(m: ProjectMatch): SpawnSpec {
  return m.spec ?? { key:m.agentKey,resource:m.project.key,issuetype:'project',summary:m.project.name,parent:null,brief:m.rule.brief,
- ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}) };
+ ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}),
+ // FACTORY-87: overrides agentLaunchConfig's own unconditional jira-project `permissionMode: "auto"` default (src/agents/argv.ts) only when set.
+ ...(m.rule.permissionMode ? {permissionMode:m.rule.permissionMode}: {}) };
 }
 
 export interface CreateJiraProjectResourceTypeDeps {
