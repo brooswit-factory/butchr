@@ -24,6 +24,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
+import { filesystemQueryProblems } from "../resources/filesystem-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
@@ -77,6 +78,88 @@ export type AgentRole = (typeof AGENT_ROLES)[number];
 
 export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
 
+/** MCP server binding shapes a rule/definition can bind to, beyond butchr's own. Only `http` today. */
+export const MCP_SERVER_BINDING_TYPES = ["http"] as const;
+export type McpServerBindingType = (typeof MCP_SERVER_BINDING_TYPES)[number];
+
+/** The name every launch already reserves for butchr's own MCP server; no binding may reuse it. */
+export const RESERVED_MCP_SERVER_NAME = "butchr";
+
+/**
+ * One additional MCP server a rule's agent(s) (or a managed-session
+ * definition's agent, BUTCHR-408) may connect to, beyond butchr's own
+ * (BUTCHR-411/CNDLX-45; the type was ported to main's session-definition
+ * work from this story's BUTCHR-395 branch, PR #387 merge commit 5520722,
+ * per the epic's sequencing decision on BUTCHR-408 — S4 had not landed this
+ * on `main` yet when the session-definition work needed it, so that was
+ * source material copied verbatim, not a competing shape; this sync is
+ * where S4's own `Rule.mcpServers` lands on `main` and the two uses
+ * converge on this one type). `channel: true` means Claude also receives
+ * this server's push notifications — one more
+ * `--dangerously-load-development-channels=server:<name>` entry, the exact
+ * mechanism `server:butchr` already relies on (src/agents/argv.ts) — so
+ * event-driven delivery from a non-Rocket.Chat MCP server (e.g. a MUD
+ * bridge) needs no polling substitute. `channel: false` still reaches
+ * `mcp.json`/the Codex `mcpServers` config (tools work) but is never added
+ * to the channel flag.
+ *
+ * `headersEnvVar`, not `headers`: header VALUES (often bearer tokens) are
+ * never written into a rules file or a managed-session definition file
+ * itself — only the NAME of an env var on THIS DAEMON's own process that
+ * holds a JSON object of header values, resolved at launch time
+ * (`resolveMcpServerHeaders`, src/agents/workspace.ts). A binding with no
+ * `headersEnvVar`, or one naming an unset/malformed var, simply connects
+ * with no extra headers (logged once, value never logged). A resolved
+ * header value is written ONLY into a Claude workspace's `mcp.json`
+ * (permission-tightened when it carries one — see that function's own doc
+ * comment) — NEVER into Codex argv, which is a real process command line
+ * other local users can read (review finding, PR #387): `boundCodexServers`
+ * (src/agents/argv.ts) never resolves headers at all, so a Codex agent gets
+ * a bound server's tools with no extra headers, regardless of
+ * `headersEnvVar` (BUTCHR-408's own manifest doc calls this out for its
+ * Codex example definitions too).
+ *
+ * Deliberately independent of `Rule.account`/`Rule.execution`: a binding (and
+ * its `channel` flag) is wired into launch argv from this field alone, never
+ * from account policy, so an `account: "none"` rule (no Rocket.Chat account
+ * — e.g. Candlestix's MUD players) still gets full event-driven channel
+ * delivery for a bound server.
+ *
+ * `accountHeader`, not a second binding mechanism (BUTCHR-412, BUTCHR-391
+ * comment 24007): the corrected Rocket.Chat credential design has an agent's
+ * MCP binding carry only its OWN (non-secret) account name, in a header —
+ * `x-rocketr-account` for rocketr — which `headersEnvVar` above cannot
+ * express: that resolves ONE static value per RULE from the daemon's own
+ * env, while an account name is per-AGENT (this rule's every agent gets a
+ * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
+ * value, which is deliberately kept out of Codex argv entirely — see that
+ * field's own doc comment; `accountHeader`'s value has no such restriction,
+ * and BUTCHR-413 does resolve it for Codex, via `resolveAccountHeader`
+ * reused directly in `boundCodexServers`, src/agents/argv.ts — the small,
+ * explicit extension that review's finding 1 needed, proven by a test that
+ * a Codex agent's own bound `rocketr` server carries its account name with
+ * no secret ever alongside it). Set to the literal header NAME (e.g.
+ * `"x-rocketr-account"`); the VALUE is resolved at launch time from
+ * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
+ * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
+ * `ensureAccount` actually provisioned this agent's account, never written
+ * into a rules file or a managed-session definition itself. A binding with
+ * `accountHeader` set but no `spec.rocketchatAccount` (this rule's `account`
+ * policy is `"none"`, or `ensureAccount` hasn't run for this spec) simply
+ * omits the header — same "absent means no extra header" discipline
+ * `headersEnvVar` already has. Combines with `headersEnvVar` on the SAME
+ * binding if both are set (rare, but not forbidden): the two are resolved
+ * independently and merged.
+ */
+export interface McpServerBinding {
+  name: string;
+  type: McpServerBindingType;
+  url: string;
+  headersEnvVar?: string;
+  accountHeader?: string;
+  channel: boolean;
+}
+
 /**
  * Relationships name other rules; how a link is realised in the resource
  * system (a Jira issue link, a backlink field) is the provider adapter's
@@ -107,7 +190,11 @@ export interface Rule {
    * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
    * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
    * a JSON object (not JQL) for `jira-project` — `{ leadAccountId?, keys?,
-   * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts).
+   * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts); a
+   * small JSON object for `filesystem` (root, kind, name pattern, recursion
+   * depth, an optional content/metadata predicate — see
+   * src/resources/filesystem-query.ts and docs/filesystem.md for the syntax
+   * decision).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -121,6 +208,8 @@ export interface Rule {
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /** Additional MCP servers this rule's agent(s) may connect to, beyond butchr's own (BUTCHR-411). Absent means none — today's behaviour exactly. */
+  mcpServers?: McpServerBinding[];
   /** Operator-owned MCP config path (`jira-project` rules only); `{{KEY}}` expands to the resource key. Absolute path required. */
   mcpConfigFile?: string;
   /**
@@ -181,11 +270,17 @@ export interface Rule {
 }
 
 const RULE_FIELDS = new Set([
-  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpConfigFile",
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
+const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
+/** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+/** RFC 7230 `field-name` (token charset), lowercased-or-not — an HTTP header name. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -214,6 +309,49 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     if (seen.has(identity)) errors.push(`${pat} repeats an earlier preference`);
     seen.add(identity);
     return pref;
+  });
+}
+
+const isHttpUrl = (v: unknown): boolean => {
+  if (typeof v !== "string" || v.trim() === "") return false;
+  try { const u = new URL(v.trim()); return u.protocol === "http:" || u.protocol === "https:"; }
+  catch { return false; }
+};
+
+/**
+ * Same validator shape as every other `parse*` helper in this file: collects
+ * every problem into `errors` and returns `undefined` when any exist (the
+ * caller never uses a partially-valid result). `at` names the field for
+ * error text (e.g. `rules[2].mcpServers` or a session definition's own
+ * `<path>.mcpServers`) — this function is deliberately caller/document
+ * agnostic so both `Rule` and a session definition (BUTCHR-408) can share it
+ * without either owning the other's shape.
+ */
+export function parseMcpServers(raw: unknown, at: string, errors: string[]): McpServerBinding[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) { errors.push(`${at} must be a non-empty array`); return undefined; }
+  const seen = new Set<string>();
+  return raw.map((s, j) => {
+    const pat = `${at}[${j}]`;
+    if (!isObject(s)) { errors.push(`${pat} must be an object`); return undefined as never; }
+    unknownFields(s, MCP_SERVER_BINDING_FIELDS, pat, errors);
+    const name = typeof s.name === "string" ? s.name.trim() : "";
+    if (!nonEmpty(s.name) || !MCP_SERVER_NAME_RE.test(name)) errors.push(`${pat}.name must be a non-empty name of letters, digits, "_" or "-"`);
+    else if (name === RESERVED_MCP_SERVER_NAME) errors.push(`${pat}.name "${RESERVED_MCP_SERVER_NAME}" is reserved for butchr's own server`);
+    else if (seen.has(name)) errors.push(`${pat}.name "${name}" is a duplicate`);
+    else seen.add(name);
+    if (!oneOf(MCP_SERVER_BINDING_TYPES, s.type)) errors.push(`${pat}.type must be one of ${MCP_SERVER_BINDING_TYPES.join(", ")}`);
+    if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
+    const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
+    if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
+    const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
+    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be a valid HTTP header name`);
+    if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
+    return {
+      name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
+      ...(headersEnvVar ? { headersEnvVar } : {}),
+      ...(accountHeader ? { accountHeader } : {}),
+      channel: s.channel as boolean,
+    };
   });
 }
 
@@ -263,6 +401,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
+    else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
     if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
@@ -287,8 +426,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
+    const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -300,6 +440,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
+      ...(mcpServers ? { mcpServers } : {}),
       ...(typeof raw.mcpConfigFile === "string" ? { mcpConfigFile: raw.mcpConfigFile } : {}),
       ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
       ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),

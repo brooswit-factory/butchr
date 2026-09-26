@@ -1,12 +1,13 @@
 # Resource links: `ResourceRef`, the managed-link collection, and `list_links`/`add_link`/`remove_link`
 
 FACTORY-7 (implementing FACTORY-4, story 1/3 of epic FACTORY-3 — "resource
-links and project-level agents"). This is the foundation two shelved stories
-build on: FACTORY-5 (a `jira-project` resource type persisting managed links
-in the `brooswit.butchr.links` project property) and FACTORY-6 (reconciling
-the effective link set into watchers, snapshots, and change events). Neither
-is implemented here — this document exists so their authors have a stable,
-documented surface to build against.
+links and project-level agents") laid this foundation. Two more stories build
+on it: FACTORY-5 (a `jira-project`-owned managed-link collection persisted in
+the `brooswit.butchr.links` project property, wired into
+`list_links`/`add_link`/`remove_link` — implemented below, see Decision 9)
+and FACTORY-6 (reconciling the effective link set into watchers, snapshots,
+and change events — still not implemented; this document remains the stable,
+documented surface its author builds against).
 
 Background: [Handoff — Butcher Resource Links and Project-Level
 Agents](https://wroosbit.atlassian.net/wiki/spaces/BROOSWITFACTORY/pages/39518269/Handoff+Butcher+Resource+Links+and+Project-Level+Agents)
@@ -217,14 +218,16 @@ built or wired:
 A single JSON file (`{ v: 1, links: { "<ownerKey>": ["<targetKey>", ...] } }`)
 under `join(workspaceRoot(), ".links.json")` (overridable via
 `BUTCHR_LINKS_STORE_FILE`) — **not** a Jira project property, which is
-`jira-project`-specific persistence belonging to FACTORY-5. This is a real,
-tested implementation, not a stub: any resource kind can use it, and
-FACTORY-5's own tests can build on it directly rather than needing a live
-Jira project to test against.
+`jira-project`-specific persistence, implemented separately in Decision 9
+below (FACTORY-5) and routed to only for a `jira-project:<KEY>` owner. This
+file store is a real, tested implementation, not a stub, and remains the
+persistence for every OTHER owner kind: FACTORY-5's own tests build on it
+directly (see Decision 9) rather than needing a live Jira project to test
+against.
 
 `LinkStore`'s methods are `Promise`-returning even though this
-implementation is synchronous underneath, so a future network-backed
-implementation (FACTORY-5's Jira REST project property) can satisfy the same
+implementation is synchronous underneath, so a network-backed implementation
+(FACTORY-5's Jira REST project property, Decision 9) can satisfy the same
 interface without a breaking signature change.
 
 The CLI resolves the store via the SAME `defaultLinksStorePath()`
@@ -253,6 +256,120 @@ lightly written to; a real multi-writer lock is out of scope.
   reported via `{ added: false, reason: "already-present" }`, never an error.
 - **`remove_link` of an absent link is non-destructive**: reported via
   `{ removed: false, reason: "not-present" }`, never an error.
+
+## Decision 9 — `jira-project` persistence and owner routing (FACTORY-5)
+
+**A second `LinkStore` implementation, backed by the Jira project entity
+property `brooswit.butchr.links`** (`src/resources/jira-project-link-store.ts`,
+`createJiraProjectLinkStore(ops: AtlassianOps): LinkStore`) — used for a
+`jira-project:<KEY>` OWNER only; every other owner kind keeps using the
+file store from Decision 7 unchanged. The property key is namespaced
+`brooswit.` because project-property keys are shared across whatever apps a
+project has, not just this daemon; `.butchr.links` distinguishes it from the
+unrelated `butchr` property `src/resources/project.ts` already owns for this
+daemon's own project-tier wake watermarks — a different concern, deliberately
+not reused or extended, so a link-heavy project can never starve the
+project's own wake bookkeeping of space (or vice versa).
+
+**Value shape:** `{ v: 1, links: ["<targetCanonicalKey>", ...] }` — a FLAT
+array, not the file store's `{ v: 1, links: { "<ownerKey>": [...] } }` map.
+Deliberate departure from the file store's shape: a Jira project property
+read/write call is already scoped to exactly one project (`projectKey` is an
+argument to the Jira API call, not data inside the value), so there is
+exactly one owner a given property value could ever describe — a map keyed
+by an owner that never varies would just be a wrapper around one entry.
+`list`/`add`/`remove` still take the SAME full canonical `ownerKey` string
+(e.g. `"jira-project:BUTCHR"`) every `LinkStore` method already receives;
+this implementation asserts that key names the same project the property
+call targets rather than storing it.
+
+**Same discipline as the file store, restated independently (this is a
+second, independent implementation, not a shared code path):** `v` refuses
+to load a version newer than this build supports (today, only `1`) rather
+than guess. Target strings are round-tripped as plain strings, never parsed
+into a `ResourceRef` at this layer — achieved structurally, the same way the
+file store achieves it: an entry this build's `resource-ref.ts` can't parse
+survives an `add`/`remove` of a DIFFERENT target in the same property, byte
+for byte (pinned by `jira-project-link-store.test.ts`'s "unknown-provider
+(unparseable) entries" suite). Missing property (`getProjectPropertyOrNull`
+resolving `null`, i.e. a genuine Jira 404) is treated as `{ v: 1, links: [] }`
+— an empty collection, not an error; any OTHER read/write failure (a
+permission error, a network error, a malformed value) propagates uncaught.
+
+**Atomicity / race window, NAMED:** `add`/`remove` are a read-modify-write of
+the FULL property value (`getProjectPropertyOrNull` then
+`setProjectProperty`, a full-value REPLACE — Jira's project property API has
+no compare-and-swap, no partial update, no ETag/version precondition). Two
+concurrent callers (two agents, or an agent racing an operator's CLI) can
+both read the same starting value before either writes; the second write
+wins and the first caller's change is silently lost. Same judgment as
+Decision 7's own, differently-caused race: accepted for a collection this
+lightly written to relative to how often it's read; a real fix needs
+Jira-side optimistic locking this API does not expose.
+
+**Size cap:** a Jira project entity property value is capped at 32768 bytes
+(the same platform-wide ceiling `src/resources/project.ts`'s
+`PROJECT_PROPERTY_SIZE_CEILING_BYTES` independently documents and enforces
+for its own, unrelated property). `createJiraProjectLinkStore`'s `add`
+refuses with a clear, thrown error naming the actual byte count rather than
+risking a silent Jira-side truncation or rejection; `remove` can only shrink
+the value, so it is not checked.
+
+**Credentials / permissions, honestly stated:** `src/resources/project.ts`
+MEASURED live (2026-09-01) that this daemon's own credential can write a
+project entity property it does not lead, gated on Jira's Administer
+Jira/Projects grant rather than project leadership — but that measurement is
+against the OTHER (`butchr`) property. This story has NOT independently
+re-measured `brooswit.butchr.links` specifically against a live project; it
+is the SAME Jira REST endpoint and expected to carry the same permission
+model, but "expected to match" is stated here as exactly that, not as a
+second live measurement. See this story's PR description for what was
+actually verified live, if anything, against a scratch project property
+(created and deleted for the purpose — `brooswit.butchr.links` is not left
+on any real project by this story's own verification).
+
+**Owner routing — one small, testable function, not scattered ifs**
+(`src/resources/link-store-router.ts`, `createRoutingLinkStore`): given a
+file store and a LAZY `jiraProjectStore` factory, every `list`/`add`/`remove`
+call checks whether its `ownerKey` starts with `jira-project:` and delegates
+to whichever store applies. The factory is a factory, not a value, and is
+invoked ONLY when a call actually routes to a `jira-project:` owner — this is
+what lets the CLI build a routing store without needing Jira credentials for
+the common (non-`jira-project`) case. `listLinks`/`addLink`/`removeLink`
+(`src/resources/link-store.ts`) are UNCHANGED by this story: routing happens
+entirely in which `LinkStore` value they're handed, never inside those three
+functions. The daemon (`src/daemon/index.ts`) wires the routing store into
+`resourceLinkTools` (MCP) unconditionally — it already has Jira credentials
+loaded at that point, so its `jiraProjectStore` factory is cheap and
+side-effect-free, not genuinely lazy.
+
+**CLI credential loading (`src/cli/link-cli.ts`):** `butchr link ...` for any
+NON-`jira-project` owner still needs no Jira credentials or rules file,
+exactly as Decision 7 describes — unaffected by this story. A `jira-project`
+owner's `jiraProjectStore` factory (`jiraProjectStoreFromEnv`) calls the
+SAME `loadConfig` (`src/config/config.ts`) the daemon itself uses, reading
+`ATLASSIAN_SITE`/`ATLASSIAN_EMAIL`/`ATLASSIAN_TOKEN`(`_FILE`) from the
+CLI invoker's own environment — an operator must run `butchr link ... jira-project:X ...`
+with the same Jira credentials the daemon would use, the same discipline
+Decision 7 already documents for `BUTCHR_WORKSPACES`/`BUTCHR_LINKS_STORE_FILE`.
+A missing/invalid credential, or a Jira 4xx/5xx the resulting call hits,
+surfaces through the EXACT SAME path a file-store read failure already did
+before this story: `tryStoreOp` (link-cli.ts) turns any rejected store call
+into one clean `stderr` line and exit 1 — no separate error-handling branch
+was added for this case.
+
+**Targets of any kind, self-links, idempotency:** unchanged and inherited
+for free. A `jira-project` owner's targets may be any of the six
+`ResourceRef` kinds (nothing in `createJiraProjectLinkStore` restricts
+target shape). Self-link refusal, idempotent `add`, and non-destructive
+`remove` (Decision 8) are enforced in `addLink`/`removeLink`
+(`link-store.ts`) BEFORE either implementation's `store.add`/`store.remove`
+is ever called, so both stores get this behaviour identically without
+reimplementing it.
+
+**`ProviderAdapter.nativeLinks` for `jira-project`:** untouched by this
+story — nothing in this codebase constructs a `ProviderAdapter` at all yet
+(Decision 6), so there was nothing to omit or stub.
 
 ## The operations: core, MCP, CLI
 
@@ -283,7 +400,9 @@ union has no such member for them) — "the caller's own resource" is simply
 not an answerable question for them. An explicit argument also matches the
 handoff doc's own signature, `list_links(resource)`, literally, and is
 registered **unconditionally** (unlike every provider-specific tool set),
-since the local store needs no credentials and works for every kind.
+since the daemon already has Jira credentials loaded regardless of which
+owner kind a given call names (Decision 9's routing is invisible from here —
+the daemon's own `jiraProjectStore` factory is cheap, not genuinely lazy).
 
 CLI: `butchr link list <resource>`, `butchr link add <resource> <target>`,
 `butchr link remove <resource> <target>`, plus `--help`/`-h`. Non-zero exit
@@ -294,13 +413,18 @@ no-ops included, since those are not errors.
 `package.json`'s `bin.butchr` builds solely from `src/daemon/index.ts` — this
 is the first subcommand this binary has ever had, so `runLinkCli` is invoked
 from a small `argv[2] === "link"` guard at the very top of that file, before
-its config/rules loading, so a `butchr link` invocation needs no Jira
-credentials or rules file.
+its config/rules loading. A `butchr link` invocation for any NON-`jira-project`
+owner still needs no Jira credentials or rules file, exactly as before this
+story; a `jira-project` owner is the one exception, needing Jira credentials
+from the CLI invoker's own environment — see Decision 9's "CLI credential
+loading" for exactly how and why that's still lazy.
 
-## What FACTORY-5/FACTORY-6 should consume
+## What FACTORY-6 should consume
 
-The stable exported surface, expected not to change shape without a
-conversation with whoever is building against it:
+FACTORY-5 (Decision 9) is implemented; FACTORY-6 (reconciling the effective
+link set into watchers, snapshots, and change events) is not. The stable
+exported surface, expected not to change shape without a conversation with
+whoever is building against it:
 
 - `src/resources/resource-ref.ts`: `ResourceRef`, `ResourceRefProvider`,
   `RESOURCE_REF_PROVIDERS`, `parseResourceRef`, `tryParseResourceRef`,
@@ -309,17 +433,18 @@ conversation with whoever is building against it:
   `LinkOrigin`.
 - `src/resources/provider-adapter.ts`: `ProviderAdapter<Ref>` — FACTORY-6's
   own adapters implement this per provider.
-- `src/resources/link-store.ts`: `LinkStore` (the interface — FACTORY-5 can
-  implement its own project-property-backed version of it),
-  `createLinkStore`/`defaultLinksStorePath` (the provided local
-  implementation), `listLinks`/`addLink`/`removeLink` (the core operations —
+- `src/resources/link-store.ts`: `LinkStore` (the interface),
+  `createLinkStore`/`defaultLinksStorePath` (the file-backed implementation,
+  Decision 7), `listLinks`/`addLink`/`removeLink` (the core operations —
   reusable directly by any future in-process caller, not only the MCP/CLI
-  wrappers in this story).
-
-FACTORY-5 does not have to use `createLinkStore`'s file-backed
-implementation for `jira-project` resources — it only has to satisfy
-`LinkStore`'s interface so `listLinks`/`addLink`/`removeLink` keep working
-unchanged over whatever persistence it builds.
+  wrappers).
+- `src/resources/jira-project-link-store.ts`: `createJiraProjectLinkStore`
+  (the project-property-backed `LinkStore`, Decision 9).
+- `src/resources/link-store-router.ts`: `createRoutingLinkStore`,
+  `isJiraProjectOwnerKey` — the owner-routing decision (Decision 9), reusable
+  by any future caller that needs the same file-vs-project-property split
+  FACTORY-6 will likely also need for its own per-provider persistence
+  questions.
 
 ## FACTORY-9 (implements FACTORY-6, story 3/3): effective links reconciled into watchers
 

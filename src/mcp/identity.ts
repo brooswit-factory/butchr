@@ -20,10 +20,11 @@ export type CallerIdentity =
   | { provider: "jira-project"; agent: string; ruleId: string; resource: string }
   | { provider: "jira-idea"; agent: string; ruleId: string; resource: string }
   | { provider: "zendesk-ticket"; agent: string; ruleId: string; resource: string; ref: ZendeskTicketRef }
+  | { provider: "filesystem"; agent: string; ruleId: string; resource: string }
   | { provider: ResourceProvider; agent: string; ruleId: string; query: true };
 
 /** Providers whose agents identify by agent key alone, never `x-issue`. */
-export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "jira-idea", "zendesk-ticket", "jira-project"];
+export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"];
 
 /**
  * `decoded` is `decodeAnyAgentKey`'s result, so it can be a query-level key
@@ -55,6 +56,9 @@ export function callerIdentity(headers: Readonly<Record<string, string | undefin
   if (decoded?.resourceProvider === "zendesk-ticket") {
     const ref = parseZendeskTicketRef(decoded.resourceId);
     return issue || !ref ? null : { provider: "zendesk-ticket", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId, ref };
+  }
+  if (decoded?.resourceProvider === "filesystem") {
+    return issue ? null : { provider: "filesystem", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId };
   }
   return issue ? { provider: "jira-work", issue, ...(agent ? { agent } : {}) } : null;
 }

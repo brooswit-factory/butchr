@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
@@ -15,7 +15,8 @@ import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentPreference } from "../rules/rules.js";
+import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
+import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 
 /**
  * `key` is the herd identity: a rule-engine agent key
@@ -23,7 +24,11 @@ import type { AgentPreference } from "../rules/rules.js";
  * legacy/test callers that predate rules — a bare resource key. The optional
  * fields are set only for rule-engine agents: `resource` is the Jira key the
  * agent works (what MCP tools see as `x-issue`), `brief` replaces the
- * issue-type brief, and `agents` is the rule's ranked harness preference.
+ * issue-type brief, `agents` is the rule's ranked harness preference, and
+ * `mcpServers` is the rule's additional MCP server bindings (BUTCHR-411,
+ * `Rule.mcpServers` — src/rules/rules.ts), each launched alongside butchr's
+ * own server and (for `channel: true` entries) added to Claude's development
+ * channels. Absent/empty means none — today's behaviour exactly.
  */
 export interface SpawnSpec {
   key: string;
@@ -33,10 +38,109 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
+  /**
+   * Rocket.Chat account name for THIS launch (BUTCHR-412 S4 design
+   * correction — BUTCHR-391 comment 24007) — set only by the reconcile-layer
+   * account hook (`src/agents/account-lifecycle.ts`), never by a
+   * `specFor*` function, and only after `ensureAccount` actually succeeded
+   * for this agent's rule policy. Carries NO credential: rocketr (Nexus's
+   * bridge) holds every token centrally, and an agent's own MCP binding
+   * names only its account, non-secret, in the `x-rocketr-account` header —
+   * see `resolveAccountHeader`/`McpServerBinding.accountHeader` below for
+   * how a per-agent literal (as opposed to BUTCHR-411's per-RULE
+   * `headersEnvVar`) reaches that header, and `docs/rocketchat-accounts.md`'s
+   * "Wiring" section for why. Superseded design (kept only in history, never
+   * revived): an earlier round of this ticket delivered a per-agent token in
+   * a dedicated 0600 file (`RC_ACCOUNT_FILE`) that the agent itself read —
+   * removed per the corrected design, which forbids a token ever reaching an
+   * agent's workspace at all.
+   *
+   * BUTCHR-413's own consumers of this SAME field, outside any one launch's
+   * spec: `HerdrHerd.spawn`/`HerdrHerd.staleIssues` (src/agents/herd.ts) fill
+   * this in ONLY when `ensure()` above never ran for a launch at all (no
+   * accountLifecycle wired — RC not configured for any rule), and never
+   * overwrite an already-set value; `createCodexChannelRelayPool`'s own
+   * daemon-side connection (src/notify/codex-channel-relay.ts) has no live
+   * spec to read at all and always derives it. Both use the exact same
+   * `rcUsernameFor(agentKey, prefix)` this field's own real producer
+   * (`ensureAccount`) uses internally, with the SAME configured
+   * `Config.rocketchat.managedPrefix` — one function, one prefix, so a
+   * derived answer can never name a different account than the one actually
+   * provisioned.
+   */
+  rocketchatAccount?: string;
   /** Operator-owned MCP config path (jira-project rules only); `{{KEY}}` expands to the resource key. */
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
   externalMcpServers?: Array<{ name: string; url: string; headers?: Record<string, string> }>;
+  /**
+   * BUTCHR-408: where a managed-session agent should actually WORK — a
+   * Bakr agent's own project directory, never a synthetic
+   * `<workspaceRoot>/filesystem/...` bookkeeping tree.
+   *
+   * PR #394 review, round 3 — NOT the launched process's own OS-level cwd,
+   * despite an earlier version of this comment (and this ticket's own
+   * text) saying so. Two independent, load-bearing invariants make that
+   * unsafe, both discovered live reproducing this exact ticket's own
+   * staged spawn test through the REAL `HerdrHerd` + `@brooswit/drovr`
+   * `ManagedHerdrLifecycle` (not a stub — see test/unit/herd.test.ts):
+   *
+   * 1. `ManagedHerdrLifecycle` (`herd.ts`'s `lifecycle()`) is constructed
+   *    with ONE fixed `cwd` — always `workspaceDirFor(issue)` — and
+   *    HARD-REQUIRES the prepared launch's own `cwd` to equal it exactly
+   *    (`"Launch does not match selected provider and workspace"` if not).
+   *    It uses that SAME `cwd` to create the herdr workspace/pane AND as
+   *    the residency key it scans `herdr.agent.list()` against. There is
+   *    no seam in Drovr's current API for "the pane's OS cwd differs from
+   *    its own workspace identity."
+   * 2. `HerdrHerd.runningIssues()`/`byIssue()` (this file's own
+   *    `agentIdOfWorkspacePath`) reverse-maps a live pane's cwd back to an
+   *    agent id by assuming the fixed `workspaceDirFor` 1-or-3-deep shape.
+   *    A pane at an ARBITRARY operator directory returns `null` there — it
+   *    would be permanently invisible to `runningIssues()`, which EVERY
+   *    reconciliation call (`scopedHerd`, admission residency, the
+   *    daemon's own no-double-owner guarantee) is built on. This is core,
+   *    heavily-shared daemon machinery every other provider also depends
+   *    on — not something to patch around under review pressure.
+   *
+   * Given both, the launched process's cwd is ALWAYS `workspaceDirFor`
+   * (unchanged for every existing and managed-session spec alike — see
+   * `agentLaunchConfig`, src/agents/argv.ts). `cwd` here is instead
+   * communicated to the agent through its own KICKOFF instructions
+   * (`kickoffFor`, src/agents/argv.ts): told explicitly to `cd` there
+   * before doing anything else. `buildWorkspace` (below) still always
+   * writes CLAUDE.md/AGENTS.md/brief.md/mcp.json/ENVIRONMENT.md to
+   * `workspaceDirFor(spec.key)`, exactly as it does for every other spec —
+   * never into `cwd`, for the SAME reason as before (PR #394 review, round
+   * 1): `cwd` names an OPERATOR's own project directory, which may already
+   * hold its own `CLAUDE.md`/`AGENTS.md`, and butchr writing its own
+   * bookkeeping files there would silently destroy them — see
+   * `docs/managed-sessions.md`'s "Working directory wiring".
+   *
+   * Absent (the default for every existing caller), behaviour is
+   * byte-for-byte unchanged: `kickoffFor` falls straight through to its
+   * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
+   */
+  cwd?: string;
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */
+  permissionMode?: string;
+  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
+  strictMcpConfig?: boolean;
+  /**
+   * BUTCHR-408: additional MCP servers this agent may connect to, beyond
+   * butchr's own — a managed-session definition's own `mcpServers`
+   * (src/resources/session-definition.ts). `McpServerBinding` (src/rules/rules.ts)
+   * was ported there from S4's (BUTCHR-395/BUTCHR-411) branch as source
+   * material per the epic's sequencing decision; when S4's own
+   * `Rule.mcpServers` lands it should reach `SpawnSpec` through this SAME
+   * field, not a second one — see `boundChannels`/`boundCodexServers`
+   * (src/agents/argv.ts) for how a binding turns into launch argv, and
+   * `resolveMcpServerHeaders`/`workspaceMcpServers` below for how a header
+   * VALUE is kept out of everywhere but this daemon's own environment and a
+   * Claude workspace's `mcp.json`. Absent/empty means none — today's
+   * behaviour exactly.
+   */
+  mcpServers?: readonly McpServerBinding[];
 }
 
 
@@ -208,10 +312,60 @@ export const singleResourceOf = (id: string): string | null => (decodeQueryAgent
  * ENVIRONMENT.md (the same ground truth, standalone). Returns the
  * directory — the agent's cwd.
  */
+/**
+ * PR #394 review fix (Nexus MCP isolation, round 2): the round-1 guarantee
+ * ("butchr never writes a `.mcp.json`") was necessary but not sufficient —
+ * Claude's own `--mcp-config` is ADDITIVE to its ordinary project-level
+ * `.mcp.json` discovery (`@brooswit/drovr` never passes
+ * `--strict-mcp-config`; verified by grepping its own built argv builder),
+ * and that discovery walks UP from the launched process's OWN cwd through
+ * every ancestor directory, not just the cwd itself. Since a managed-session
+ * agent's launched cwd is ALWAYS `workspaceDirFor(spec.key)` (never
+ * `spec.cwd` — see that field's own doc comment), a `.mcp.json` sitting in
+ * ANY ancestor of THAT directory (`workspaceRoot()`, its own parent, …) —
+ * not `spec.cwd`/`workingDirectory`, which the launched process never
+ * actually sits in or under — could still be inherited. Rather than assert
+ * an unverified claim about Claude's exact discovery behaviour, this
+ * GUARANTEES the property by refusing the spawn outright whenever the
+ * (small, fixed) ancestor chain actually contains one, walking all the way
+ * to the filesystem root — cheap (a handful of `existsSync` calls, once per
+ * spawn attempt) and unconditional, no assumption required either way.
+ * Scoped to managed-session specs only (`spec.cwd` set) per the review: a
+ * BARE `jira-work`/other-provider spec's `workspaceDirFor` ancestor chain is
+ * this same shared `workspaceRoot()` tree, but Nexus's own constraint was
+ * raised specifically against "the definitions-directory design".
+ */
+export function assertNoInheritedMcpConfig(dir: string): void {
+  let ancestor = dirname(dir);
+  while (true) {
+    if (existsSync(join(ancestor, ".mcp.json"))) {
+      throw new Error(`managed-session workspace ${dir} would inherit ${join(ancestor, ".mcp.json")} — a managed-session agent's launched cwd must have NO .mcp.json anywhere in its ancestor chain (Nexus's MCP isolation constraint); remove or relocate that file before this definition can spawn`);
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break; // reached the filesystem root ("/")
+    ancestor = parent;
+  }
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
+  // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
+  // comment for why butchr's bookkeeping files must never land in an
+  // operator's own project directory. `spec.cwd`, when present, only ever
+  // reaches the launched PROCESS's cwd (`agentLaunchConfig`, src/agents/argv.ts).
   const dir = workspaceDirFor(spec.key);
+  if (spec.cwd !== undefined) assertNoInheritedMcpConfig(dir);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
+  // BUTCHR-408: `McpServerBinding` never carries a resolved header VALUE
+  // (only `headersEnvVar`, an env var NAME) — see that type's own doc
+  // comment (src/rules/rules.ts) — so, unlike `.butchr-external-mcp.json`
+  // above, this file carries nothing secret and needs no tightened mode.
+  // `staleIssues()` (src/agents/herd.ts) reads it back via
+  // `workspaceMcpServers` (below) to rebuild the expected argv for an
+  // already-running managed-session agent, the same "persist non-secret
+  // spawn intent, re-derive it at staleness-check time" shape
+  // `.butchr-external-mcp.json`/`workspaceExternalMcp` already established.
+  if (spec.mcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-mcp-servers.json"),JSON.stringify(spec.mcpServers)); }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
@@ -241,7 +395,41 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])) } }, null, 2));
+  if (provider === "claude") {
+    // BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
+    // mcp.json alongside butchr's own and any externalMcpServers, `channel:
+    // true` or not — mcp.json is what gives Claude MCP TOOL access; the
+    // channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
+    // additive decision about PUSH notifications. No bindings -> byte-identical
+    // to before (Object.fromEntries([]) spreads nothing). A binding's headers
+    // are the union of its (per-RULE, env-resolved, potentially secret)
+    // `headersEnvVar` value and its (per-AGENT, always non-secret)
+    // `accountHeader` value — see `resolveMcpServerHeaders`/
+    // `resolveAccountHeader`'s own doc comments for why these are two
+    // different resolution mechanisms sharing one binding shape, not two
+    // competing ones.
+    let hasSecretHeaders = false;
+    const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
+      const envHeaders = resolveMcpServerHeaders(b);
+      if (envHeaders) hasSecretHeaders = true;
+      const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
+      const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
+      return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
+    }));
+    const mcpJsonPath = join(dir, "mcp.json");
+    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
+    // Review finding, PR #387: a bound server's resolved header VALUE (often
+    // a bearer token) must never sit in a group/other-readable file at the
+    // default umask. `writeFileSync`'s own `mode` option only ever applies
+    // when it CREATES the file (a rebuilt workspace's mcp.json already
+    // exists), so this is an explicit chmod, not a write option, and only
+    // when this write
+    // actually carries a secret; a binding-less (or headers-less) mcp.json
+    // keeps its exact previous permissions, untouched. `accountHeader`'s own
+    // value (an account NAME, never a secret) never sets `hasSecretHeaders`
+    // by itself — only `headersEnvVar`'s resolution does.
+    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
+  }
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -262,7 +450,7 @@ const providerOf = (spec: SpawnSpec) => decodeAnyAgentKey(spec.key)?.resourcePro
 /** A query-level spec (`singleton`/`persistent`, BUTCHR-398): no single resource, of ANY provider — see `mcpIdentityHeaders`/`buildWorkspace`'s own use. */
 const isQuerySpec = (spec: SpawnSpec): boolean => decodeQueryAgentKey(spec.key) !== null;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project"].includes(providerOf(spec) ?? "");
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
@@ -276,7 +464,25 @@ export const JIRA_IDEA_TOOLS_NOTE =
 export const ZENDESK_TICKET_TOOLS_NOTE =
   "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
 
-const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE };
+/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. NOT shown to a managed-session (`managed-sessions` rule) agent — see `MANAGED_SESSION_TOOLS_NOTE` below, which is the accurate note for that narrower case (BUTCHR-456 gives it exactly two conditional tools, not none). */
+export const FILESYSTEM_TOOLS_NOTE =
+  "Your resource is a file or directory on disk, not a Jira ticket. Read and edit it directly with your own file tools — there is no butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. You are told when it changes (created, modified, or removed) — re-read it from disk then.";
+
+/**
+ * BUTCHR-456: what a MANAGED-SESSION agent specifically is told — narrower
+ * than `FILESYSTEM_TOOLS_NOTE` above, which would otherwise tell a
+ * `director-brooswit-mud`-shaped agent "there is no butchr MCP tool for it"
+ * even once its own definition IS granted freeze/unfreeze control over
+ * another one, undermining the very capability this delegation exists to
+ * give it. Shown to every managed-session agent regardless of whether it
+ * currently holds any grant (a definition's OWN manifest is what actually
+ * decides that at call time — this brief text is static per rule, like
+ * every other `TOOLS_NOTE` entry, not re-derived per grant).
+ */
+export const MANAGED_SESSION_TOOLS_NOTE =
+  "Your resource is a managed-session definition file, not a Jira ticket. Read and edit YOUR OWN definition directly with your own file tools — there is no general-purpose butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. The ONE exception: if ANOTHER definition's own `freezeControllers`/`unfreezeControllers` grant names your definition's file, you may call the butchr `freeze_session`/`unfreeze_session` tool (argument: that OTHER definition's name) to flip its freeze state. You have no other butchr MCP tool, and you can never edit any grant, or create, archive, or delete a definition — see docs/managed-sessions.md's \"Delegated freeze/unfreeze\" section. You are told when your own file changes (created, modified, or removed) — re-read it from disk then.";
+
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 
 /**
  * A rule-engine brief: the rule's own text under a header naming the ticket.
@@ -286,9 +492,12 @@ const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISS
  * {{KEY}}/{{PARENT}}/… placeholders never reach the agent raw.
  */
 const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
-  const note = TOOLS_NOTE[providerOf(spec) ?? ""];
+  const decoded = decodeAnyAgentKey(spec.key);
+  const note = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID
+    ? MANAGED_SESSION_TOOLS_NOTE
+    : TOOLS_NOTE[decoded?.resourceProvider ?? ""];
   const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
-  return `${ruleBriefHeader(decodeAnyAgentKey(spec.key)?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
+  return `${ruleBriefHeader(decoded?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
 };
 
 /**
@@ -313,6 +522,69 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
   return { "x-issue": resourceOfSpec(spec), ...(spec.resource ? { "x-butchr-agent": spec.key } : {}) };
 }
 
+/**
+ * Header VALUES for a bound MCP server (BUTCHR-408/BUTCHR-411, type ported
+ * to main from S4's BUTCHR-395 branch — see `McpServerBinding`'s own doc
+ * comment, src/rules/rules.ts), resolved from THIS DAEMON's own
+ * environment — never from the rules/session-definition file, which only
+ * ever names the env var (`McpServerBinding.headersEnvVar`). `env` defaults
+ * to `process.env` for every real caller; tests pass an explicit map
+ * instead of touching the process environment. Missing var, empty value,
+ * invalid JSON, or JSON that isn't a flat string-valued object all resolve
+ * to `undefined` (connect with no extra headers) rather than throwing — a
+ * malformed/unset secret must not crash workspace building or launch.
+ *
+ * Review finding, PR #387: a `headersEnvVar` that resolves to nothing used
+ * to fail this silently — for an authenticated bridge that is an agent that
+ * connects unauthenticated and only fails later, with nothing pointing back
+ * at the cause. `log` (default `console.error`, overridable for tests)
+ * prints exactly one line naming the BINDING and the ENV VAR — never the
+ * value, never the raw env content — whenever `headersEnvVar` was named but
+ * produced no usable headers.
+ */
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
+  if (!binding.headersEnvVar) return undefined;
+  const raw = env[binding.headersEnvVar];
+  const parsed = raw ? tryParseHeaders(raw) : undefined;
+  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+  return parsed;
+}
+
+const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.values(parsed).every((v) => typeof v === "string")) return parsed as Record<string, string>;
+  } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
+  return undefined;
+};
+
+/**
+ * The PER-AGENT half of a bound server's headers (BUTCHR-412, BUTCHR-391
+ * comment 24007) — `McpServerBinding.accountHeader`'s own doc comment
+ * (`src/rules/rules.ts`) explains why this is a second, deliberately
+ * separate resolution mechanism from `resolveMcpServerHeaders` above rather
+ * than a second reading of the same one: that one resolves ONE static value
+ * per RULE from the daemon's own env; this resolves a DIFFERENT value per
+ * AGENT from `spec.rocketchatAccount` (set only by
+ * `../agents/account-lifecycle.ts`'s `ensure`, after `ensureAccount`
+ * actually provisioned this agent's account). No binding names an env var
+ * here, and nothing is ever "malformed" — the value is either present
+ * (this agent has an account) or it is not (no `accountHeader` on the
+ * binding, or no account for this launch), so there is no failure mode to
+ * log, unlike `resolveMcpServerHeaders`'s own unset/malformed-env case.
+ *
+ * BUTCHR-413 reuses this SAME function, unmodified, for Codex's own
+ * bound-server config (`boundCodexServers`, src/agents/argv.ts) — safe
+ * there in a way `resolveMcpServerHeaders`'s own resolved value never is,
+ * because an account name grants no capability by itself (see
+ * `McpServerBinding.accountHeader`'s own doc comment for why). One function,
+ * two callers (Claude's mcp.json here, Codex's argv there), never a second
+ * copy of the same one-line lookup.
+ */
+export function resolveAccountHeader(binding: McpServerBinding, account: string | undefined): Record<string, string> | undefined {
+  return binding.accountHeader && account ? { [binding.accountHeader]: account } : undefined;
+}
+
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
   try {
@@ -325,4 +597,17 @@ export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers
 export function workspaceExternalMcp(dir:string):SpawnSpec['externalMcpServers'] {
   try {return JSON.parse(readFileSync(join(dir,'.butchr-external-mcp.json'),'utf8'));}
   catch(e) {if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}
+}
+
+/**
+ * BUTCHR-408: the persisted, non-secret counterpart of `workspaceExternalMcp`
+ * above, for `spec.mcpServers` (`.butchr-mcp-servers.json`, `buildWorkspace`).
+ * Lets `staleIssues()` (src/agents/herd.ts) rebuild an already-running
+ * managed-session agent's expected argv (channel flags, Codex tool list)
+ * without HerdrHerd holding any rule/definition state of its own — same
+ * read-the-workspace-back shape, same reason.
+ */
+export function workspaceMcpServers(dir: string): SpawnSpec["mcpServers"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }

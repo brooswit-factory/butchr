@@ -340,6 +340,7 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     parent: bossKeyFrom(issue),
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
   };
 }
 
@@ -360,6 +361,7 @@ export function specForRuleQuery(rule: Rule, agentKey: string): SpawnSpec {
     parent: null,
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
   };
 }
 

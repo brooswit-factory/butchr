@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { IssueLink, JiraIssue } from "../../src/atlassian/types.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
-import { spawnArgs, agentLaunchConfig } from "../../src/agents/argv.js";
+import { spawnArgs, agentLaunchConfig, checkArgv } from "../../src/agents/argv.js";
 import { agentIdOfWorkspacePath, briefFor, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { panesFor, groupOwnedPanes } from "../../src/agents/residency-census.js";
 import { strandedCandidates } from "../../src/agents/reap.js";
@@ -947,6 +947,26 @@ describe("rule workspaces", () => {
     expect(claude.provider === "claude" && [claude.model, claude.effort]).toEqual(["opus", "max"]);
   });
 
+  test("BUTCHR-408: spec.permissionMode reaches a claude launch's permissionMode; absent means today's behaviour exactly (no field at all)", () => {
+    const withMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "claude" });
+    expect(withMode.provider === "claude" && withMode.permissionMode).toBe("auto");
+    const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
+    expect(without.provider === "claude" && "permissionMode" in without).toBe(false);
+    // Codex has no permissionMode concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
+    const codexWithMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
+    expect(codexWithMode.provider === "codex" && "permissionMode" in codexWithMode).toBe(false);
+  });
+
+  test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig reaches a claude launch's strictMcpConfig; absent means today's behaviour exactly (no field at all)", () => {
+    const withFlag = agentLaunchConfig({ ...ruleSpec, strictMcpConfig: true }, "/d", "p", "n", { provider: "claude" });
+    expect(withFlag.provider === "claude" && withFlag.strictMcpConfig).toBe(true);
+    const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
+    expect(without.provider === "claude" && "strictMcpConfig" in without).toBe(false);
+    // Codex has no strict-MCP-config concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
+    const codexWithFlag = agentLaunchConfig({ ...ruleSpec, strictMcpConfig: true }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
+    expect(codexWithFlag.provider === "codex" && "strictMcpConfig" in codexWithFlag).toBe(false);
+  });
+
   test("the herd reports rule agents by key, legacy agents by bare key, and only rule agents survive ownership scoping", async () => {
     const ruleCwd = buildWorkspace(ruleSpec, "http://localhost:7717/mcp", "codex", []);
     const legacyCwd = join(root, "BUTCHR-12");
@@ -977,6 +997,55 @@ describe("rule workspaces", () => {
     expect([...groupOwnedPanes(panes, root).keys()].sort()).toEqual(["BUTCHR-12", "jira-work:task:BUTCHR-12"]);
     const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-12" }] as never[];
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
+  });
+});
+
+// BUTCHR-411 / CNDLX-45: the ticket's own concrete case — the Candlestix MUD
+// players' shared `mud-mcp` HTTP bridge, account policy `none` (no
+// Rocket.Chat account is provisioned for them; that's a sibling task, S4, on
+// a parallel branch). Event-driven Claude delivery from that non-RC MCP
+// server must be preserved end to end: the rule's own binding, through
+// specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's channel
+// flag.
+describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind a non-Rocket.Chat MCP channel server", () => {
+  const mudBinding = { name: "mud-mcp", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("the binding path never reads Rule.account — account: none still gets full channel delivery", () => {
+    const [rule] = rules({ id: "mud", query: "project = CNDLX", account: "none", mcpServers: [mudBinding] });
+    expect(rule!.account).toBe("none"); // the sibling RC-lifecycle task's own field — set, but untouched below
+    const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
+    // SpawnSpec has no `account` field at all: agentLaunchConfig's channel wiring
+    // (argv.ts) has no way to consult account policy even if it wanted to —
+    // structural independence, not just an untested code path.
+    expect(spec).not.toHaveProperty("account");
+    expect(spec.mcpServers).toEqual([mudBinding]);
+    const launch = agentLaunchConfig(spec, "/d", "p", "n", { provider: "claude" });
+    expect(launch.provider === "claude" && launch.developmentChannels).toEqual(["server:butchr", "server:mud-mcp"]);
+  });
+
+  test("end to end: mcp.json carries the bound server, launch argv carries both channels, and a running agent launched without the binding reads as stale against this rule's current spec", () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-mud-ws-"));
+    const previous = process.env.BUTCHR_WORKSPACES;
+    process.env.BUTCHR_WORKSPACES = dir;
+    try {
+      const [rule] = rules({ id: "mud", query: "project = CNDLX", mcpServers: [mudBinding] });
+      const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
+      const cwd = buildWorkspace(spec, "http://localhost:7717/mcp", "claude");
+      const mcp = JSON.parse(readFileSync(join(cwd, "mcp.json"), "utf8"));
+      expect(Object.keys(mcp.mcpServers).sort()).toEqual(["butchr", "mud-mcp"]);
+      const args = spawnArgs(spec, cwd);
+      expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+      expect(args).toContain("--dangerously-load-development-channels=server:mud-mcp");
+      // A resident spawned before this rule bound mud-mcp — the deploy-day shape.
+      const withoutBinding = spawnArgs({ ...spec, mcpServers: [] }, cwd);
+      const check = checkArgv(args, withoutBinding);
+      expect(check.ok).toBe(false);
+      if (!check.ok) expect(check.reason).toContain("--dangerously-load-development-channels server:mud-mcp");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1042,5 +1111,103 @@ describe("BUTCHR-436: linked-change eventing wiring", () => {
     // The Implements-chain related entry for BUTCHR-1 (heard by BUTCHR-9) is still produced, unaffected by the linked-eventing tick throwing inside notify().
     expect(related.some((r) => (r.issue.kind === "resource" ? r.issue.match.issue.key : null) === "BUTCHR-1")).toBe(true);
     expect(lines.some((l) => l.includes("WARNING: [linked-eventing] tick threw"))).toBe(true);
+  });
+});
+
+// FACTORY-1: investigated a reported regression — "after linked eventing was
+// enabled, a cross-daemon Story→Epic submit_to_boss no longer wakes the
+// boss", hypothesised as the new `linked:` rate cap (`maxLinkedTurnsPerHour`)
+// superseding or sharing a budget with the pre-existing `related:` (Implements
+// chain) boss-wake mechanism. NOT REPRODUCIBLE: the two mechanisms are
+// architecturally independent — `discovery.related()`'s return value (which
+// `related:` events are computed from) is built from `relatedForRules` BEFORE
+// `linkedEventingState.runTick` ever runs, and `runTick` only ever performs
+// `deps.notify` side effects under its own `turns` budget, keyed by the
+// OWNING resource's agent key — it never touches the related-resource array
+// or any state `createRuleEventRules`'s "related" space reads. This test
+// pins that independence for the epic/story case the ticket asked for: a
+// cross-daemon boss (whose OWN rule matches no local Story at all — the
+// worker is fetched only through the foreign-implementer path, exactly
+// BUTCHR-388's own documented live-fleet shape) whose OWN linked-eventing
+// budget is already exhausted by unrelated linked churn (reproducing the
+// live `[notify-suppressed] ... arm=rate-capped count=2 max=2` evidence)
+// still gets exactly one `related:` notify the moment its real child moves to
+// In Review. (Investigation record, incl. why the live incident actually
+// happened — a missing Implements issuelink, not this hypothesis — is on the
+// FACTORY-1 ticket and its linked doc.)
+describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker related: wake", () => {
+  test("cross-daemon epic hears its story's move to In Review via related:, even with its own linkedEventing budget exhausted", async () => {
+    const bossKey = "DROVR-37";
+    const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it
+    const siblingKeys = ["DROVR-30", "DROVR-31"]; // other Implements targets of the boss, used to genuinely exhaust its linked-eventing budget first
+
+    let storyStatus = "In Progress";
+    let siblingRound = 0;
+    const boss = () => issue(bossKey, {
+      issuetype: "Epic",
+      issuelinks: [
+        { type: "Implements", otherEnd: "outward", key: workerKey },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[0]! },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[1]! },
+      ] as never,
+    });
+    const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
+    const worker = () => issue(workerKey, { issuetype: "Story", status: storyStatus, issuelinks: implementsBoss(bossKey) });
+    const sibling = (key: string, round: number) =>
+      issue(key, { issuetype: "Story", status: round % 2 === 0 ? "In Progress" : "In Review", issuelinks: implementsBoss(bossKey) });
+
+    const logs: string[] = [];
+    // This daemon's own rules match ONLY Epics — BUTCHR-388's own documented
+    // live-fleet shape ("booswrit's ... rules are issuetype = Epic|Task|Bug").
+    const ruleSet = rules({ id: "epics", query: "issuetype = Epic", linkedEventing: true, maxLinkedTurnsPerHour: 2 });
+    const search = async (jql: string) => {
+      if (jql === "issuetype = Epic") return [boss()];
+      if (jql.startsWith("key in (")) {
+        const out: JiraIssue[] = [];
+        if (jql.includes(bossKey)) out.push(boss());
+        if (jql.includes(workerKey)) out.push(worker());
+        if (jql.includes(siblingKeys[0]!)) out.push(sibling(siblingKeys[0]!, siblingRound));
+        if (jql.includes(siblingKeys[1]!)) out.push(sibling(siblingKeys[1]!, siblingRound));
+        return out;
+      }
+      return [];
+    };
+    const type = createRuleResourceType({ rules: ruleSet, search, notify: async () => {}, log: (l) => logs.push(l) });
+    const active = ["jira-work:epics:" + bossKey];
+
+    await type.discovery.search();
+    let related = await type.discovery.related!(active);
+    // Two genuine sibling status flips spend the epic's own maxLinkedTurnsPerHour: 2 budget.
+    for (let i = 0; i < 2; i++) {
+      siblingRound++;
+      await type.discovery.search();
+      related = await type.discovery.related!(active);
+    }
+    logs.length = 0; // ignore the warm-up churn's own logging
+
+    // The real boss-wake event: the story moves to In Review while the budget is exhausted.
+    storyStatus = "In Review";
+    await type.discovery.search();
+    const relatedAfter = await type.discovery.related!(active);
+
+    // Confirm the rate cap genuinely bit this tick (matching the live
+    // `arm=rate-capped count=2 max=2` evidence) — a vacuously-passing test
+    // that never actually exhausted the budget would prove nothing.
+    expect(logs.some((l) => l.includes("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(bossKey))).toBe(true);
+
+    // The SAME mechanism `runResourceLoop`'s own onChange stage (src/daemon/loop.ts)
+    // uses: diff the two related snapshots, then decide+deliver per watcher.
+    const evPoll = await type.eventRules.poll({ primary: [], related }, { primary: [], related: relatedAfter });
+    const watchersOf = (k: string) =>
+      relatedAfter.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? related.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? [];
+    const delivered: string[] = [];
+    for (const key of evPoll.changedRelated) {
+      for (const w of watchersOf(key)) {
+        if ((await evPoll.decide(key, w, "related")).deliver) delivered.push(w);
+      }
+    }
+    expect(delivered).toEqual(["jira-work:epics:" + bossKey]); // exactly one related: notify to the boss, never dropped by the exhausted linked-eventing cap
   });
 });
