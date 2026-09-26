@@ -4,9 +4,17 @@ import { isIssueKey, isProjectId } from "../resources/id.js";
 
 /**
  * BUTCHR-422 (Brooswit, 2026-09-25; interim until query-based resources
- * replace these tiers): the fleet agent cap counts only LEAF work — Task,
- * Sub-task and Bug agents. Project agents, and Epic and Story agents, are
+ * replace these tiers): the fleet agent cap counts only LEAF work — Task
+ * and Sub-task agents. Project agents, and Epic, Story and Bug agents, are
  * never counted toward `maxAgents` and never withheld.
+ *
+ * FACTORY-39 (FACTORY-37) moved Bug from the counted set to here: a Bug is
+ * now a BOSS, the same tier as an Epic — it idles while its Stories run,
+ * exactly like an Epic idles while its Stories run, so it must be exempt
+ * from the cap the same way, or an idling Bug could hold a slot and cause
+ * admission to withhold it at the cap. BUTCHR-422's original listing of Bug
+ * as leaf work was correct only while a Bug fixed the code itself; it no
+ * longer does.
  *
  * Built on BUTCHR-398's capacity role instead of a second admission
  * mechanism: an uncounted agent is classified `"sentinel"`, which admission
@@ -14,7 +22,7 @@ import { isIssueKey, isProjectId } from "../resources/id.js";
  * kind and its issue's type — NOT on a rule-file flag — so it applies to
  * every deployed daemon's existing rules with no config change.
  */
-export const UNCOUNTED_ISSUE_TYPES: ReadonlySet<string> = new Set(["epic", "story"]);
+export const UNCOUNTED_ISSUE_TYPES: ReadonlySet<string> = new Set(["epic", "story", "bug"]);
 
 const isUncountedIssueType = (issuetype: string | undefined): boolean =>
   issuetype !== undefined && UNCOUNTED_ISSUE_TYPES.has(issuetype.trim().toLowerCase());
@@ -24,7 +32,7 @@ const isUncountedIssueType = (issuetype: string | undefined): boolean =>
  *
  * - A project-tier agent (its id is a bare project key, e.g. `BUTCHR`) →
  *   `"sentinel"`.
- * - An agent for a Jira issue whose type is Epic or Story → `"sentinel"`.
+ * - An agent for a Jira issue whose type is Epic, Story or Bug → `"sentinel"`.
  *   This covers `jira-work` rule agents (`jira-work:<rule>:<KEY>`) and bare
  *   issue-key agents. The type comes from `issuetypeOf`, the daemon's own
  *   record of what its latest searches returned for that key.

@@ -205,11 +205,12 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
-// BUTCHR-422: only leaf work (Task/Sub-task/Bug) counts toward the cap —
-// project agents and Epic/Story agents are classified "sentinel" here (see
-// src/agents/capacity-role.ts). `issueMeta` (declared below, filled by every
-// jira-work search) supplies the issue type; it is only read at call time,
-// after the whole module has initialised.
+// BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
+// (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
+// agents are classified "sentinel" here (see src/agents/capacity-role.ts).
+// `issueMeta` (declared below, filled by every jira-work search) supplies
+// the issue type; it is only read at call time, after the whole module has
+// initialised.
 const roleOfAgent = (id: string): AgentCapacityRole =>
   capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
 
