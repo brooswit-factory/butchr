@@ -59,8 +59,15 @@ const EXCLUSIONS: ReadonlyArray<{ path: string; reason: string }> = [
  * own label-scan.ts/header-scan.ts/workspace-scan.ts precedent for keeping
  * per-medium checks self-contained rather than building one shared
  * abstraction two unrelated guards would then both depend on.
+ *
+ * FACTORY-40: "bug" joined this list once `briefs/bug.md` was rewritten
+ * from a worker-tier stub into a boss-tier brief that reviews each Story it
+ * files — the same reviewer position story.md/epic.md are in, reaching for
+ * the same `expect()` tally the same way, so it carries the identical
+ * instruction (mirrored close to verbatim from epic.md's own review
+ * section), not a bug-specific variant of it.
  */
-const ASSERTION_CHECK_INSTRUCTING_BRIEFS = ["story", "epic"] as const;
+const ASSERTION_CHECK_INSTRUCTING_BRIEFS = ["story", "epic", "bug"] as const;
 
 interface TypeExclusion { readonly type: string; readonly reason: string }
 
@@ -71,7 +78,6 @@ interface TypeExclusion { readonly type: string; readonly reason: string }
 const TYPE_EXCLUSIONS: readonly TypeExclusion[] = [
   { type: "task", reason: "task.md is the reviewee here, not the reviewer — a task has no worker below it whose test diff it would review, so this instruction (aimed at a reviewer about to reach for the expect() tally) has nothing to attach to in task.md" },
   { type: "project", reason: "project.md's epic-review workflow has no equivalent test-gate framing to attach this instruction to, unlike story (reviews a task's test diff) and epic (reviews a story's test diff)" },
-  { type: "bug", reason: "bug.md is a defect-fix brief and does not review a worker's test diff; its verification guidance is specific to reproducing the reported failure" },
 ];
 
 const ASSERTED_TYPES: ReadonlySet<string> = new Set(ASSERTION_CHECK_INSTRUCTING_BRIEFS);
@@ -95,7 +101,7 @@ function formatUnaccountedBriefTypeError(types: readonly string[]): string {
   ].join("\n");
 }
 
-function briefChannel(issuetype: "Story" | "Epic"): string {
+function briefChannel(issuetype: "Story" | "Epic" | "Bug"): string {
   const root = mkdtempSync(join(tmpdir(), "assertion-check-guard-"));
   const prevEnv = process.env.BUTCHR_WORKSPACES;
   process.env.BUTCHR_WORKSPACES = root;
@@ -138,15 +144,17 @@ describe("assertion-check instruction channels (BUTCHR-162)", () => {
 
     const story = briefChannel("Story");
     const epic = briefChannel("Epic");
+    const bug = briefChannel("Bug");
     expect(story.includes("You own one increment of value")).toBe(true);
     expect(epic.includes("You own one outcome")).toBe(true);
+    expect(bug.includes("You own one defect")).toBe(true);
 
     expect(EXCLUSIONS.length).toBeGreaterThan(0);
   });
 
-  test("both reviewer briefs (story.md, epic.md) name the tally as unsafe to compare, the safe command with its || true guard, and that the count is a prompt to inspect, not a verdict", () => {
+  test("all three reviewer briefs (story.md, epic.md, bug.md) name the tally as unsafe to compare, the safe command with its || true guard, and that the count is a prompt to inspect, not a verdict", () => {
     for (const issuetype of ASSERTION_CHECK_INSTRUCTING_BRIEFS) {
-      const text = briefChannel((issuetype.charAt(0).toUpperCase() + issuetype.slice(1)) as "Story" | "Epic");
+      const text = briefChannel((issuetype.charAt(0).toUpperCase() + issuetype.slice(1)) as "Story" | "Epic" | "Bug");
       expect(text, `${issuetype} brief should say the tally is non-deterministic`).toMatch(NAMES_NON_DETERMINISM);
       expect(text, `${issuetype} brief should carry the exact safe command, including its trailing || true`).toContain(SAFE_COMMAND);
       expect(text, `${issuetype} brief should say the count is a prompt to inspect, not a verdict`).toMatch(NAMES_PROMPT_NOT_VERDICT);
