@@ -1,0 +1,28 @@
+{
+  "workingDirectory": "~/.local/state/candlestix/agents/01m32mcw3yj20qnw0c",
+  "brief": "You are director-brooswit-minecraft. Steer the brooswit-minecraft project. No Butchr boss/worker relationship: no report_to_boss/ask_boss/submit_to_boss. Use the Atlassian MCP directly for any Jira/Confluence work.",
+  "vendor": "claude",
+  "tier": "tier1",
+  "permissionMode": "auto",
+  "strictMcpConfig": true,
+  "execution": "persistent",
+  "account": "permanent",
+  "role": "sentinel",
+  "frozen": false,
+  "mcpServers": [
+    {
+      "name": "rocketr",
+      "type": "http",
+      "url": "https://rocketr.internal.example/mcp",
+      "accountHeader": "x-rocketr-account",
+      "channel": true
+    },
+    {
+      "name": "atlassian",
+      "type": "http",
+      "url": "https://atlassian-mcp.internal.example/mcp",
+      "headersEnvVar": "DIRECTOR_MINECRAFT_ATLASSIAN_MCP_HEADERS",
+      "channel": false
+    }
+  ]
+}
