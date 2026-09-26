@@ -15,6 +15,43 @@ const CLOCK_SKEW_GRACE_MS = 120_000;
 export interface CommentRow { id: string; body: string; created: string }
 
 /**
+ * FACTORY-45: journal-line prefix for a KEYLESS managed-session pane's own
+ * escalation (`issue === null`, filesystem-provider `managed-sessions` rule
+ * — see docs/managed-sessions.md) — deliberately distinct from `[prompts]`
+ * (this module's ordinary log wrapper) so an operator can `journalctl --user
+ * -u <unit> | grep managed-escalation` and find every such event regardless
+ * of how noisy the ordinary prompt log is. Real dialog recognition/auto-
+ * answer is drovr's own job (FACTORY-46) — this fires only for a dialog
+ * `watchPrompts` already decided it cannot auto-answer.
+ */
+export const MANAGED_ESCALATION_MARKER = "[managed-escalation]";
+
+/**
+ * FACTORY-45: a keyless pane's managed-session identity, resolved fresh on
+ * every poll from the pane's own workspace path (`EscalatorDeps.managedSessionOf`)
+ * — never persisted by this module. `agentKey` is the filesystem agent key
+ * butchr's own managed-sessions rule assigned this definition
+ * (`filesystem:managed-sessions:<encoded path>`, src/rules/agent-key.ts);
+ * `definitionPath` is that key's decoded resource id — the definition
+ * file's own path — which is what the journal line and the `/health`
+ * sibling actually name for an operator.
+ */
+export interface ManagedSessionTarget {
+  agentKey: string;
+  definitionPath: string;
+}
+
+/** One currently-"stalled" managed session — the `/health` sibling `EscalatorDeps.log`'s journal line is paired with (see `Escalator.managedSessionEscalations`). */
+export interface ManagedSessionEscalation {
+  agentKey: string;
+  definitionPath: string;
+  paneId: string;
+  fingerprint: string;
+  /** ISO timestamp of this episode's first escalated poll. */
+  since: string;
+}
+
+/**
  * BUTCHR-124: marker for the sustained-blocked-and-unparseable alarm —
  * deliberately distinct from escalate.ts's `MARKER` (`[butchr:blocked]`) so a
  * reader can tell the two apart at a glance: `[butchr:blocked]` means "here
@@ -97,6 +134,12 @@ export interface EscalatorDeps {
    * it but an operator's hand transcription). Optional and injected, like
    * session-limit-watch's own CaptureSink: when absent, escalation behaves
    * exactly as it did before this ticket (comment only, no capture).
+   *
+   * FACTORY-50 (Part C): the SAME sink also lands a keyless managed-session
+   * pane's full text via `captureManagedSessionEscalationText` — a
+   * different filename shape (`MANAGED_ESCALATION_CAPTURE_NAME`), so the
+   * two capture kinds never collide in listing or eviction, but the same
+   * "optional, fails open, local disk only" contract.
    */
   captures?: CaptureSink;
   /**
@@ -113,6 +156,26 @@ export interface EscalatorDeps {
    * declining call sites in this one).
    */
   coverage?: CoverageRecorder;
+  /**
+   * FACTORY-45: resolves `paneId` -> its managed-session identity, called
+   * ONLY when `onBlocked` was given `issue === null` — never for a keyed
+   * pane. Returns `null` for any OTHER keyless pane (an unowned/legacy
+   * workspace, a query-level agent, …), which keeps today's log-only
+   * behavior exactly for those — this ticket widens the keyless path only
+   * for a pane that is genuinely a filesystem-provider `managed-sessions`
+   * agent (see docs/managed-sessions.md). Optional: absent means no
+   * managed-session awareness at all, byte-for-byte the same log-only
+   * behavior as before this ticket.
+   */
+  managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>;
+  /**
+   * PR #455 review: overrides `MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS` for
+   * `captureManagedSessionEscalationText` — exists so a test can inject a
+   * short value (milliseconds) to exercise a hung read/write without an
+   * actual multi-second wait or fake timers. Absent means the real,
+   * production default.
+   */
+  managedSessionCaptureTimeoutMs?: number;
 }
 
 interface PaneState {
@@ -154,6 +217,33 @@ export interface Escalator {
    * silently sitting stuck (KAN-682, applied to the parser).
    */
   onNoPrompt: (paneId: string, issue: string | null, text: string, pollSeq: number) => void;
+  /**
+   * FACTORY-45: every managed-session pane CURRENTLY marked stalled — an
+   * escalated (logged), not-yet-resolved dialog on a keyless managed-session
+   * pane. Read by `src/daemon/index.ts`'s `/health` wiring (a sibling field,
+   * same "additive, never flips `ok`" pattern `admission`/`coverage` already
+   * use — see src/daemon/health.ts) so an operator has a status SURFACE to
+   * find a blocked managed session on, not only the journal line. A pure
+   * snapshot of this instance's own in-memory tracking; empty when nothing
+   * is stalled, or when `EscalatorDeps.managedSessionOf` was never wired.
+   */
+  managedSessionEscalations: () => readonly ManagedSessionEscalation[];
+  /**
+   * FACTORY-45 Part B: the two halves of drovr's host-neutral escalation
+   * hook (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
+   * pass this pair as `{ onUnknownDialog: escalator.onDrovrUnknownDialog,
+   * onDialogResolved: escalator.onDrovrDialogResolved }` to that function
+   * (see src/daemon/index.ts). Deliberately independent of `onBlocked`/
+   * `onPoll`/`onNoPrompt` above: drovr's watcher carries its own
+   * (pane, fingerprint) episode state in its own closure, so these never
+   * touch the Jira-shaped `state` map or its pollSeq-based debounce — only
+   * `managedSessionEscalations`'s own tracking, which `onBlocked`'s
+   * Butchr-detected path (`handleManagedSessionBlocked`) also feeds. See
+   * `onDrovrUnknownDialog`'s own doc comment for why a keyed or non-managed
+   * keyless pane is a no-op here.
+   */
+  onDrovrUnknownDialog: (escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }) => Promise<void>;
+  onDrovrDialogResolved: (resolved: { paneId: string; fingerprint: string }) => void;
 }
 
 /** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
@@ -284,6 +374,117 @@ async function captureEscalationText(deps: EscalatorDeps, paneId: string, issue:
     deps.log(`escalation capture failed for ${issue} pane ${paneId}: ${(e as Error)?.message ?? e}`);
     return null;
   }
+}
+
+/**
+ * FACTORY-50 (Part C): global cap on managed-session escalation capture
+ * files kept at once — same discipline as `ESCALATION_CAPTURE_MAX_FILES`
+ * just above and session-limit-watch's own `CAPTURE_MAX_FILES`, kept
+ * separate because it recognizes a different filename shape (there is no
+ * issue/project key here — a managed session has neither) and must never
+ * evict, or be evicted by, either sibling's captures.
+ */
+const MANAGED_ESCALATION_CAPTURE_MAX_FILES = 50;
+
+/**
+ * `<agentKey>-managed-escalation-<paneId>-<compact-UTC-timestamp>.txt` —
+ * recognizes exactly the filenames `captureManagedSessionEscalationText`
+ * writes. `agentKey` is already `encodeURIComponent`-escaped per component
+ * (`encodeAgentKey`, src/rules/agent-key.ts) and this ticket's own path is
+ * always the `filesystem` provider (see `ManagedSessionTarget`'s doc
+ * comment), so it is filename-safe as written — no extra sanitizing needed.
+ * Disjoint from `ESCALATION_CAPTURE_NAME` and session-limit-watch's
+ * `CAPTURE_NAME` by the literal `-managed-escalation-` segment: those two
+ * always key on an issue/project id, which this shape never has.
+ */
+const MANAGED_ESCALATION_CAPTURE_NAME = /^filesystem:[a-z0-9-]+:[A-Za-z0-9%._~-]+-managed-escalation-.+-(\d{8}T\d{6}Z)\.txt$/;
+
+/**
+ * PR #455 review: a capture that ERRORS is handled (logged, `null`
+ * returned), but a capture that HANGS is not — `deps.read` (herdr's own
+ * pane read) carries no deadline of its own (see drovr's DROVR-33, raised
+ * for the exact same reason), and an unbounded `list`/`write` on the
+ * injected sink is no safer. A few seconds, not milliseconds: a real pane
+ * read is fast, and the failure mode this guards is a genuinely stuck
+ * call, not ordinary latency.
+ */
+const MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS = 5_000;
+
+/**
+ * FACTORY-50 (Part C): durably capture a keyless managed-session pane's
+ * full, UNREDACTED text the moment `markManagedSessionStalled` marks a
+ * genuinely NEW (pane, fingerprint) episode. Mirrors `captureEscalationText`
+ * above: local disk only (never Jira — a managed session has no ticket to
+ * post to), no redaction, and only the returned PATH — never the content —
+ * ever reaches the `[managed-escalation]` journal line.
+ *
+ * PR #455 review: bounded by `MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS` (or
+ * `deps.managedSessionCaptureTimeoutMs`, for a test's short injected value)
+ * via `Promise.race` against the real work below — a capture that ERRORS
+ * OR HANGS must fail open the same way, since either would otherwise delay
+ * or suppress the alarm line itself, hold `onBlocked`'s `inFlight` guard
+ * open for that pane, and — through `onDrovrUnknownDialog` — stall drovr's
+ * own serialized poll for every pane. The timer is cleared the instant
+ * EITHER side settles, so a genuinely slow (not hung) capture that finishes
+ * just after losing the race still completes its own write on local disk —
+ * this only bounds how long `markManagedSessionStalled` itself waits, it
+ * never cancels the underlying read/list/write — but its result is
+ * discarded: a late resolution must never retroactively change the journal
+ * line or any state already committed to.
+ */
+async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: string, target: ManagedSessionTarget, fp: string): Promise<string | null> {
+  const sink = deps.captures;
+  if (!sink) return null;
+  let timedOut = false;
+  const work = (async (): Promise<string | null> => {
+    try {
+      const text = await deps.read(paneId);
+      const capturedAt = deps.now();
+      const name = `${target.agentKey}-managed-escalation-${paneId}-${compactUtc(capturedAt)}.txt`;
+      const header =
+        `# butchr managed-session escalation capture\n` +
+        `# agent-key: ${target.agentKey}\n` +
+        `# definition: ${target.definitionPath}\n` +
+        `# pane: ${paneId}\n` +
+        `# fingerprint: ${fp}\n` +
+        `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
+        `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
+        `\n`;
+      const all = await sink.list();
+      const ours = all
+        .map((n) => ({ n, m: MANAGED_ESCALATION_CAPTURE_NAME.exec(n) }))
+        .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
+        .map((x) => ({ name: x.n, ts: x.m[1]! }))
+        .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+      while (ours.length >= MANAGED_ESCALATION_CAPTURE_MAX_FILES) {
+        const oldest = ours.shift()!;
+        await sink.remove(oldest.name);
+      }
+      return await sink.write(name, header + text);
+    } catch (e) {
+      // "WARNING: [managed-escalation] ..." — NOT bare
+      // `${MANAGED_ESCALATION_MARKER} ...` (matching `onDrovrUnknownDialog`'s
+      // own resolve-failure log just below): a bare
+      // `${MANAGED_ESCALATION_MARKER}`-prefixed line here would be
+      // indistinguishable, to any `startsWith(MANAGED_ESCALATION_MARKER)`
+      // reader (including this file's own tests), from the real
+      // stalled-mark line this same poll already logs — turning one
+      // escalation into two apparent ones. Suppressed entirely once this
+      // capture has already lost the race below: a late-arriving error must
+      // never log anything either, same as a late-arriving success.
+      if (!timedOut) deps.log(`WARNING: [managed-escalation] capture failed for pane ${paneId} (${target.agentKey}): ${(e as Error)?.message ?? e}`);
+      return null;
+    }
+  })();
+  const timeoutMs = deps.managedSessionCaptureTimeoutMs ?? MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<string | null>((resolve) => {
+    timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs);
+  });
+  const result = await Promise.race([work, timeout]);
+  clearTimeout(timer!);
+  if (timedOut) deps.log(`WARNING: [managed-escalation] capture timed out after ${timeoutMs}ms for pane ${paneId} (${target.agentKey}) — logging the escalation without a capture path`);
+  return result;
 }
 
 /**
@@ -440,6 +641,112 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     unresponsiveCap.record(issue, deps.now());
     log(`[unresponsive] escalated ${issue} pane ${paneId} (${elapsedMinutes}m sustained blocked+unparseable)`);
     return deps.now();
+  }
+
+  // ===========================================================================
+  // FACTORY-45: the KEYLESS managed-session escalation — a fully separate
+  // tracker from `state`/PaneState above, deliberately, same precedent
+  // BUTCHR-124's `unresponsive` tracker sets just above: there is no issue
+  // to comment on, no ANSWER directive to read back, and no 15-minute
+  // follow-up for a managed session (docs/managed-sessions.md: no Implements
+  // links, no boss/worker model) — reusing PaneState's Jira-shaped fields
+  // for a concept that has none of them would only risk the very regression
+  // this whole file's own precedent (item D7, KAN-756) forbids: a change to
+  // the Jira flow's behaviour. Real dialog recognition/auto-answer is
+  // drovr's job (FACTORY-46); this only logs + marks a dialog `watchPrompts`
+  // ALREADY decided it cannot auto-answer.
+  // ===========================================================================
+
+  interface ManagedSessionEntry {
+    target: ManagedSessionTarget;
+    fp: string;
+    /** ISO timestamp of this episode's first escalated poll — carried into `ManagedSessionEscalation.since`. */
+    since: string;
+  }
+  const managedSessionStalled = new Map<string, ManagedSessionEntry>();
+
+  /**
+   * Log + mark once per (pane, fingerprint) episode — the shared core both
+   * `handleManagedSessionBlocked` (Butchr's own KAN-756-hardened dialog
+   * parser, below) and `onDrovrUnknownDialog` (FACTORY-45 Part B: drovr's
+   * `createBlockingEscalationWatcher` hook, src/daemon/index.ts) funnel
+   * into — two independent detectors, one mark. A NO-OP whenever the
+   * TRACKED fingerprint for this pane is unchanged (dedupe is the in-memory
+   * map itself, never a re-read of anything external: there is no comment
+   * channel to adopt from, unlike `escalate`/`escalateUnresponsive` above,
+   * so a daemon restart mid-episode simply re-logs once — acceptable per
+   * this ticket's own reduced scope, unlike the Jira flow's restart-safe
+   * adoption). KNOWN, ACCEPTED RESIDUAL: Butchr's own parser and drovr's
+   * may derive slightly different fingerprints for the SAME real dialog
+   * (different text-extraction), so the two detectors racing the same
+   * episode can each log once under their own fingerprint — an extra
+   * journal line, never a functional miss, and the mark still reads
+   * "stalled" correctly either way.
+   *
+   * FACTORY-50 (Part C): also durably captures the pane's full text via
+   * `captureManagedSessionEscalationText` for a genuinely NEW episode
+   * (never on a no-op re-entry) — the state map entry above is set BEFORE
+   * that await, so an overlapping synchronous re-entry for the same fp
+   * still short-circuits on the guard above and never double-captures.
+   */
+  async function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): Promise<void> {
+    const prior = managedSessionStalled.get(paneId);
+    if (prior?.fp === fp) return; // already logged + marked for this exact dialog this episode
+    const since = new Date(deps.now()).toISOString();
+    managedSessionStalled.set(paneId, { target, fp, since });
+    const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
+    const optionsLine = options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
+  }
+
+  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. */
+  function clearManagedSessionStalled(paneId: string, reason: string): void {
+    if (!managedSessionStalled.delete(paneId)) return;
+    deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} ${reason} — clearing stalled mark`);
+  }
+
+  async function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): Promise<void> {
+    await markManagedSessionStalled(paneId, target, prompt.question, prompt.options, fingerprint(prompt));
+  }
+
+  /**
+   * FACTORY-45 Part B: the other end of drovr's host-neutral escalation
+   * hook (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
+   * wired in `src/daemon/index.ts`. Drovr's own watcher already dedupes a
+   * dialog to exactly one call per (pane, fingerprint) episode in ITS OWN
+   * closure (see that package's docs/blocking-escalation.md), so this never
+   * re-derives a fingerprint of its own; it only decides WHERE the episode
+   * goes. `deps.managedSessionOf` resolving to `null` — a keyed pane, or a
+   * keyless pane that isn't a managed session — is deliberately a no-op
+   * here: Butchr's OWN existing pipeline (`onBlocked`'s own `issue`/
+   * `managedSessionOf` resolution) stays the authoritative detector and
+   * escalator for both of those, completely unchanged by this ticket.
+   */
+  async function onDrovrUnknownDialog(escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }): Promise<void> {
+    if (!deps.managedSessionOf) return;
+    let target: ManagedSessionTarget | null;
+    try {
+      target = await deps.managedSessionOf(escalation.paneId);
+    } catch (e) {
+      deps.log(`WARNING: [managed-escalation] could not resolve managed-session identity for pane ${escalation.paneId} (drovr hook): ${(e as Error)?.message ?? e}`);
+      return;
+    }
+    if (!target) return;
+    await markManagedSessionStalled(escalation.paneId, target, escalation.question, escalation.options, escalation.fingerprint);
+  }
+
+  /** The resolution half of `onDrovrUnknownDialog` — drovr's own `hook.onDialogResolved`. Only clears an episode THIS fingerprint opened; a stale/foreign fingerprint (the episode already moved on, e.g. a newer one Butchr's own parser logged in the meantime) is left alone rather than clearing a live mark on a guess. */
+  function onDrovrDialogResolved(resolved: { paneId: string; fingerprint: string }): void {
+    const prior = managedSessionStalled.get(resolved.paneId);
+    if (!prior || prior.fp !== resolved.fingerprint) return;
+    clearManagedSessionStalled(resolved.paneId, "no longer blocked (drovr)");
+  }
+
+  /** Every managed session CURRENTLY marked stalled — see `Escalator.managedSessionEscalations`'s own doc comment. */
+  function managedSessionEscalations(): readonly ManagedSessionEscalation[] {
+    return [...managedSessionStalled.entries()].map(([paneId, e]) => ({
+      agentKey: e.target.agentKey, definitionPath: e.target.definitionPath, paneId, fingerprint: e.fp, since: e.since,
+    }));
   }
 
   /**
@@ -713,7 +1020,28 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
 
   async function onBlocked(paneId: string, issue: string | null, prompt: Prompt, pollSeq: number): Promise<void> {
     if (issue === null) {
-      log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
+      // FACTORY-45: widen the keyless path ONLY for a pane that is
+      // genuinely a filesystem-provider `managed-sessions` agent — every
+      // OTHER keyless pane (an unowned/legacy workspace, a query-level
+      // agent, ...) keeps today's log-only behavior exactly (5.: "do not
+      // widen the change"). `managedSessionOf` is called fresh every poll
+      // rather than cached: it is cheap (one herd.agent.list() the caller
+      // already needed to resolve `issue` itself — see daemon/index.ts's
+      // `issueForPane`), and a pane's own identity cannot change mid-life.
+      if (inFlight.has(paneId)) {
+        log(`skipped overlapping poll for ${paneId} — no issue key, a previous poll is still in flight`);
+        return;
+      }
+      inFlight.add(paneId);
+      try {
+        const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
+        if (session) await handleManagedSessionBlocked(paneId, session, prompt);
+        else log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
+      } catch (e) {
+        log(`error handling ${paneId}: ${(e as Error)?.message ?? e}`);
+      } finally {
+        inFlight.delete(paneId);
+      }
       return;
     }
     if (inFlight.has(paneId)) {
@@ -767,6 +1095,16 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // NEXT time onNoPrompt happens to fire for it, if ever).
     for (const paneId of unresponsive.keys()) {
       if (!blocked.has(paneId)) unresponsive.delete(paneId);
+    }
+    // FACTORY-45: "clear the stalled mark when the dialog clears" — the
+    // herd no longer reporting this pane blocked AT ALL is the resolution
+    // signal (mirrors the `unresponsive` cleanup just above); a fingerprint
+    // CHANGE while still blocked is handled inline in
+    // `handleManagedSessionBlocked` itself (a new fp simply overwrites the
+    // old entry and re-logs, satisfying "a new fingerprint escalates
+    // again" without needing a separate clear step here).
+    for (const [paneId] of managedSessionStalled) {
+      if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
   }
 
@@ -833,5 +1171,5 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     })();
   }
 
-  return { onBlocked, onPoll, onNoPrompt };
+  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved };
 }
