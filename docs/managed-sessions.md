@@ -63,6 +63,7 @@ takes effect on restart, not live), like every other provider's query.
 | `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
 | `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
 | `unfreezeControllers` | no | Same shape, for `unfreeze_session` — an INDEPENDENT list; a name in `freezeControllers` grants nothing here, and vice versa. |
+| `linkedEventingProjects` | no | FACTORY-52. Non-empty array of canonical `jira-project:<KEY>` references naming the Jira project(s) this definition opts into linked eventing for. See "`linkedEventingProjects`: per-definition linked-eventing project opt-in" below. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
@@ -127,6 +128,64 @@ is still out of scope for this ticket — see "Not in this version"
 (BUTCHR-413 later added a daemon-side relay that delivers `channel: true`
 push as a `herd.nudge` prompt instead, without Codex's own connection ever
 receiving it — see `docs/codex-channel-relay.md`).
+
+### `linkedEventingProjects`: per-definition linked-eventing project opt-in
+
+FACTORY-52 (epic FACTORY-51, story implementing FACTORY-52). An optional
+field naming one or more Jira projects this definition's agent should get
+linked eventing for, in the canonical `jira-project:<KEY>` vocabulary
+`src/resources/resource-ref.ts` (`parseResourceRef`/`formatResourceRef`)
+already defines and every other resource ref in this codebase already
+reuses:
+
+```json
+{
+  "workingDirectory": "~/code/brooswit-factory/some-project",
+  "brief": "Keep this repo's docs and dependency versions current.",
+  "vendor": "claude",
+  "tier": "tier1",
+  "permissionMode": "default",
+  "linkedEventingProjects": ["jira-project:FACTORY"]
+}
+```
+
+- **Shape:** a non-empty array of strings; each entry must parse as a
+  canonical `jira-project:<KEY>` reference — a bare key with no provider
+  prefix (`"FACTORY"`) is rejected, same as everywhere else this codebase
+  requires the canonical form rather than a shorthand. Only the
+  `jira-project` provider is accepted; naming any other kind of resource
+  (`jira-work-item:...`, `github-issue:...`, ...) is rejected with a message
+  naming the provider it actually parsed as.
+- **Validation, not silent correction:** a malformed key, the wrong
+  provider, a non-array value, an empty array, or a non-string entry each
+  produce a clear load-time problem (collected alongside every other
+  problem on the manifest, same one-pass discipline as every other field).
+  Duplicate entries — compared by CANONICAL form, so the same project
+  written twice, or written once upper-case and once lower-case, collides —
+  are rejected outright rather than silently deduped, the same "reject,
+  never silently drop" choice `freezeControllers`/`unfreezeControllers`
+  already make for their own duplicate entries.
+- **Exposed value:** `SessionDefinition.linkedEventingProjects` (when
+  present) is the array of CANONICAL `jira-project:<KEY>` strings — not bare
+  project keys — so a consumer already working in `ResourceRef`/canonical-
+  string terms elsewhere in the codebase needs no separate parsing step to
+  use it.
+- **Additive, parse-only:** a definition WITHOUT this field parses and
+  behaves exactly as it did before this field existed — no key materialises
+  on the parsed object at all. This ticket (FACTORY-54) is schema +
+  parsing + validation only: nothing in the daemon reads
+  `linkedEventingProjects` yet to actually nudge, notify, rate-cap, or watch
+  anything. That wiring — making a managed-session agent's own project
+  opt-in actually DO something, mirroring what `Rule.linkedEventing`
+  (`src/rules/rules.ts`) already does for rule-owned resources — is
+  FACTORY-53's own scope.
+- **Deliberately not a reuse of `Rule.linkedEventing`:** that field is a
+  per-RULE boolean with no project of its own to name (a `Rule` already
+  owns whichever resources its query matches); a managed-session definition
+  has no owning `Rule` in the same sense and needs to say WHICH project(s),
+  not merely whether — hence a dedicated, project-naming field here instead
+  of trying to bolt a boolean onto a definition that has nothing for it to
+  apply to.
 
 ## Tier -> model mapping
 
