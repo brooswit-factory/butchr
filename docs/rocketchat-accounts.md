@@ -402,16 +402,39 @@ corrected to point here. Wiring `ensureAccount`/`releaseAccount` into actual
 agent start/stop is still not done; that remains the follow-up task's job,
 now that this module exists for it to call.
 
-## Wiring (BUTCHR-412)
+## Wiring (BUTCHR-412, and BUTCHR-460 for managed sessions)
 
 The follow-up task above is done. `src/agents/account-lifecycle.ts` wires
 `ensureAccount`/`releaseAccount` into `reconcileNow` (`src/daemon/loop.ts`)
 as two hooks, `ensure`/`release`, added to `ReconcileOptions.account` and
 threaded through every rule loop (`src/daemon/index.ts`: jira-work,
-github-issue, jira-idea, zendesk-ticket) as ONE shared instance, over ONE
-shared `AccountManager` — same "fleet-wide, not per-tier" discipline
+github-issue, jira-idea, zendesk-ticket, AND — BUTCHR-460 — the built-in
+managed-sessions loop) as ONE shared instance, over ONE shared
+`AccountManager` — same "fleet-wide, not per-tier" discipline
 `admissionController` already has, and for the same reason: one Rocket.Chat
 seat budget, one store file.
+
+**Managed sessions get the identical `ensure`/`release` contract described
+below, with one addition — see "Archive release (BUTCHR-460)" further down.**
+A managed-session definition's own `account` field (validated the same way a
+`Rule`'s is — see `docs/managed-sessions.md`) drives `ensureAccount`/
+`releaseAccount` exactly like any other provider's rule-level `account` does;
+`accountPolicyOf` (`src/daemon/index.ts`) resolves it from the per-poll
+`managedSessionAccountPolicies` map (rebuilt every poll from each eligible
+definition's own `account` field — the same seam `managedSessionRoles`
+already uses for `role`) rather than from a `Rule`, since the built-in
+managed-sessions rule is ONE shared `Rule` (fixed `account: "none"`) for
+every heterogeneous definition file. **One STARTUP-TIME caveat, honestly
+named rather than left implicit:** whether `accountLifecycle` is built AT
+ALL (see "DORMANT UNLESS..." above this section in the source) is decided
+ONCE, from a snapshot of the definitions directory taken at daemon start —
+same "root resolution happens once at daemon startup, not live" precedent
+`docs/managed-sessions.md`'s own root-resolution section already documents.
+A definition ADDED (or edited to newly request an account) after that
+snapshot, on a daemon where no `rules.json` rule ALSO wants Rocket.Chat,
+does not retroactively wake the subsystem up until the next restart — same
+class of gap as any other definitions-directory change needing a restart to
+be picked up by anything that isn't the poll loop itself.
 
 **`ensure(spec)`** runs for exactly the ids about to be spawned — the
 ordinary spawn loop's `admitted` set (already excludes every resident agent,
@@ -467,6 +490,47 @@ out from under the now-running agent). This is the FAST recovery path
 (next poll, seconds to a minute); the periodic orphan sweep below is the
 SLOW, crash-safe backstop for the same failure mode across a daemon
 restart, which drops the in-memory queue but not the store's own record.
+
+**Archive release (BUTCHR-460).** `butchr session archive` (S3, BUTCHR-394)
+moves a managed-session definition file out of the active directory — the
+next poll, `searchSessionDefinitions` no longer lists it, so it drops out of
+`desired` and falls into the SAME `plan.stop` diff described above, `release`
+included, exactly like any other definition that stops being desired
+(deleted outright, edited invalid, frozen). That alone already releases a
+`temporary` account correctly — but always reports reason `"stop"`, which is
+accurate (nothing here is wrong) but not the SPECIFIC, already-modeled reason
+(`ReleaseReason` has carried `"archive"` distinctly since BUTCHR-410) an
+archive actually is. `src/agents/managed-session-account-release.ts`'s
+`wireManagedSessionArchiveRelease` sits in front of `release`, for the
+managed-sessions loop ONLY, and upgrades a `"stop"` call to `"archive"` the
+moment it can positively confirm the definition now exists, under its exact
+original basename, in the archive directory (`sessionArchiveDir`,
+`src/resources/session-archive.ts` — the one function every archive-
+directory caller resolves through). This also catches an archive done by
+hand-moving the file (indistinguishable, from this check's point of view,
+from one done through the CLI) — something no CLI-side hook could ever see.
+`stop` and `archive` behave IDENTICALLY in `releaseAccount` itself (both
+unprovision a `temporary` account, retain a `permanent` one) — this
+distinction is purely for the audit trail (the `[account] ... released
+(archive)` log line, and an equally honest `WARNING: [account] ... release
+(archive) failed — ... queued for retry` line on the failure path above,
+which this wrapper does not change at all: a queued/retried archive release
+is still retried by the SAME `retryPendingReleases` mechanism, with reason
+`"archive"` preserved through the retry).
+
+**Why not `archiveSessionDefinition`'s own `onArchived` hook instead.**
+`butchr session archive` is a credential-free, daemon-free CLI process
+(`src/cli/session-cli.ts`'s own top comment) — it has no Rocket.Chat client,
+account store, or Nexus manifest publisher. Wiring release there (the
+design question's "Option 1") would mean a SECOND process writing
+`.butchr-rc-accounts.json` with no cross-process lock (the account manager's
+own in-process keyed lock, "Race-safety" above, does not span processes),
+and the Nexus hand-off manifest is only ever republished by the daemon's own
+per-poll batch (`publishBatch`, "Batch provisioning" below) — a CLI-side
+release would leave a released account listed in the manifest until some
+UNRELATED later batch happened to republish it. `onArchived` stays a
+documented no-op (`src/cli/session-cli.ts`'s `defaultIo()`); the real release
+is entirely daemon-side, described above.
 
 **Deliberately NOT wired**: `watchSessionLimits`'s own `herd.stop()` call
 (`src/daemon/index.ts`) — a session-limit close is the same agent identity,
@@ -816,3 +880,20 @@ running rather than stopping it with nothing to replace it,
 `publishBatch` called exactly once per poll, after `retryPendingReleases`
 and every `ensure`/`release`); `test/unit/config.test.ts` covers the four new
 `Config.rocketchat` fields and their env vars/defaults.
+
+**BUTCHR-460's own coverage.** `test/unit/managed-session-account-release.test.ts`
+covers `wireManagedSessionArchiveRelease` directly: a `"stop"` release for a
+managed-session id upgrades to `"archive"` exactly when the archive
+directory holds a same-basename file, stays `"stop"` when it does not
+(deleted/invalidated/frozen, not archived), never upgrades a `"respawn"`
+release or a non-managed-session id's `"stop"` even against a coincidentally
+matching path, honours `BUTCHR_SESSION_ARCHIVE_DIR`, and passes
+`ensure`/`retryPendingReleases`/`publishBatch` straight through unchanged.
+`test/unit/session-definition-type.test.ts` covers the `accountPolicies` map
+(cleared and rebuilt every search from each eligible match's own manifest
+`account` field, same discipline `roles` already has — a frozen/removed
+definition's policy does not linger). No test seeds a live daemon or a real
+Rocket.Chat server for any of this — the managed-sessions loop's own
+`account`/`accountPolicies` wiring and the archive-detection wrapper are both
+exercised entirely through the fake-RC harness and injected fakes, same
+discipline as every other test in this file's own list.

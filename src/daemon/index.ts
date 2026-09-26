@@ -76,7 +76,7 @@ import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
-import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
+import { builtinManagedSessionsRule, ownsManagedSessionAgent, searchSessionDefinitions } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
@@ -173,6 +173,16 @@ for (const r of rules) {
 // default below — documented here, not silently relied upon.
 const managedSessionRoles = new Map<string, AgentRole>();
 /**
+ * BUTCHR-460 — same seam as `managedSessionRoles` immediately above, one
+ * field over: `accountPolicyOf` below is RULE-level only, same reason
+ * `roleOfAgent` needed `managedSessionRoles` — the built-in managed-sessions
+ * rule is ONE shared `Rule` (fixed `account: "none"`) for every
+ * heterogeneous definition file. Rebuilt every poll by the managed-sessions
+ * loop itself (`ManagedSessionResourceDeps.accountPolicies`,
+ * src/rules/session-definition-type.ts) from that poll's eligible matches.
+ */
+const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
+/**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
  * derived from its rule (provider + rule id, `decodeAnyAgentKey`) looked up
@@ -230,10 +240,20 @@ const mcpBindingsOf = (id: string) => {
  * bare-issue id, or a rule since removed) — an unrecognised agent must never
  * provision an account for itself, mirroring `roleOfAgent`'s own "an
  * unrecognised agent is always a worker" fail-safe.
+ * BUTCHR-460: a managed-session agent's OWN `account` (its manifest field)
+ * IS read here — via `managedSessionAccountPolicies`, checked before the
+ * rule-level fallback — same precedent as `ruleRoleOfAgent`'s own
+ * `managedSessionRoles` lookup just above, for the identical reason (the
+ * built-in managed-sessions rule cannot carry a per-file account policy
+ * itself).
  */
 const accountPolicyOf = (id: string): AccountPolicy => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return "none";
+  if (ownsManagedSessionAgent(id)) {
+    const manifestPolicy = managedSessionAccountPolicies.get(id);
+    if (manifestPolicy) return manifestPolicy;
+  }
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.account ?? "none";
 };
@@ -860,7 +880,30 @@ const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== n
 // every `ensureAccount` call for that rule visibly refuses (logged, and
 // withheld — see `ensure`'s own doc comment) rather than the daemon silently
 // staying dormant over a rule that explicitly asked for an account.
-const rcPolicyNeeded = rules.some((r) => r.enabled && r.account !== "none");
+//
+// BUTCHR-460: `rules.json` is not the only source of an `account` policy any
+// more — a managed-session definition (read from disk, never `rules.json`)
+// carries its own. Unlike every OTHER rule field, that content is not known
+// until the managed-sessions loop's own first poll — so this is a STARTUP
+// SNAPSHOT of the definitions directory, taken once, here, same "root
+// resolution happens once at daemon startup, not live" precedent
+// `startManagedSessionsLoop` itself already documents for its own root. A
+// definition ADDED (or edited to newly request an account) after this
+// snapshot, on a daemon where no `rules.json` rule also wants RC, does not
+// retroactively wake this subsystem up — same as any other definitions-
+// directory change needing a restart to be picked up by anything that isn't
+// the poll loop itself. A snapshot failure (directory unreadable, listing
+// safety cap) is logged and treated as "nothing found" rather than crashing
+// startup — the managed-sessions loop's own regular poll surfaces that same
+// failure loudly, every poll, once it starts; duplicating that here would
+// only mask which one actually failed.
+const managedSessionDefsAtStartup = await searchSessionDefinitions(
+  { rule: builtinManagedSessionsRule(sessionDefinitionsPath()), list: listFilesystemResources, read: (p) => readFile(p, "utf8") },
+).catch((e) => {
+  console.error(`  WARNING: [account] could not scan ${sessionDefinitionsPath()} at startup to check for a managed-session account policy — assuming none for now (the managed-sessions loop's own poll will report the real error): ${(e as Error)?.message ?? e}`);
+  return [];
+});
+const rcPolicyNeeded = rules.some((r) => r.enabled && r.account !== "none") || managedSessionDefsAtStartup.some((m) => m.definition.account !== "none");
 let accountLifecycle: ReturnType<typeof createAccountLifecycle> | undefined;
 if (rcPolicyNeeded) {
   const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
@@ -1281,6 +1324,8 @@ startFilesystemLoop({
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
+  accountPolicies: managedSessionAccountPolicies,
+  ...(accountLifecycle ? { account: accountLifecycle } : {}),
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));

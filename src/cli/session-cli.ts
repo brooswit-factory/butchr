@@ -90,6 +90,19 @@ function defaultIo(): SessionCliIo {
   return {
     dir,
     freeze,
+    // BUTCHR-460: `archive.onArchived` deliberately stays unset here. This
+    // CLI is credential-free and daemon-free by design (this file's own top
+    // comment) — it has no Rocket.Chat client, account store, or Nexus
+    // manifest publisher to call `releaseAccount(agentKey, "archive")` with,
+    // and building one here would mean a second process writing
+    // `.butchr-rc-accounts.json` with no cross-process lock, plus a stale
+    // Nexus manifest until the daemon's own next unrelated batch republished
+    // it (see `docs/rocketchat-accounts.md`'s "Race-safety" and "Batch
+    // provisioning" sections). The real release happens daemon-side instead
+    // — `../agents/managed-session-account-release.ts`'s own top comment has
+    // the full reasoning, including why that's MORE reliable than this hook
+    // (it also catches a hand-moved archive, which this hook structurally
+    // cannot).
     archive: { activeDir: dir, archiveDir, ...defaultSessionArchiveIo() },
     list: listFilesystemResources,
     read: (p) => readFile(p, "utf8"),

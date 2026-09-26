@@ -264,6 +264,30 @@ describe("createManagedSessionResourceType", () => {
     expect(roles.has(keyB)).toBe(false);
   });
 
+  test("BUTCHR-460: `accountPolicies` is cleared and rebuilt every search from each eligible match's OWN manifest account policy, keyed by agent key — a frozen/removed definition's policy does not linger", async () => {
+    let files: Record<string, string> = {
+      "/defs/a.json": JSON.stringify(goodDef({ account: "temporary" })),
+      "/defs/b.json": JSON.stringify(goodDef({ account: "permanent" })),
+      "/defs/c.json": JSON.stringify(goodDef({})), // no `account` given — defaults to "none"
+    };
+    const { list } = fakeFiles(files);
+    const rule = builtinManagedSessionsRule("/defs");
+    const accountPolicies = new Map<string, "none" | "temporary" | "permanent">();
+    const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, accountPolicies });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
+    await type.discovery.search();
+    expect(accountPolicies.get(keyA)).toBe("temporary");
+    expect(accountPolicies.get(keyB)).toBe("permanent");
+    expect(accountPolicies.get(keyC)).toBe("none");
+    // b.json goes frozen (still valid, but ineligible) — its policy entry must not linger.
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ account: "permanent", frozen: true })), "/defs/c.json": files["/defs/c.json"]! };
+    await type.discovery.search();
+    expect(accountPolicies.get(keyA)).toBe("temporary");
+    expect(accountPolicies.has(keyB)).toBe(false);
+  });
+
   test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {
     const files: Record<string, string> = {
       "/defs/sentinel.json": JSON.stringify(goodDef({ role: "sentinel", workingDirectory: "/repo/sentinel" })),

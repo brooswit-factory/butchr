@@ -8,14 +8,16 @@
  */
 import { readFile } from "node:fs/promises";
 import type { Stop } from "@brooswit/sundry";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import type { Herd } from "../agents/herd.js";
 import { filesystemNudge } from "../agents/change-nudge.js";
+import { realPathExists, wireManagedSessionArchiveRelease } from "../agents/managed-session-account-release.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { FilesystemQuery } from "../resources/filesystem-query.js";
 import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { sessionDefinitionsPath, type SessionDefinitionsEnv } from "../resources/session-definition.js";
 import type { NotifyReason } from "../resources/types.js";
-import type { AgentRole } from "../rules/rules.js";
+import type { AccountPolicy, AgentRole } from "../rules/rules.js";
 import { builtinManagedSessionsRule, createManagedSessionResourceType, ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { runResourceLoop } from "./loop.js";
 
@@ -32,6 +34,21 @@ export interface ManagedSessionsLoopDeps {
   read?: (path: string) => Promise<string>;
   /** See `ManagedSessionResourceDeps.roles` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no role information is surfaced (existing behaviour unchanged). */
   roles?: Map<string, AgentRole>;
+  /** See `ManagedSessionResourceDeps.accountPolicies` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no per-definition account policy is surfaced (existing behaviour unchanged). */
+  accountPolicies?: Map<string, AccountPolicy>;
+  /**
+   * BUTCHR-460 — the SAME shared `AccountLifecycleHooks` instance every
+   * other rule loop is wired against (src/daemon/index.ts), wrapped here
+   * (see `../agents/managed-session-account-release.ts`) so a managed-
+   * session agent's release is reported as `"archive"`, not the generic
+   * `"stop"`, whenever this loop can positively confirm the stop was one.
+   * Optional; omitted, no account lifecycle runs for managed-session agents
+   * at all (today's behaviour — see that module's own top comment for why
+   * this is the ONE place that distinction can be made).
+   */
+  account?: AccountLifecycleHooks;
+  /** Only used to build the default `exists` check behind `account`'s archive-detection wrapper; overridable so a test never touches real disk. Defaults to `../agents/managed-session-account-release.js`'s `realPathExists`. */
+  exists?: (path: string) => Promise<boolean>;
   herd: Herd;
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
@@ -60,7 +77,11 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     read: deps.read ?? ((path) => readFile(path, "utf8")),
     log: deps.log,
     ...(deps.roles ? { roles: deps.roles } : {}),
+    ...(deps.accountPolicies ? { accountPolicies: deps.accountPolicies } : {}),
   });
+  const account = deps.account
+    ? wireManagedSessionArchiveRelease(deps.account, { exists: deps.exists ?? realPathExists, ...(deps.env ? { env: deps.env } : {}), ruleId: rule.id })
+    : undefined;
   return runResourceLoop(type, {
     herd: deps.herd,
     ownsId: (id) => ownsManagedSessionAgent(id, rule.id),
@@ -69,6 +90,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
       await deps.deliver(agent, resource, filesystemNudge(resource, reason));
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
+    ...(account ? { account } : {}),
     ...(deps.admission ? { admission: deps.admission } : {}),
     ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
