@@ -204,21 +204,28 @@ eligible pane gets answered.
 - On a `pane.agent_status_changed` push frame reporting `blocked` for a pane
   in the current set, the watch fires a tick immediately, the same
   `runPermissionAnswerTick` call the sweep itself uses.
-- **One shared in-flight guard.** The event-triggered tick and the periodic
-  sweep both go through the same `inFlight` boolean `startPermissionAnswerLoop`
-  already used for the sweep-only case. They can never run concurrently
-  against the same pane set; an event that arrives mid-tick is simply
-  dropped, and the next sweep (at most 20s away, same bound as before this
-  ticket) still catches whatever it would have answered. This is also what
-  bounds the read-scan rate against a burst: a tool-heavy agent transitioning
-  to `blocked` many times in quick succession collapses into whatever number
-  of ticks can actually run back-to-back, never a pile of concurrent scans.
+- **One shared in-flight guard, coalescing rather than dropping.** The
+  event-triggered tick and the periodic sweep both go through the same
+  `inFlight` boolean `startPermissionAnswerLoop` already used for the
+  sweep-only case — they can never run concurrently against the same pane
+  set. A `fire()` that arrives mid-tick does NOT drop the request: it sets a
+  `pending` flag, and the running tick's own completion runs exactly one
+  more tick before going idle if it sees that flag set. This matters for the
+  exact case the story exists for — a tool-heavy agent whose own NEXT tool
+  call goes `blocked` again while the current tick is still mid-approve/
+  verify on the previous one; dropping that event would leave it to the 20s
+  fallback, missing the latency goal whenever more than one prompt is in
+  flight at a time. A burst of N such requests during one tick still costs
+  at most one trailing tick, never N — bounding the read-scan rate the same
+  way `startPermissionAnswerLoop`'s own "a slow tick just makes the next
+  firing a no-op" bound always did, just without discarding the request that
+  arrived during the busy window.
 - **A newly-eligible pane's first tick is still scan-driven.** A pane isn't
   subscribed to until a sweep tick has seen it as eligible at least once —
   so it gets the ≤20s bound (unchanged from before this ticket) on its first
   tick as a lizard-mode pane, and the fast, sub-3s path from the second tick
   onward. Not a regression: nothing before this ticket had a fast path at
-  all.
+  all. This is the one latency gap the coalescing above does not close.
 - **Reconnection.** A subscription that ends on its own (herdr closed it, or
   it errored — a real socket can drop) is reopened after `resubscribeDelayMs`
   (default 2000ms) for the same pane-id set, unless a topology change has

@@ -215,6 +215,71 @@ describe("startPermissionAnswerWatch", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("a blocked event arriving while a tick is in flight is coalesced into one trailing re-run, not dropped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const screensByPane: Record<string, string> = { p1: "idle", p2: "idle" };
+    const sendKeysCalls: unknown[] = [];
+    // Resolved once, later — every read of p1 after that resolves instantly,
+    // so this only stalls the FIRST tick's read of p1, not a second one.
+    let releaseFirstRead!: () => void;
+    const firstReadGate = new Promise<void>((resolve) => { releaseFirstRead = resolve; });
+    let p1ReadStarted = false;
+    const client: PermissionAnswerClient = {
+      agent: {
+        list: async () => ({ type: "agent_list" as const, agents: Object.keys(screensByPane).map((pane_id) => ({ ...AGENT_BASE, pane_id, agent_status: "blocked" as const })) }),
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async (p: { target: string }) => {
+          if (p.target === "p1") { p1ReadStarted = true; await firstReadGate; }
+          return { type: "pane_read" as const, read: { format: "text" as const, pane_id: p.target, revision: 1, source: "detection" as const, tab_id: "t1", text: screensByPane[p.target] ?? "", truncated: false, workspace_id: "w1" } };
+        }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async (p: { target: string }) => { sendKeysCalls.push(p); screensByPane[p.target] = "cleared"; return { type: "ok" as const }; }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    const bothEligible = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.map((a) => [a.pane_id, a.pane_id]));
+    const subs: FakeSubscription[] = [];
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: bothEligible,
+        auditPath,
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      // Huge sweep interval: if p2 gets answered promptly below, it was the
+      // coalesced trailing tick that did it, never the sweep.
+      1_000_000,
+    );
+
+    await waitFor(() => subs.length > 0);
+    // Kick off tick 1: p1 goes blocked, its own read stalls on the gate —
+    // the tick is now genuinely in flight (inFlight is set synchronously
+    // before any await), same as a real approve/verify pass taking seconds.
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => p1ReadStarted);
+
+    // While tick 1 is stalled, p2's dialog appears and herdr reports it.
+    // The OLD (pre-review) behavior dropped this outright, leaving p2 to the
+    // 20s sweep alone — exactly the miss the review caught.
+    screensByPane.p2 = DIALOG_SCREEN;
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p2", agent_status: "blocked" } });
+    await flush(); // let the event handler run and set the pending flag
+
+    releaseFirstRead(); // tick 1 finishes (p1 had nothing pending, so nothing pressed for it)
+    // The coalesced trailing tick should answer p2 promptly, without ever
+    // reaching the (deliberately huge) sweep interval.
+    await waitFor(() => sendKeysCalls.length > 0);
+
+    expect(sendKeysCalls).toEqual([{ target: "p2", keys: ["enter"] }]);
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("fallback sweep still works when the push subscription never delivers anything (e.g. events unavailable)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
     const auditPath = join(dir, "audit.jsonl");

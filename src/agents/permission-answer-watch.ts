@@ -32,17 +32,22 @@
  * gets the fast, event-driven path from its second tick onward — not a
  * regression against today's baseline, which never had a fast path at all.
  *
- * One shared in-flight guard: an event-triggered answer and the periodic
- * sweep both funnel through the exact same `runPermissionAnswerTick` call
- * and the exact same `inFlight` flag `startPermissionAnswerLoop` already
- * uses for the sweep-only case — they can never run concurrently against the
- * same pane set. An event that fires while a tick is already running is
- * simply dropped; the next sweep (at most `intervalMs` away) still catches
- * whatever it would have answered, same as `startPermissionAnswerLoop`'s own
- * "a slow tick just makes the next firing a no-op" contract. This is also
- * what keeps a tool-heavy agent's own burst of `blocked` transitions (one
- * per tool call) from stacking up concurrent scans: at most one tick's worth
- * of eligible-pane screen reads is ever in flight at a time, however many
+ * One shared in-flight guard, with coalescing rather than dropping: an
+ * event-triggered answer and the periodic sweep both funnel through the
+ * exact same `runPermissionAnswerTick` call and the exact same `inFlight`
+ * flag `startPermissionAnswerLoop` already uses for the sweep-only case —
+ * they can never run concurrently against the same pane set. A `fire()`
+ * that arrives while a tick is already running does NOT drop the request:
+ * it sets a `pending` flag, and the in-flight tick's own completion runs
+ * exactly one more tick before going idle. This matters for the exact case
+ * this ticket exists for — a tool-heavy agent whose OWN next tool call goes
+ * `blocked` again while the current tick is still mid-approve/verify on the
+ * previous one — dropping that event (the earlier design here) would have
+ * left it to the 20s fallback, missing the story's own latency goal
+ * whenever more than one prompt is in flight at a time. Coalescing instead
+ * of queuing keeps the same bound `startPermissionAnswerLoop`'s "a slow tick
+ * just makes the next firing a no-op" already relies on: at most one tick's
+ * worth of eligible-pane screen reads is ever in flight at a time, however many
  * events arrive while it runs.
  */
 import { runPermissionAnswerTick, type PermissionAnswerLoopDeps } from "./permission-answer-loop.js";
@@ -111,6 +116,14 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean {
  */
 export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, intervalMs: number): PermissionAnswerWatchHandle {
   let inFlight = false;
+  // A fire() while inFlight sets this instead of dropping the request; the
+  // in-flight tick's own .finally runs exactly one more tick when it sees it
+  // set, then clears it. A burst of N such requests during one tick still
+  // costs at most one trailing tick, never N — the same "coalesce, don't
+  // queue" shape `startPermissionAnswerLoop`'s own in-flight guard already
+  // has for the sweep-only case, extended so an event's request to run is
+  // remembered instead of discarded.
+  let pending = false;
   let stopped = false;
   let currentPaneIds: readonly string[] = [];
   let currentSub: PermissionAnswerSubscription | undefined;
@@ -130,9 +143,13 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
   const log = tickDeps.log ?? (() => {});
 
   const fire = () => {
-    if (inFlight || stopped) return;
+    if (stopped) return;
+    if (inFlight) { pending = true; return; }
     inFlight = true;
-    void runPermissionAnswerTick(tickDeps).finally(() => { inFlight = false; });
+    void runPermissionAnswerTick(tickDeps).finally(() => {
+      inFlight = false;
+      if (pending && !stopped) { pending = false; fire(); }
+    });
   };
 
   async function runSubscription(paneIds: readonly string[], gen: number): Promise<void> {
