@@ -37,7 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
-import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
+import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -1696,14 +1696,14 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // inside DROVR-41's own 15-30s recommendation, slower than the 5s
 // `blockingEscalationTimer`/`watchPrompts` timers (a pure-read status poll,
 // cheap to run often) but close to this daemon's own ~15s Jira reconcile
-// cadence under load (BUTCHR-117) — a blocked agent is now unblocked within
-// one tick of a bound already proven acceptable elsewhere in this same
-// daemon, without adding a fourth distinct polling rhythm to reason about.
-// The lizard-mode opt-in gate above only shrinks this timer's real workload
-// (a tick with zero eligible panes costs one `agent.list()` call and
-// nothing else — see `runPermissionAnswerTick`'s own doc comment), so the
-// original cost/cadence tradeoff this value was chosen against still holds
-// even more comfortably now than when every pane was in scope.
+// cadence under load (BUTCHR-117) — a bound already proven acceptable
+// elsewhere in this same daemon, without adding a fourth distinct polling
+// rhythm to reason about. The lizard-mode opt-in gate above only shrinks
+// this timer's real workload (a tick with zero eligible panes costs one
+// `agent.list()` call and nothing else — see `runPermissionAnswerTick`'s own
+// doc comment), so the original cost/cadence tradeoff this value was chosen
+// against still holds even more comfortably now than when every pane was in
+// scope.
 // `READ_TIMEOUT_MS` (8s) sits comfortably below `INTERVAL_MS` (20s) — see
 // `AutoAnswerPermissionsOptions.readTimeoutMs`'s own doc comment
 // (`@brooswit/drovr`) for why a pane's attempt must never still be in
@@ -1711,9 +1711,40 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // approve-verify budget (5s default `verifyTimeoutMs`, measured against
 // `node_modules/@brooswit/drovr/dist/index.js`) rather than picked to
 // exactly match it.
+//
+// FACTORY-98 (FACTORY-97): 20s is no longer the ONLY thing standing between
+// a lizard-mode pane going `blocked` and getting answered — see
+// `src/agents/permission-answer-watch.ts`'s own header for why (herdr's
+// `pane.agent_status_changed` push event, real per `@brooswit/herdr-sdk`'s
+// own generated types, but filtered to a specific `pane_id` — there is no
+// "any pane" wildcard, so this stays a scan-driven sweep at its core, with
+// the push connection layered on top as a fast path for panes the sweep
+// already knows about). `INTERVAL_MS` unchanged: it is now the FALLBACK
+// cadence (a dropped or not-yet-opened subscription still gets caught within
+// one sweep, same bound as before this ticket), not the only path.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
-startPermissionAnswerLoop(
+// Narrows herdr's own push frame down to the one shape
+// `permission-answer-watch.ts` needs (`pane_id` + `agent_status`) — real
+// `PushFrame`s carry many other event shapes (workspace/tab/pane lifecycle)
+// with neither field, so `"agent_status" in frame.data` (rather than
+// asserting the wider union structurally matches) is what lets this compile
+// without a cast: only a `pane.agent_status_changed` frame's data ever has
+// both keys, which is the only kind `subscribeAgentStatus` below ever asks
+// herdr to send.
+async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subscribe"]>>): AsyncGenerator<PermissionAnswerPushFrame> {
+  for await (const frame of sub) {
+    if ("agent_status" in frame.data && "pane_id" in frame.data) {
+      yield { event: frame.event, data: { pane_id: frame.data.pane_id, agent_status: frame.data.agent_status } };
+    }
+  }
+}
+function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
+  return herdr
+    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id })))
+    .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
+}
+startPermissionAnswerWatch(
   {
     client: herdr,
     eligiblePanes: permissionAnswerEligiblePanes,
@@ -1721,6 +1752,7 @@ startPermissionAnswerLoop(
     operator: "butchr-daemon",
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
+    subscribe: subscribeAgentStatus,
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );
