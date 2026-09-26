@@ -357,10 +357,12 @@ the following are true:**
    nothing about what the RUNNING daemon's build actually does with it —
    confirm the live director agent's own launch argv contains
    `--strict-mcp-config`, not just that `butchr session show <name>` prints
-   `strictMcpConfig: true` back (that only proves the manifest was accepted,
-   which §3's hard-rejection behavior below means could be a false positive
-   from a NEW-enough daemon read from an OLD one's still-stale directory —
-   read the argv itself). On Codey, as the `butchr.service` user, once the
+   `strictMcpConfig: true` back — `session show` only proves the CLI you ran
+   it with accepted the file; the CLI binary on disk need not be the same
+   build as the DAEMON process actually running (a deploy that updated one
+   without restarting the other is exactly the gap this section exists to
+   catch), so only the live process's own argv proves the running daemon
+   itself honours the field. On Codey, as the `butchr.service` user, once the
    director's definition is staged and the daemon has picked it up:
 
    ```
@@ -384,11 +386,12 @@ the following are true:**
    that daemon, then `ps -o pid,args= -p <pid>` for that pane's pid.
 
    **Expected**: exactly one matching process line, and that same line
-   contains the literal token `--strict-mcp-config` (a standalone flag, no
-   value follows it — `checkManagedAgentArgv`'s own convention in
-   `@brooswit/drovr`, "valueless, like `--dangerously-bypass-approvals-and-
-   sandbox`"). **Fails as**: zero matching lines (the agent isn't running —
-   don't conclude anything about strict-MCP until it is), more than one
+   contains the literal token `--strict-mcp-config` as a bare, standalone
+   flag with no value after it — this is how `@brooswit/drovr`'s own
+   `buildProviderLaunchArgs` emits it (and how `spec.strictMcpConfig` reaches
+   argv through butchr's own `src/agents/argv.ts`). **Fails as**: zero
+   matching lines (the agent isn't running — don't conclude anything about
+   strict-MCP until it is), more than one
    matching line (investigate a possible duplicate before doing anything
    else — see §7), or a matching line with no `--strict-mcp-config` token
    (the daemon accepted the manifest but did not honor the field — STOP, do
