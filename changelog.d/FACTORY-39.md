@@ -15,6 +15,13 @@ bump: minor
 - The BUTCHR-110 tier-identity collision check now describes a Bug caller
   honestly (no role variable governs a Bug's assignee) instead of
   mislabeling it as governed by `BUTCHR_ASSIGNEE_EPIC`.
+- The fleet agent cap (BUTCHR-422) no longer counts a Bug agent as leaf work:
+  `UNCOUNTED_ISSUE_TYPES` now includes `"bug"` alongside `"epic"`/`"story"`,
+  since a Bug idles while its Stories run exactly like an Epic does, and
+  must be exempt from `maxAgents` the same way — otherwise an idling Bug
+  boss could hold a cap slot and get withheld at the cap. Task and Sub-task
+  remain counted.
 
-This is a rule-file change only (`src/tools/relationship.ts`), not applied to
-any host's live daemon config — it awaits the normal assembly rollout.
+This is a rule-file change only (`src/tools/relationship.ts`,
+`src/agents/capacity-role.ts`, `src/daemon/index.ts`), not applied to any
+host's live daemon config — it awaits the normal assembly rollout.
