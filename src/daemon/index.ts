@@ -26,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -80,6 +80,8 @@ import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-de
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { sessionArchiveDir } from "../resources/session-archive.js";
+import { buildQueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
@@ -661,6 +663,26 @@ const { app, mcp } = buildApp({
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
+  // FACTORY-72: every configured rule and managed-session definition,
+  // staffed or not — see src/agents/query-agent-inventory.ts's own top
+  // comment for the reuse this is built from. `rulesFile`/`configReasonFor`
+  // are this daemon's own already-computed values (loaded/decided once at
+  // startup above), never a second load or a second staffing decision.
+  configInventory: () =>
+    buildQueryAgentInventory({
+      rulesFile: { path: rulesPath(), rules, error: null },
+      dashboard: dashboardFeed.snapshot(),
+      configReasonFor: (rule) => {
+        if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
+        return null;
+      },
+      sessionDefinitions: {
+        activeDir: sessionDefinitionsPath(),
+        archiveDir: sessionArchiveDir(),
+        store: defaultSessionFreezeIo().store,
+      },
+    }),
   // BUTCHR-339: the dashboard page's header info — the SAME `build`/`currency`
   // values `/health` already reads via `toBuildReport(buildIdentity)` and
   // `currency.snapshot()` (see `health` above), never a second derivation.

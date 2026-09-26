@@ -3,6 +3,7 @@ import type { McpHandle } from "@brooswit/thatch";
 import { renderDashboard, type DashboardHeaderInfo } from "./dashboard-page.js";
 import type { HealthStatus } from "../daemon/health.js";
 import type { DashboardResponse } from "../agents/dashboard.js";
+import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -47,6 +48,16 @@ export interface ViewDeps {
    * bar as `openPane` above.
    */
   resourceLink: (key: string) => Promise<{ ok: true; url: string } | { ok: false; error: string }>;
+  /**
+   * FACTORY-72 — every configured query agent (rules + managed-session
+   * definitions), whether or not it currently has a running agent. See
+   * `../agents/query-agent-inventory.ts` for the full shape and the reuse
+   * it's built from. Async (unlike `dashboard`/`header`) because it reads
+   * the managed-session definitions directory fresh each call (local disk,
+   * not a network round trip) — see that module's own top comment for why
+   * that I/O is unavoidable and acceptable here.
+   */
+  configInventory: () => Promise<QueryAgentInventory>;
 }
 
 /** The live view: the page, its data (/state), the connected-agents feed (/agents), and the open action. */
@@ -80,6 +91,9 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // this daemon already has in hand (see src/agents/dashboard.ts's own
     // header for the "could not check" contract this serves as-is).
     .get("/dashboard", () => deps.dashboard())
+    // FACTORY-72: read-only, same discipline as `/dashboard` — a VIEW over
+    // every configured rule and managed-session definition, staffed or not.
+    .get("/config-inventory", () => deps.configInventory())
     .get("/agents", () => mcp.connections.list().map((c) => ({ id: c.id, issue: c.headers["x-issue"] ?? null, connectedAt: c.connectedAt })))
     .post("/agents/:issue/open", async ({ params, set }) => {
       const r = await deps.open(decodeURIComponent(params.issue));
