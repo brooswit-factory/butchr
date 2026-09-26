@@ -32,6 +32,11 @@ const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, co
 // and this file's own dedicated `GET /` describe block below.
 const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
 const noResourceLink = async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` });
+// FACTORY-72: a trivial, empty fixture for every existing ViewDeps literal
+// below that predates /config-inventory and isn't exercising it — that
+// route's own real shape gets its dedicated fixtures in
+// query-agent-inventory.test.ts and this file's own dedicated describe block.
+const noConfigInventory = async () => ({ rules: [], sessionDefinitions: [], errors: [] });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -68,7 +73,7 @@ const view = {
   health: () => healthy,
   dashboard: noDashboard,
   header: noHeader,
-  resourceLink: noResourceLink,
+  resourceLink: noResourceLink, configInventory: noConfigInventory,
 };
 const { app, mcp } = buildApp(view);
 app.listen(0);
@@ -287,7 +292,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
       admission: noAdmissionView,
     };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -322,7 +327,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
     const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [], admission: noAdmissionView };
 
     let snapshot: DashboardResponse = genuinelyEmpty;
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -347,7 +352,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
     let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow], admission: noAdmissionView };
-    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink });
+    const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
     app.listen(0);
     try {
       const b = `http://localhost:${app.server!.port}`;
@@ -360,6 +365,23 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       expect(body.checked).toBe(false);
       expect(body.rows).toEqual([staleRow]);
       expect(body.rows[0]!.confirmedAt).toBe(new Date(1000).toISOString()); // NOT laundered to look fresh
+    } finally {
+      app.stop();
+    }
+  });
+});
+
+// FACTORY-72: read-only, same discipline as /dashboard's own describe block
+// above — the shape/reuse contract itself is exercised in
+// query-agent-inventory.test.ts; this just proves the route is wired.
+describe("GET /config-inventory (FACTORY-72): every configured rule and managed-session definition", () => {
+  test("smoke: the route serves deps.configInventory() verbatim", async () => {
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, harnesses: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
+    const { app } = buildApp({ ...view, configInventory: async () => inventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      expect(await (await fetch(`${b}/config-inventory`)).json()).toEqual(inventory);
     } finally {
       app.stop();
     }
@@ -490,7 +512,7 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => health.status(),
       dashboard: noDashboard,
     });
@@ -583,7 +605,7 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([pollHealth, notifyHealth]),
       dashboard: noDashboard,
     });
@@ -691,7 +713,7 @@ describe("/health carries build identity as a sibling of components, never insid
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], build),
       dashboard: noDashboard,
     });
@@ -723,7 +745,7 @@ describe("/health carries build identity as a sibling of components, never insid
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -760,7 +782,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -797,7 +819,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, coverage.snapshot()),
       dashboard: noDashboard,
     });
@@ -821,7 +843,7 @@ describe("/health carries detector coverage as a sibling of components, and neve
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
@@ -856,7 +878,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -888,7 +910,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       dashboard: noDashboard,
       health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
     });
@@ -913,7 +935,7 @@ describe("/health carries the admission cap + residency as a sibling of componen
       // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       dashboard: noDashboard,
       health: () => combineHealth([health]),
     });
@@ -963,7 +985,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -995,7 +1017,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -1020,7 +1042,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -1045,7 +1067,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -1075,7 +1097,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
@@ -1099,7 +1121,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       open: async () => ({ ok: true }),
       openPane: async () => ({ ok: true }),
       header: noHeader,
-      resourceLink: noResourceLink,
+      resourceLink: noResourceLink, configInventory: noConfigInventory,
       health: () => combineHealth([health]),
       dashboard: noDashboard,
     });
