@@ -612,6 +612,20 @@ export function logLinkedDiscovery(
   }
 }
 
+/**
+ * FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): `jira-work`'s own
+ * short herdr-workspace-label id — the operator's naming spec names this
+ * case explicitly: "for jira issues, its the issue id (FACTORY-20)". A
+ * `jira-work` resourceId already IS that issue key (`encodeAgentKey`'s
+ * `resourceId`, set from `issue.key` in `searchRules` above), so this is the
+ * identity function — kept as its own named export (rather than inlined at
+ * the one dispatch call site, `src/rules/display-label.ts`) so every
+ * provider's short-id method is symmetric, independently documented, and
+ * independently testable, per that ticket's "one method on each provider,
+ * not a central switch" instruction.
+ */
+export const jiraWorkShortDisplayId = (resourceId: string): string => resourceId;
+
 /** Logs each (rule, issue) exclusion once per resource type, not once per poll. */
 export function onceExcluded(provider: string, why: string, log: ((line: string) => void) | undefined): ExcludedIssue {
   const logged = new Set<string>();

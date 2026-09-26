@@ -42,6 +42,20 @@ export interface ZendeskTicketResourceDeps {
 /** True for exactly the herd ids this type owns. */
 export const ownsZendeskTicketAgent = (id: string): boolean => decodeAnyAgentKey(id)?.resourceProvider === "zendesk-ticket";
 
+/**
+ * FACTORY-95: `zendesk-ticket`'s own short herdr-workspace-label id — the
+ * operator's spec: "zendesk-ticket: e.g. #4567" (subdomain dropped, unlike
+ * the full `resourceId`, which keeps `<subdomain>#<id>` so two subdomains'
+ * tickets never collide as AGENT KEYS — see `zendesk-ticket-ref.ts`'s own
+ * header for why the subdomain is part of identity there). A label is
+ * display-only and collision-checked separately (`src/rules/display-label.ts`),
+ * so dropping the subdomain here is safe.
+ */
+export function zendeskTicketShortDisplayId(resourceId: string): string {
+  const ref = parseZendeskTicketRef(resourceId);
+  return ref ? `#${ref.id}` : resourceId;
+}
+
 /** Every enabled `zendesk-ticket` rule's matches. Any failed search rejects the whole poll. */
 export async function searchZendeskTicketRules(deps: Pick<ZendeskTicketResourceDeps, "rules" | "search">): Promise<ZendeskTicketMatch[]> {
   const enabled = deps.rules.filter((r) => r.enabled && r.resourceProvider === "zendesk-ticket");

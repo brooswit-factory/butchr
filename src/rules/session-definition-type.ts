@@ -35,7 +35,7 @@ import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { parseResourceRef } from "../resources/resource-ref.js";
-import { isHiddenDefinitionFile, parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
+import { controllerCanonicalName, isHiddenDefinitionFile, parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
 import { onceOversized } from "./filesystem-type.js";
@@ -80,6 +80,29 @@ export const ownsManagedSessionAgent = (id: string, ruleId: string = MANAGED_SES
   const decoded = decodeAnyAgentKey(id);
   return decoded?.resourceProvider === "filesystem" && decoded.ruleId === ruleId;
 };
+
+/**
+ * FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): a managed session's
+ * own short herdr-workspace-label id — the BARE definition name (e.g.
+ * `"admin-assembly"` from a definition file path ending
+ * `.../admin-assembly.json`), NOT the generic filesystem provider's
+ * `<parent>:<name>` rule applied literally (which would give
+ * `"session-definitions:admin-assembly"`). This is FACTORY-83's own
+ * deliberately recorded decision (its 2026-09-26T19:48Z comment), not an
+ * oversight: a managed session is memorable by its OWN name alone, and its
+ * parent directory is always the same fixed well-known definitions root
+ * (`sessionDefinitionsPath`), so naming that parent on every label would add
+ * noise, not information — unlike an arbitrary filesystem resource, where
+ * the parent is exactly what disambiguates "which `rinth` is this."
+ * `resourceId` here is the definition file's own canonical path
+ * (`searchSessionDefinitions` above); `controllerCanonicalName` (exported
+ * from `session-definition.ts` for exactly this reuse) strips a trailing
+ * `.json` the same way a controller name already is.
+ */
+export function managedSessionShortDisplayId(resourceId: string): string {
+  const base = resourceId.slice(resourceId.lastIndexOf("/") + 1);
+  return controllerCanonicalName(base);
+}
 
 /**
  * FACTORY-53/FACTORY-71 (epic FACTORY-51) — wires a managed-session

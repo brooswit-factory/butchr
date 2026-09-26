@@ -8,7 +8,7 @@ import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
-import { encodeAgentKey } from "../../src/rules/agent-key.js";
+import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
 
@@ -22,18 +22,26 @@ afterEach(clearQuota);
 /** One foreground process, as herdr's `pane.process_info` reports it. */
 interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
-function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined }>) {
-  const started: any[] = []; const closed: string[] = []; let createdCwd: string | undefined;
+function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined; workspace_id?: string }>) {
+  const started: any[] = []; const closed: string[] = []; const renamed: any[] = []; const metadata: any[] = []; const creates: any[] = [];
+  let createdCwd: string | undefined; let createdWorkspaceId = "w9";
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
       // Names are key hashes, so started agents carry their workspace's cwd; fixtures seeded by name still map `butchr-kan-1` to KAN-1.
       const cwd = a.cwd ?? (a.name?.startsWith("butchr-") ? join(workspaceRoot(), a.name.slice("butchr-".length).toUpperCase()) : undefined);
-      return cwd ? { ...a, agent: "claude", cwd } : a;
-    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd }); } },
+      const workspace_id = a.workspace_id ?? "w9";
+      return cwd ? { ...a, agent: "claude", cwd, workspace_id } : { ...a, workspace_id };
+    }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd, workspace_id: createdWorkspaceId }); } },
     pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
-    workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: "w9:p1" } }; } },
+    workspace: {
+      // `label` is passed to `workspace.create` by drovr's own `ManagedHerdrLifecycle.start()`
+      // (never to `agent.start`) — see this fake's own `creates` tracking array below.
+      create: async (p: any) => { createdCwd = p.cwd; creates.push(p); return { root_pane: { pane_id: `${createdWorkspaceId}:p1` } }; },
+      rename: async (p: any) => { renamed.push(p); return {}; },
+      reportMetadata: async (p: any) => { metadata.push(p); return {}; },
+    },
   };
-  return { client: client as any, started, closed };
+  return { client: client as any, started, closed, renamed, metadata, creates };
 }
 
 describe("agent name convention", () => {
@@ -1267,5 +1275,173 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
       const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
       expect(await herd.providerOf("KAN-783")).toBeNull();
     });
+  });
+});
+
+// FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): a spawned agent's
+// herdr workspace label is its short display id (`resolveDisplayLabels`,
+// src/rules/display-label.ts), collision-safe against every OTHER
+// currently-running agent — never the bare `spec.key` (this ticket's own
+// change), and the full agent key is preserved in herdr metadata.
+describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () => {
+  test("an ordinary rule-engine spawn labels its workspace \"<shortId> · <ruleId>\", not the bare key", async () => {
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
+    await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
+    expect(f.creates[0].label).toBe("FACTORY-51 · jira-work");
+  });
+
+  test("a legacy/bare key (no rule-engine encoding) still labels as itself — unchanged, pre-FACTORY-95 behaviour", async () => {
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
+    expect(f.creates[0].label).toBe("KAN-7");
+  });
+
+  // FACTORY-95 review fix (round 1): no two LIVE workspaces may ever share a
+  // label, in EITHER sort order — not just the case where the incoming key
+  // happens to sort after the running one. `resolveDisplayLabels`'s
+  // tie-break (the lexicographically smallest key of a colliding group)
+  // does not care which key is "new"; when the incoming key sorts BEFORE an
+  // already-running colliding key, the running workspace's OWN label must
+  // be fixed up too, right now — not left to share the incoming spawn's
+  // bare label until the next `relabelOwnedWorkspaces()` restart pass.
+  test("spawning a colliding key that sorts AFTER an already-running one: the new workspace is suffixed, the running one keeps its bare label (reasserted, not left stale)", async () => {
+    // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
+    const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+    const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    expect(incoming > running).toBe(true); // pins the ordering this test relies on
+    const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
+    expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    // `labelFor` unconditionally reasserts every OTHER member of the group's own
+    // correct label whenever the group has more than one member — cheap, idempotent,
+    // and never relies on knowing whether herdr's own stored value already agrees.
+    expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
+    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
+  });
+
+  test("spawning a colliding key that sorts BEFORE an already-running one: the new workspace gets the bare label AND the running workspace is relabeled to the suffix, so the two never share a label", async () => {
+    const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+    expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
+    const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
+    expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
+    // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
+    expect(f.renamed).toHaveLength(1);
+    expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
+    expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
+    // The one invariant that matters: no two live workspaces ever share a label.
+    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
+  });
+
+  test("a successful spawn preserves the full agent key in herdr metadata, keyed by the started workspace id", async () => {
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
+    await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
+    expect(f.metadata).toEqual([{ workspace_id: "w9", source: "butchr", tokens: { agentKey: key } }]);
+  });
+
+  test("a failed spawn reports no metadata at all", async () => {
+    const f = {
+      agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+      workspace: { create: async () => ({ root_pane: "wX:p1" }), reportMetadata: async (p: any) => { metadata.push(p); } },
+      pane: { close: async () => {} },
+    };
+    const metadata: any[] = [];
+    const herd = new HerdrHerd(f as any, "http://x/mcp", instant);
+    await expect(herd.spawn({ key: "KAN-9", issuetype: "Task", summary: "s", parent: null })).rejects.toThrow("boom");
+    expect(metadata).toEqual([]);
+  });
+});
+
+// FACTORY-95: relabelling already-running workspaces in place, without an
+// agent restart — `HerdrHerd.relabelOwnedWorkspaces`, today's only caller
+// being daemon startup (src/daemon/index.ts).
+describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in place)", () => {
+  test("renames every owned running workspace to its short display label and reports its full key as metadata", async () => {
+    const keyA = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
+    const keyB = encodeQueryAgentKey({ resourceProvider: "github-issue", ruleId: "triage" });
+    const f = fakeHerdr([
+      { pane_id: "p1", cwd: workspaceDirFor(keyA), workspace_id: "wA" },
+      { pane_id: "p2", cwd: workspaceDirFor(keyB), workspace_id: "wB" },
+    ]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.relabelOwnedWorkspaces();
+    const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
+    expect(renameFor("wA")).toBe("FACTORY-51 · jira-work");
+    expect(renameFor("wB")).toBe("triage");
+    const metadataFor = (workspaceId: string) => f.metadata.find((m) => m.workspace_id === workspaceId);
+    expect(metadataFor("wA")).toEqual({ workspace_id: "wA", source: "butchr", tokens: { agentKey: keyA } });
+    expect(metadataFor("wB")).toEqual({ workspace_id: "wB", source: "butchr", tokens: { agentKey: keyB } });
+  });
+
+  test("never touches a workspace whose pane cwd is NOT butchr's own (ownership proven via cwd, never via herdr's current label)", async () => {
+    const f = fakeHerdr([{ pane_id: "p1", cwd: "/home/someone/unrelated-project", workspace_id: "wX" }]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.relabelOwnedWorkspaces();
+    expect(f.renamed).toEqual([]);
+    expect(f.metadata).toEqual([]);
+  });
+
+  test("disambiguates a collision across two owned workspaces the same way spawn-time collision resolution would (same agent -> same label both ways)", async () => {
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const f = fakeHerdr([
+      { pane_id: "p1", cwd: workspaceDirFor(a), workspace_id: "wA" },
+      { pane_id: "p2", cwd: workspaceDirFor(b), workspace_id: "wB" },
+    ]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.relabelOwnedWorkspaces();
+    const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
+    const labels = [renameFor("wA"), renameFor("wB")];
+    expect(new Set(labels).size).toBe(2); // never shared
+    expect(labels).toContain("brooswit-factory:rinth · repos"); // one keeps the bare label
+    expect(labels.find((l) => l !== "brooswit-factory:rinth · repos")).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+  });
+
+  test("idempotent: calling it twice renames to the same labels both times", async () => {
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
+    const f = fakeHerdr([{ pane_id: "p1", cwd: workspaceDirFor(key), workspace_id: "wA" }]);
+    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+    await herd.relabelOwnedWorkspaces();
+    await herd.relabelOwnedWorkspaces();
+    expect(f.renamed.map((r) => r.label)).toEqual(["FACTORY-51 · jira-work", "FACTORY-51 · jira-work"]);
+  });
+
+  test("never throws when herdr itself is unreachable — logged and swallowed, like reap.ts's own detector", async () => {
+    const f = { agent: { list: async () => { throw new Error("herdr socket closed"); } }, workspace: {}, pane: {} };
+    const lines: string[] = [];
+    const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await expect(herd.relabelOwnedWorkspaces()).resolves.toBeUndefined();
+    expect(lines.some((l) => l.includes("WARNING: [relabel]"))).toBe(true);
+  });
+
+  test("one workspace's own rename failure never blocks the others", async () => {
+    const good = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-1" });
+    const bad = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-2" });
+    const renamed: any[] = [];
+    const f = {
+      agent: { list: async () => ({ agents: [
+        { pane_id: "p1", cwd: workspaceDirFor(good), workspace_id: "w-good" },
+        { pane_id: "p2", cwd: workspaceDirFor(bad), workspace_id: "w-bad" },
+      ] }) },
+      workspace: {
+        rename: async (p: any) => { if (p.workspace_id === "w-bad") throw new Error("rename rejected"); renamed.push(p); },
+        reportMetadata: async () => {},
+      },
+      pane: {},
+    };
+    const lines: string[] = [];
+    const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
+    await herd.relabelOwnedWorkspaces();
+    expect(renamed).toEqual([{ workspace_id: "w-good", label: "FACTORY-1 · jira-work" }]);
+    expect(lines.some((l) => l.includes(`WARNING: [relabel] ${bad}`))).toBe(true);
   });
 });
