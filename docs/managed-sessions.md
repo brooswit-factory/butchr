@@ -827,6 +827,12 @@ What each kind of mismatch actually does:
 
 ## Working directory wiring
 
+For a Windows host running Butchr inside WSL specifically, see
+[`docs/windows-wsl-agent-guide.md`](windows-wsl-agent-guide.md) for how to
+choose `workingDirectory` between the WSL home and `/mnt/c/...`, and how to
+translate paths between them — this section covers the mechanism, not that
+host-specific choice.
+
 `SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) carries a
 definition's own `workingDirectory` through the shared spawn machinery —
 but, as of PR #394's THIRD review round, it is **not** the spawned
