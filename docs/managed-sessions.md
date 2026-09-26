@@ -56,7 +56,7 @@ takes effect on restart, not live), like every other provider's query.
 | `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
-| `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). Stored only — the Rocket.Chat account lifecycle itself is unimplemented for every provider today, managed sessions included. |
+| `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
 | `frozen` | no | `false` default. A frozen definition is a VALID one that simply runs no agent — see "Eligible = valid, not frozen" below. |
 | `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
@@ -640,23 +640,37 @@ succeeded. A failure at any step before that final rename leaves the
 source untouched and best-effort cleans up its own temp file; no partial
 file is ever left under the destination's own final name.
 
-### Post-archive hook seam (not yet wired to S4)
+### Post-archive hook seam (present, deliberately left a no-op — release is wired daemon-side instead, BUTCHR-460)
 
 `archiveSessionDefinition` accepts an injected `onArchived({ agentKey,
-path })` async hook, default no-op, run once after a successful move.
-This exists for S4 (BUTCHR-395), which owns Rocket.Chat account cleanup
-(`releaseAccount(agentKey, "archive")`, `src/accounts/manager.ts`) — but
-that code lives on the BUTCHR-395 story branch, not `main`, so **this
-ticket wires the seam and imports nothing from that branch**; a follow-up
-task wires the real hook in once BUTCHR-395 merges. A hook failure is
-reported loudly (the CLI prints it to stderr, and the core function
-surfaces it as `ArchiveResult.hookError`) but **never undoes the move** —
-by the time the hook runs, the definition is already out of the eligible
-set, and rolling the file back on a hook failure would silently re-enter
-it into the eligible set for a reason (account cleanup) unrelated to
-whether the move itself was valid. The hook is never called on a refusal,
-and `unarchive` has no hook parameter at all (this seam is one-directional:
-S4's cleanup is an archive-time concern).
+path })` async hook, default no-op, run once after a successful move. This
+was built for S4 (BUTCHR-395), which owns Rocket.Chat account cleanup
+(`releaseAccount(agentKey, "archive")`, `src/accounts/manager.ts`) — that
+release is now wired and real (`docs/rocketchat-accounts.md`'s "Archive
+release" section), but NOT through this hook: `butchr session archive` is a
+credential-free, daemon-free CLI process with no Rocket.Chat client, account
+store, or Nexus manifest publisher to call `releaseAccount` with (see that
+same doc section for the full reasoning — a CLI-side release would mean a
+second process racing the daemon's own store writes, and a manifest that
+stays stale until some unrelated later batch republished it). The real
+release happens daemon-side: the managed-sessions loop notices the
+definition disappeared from `desired` (this move already causes that, on the
+daemon's own next poll) and, before falling through to an ordinary `"stop"`
+release, checks whether a same-basename file now exists in the archive
+directory — a positive check upgrades the release to reason `"archive"`.
+This ALSO covers an archive done by hand-moving the file, which no CLI-side
+hook could ever see. `onArchived` therefore stays a documented no-op here —
+this section is the "not yet wired" note's successor, not a removal of the
+seam itself: a future caller (a hypothetical MCP archive tool, symmetric to
+`freeze_session`/`unfreeze_session`) still gets the hook for free, same as
+before. A hook failure is reported loudly (the CLI prints it to stderr, and
+the core function surfaces it as `ArchiveResult.hookError`) but **never
+undoes the move** — by the time the hook runs, the definition is already out
+of the eligible set, and rolling the file back on a hook failure would
+silently re-enter it into the eligible set for a reason (account cleanup)
+unrelated to whether the move itself was valid. The hook is never called on
+a refusal, and `unarchive` has no hook parameter at all (this seam is
+one-directional: S4's cleanup is an archive-time concern).
 
 ### `list --archived`
 
@@ -881,14 +895,13 @@ permission wiring is out of scope for this ticket.
   wiring are real (see "`mcpServers`: additional MCP server bindings"
   above); a Codex agent still only ever gets a bound server's tools, never
   push, matching S4's own "Codex steering is a later story" scoping.
-- **The Rocket.Chat account lifecycle** (`account: "temporary"|"permanent"`)
-  — accepted and stored, like every `Rule`'s own `account` field, but
-  implements nothing; the account lifecycle itself is a later story for
-  every provider alike. `archiveSessionDefinition`'s `onArchived` hook
-  (BUTCHR-455, see "Post-archive hook seam" above) is the wiring POINT for
-  this — S4's `releaseAccount(agentKey, "archive")` — but is not itself
-  wired to it yet: that hook still defaults to a no-op until a follow-up
-  task connects it, once BUTCHR-395 (S4) reaches `main`.
+- ~~The Rocket.Chat account lifecycle (`account: "temporary"|"permanent"`)~~
+  **BUTCHR-460: now wired**, same as every other provider — see the
+  `account` field's own table row above and `docs/rocketchat-accounts.md`'s
+  "Wiring"/"Archive release" sections for the full design, including WHY
+  the release path runs daemon-side rather than through
+  `archiveSessionDefinition`'s `onArchived` hook (see "Post-archive hook
+  seam" above, which now describes what actually happens).
 - **A definition's own `execution` mode is not acted on.** The built-in
   rule always runs `swarm` (one agent per eligible definition file); a
   definition's `execution` field reuses `Rule`'s type/validation and is

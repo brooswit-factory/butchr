@@ -27,7 +27,7 @@
 import { readFile } from "node:fs/promises";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, resourceMatches, unitAgentKey, type ExecutionUnit } from "./execution.js";
-import type { AgentRole, Rule } from "./rules.js";
+import type { AccountPolicy, AgentRole, Rule } from "./rules.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
@@ -259,6 +259,18 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * fail-safe default it already documents for "cannot be resolved".
    */
   roles?: Map<string, AgentRole>;
+  /**
+   * BUTCHR-460 — same seam as `roles` immediately above, one field over:
+   * `accountPolicyOf` (src/daemon/index.ts) is RULE-level only, same reason
+   * `roleOfAgent` was before BUTCHR-408's `roles` map — the built-in
+   * managed-sessions rule is ONE shared `Rule` (fixed `account: "none"`) for
+   * every heterogeneous definition file, so a per-file `account` policy
+   * needs this same rebuilt-every-poll map, keyed identically. Before this
+   * loop's first poll completes, an already-running managed-session agent
+   * has no entry yet and `accountPolicyOf` falls back to its own existing
+   * fail-safe `"none"` default — same brief, documented window `roles` has.
+   */
+  accountPolicies?: Map<string, AccountPolicy>;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
@@ -274,6 +286,10 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
         if (deps.roles) {
           deps.roles.clear();
           for (const m of matches) deps.roles.set(m.agentKey, m.definition.role);
+        }
+        if (deps.accountPolicies) {
+          deps.accountPolicies.clear();
+          for (const m of matches) deps.accountPolicies.set(m.agentKey, m.definition.account);
         }
         return groupExecutionUnits([deps.rule], matches);
       },
