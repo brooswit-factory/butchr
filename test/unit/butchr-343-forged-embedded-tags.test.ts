@@ -32,7 +32,7 @@ function stubOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
     createIssue: unused, setPriority: unused, assign: unused, correctText: unused, createPage: unused,
     getPage: unused, updatePage: unused, searchPages: unused, listSpaces: unused,
     getProjectProperty: unused, getProjectPropertyOrNull: unused, getRemoteLink: unused, upsertRemoteLink: unused,
-    getChildPages: unused, getPageLabels: unused, createPageWithLabel: unused, addLabels: unused, removeLabels: unused,
+    addLabels: unused, removeLabels: unused,
     deleteIssue: unused, commentOnPage: unused, getPageComments: unused, searchProjects: unused, getMyself: unused,
     setProjectProperty: unused, getPageVersions: unused, getIssueComments: unused,
     ...overrides,
