@@ -8,11 +8,13 @@
  */
 import { readFile } from "node:fs/promises";
 import type { Stop } from "@brooswit/sundry";
+import type { JiraIssue } from "../atlassian/types.js";
 import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import type { Herd } from "../agents/herd.js";
 import { filesystemNudge } from "../agents/change-nudge.js";
 import { realPathExists, wireManagedSessionArchiveRelease } from "../agents/managed-session-account-release.js";
 import { resourceKeyOf } from "../agents/workspace.js";
+import type { LinkedEventingDeps } from "../jira-watch/linked-eventing.js";
 import type { FilesystemQuery } from "../resources/filesystem-query.js";
 import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { sessionDefinitionsPath, type SessionDefinitionsEnv } from "../resources/session-definition.js";
@@ -73,6 +75,20 @@ export interface ManagedSessionsLoopDeps {
   onPollSuccess?: () => void;
   /** Each failed poll (after it is logged), for /health. */
   onError?: (error: unknown) => void;
+  /**
+   * FACTORY-53/FACTORY-71 — linked-change eventing for a managed session
+   * that opts in via its own `linkedEventingProjects` field. All five are
+   * threaded straight through to `ManagedSessionResourceDeps`
+   * (src/rules/session-definition-type.ts) unchanged; see that interface's
+   * own doc comments for what each does. `searchIssues` and `notify` must
+   * BOTH be present for a linked-eventing tick to ever run; any subset
+   * omitted, existing behaviour (no linked-eventing at all) is unchanged.
+   */
+  searchIssues?: (jql: string) => Promise<JiraIssue[]>;
+  notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
+  comments?: LinkedEventingDeps["comments"];
+  linkStore?: LinkedEventingDeps["linkStore"];
+  isFrozen?: (id: string) => Promise<boolean>;
 }
 
 /**
@@ -89,6 +105,11 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     log: deps.log,
     ...(deps.roles ? { roles: deps.roles } : {}),
     ...(deps.accountPolicies ? { accountPolicies: deps.accountPolicies } : {}),
+    ...(deps.searchIssues ? { searchIssues: deps.searchIssues } : {}),
+    ...(deps.notify ? { notify: deps.notify } : {}),
+    ...(deps.comments ? { comments: deps.comments } : {}),
+    ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
+    ...(deps.isFrozen ? { isFrozen: deps.isFrozen } : {}),
   });
   const account = deps.account
     ? wireManagedSessionArchiveRelease(deps.account, { exists: deps.exists ?? realPathExists, ...(deps.env ? { env: deps.env } : {}), ruleId: rule.id })
