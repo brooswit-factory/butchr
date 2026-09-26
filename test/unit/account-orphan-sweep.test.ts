@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createAccountOrphanSweep } from "../../src/agents/account-orphan-sweep.js";
 import { createAccountManager } from "../../src/accounts/manager.js";
-import { fakeStore, fakeRcClient } from "../fixtures/rocketchat-fakes.js";
+import { fakeStore, fakeRcClient, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
 import type { AccountRecord } from "../../src/accounts/manager.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
 
@@ -19,7 +19,7 @@ function tickingNow(start: number) {
 function harness(records: AccountRecord[], residentSequence: Array<readonly string[] | Error>) {
   const store = fakeStore(records);
   const { client, calls } = fakeRcClient();
-  const manager = createAccountManager({ client, store, userCapThreshold: 45, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" });
+  const manager = createAccountManager(baseAccountManagerDeps({ client, store, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" }));
   const released: string[] = [];
   const logs: string[] = [];
   let call = 0;
@@ -140,7 +140,7 @@ describe("createAccountOrphanSweep (BUTCHR-412 review round 1, blocking finding 
     // Force reconcileOrphans to reject by making the underlying store.list() throw.
     const brokenStore = { ...store, list: async () => { throw new Error("corrupt store"); } };
     const { client } = fakeRcClient();
-    const manager = createAccountManager({ client, store: brokenStore, userCapThreshold: 45 });
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store: brokenStore }));
     const logs: string[] = [];
     const sweep = createAccountOrphanSweep({
       now: () => NOW,
@@ -156,7 +156,7 @@ describe("createAccountOrphanSweep (BUTCHR-412 review round 1, blocking finding 
   test("a release failure is logged and swallowed, never thrown out of sweep()", async () => {
     const store = fakeStore([{ agentKey: AGENT, rcUserId: "u1", username: rcUsernameFor(AGENT), policy: "temporary", createdAt: OLD_ENOUGH }]);
     const { client } = fakeRcClient();
-    const manager = createAccountManager({ client, store, userCapThreshold: 45 });
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store }));
     const logs: string[] = [];
     const failingSweep = createAccountOrphanSweep({
       now: () => NOW,
@@ -182,5 +182,40 @@ describe("createAccountOrphanSweep (BUTCHR-412 review round 1, blocking finding 
     await sweep.sweep();
     await sweep.sweep();
     expect(released).toEqual([AGENT]);
+  });
+
+  // BUTCHR-412 (batch provisioning): this sweep runs on its own timer,
+  // independent of any reconcileNow poll, so a release it makes needs its
+  // own flush.
+  test("publishBatch (when wired) is called exactly once per sweep round, only after every release this round settled", async () => {
+    const store = fakeStore([{ agentKey: AGENT, rcUserId: "u1", username: rcUsernameFor(AGENT), policy: "temporary", createdAt: OLD_ENOUGH }]);
+    const { client } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store }));
+    let publishCalls = 0;
+    const sweep = createAccountOrphanSweep({
+      now: () => NOW,
+      reconcileOrphans: (agentExists) => manager.reconcileOrphans(agentExists),
+      residentIssues: async () => [],
+      release: async (agentKey, reason) => { await manager.releaseAccount(agentKey, reason); },
+      publishBatch: async () => { publishCalls++; },
+    });
+    await sweep.sweep(); // observation 1
+    expect(publishCalls).toBe(1);
+    await sweep.sweep(); // observation 2 — release actually happens this round
+    expect(publishCalls).toBe(2); // still exactly once PER ROUND, not once per release
+  });
+
+  test("omitting publishBatch is a documented no-op — a sweep that releases something still never throws", async () => {
+    const store = fakeStore([{ agentKey: AGENT, rcUserId: "u1", username: rcUsernameFor(AGENT), policy: "temporary", createdAt: OLD_ENOUGH }]);
+    const { client } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store }));
+    const sweep = createAccountOrphanSweep({
+      now: () => NOW,
+      reconcileOrphans: (agentExists) => manager.reconcileOrphans(agentExists),
+      residentIssues: async () => [],
+      release: async (agentKey, reason) => { await manager.releaseAccount(agentKey, reason); },
+    });
+    await sweep.sweep();
+    await expect(sweep.sweep()).resolves.toBeUndefined();
   });
 });

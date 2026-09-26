@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
-  EXECUTION_MODES, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS, RULE_ID_MAX, rulesPath,
+  EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS,
+  RULE_ID_MAX, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
 import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
+import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
+import { ownsFilesystemAgent } from "../../src/rules/filesystem-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
 
@@ -129,6 +132,62 @@ describe("parseRules", () => {
   });
 });
 
+describe("unresolvedRelationships", () => {
+  const rule = (over: Partial<Rule>): Rule => ({ id: "x", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over });
+
+  test("childRule naming an absent id is reported", () => {
+    expect(unresolvedRelationships([rule({ id: "task", relationships: { childRule: "missing" } })]))
+      .toEqual([{ ruleId: "task", field: "childRule", missingTarget: "missing" }]);
+  });
+
+  test("inwardConnectionRules naming an absent id is reported, separately from childRule", () => {
+    expect(unresolvedRelationships([rule({ id: "task", relationships: { inwardConnectionRules: ["missing"] } })]))
+      .toEqual([{ ruleId: "task", field: "inwardConnectionRules", missingTarget: "missing" }]);
+  });
+
+  test("of a list where one entry resolves and one doesn't, only the missing one is reported", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { inwardConnectionRules: ["story", "gone"] } }),
+      rule({ id: "story" }),
+    ])).toEqual([{ ruleId: "task", field: "inwardConnectionRules", missingTarget: "gone" }]);
+  });
+
+  test("negative: every relationship resolves to an id present in the same rules -> nothing reported", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { childRule: "story", inwardConnectionRules: ["story"] } }),
+      rule({ id: "story" }),
+    ])).toEqual([]);
+  });
+
+  test("a disabled SOURCE rule is not reported, even with a dangling reference", () => {
+    expect(unresolvedRelationships([rule({ id: "task", enabled: false, relationships: { childRule: "missing" } })])).toEqual([]);
+  });
+
+  test("a disabled TARGET still counts as resolved — this check is existence-only, never enabled-ness", () => {
+    expect(unresolvedRelationships([
+      rule({ id: "task", relationships: { childRule: "story" } }),
+      rule({ id: "story", enabled: false }),
+    ])).toEqual([]);
+  });
+
+  test("only jira-work rules are reported — a jira-idea rule's inwardConnectionRules is out of scope here", () => {
+    expect(unresolvedRelationships([rule({ id: "idea", resourceProvider: "jira-idea", relationships: { inwardConnectionRules: ["missing"] } })])).toEqual([]);
+  });
+
+  test("a rule with no relationships at all is skipped, not an error", () => {
+    expect(unresolvedRelationships([rule({ id: "task" })])).toEqual([]);
+  });
+});
+
+describe("formatUnresolvedRelationshipWarning", () => {
+  test("names the source rule, the field, and the missing target", () => {
+    const msg = formatUnresolvedRelationshipWarning({ ruleId: "task", field: "childRule", missingTarget: "story" });
+    expect(msg).toContain('rule "task"');
+    expect(msg).toContain("childRule");
+    expect(msg).toContain('"story"');
+  });
+});
+
 describe("execution and account (BUTCHR-397)", () => {
   test("both default when absent: swarm/none, exactly today's behaviour", () => {
     const [r] = parseRules({ rules: [minimal] });
@@ -137,7 +196,7 @@ describe("execution and account (BUTCHR-397)", () => {
   test("every valid value is accepted for every provider — the two fields are provider-generic", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       for (const execution of EXECUTION_MODES) for (const account of ACCOUNT_POLICIES) {
-        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, execution, account }] });
         expect(r).toMatchObject({ resourceProvider, execution, account });
       }
@@ -191,7 +250,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
   test("both values are accepted for every provider, independent of execution and account", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
       for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
         expect(r).toMatchObject({ resourceProvider, role, execution });
@@ -202,6 +261,179 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
     expect(() => parseRules({ rules: [{ ...minimal, role: "manager" }] }, "f.json")).toThrow("f.json: rules[0].role must be one of worker, sentinel");
   });
   test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
+describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a rule)", () => {
+  const mud = { name: "mud", type: "http", url: "https://mud.example/mcp", channel: true };
+
+  test("absent means none — existing rules load unchanged with no new field", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.mcpServers).toBeUndefined();
+    expect(Object.keys(r!)).not.toContain("mcpServers");
+  });
+
+  test("a bound server is accepted, normalised, and independent of execution/account — the Candlestix mud-bridge shape (account: none, no RC)", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, account: "none", mcpServers: [mud] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", channel: true }]);
+    expect(r!.account).toBe("none");
+  });
+
+  test("a channel: false binding is accepted the same way — tools yes, channel no", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, channel: false }] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", channel: false }]);
+  });
+
+  test("two channel servers on one rule both parse", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [mud, { name: "second", type: "http", url: "https://second.example/mcp", channel: true }] }] });
+    expect(r!.mcpServers).toHaveLength(2);
+  });
+
+  test("headersEnvVar names an env var; never a literal header value", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, headersEnvVar: " MUD_MCP_HEADERS " }] }] });
+    expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", headersEnvVar: "MUD_MCP_HEADERS", channel: true }]);
+  });
+
+  // BUTCHR-412 (BUTCHR-391 comment 24007): the per-AGENT, non-secret literal
+  // header extension — a Rocket.Chat/rocketr binding names the header the
+  // agent's own account name is injected into, never the value itself.
+  describe("accountHeader (BUTCHR-412)", () => {
+    test("accepted and normalised (trimmed)", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: " x-rocketr-account " }] }] });
+      expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", accountHeader: "x-rocketr-account", channel: true }]);
+    });
+
+    test("combines with headersEnvVar on the SAME binding", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, headersEnvVar: "MUD_MCP_HEADERS", accountHeader: "x-rocketr-account" }] }] });
+      expect(r!.mcpServers).toEqual([{ name: "mud", type: "http", url: "https://mud.example/mcp", headersEnvVar: "MUD_MCP_HEADERS", accountHeader: "x-rocketr-account", channel: true }]);
+    });
+
+    test("rejects an invalid HTTP header name", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: "not a header name" }] }] }, "f.json"))
+        .toThrow("f.json: rules[0].mcpServers[0].accountHeader must be a valid HTTP header name");
+    });
+
+    test("rejects an empty accountHeader", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: "" }] }] }, "f.json"))
+        .toThrow("rules[0].mcpServers[0].accountHeader must be a valid HTTP header name");
+    });
+
+    test("absent means none — existing headersEnvVar-only bindings load unchanged", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [mud] }] });
+      expect(Object.keys(r!.mcpServers![0]!)).not.toContain("accountHeader");
+    });
+  });
+
+  test("an empty array is rejected the same way agentPreferences is", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [] }] }, "f.json")).toThrow("f.json: rules[0].mcpServers must be a non-empty array");
+  });
+
+  test("reports every malformed binding problem at once", () => {
+    let msg = "";
+    try {
+      parseRules({ rules: [{ ...minimal, mcpServers: [
+        "nope",
+        { name: "", type: "http", url: "not a url", channel: "yes" },
+        { name: "bad name!", type: "stdio", url: "ftp://x", channel: true, extra: 1 },
+        { name: "butchr", type: "http", url: "https://x", channel: true },
+        { name: "dup", type: "http", url: "https://x", channel: true },
+        { name: "dup", type: "http", url: "https://y", channel: false },
+        { name: "envbad", type: "http", url: "https://x", channel: true, headersEnvVar: "lower_case" },
+      ] }] }, "f.json");
+    } catch (e) { msg = (e as Error).message; }
+    for (const part of [
+      "rules[0].mcpServers[0] must be an object",
+      "rules[0].mcpServers[1].name must be a non-empty name",
+      "rules[0].mcpServers[1].url must be an absolute http(s) URL",
+      "rules[0].mcpServers[1].channel must be a boolean",
+      "rules[0].mcpServers[2].name must be a non-empty name",
+      "rules[0].mcpServers[2].type must be one of http",
+      "rules[0].mcpServers[2].url must be an absolute http(s) URL",
+      'rules[0].mcpServers[2] has unknown field "extra"',
+      'rules[0].mcpServers[3].name "butchr" is reserved',
+      'rules[0].mcpServers[5].name "dup" is a duplicate',
+      "rules[0].mcpServers[6].headersEnvVar must be an env var name",
+    ]) expect(msg).toContain(`f.json: ${part}`);
+  });
+
+  test("url must be absolute http(s) — a relative path or another scheme is rejected", () => {
+    for (const url of ["/relative", "ftp://x.example", "not-a-url", ""]) {
+      expect(() => parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, url }] }] })).toThrow(".mcpServers[0].url must be an absolute http(s) URL");
+    }
+  });
+
+  test("mcpServers is rejected on the same terms as every other unknown-field-checked block", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, mcpServers: "nope" }] }, "f.json")).toThrow("f.json: rules[0].mcpServers must be a non-empty array");
+  });
+});
+
+describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default inert)", () => {
+  test("all five are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.linkedEventing).toBeUndefined();
+    expect(r!.linkedPollIntervalMs).toBeUndefined();
+    expect(r!.maxLinkedItems).toBeUndefined();
+    expect(r!.maxLinkedTurnsPerHour).toBeUndefined();
+    expect(r!.linkedRemoteLinks).toBeUndefined();
+  });
+
+  test("each is accepted when valid, independent of the others and of every other field", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true }] });
+    expect(r).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true });
+  });
+
+  test("linkedEventing: false is accepted and kept (distinct from omitted, even though both are inert today)", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: false }] });
+    expect(r!.linkedEventing).toBe(false);
+  });
+
+  // BUTCHR-436: linkedRemoteLinks is NOT inert — a resource whose rule sets
+  // it fetches remote links (src/jira-watch/linked-eventing.ts) — but its
+  // OWN validation/plumbing is exactly this same additive, independently-
+  // optional shape, so it is tested alongside its four siblings here rather
+  // than in a separate describe block.
+  test("linkedRemoteLinks: false is accepted and kept, distinct from omitted", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedRemoteLinks: false }] });
+    expect(r!.linkedRemoteLinks).toBe(false);
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true }] });
+      expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true });
+    }
+  });
+
+  test("rejects a non-boolean linkedEventing or linkedRemoteLinks", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, linkedEventing: "yes" }] }, "f.json")).toThrow("f.json: rules[0].linkedEventing must be a boolean");
+    expect(() => parseRules({ rules: [{ ...minimal, linkedRemoteLinks: "yes" }] }, "f.json")).toThrow("f.json: rules[0].linkedRemoteLinks must be a boolean");
+  });
+
+  test("rejects a non-positive-integer for each numeric knob, naming the rule and field", () => {
+    for (const field of ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const) {
+      for (const bad of [0, -1, 1.5, "5", null]) {
+        expect(() => parseRules({ rules: [{ ...minimal, [field]: bad }] }, "f.json")).toThrow(`f.json: rules[0].${field} must be a positive integer`);
+      }
+    }
+  });
+
+  test("all five bad at once are all reported together", () => {
+    let msg = "";
+    try { parseRules({ rules: [{ ...minimal, linkedEventing: 1, linkedPollIntervalMs: 0, maxLinkedItems: -5, maxLinkedTurnsPerHour: "many", linkedRemoteLinks: "no" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toContain("f.json: rules[0].linkedEventing must be a boolean");
+    expect(msg).toContain("f.json: rules[0].linkedPollIntervalMs must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedItems must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].maxLinkedTurnsPerHour must be a positive integer");
+    expect(msg).toContain("f.json: rules[0].linkedRemoteLinks must be a boolean");
+  });
+
+  test("a pre-change rules document (none of the five set) loads unchanged — no existing rules file needs to opt in", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
@@ -301,7 +533,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -325,5 +557,7 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "jira-work": case "jira-idea": return "BUTCHR-12";
     case "github-issue": return "owner/repo#12";
     case "zendesk-ticket": return "acme#12";
+    case "jira-project": return "BUTCHR";
+    case "filesystem": return "/tmp/example.txt";
   }
 }

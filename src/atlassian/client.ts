@@ -1,3 +1,4 @@
+import { parseProjectQuery, type JiraProject } from '../resources/jira-project.js';
 import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink, JiraRemoteLinkInput } from "./types.js";
 
 /** One issue read by key, with its description flattened to plain text. */
@@ -34,7 +35,7 @@ export class AtlassianHttpError extends Error {
   }
 }
 
-const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks,project";
+const SEARCH_FIELDS = "summary,status,issuetype,assignee,parent,updated,labels,issuelinks,project,description";
 
 /**
  * A thin Jira Cloud REST client using classic-token Basic auth. `fetch` is
@@ -51,6 +52,28 @@ export class AtlassianClient {
     private readonly log: (line: string) => void = () => {},
   ) {
     this.auth = "Basic " + Buffer.from(`${email}:${token}`).toString("base64");
+  }
+
+  async searchProjects(query: string): Promise<JiraProject[]> {
+    const q = parseProjectQuery(query);
+    const lead = q.leadAccountId === 'me' ? (await this.get('/rest/api/3/myself')).accountId : q.leadAccountId;
+    if (q.leadAccountId && !lead) throw new Error('Cannot determine project lead identity');
+    const out: JiraProject[] = [];
+    for (let offset = 0; ;) {
+      const params = new URLSearchParams({startAt:String(offset),maxResults:'100',expand:'lead',status:'live'});
+      if (q.query) params.set('query', q.query);
+      const page = await this.get('/rest/api/3/project/search?' + params);
+      if (!Array.isArray(page.values) || typeof page.total !== 'number') throw new Error('Invalid project search page');
+      for (const p of page.values) {
+        if (typeof p.id !== 'string' || typeof p.key !== 'string' || typeof p.name !== 'string') throw new Error('Invalid project record');
+        if (lead && typeof p.lead?.accountId !== 'string') throw new Error('Project search omitted lead identity');
+        if (p.archived || (lead && p.lead.accountId !== lead) || (q.keys && !q.keys.includes(p.key))) continue;
+        out.push({id:p.id,key:p.key,name:p.name,...(p.lead?.accountId ? {leadAccountId:p.lead.accountId}:{}),...(typeof p.archived==='boolean'?{archived:p.archived}:{})});
+      }
+      offset += page.values.length;
+      if (page.isLast === true || offset >= page.total) return out;
+      if (!page.values.length) throw new Error('Incomplete project search pagination');
+    }
   }
 
   private async get(path: string): Promise<any> {
@@ -158,7 +181,10 @@ export class AtlassianClient {
    * so callers that act on a specific key must compare `key` themselves.
    */
   async issue(issueKey: string): Promise<JiraIssueDetail> {
-    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${SEARCH_FIELDS},description`);
+    // BUTCHR-431: `SEARCH_FIELDS` already carries "description" (added so
+    // `search()`/`searchAll()` can feed it to link discovery) — no need to
+    // append it a second time here.
+    const body = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${SEARCH_FIELDS}`);
     if (!body || typeof body.key !== "string") throw new Error(`Jira issue read for ${issueKey} returned an unexpected body`);
     return { ...mapIssue(body), description: adfToText(body.fields?.description) };
   }
@@ -204,6 +230,38 @@ export class AtlassianClient {
       if (url === null || title === null || (typeof l.id !== "number" && typeof l.id !== "string")) return [];
       return [{ id: String(l.id), globalId: str(l.globalId), relationship: str(l.relationship), url, title, applicationType: str(l.application?.type) }];
     });
+  }
+
+  /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): a Confluence page's CURRENT
+   * `version.number`, for the Confluence link poller
+   * (src/jira-watch/external-poll.ts) — same call shape `get_doc`/
+   * `confluence_get_page` already use (`GET /wiki/api/v2/pages/{id}`, no
+   * `body-format` requested, so this never pulls the page's body content the
+   * way `get_doc` does), over the SAME site + Basic-auth credential this
+   * class already carries for Jira (Atlassian Cloud accepts one credential
+   * across both REST APIs for one account). Never throws on a 404/403 — a
+   * genuinely unreadable/gone page is a fact the poller needs to classify as
+   * "unreadable", not an exception to catch a second time — so this resolves
+   * a tagged union instead, the same "one not-found shape, not a try/catch
+   * each" discipline `getRemoteLink` (src/tools/atlassian.ts) already
+   * documents for itself. Any OTHER non-2xx (5xx, a timeout the fetchImpl
+   * itself rejects with) resolves `{ok:false, transient:true}` — a fact the
+   * poller must retry, never report as unreadable (mirrors this story's own
+   * Jira-kind precedent: a search failure must never read as "every link
+   * unreadable").
+   */
+  async confluencePageVersion(pageId: string): Promise<{ ok: true; version: number } | { ok: false; transient: false; httpStatus: number } | { ok: false; transient: true }> {
+    try {
+      const body = await this.get(`/wiki/api/v2/pages/${encodeURIComponent(pageId)}`);
+      const version = body?.version?.number;
+      if (typeof version !== "number") throw new Error(`Confluence page ${pageId} read returned no version.number`);
+      return { ok: true, version };
+    } catch (e) {
+      if (e instanceof AtlassianHttpError && (e.status === 404 || e.status === 403)) return { ok: false, transient: false, httpStatus: e.status };
+      if (e instanceof AtlassianHttpError) return { ok: false, transient: true };
+      throw e;
+    }
   }
 
   /**
@@ -281,5 +339,12 @@ function mapIssue(i: any): JiraIssue {
     // when absent from the response, never a fabricated `[]` standing in
     // for "I checked and there are none" (see JiraIssue's own doc comment).
     ...(f.issuelinks !== undefined ? { issuelinks: parseIssueLinks(f.issuelinks) } : {}),
+    // BUTCHR-431: same discipline — only set when the response carried a
+    // "description" field at all (search()/searchAll() always ask for it
+    // now; a raw fixture that predates this field simply omits it). Jira
+    // returns ADF or an explicit `null` for an empty description; `adfToText`
+    // tolerates both (and any other odd shape) without throwing, so a null
+    // description maps to `""`, never a crash.
+    ...(f.description !== undefined ? { description: adfToText(f.description) } : {}),
   };
 }

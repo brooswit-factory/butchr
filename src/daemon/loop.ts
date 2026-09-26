@@ -472,6 +472,8 @@ export interface ReconcileOptions {
  * case is untouched by this reversal.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const frozen = new Set(herd.frozen ? await herd.frozen([...desired.keys()]) : []);
+  desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
   const failures: ReconcileFailure[] = [];
   // BUTCHR-412: drain any release `AccountLifecycleHooks.release` could not
   // complete on an earlier poll (the manager call itself threw, after
@@ -494,6 +496,9 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
   const running = await herd.runningIssues();
+  if(herd.frozen) for(const id of await herd.frozen(running)) frozen.add(id);
+  desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
+  opts = {...opts, atRest:[...(opts.atRest ?? [])].filter(id=>!frozen.has(id))};
   // BUTCHR-305/BUTCHR-238: audible-only pinned-active detection, run BEFORE
   // `atRest` is ever touched and independent of it — `desired ∩ running` is
   // the shape `planReconcile` never puts in `spawn`/`stop`/`respawn` (see
@@ -770,6 +775,15 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // try/catch here is ever removed or narrowed, this call site becomes
   // exactly that same hazard and should be wrapped too.
   if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
+  // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): called ONCE,
+  // at the very end of this poll, after every `ensure`/`release` call above
+  // (spawn loop, stop loop, respawn loop) has run — never per-id. A poll
+  // that provisioned or released nothing this round is a no-op here (see
+  // `AccountLifecycleHooks.publishBatch`'s own doc comment, `../agents/account-lifecycle.ts`,
+  // for the dirty-tracking that makes that true); one that did publishes the
+  // Nexus hand-off manifest exactly once, regardless of how many ids this
+  // poll's spawn/respawn/stop loops touched.
+  if (opts.account) await opts.account.publishBatch();
 }
 
 /**
@@ -855,6 +869,7 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
   // `Herd` ever gains a member, where the spread would have silently kept
   // dropping it.
   return {
+    ...(herd.frozen ? {frozen:(ids:readonly string[])=>herd.frozen!(ids.filter(ownsId))} : {}),
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
     staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
     // BUTCHR-334: `origin` threaded straight through, unchanged — dropping it

@@ -144,6 +144,27 @@ describe("HerdrHerd", () => {
     await new HerdrHerd(f2.client, "u", instant).spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
     expect(f2.started.length).toBe(0);
   });
+
+  test("PR #394 review fix (round 3): a managed-session spec (cwd set) spawns cleanly end-to-end through the REAL spawn path (HerdrHerd + Drovr's ManagedHerdrLifecycle, not a stub) — kickoff names both the working directory AND the brief, and the launched process itself stays at the ordinary bookkeeping workspace", async () => {
+    // Round 2 shipped a version where agentLaunchConfig's own `cwd` was `spec.cwd` directly. That
+    // broke Drovr's ManagedHerdrLifecycle invariant (its `cwd` is FIXED to workspaceDirFor(issue) —
+    // see herd.ts's own `lifecycle()` — and it throws "Launch does not match selected provider and
+    // workspace" the moment the prepared launch's cwd differs) — caught here, through the real spawn
+    // path, not by the narrower buildWorkspace/agentLaunchConfig-only tests the PR review itself ran.
+    const f = fakeHerdr([]);
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    await herd.spawn({
+      key, issuetype: "managed-session", summary: "s", parent: null,
+      brief: "Keep this repo's docs and dependency versions current.",
+      cwd: "/repo/some-project",
+      agents: [{ harness: "claude", model: "sonnet" }],
+    });
+    expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
+    expect(f.started[0].args[0]).toContain("/repo/some-project");
+    expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
+    expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
+  });
   test("paneFor resolves the current pane, or null when not running", async () => {
     const f = fakeHerdr([{ name: "butchr-kan-5", pane_id: "w1:p5" }]);
     const herd = new HerdrHerd(f.client, "u");
@@ -574,6 +595,16 @@ describe("nudge", () => {
       read: async () => ({ read: { text: "no refusal here" } }),
     },
   });
+  test("Codex channel followups do not wait for Claude quota observation", async () => {
+    const prompts: any[] = []; const fixture = base(prompts);
+    const list = fixture.agent.list; const prompt = fixture.agent.prompt;
+    fixture.agent.list = async () => ({agents:(await list()).agents.map(a=>({...a,agent:"codex",agent_status:"working"}))});
+    fixture.agent.prompt = async p => ({agent:{...(await prompt(p)).agent,agent:"codex",agent_status:"working"}});
+    const waits:number[]=[];
+    const herd = new HerdrHerd(fixture as any,"http://x/mcp",async ms=>{waits.push(ms);});
+    expect(await herd.nudge("KAN-7","stop current work")).toEqual({delivered:true});
+    expect(prompts).toHaveLength(1);expect(waits).toEqual([]);
+  });
   test("delivers a prompt; still idle after the wait → submits the stranded composer", async () => {
     const prompts: any[] = []; const keys: any[] = [];
     const herd = new HerdrHerd(base(prompts, { keys }) as any, "http://x/mcp", instant);
@@ -719,6 +750,56 @@ describe("staleIssues", () => {
     expect(await herd.staleIssues()).toEqual([]);
   });
 
+  test("BUTCHR-408: a managed-session agent's real bound channel server (persisted at build time, workspaceMcpServers) is honoured, not flagged stale for lacking a flag it never should have had in the first place", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Built via the SAME spawnArgs a real spawn (and staleIssues' own
+      // "expected" reconstruction) uses, so the channel-flag joining format
+      // is guaranteed consistent rather than hand-guessed here.
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", mcpServers }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("BUTCHR-408: a running agent missing its definition's bound channel flag IS flagged stale — proves workspaceMcpServers is actually consulted, not just harmlessly absent", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mcp-drift-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true });
+      const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
+      // Missing the server:mud-bridge channel flag the definition now calls for.
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("server:mud-bridge");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("no cwd reported for the agent -> unknown, not stale (never even calls pane.process_info)", async () => {
     const { client, calls } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd: null }], { "w1:p1": ok([{ pid: 1, argv: ["claude", "--resume", "x"], name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
@@ -792,6 +873,85 @@ describe("staleIssues", () => {
     );
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
+  });
+});
+
+// BUTCHR-411: staleIssues() rebuilds its expected argv from key/provider/
+// disabledMcpServers/resource alone (see herd.ts's own doc comment on
+// spawnArgs' callers) — a rule's mcpServers bindings are invisible to that
+// reconstruction unless the caller supplies `mcpBindingsOf`, the 9th
+// constructor param. These tests are the ticket's own DoD line: a running
+// agent whose argv matches the bound argv is not flagged, and one launched
+// WITHOUT the binding is.
+describe("staleIssues — mcpBindingsOf / MCP server bindings (BUTCHR-411)", () => {
+  const instant = () => Promise.resolve();
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+  const issue = "jira-work:mud-rule:BUTCHR-1";
+  const cwd = workspaceDirFor(issue);
+
+  function fakeHerdrWithCwd(agents: Array<{ name?: string; pane_id: string; cwd?: string | null }>, argv: string[]) {
+    const client = {
+      agent: { list: async () => ({ agents }) },
+      pane: { processInfo: async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv, name: "claude" }] } }) },
+    };
+    return client as any;
+  }
+
+  test("mcpBindingsOf omitted (default): a rule's binding is invisible, so an agent launched WITH it never reads as stale either — no fleet-wide respawn for callers that don't wire this seam", async () => {
+    const argv = ["claude", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1", mcpServers: [mud] }, cwd)];
+    const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("mcpBindingsOf resolves the rule's bindings: an agent launched WITH the bound channel is not stale", async () => {
+    const argv = ["claude", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1", mcpServers: [mud] }, cwd)];
+    const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, () => [mud]);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  test("mcpBindingsOf resolves the rule's bindings: an agent launched WITHOUT the binding IS stale, naming the missing channel", async () => {
+    const argv = ["claude", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1" }, cwd)]; // no binding at launch
+    const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, () => [mud]);
+    const stale = await herd.staleIssues();
+    expect(stale.length).toBe(1);
+    expect(stale[0]!.issue).toBe(issue);
+    expect(stale[0]!.reason).toContain("--dangerously-load-development-channels server:mud");
+  });
+
+  test("a rule that never sets mcpServers (mcpBindingsOf returns undefined for it) is unaffected — byte-identical expected argv to pre-BUTCHR-411", async () => {
+    const argv = ["claude", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1" }, cwd)];
+    const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
+    const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, () => undefined);
+    expect(await herd.staleIssues()).toEqual([]);
+  });
+
+  // Review finding, PR #387: a bound server's secret header value must
+  // never surface in a StaleAgent's `reason` or `observedArgv` — both are
+  // logged verbatim ([reconcile] .../onRespawn in src/daemon/index.ts) and
+  // shown on the Jira ticket. Proven end to end through staleIssues() for a
+  // Codex agent, since that's the only provider whose argv could ever have
+  // carried a header value at all (Claude's argv never does).
+  test("a Codex agent's stale reason/observedArgv never contain a bound server's secret header value, even when the daemon's own env holds one", async () => {
+    process.env.BUTCHR_TEST_HERD_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE" });
+    try {
+      const secretMud = { ...mud, headersEnvVar: "BUTCHR_TEST_HERD_MUD_HEADERS" };
+      const codexArgvWithoutBinding = ["codex", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1" }, cwd, { provider: "codex", disabledMcpServers: [] })];
+      const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], codexArgvWithoutBinding);
+      // Fake process reports as codex via its argv/name shape used elsewhere in this file's fakes.
+      client.pane.processInfo = async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv: codexArgvWithoutBinding, name: "codex" }] } });
+      // disabledMcpServers: [] (not undefined) so staleIssues() doesn't take
+      // the separate "Codex MCP isolation inventory missing" early-out and
+      // actually reaches the expected-vs-observed comparison this test needs.
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] }, undefined, undefined, undefined, () => [secretMud]);
+      const stale = await herd.staleIssues();
+      expect(stale.length).toBe(1);
+      expect(stale[0]!.reason).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(stale[0]!.observedArgv.join(" ")).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(stale[0]!.reason).not.toContain("Authorization");
+    } finally { delete process.env.BUTCHR_TEST_HERD_MUD_HEADERS; }
   });
 });
 

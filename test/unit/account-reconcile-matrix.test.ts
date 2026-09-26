@@ -18,7 +18,8 @@ import { createAccountManager } from "../../src/accounts/manager.js";
 import { createAccountLifecycle } from "../../src/agents/account-lifecycle.js";
 import { encodeAgentKey, encodeQueryAgentKey, decodeAnyAgentKey } from "../../src/rules/agent-key.js";
 import type { AccountPolicy, ExecutionMode } from "../../src/rules/rules.js";
-import { fakeStore, fakeRcClient } from "../fixtures/rocketchat-fakes.js";
+import { fakeStore, fakeRcClient, fakeManifestPublisher, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
+import { rcUsernameFor } from "../../src/accounts/identity.js";
 import type { Herd, SpawnSpec } from "../../src/agents/herd.js";
 
 interface TestRule { id: string; execution: ExecutionMode; account: AccountPolicy }
@@ -53,13 +54,13 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
   test("every cell independently: temporary provisions on spawn and unprovisions on stop; permanent provisions and is retained; none never touches RC — regardless of execution mode", async () => {
     const store = fakeStore();
     const { client, calls } = fakeRcClient();
-    const manager = createAccountManager({ client, store, userCapThreshold: 45, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" });
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store, now: () => "2026-09-24T00:00:00.000Z", randomPassword: () => "fixed" }));
     const policyOf = (id: string): AccountPolicy => {
       const decoded = decodeAnyAgentKey(id);
       const rule = RULES.find((r) => r.id === decoded?.ruleId);
       return rule?.account ?? "none";
     };
-    const account = createAccountLifecycle({ manager, policyOf, url: "https://chat.example.com" });
+    const account = createAccountLifecycle({ manager, policyOf, manifestPublisher: fakeManifestPublisher() });
     const herd = fakeHerd();
     const specFor = (rule: TestRule): SpawnSpec => ({ key: keyFor(rule), issuetype: "task", summary: rule.id, parent: null });
 
@@ -76,9 +77,9 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       const spawnedSpec = herd.spawnedSpecs.get(key);
       expect(spawnedSpec).toBeDefined();
       if (rule.account === "none") {
-        expect(spawnedSpec!.rocketchat).toBeUndefined();
+        expect(spawnedSpec!.rocketchatAccount).toBeUndefined();
       } else {
-        expect(spawnedSpec!.rocketchat).toMatchObject({ url: "https://chat.example.com" });
+        expect(spawnedSpec!.rocketchatAccount).toBe(rcUsernameFor(key));
         expect(await store.get(key)).toMatchObject({ policy: rule.account });
       }
     }
@@ -110,8 +111,8 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       const key = keyFor(rule);
       const store = fakeStore();
       const { client, calls } = fakeRcClient();
-      const manager = createAccountManager({ client, store, userCapThreshold: 45 });
-      const account = createAccountLifecycle({ manager, policyOf: () => "temporary", url: "https://chat.example.com" });
+      const manager = createAccountManager(baseAccountManagerDeps({ client, store }));
+      const account = createAccountLifecycle({ manager, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher() });
       const herd: Herd = {
         async runningIssues() { return [key]; },
         async staleIssues() { return [{ issue: key, reason: "stale argv", observedArgv: [] }]; },

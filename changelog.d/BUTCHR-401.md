@@ -1,0 +1,4 @@
+bump: patch
+
+### Changed
+- **README "Rules file" section's capacity-naming paragraph no longer says to adopt `workers`/`sentinels` naming once BUTCHR-392 lands (BUTCHR-401, story BUTCHR-399).** The owner clarified that the default capacity role is `worker`, so a ticket-worker rule (`docs/rules.example.json`) needs no capacity flag at all — only an always-on agent is ever flagged `sentinel`. The prior wording implied ticket-worker rules should eventually carry a capacity field of their own; `docs/rules.example.json` was already correct (no capacity field on any of its five rules), only the README's framing was wrong. Corrected by BUTCHR-414 once BUTCHR-392 merged: the concrete field is `role: "worker" | "sentinel"` (`src/rules/rules.ts`), default `"worker"`, and the README now names it exactly.

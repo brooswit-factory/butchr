@@ -1,9 +1,12 @@
+import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events';
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
+import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import type { McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -40,6 +43,7 @@ export interface StaleAgent {
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
 export interface Herd {
+  frozen?(ids: readonly string[]): Promise<ReadonlySet<string>>;
   /** Issues that currently have a butchr-managed agent running. */
   runningIssues(): Promise<string[]>;
   /**
@@ -173,6 +177,13 @@ export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
+  private readonly freezeWatches = new Map<string, ReturnType<typeof watchInstanceFreeze>>();
+  async frozen(ids: readonly string[]): Promise<ReadonlySet<string>> {
+    const frozen = new Set<string>();
+    for(const id of ids) { try { if((await instanceFreezeStore.read(`butchr:${id}`)).frozen) frozen.add(id); }
+      catch(e) { frozen.add(id); this.log?.(`Freeze state unreadable for ${id}: ${String(e)}`); } }
+    return frozen;
+  }
   private readonly lifecycles = new Map<string, ManagedHerdrLifecycle>();
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
@@ -197,6 +208,21 @@ export class HerdrHerd implements Herd {
     private readonly prepareWorkspace: (options: { provider: ManagedAgentProvider; cwd: string; unattended: true }) => unknown | Promise<unknown> = prepareFactoryWorkspace,
     /** Monotonic readiness clock; paired with the injected wait in tests. */
     private readonly monotonicNow: () => number = () => performance.now(),
+    /**
+     * BUTCHR-411 — the design decision the ticket calls out by name: how
+     * `staleIssues()` sees a rule's MCP server bindings without HerdrHerd
+     * itself holding any rule state (it is one flat instance shared by every
+     * rule/provider — see src/daemon/index.ts). The caller resolves an
+     * issue id to its rule's current `mcpServers` (or `undefined`); this
+     * mirrors `roleOfAgent` in src/daemon/index.ts, the same
+     * decode-then-look-up-by-ruleId shape that field already uses for a
+     * different rule-level property. Optional and defaulting to "no
+     * bindings for anyone" is exactly what keeps a rule that never opts into
+     * `mcpServers` producing byte-identical expected argv to before this
+     * ticket — the deploy-day fleet-wide-respawn hazard the ticket's own
+     * survey flagged stays closed.
+     */
+    private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -358,7 +384,23 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // BUTCHR-408/BUTCHR-411: two independent sources feed a spec's
+      // mcpServers, kept apart by POPULATION so neither shadows the other's
+      // staleness signal. A managed-session agent (filesystem provider,
+      // MANAGED_SESSIONS_RULE_ID, BUTCHR-408) has no entry in `rules` at
+      // all, so `mcpBindingsOf` could only ever answer "no bindings" for
+      // it — its real mcpServers is whatever buildWorkspace last persisted
+      // for this workspace (workspaceMcpServers, src/agents/workspace.ts,
+      // the SAME read-the-workspace-back shape externalMcpServers below
+      // already uses). A rule-engine agent's mcpServers (BUTCHR-411), by
+      // contrast, must come from the RULE's CURRENT config, not a persisted
+      // file, or an admin removing a binding from rules.json would never
+      // read as stale — see the constructor's own doc comment on
+      // mcpBindingsOf for why this lookup exists instead of caching the
+      // original spawn's SpawnSpec.
+      const isManagedSession = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID;
+      const mcpServers = isManagedSession ? (workspaceMcpServers(cwd) ?? []) : this.mcpBindingsOf?.(issue);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -454,11 +496,19 @@ export class HerdrHerd implements Herd {
   }
 
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
+    await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
+    if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label: spec.key,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
-      kickoff: kickoffFor,
+      // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
+      // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
+      // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
+      // its real working directory, then follow its definition's own
+      // brief — the launched process itself still starts at the ordinary
+      // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
+      kickoff: (provider) => kickoffFor(provider, spec),
       prepare: async provider => {
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
@@ -495,6 +545,7 @@ export class HerdrHerd implements Herd {
   async stop(issue: string): Promise<void> {
     await this.exclusive(issue, async () => {
       await this.lifecycle(issue).stop();
+      this.freezeWatches.get(issue)?.close();this.freezeWatches.delete(issue);
       this.refused.delete(issue);
     });
   }
@@ -656,8 +707,12 @@ export class HerdrHerd implements Herd {
     return this.exclusive(issue, async () => {
       const lifecycle = this.lifecycle(issue);
       try {
+        await instanceFreezeStore.assertRunnable(`butchr:${issue}`);
         const prompted = await lifecycle.prompt(text);
         if (!prompted || prompted.agent_status === "blocked") return { delivered: false };
+        // Codex accepts follow-ups in its native input path. Do not hold the
+        // channel relay behind Claude's delayed quota-dialog observation.
+        if (prompted.agent === "codex") return { delivered: true };
       } catch { return { delivered: false }; }
       await this.wait(NUDGE_VERIFY_MS);
       const current = await lifecycle.resolveCurrent().catch(() => undefined);

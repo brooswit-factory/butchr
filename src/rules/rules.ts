@@ -22,9 +22,11 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
+import { filesystemQueryProblems } from "../resources/filesystem-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
+import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
@@ -76,6 +78,85 @@ export type AgentRole = (typeof AGENT_ROLES)[number];
 
 export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
 
+/** MCP server binding shapes a rule/definition can bind to, beyond butchr's own. Only `http` today. */
+export const MCP_SERVER_BINDING_TYPES = ["http"] as const;
+export type McpServerBindingType = (typeof MCP_SERVER_BINDING_TYPES)[number];
+
+/** The name every launch already reserves for butchr's own MCP server; no binding may reuse it. */
+export const RESERVED_MCP_SERVER_NAME = "butchr";
+
+/**
+ * One additional MCP server a rule's agent(s) (or a managed-session
+ * definition's agent, BUTCHR-408) may connect to, beyond butchr's own
+ * (BUTCHR-411/CNDLX-45; the type was ported to main's session-definition
+ * work from this story's BUTCHR-395 branch, PR #387 merge commit 5520722,
+ * per the epic's sequencing decision on BUTCHR-408 — S4 had not landed this
+ * on `main` yet when the session-definition work needed it, so that was
+ * source material copied verbatim, not a competing shape; this sync is
+ * where S4's own `Rule.mcpServers` lands on `main` and the two uses
+ * converge on this one type). `channel: true` means Claude also receives
+ * this server's push notifications — one more
+ * `--dangerously-load-development-channels=server:<name>` entry, the exact
+ * mechanism `server:butchr` already relies on (src/agents/argv.ts) — so
+ * event-driven delivery from a non-Rocket.Chat MCP server (e.g. a MUD
+ * bridge) needs no polling substitute. `channel: false` still reaches
+ * `mcp.json`/the Codex `mcpServers` config (tools work) but is never added
+ * to the channel flag.
+ *
+ * `headersEnvVar`, not `headers`: header VALUES (often bearer tokens) are
+ * never written into a rules file or a managed-session definition file
+ * itself — only the NAME of an env var on THIS DAEMON's own process that
+ * holds a JSON object of header values, resolved at launch time
+ * (`resolveMcpServerHeaders`, src/agents/workspace.ts). A binding with no
+ * `headersEnvVar`, or one naming an unset/malformed var, simply connects
+ * with no extra headers (logged once, value never logged). A resolved
+ * header value is written ONLY into a Claude workspace's `mcp.json`
+ * (permission-tightened when it carries one — see that function's own doc
+ * comment) — NEVER into Codex argv, which is a real process command line
+ * other local users can read (review finding, PR #387): `boundCodexServers`
+ * (src/agents/argv.ts) never resolves headers at all, so a Codex agent gets
+ * a bound server's tools with no extra headers, regardless of
+ * `headersEnvVar` (BUTCHR-408's own manifest doc calls this out for its
+ * Codex example definitions too).
+ *
+ * Deliberately independent of `Rule.account`/`Rule.execution`: a binding (and
+ * its `channel` flag) is wired into launch argv from this field alone, never
+ * from account policy, so an `account: "none"` rule (no Rocket.Chat account
+ * — e.g. Candlestix's MUD players) still gets full event-driven channel
+ * delivery for a bound server.
+ *
+ * `accountHeader`, not a second binding mechanism (BUTCHR-412, BUTCHR-391
+ * comment 24007): the corrected Rocket.Chat credential design has an agent's
+ * MCP binding carry only its OWN (non-secret) account name, in a header —
+ * `x-rocketr-account` for rocketr — which `headersEnvVar` above cannot
+ * express: that resolves ONE static value per RULE from the daemon's own
+ * env, while an account name is per-AGENT (this rule's every agent gets a
+ * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
+ * value, which is deliberately kept out of Codex argv entirely — see that
+ * field's own doc comment; `accountHeader`'s value has no such restriction
+ * in principle, but no caller resolves it for Codex today either — narrowing
+ * that is S6's, BUTCHR-419/420). Set to the literal header NAME (e.g.
+ * `"x-rocketr-account"`); the VALUE is resolved at launch time from
+ * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
+ * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
+ * `ensureAccount` actually provisioned this agent's account, never written
+ * into a rules file or a managed-session definition itself. A binding with
+ * `accountHeader` set but no `spec.rocketchatAccount` (this rule's `account`
+ * policy is `"none"`, or `ensureAccount` hasn't run for this spec) simply
+ * omits the header — same "absent means no extra header" discipline
+ * `headersEnvVar` already has. Combines with `headersEnvVar` on the SAME
+ * binding if both are set (rare, but not forbidden): the two are resolved
+ * independently and merged.
+ */
+export interface McpServerBinding {
+  name: string;
+  type: McpServerBindingType;
+  url: string;
+  headersEnvVar?: string;
+  accountHeader?: string;
+  channel: boolean;
+}
+
 /**
  * Relationships name other rules; how a link is realised in the resource
  * system (a Jira issue link, a backlink field) is the provider adapter's
@@ -104,7 +185,13 @@ export interface Rule {
    * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
    * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
    * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
-   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts).
+   * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
+   * a JSON object (not JQL) for `jira-project` — `{ leadAccountId?, keys?,
+   * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts); a
+   * small JSON object for `filesystem` (root, kind, name pattern, recursion
+   * depth, an optional content/metadata predicate — see
+   * src/resources/filesystem-query.ts and docs/filesystem.md for the syntax
+   * decision).
    */
   query: string;
   /** Brief the agent is given; opaque to validation beyond being non-empty. */
@@ -118,15 +205,84 @@ export interface Rule {
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
+  /** Additional MCP servers this rule's agent(s) may connect to, beyond butchr's own (BUTCHR-411). Absent means none — today's behaviour exactly. */
+  mcpServers?: McpServerBinding[];
+  /** Operator-owned MCP config path (`jira-project` rules only); `{{KEY}}` expands to the resource key. Absolute path required. */
+  mcpConfigFile?: string;
+  /**
+   * BUTCHR-429 (epic BUTCHR-421, story 1/4): four additive, independently
+   * optional knobs for "linked-change eventing" — a change to anything
+   * LINKED to this rule's resources (a Jira issue link, parent Epic, remote
+   * link, Confluence page, GitHub issue/PR, or general webpage) becoming a
+   * turn-causing update, same as a change to the resource itself. Absent
+   * means exactly today's behaviour: this story's own link DISCOVERY still
+   * runs and logs (`[linked-discovery]`, src/jira-watch/linked-discovery-log.ts)
+   * regardless of these knobs — it is a cost-free pure parse of data a
+   * rule's poll already fetched — but nothing downstream of discovery exists
+   * yet (that is stories 2/3), so no knob here changes any agent's behaviour
+   * in this story. Kept as four independently optional fields, mirroring
+   * `agentPreferences`/`relationships` above rather than `execution`/
+   * `account`/`role`'s always-defaulted style, because "absent" and "false"
+   * are the same no-op here — there is no live default value to normalise
+   * onto every rule for a mechanism that does not run yet.
+   */
+  /** Opt in to linked-change eventing for this rule's agents. Absent/false: today's behaviour, exactly (see this field's own group comment above). Reserved for stories 2/3 to actually gate on; this story validates and plumbs it only. */
+  linkedEventing?: boolean;
+  /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
+  linkedPollIntervalMs?: number;
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  maxLinkedItems?: number;
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  maxLinkedTurnsPerHour?: number;
+  /**
+   * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's
+   * matched resources' Jira REMOTE links as an additional linked-Jira-item
+   * source, on top of issuelinks/parent/description (all free — they ride
+   * the existing search fields). Unlike those, a remote link costs one
+   * genuinely separate API call per resource
+   * (`AtlassianClient#remoteLinks`), so it is gated behind this own knob
+   * rather than folded into `linkedEventing` — a resource whose rule leaves
+   * this absent/false makes ZERO remote-link calls. Only meaningful when
+   * `linkedEventing` is also true; absent/false is today's behaviour
+   * exactly (no remote-link fetch, same as before this field existed).
+   */
+  linkedRemoteLinks?: boolean;
+  /**
+   * BUTCHR-437 (epic BUTCHR-421, story 3/4): opt in to LIVE POLLING of
+   * Confluence / GitHub-issue / GitHub-PR / webpage links found via
+   * DESCRIPTION-TEXT PARSING (`descriptionItems`, src/resources/linked-discovery.ts)
+   * — as opposed to a Jira remote link, which this knob does not gate (a
+   * non-Jira remote link's live polling is out of scope for this story; see
+   * `jiraKindLinkedItems`'s own doc comment, src/jira-watch/linked-eventing.ts).
+   * Absent/false: today's behaviour exactly — `linkedEventing` alone still
+   * enables Jira-kind polling, but none of these three pollers ever run, even
+   * for a resource whose description names a Confluence page or GitHub
+   * issue/PR. Only meaningful when `linkedEventing` is also true; mirrors
+   * `linkedRemoteLinks`'s own independently-optional, cost-gated shape (each
+   * of the three pollers this knob gates costs a genuinely separate network
+   * call per distinct linked target per tick, never free the way `issuelinks`/
+   * `parent`/description-derived Jira keys already are).
+   */
+  linkedDescriptionLinks?: boolean;
 }
 
-const RULE_FIELDS = new Set(["id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships"]);
+const RULE_FIELDS = new Set([
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
+]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
+const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
+/** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+/** RFC 7230 `field-name` (token charset), lowercased-or-not — an HTTP header name. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
+const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
 const unknownFields = (raw: Record<string, unknown>, allowed: Set<string>, at: string, errors: string[]): void => {
   for (const k of Object.keys(raw)) if (!allowed.has(k)) errors.push(`${at} has unknown field "${k}"`);
 };
@@ -150,6 +306,49 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     if (seen.has(identity)) errors.push(`${pat} repeats an earlier preference`);
     seen.add(identity);
     return pref;
+  });
+}
+
+const isHttpUrl = (v: unknown): boolean => {
+  if (typeof v !== "string" || v.trim() === "") return false;
+  try { const u = new URL(v.trim()); return u.protocol === "http:" || u.protocol === "https:"; }
+  catch { return false; }
+};
+
+/**
+ * Same validator shape as every other `parse*` helper in this file: collects
+ * every problem into `errors` and returns `undefined` when any exist (the
+ * caller never uses a partially-valid result). `at` names the field for
+ * error text (e.g. `rules[2].mcpServers` or a session definition's own
+ * `<path>.mcpServers`) — this function is deliberately caller/document
+ * agnostic so both `Rule` and a session definition (BUTCHR-408) can share it
+ * without either owning the other's shape.
+ */
+export function parseMcpServers(raw: unknown, at: string, errors: string[]): McpServerBinding[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) { errors.push(`${at} must be a non-empty array`); return undefined; }
+  const seen = new Set<string>();
+  return raw.map((s, j) => {
+    const pat = `${at}[${j}]`;
+    if (!isObject(s)) { errors.push(`${pat} must be an object`); return undefined as never; }
+    unknownFields(s, MCP_SERVER_BINDING_FIELDS, pat, errors);
+    const name = typeof s.name === "string" ? s.name.trim() : "";
+    if (!nonEmpty(s.name) || !MCP_SERVER_NAME_RE.test(name)) errors.push(`${pat}.name must be a non-empty name of letters, digits, "_" or "-"`);
+    else if (name === RESERVED_MCP_SERVER_NAME) errors.push(`${pat}.name "${RESERVED_MCP_SERVER_NAME}" is reserved for butchr's own server`);
+    else if (seen.has(name)) errors.push(`${pat}.name "${name}" is a duplicate`);
+    else seen.add(name);
+    if (!oneOf(MCP_SERVER_BINDING_TYPES, s.type)) errors.push(`${pat}.type must be one of ${MCP_SERVER_BINDING_TYPES.join(", ")}`);
+    if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
+    const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
+    if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
+    const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
+    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be a valid HTTP header name`);
+    if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
+    return {
+      name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
+      ...(headersEnvVar ? { headersEnvVar } : {}),
+      ...(accountHeader ? { accountHeader } : {}),
+      channel: s.channel as boolean,
+    };
   });
 }
 
@@ -198,6 +397,10 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
+    else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
+    if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
     // `execution` and `account` are independent of each other (any of the 9 combinations
@@ -207,10 +410,22 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
     // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
+    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
+    if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
+    if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
+    if (maxLinkedItems !== undefined && !isPositiveInt(maxLinkedItems)) errors.push(`${at}.maxLinkedItems must be a positive integer`);
+    if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
+    // BUTCHR-436: fifth linked-eventing knob, same independently-optional house style.
+    if (linkedRemoteLinks !== undefined && typeof linkedRemoteLinks !== "boolean") errors.push(`${at}.linkedRemoteLinks must be a boolean`);
+    // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
+    const { linkedDescriptionLinks } = raw;
+    if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
+    const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -222,6 +437,14 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
+      ...(mcpServers ? { mcpServers } : {}),
+      ...(typeof raw.mcpConfigFile === "string" ? { mcpConfigFile: raw.mcpConfigFile } : {}),
+      ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
+      ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
+      ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
+      ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
+      ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
+      ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {
@@ -267,6 +490,63 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }
   return { path, origin: "file", rules: parseRules(doc, path) };
+}
+
+/** One enabled jira-work rule's relationship field naming a rule id this daemon has no rule for. */
+export interface UnresolvedRelationship {
+  ruleId: string;
+  field: "childRule" | "inwardConnectionRules";
+  missingTarget: string;
+}
+
+/**
+ * BUTCHR-405: enabled `jira-work` rules whose `relationships.childRule` or
+ * `relationships.inwardConnectionRules` name a rule id absent from `rules`
+ * itself. Purely existence-based — it does not ask whether the missing id is
+ * staffed, observed, or enabled elsewhere (that is a different question, and
+ * this check must keep working regardless of how or whether that question is
+ * ever answered). Both the startup warning and the `/health` field call this
+ * one function so they can never disagree.
+ *
+ * `parseRules` above already refuses to load a file where a relationship
+ * targets an id missing from THAT SAME file, so this can never fire for
+ * rules that came from a single `loadRules` call today. It stays a real,
+ * independent check — not dead code — because it takes any `Rule[]`, not
+ * only ones `parseRules` validated: a rule set assembled some other way
+ * (built by hand in a test, or combined across sources) is exactly where a
+ * dangling reference can reach here uncaught.
+ *
+ * `childRule` here is checked for existence only, same as
+ * `inwardConnectionRules`, but the two differ in what a real gap would mean:
+ * `inwardConnectionRules` still gates the live `Relates` routing edge
+ * (`relatedForRules` in src/rules/resource-type.ts), so a dangling id there
+ * is a real broken connection. `childRule` does not — PR #372 (BUTCHR-388,
+ * already in main) dropped the `childRule` gate on `Implements` routing: a
+ * boss now hears its implementer on the `Implements` link alone, across
+ * daemons, with no rules-file wiring. So a dangling `childRule` id found
+ * here would not break any live routing; the field is kept (parsed,
+ * validated, and reported by this check) as a legacy/documentation-shaped
+ * value only — "what a child created by this rule's agent is meant to
+ * match" — with no effect on which agent hears what.
+ */
+export function unresolvedRelationships(rules: readonly Rule[]): UnresolvedRelationship[] {
+  const ids = new Set(rules.map((r) => r.id));
+  const out: UnresolvedRelationship[] = [];
+  for (const rule of rules) {
+    if (!rule.enabled || rule.resourceProvider !== "jira-work") continue;
+    const rel = rule.relationships;
+    if (!rel) continue;
+    if (rel.childRule !== undefined && !ids.has(rel.childRule)) out.push({ ruleId: rule.id, field: "childRule", missingTarget: rel.childRule });
+    for (const target of rel.inwardConnectionRules ?? []) {
+      if (!ids.has(target)) out.push({ ruleId: rule.id, field: "inwardConnectionRules", missingTarget: target });
+    }
+  }
+  return out;
+}
+
+/** Startup log line for one `unresolvedRelationships` entry. */
+export function formatUnresolvedRelationshipWarning(u: UnresolvedRelationship): string {
+  return `WARNING: jira-work rule "${u.ruleId}" relationships.${u.field} names rule "${u.missingTarget}", which is not present in this daemon's own rules file; no edge is created — fix the id, or confirm "${u.missingTarget}" is staffed by a different daemon`;
 }
 
 export {

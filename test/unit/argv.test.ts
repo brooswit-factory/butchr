@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentStartParams, spawnArgs, checkArgv, providerOrder } from "../../src/agents/argv.js";
+import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder } from "../../src/agents/argv.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
 
 const spec = { key: "KAN-783", issuetype: "Task", summary: "s", parent: null };
@@ -28,6 +28,64 @@ describe("spawnArgs", () => {
       // "server:x" value could be swallowed as a user turn.
       "--dangerously-load-development-channels=server:butchr",
     ]);
+  });
+
+  test("PR #394 review fix (round 3): a spec with cwd set gets a kickoff that names its own working directory AND its own brief — both vendors — never the bare \"follow your CLAUDE.md/AGENTS.md\", which would be ambiguous about where the agent should actually work", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
+    const claudeArgs = spawnArgs(cwdSpec, "/w/KAN-783");
+    expect(claudeArgs[0]).toContain("/repo/some-project");
+    expect(claudeArgs[0]).toContain("Keep this repo's docs current.");
+    expect(claudeArgs[0]).not.toContain("CLAUDE.md");
+    const codexArgs = spawnArgs(cwdSpec, "/w/KAN-783", { provider: "codex" });
+    expect(codexArgs[0]).toContain("/repo/some-project");
+    expect(codexArgs[0]).toContain("Keep this repo's docs current.");
+    expect(codexArgs[0]).not.toContain("AGENTS.md");
+  });
+
+  test("PR #394 review fix (round 3): a spec with cwd set is STILL launched with its process cwd at the ordinary bookkeeping directory, never at spec.cwd — see SpawnSpec.cwd's own doc comment for why (Drovr's launch.cwd===workspace.cwd invariant, and runningIssues()'s agentIdOfWorkspacePath-based residency)", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
+    const claude = agentLaunchConfig(cwdSpec, "/w/KAN-783", "pane", "worker", { provider: "claude" });
+    expect(claude.cwd).toBe("/w/KAN-783");
+    expect(claude.cwd).not.toBe("/repo/some-project");
+    const codex = agentLaunchConfig(cwdSpec, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(codex.cwd).toBe("/w/KAN-783");
+  });
+
+  test("PR #394 review fix (round 2/3): a spec WITHOUT cwd is byte-for-byte unchanged — kickoff stays \"follow your CLAUDE.md\"/\"follow your AGENTS.md\" even when brief is set", () => {
+    const briefedSpec = { ...spec, brief: "Some rule-engine brief text." };
+    expect(spawnArgs(briefedSpec, "/w/KAN-783")[0]).toBe("follow your CLAUDE.md");
+    expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe("follow your AGENTS.md");
+  });
+
+  test("BUTCHR-408 (McsServerBinding ported from S4): a channel:true bound server adds its own development-channels flag alongside server:butchr; channel:false does not", () => {
+    const bound = [
+      { name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true },
+      { name: "quiet-tools", type: "http" as const, url: "https://quiet.internal/mcp", channel: false },
+    ];
+    const args = spawnArgs({ ...spec, mcpServers: bound }, "/w/KAN-783");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).toContain("--dangerously-load-development-channels=server:mud-bridge");
+    expect(args.some((a) => a.includes("server:quiet-tools"))).toBe(false);
+  });
+
+  test("BUTCHR-408: a bound server reaches Codex as an MCP tool with NEVER a header, even when headersEnvVar names a real secret — a Codex process's argv is world-readable via ps/proc", () => {
+    const before = process.env.MUD_BRIDGE_HEADERS;
+    process.env.MUD_BRIDGE_HEADERS = JSON.stringify({ Authorization: "Bearer super-secret-token" });
+    try {
+      const bound = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", headersEnvVar: "MUD_BRIDGE_HEADERS", channel: true }];
+      const args = spawnArgs({ ...spec, mcpServers: bound }, "/w/KAN-783", { provider: "codex" });
+      expect(args.join(" ")).toContain("mud-bridge");
+      expect(args.join(" ")).not.toContain("super-secret-token");
+      expect(args.join(" ")).not.toContain("Authorization");
+      // Codex has no development-channel concept at all — a bound server reaches it as a tool only, never push.
+      expect(args.some((a) => a.includes("--dangerously-load-development-channels"))).toBe(false);
+    } finally {
+      if (before === undefined) delete process.env.MUD_BRIDGE_HEADERS; else process.env.MUD_BRIDGE_HEADERS = before;
+    }
+  });
+
+  test("BUTCHR-408: no mcpServers is byte-for-byte unchanged (today's behaviour exactly)", () => {
+    expect(spawnArgs(spec, "/w/KAN-783")).toEqual(spawnArgs({ ...spec, mcpServers: [] }, "/w/KAN-783"));
   });
 
   test("--effort sits adjacent to --model, before the variadic flags", () => {
@@ -92,5 +150,92 @@ describe("checkArgv", () => {
     const check = checkArgv(expected, observed);
     expect(check.ok).toBe(false);
     if (!check.ok) expect(check.reason).toBe("argv lacks --mcp-config /w/KAN-783/mcp.json");
+  });
+});
+
+// BUTCHR-411: a rule binds any MCP channel server; `server:butchr` remains
+// bound exactly as today, and a bound server's own `channel` flag decides
+// whether it also joins the (variadic) channel flag.
+describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("a rule with no mcpServers produces byte-identical argv to before — the deploy-day no-op case", () => {
+    expect(spawnArgs(spec, "/w/KAN-783")).toEqual(spawnArgs({ ...spec, mcpServers: [] }, "/w/KAN-783"));
+  });
+
+  test("a bound channel server appends its own --dangerously-load-development-channels flag, kickoff still first", () => {
+    const args = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
+    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).toContain("--dangerously-load-development-channels=server:mud");
+    // server:butchr's own flag precedes the bound one — order follows spec.mcpServers, butchr always first.
+    expect(args.indexOf("--dangerously-load-development-channels=server:butchr")).toBeLessThan(args.indexOf("--dangerously-load-development-channels=server:mud"));
+  });
+
+  test("two channel servers both appear", () => {
+    const second = { name: "second", type: "http" as const, url: "https://second.example/mcp", channel: true };
+    const args = spawnArgs({ ...spec, mcpServers: [mud, second] }, "/w/KAN-783");
+    for (const flag of ["--dangerously-load-development-channels=server:butchr", "--dangerously-load-development-channels=server:mud", "--dangerously-load-development-channels=server:second"]) expect(args).toContain(flag);
+  });
+
+  test("channel: false reaches mcp.json (see workspace.test.ts) but never the channel flag", () => {
+    const args = spawnArgs({ ...spec, mcpServers: [{ ...mud, channel: false }] }, "/w/KAN-783");
+    expect(args).toContain("--dangerously-load-development-channels=server:butchr");
+    expect(args).not.toContain("--dangerously-load-development-channels=server:mud");
+    expect(args.filter((a) => a.startsWith("--dangerously-load-development-channels"))).toHaveLength(1);
+  });
+
+  test("a Claude rule bound to a second channel server produces argv the pre-BUTCHR-411 checkArgv still accepts as itself, and a running agent launched WITHOUT the binding reads as stale against it", () => {
+    const withBinding = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
+    const withoutBinding = spawnArgs(spec, "/w/KAN-783");
+    expect(checkArgv(withBinding, withBinding)).toEqual({ ok: true });
+    const check = checkArgv(withBinding, withoutBinding);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.reason).toContain("--dangerously-load-development-channels server:mud");
+  });
+
+  test("codex gets every bound server as an MCP tool server, butchr first — never a channel flag (BUTCHR-359 is out of scope here)", () => {
+    const withHeaders = { ...mud, headersEnvVar: "MUD_MCP_HEADERS" };
+    const args = spawnArgs({ ...spec, mcpServers: [withHeaders] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args.filter((a) => a.startsWith("--dangerously-load-development-channels"))).toHaveLength(0);
+    const butchrIdx = args.findIndex((a) => a.includes("mcp_servers.butchr="));
+    const mudIdx = args.findIndex((a) => a.includes("mcp_servers.mud="));
+    expect(butchrIdx).toBeGreaterThanOrEqual(0);
+    expect(mudIdx).toBeGreaterThan(butchrIdx);
+    expect(args[mudIdx]).toContain('url = "https://mud.example/mcp"');
+    expect(args[mudIdx]).not.toContain("http_headers");
+  });
+
+  // Review finding, PR #387 (BLOCKING): a bound server's resolved header
+  // VALUE (often a bearer token) must never reach Codex argv — a real
+  // process command line other local users can read via ps/procfs — and
+  // must therefore never reach anything downstream that echoes argv
+  // verbatim (staleIssues()'s observedArgv, the respawn journal line).
+  test("a bound server's headersEnvVar is NEVER resolved for Codex, even when the env var holds a real secret — argv contains no trace of it", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE" });
+    try {
+      const args = spawnArgs({ ...spec, mcpServers: [{ ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS" }] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+      expect(mudArg).toBeDefined();
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE");
+      expect(mudArg).not.toContain("http_headers");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE");
+    } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS; }
+  });
+
+  test("agy's launch is unaffected by mcpServers — bindings must not break it", () => {
+    const launch = agentStartParams({ ...spec, mcpServers: [mud] }, "/w/KAN-783", "pane", "worker", { provider: "agy" });
+    expect(launch).toEqual(agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy" }));
+  });
+});
+
+describe("project-manager Claude permissions", () => {
+  // No human answers a project manager's prompts; Claude's auto mode is the
+  // counterpart of the Codex launch's on-request + auto_review policy.
+  test("a jira-project Claude agent launches in auto permission mode", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
   });
 });

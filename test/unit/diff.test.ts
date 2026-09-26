@@ -20,6 +20,17 @@ describe("changedKeys", () => {
     expect(changedKeys([iss("A", "In Progress", "old")], [iss("A", "In Progress", "new")])).toEqual(["A"]);
     expect(changedKeys([iss("A", "In Progress", "s", "t1")], [iss("A", "In Progress", "s", "t2")])).toEqual(["A"]);
   });
+
+  // BUTCHR-431: `description` joined `SEARCH_FIELDS` and now rides along on
+  // every `JiraIssue`, but `changedKeys` reads only status/summary/updated —
+  // a description-only edit (status/summary/updated all held constant) must
+  // NOT newly count as a change, or every description edit would wake agents
+  // that previously ignored it.
+  test("a description-only difference is NOT a change — changedKeys never reads description", () => {
+    const before = { ...iss("A", "In Progress", "s", "t1"), description: "old text" };
+    const after = { ...iss("A", "In Progress", "s", "t1"), description: "new text, with a link https://example.com" };
+    expect(changedKeys([before], [after])).toEqual([]);
+  });
 });
 
 describe("isDaemonLabelOnlyDiff", () => {

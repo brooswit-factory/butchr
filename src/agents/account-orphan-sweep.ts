@@ -83,6 +83,24 @@ export interface AccountOrphanSweepDeps {
   residentIssues: () => Promise<readonly string[]>;
   /** `AccountLifecycleHooks.release` (`./account-lifecycle.ts`), reason always `"stop"` — a sweep-confirmed absence is a genuine stop, not a respawn. Already never throws (queues its own retry internally) — this sweep still wraps the call defensively in case a future implementation does not share that contract. */
   release: (agentKey: string, reason: "stop") => Promise<void>;
+  /**
+   * `AccountLifecycleHooks.publishBatch` (BUTCHR-412, batch provisioning) —
+   * this sweep runs on its OWN timer, independent of any rule loop's
+   * `reconcileNow` poll. `dirty` (the flag that decides whether a publish
+   * actually writes anything) lives on the ONE shared `AccountLifecycleHooks`
+   * instance `src/daemon/index.ts` wires here and into every rule loop, so a
+   * release this sweep makes would eventually be flushed by the next
+   * `reconcileNow` poll of ANY loop regardless — this call just makes that
+   * prompt (right after this sweep's own round, not whenever some other
+   * loop's poll next happens to run) rather than merely eventual, and is
+   * what makes a sweep-only test (no reconciler poll running at all) able to
+   * observe the publish directly. Called ONCE after every candidate this
+   * round has been processed, never once per release — same "at most one
+   * manifest publish per batch" discipline `reconcileNow` has. Optional;
+   * omitted, nothing here calls it (the daemon always wires it in production
+   * — see `src/daemon/index.ts`'s own wiring).
+   */
+  publishBatch?: () => Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -133,6 +151,7 @@ export function createAccountOrphanSweep(deps: AccountOrphanSweepDeps): AccountO
         log(`WARNING: [account] orphan sweep release failed for ${record.agentKey}: ${(e as Error)?.message ?? e}`);
       }
     }
+    if (deps.publishBatch) await deps.publishBatch();
   }
 
   return { sweep };

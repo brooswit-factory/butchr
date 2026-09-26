@@ -38,13 +38,20 @@ const HASH_LEN = 10;
  * (e.g. `jira-work:foo-bar:x` and `jira-work:foo:bar-x`) — the ticket's own
  * "collision-proof when truncating" ask is the truncated case; this closes
  * the untruncated one too, which is just as real.
+ *
+ * `prefix` (BUTCHR-412, BUTCHR-391 comment 24003 item "naming convention"):
+ * defaults to `RC_MANAGED_PREFIX`, but is accepted here so a daemon can
+ * override it (`Config.rocketchat.managedPrefix`, `ROCKETCHAT_MANAGED_PREFIX`)
+ * once the convention is actually agreed with Nexus — that conversation is
+ * the story agent's to have, not this ticket's to block on; the derivation
+ * itself (hash, truncation, charset) is unchanged either way.
  */
-export function rcUsernameFor(agentKey: string): string {
+export function rcUsernameFor(agentKey: string, prefix: string = RC_MANAGED_PREFIX): string {
   const hash = createHash("sha256").update(agentKey).digest("hex").slice(0, HASH_LEN);
-  const budget = Math.max(RC_USERNAME_MAX - RC_MANAGED_PREFIX.length - 1 - hash.length, 1);
+  const budget = Math.max(RC_USERNAME_MAX - prefix.length - 1 - hash.length, 1);
   const body = sanitize(agentKey).slice(0, budget);
-  return `${RC_MANAGED_PREFIX}${body}_${hash}`;
+  return `${prefix}${body}_${hash}`;
 }
 
-/** Whether `username` carries butchr's own managed-account marker — the ONLY signal ever consulted before a destructive RC call. */
-export const isManagedUsername = (username: string): boolean => username.startsWith(RC_MANAGED_PREFIX);
+/** Whether `username` carries butchr's own managed-account marker — the ONLY signal ever consulted before a destructive RC call. `prefix` mirrors `rcUsernameFor`'s own (same default, same override). */
+export const isManagedUsername = (username: string, prefix: string = RC_MANAGED_PREFIX): boolean => username.startsWith(prefix);

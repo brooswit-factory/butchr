@@ -9,8 +9,12 @@
  * Extracted here, rather than duplicated per file, per that ticket's own DoD:
  * "make the harness reusable and say where it is" — this file is where it is.
  */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { RocketChatApiError, type RocketChatClient, type RocketChatUser } from "../../src/resources/rocketchat.js";
 import type { AccountManagerDeps, AccountRecord, AccountStore } from "../../src/accounts/manager.js";
+import type { NexusManifestEntry, NexusManifestPublisher } from "../../src/accounts/nexus-manifest.js";
 
 export function fakeStore(initial: AccountRecord[] = []): AccountStore & { data: Map<string, AccountRecord> } {
   const data = new Map(initial.map((r) => [r.agentKey, r]));
@@ -67,10 +71,24 @@ export function fakeRcClient(seed: RocketChatUser[] = []) {
   };
 }
 
+/** A fresh scratch directory per call — `createAccountManager` writes real 0600 token files into `AccountManagerDeps.tokenDir`, so tests need a real (isolated, per-test) filesystem location, never a shared one. Never cleaned up automatically (bun's own tmp reaping handles that); a test that cares removes its own dir. */
+export const freshTokenDir = (): string => mkdtempSync(join(tmpdir(), "butchr-rc-tokens-"));
+
+/** In-memory `NexusManifestPublisher` double — records every `publish()` call's full argument list, so a test can assert BOTH "how many times" (batching) and "what was in each batch" (content). */
+export function fakeManifestPublisher(): NexusManifestPublisher & { publishes: NexusManifestEntry[][] } {
+  const publishes: NexusManifestEntry[][] = [];
+  return {
+    publishes,
+    async publish(entries) { publishes.push([...entries]); },
+  };
+}
+
 export const baseAccountManagerDeps = (over: Partial<AccountManagerDeps> = {}): AccountManagerDeps => ({
   client: fakeRcClient().client,
   store: fakeStore(),
   userCapThreshold: 45,
+  tempAccountCapThreshold: 100, // high, non-restrictive default — tests that care about this cap set it explicitly
+  tokenDir: freshTokenDir(),
   now: () => "2026-09-24T00:00:00.000Z",
   randomPassword: () => "fixed-password",
   ...over,
