@@ -4,6 +4,7 @@
   "vendor": "claude",
   "tier": "tier1",
   "permissionMode": "auto",
+  "strictMcpConfig": true,
   "execution": "persistent",
   "account": "permanent",
   "role": "sentinel",

@@ -74,6 +74,23 @@ describe("docs/codey-session-definitions.example/", () => {
     }
   });
 
+  test("BUTCHR-453/S7 landed: the 3 directors claim strict-MCP-config; Nexus (not a director) does not", () => {
+    for (const name of ["director-brooswit-factory.json", "director-brooswit-minecraft.json", "director-brooswit-mud.json"]) {
+      expect(load(name).strictMcpConfig).toBe(true);
+    }
+    expect(load("admin-brooswit-nexus.json").strictMcpConfig).toBeUndefined();
+  });
+
+  test("no non-director staged definition sets strictMcpConfig, and no vendor:codex definition does (codex has no strict-MCP-config concept — rejected at manifest load)", () => {
+    const directors = new Set(["director-brooswit-factory.json", "director-brooswit-minecraft.json", "director-brooswit-mud.json"]);
+    for (const name of EXPECTED_FILES) {
+      const def = load(name);
+      if (directors.has(name)) continue;
+      expect(def.strictMcpConfig).toBeUndefined();
+      if (def.vendor === "codex") expect(def.strictMcpConfig).toBeUndefined();
+    }
+  });
+
   test("the 10 MUD players: frozen persistent, tier1, account none, sentinel role, mud-mcp bound, only director-brooswit-mud may freeze", () => {
     const players = EXPECTED_FILES.filter((f) => f.startsWith("mud-player-"));
     expect(players.length).toBe(10);
@@ -111,10 +128,10 @@ describe("docs/codey-session-definitions.example/", () => {
     }
   });
 
-  test("none of the 3 director definitions claims strict-MCP-config today (BUTCHR-453/S7 not yet shipped)", () => {
+  test("BUTCHR-453/S7 landed: all 3 director definitions now claim strict-MCP-config (field name `strictMcpConfig`, verified against src/resources/session-definition.ts)", () => {
     for (const name of ["director-brooswit-factory.json", "director-brooswit-minecraft.json", "director-brooswit-mud.json"]) {
       const raw = readFileSync(join(EXAMPLES_DIR, name), "utf8");
-      expect(raw).not.toMatch(/strict/i);
+      expect(raw).toMatch(/"strictMcpConfig"\s*:\s*true/);
     }
   });
 });
