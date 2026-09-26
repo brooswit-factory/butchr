@@ -120,6 +120,25 @@ export interface SpawnSpec {
    * rotates on every launch, which a static env var cannot express).
    */
   rocketchat?: { url: string; rcUserId: string; username: string; token: string };
+  /**
+   * BUTCHR-413 (CHANGES_REQUESTED review finding 1): this agent's own
+   * non-secret Rocket.Chat account name — `rcUsernameFor(agentKey)`
+   * (src/accounts/identity.ts), a deterministic, public identifier, never a
+   * credential — merged into a binding's headers under
+   * `McpServerBinding.accountHeader` (see that field's own doc comment,
+   * src/rules/rules.ts) by `resolveMcpServerHeaders`/
+   * `resolveCodexSafeMcpServerHeaders` below. Set by `HerdrHerd.spawn`/
+   * `HerdrHerd.staleIssues` from the SAME injected `accountNameOf` callback
+   * (src/agents/herd.ts) — never by a `specFor*` function directly — so a
+   * value that is deterministic in its source can never drift between what
+   * an agent launched with and what a later poll expects. Deliberately a
+   * separate field from `rocketchat` above: unlike that bundle (a
+   * credential, one file, Claude-workspace-only, BUTCHR-412's to reshape),
+   * this is a bare name, safe on every launch surface Codex argv included —
+   * see `boundCodexServers` (src/agents/argv.ts) for exactly where that
+   * distinction is spent.
+   */
+  mcpAccountName?: string;
 }
 
 
@@ -396,8 +415,15 @@ Await direction if your brief does not assign work. Preserve sandbox and approva
     // to before (Object.fromEntries([]) spreads nothing).
     let hasSecretHeaders = false;
     const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const headers = resolveMcpServerHeaders(b);
-      if (headers) hasSecretHeaders = true;
+      const headers = resolveMcpServerHeaders(b, undefined, undefined, spec.mcpAccountName);
+      // Conservative on `b.headersEnvVar` being DECLARED, not on it having
+      // actually resolved: a binding whose ONLY resolved header ends up
+      // being the non-secret account name (headersEnvVar absent/malformed)
+      // never sets this, but one that NAMES a headersEnvVar always does,
+      // even on the rare poll where that var is temporarily unset — tighter
+      // than strictly necessary, never looser, for a file that is 664 by
+      // default and 0600 only when this flag fires.
+      if (headers && b.headersEnvVar) hasSecretHeaders = true;
       return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
     }));
     const mcpJsonPath = join(dir, "mcp.json");
@@ -536,13 +562,38 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
  * prints exactly one line naming the BINDING and the ENV VAR — never the
  * value, never the raw env content — whenever `headersEnvVar` was named but
  * produced no usable headers.
+ *
+ * `accountName` (BUTCHR-413): this launch's own `spec.mcpAccountName`, or
+ * undefined for none. When `binding.accountHeader` names a header AND an
+ * account name is available, it is merged into the result under that
+ * header — on top of, never instead of, whatever `headersEnvVar` resolved
+ * (a rule can want both a shared bridge credential and a per-agent account
+ * name). Unlike every value `headersEnvVar` can ever produce, an account
+ * name merged in this way is safe to also hand to `boundCodexServers`
+ * (src/agents/argv.ts) — see `McpServerBinding.accountHeader`'s own doc
+ * comment (src/rules/rules.ts) for why.
  */
-export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error): Record<string, string> | undefined {
-  if (!binding.headersEnvVar) return undefined;
-  const raw = env[binding.headersEnvVar];
-  const parsed = raw ? tryParseHeaders(raw) : undefined;
-  if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
-  return parsed;
+export function resolveMcpServerHeaders(binding: McpServerBinding, env: Record<string, string | undefined> = process.env, log: (line: string) => void = console.error, accountName?: string): Record<string, string> | undefined {
+  const envHeaders = binding.headersEnvVar ? (() => {
+    const raw = env[binding.headersEnvVar!];
+    const parsed = raw ? tryParseHeaders(raw) : undefined;
+    if (!parsed) log(`butchr: MCP server binding "${binding.name}" names headersEnvVar "${binding.headersEnvVar}", but it is unset, empty, or not a flat string-valued JSON object — connecting with no extra headers`);
+    return parsed;
+  })() : undefined;
+  const accountHeaders = binding.accountHeader && accountName ? { [binding.accountHeader]: accountName } : undefined;
+  if (!envHeaders && !accountHeaders) return undefined;
+  return { ...envHeaders, ...accountHeaders };
+}
+
+/**
+ * The subset of `resolveMcpServerHeaders` that is safe on EVERY launch
+ * surface, Codex argv/mcp.json included — the account-name header alone,
+ * never `headersEnvVar`'s resolved value (see `boundCodexServers`,
+ * src/agents/argv.ts, and `McpServerBinding.accountHeader`'s own doc
+ * comment, src/rules/rules.ts, for why the two are not equally safe there).
+ */
+export function resolveCodexSafeMcpServerHeaders(binding: McpServerBinding, accountName?: string): Record<string, string> | undefined {
+  return binding.accountHeader && accountName ? { [binding.accountHeader]: accountName } : undefined;
 }
 
 const tryParseHeaders = (raw: string): Record<string, string> | undefined => {

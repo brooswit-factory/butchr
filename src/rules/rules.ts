@@ -124,12 +124,35 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * from account policy, so an `account: "none"` rule (no Rocket.Chat account
  * — e.g. Candlestix's MUD players) still gets full event-driven channel
  * delivery for a bound server.
+ *
+ * `accountHeader` (BUTCHR-413, the small explicit extension this ticket's
+ * review found necessary): the NAME of a header that should carry THIS
+ * AGENT'S OWN account-identifying value — for Rocket.Chat's `rocketr`
+ * bridge, `"x-rocketr-account"` and `spec.rocketchat.username` (the
+ * account's Rocket.Chat username, already documented as non-secret —
+ * BUTCHR-410/412 never treat it as one). Unlike `headersEnvVar`, this is
+ * safe on EVERY launch surface, Codex argv/mcp.json included
+ * (`boundCodexServers`, src/agents/argv.ts): the value is an account NAME,
+ * not a bearer token — reading it off a process command line or a daemon
+ * log line lets an observer see WHICH account an agent is, never lets them
+ * ACT as it, because rocketr (not this header) is the only thing that ever
+ * resolves a name to real Rocket.Chat authority, over a channel this
+ * header never travels. Absent, or present with no `spec.rocketchat` for
+ * this launch (an `account: "none"` rule, or a provisioning refusal), the
+ * binding connects with no extra header from this field — falling back to
+ * `headersEnvVar`'s shared credential when the rule names one, exactly as
+ * before this field existed. This is what makes finding 1 of the
+ * CHANGES_REQUESTED review ("a Codex agent cannot authenticate to rocketr
+ * to reply") answerable: give Codex's own bound `rocketr` server this
+ * header and rocketr can identify the replying account without Codex ever
+ * touching a secret.
  */
 export interface McpServerBinding {
   name: string;
   type: McpServerBindingType;
   url: string;
   headersEnvVar?: string;
+  accountHeader?: string;
   channel: boolean;
 }
 
@@ -248,10 +271,12 @@ const RULE_FIELDS = new Set([
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
-const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "channel"]);
+const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+/** HTTP header field-name token chars (RFC 7230 `token`, ASCII-restricted) — same charset used for `x-rocketr-account`, `x-issue`, etc. throughout this codebase. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -314,10 +339,13 @@ export function parseMcpServers(raw: unknown, at: string, errors: string[]): Mcp
     if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
     const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
     if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
+    const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
+    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be an HTTP header name`);
     if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
     return {
       name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
       ...(headersEnvVar ? { headersEnvVar } : {}),
+      ...(accountHeader ? { accountHeader } : {}),
       channel: s.channel as boolean,
     };
   });

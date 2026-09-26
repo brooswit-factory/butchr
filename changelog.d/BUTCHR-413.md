@@ -18,18 +18,37 @@ bump: minor
   make stale). A relay is kept, never rebuilt or torn down, while an
   issue's provider is transiently unknown (`null` — a herdr hiccup, a
   starting shell, a pane blocked on a dialog).
-- Each relay connects with the agent's OWN Rocket.Chat identity when it has
-  one (BUTCHR-412's per-agent `.butchr-rocketchat.json`), falling back to
-  the rule-level shared credential only for an `account: "none"` rule —
-  needed so a channel server can route a DM to one agent rather than every
-  agent sharing that rule's binding.
+- **`McpServerBinding.accountHeader`** (`src/rules/rules.ts`), the small,
+  explicit extension to BUTCHR-411's own contract this ticket's review
+  found necessary: a header NAME that carries this agent's own non-secret
+  Rocket.Chat account name (`rcUsernameFor(agentKey)`, a deterministic
+  public identifier, never a credential) — safe on every launch surface,
+  Codex argv/mcp.json included, unlike `headersEnvVar`'s resolved value,
+  which still never reaches Codex. This is what lets a Codex agent identify
+  itself to `rocketr` on its own outbound tool calls (a reply) — `rocketr`
+  is a central bridge that holds every account's real token itself, so an
+  agent never needs to present one; naming its account is enough.
+  `HerdrHerd.spawn`/`HerdrHerd.staleIssues` inject the same account name
+  (via a new `accountNameOf` constructor param) so a launched agent's argv
+  and a later poll's expectation of it can never drift apart.
+- Each relay connects with the SAME per-agent, non-secret account name
+  (`accountNameOf`, shared with the launch-time wiring above) rather than a
+  shared rule-level credential — needed so a channel server can route a DM
+  to one agent rather than every agent sharing that rule's binding.
 
-### Known gap (filed, not fixed here)
+### Corrected mid-flight (epic design correction, 2026-09-25)
 
-- A Codex agent still cannot reply through an authenticated bound server's
-  own tools (e.g. `rocketr`): BUTCHR-411 strips every bound-server header
-  from a Codex launch to keep credentials out of argv. Filed as BUTCHR-418.
-  Inbound delivery to Codex works; that specific reply path does not yet.
+- The account-lifecycle design this ticket first built against (an agent
+  reads its own Rocket.Chat token from a workspace file) was superseded by
+  the epic: **agents never hold a Rocket.Chat credential.** `rocketr` is a
+  central bridge that keeps every token; an agent's binding names only its
+  account. This ticket's relay was reworked to match: it no longer reads
+  any credential file, computing the (already-non-secret) account name
+  directly instead.
+- The "Codex cannot reply through rocketr" gap filed as BUTCHR-418 in the
+  first review round is resolved by the above: the reason it couldn't reply
+  (BUTCHR-411 strips secret header values from Codex argv) never applied to
+  a non-secret account name in the first place.
 
 ### Fixed
 

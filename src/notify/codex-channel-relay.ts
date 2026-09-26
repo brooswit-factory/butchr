@@ -65,44 +65,9 @@
  * the seam (see each export's own doc comment), never called from anywhere
  * else.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { keepChannelSource, renderInboxTurn, type InboxMessage, type DeliveryOutcome, type ChannelSourceStatus, type KeepChannelSourceOptions } from "@brooswit/drovr";
 import type { McpServerBinding } from "../rules/rules.js";
-import { resolveMcpServerHeaders, workspaceDirFor, RC_ACCOUNT_FILE } from "../agents/workspace.js";
-
-/** BUTCHR-412's per-agent Rocket.Chat connection material, as `.butchr-rocketchat.json` holds it. */
-export interface RcAccountIdentity { url: string; userId: string; authToken: string; username: string }
-
-/**
- * Reads THIS agent's own Rocket.Chat connection material (BUTCHR-412,
- * `RC_ACCOUNT_FILE` in its workspace directory) — review finding 2: every
- * binding this module previously connected with used
- * `resolveMcpServerHeaders(binding)`, ONE credential shared by every agent a
- * rule binds, so a channel server had no way to route a message to "this
- * agent's own identity" (a DM, or any per-recipient targeting) — every
- * Codex agent sharing that rule's connection would look identical to it.
- * `startCodexChannelRelay` uses this identity when present, falling back to
- * the shared per-binding credential only when it is absent (an
- * `account: "none"` rule, e.g. Candlestix's MUD players, who have no
- * personal Rocket.Chat account and for whom a shared credential is the
- * correct, only option). Never throws: no file (account policy `"none"`, or
- * `ensureAccount` hasn't run yet this launch), an unreadable file, or
- * malformed JSON all resolve to `undefined` — the same "absent, not a
- * crash" discipline `resolveMcpServerHeaders` itself uses for a bad
- * `headersEnvVar`.
- */
-export function readRcAccountIdentity(issue: string): RcAccountIdentity | undefined {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(join(workspaceDirFor(issue), RC_ACCOUNT_FILE), "utf8"));
-    if (parsed && typeof parsed === "object"
-      && typeof (parsed as Record<string, unknown>).url === "string"
-      && typeof (parsed as Record<string, unknown>).userId === "string"
-      && typeof (parsed as Record<string, unknown>).authToken === "string"
-      && typeof (parsed as Record<string, unknown>).username === "string") return parsed as RcAccountIdentity;
-  } catch { /* no file / unreadable / malformed — treated as "no per-agent identity", see doc comment */ }
-  return undefined;
-}
+import { resolveMcpServerHeaders } from "../agents/workspace.js";
 
 /**
  * A corrected, minimal stand-in for `@brooswit/drovr`'s `InboxRelay` queue —
@@ -189,8 +154,23 @@ export interface CodexChannelRelayDeps {
   connect?: (options: KeepChannelSourceOptions) => { stop: () => Promise<void> };
   /** How long a delivered message's dedup key is remembered before an identical repeat is treated as new. Default 5 minutes. */
   dedupWindowMs?: number;
-  /** This issue's own Rocket.Chat connection material, or undefined for none. Defaults to `readRcAccountIdentity`; tests inject a fake so they never touch the filesystem. */
-  identityFor?: (issue: string) => RcAccountIdentity | undefined;
+  /**
+   * This issue's own non-secret Rocket.Chat account name
+   * (`spec.mcpAccountName`'s own source, `rcUsernameFor(issue)` —
+   * src/accounts/identity.ts — gated on the issue's rule actually granting
+   * an account), or undefined for none (an `account: "none"` rule, e.g.
+   * Candlestix's MUD players, or no Rocket.Chat configured at all). Passed
+   * straight into `resolveMcpServerHeaders` alongside `binding` below, so
+   * this daemon's OWN connection identifies as the SAME account
+   * `boundCodexServers` (src/agents/argv.ts) puts in Codex's own bound-server
+   * headers for the reply path — review finding 2: a shared, rule-level-only
+   * credential could not route a DM to one agent; this is what fixes that.
+   * Defaults to a no-op (no per-agent identity for anyone); the real daemon
+   * wiring (src/daemon/index.ts) passes the SAME `accountNameOf` function
+   * `HerdrHerd` uses, so the two can never name a different account for the
+   * same issue.
+   */
+  accountNameOf?: (issue: string) => string | undefined;
 }
 
 export interface CodexChannelRelayHandle {
@@ -243,22 +223,25 @@ export function startCodexChannelRelay(issue: string, binding: McpServerBinding,
     },
   });
 
-  // Per-agent identity first (BUTCHR-412's RC_ACCOUNT_FILE — review finding
-  // 2: a shared, rule-level credential can't let a channel server route a
-  // message to "this agent alone"), the rule-level shared credential only
-  // when this agent has none (an `account: "none"` rule, which has no
-  // per-agent identity to read at all). Resolved/read server-side, in THIS
-  // process — never written to argv or a log line anywhere in this file,
-  // unlike the leak BUTCHR-411's own review found in Codex's own
-  // launch-argv path (a different code path entirely: that one spawns a
-  // child process; this one is an ordinary in-process HTTP connection this
-  // daemon makes for itself). Header names assumed to match Rocket.Chat's
-  // own convention (`src/resources/rocketchat.ts`'s client uses the same
-  // pair) — unverified against a real `rocketr`, which does not exist in
-  // this repo; see docs/codex-channel-relay.md.
-  const identityFor = deps.identityFor ?? readRcAccountIdentity;
-  const identity = identityFor(issue);
-  const headers = identity ? { "x-user-id": identity.userId, "x-auth-token": identity.authToken } : resolveMcpServerHeaders(binding);
+  // Review finding 2 (corrected against the rocketr design): a shared,
+  // rule-level-only credential (`headersEnvVar`) can't let a channel server
+  // route a message to "this agent alone" — every Codex agent sharing that
+  // rule's connection would look identical to it. This daemon's OWN
+  // connection now carries the SAME per-agent, non-secret account name
+  // (`binding.accountHeader`, `spec.rocketchat/rules.ts`'s own doc comment)
+  // that reaches Codex's own bound-server config for the reply path
+  // (`boundCodexServers`, src/agents/argv.ts) — one account identity, two
+  // consumers, never two mechanisms. `resolveMcpServerHeaders` (not the
+  // codex-safe subset) is correct here: THIS process is the daemon itself,
+  // never a launched child whose argv another local user can read, so a
+  // `headersEnvVar`-resolved shared secret is exactly as safe here as it
+  // already is for Claude's own direct connection. Header NAME assumed to
+  // match Rocket.Chat's own convention when no `accountHeader` is
+  // configured (`src/resources/rocketchat.ts`'s client uses the same pair)
+  // — unverified against a real `rocketr`, which does not exist in this
+  // repo; see docs/codex-channel-relay.md.
+  const accountNameOf = deps.accountNameOf ?? (() => undefined);
+  const headers = resolveMcpServerHeaders(binding, undefined, log, accountNameOf(issue));
   const source = connect({
     name: binding.name,
     url: binding.url,

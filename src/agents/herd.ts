@@ -236,6 +236,24 @@ export class HerdrHerd implements Herd {
      * survey flagged stays closed.
      */
     private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
+    /**
+     * BUTCHR-413 — same shape and same reason as `mcpBindingsOf` immediately
+     * above, one field over: this issue's own non-secret account-identifying
+     * name for `McpServerBinding.accountHeader` (`spec.mcpAccountName`, see
+     * that field's own doc comment, src/agents/workspace.ts), or `undefined`
+     * for none (an `account: "none"` rule, or no Rocket.Chat configured at
+     * all). Called from BOTH `spawnExclusive` (augments the real spec before
+     * `buildWorkspace`/`agentLaunchConfig`) and `staleIssues()` (augments the
+     * reconstructed comparison spec) — the SAME callback both times, so a
+     * value that is deterministic in its caller (as `rcUsernameFor(issue)`
+     * is, src/accounts/identity.ts) can never drift between what an agent
+     * was actually launched with and what a later poll expects, with no
+     * persistence required. Optional and defaulting to "no account name for
+     * anyone" keeps a daemon with no Rocket.Chat configured, or a rule with
+     * no `accountHeader` binding, at byte-identical expected argv to before
+     * this field existed.
+     */
+    private readonly accountNameOf?: (issue: string) => string | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -432,7 +450,12 @@ export class HerdrHerd implements Herd {
       // original spawn's SpawnSpec.
       const isManagedSession = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID;
       const mcpServers = isManagedSession ? (workspaceMcpServers(cwd) ?? []) : this.mcpBindingsOf?.(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // BUTCHR-413: same `accountNameOf` callback `spawn()` itself uses —
+      // see that constructor param's own doc comment for why recomputing it
+      // fresh here, rather than caching the original spawn's spec, is what
+      // keeps this comparison from drifting.
+      const accountName = this.accountNameOf?.(issue);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { mcpAccountName: accountName } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -491,7 +514,13 @@ export class HerdrHerd implements Herd {
    * reach zero lines on a rejecting `agent.list()`, at this method's
    * pre-fix shape, before this fix landed.
    */
-  async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
+  async spawn(specIn: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
+    // BUTCHR-413: freshly computed here, on every spawn, from the SAME
+    // `accountNameOf` callback `staleIssues()` uses to reconstruct its own
+    // comparison spec — see that constructor param's own doc comment for why
+    // this can never drift out of sync with what a later poll expects.
+    const accountName = this.accountNameOf?.(specIn.key);
+    const spec: SpawnSpec = accountName ? { ...specIn, mcpAccountName: accountName } : specIn;
     return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
   }
 

@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, statSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, RC_ACCOUNT_FILE, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resolveCodexSafeMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspaceRoot, RC_ACCOUNT_FILE, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -905,6 +905,25 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): spec.mcpAccountName +
+  // a binding's accountHeader reach Claude's mcp.json too, not just Codex's
+  // argv — the SAME non-secret value on both surfaces (boundCodexServers,
+  // src/agents/argv.ts, and argv.test.ts's own coverage for that half).
+  test("spec.mcpAccountName + a binding's accountHeader land in Claude's mcp.json", () => {
+    withRoot(() => {
+      const dir = buildWorkspace({ key: "KAN-29", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], mcpAccountName: "butchr_acct_1" }, "http://x/mcp");
+      const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+      expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp", headers: { "x-rocketr-account": "butchr_acct_1" } });
+    });
+  });
+
+  test("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
+    withRoot(() => {
+      const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], mcpAccountName: "butchr_acct_1" }, "http://x/mcp");
+      expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
+    });
+  });
+
   test("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
     withRoot(() => {
       const spec = { key: "KAN-28", issuetype: "Task", summary: "s", parent: null };
@@ -961,5 +980,44 @@ describe("resolveMcpServerHeaders (BUTCHR-411)", () => {
     process.env.BUTCHR_TEST_RESOLVE_HEADERS = JSON.stringify({ A: "b" });
     try { expect(resolveMcpServerHeaders({ ...mud, headersEnvVar: "BUTCHR_TEST_RESOLVE_HEADERS" })).toEqual({ A: "b" }); }
     finally { delete process.env.BUTCHR_TEST_RESOLVE_HEADERS; }
+  });
+
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): accountHeader/accountName,
+  // the small explicit extension to this same function — additive to
+  // headersEnvVar, never a replacement for it.
+  describe("accountHeader / accountName (BUTCHR-413)", () => {
+    test("no accountHeader on the binding -> the accountName argument is ignored entirely", () => {
+      expect(resolveMcpServerHeaders(mud, {}, silent, "some-account")).toBeUndefined();
+    });
+    test("accountHeader present but no accountName for this launch -> undefined, same as an account:\"none\" rule or a provisioning refusal", () => {
+      expect(resolveMcpServerHeaders({ ...mud, accountHeader: "x-rocketr-account" }, {}, silent)).toBeUndefined();
+      expect(resolveMcpServerHeaders({ ...mud, accountHeader: "x-rocketr-account" }, {}, silent, undefined)).toBeUndefined();
+    });
+    test("accountHeader + accountName resolve together, with no headersEnvVar involved at all", () => {
+      expect(resolveMcpServerHeaders({ ...mud, accountHeader: "x-rocketr-account" }, {}, silent, "butchr_acct_1")).toEqual({ "x-rocketr-account": "butchr_acct_1" });
+    });
+    test("headersEnvVar's resolved value and the accountHeader's account name MERGE — a rule can want both a shared bridge credential and a per-agent name", () => {
+      const headers = resolveMcpServerHeaders(
+        { ...mud, headersEnvVar: "H", accountHeader: "x-rocketr-account" },
+        { H: JSON.stringify({ Authorization: "Bearer shared-secret" }) },
+        silent,
+        "butchr_acct_1",
+      );
+      expect(headers).toEqual({ Authorization: "Bearer shared-secret", "x-rocketr-account": "butchr_acct_1" });
+    });
+  });
+});
+
+describe("resolveCodexSafeMcpServerHeaders (BUTCHR-413)", () => {
+  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
+
+  test("no accountHeader -> undefined, regardless of accountName", () => {
+    expect(resolveCodexSafeMcpServerHeaders(mud, "butchr_acct_1")).toBeUndefined();
+  });
+  test("accountHeader with no accountName -> undefined", () => {
+    expect(resolveCodexSafeMcpServerHeaders({ ...mud, accountHeader: "x-rocketr-account" })).toBeUndefined();
+  });
+  test("accountHeader + accountName -> exactly that one header, never anything headersEnvVar could have resolved", () => {
+    expect(resolveCodexSafeMcpServerHeaders({ ...mud, accountHeader: "x-rocketr-account", headersEnvVar: "IGNORED_ON_THIS_PATH" }, "butchr_acct_1")).toEqual({ "x-rocketr-account": "butchr_acct_1" });
   });
 });

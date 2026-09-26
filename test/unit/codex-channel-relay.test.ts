@@ -140,13 +140,25 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     const lines: string[] = [];
     const nudge: RelayNudge = async () => ({ delivered: true });
     const SECRET = "sekrit-bearer-token-xyz";
-    const relay = startCodexChannelRelay("ISS-1", binding({ url: server.url, headersEnvVar: "FAKE_ROCKETR_HEADERS" }), {
-      nudge, log: (l) => lines.push(l), identityFor: () => ({ url: server.url, userId: "u1", authToken: SECRET, username: "codex-1" }),
-    });
-    cleanups.push(relay.stop);
-    await server.push("hi");
-    await until(() => lines.some((l) => l.includes("delivered")));
-    expect(lines.some((l) => l.includes(SECRET))).toBe(false);
+    const envVar = `FAKE_ROCKETR_HEADERS_${Math.random().toString(36).slice(2)}`;
+    const previous = process.env[envVar];
+    // A shared rule-level secret (headersEnvVar) AND a per-agent non-secret
+    // account name (accountHeader) resolve together for THIS daemon's own
+    // connection (review finding 2's fix, see startCodexChannelRelay's own
+    // comment) — proving the secret never leaks even while the non-secret
+    // name is in play is the more faithful shape post-redesign.
+    process.env[envVar] = JSON.stringify({ Authorization: `Bearer ${SECRET}` });
+    try {
+      const relay = startCodexChannelRelay("ISS-1", binding({ url: server.url, headersEnvVar: envVar, accountHeader: "x-rocketr-account" }), {
+        nudge, log: (l) => lines.push(l), accountNameOf: () => "codex-1",
+      });
+      cleanups.push(relay.stop);
+      await server.push("hi");
+      await until(() => lines.some((l) => l.includes("delivered")));
+      expect(lines.some((l) => l.includes(SECRET))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env[envVar]; else process.env[envVar] = previous;
+    }
   });
 
   test("review finding 2: per-agent identity — two Codex agents bound to the SAME binding get distinct connection identities, so a message addressed to one reaches only it", async () => {
@@ -161,24 +173,26 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     const callsB: string[] = [];
     const nudgeA: RelayNudge = async (issue) => { callsA.push(issue); return { delivered: true }; };
     const nudgeB: RelayNudge = async (issue) => { callsB.push(issue); return { delivered: true }; };
-    const relayA = startCodexChannelRelay("AGENT-A", binding({ url }), { nudge: nudgeA, identityFor: () => ({ url, userId: "user-a", authToken: "token-a", username: "codex-a" }) });
-    const relayB = startCodexChannelRelay("AGENT-B", binding({ url }), { nudge: nudgeB, identityFor: () => ({ url, userId: "user-b", authToken: "token-b", username: "codex-b" }) });
+    const relayA = startCodexChannelRelay("AGENT-A", binding({ url, accountHeader: "x-rocketr-account" }), { nudge: nudgeA, accountNameOf: () => "account-a" });
+    const relayB = startCodexChannelRelay("AGENT-B", binding({ url, accountHeader: "x-rocketr-account" }), { nudge: nudgeB, accountNameOf: () => "account-b" });
     cleanups.push(relayA.stop, relayB.stop);
 
     // Stands in for rocketr routing a DM by the connection's own identity —
     // exactly the pattern src/daemon/app.ts's own `notifyAgent` already uses
-    // (`sendAll(..., { where: (c) => c.headers[...] === target })`).
-    const pushToUser = async (userId: string, content: string, meta: Record<string, string> = {}) => {
+    // (`sendAll(..., { where: (c) => c.headers[...] === target })`) — the
+    // account name (never a userId/token, review finding 2's corrected
+    // design) is what a real rocketr would route a DM by.
+    const pushToUser = async (accountName: string, content: string, meta: Record<string, string> = {}) => {
       const deadline = Date.now() + 3000;
       for (;;) {
-        const result = await mcp.sendAll({ content, meta }, { where: (c: { headers: Record<string, string> }) => c.headers["x-user-id"] === userId });
+        const result = await mcp.sendAll({ content, meta }, { where: (c: { headers: Record<string, string> }) => c.headers["x-rocketr-account"] === accountName });
         if (result.sent.length > 0) return result;
         if (Date.now() > deadline) throw new Error("no matching connection ever connected");
         await Bun.sleep(20);
       }
     };
 
-    await pushToUser("user-a", "DM for A", { id: "dm-1" });
+    await pushToUser("account-a", "DM for A", { id: "dm-1" });
     await until(() => callsA.length === 1);
     await Bun.sleep(150);
     expect(callsA).toEqual(["AGENT-A"]);

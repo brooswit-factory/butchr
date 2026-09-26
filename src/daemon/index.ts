@@ -84,6 +84,7 @@ import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
 import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
 import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
+import { rcUsernameFor } from "../accounts/identity.js";
 import { createAccountLifecycle } from "../agents/account-lifecycle.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
@@ -236,6 +237,23 @@ const accountPolicyOf = (id: string): AccountPolicy => {
   return rule?.account ?? "none";
 };
 
+/**
+ * BUTCHR-413 — this id's own non-secret Rocket.Chat account name
+ * (`spec.mcpAccountName`'s source, see that field's own doc comment,
+ * src/agents/workspace.ts), or `undefined` for an id whose rule grants it
+ * none (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
+ * `accountLifecycle` itself is gated on immediately below). Deliberately
+ * `rcUsernameFor` directly, never a read of `spec.rocketchat`/
+ * `RC_ACCOUNT_FILE` (BUTCHR-412's own credential bundle, still mid-rework at
+ * time of writing): the username half of that bundle IS this same
+ * deterministic value (`src/accounts/manager.ts`'s `ensureAccount` computes
+ * it identically), so computing it directly here needs no coordination with
+ * however BUTCHR-412 ends up delivering the credential half, and gives
+ * `HerdrHerd`/`createCodexChannelRelayPool` an identical answer on every
+ * call with no file read and no risk of ever going stale.
+ */
+const accountNameOf = (id: string): string | undefined => (accountPolicyOf(id) === "none" ? undefined : rcUsernameFor(id));
+
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
 // runs and nothing is spawned for one (announced by startGithubIssueLoop).
@@ -292,7 +310,7 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf);
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
 // binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the
@@ -308,6 +326,12 @@ const codexChannelRelays = createCodexChannelRelayPool({
   bindingsOf: mcpBindingsOf,
   runningIssues: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
+  // BUTCHR-413 (review finding 2): the SAME per-agent, non-secret account
+  // name `herd` above uses for Codex's own bound-server headers — one
+  // identity, two consumers, so a message aimed at this agent's account
+  // reaches it however it is running, and the two paths can never disagree
+  // about who this agent is.
+  accountNameOf,
 });
 const codexChannelRelayTick = () => codexChannelRelays.reconcile().catch((e) => console.error(`  WARNING: [notify] codex channel relay reconcile failed: ${(e as Error)?.message ?? e}`));
 void codexChannelRelayTick();
