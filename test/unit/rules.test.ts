@@ -130,6 +130,53 @@ describe("parseRules", () => {
     for (const id of ["", "-a", "a-", "a--b", "A", "a.b", "a_b", "a:b", "x".repeat(RULE_ID_MAX + 1), 7])
       expect(() => parseRules({ rules: [{ ...minimal, id }] })).toThrow(".id must be");
   });
+
+  // FACTORY-75 — the two-axis (modelPower/effortPower) mechanism on
+  // agentPreferences, resolved to plain model/effort at parse time (see
+  // AgentPreference's own doc comment, src/rules/rules.ts, for why nothing
+  // downstream needed to change).
+  describe("agentPreferences: modelPower/effortPower (FACTORY-75)", () => {
+    test("modelPower alone resolves to a model, through the SAME power-scale.ts table session definitions use", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 100 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "fable" }]);
+    });
+    test("effortPower alone resolves to an AgentEffort", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effortPower: 70 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", effort: "xhigh" }]);
+    });
+    test("modelPower+effortPower together resolve both", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 75, effortPower: 90 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "fable", effort: "max" }]);
+    });
+    test("codex gets its own model-power table", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "codex", modelPower: 0 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "codex", model: "gpt-5.6-luna" }]);
+    });
+    test("setting both model and modelPower (or effort and effortPower) is rejected — ambiguous precedence, never silently resolved", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", model: "opus", modelPower: 50 }] }] }))
+        .toThrow('must not set both "model" and "modelPower"');
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effort: "high", effortPower: 50 }] }] }))
+        .toThrow('must not set both "effort" and "effortPower"');
+    });
+    test("modelPower/effortPower are rejected for harness agy — no power table exists for it", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "agy", modelPower: 50 }] }] }))
+        .toThrow('modelPower is not supported for harness "agy"');
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "agy", effortPower: 50 }] }] }))
+        .toThrow('effortPower is not supported for harness "agy"');
+    });
+    test("out-of-range/non-integer modelPower/effortPower are rejected, same message shape as session-definition.ts's own fields", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 101 }] }] }))
+        .toThrow("modelPower must be between 0 and 100");
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effortPower: -1 }] }] }))
+        .toThrow("effortPower must be between 0 and 100");
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 50.5 }] }] }))
+        .toThrow("modelPower must be an integer");
+    });
+    test("absent modelPower/effortPower: today's behaviour exactly — an explicit model/effort, or neither", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude" }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude" }]);
+    });
+  });
 });
 
 describe("unresolvedRelationships", () => {

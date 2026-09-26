@@ -29,13 +29,19 @@ import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
+import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /** Agent harnesses Drovr can launch. */
 export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];
-export const AGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
-export type AgentEffort = (typeof AGENT_EFFORTS)[number];
+/**
+ * FACTORY-75: moved to src/resources/power-scale.ts (that module's own top
+ * comment explains why — it needs this type for its shared effort table,
+ * and must not import it back from here) and re-exported here unchanged
+ * for every existing importer of `rules.js`.
+ */
+export { AGENT_EFFORTS, type AgentEffort };
 
 /**
  * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
@@ -76,7 +82,28 @@ export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
 export const AGENT_ROLES = ["worker", "sentinel"] as const;
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
-export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
+/**
+ * FACTORY-75: `modelPower`/`effortPower` are the SAME 0-100 two-axis
+ * mechanism `SessionDefinition` uses (src/resources/power-scale.ts's own
+ * top comment) resolved to `model`/`effort` at RULE-PARSE time (`loadRules`,
+ * once at daemon startup) — by the time any of this codebase's existing
+ * `agentPreferences`-consuming code (every `specFor*` in src/rules/*-type.ts,
+ * `src/agents/herd.ts`'s `prepare()`) ever looks at a preference, `model`/
+ * `effort` are already filled in exactly as if written by hand, so NONE of
+ * that code needed to change. Named `modelPower`, never `capability` (the
+ * ticket's own suggestion) — `capability` already names an unrelated
+ * concept in this codebase (src/resources/capabilities.ts's per-provider
+ * capability declarations) and reusing the word here would read as related
+ * when it isn't. Named `effortPower`, never reusing `effort`'s own name —
+ * `effort` is this field's pre-existing explicit override (a literal
+ * `AgentEffort` string), and the two coexisting under one name would be
+ * ambiguous; setting BOTH `effort` and `effortPower` (or both `model` and
+ * `modelPower`) on the same preference is rejected at load time
+ * (`parsePreferences` below) rather than silently letting one win.
+ * Absent (every rule before this ticket) means today's behaviour exactly —
+ * an explicit `model`/`effort`, or neither, same as always.
+ */
+export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort; modelPower?: number; effortPower?: number }
 
 /** MCP server binding shapes a rule/definition can bind to, beyond butchr's own. Only `http` today. */
 export const MCP_SERVER_BINDING_TYPES = ["http"] as const;
@@ -273,7 +300,7 @@ const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
 ]);
-const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
+const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
@@ -300,10 +327,43 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     if (!oneOf(AGENT_HARNESSES, p.harness)) errors.push(`${pat}.harness must be one of ${AGENT_HARNESSES.join(", ")}`);
     if (p.model !== undefined && !nonEmpty(p.model)) errors.push(`${pat}.model must be a non-empty string`);
     if (p.effort !== undefined && !oneOf(AGENT_EFFORTS, p.effort)) errors.push(`${pat}.effort must be one of ${AGENT_EFFORTS.join(", ")}`);
+    // FACTORY-75: modelPower/effortPower are the new 0-100 two-axis
+    // mechanism (src/resources/power-scale.ts) — reject combining either
+    // with its own explicit sibling (ambiguous precedence), and reject
+    // either for "agy" (no power table exists for that harness — Drovr's
+    // own AgyAgentLaunch has no effort concept at all, see agentLaunchConfig,
+    // src/agents/argv.ts). Valid only when `p.harness` is already known-good
+    // (claude/codex) AND the raw value itself passes `powerValueProblems` —
+    // an invalid harness or an invalid power value both already pushed
+    // their own error above/below, so resolution is skipped rather than
+    // resolving against garbage input.
+    const powerVendor: "claude" | "codex" | undefined = p.harness === "claude" || p.harness === "codex" ? p.harness : undefined;
+    let modelPowerResolved: string | undefined;
+    if (p.modelPower !== undefined) {
+      if (p.model !== undefined) errors.push(`${pat} must not set both "model" and "modelPower"`);
+      else if (p.harness === "agy") errors.push(`${pat}.modelPower is not supported for harness "agy" — agy has no model-power table`);
+      else {
+        const problems = powerValueProblems(p.modelPower, `${pat}.modelPower`);
+        errors.push(...problems);
+        if (problems.length === 0 && powerVendor) modelPowerResolved = resolveModelPower(powerVendor, p.modelPower as number);
+      }
+    }
+    let effortPowerResolved: AgentEffort | undefined;
+    if (p.effortPower !== undefined) {
+      if (p.effort !== undefined) errors.push(`${pat} must not set both "effort" and "effortPower"`);
+      else if (p.harness === "agy") errors.push(`${pat}.effortPower is not supported for harness "agy" — agy has no effort concept`);
+      else {
+        const problems = powerValueProblems(p.effortPower, `${pat}.effortPower`);
+        errors.push(...problems);
+        if (problems.length === 0) effortPowerResolved = resolveEffortPower(p.effortPower as number);
+      }
+    }
+    const resolvedModel = typeof p.model === "string" ? p.model.trim() : modelPowerResolved;
+    const resolvedEffort = p.effort !== undefined ? (p.effort as AgentEffort) : effortPowerResolved;
     const pref: AgentPreference = {
       harness: p.harness as AgentHarness,
-      ...(typeof p.model === "string" ? { model: p.model.trim() } : {}),
-      ...(p.effort !== undefined ? { effort: p.effort as AgentEffort } : {}),
+      ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+      ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
     };
     const identity = JSON.stringify([pref.harness, pref.model ?? null, pref.effort ?? null]);
     if (seen.has(identity)) errors.push(`${pat} repeats an earlier preference`);

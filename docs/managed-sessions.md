@@ -36,7 +36,8 @@ takes effect on restart, not live), like every other provider's query.
   "workingDirectory": "~/code/brooswit-factory/some-project",
   "brief": "Keep this repo's docs and dependency versions current.",
   "vendor": "claude",
-  "tier": "tier1",
+  "modelPower": 25,
+  "effort": 20,
   "permissionMode": "default",
   "execution": "swarm",
   "account": "none",
@@ -48,12 +49,20 @@ takes effect on restart, not live), like every other provider's query.
 }
 ```
 
+(`modelPower: 25, effort: 20` is this doc's own canonical "Sonnet at medium
+effort" pair — see `docs/power-scale.md`. A definition may instead set the
+DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
+`modelPower`/`effort` above — never both; see the `tier` row below and
+`docs/power-scale.md`'s "Back-compat" section.)
+
 | field | required | meaning |
 |---|---|---|
 | `workingDirectory` | yes | Where the managed agent actually works. Absolute, or `~`/`~/rest` (expanded against the daemon's own `$HOME`, same rule as a `filesystem` query's `root`). The agent is told to `cd` there at startup — see "Working directory wiring" below for why this is not the launched process's own OS `cwd`. |
 | `brief` | yes | The agent's prompt/role. Literal text; no `@builtin:` shorthand (that convenience is a `Rule` field's, not a definition's). |
 | `vendor` | yes | `"claude"` or `"codex"` — narrower than `Rule.agentPreferences[].harness` (`agy` is not a Bakr/Candlestix vendor). |
-| `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
+| `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
+| `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
+| `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
@@ -188,6 +197,14 @@ reuses:
   apply to.
 
 ## Tier -> model mapping
+
+**DEPRECATED (FACTORY-75):** `tier` is superseded by the two-axis
+`modelPower`/`effort` mechanism — see `docs/power-scale.md` for the
+current, actively-maintained tables (both vendors, both axes, the four
+operator-requested canonical target pairs, and rules-path support).
+`tierToModel` below is kept working, unchanged, purely for back-compat with
+existing `tier`-based definitions (the 8 live codey ones at the time of
+FACTORY-75) — it is no longer where new model/effort decisions get made.
 
 PORTED from Candlestix's own `~/.config/candlestix/model-tiers.json` on
 host Codey. The ticket's preserved-branch pointer

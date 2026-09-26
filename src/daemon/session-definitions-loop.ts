@@ -17,7 +17,7 @@ import type { FilesystemQuery } from "../resources/filesystem-query.js";
 import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { sessionDefinitionsPath, type SessionDefinitionsEnv } from "../resources/session-definition.js";
 import type { NotifyReason } from "../resources/types.js";
-import type { AccountPolicy, AgentRole } from "../rules/rules.js";
+import type { AccountPolicy, AgentEffort, AgentRole } from "../rules/rules.js";
 import { builtinManagedSessionsRule, createManagedSessionResourceType, ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { runResourceLoop } from "./loop.js";
 
@@ -36,6 +36,8 @@ export interface ManagedSessionsLoopDeps {
   roles?: Map<string, AgentRole>;
   /** See `ManagedSessionResourceDeps.accountPolicies` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, no per-definition account policy is surfaced (existing behaviour unchanged). */
   accountPolicies?: Map<string, AccountPolicy>;
+  /** See `ManagedSessionResourceDeps.resolvedAgents` (src/rules/session-definition-type.ts) — threaded straight through, unchanged shape. Optional; omitted, `HerdrHerd.staleIssues()`'s own `resolvedAgentOf` seam sees no managed-session entries (existing behaviour for anything not wired up). */
+  resolvedAgents?: Map<string, { model: string; effort?: AgentEffort }>;
   /**
    * BUTCHR-460 — the SAME shared `AccountLifecycleHooks` instance every
    * other rule loop is wired against (src/daemon/index.ts), wrapped here
@@ -89,6 +91,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     log: deps.log,
     ...(deps.roles ? { roles: deps.roles } : {}),
     ...(deps.accountPolicies ? { accountPolicies: deps.accountPolicies } : {}),
+    ...(deps.resolvedAgents ? { resolvedAgents: deps.resolvedAgents } : {}),
   });
   const account = deps.account
     ? wireManagedSessionArchiveRelease(deps.account, { exists: deps.exists ?? realPathExists, ...(deps.env ? { env: deps.env } : {}), ruleId: rule.id })
