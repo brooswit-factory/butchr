@@ -545,7 +545,7 @@ Windows task each one manages.
   "Known limitation" above (FACTORY-65) before assuming this install is
   broken.
 - **`powershell.exe`/`cmd.exe` fail with "Invalid argument" from herdr or an
-  agent pane, but work fine from an interactive WSL shell`** — a systemd/
+  agent pane, but work fine from an interactive WSL shell** — a systemd/
   interop gotcha, not a bug in this install's own scripts (which don't yet
   handle it — see "Windows interop under systemd" below).
 - **herdr restarted and Butchr won't replace the vanished worker
@@ -661,7 +661,10 @@ documented safeguard in this repo: `docs/provider-handoff.md` describes
 acknowledgement failure preserve the old worker," and "a handoff blocked
 before commit closes only the candidate pane, with best-effort cleanup" —
 i.e. Butchr fails closed rather than silently discarding a worker it can't
-positively confirm the replacement for. **The report labels this a
+positively confirm the replacement for — consistent with, though not
+verified here as the exact same code path as, the `"handoff blocked"`
+log line in `src/agents/herd.ts` (`startProviders`, `status === "blocked"`).
+**The report labels this a
 "FACTORY-43 safeguard"; this project's own FACTORY-43 ticket, checked
 directly, is a different, unrelated fix (a managed-session respawn-loop
 from a stale-argv comparison, not handoff-blocking) — the underlying
@@ -680,16 +683,16 @@ butchr session unfreeze <name>
 ```
 
 where `<name>` is the managed-session **definition's name** (not a number)
-— see `docs/managed-sessions.md`'s "Managed sessions on this host" pointer
-above for the full session CLI, and its "Two freeze gates" / "Delegated
-freeze/unfreeze" sections for what `freeze`/`unfreeze` actually do
-(flip both the on-disk manifest's `frozen` flag and the daemon's own
-in-memory freeze store) and why a plain re-run of `install`/a manual pane
-kill alone doesn't have the same effect. If the report's `<n>` meant
-something else on the zippy host specifically (e.g. a shorthand the
-operator used for a name they weren't spelling out in full), that
-shorthand isn't reflected in this repo's own CLI — use the real `<name>`
-form above.
+— see `docs/managed-sessions.md`'s own "Two freeze gates, and why both" and
+"Delegated freeze/unfreeze" sections directly for the full session CLI and
+for what `freeze`/`unfreeze` actually do: flip both the on-disk manifest's
+`frozen` flag and the freeze store (on disk, shared with the daemon —
+`instanceFreezeStore`, rooted at `freezeStateRoot()`, honours
+`DROVR_CONTROL_HOME`; see `src/resources/session-freeze.ts`). If the
+report's `<n>` meant something else on the zippy host specifically (e.g. a
+shorthand the operator used for a name they weren't spelling out in full),
+that shorthand isn't reflected in this repo's own CLI — use the real
+`<name>` form above.
 
 ## What was and wasn't tested off-Windows
 
