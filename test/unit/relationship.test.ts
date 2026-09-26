@@ -242,6 +242,23 @@ describe("newWorker: inference", () => {
     expect(child.assignee).toBe(ROLES.task);
   });
 
+  // FACTORY-39 (FACTORY-37): a Bug is a BOSS, the same tier as an Epic — it
+  // creates Stories for the fix rather than fixing the code itself, so it
+  // gets the identical grant an Epic caller gets here, never a new shape.
+  test("Bug caller -> Story child, staffed by roles.story (FACTORY-39: Bug is a boss, mirrors Epic)", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    const child = issues.get(result.key)!;
+    expect(child.issuetype).toBe("Story");
+    expect(child.assignee).toBe(ROLES.story);
+    // The Story carries the Implements link back to the Bug — findBossKey
+    // reads `bossKey`, set on the CHILD (from), never on the caller (to).
+    expect(child.bossKey).toBe("BUTCHR-1");
+    expect(result.implements).toBe("BUTCHR-1");
+  });
+
   test("Task caller REFUSES with a message that explains itself in words, not a type/enum error", async () => {
     const { ops, addIssue } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Task", project: "BUTCHR" });
@@ -249,11 +266,11 @@ describe("newWorker: inference", () => {
       .rejects.toThrow(/is a Task.*has no worker beneath it/);
   });
 
-  test("an unrecognized caller issue type (neither Epic nor Story nor Task) refuses with a generic explanation, not a Task-specific one", async () => {
+  test("an unrecognized caller issue type (neither Epic, Story, Task nor Bug) refuses with a generic explanation, not a Task-specific one", async () => {
     const { ops, addIssue } = makeWorld();
-    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" });
+    addIssue("BUTCHR-1", { issuetype: "Improvement", project: "BUTCHR" });
     await expect(newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } }))
-      .rejects.toThrow(/"Bug".*has no defined child type/);
+      .rejects.toThrow(/"Improvement".*has no defined child type/);
   });
 
   test("a caller issue with no readable issuetype at all refuses, naming it \"unknown\" rather than crashing", async () => {
@@ -1967,6 +1984,17 @@ describe("finishWithoutABoss", () => {
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
   });
+
+  // FACTORY-39 (FACTORY-37): a TOP-LEVEL Bug (no Epic) needs the same
+  // boss-less closing path an Epic gets — this generalizes cleanly with no
+  // code change, since finish_without_a_boss is keyed on findBossKey (a
+  // link), never on issue type. Pinned here as a Bug-specific regression.
+  test("FACTORY-39: a top-level Bug (no Epic) reaches Done through the same boss-less path an Epic uses", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" }); // no bossKey at all
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
 });
 
 // ===========================================================================
@@ -2086,6 +2114,31 @@ describe("BUTCHR-193: finish_without_a_boss refuses a caller with open workers o
     await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/In Review/);
     await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/finish_worker/);
     await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/shelve_worker/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
+  });
+
+  // FACTORY-39 (FACTORY-37): a top-level Bug must be refused exactly like an
+  // Epic is when it still has an open Story — same guard (`openWorkers`),
+  // link-based, no code change needed to reach a Bug caller; pinned as its
+  // own acceptance test per this ticket's own definition of done.
+  test("FACTORY-39: refuses a top-level Bug with an open Story, naming the Story's key, status, and both discharge verbs", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/BUTCHR-2/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/In Progress/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/finish_worker/);
+    await expect(finishWithoutABoss(ops, "BUTCHR-1")).rejects.toThrow(/shelve_worker/);
+    expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
+  });
+
+  test("FACTORY-39: a Bug with a parent Epic is refused by submit_to_boss (not finish_without_a_boss) while its Story is still open — same guard, the WITH-a-boss door", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-0", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR", bossKey: "BUTCHR-0" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Review" });
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/BUTCHR-2/);
+    await expect(submitToBoss(ops, "BUTCHR-1")).rejects.toThrow(/In Review/);
     expect(issues.get("BUTCHR-1")!.status).toBe("To Do");
   });
 
@@ -2502,6 +2555,24 @@ describe("newWorker: tier-identity collision (BUTCHR-110/S1, issue caller)", () 
     expect(child.comments).toHaveLength(1);
     expect(child.comments[0]).toStartWith("[BUTCHR-1]");
     expect(child.comments[0]).toContain("GitHub refuses");
+  });
+
+  // FACTORY-39: a Bug caller has NO role variable at all (a Bug's assignee
+  // is whoever the bug was filed to, never daemon-staffed) — this must say
+  // so honestly, never claim BUTCHR_ASSIGNEE_EPIC governs it (the wrong-
+  // variable failure this collision machinery's own doc comment warns
+  // against, just for the new tier this ticket adds).
+  test("Bug caller whose OWN assignee equals roles.story: identityCollision names the bug tier honestly (no role variable), never BUTCHR_ASSIGNEE_EPIC", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR", assignee: ROLES.story });
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result.identityCollision).toBeDefined();
+    expect(result.identityCollision).toContain("bug tier");
+    expect(result.identityCollision).toContain("no role variable");
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_STORY");
+    expect(result.identityCollision).not.toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(result.identityCollision).toContain(ROLES.story);
   });
 
   test("non-collision: caller's own assignee differs from the child's role — no identityCollision, no comment, nothing added to the result", async () => {
