@@ -118,6 +118,35 @@ describe("briefFor / modelFor", () => {
     expect(briefFor("Task")).toContain("one unit of work");
     expect(briefFor("Bug")).toContain("Read your ticket");
   });
+  // FACTORY-40: briefs/bug.md was rewritten from a ~21-line worker-tier stub
+  // ("You own one defect. Reproduce it... work in the repository... submit
+  // the bug for review") into a boss-tier brief, the same tier as an Epic —
+  // it files Stories for the fix and formally reviews them, never touching
+  // code itself. This guards the shape of that rewrite directly, the same
+  // way the merge-check-guard/assertion-check-guard accounting guards its
+  // review-instruction content: a future edit that quietly regresses bug.md
+  // back toward "fix it yourself" fails this loudly instead of only
+  // surfacing in a much later end-to-end symptom.
+  test("FACTORY-40: bug brief is boss-tier — reviews Stories via new_worker, sends a [review] line, states the Done-gate, and carries no worker-stub phrasing instructing it to fix code itself", () => {
+    const brief = briefFor("Bug");
+    // boss-side staffing verb, same as epic.md/story.md teach for their own workers
+    expect(brief).toContain("new_worker");
+    expect(brief).toContain("adopt_worker");
+    // the reviewer-side [review] line shape this brief sends DOWN to a Story
+    expect(brief).toMatch(/\[review\]\s+APPROVED\s+<pr-url>\s+@\s*<full 40-char sha>/);
+    expect(brief).toMatch(/\[review\]\s+CHANGES_REQUESTED\s+<pr-url>\s+@\s*<full 40-char sha>/);
+    // the Done-gate, stated in words (point 6 of FACTORY-40's own ticket)
+    expect(brief).toContain("never closes itself");
+    expect(brief).toContain("Stories is not Done");
+    // negative: none of the old worker-stub's own phrasing survives
+    expect(brief).not.toContain("identify the smallest correct fix");
+    expect(brief).not.toContain("work in the repository and branch named by the ticket");
+    expect(brief).not.toContain("submit the bug for review");
+    // negative: a Bug never authors its own PR — no author-side merge check
+    // (that's Story's/Task's instruction, not a boss's — see
+    // merge-check-guard.test.ts's MERGE_INSTRUCTING_BRIEFS)
+    expect(brief).not.toContain("reviews[].commit.oid");
+  });
   test("BUTCHR-71: a project resource is selected the SAME WAY an issue's issuetype is — 'project' resolves to briefs/project.md, case-insensitively", () => {
     expect(briefFor("project")).toContain("You own a **product**, not a ticket");
     expect(briefFor("Project")).toBe(briefFor("project")); // same case-insensitivity every other entry gets
