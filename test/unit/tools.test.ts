@@ -743,6 +743,14 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
     expect(Object.keys(tools.set_doc!.input).sort()).toEqual(["body", "title"]);
   });
 
+  test("get_doc's description no longer sends an agent to set_doc to create a doc (FACTORY-84/FACTORY-86 review fix: set_doc refuses, it never creates)", () => {
+    const { tools } = customRig();
+    const d = tools.get_doc!.description;
+    expect(d).not.toMatch(/use set_doc to create/i);
+    expect(d).toMatch(/set_doc writes an EXISTING doc/);
+    expect(d).toMatch(/confluence_create_page/);
+  });
+
   test("get_doc() with no args resolves to the caller's OWN key from x-issue, never an argument", async () => {
     const seen: string[] = [];
     const { tools } = customRig({ getRemoteLink: async (key) => { seen.push(key); return null; } });
