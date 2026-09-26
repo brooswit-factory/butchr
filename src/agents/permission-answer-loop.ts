@@ -151,6 +151,16 @@ export interface PermissionAnswerLoopDeps {
   loggedSkips?: Set<string>;
   /** Test seam: the drovr pass to run. Defaults to `@brooswit/drovr`'s own `autoAnswerPermissions`. */
   autoAnswer?: typeof autoAnswerPermissions;
+  /**
+   * FACTORY-98: called once per tick with the pane ids `eligiblePanes`
+   * returned THIS tick — before any screen is scanned or pressed, and even
+   * when the set is empty. Lets a caller (`permission-answer-watch.ts`'s
+   * event-driven fast path) keep a herdr push subscription's pane-id filter
+   * in sync with the exact same `agent.list()` call this tick already makes,
+   * instead of polling a second one just to notice the set changed. Optional;
+   * omitted, nothing extra happens.
+   */
+  onEligiblePaneIds?: (paneIds: readonly string[]) => void;
 }
 
 /**
@@ -185,6 +195,7 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
   try {
     const { agents } = await deps.client.agent.list();
     const labels = deps.eligiblePanes(agents.map((a) => ({ pane_id: a.pane_id, cwd: a.cwd })));
+    deps.onEligiblePaneIds?.([...labels.keys()]);
     if (labels.size === 0) return [];
     const eligible = agents.filter((a) => labels.has(a.pane_id));
     const scopedClient: PermissionAnswerClient = {
