@@ -25,15 +25,18 @@
  * `SpawnSpec` from it, something `specForFilesystem` structurally cannot do.
  */
 import { readFile } from "node:fs/promises";
+import type { JiraIssue } from "../atlassian/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, resourceMatches, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { AccountPolicy, AgentRole, Rule } from "./rules.js";
 import type { SpawnSpec } from "../agents/workspace.js";
+import { createLinkedEventingState, type LinkedEventingDeps, type ProjectLinkedEventingMatch } from "../jira-watch/linked-eventing.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
+import { parseResourceRef } from "../resources/resource-ref.js";
 import { isHiddenDefinitionFile, parseSessionDefinitionFile, tierToModel, type SessionDefinition } from "../resources/session-definition.js";
-import type { EventPoll, EventRules, PollSnapshot, ResourceType } from "../resources/types.js";
+import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
 import { onceOversized } from "./filesystem-type.js";
 
@@ -77,6 +80,88 @@ export const ownsManagedSessionAgent = (id: string, ruleId: string = MANAGED_SES
   const decoded = decodeAnyAgentKey(id);
   return decoded?.resourceProvider === "filesystem" && decoded.ruleId === ruleId;
 };
+
+/**
+ * FACTORY-53/FACTORY-71 (epic FACTORY-51) — wires a managed-session
+ * definition's `linkedEventingProjects` (src/resources/session-definition.ts)
+ * into the SAME `jira-project` linked-eventing machinery
+ * (`createLinkedEventingState`/`runTick`, src/jira-watch/linked-eventing.ts)
+ * `createJiraProjectResourceType` already reuses for its own owners — never
+ * a second watcher, never a separate rate cap (the ticket's own instruction).
+ *
+ * `MANAGED_SESSION_LINKED_EVENTING_RULE` is the one new seam this needed
+ * INSIDE `runTick`: every `ProjectLinkedEventingMatch` is gated on
+ * `m.rule.linkedEventing === true` (unchanged — see that gate's own doc
+ * comment on why it was reused rather than generalised), but a managed
+ * session has no `Rule` of its own to read that flag from. Naming a project
+ * in `linkedEventingProjects` already IS the per-project opt-in, so this
+ * fixed, shared, never-user-editable `Rule`-shaped value simply always
+ * carries `linkedEventing: true` — there is no separate boolean to plumb
+ * through, and every OTHER linked-eventing knob (`maxLinkedItems`,
+ * `maxLinkedTurnsPerHour`, `linkedRemoteLinks`, `linkedDescriptionLinks`) is
+ * left absent, the same "absent means uncapped/off" default an unconfigured
+ * `jira-project` rule already has. `resourceProvider: "filesystem"` (rather
+ * than "jira-project") is deliberate: this value never names a jira-project
+ * RULE — it names the managed-sessions definition file that granted the
+ * opt-in — but nothing reads its `resourceProvider`/`query` fields; they
+ * exist only because `Rule` requires them.
+ */
+const MANAGED_SESSION_LINKED_EVENTING_RULE_ID = "managed-sessions-linked-eventing";
+const MANAGED_SESSION_LINKED_EVENTING_RULE: Rule = {
+  id: MANAGED_SESSION_LINKED_EVENTING_RULE_ID,
+  enabled: true,
+  resourceProvider: "filesystem",
+  query: JSON.stringify({ root: "/", kind: "file", maxDepth: 0 }),
+  brief: "Managed-session linked-eventing opt-in gate (FACTORY-53) — never a real rule; matches no resource of its own.",
+  execution: "swarm",
+  account: "none",
+  role: "worker",
+  linkedEventing: true,
+};
+
+/**
+ * FACTORY-53/FACTORY-71: the STATE-OWNING key one (session, opted-in
+ * project) pair uses inside `runTick`'s own `agentKey`-keyed maps — see
+ * `ProjectLinkedEventingMatch.notifyAgentKey`'s own doc comment for why this
+ * must differ from `sessionAgentKey` whenever a session names more than one
+ * project (otherwise the second project's per-tick state would silently
+ * overwrite the first's). `"\0"` (NUL) is the separator: every real agent
+ * key already forbids a NUL byte (see e.g. `controllerListProblems`,
+ * src/resources/session-definition.ts), so this can never collide with a
+ * real agent key, and this string is never decoded — it is opaque, used only
+ * as an internal Map key inside `createLinkedEventingState`.
+ */
+const managedSessionProjectWatchKey = (sessionAgentKey: string, projectRef: string): string => `${sessionAgentKey}\0linked:${projectRef}`;
+
+/**
+ * One eligible, opted-in definition's own `ProjectLinkedEventingMatch[]` —
+ * one per entry in its `linkedEventingProjects` (already validated,
+ * canonical `jira-project:<KEY>` refs — see `linkedEventingProjectsProblems`,
+ * src/resources/session-definition.ts), `[]` for a definition that names
+ * none (today's behaviour exactly: no extra state, no extra search — see
+ * `runTick`'s own `if (!opted.length && !projectOpted.length) return;`).
+ * Exported and kept pure (no I/O, no `isFrozen` check) so it is unit-testable
+ * on its own, mirroring the existing BUTCHR-469 test style of asserting
+ * directly against hand-built `ProjectLinkedEventingMatch` values rather
+ * than only through the full resource-type wiring.
+ */
+export function sessionDefinitionProjectMatches(m: SessionDefinitionMatch): ProjectLinkedEventingMatch[] {
+  const refs = m.definition.linkedEventingProjects;
+  if (!refs?.length) return [];
+  return refs.map((ref) => {
+    const parsed = parseResourceRef(ref);
+    // Unreachable in practice: `parseSessionDefinition` already validated
+    // every entry is a `jira-project` reference at manifest-load time (see
+    // `linkedEventingProjectsProblems`) — defensive, not a real branch.
+    const projectKey = parsed.provider === "jira-project" ? parsed.key : ref;
+    return {
+      agentKey: managedSessionProjectWatchKey(m.agentKey, ref),
+      rule: MANAGED_SESSION_LINKED_EVENTING_RULE,
+      projectKey,
+      notifyAgentKey: m.agentKey,
+    };
+  });
+}
 
 /** Told about a definition file that failed to parse/validate (`error` is the joined problem list) — never crashes the poll; see this module's own top comment. */
 export type InvalidDefinition = (path: string, error: string) => void;
@@ -272,6 +357,61 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * fail-safe `"none"` default — same brief, documented window `roles` has.
    */
   accountPolicies?: Map<string, AccountPolicy>;
+  /**
+   * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `roles`/
+   * `accountPolicies` immediately above, one field over: whether an eligible
+   * definition opted into "lizard mode" (`SessionDefinition.lizardMode`).
+   * The permission-answer timer (`src/agents/permission-answer-loop.ts`,
+   * wired in `src/daemon/index.ts`) consults this map every tick to decide
+   * which panes it may scan/answer at all — a definition absent from this
+   * map (not yet observed this daemon's lifetime, or simply never setting
+   * the field) is never touched, matching `lizardMode`'s own "absent means
+   * today's behaviour exactly" contract. Deliberately live, not
+   * persisted-at-spawn like `permissionMode`/`strictMcpConfig` (FACTORY-43)
+   * — this field never reaches the launched process's argv, so there is
+   * nothing for a stale-argv check to compare and no respawn-loop risk to
+   * guard against; toggling it in the manifest takes effect on this loop's
+   * very next poll, live, with no agent restart. Optional; omitted, no
+   * lizard-mode information is surfaced (today's behaviour — every caller
+   * before this ticket, and any direct call that does not opt in).
+   */
+  lizardModes?: Map<string, boolean>;
+  /**
+   * FACTORY-53/FACTORY-71 — the SAME `(jql) => Promise<JiraIssue[]>` seam
+   * `CreateJiraProjectResourceTypeDeps.searchIssues` (src/rules/jira-project-type.ts)
+   * already uses for linked-eventing's member-discovery watch and its shared
+   * batched Jira-kind fetch. Optional; omitted (or `notify` below omitted),
+   * linked-eventing never runs for managed-session agents — the same
+   * "omitted dep ⇒ feature silently never runs" shape `jira-project`'s own
+   * wiring already has, so every existing caller/test that doesn't wire this
+   * is completely unaffected.
+   */
+  searchIssues?: (jql: string) => Promise<JiraIssue[]>;
+  /** FACTORY-53/FACTORY-71 — delivers one poll tick's coalesced linked-change nudge; the SAME seam `CreateJiraProjectResourceTypeDeps.notify` already is. Both this AND `searchIssues` must be present for a linked-eventing tick to ever run (see `discovery.related` below). */
+  notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
+  /** FACTORY-53/FACTORY-71 — per-target comment-cursor support for a project's member/managed-link Jira targets, the SAME `LinkedEventingDeps.comments` shape. Optional; omitted, no comment event is ever detected. */
+  comments?: LinkedEventingDeps["comments"];
+  /** FACTORY-53/FACTORY-71 — the FACTORY-4/FACTORY-8 managed-link store, routed (`createRoutingLinkStore`) exactly as `CreateJiraProjectResourceTypeDeps.linkStore` already is, so a `jira-project:<KEY>` owner ref reaches the SAME `brooswit.butchr.links` project-property store a `jira-project` rule's own agent would. Optional; omitted, no managed link is ever reconciled into a session's watch. */
+  linkStore?: LinkedEventingDeps["linkStore"];
+  /**
+   * FACTORY-53/FACTORY-71 — the SAME herd/store-level freeze check
+   * `CreateJiraProjectResourceTypeDeps.isFrozen` already is (`herd.frozen`,
+   * keyed by real agent id — see `session-freeze.ts`'s own
+   * `instanceFreezeStore`), consulted in `discovery.related` below to
+   * exclude an opted-in but currently-frozen session from even BUILDING a
+   * `ProjectLinkedEventingMatch` this poll — belt-and-suspenders on top of
+   * `herd.nudge`'s own `assertRunnable` freeze check, which already refuses
+   * to deliver to a frozen agent regardless (the ONLY freeze enforcement
+   * `jira-project`'s own owners get today; see that check's own doc comment
+   * for why relying on it alone is already sufficient for correctness, but
+   * checking `isFrozen` here too avoids doing a member-discovery search and
+   * building state for an agent that cannot be nudged either way). Optional;
+   * omitted, this extra check simply never runs (delivery is still refused
+   * centrally by `herd.nudge`).
+   */
+  isFrozen?: (id: string) => Promise<boolean>;
+  /** Injectable clock, for deterministic tests — threaded straight through to `LinkedEventingDeps.now`. */
+  now?: () => number;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
@@ -279,6 +419,11 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
   const onInvalid = onceInvalidDefinition(deps.log);
   const onFrozen = onceFrozenDefinition(deps.log);
   const onMissingRoot = onceMissingRoot(deps.log);
+  // FACTORY-53/FACTORY-71: this poll's own matches, read by `related` below
+  // — mirrors `createJiraProjectResourceType`'s own `let latest`
+  // (src/rules/jira-project-type.ts).
+  let latest: SessionDefinitionMatch[] = [];
+  const linkedEventingState = createLinkedEventingState();
   return {
     discovery: {
       idOf: unitAgentKey,
@@ -292,7 +437,44 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
           deps.accountPolicies.clear();
           for (const m of matches) deps.accountPolicies.set(m.agentKey, m.definition.account);
         }
+        latest = matches;
+        if (deps.lizardModes) {
+          deps.lizardModes.clear();
+          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? false);
+        }
         return groupExecutionUnits([deps.rule], matches);
+      },
+      // FACTORY-53/FACTORY-71: linked-change eventing for managed-session
+      // agents that opt in via `linkedEventingProjects` — mirrors
+      // `createJiraProjectResourceType`'s own `related` (src/rules/jira-project-type.ts)
+      // almost verbatim; see this function's own deps doc comments for what
+      // each seam is. Only runs when BOTH `deps.notify` and
+      // `deps.searchIssues` are wired; either omitted, no tick ever runs
+      // (every existing caller/test that wires neither is unaffected).
+      related: async () => {
+        if (deps.notify && deps.searchIssues) {
+          const notify = deps.notify;
+          const searchIssues = deps.searchIssues;
+          const projectMatches: ProjectLinkedEventingMatch[] = [];
+          for (const m of latest) {
+            if (!m.definition.linkedEventingProjects?.length) continue;
+            if (await deps.isFrozen?.(m.agentKey)) continue; // see `isFrozen`'s own doc comment — belt-and-suspenders, herd.nudge refuses delivery either way
+            projectMatches.push(...sessionDefinitionProjectMatches(m));
+          }
+          try {
+            await linkedEventingState.runTick([], {
+              search: searchIssues,
+              notify,
+              ...(deps.log ? { log: deps.log } : {}),
+              ...(deps.now ? { now: deps.now } : {}),
+              ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
+              ...(deps.comments ? { comments: deps.comments } : {}),
+            }, projectMatches);
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] managed-session project tick threw: ${(e as Error)?.message ?? e}`);
+          }
+        }
+        return [] as RelatedResource<ExecutionUnit<SessionDefinitionMatch>>[];
       },
     },
     activation: { verdictFor: () => "active" },

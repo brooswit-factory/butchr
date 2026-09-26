@@ -56,6 +56,7 @@ takes effect on restart, not live), like every other provider's query.
 | `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
+| `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, Claude only, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
@@ -170,15 +171,9 @@ reuses:
   project keys — so a consumer already working in `ResourceRef`/canonical-
   string terms elsewhere in the codebase needs no separate parsing step to
   use it.
-- **Additive, parse-only:** a definition WITHOUT this field parses and
-  behaves exactly as it did before this field existed — no key materialises
-  on the parsed object at all. This ticket (FACTORY-54) is schema +
-  parsing + validation only: nothing in the daemon reads
-  `linkedEventingProjects` yet to actually nudge, notify, rate-cap, or watch
-  anything. That wiring — making a managed-session agent's own project
-  opt-in actually DO something, mirroring what `Rule.linkedEventing`
-  (`src/rules/rules.ts`) already does for rule-owned resources — is
-  FACTORY-53's own scope.
+- **Additive:** a definition WITHOUT this field parses and behaves exactly
+  as it did before this field existed — no key materialises on the parsed
+  object, no extra search, no extra state.
 - **Deliberately not a reuse of `Rule.linkedEventing`:** that field is a
   per-RULE boolean with no project of its own to name (a `Rule` already
   owns whichever resources its query matches); a managed-session definition
@@ -186,6 +181,26 @@ reuses:
   not merely whether — hence a dedicated, project-naming field here instead
   of trying to bolt a boolean onto a definition that has nothing for it to
   apply to.
+- **Wired (FACTORY-53/FACTORY-71, epic FACTORY-51):** naming a project here
+  actually nudges this definition's agent now — see
+  `docs/resource-links.md`'s "Managed-session linked eventing" section for
+  the full behaviour (what fires a nudge, and how a frozen session is
+  excluded). `createManagedSessionResourceType`'s own `related` hook
+  (`src/rules/session-definition-type.ts`) builds one
+  `ProjectLinkedEventingMatch` per opted-in project and feeds it straight
+  into the SAME `createLinkedEventingState`/`runTick` machinery
+  (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
+  already use — no second watcher, no separate rate cap.
+- **Uncapped by default (known gap, FACTORY-78):** these nudges reuse the
+  BUTCHR-469 rate-cap MECHANISM, but this definition has no field to
+  configure a cap VALUE, and the wiring's own fixed `Rule`-shaped gate never
+  sets one — so today, a managed session's linked-eventing nudges are
+  uncapped, the same "absent means uncapped" behaviour an unconfigured
+  `jira-project` rule owner already has, not a real per-session or
+  per-project budget. A real default (or a per-definition setting) is an
+  open operator decision, deliberately deferred rather than invented
+  unilaterally — see `docs/resource-links.md`'s own section for the full
+  reasoning and FACTORY-78 for the tracked gap.
 
 ## Tier -> model mapping
 
@@ -813,6 +828,12 @@ What each kind of mismatch actually does:
 
 ## Working directory wiring
 
+For a Windows host running Butchr inside WSL specifically, see
+[`docs/windows-wsl-agent-guide.md`](windows-wsl-agent-guide.md) for how to
+choose `workingDirectory` between the WSL home and `/mnt/c/...`, and how to
+translate paths between them — this section covers the mechanism, not that
+host-specific choice.
+
 `SpawnSpec.cwd` (`src/agents/workspace.ts`, BUTCHR-408) carries a
 definition's own `workingDirectory` through the shared spawn machinery —
 but, as of PR #394's THIRD review round, it is **not** the spawned
@@ -987,6 +1008,80 @@ does. A director definition wants both: `assertNoInheritedMcpConfig` closes
 the project-level gap unconditionally, `strictMcpConfig: true` closes the
 user-level one this definition explicitly asks for.
 
+## Lizard mode: manual permission mode without the freeze risk (DROVR-42/FACTORY-67)
+
+DROVR-37 shipped `@brooswit/drovr`'s `autoAnswerPermissions`: an unattended
+pass over Claude panes that presses the "Yes, and always allow … from this
+project" stored-rule option on an unambiguous tool-permission dialog, only
+when it is unambiguous, auditing every attempt. The operator's own name for
+running a managed session in Claude's manual/ask mode (`permissionMode:
+"default"`) with that auto-answer switched on is **"lizard mode"** — the
+point is to keep manual mode's own safety property for every tool call
+while never letting the agent sit frozen on the ONE dialog drovr already
+answers safely, which is exactly the incident (agents frozen for hours,
+herdr reporting them idle/done) this whole DROVR-37 epic exists to fix:
+
+```json
+{
+  "workingDirectory": "~/candlestix/throwaway-director",
+  "brief": "A throwaway live-proof session.",
+  "vendor": "claude",
+  "tier": "tier2",
+  "permissionMode": "default",
+  "lizardMode": true
+}
+```
+
+`lizardMode: true` opts this ONE definition's agent into the daemon's
+separate permission-answer timer (`src/agents/permission-answer-loop.ts`,
+20s cadence, its own `setInterval` independent of the reconcile loop and the
+blocking-escalation watcher — see `docs/permission-answer-loop.md` for the
+full cadence/audit-visibility writeup). A definition that doesn't set the
+field is untouched by that timer entirely — this is NOT a blanket sweep over
+every pane; the timer's own `eligiblePanes` hook resolves, fresh every tick,
+which panes belong to a currently-eligible `lizardMode: true` definition
+(via the SAME live `managedSessionLizardModes` map BUTCHR-408's `roles`/
+BUTCHR-460's `accountPolicies` maps already established the pattern for —
+rebuilt every managed-sessions poll from each eligible definition's own
+manifest, never persisted or acted on stale).
+
+**Nothing here requires pairing with `permissionMode: "default"`** — the
+field is independent and a definition may set it alongside any
+`permissionMode` — but manual mode is the combination it exists for; in
+`"auto"`/`"bypassPermissions"` mode the tool-permission dialog this targets
+essentially never appears, so `lizardMode` there is a harmless no-op, not an
+error.
+
+**No stale-argv risk, unlike `permissionMode`/`strictMcpConfig` (FACTORY-43).**
+Those two fields DO reach the launched process's argv, which is exactly why
+FACTORY-43 had to fix `HerdrHerd.staleIssues()` to read their persisted
+spawn-time values back through the SAME builder the real launch uses,
+closing a respawn-loop bug from a second, independently-recomputed
+expectation. `lizardMode` was deliberately kept out of `SpawnSpec` entirely
+— it never becomes a CLI flag, so there is no argv for a stale-argv check to
+compare and nothing to keep in sync. Toggling it in a manifest takes effect
+on the daemon's very next poll, live, no agent respawn.
+
+**Audit visibility.** Every auto-answer is recorded to a JSONL file under
+the workspace root (`Config.permissionAuditPath`, default
+`.permission-audit.jsonl`) with the exact stored-rule text pressed, and the
+daemon's own journal logs a line per answered/failed pane naming the
+DEFINITION FILE (not just an opaque pane id) and the tool — see
+`docs/permission-answer-loop.md`'s "Seeing recent auto-answers" section for
+the full detail and the reasoning for why this module never re-parses a
+pane's dialog itself to recover the exact rule text (dialog recognition
+stays drovr's job — FACTORY-49/FACTORY-67).
+
+**Rule-launched agents are a separate, dependent story.** FACTORY-76 extends
+the same field/mechanism to jira-work / jira-project / github / filesystem
+rule agents — not this ticket's scope, coordinated on field name and
+daemon-wiring shape rather than diverging.
+
+**Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
+manifest load rather than silently storing-and-dropping it — see
+"Per-vendor launch differences" immediately below for why this follows
+`strictMcpConfig`'s precedent, not `permissionMode`'s more lenient one.
+
 ## Per-vendor launch differences
 
 `permissionMode` reaches a **Claude** launch's `ClaudeAgentLaunch.permissionMode`
@@ -1018,6 +1113,14 @@ no-op), but a silently-ignored `strictMcpConfig` would leave them believing
 they have an MCP-isolation security property they do not — the exact
 silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
 first place. `test/unit/session-definition.test.ts` proves the rejection.
+
+`lizardMode` follows `strictMcpConfig`'s precedent, not `permissionMode`'s:
+`@brooswit/drovr`'s `classifyPermissionPrompt` recognises the Claude Code
+CLI's own tool-permission dialog shape specifically and never matches a
+Codex pane's screen, so a `vendor: "codex"` definition setting
+`lizardMode: true` would silently do nothing — the same misleading-silence
+failure mode, closed the same way (**REJECTED at manifest load**, any
+value, not merely a truthy one).
 
 ## Not in this version
 

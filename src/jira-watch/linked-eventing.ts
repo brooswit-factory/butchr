@@ -35,6 +35,24 @@
  * own doc comment for the full design (member-discovery watermark, managed
  * links, and the member/managed-link dedup and removal-tracking rules).
  *
+ * FACTORY-53/FACTORY-71 (epic FACTORY-51): a THIRD source of
+ * `ProjectLinkedEventingMatch`es, alongside the `jira-project` owner above —
+ * a managed-session agent that opts one or more Jira projects into this same
+ * machinery via its own `linkedEventingProjects` field
+ * (src/resources/session-definition.ts). Built by
+ * `sessionDefinitionProjectMatches` (src/rules/session-definition-type.ts),
+ * never here — this module stays ignorant of managed-session definitions
+ * entirely, exactly as it already stays ignorant of `jira-project`'s own
+ * `ProjectMatch` shape (src/rules/jira-project-type.ts). The one seam this
+ * addition needed INSIDE this module is `ProjectLinkedEventingMatch.notifyAgentKey`
+ * (see its own doc comment) — everything else, including the opt-in gate
+ * (`m.rule.linkedEventing === true`) and the rate cap, is reused completely
+ * unchanged: a managed-session match's `rule` is a fixed, shared, non-editable
+ * `Rule`-shaped value with `linkedEventing: true` (naming a project in
+ * `linkedEventingProjects` already IS the opt-in — there is no separate
+ * per-session boolean to carry), so this module never needed a second,
+ * looser gate.
+ *
  * ONE HOP ONLY (epic decision, not re-litigated here either): a linked
  * item's OWN further links are never chased. This module only ever diffs
  * the target's own status/summary/updated/labels (Jira-kind) or its own
@@ -259,6 +277,33 @@ export interface ProjectLinkedEventingMatch {
   agentKey: string;
   rule: Rule;
   projectKey: string;
+  /**
+   * FACTORY-53/FACTORY-71: the REAL agent this match's coalesced nudge is
+   * delivered to, when it differs from `agentKey` above. Every existing
+   * `jira-project` caller leaves this absent — for that owner, the watched
+   * project's own identity IS both the state-owning key and the notified
+   * agent, so `agentKey` is used for both, byte-identical to pre-FACTORY-71
+   * behaviour (see `runTick`'s own `ownerEntries` construction below).
+   *
+   * A managed-session agent that opts into one or more Jira projects via
+   * `linkedEventingProjects` (src/resources/session-definition.ts) needs
+   * `agentKey` to be a synthetic, per-(session, project) identity instead:
+   * every map in `runTick` below (`baselines`, `watchSets`, `turns`,
+   * `projectWatermarks`, ...) is keyed by `agentKey` ALONE, so a session
+   * opted into more than one project — feeding two matches that both used
+   * the session's own real agent key as `agentKey` — would have the second
+   * project's per-tick state silently OVERWRITE the first's in every one of
+   * those maps, permanently losing that project's watch. Giving each
+   * (session, project) pair its own `agentKey` keeps their state
+   * independent (own watermark, own rate-cap bucket); this field then says
+   * where the resulting nudge actually goes — the session's own real agent
+   * key, which is also what `herd.nudge`'s own freeze check
+   * (`instanceFreezeStore.assertRunnable`) is keyed on, so a frozen session
+   * is never nudged regardless of which project's watch fired. See
+   * `sessionDefinitionProjectMatches` (src/rules/session-definition-type.ts)
+   * for the one caller that sets this.
+   */
+  notifyAgentKey?: string;
 }
 
 /** Of every kind `discoverLinkedItems` can produce, only these are Jira-kind for THIS module's Jira-diffing path (Confluence/GitHub/webpage are BUTCHR-437's, driven by the external-poll.ts path below). */
@@ -794,10 +839,17 @@ export function createLinkedEventingState(): LinkedEventingState {
       // fork on which kind of match produced an owner's items. `label` is
       // only ever used for a log line (`rateCappedSuppressedLine`); every
       // other decision reads `perOwnerItems`/`managedTargetsByOwner` by
-      // `agentKey` alone.
-      const ownerEntries: Array<{ agentKey: string; rule: Rule; label: string }> = [
-        ...opted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.issue.key })),
-        ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey })),
+      // `agentKey` alone. FACTORY-53/FACTORY-71: `notifyAgentKey` is the ONE
+      // exception — see `ProjectLinkedEventingMatch.notifyAgentKey`'s own
+      // doc comment for why delivery may target a different real agent than
+      // the state-owning `agentKey`. Defaults to `agentKey` for an issue
+      // owner (no such field on `LinkedEventingMatch`) and for any project
+      // owner that leaves it unset (every `jira-project` caller today) —
+      // byte-identical to the pre-FACTORY-71 `deps.notify(entry.agentKey,
+      // entry.agentKey, ...)` call below.
+      const ownerEntries: Array<{ agentKey: string; rule: Rule; label: string; notifyAgentKey: string }> = [
+        ...opted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.issue.key, notifyAgentKey: m.agentKey })),
+        ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey, notifyAgentKey: m.notifyAgentKey ?? m.agentKey })),
       ];
       // The subset of `kept` that participates in watch-set/removal
       // tracking: everything, for an issue owner (unchanged pre-BUTCHR-469
@@ -1120,7 +1172,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         // unadvanced too, so "delayed, not lost" holds for a notify failure
         // the same way it already does for a capped tick. (`lastExternalPollAt`
         // is the one exception — see this module's own top comment.)
-        await deps.notify(entry.agentKey, entry.agentKey, { linked: { events } });
+        await deps.notify(entry.notifyAgentKey, entry.notifyAgentKey, { linked: { events } });
         advance();
       }
     },
