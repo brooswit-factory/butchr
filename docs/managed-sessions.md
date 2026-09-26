@@ -170,15 +170,9 @@ reuses:
   project keys — so a consumer already working in `ResourceRef`/canonical-
   string terms elsewhere in the codebase needs no separate parsing step to
   use it.
-- **Additive, parse-only:** a definition WITHOUT this field parses and
-  behaves exactly as it did before this field existed — no key materialises
-  on the parsed object at all. This ticket (FACTORY-54) is schema +
-  parsing + validation only: nothing in the daemon reads
-  `linkedEventingProjects` yet to actually nudge, notify, rate-cap, or watch
-  anything. That wiring — making a managed-session agent's own project
-  opt-in actually DO something, mirroring what `Rule.linkedEventing`
-  (`src/rules/rules.ts`) already does for rule-owned resources — is
-  FACTORY-53's own scope.
+- **Additive:** a definition WITHOUT this field parses and behaves exactly
+  as it did before this field existed — no key materialises on the parsed
+  object, no extra search, no extra state.
 - **Deliberately not a reuse of `Rule.linkedEventing`:** that field is a
   per-RULE boolean with no project of its own to name (a `Rule` already
   owns whichever resources its query matches); a managed-session definition
@@ -186,6 +180,16 @@ reuses:
   not merely whether — hence a dedicated, project-naming field here instead
   of trying to bolt a boolean onto a definition that has nothing for it to
   apply to.
+- **Wired (FACTORY-53/FACTORY-71, epic FACTORY-51):** naming a project here
+  actually nudges this definition's agent now — see
+  `docs/resource-links.md`'s "Managed-session linked eventing" section for
+  the full behaviour (what fires a nudge, the rate cap, and how a frozen
+  session is excluded). `createManagedSessionResourceType`'s own `related`
+  hook (`src/rules/session-definition-type.ts`) builds one
+  `ProjectLinkedEventingMatch` per opted-in project and feeds it straight
+  into the SAME `createLinkedEventingState`/`runTick` machinery
+  (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
+  already use — no second watcher, no separate rate cap.
 
 ## Tier -> model mapping
 

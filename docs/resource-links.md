@@ -672,6 +672,96 @@ same as every other JQL search in this codebase (the shared `key in (...)`
 batch included); accepted as-is for a project's own window search, no
 different from any other `searchAll` caller.
 
+## FACTORY-53/FACTORY-71 (epic FACTORY-51): managed-session linked eventing
+
+Wires a managed-session definition's `linkedEventingProjects` field
+(FACTORY-52, `src/resources/session-definition.ts` — see
+`docs/managed-sessions.md`'s own section on it) into the EXACT SAME
+`jira-project` owner machinery the BUTCHR-469 section above describes:
+member discovery, the project's own managed-link collection, the coalescer,
+the per-agent rate cap, and delivery all reuse `runTick`
+(`src/jira-watch/linked-eventing.ts`) unchanged. No second watcher, no
+separate/looser rate cap.
+
+**The one new seam.** A `jira-project` rule owner's `ProjectLinkedEventingMatch.agentKey`
+is both the state-owning identity `runTick`'s own `agentKey`-keyed maps use
+AND the real agent `deps.notify` delivers to — true 1:1 for a rule-owned
+project. A managed session breaks that 1:1: `linkedEventingProjects` is an
+array, so ONE session may opt into SEVERAL projects, but `runTick`'s
+internal maps (baselines, watch sets, the rate-cap `turns` window, the
+per-project member watermark, ...) are all keyed by `agentKey` alone —
+feeding two matches that both used the session's own real agent key as
+`agentKey` would let the second project's per-tick state silently overwrite
+the first's, permanently losing that project's watch. `ProjectLinkedEventingMatch`
+therefore grew one new optional field, `notifyAgentKey`: `sessionDefinitionProjectMatches`
+(`src/rules/session-definition-type.ts`) gives each (session, project) pair
+its own synthetic, opaque `agentKey` (`<session agent key>\0linked:<project ref>`
+— NUL-separated so it can never collide with a real agent key, which
+already forbids NUL bytes) so their state stays independent, and sets
+`notifyAgentKey` to the session's own REAL agent key, which is what
+`runTick`'s delivery call now targets (`entry.notifyAgentKey`, defaulting to
+`entry.agentKey` for every existing caller — byte-identical to the
+pre-FACTORY-71 `deps.notify(entry.agentKey, entry.agentKey, ...)` call for
+a `jira-project` owner and for an issue owner alike). One practical
+consequence: a session opted into N projects gets N independent rate-cap
+buckets (each keyed by its own synthetic `agentKey`), all funneling to the
+SAME real agent — not one shared per-session budget. This is the SAME
+mechanism `jira-project` owners already use (an independent bucket per
+watched project), reused rather than replaced, not a new cap.
+
+**The opt-in gate, reused rather than generalised.** `runTick` filters
+`projectMatches` on `m.rule.linkedEventing === true`, unchanged. A managed
+session has no `Rule` of its own to read that flag from, but naming a
+project in `linkedEventingProjects` already IS the per-project opt-in — so
+`sessionDefinitionProjectMatches` hands every match a fixed, shared,
+never-user-editable `Rule`-shaped value (`MANAGED_SESSION_LINKED_EVENTING_RULE`)
+that always carries `linkedEventing: true`. Every other linked-eventing knob
+on it (`maxLinkedItems`, `maxLinkedTurnsPerHour`, `linkedRemoteLinks`,
+`linkedDescriptionLinks`) is left absent — the same "absent means
+uncapped/off" default an unconfigured `jira-project` rule already has.
+
+**Frozen sessions.** `herd.nudge`'s own `assertRunnable` freeze check
+(`instanceFreezeStore`, `src/resources/session-freeze.ts`) is the ONLY
+freeze enforcement a `jira-project` owner's own linked-eventing nudge gets
+today — `createJiraProjectResourceType`'s `related` never filters its
+`projectMatches` by frozen status before calling `runTick`, relying
+entirely on `herd.nudge` refusing delivery to a frozen agent. This wiring
+adds one more, belt-and-suspenders check on top: `discovery.related`
+(`src/rules/session-definition-type.ts`) consults the SAME `isFrozen`
+(`herd.frozen`, keyed by the session's real agent id) `jira-project`'s own
+wiring already uses, and skips building ANY `ProjectLinkedEventingMatch` for
+a currently-frozen session — so a frozen, opted-in session costs no
+member-discovery search either, not merely no delivered nudge. Delegated
+freeze/unfreeze (`freezeControllers`/`unfreezeControllers`,
+`docs/managed-sessions.md`'s own section) writes to this SAME
+`instanceFreezeStore`, so it is honoured automatically — there is no
+separate freeze concept for this path to special-case.
+
+**Seam and wiring.** `createManagedSessionResourceType` grew a `discovery.related`
+hook, structurally mirroring `createJiraProjectResourceType`'s own: it
+tracks the poll's own eligible `SessionDefinitionMatch[]` (`let latest`,
+same pattern), and — only when both `notify` and `searchIssues` are wired —
+builds `projectMatches` from every eligible, opted-in, non-frozen match and
+runs the SAME `linkedEventingState.runTick([], deps, projectMatches)`.
+`src/daemon/session-definitions-loop.ts` threads `searchIssues`, `notify`,
+`comments`, `linkStore`, `isFrozen` straight through from
+`ManagedSessionsLoopDeps` to `ManagedSessionResourceDeps`; `src/daemon/index.ts`
+wires the managed-sessions loop with the SAME `atlassian.searchAll`,
+`atlassian.comments`, `routingLinkStore`, `notifyRuleAgent`, and
+`herd.frozen`-backed `isFrozen` the `jira-project` rule loop's own wiring
+above already uses — so a managed session's opted-in project reaches the
+SAME `brooswit.butchr.links` project-property managed-link collection a
+`jira-project` rule's own agent (if any) for that same project would also
+watch.
+
+**Unaffected.** A managed-session definition without `linkedEventingProjects`
+sees no behaviour change at all: `sessionDefinitionProjectMatches` returns
+`[]` for it, so it contributes no match, no search, no state — the same
+"omitted ⇒ feature silently never runs" shape every other optional
+linked-eventing dep in this codebase already has. Existing `jira-project`
+owner behaviour is untouched: `notifyAgentKey` defaults to `agentKey`
+wherever it is left unset, which every `jira-project` caller does.
+
 ## Verification
 
 - `bun run typecheck` — clean.

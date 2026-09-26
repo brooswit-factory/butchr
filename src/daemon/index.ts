@@ -1436,6 +1436,15 @@ startManagedSessionsLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
+  // FACTORY-53/FACTORY-71: linked-change eventing for a managed session that
+  // opts in via `linkedEventingProjects` — the SAME `searchAll`/`comments`/
+  // `notifyRuleAgent`/routed link store/`herd.frozen` seams the `jira-project`
+  // rule loop's own linked-eventing wiring already uses above.
+  searchIssues: (jql) => atlassian.searchAll(jql),
+  comments: (key) => atlassian.comments(key),
+  linkStore: routingLinkStore,
+  notify: notifyRuleAgent,
+  isFrozen: async (id) => (await herd.frozen([id])).has(id),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
