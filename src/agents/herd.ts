@@ -180,6 +180,22 @@ export const PANE_BUSY_MAX_RETRIES = 4;
 export const SPAWN_TAG = "[spawn]";
 
 /**
+ * FACTORY-75 (PR #473 review fix) — `staleIssues()`'s own argv fallback for
+ * `--model`/`--effort`, used ONLY when `workspaceModel`/`workspaceEffort`
+ * (src/agents/workspace.ts) find no persisted file: a workspace spawned by
+ * a build before this ticket never wrote one, so this recovers what the
+ * ALREADY-RUNNING process was actually launched with directly from its own
+ * argv, rather than treating "no persisted file" as "no model/effort at
+ * all" — see `staleIssues()`'s own doc comment on this exact seam for the
+ * mass-restart-on-deploy bug this closes. Same `argv.indexOf(flag)` shape
+ * Drovr's own internal (unexported) `flagValue` uses.
+ */
+const argvFlagValue = (argv: readonly string[], flag: string): string | undefined => {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] : undefined;
+};
+
+/**
  * BUTCHR-334: which reconcile loop produced a given `spawn()` attempt — see
  * `SPAWN_TAG`'s own doc comment for the cross-instrument rule this exists to
  * close. `spawn()` itself cannot know this (both loops call the same
@@ -506,10 +522,48 @@ export class HerdrHerd implements Herd {
       // model/effort of `undefined` (this provider's own preference sets
       // neither), means nothing to compare — never flagged, the same
       // fail-safe shape `mcpBindingsOf`'s own absence already has.
+      //
+      // REVIEW FIX (PR #473, first review): a workspace spawned by a build
+      // BEFORE this ticket never wrote `.butchr-model.json`/`.butchr-effort.json`
+      // at all — `workspaceModel`/`workspaceEffort` return `undefined` for
+      // every already-running managed session (tier-based, so `liveResolved.model`
+      // is always defined) and every already-running rule agent whose
+      // `agentPreferences` already set an explicit `model`/`effort` (unrelated
+      // to `modelPower`/`effortPower`). Comparing that `undefined` directly
+      // against `liveResolved.model` (always defined for those cases) would
+      // flag EVERY one of them stale on the very first poll after deploy — a
+      // fleet-wide mass restart, exactly the "unexpected behaviour change on
+      // deploy" this ticket's own back-compat requirement forbids, and the
+      // same bug SHAPE FACTORY-43 fixed (a stale-check expectation that does
+      // not match what the previous launch actually persisted).
+      //
+      // Fixed by falling back to what `proc.argv` shows the process was
+      // ACTUALLY launched with, when the persisted file is absent — Claude
+      // always emits both `--model` and `--effort` unconditionally
+      // (`agentLaunchConfig`'s claude branch: both fields are non-optional,
+      // always resolved via a default), so `argvFlagValue` recovers the
+      // real value with no `buildWorkspace` change needed for THIS build to
+      // read back a PREVIOUS build's launch. Codex has no `--effort` flag at
+      // all (its reasoning effort lives in `.codex/config.toml`, never
+      // argv — see `codexReasoningEffortFlag`'s own doc comment,
+      // src/resources/power-scale.ts) and `--model` only when explicitly
+      // set; with NO persisted file and NO argv signal for Codex effort,
+      // there is nothing to compare against, so `?? liveResolved.effort`
+      // makes that comparison trivially equal (never flagged) rather than
+      // guessing a value — the same "unknown, not stale" fail-safe this
+      // file's own `staleIssues()` already uses for a pane that reports
+      // nothing (see "no cwd reported" / "pane.process_info rejects" tests).
+      // Once a respawn actually happens (this comparison flags a REAL
+      // change, or any other reason), the NEW build's `buildWorkspace`
+      // persists real values and every later poll compares persisted-vs-live
+      // exactly as designed, with no more argv fallback needed.
       const liveResolved = this.resolvedAgentOf?.(issue, provider);
       if (liveResolved) {
-        const persistedModel = workspaceModel(cwd);
-        const persistedEffort = workspaceEffort(cwd);
+        const persistedModel = workspaceModel(cwd) ?? argvFlagValue(proc.argv, "--model");
+        // Claude's `--effort` value is always one of AgentEffort's own literals (agentLaunchConfig
+        // never emits anything else) — safe to widen back to that type here.
+        const observedClaudeEffort = provider === "claude" ? argvFlagValue(proc.argv, "--effort") as AgentEffort | undefined : undefined;
+        const persistedEffort = workspaceEffort(cwd) ?? (provider === "claude" ? observedClaudeEffort : liveResolved.effort);
         const modelChanged = liveResolved.model !== undefined && liveResolved.model !== persistedModel;
         const effortChanged = liveResolved.effort !== undefined && liveResolved.effort !== persistedEffort;
         if (modelChanged || effortChanged) {

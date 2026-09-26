@@ -153,6 +153,39 @@ already use); for a rule-launched agent, from that rule's own
 see "Rules support" below). `staleIssues()` compares that LIVE value
 against the PERSISTED one; a mismatch is flagged stale.
 
+### What happens to already-running agents at deploy
+
+**Nothing** — this was a real gap the first review of PR #473 caught and it
+is worth stating explicitly, since it is easy to read the paragraphs above
+as "matched state is never flagged" without noticing the edge case: a
+workspace spawned by a build *before* this ticket never wrote
+`.butchr-model.json`/`.butchr-effort.json` at all (those files did not
+exist yet). Comparing that absence directly against the live resolution
+(always defined for a `tier`-based definition, or for a rule that already
+sets an explicit `model`/`effort`) would flag EVERY already-running agent
+stale on the very first poll after deploy — a fleet-wide mass restart, the
+exact "unexpected behaviour change on deploy" this ticket's own back-compat
+requirement forbids.
+
+Fixed in `staleIssues()` (`src/agents/herd.ts`) by falling back to reading
+what the process was actually launched with straight from its own
+`proc.argv` whenever the persisted file is absent: Claude always emits both
+`--model` and `--effort` unconditionally (`agentLaunchConfig`'s claude
+branch resolves both through a non-optional default), so this recovers the
+real value with no `buildWorkspace` change needed to read back a *previous*
+build's launch. Codex has no `--effort` flag at all (its reasoning effort
+lives only in `.codex/config.toml`, never argv) and emits `--model` only
+when one was explicitly set; with no persisted file and no argv signal for
+Codex effort, there is nothing to compare against, so that specific
+comparison is skipped (treated as "unknown, not stale") rather than
+guessing. The net effect: an already-running agent that already matches
+its definition/rule is NOT flagged at deploy; one whose definition/rule
+has genuinely changed since it was spawned IS flagged, exactly once, and
+the respawn that follows persists real values so every later poll goes
+back to the ordinary persisted-vs-live comparison. Regression tests for
+both directions, for both managed sessions and rule agents, live in
+`test/unit/herd.test.ts` under "FACTORY-75 review fix: legacy workspaces".
+
 A naive implementation that skips the persist-and-read-back step — e.g.
 comparing the live resolution against itself, or against nothing at all —
 would either flag every agent stale on every poll (FACTORY-43's own

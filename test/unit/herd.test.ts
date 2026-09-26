@@ -1088,6 +1088,149 @@ describe("staleIssues", () => {
     }
   });
 
+  // PR #473 review fix — the mass-restart-on-deploy bug: a workspace
+  // spawned by a build BEFORE this ticket never wrote
+  // `.butchr-model.json`/`.butchr-effort.json` at all, so every
+  // already-running tier-based managed session (whose `effectiveAgent()`
+  // always resolves a defined `model`) would have been flagged stale on
+  // the very first poll after deploy, with no edit having happened. Fixed
+  // by falling back to `proc.argv` (Claude always emits `--model`/`--effort`
+  // unconditionally) when the persisted file is absent — see
+  // `staleIssues()`'s own doc comment on this seam for the full account.
+  describe("FACTORY-75 review fix: legacy workspaces (spawned before this ticket, no .butchr-model.json/.butchr-effort.json) must not mass-restart on deploy", () => {
+    test("a legacy tier-based managed session whose argv already matches its definition's resolved model is NOT flagged stale, even with no persisted model/effort file at all", async () => {
+      const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-match-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const cwd = workspaceDirFor(key);
+        mkdirSync(cwd, { recursive: true }); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
+        // A pre-existing build's real launch: agentLaunchConfig always emits both --model and --effort for Claude, unconditionally (its own default fallback resolved to sonnet/high here).
+        const argv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
+        // The tier1 definition still resolves to sonnet, no effort — matches what's actually running.
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "sonnet" }));
+        expect(await herd.staleIssues()).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("a legacy tier-based managed session whose definition has since changed IS flagged stale exactly once (no persisted file, argv fallback used); after the respawn persists the new values, staleIssues() stays clean across 5+ subsequent polls", async () => {
+      const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-drift-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const cwd = workspaceDirFor(key);
+        mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file.
+        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
+        // The operator has since moved this definition to modelPower=100/effort=70 (Fable/xhigh).
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).toContain("sonnet"); expect(stale[0]!.reason).toContain("fable");
+        // Respawn happens: buildWorkspace persists the NEW resolved values.
+        writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
+        writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
+        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "fable", "--effort", "xhigh", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
+        const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
+        for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("a legacy RULE agent with an explicit agentPreferences.model/effort (unrelated to modelPower/effortPower) is NOT flagged stale when its argv already matches, even with no persisted file", async () => {
+      const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "herd-legacy-rule-match-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const issue = "jira-work:triage:KAN-500";
+        const cwd = workspaceDirFor(issue);
+        mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file.
+        const argv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "opus", effort: "high" }));
+        expect(await herd.staleIssues()).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("a legacy RULE agent whose explicit agentPreferences.model has since changed IS flagged stale exactly once, then clean across 5+ polls after the respawn persists the new value", async () => {
+      const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "herd-legacy-rule-drift-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const issue = "jira-work:triage:KAN-501";
+        const cwd = workspaceDirFor(issue);
+        mkdirSync(cwd, { recursive: true });
+        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
+        // An operator edit to rules.json moved this rule to a different explicit model.
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).toContain("opus"); expect(stale[0]!.reason).toContain("haiku");
+        writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("haiku"));
+        writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("low"));
+        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "haiku", "--effort", "low", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
+        const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
+        for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    // Codex has no --effort flag at all (its reasoning effort lives only in
+    // .codex/config.toml) — with no persisted effort file and no argv
+    // signal, there is nothing to compare against, so a legacy Codex rule
+    // agent's explicit effort preference must never be flagged (the
+    // "unknown, not stale" fail-safe), even though its effort has genuinely
+    // never been observed.
+    test("a legacy CODEX rule agent with an explicit effort preference is NOT flagged stale for effort — Codex has no argv signal for it at all, so 'unknown' must not read as 'changed'", async () => {
+      const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const previous = process.env.BUTCHR_WORKSPACES;
+      const root = mkdtempSync(join(tmpdir(), "herd-legacy-codex-effort-"));
+      process.env.BUTCHR_WORKSPACES = root;
+      try {
+        const issue = "jira-work:triage:KAN-502";
+        const cwd = workspaceDirFor(issue);
+        mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file, no .codex/config.toml either.
+        // A realistic codex launch, via the SAME spawnArgs() builder the real launch and staleIssues() reconstruction both use.
+        const spec = { key: issue, issuetype: "task", summary: "s", parent: null, resource: "KAN-502" };
+        // spawnArgs()/agentLaunchConfig() reads the launch model from the AgentConfig param directly (spec.agents is
+        // resolved into it by startProviders()'s own prepare() callback before a real launch reaches this point).
+        const argv = ["codex", ...spawnArgs(spec, cwd, { provider: "codex", model: "gpt-6-astra", disabledMcpServers: [] }, "http://x/mcp")];
+        const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "codex" }]) });
+        // model matches (recovered from argv); effort ("high") has no argv signal at all for codex.
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] }, undefined, undefined, undefined, undefined, undefined, () => ({ model: "gpt-6-astra", effort: "high" }));
+        expect(await herd.staleIssues()).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("FACTORY-75: resolvedAgentOf returning undefined (nothing this daemon can resolve for this issue) means nothing to compare — never flagged, same fail-safe shape mcpBindingsOf's own absence already has", async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
     const { tmpdir } = require("node:os") as typeof import("node:os");
