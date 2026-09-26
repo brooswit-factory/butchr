@@ -81,8 +81,17 @@ export interface PermissionAnswerLoopDeps {
    * can never still be in flight when the next tick fires.
    */
   readTimeoutMs?: number;
-  /** Free-text daemon log line, one per tick that answered/failed anything, plus one per failed/answered pane, named by its `eligiblePanes` label. Optional; omitted, this tick's outcomes are simply never logged (a caller with no daemon console to write to). */
+  /** Free-text daemon log line, one per tick that answered/failed anything, plus one per failed/answered pane, named by its `eligiblePanes` label, plus one per NEWLY skipped pane+reason (FACTORY-93). Optional; omitted, this tick's outcomes are simply never logged (a caller with no daemon console to write to). */
   log?: (line: string) => void;
+  /**
+   * FACTORY-93: pane+reason keys already logged as skipped, so a prompt that
+   * stays unanswerable is logged ONCE (never silently, never every tick).
+   * `startPermissionAnswerLoop` owns one for the loop's lifetime; omitted,
+   * every skip is logged on every tick.
+   */
+  loggedSkips?: Set<string>;
+  /** Test seam: the drovr pass to run. Defaults to `@brooswit/drovr`'s own `autoAnswerPermissions`. */
+  autoAnswer?: typeof autoAnswerPermissions;
 }
 
 /**
@@ -127,7 +136,11 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
         sendKeys: deps.client.agent.sendKeys,
       },
     };
-    const results = await autoAnswerPermissions(scopedClient, {
+    // FACTORY-93 (operator direction): always press option 1 "Yes" (allow
+    // once). Matching Claude's "always allow" wording was fragile — the
+    // read-permission dialog says "Yes, allow reading …" and was skipped.
+    const results = await (deps.autoAnswer ?? autoAnswerPermissions)(scopedClient, {
+      scope: "once",
       auditPath: deps.auditPath,
       ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
       ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
@@ -137,9 +150,17 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     const failed = results.filter((r) => r.outcome === "failed");
     if (answered.length || failed.length) {
       log(`[permission-answer] ${answered.length} answered, ${results.length - answered.length - failed.length} skipped, ${failed.length} failed`);
-      for (const a of answered) log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath} for the exact stored-rule text)`);
+      for (const a of answered) log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath})`);
       for (const f of failed) log(`[permission-answer] ${label(f.paneId)} (${f.paneId}) failed: ${f.reason} — ${f.detail}`);
     }
+    for (const r of results) {
+      if (r.outcome !== "skipped") continue;
+      const key = `${r.paneId}\u0000${r.reason}`;
+      if (deps.loggedSkips?.has(key)) continue;
+      deps.loggedSkips?.add(key);
+      log(`[permission-answer] ${label(r.paneId)} (${r.paneId}) SKIPPED, left for a human: ${r.reason}`);
+    }
+    if (deps.loggedSkips && deps.loggedSkips.size > 1000) deps.loggedSkips.clear();
     return results;
   } catch (e) {
     log(`[permission-answer] tick failed: ${(e as Error)?.message ?? e}`);
@@ -158,6 +179,7 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
  */
 export function startPermissionAnswerLoop(deps: PermissionAnswerLoopDeps, intervalMs: number): ReturnType<typeof setInterval> {
   let inFlight = false;
+  deps = { ...deps, loggedSkips: deps.loggedSkips ?? new Set<string>() };
   const timer = setInterval(() => {
     if (inFlight) return;
     inFlight = true;
