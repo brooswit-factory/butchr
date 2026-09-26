@@ -59,6 +59,21 @@ export function jiraWorkItemOwnerRef(issue: Pick<JiraIssue, "key">): ResourceRef
 }
 
 /**
+ * BUTCHR-469: a `jira-project` OWNER's own `ResourceRef` — the FACTORY-5/
+ * FACTORY-8 counterpart of `jiraWorkItemOwnerRef` above, now that a project
+ * is a live owner too (`ProjectLinkedEventingMatch`,
+ * src/jira-watch/linked-eventing.ts). `listLinks`/`mergeEffectiveLinks`
+ * route this ref's canonical key (`jira-project:<KEY>`) to the Jira
+ * project-property-backed store (`createJiraProjectLinkStore`, via
+ * `createRoutingLinkStore`) — a project has no structural native links of
+ * its own (no issuelinks/parent), so a caller always passes `nativeRefs: []`
+ * for this ref, and every managed link on it is "managed"-origin.
+ */
+export function jiraProjectOwnerRef(key: string): ResourceRef {
+  return { provider: "jira-project", key };
+}
+
+/**
  * `issue`'s STRUCTURAL native links only — `issuelinks` and `parent` — as
  * `jira-work-item` `ResourceRef`s, de-duplicated by canonical key and
  * excluding `issue`'s own key (a resource cannot link to itself, per

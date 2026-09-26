@@ -71,6 +71,65 @@ test('project discovery deduplicates, skips archived, preserves empty results an
  expect(await createJiraProjectResourceType({rules:[],search:async()=>{throw Error('must not search')}}).discovery.search()).toEqual([]);
  expect(specForProject({...matches[0]!,spec:undefined} as any).brief).toBe(rule.brief);
 });
+/**
+ * BUTCHR-469: `discovery.related` is `jira-project`'s own linked-eventing
+ * seam (member-discovery watch + managed links — see
+ * `test/unit/linked-eventing-project.test.ts` for the actual coalescer/
+ * rate-cap/dedup behaviour, reused unchanged). This covers the WIRING only:
+ * always returns `[]` (no related-resource concept of its own, unchanged),
+ * never runs without both `notify` and `searchIssues`, and a Codey-shaped
+ * rule with no linked-eventing fields still triggers zero member searches
+ * end-to-end through this resource type — the DoD-4 analogue of the
+ * deploy-hazard test above, at this seam specifically.
+ */
+test('linked-eventing wiring: related() is a no-op with neither/either dep omitted, and never searches for a rule without linkedEventing', async () => {
+ const rules = parseRules({ rules: [{ ...rule, mcpConfigFile: undefined }] });
+ const search = async () => [{ id: '1', key: 'PROJ', name: 'Project' }];
+ const notified: unknown[] = [];
+
+ // Neither dep wired: related() must still return [] and never throw.
+ const bare = createJiraProjectResourceType({ rules, search });
+ await bare.discovery.search();
+ expect(await bare.discovery.related!([])).toEqual([]);
+
+ // Only notify wired (no searchIssues): still a no-op, no throw.
+ const halfWired = createJiraProjectResourceType({ rules, search, notify: async (a, b, r) => { notified.push([a, b, r]); } });
+ await halfWired.discovery.search();
+ expect(await halfWired.discovery.related!([])).toEqual([]);
+ expect(notified).toHaveLength(0);
+
+ // Both wired, but the rule (Codey's exact live shape) has no linkedEventing field: zero member searches.
+ let searchIssueCalls = 0;
+ const full = createJiraProjectResourceType({
+   rules, search, notify: async (a, b, r) => { notified.push([a, b, r]); },
+   searchIssues: async () => { searchIssueCalls++; return []; },
+ });
+ await full.discovery.search();
+ expect(await full.discovery.related!([])).toEqual([]);
+ expect(searchIssueCalls).toBe(0);
+ expect(notified).toHaveLength(0);
+
+ // A rule that DOES opt in, with a `searchIssues` that always throws: fails
+ // open per linked-eventing.ts's own discipline (logged, no throw out of
+ // `related()`) — proven end-to-end through this resource type's wiring,
+ // not just in linked-eventing.test.ts's own direct unit tests.
+ const optedRules = parseRules({ rules: [{ ...rule, linkedEventing: true }] });
+ const logs: string[] = [];
+ const throwing = createJiraProjectResourceType({
+   rules: optedRules, search,
+   notify: async () => {}, searchIssues: async () => { throw new Error('offline'); },
+   log: (l) => logs.push(l),
+ });
+ await throwing.discovery.search();
+ expect(await throwing.discovery.related!([])).toEqual([]); // must not throw
+ // Seeds its watermark on this first tick and never searches — the warning
+ // only appears from the SECOND tick on (see linked-eventing-project.test.ts's
+ // own "first sighting" test for why); confirm that here too, end-to-end.
+ expect(logs.some((l) => l.includes('WARNING'))).toBe(false);
+ await throwing.discovery.search();
+ await throwing.discovery.related!([]);
+ expect(logs.some((l) => l.includes('WARNING: [linked-eventing] project-member search failed') && l.includes('PROJ'))).toBe(true);
+});
 test('project search paginates before filtering by owner and keys; failures never become empty results',async()=>{
  const paths:string[]=[];
  const client=new AtlassianClient('https://jira.test','u','secret',async url=>{
