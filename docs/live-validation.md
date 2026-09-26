@@ -25,8 +25,11 @@ Every placeholder below (`<...>`) is the operator's to fill in.
 
 Shared (every provider):
 
-- `ATLASSIAN_SITE`, `ATLASSIAN_EMAIL`, `ATLASSIAN_TOKEN_FILE` (required even
-  for a GitHub-only run: the daemon's config needs them).
+- `ATLASSIAN_SITE`, `ATLASSIAN_EMAIL`, `ATLASSIAN_TOKEN_FILE` — required for
+  the `jira-work`/`jira-idea` steps below (and for a GitHub-only run that
+  wants `jira-idea` linking). FACTORY-66: Atlassian is otherwise optional —
+  a `github-issue`- or `zendesk-ticket`-only validation run may leave all
+  three unset instead, and the daemon starts with Jira/Confluence disabled.
 - `BUTCHR_RULES_FILE`: an explicit path, so a typo stops startup instead of
   silently staffing nothing. The file is written by the operator, outside the
   repo, and read once at startup (edits need a restart).

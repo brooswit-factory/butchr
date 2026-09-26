@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
+  ACCOUNT_POLICIES, atlassianStaffing, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
   EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS,
   RULE_ID_MAX, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
@@ -185,6 +185,55 @@ describe("formatUnresolvedRelationshipWarning", () => {
     expect(msg).toContain('rule "task"');
     expect(msg).toContain("childRule");
     expect(msg).toContain('"story"');
+  });
+});
+
+describe("atlassianStaffing (FACTORY-66)", () => {
+  const rule = (over: Partial<Rule>): Rule => ({ id: "x", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over });
+
+  test("Atlassian configured: ok regardless of what rules are enabled", () => {
+    expect(atlassianStaffing([rule({ resourceProvider: "jira-work" })], true)).toEqual({ ok: true });
+    expect(atlassianStaffing([], true)).toEqual({ ok: true });
+  });
+
+  test("Atlassian NOT configured, no rules at all: ok — a managed-sessions-only host", () => {
+    expect(atlassianStaffing([], false)).toEqual({ ok: true });
+  });
+
+  test("Atlassian NOT configured, only non-Jira rules enabled (github-issue/zendesk-ticket/filesystem): ok", () => {
+    expect(atlassianStaffing([
+      rule({ id: "gh", resourceProvider: "github-issue" }),
+      rule({ id: "zd", resourceProvider: "zendesk-ticket" }),
+      rule({ id: "fs", resourceProvider: "filesystem" }),
+    ], false)).toEqual({ ok: true });
+  });
+
+  for (const provider of ["jira-work", "jira-idea", "jira-project"] as const) {
+    test(`Atlassian NOT configured, an enabled ${provider} rule: refused, naming the rule and provider`, () => {
+      const result = atlassianStaffing([rule({ id: "needs-jira", resourceProvider: provider })], false);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toContain("needs-jira");
+        expect(result.reason).toContain(provider);
+        expect(result.reason).toContain("ATLASSIAN_SITE");
+      }
+    });
+  }
+
+  test("Atlassian NOT configured, a DISABLED jira-work rule: ok — a disabled rule is never staffed regardless", () => {
+    expect(atlassianStaffing([rule({ resourceProvider: "jira-work", enabled: false })], false)).toEqual({ ok: true });
+  });
+
+  test("Atlassian NOT configured, several Jira-dependent rules enabled: every one is named", () => {
+    const result = atlassianStaffing([
+      rule({ id: "a", resourceProvider: "jira-work" }),
+      rule({ id: "b", resourceProvider: "jira-idea" }),
+    ], false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("a (jira-work)");
+      expect(result.reason).toContain("b (jira-idea)");
+    }
   });
 });
 

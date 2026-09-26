@@ -552,6 +552,30 @@ export function formatUnresolvedRelationshipWarning(u: UnresolvedRelationship): 
   return `WARNING: jira-work rule "${u.ruleId}" relationships.${u.field} names rule "${u.missingTarget}", which is not present in this daemon's own rules file; no edge is created — fix the id, or confirm "${u.missingTarget}" is staffed by a different daemon`;
 }
 
+/** The `resourceProvider`s this codebase can only ever staff over an `AtlassianClient`/`AtlassianOps` (see src/daemon/index.ts's `atlassian`/`ops` construction) — `github-issue`, `zendesk-ticket` and `filesystem` need no Jira credential at all. */
+export const JIRA_DEPENDENT_PROVIDERS: ReadonlySet<ResourceProvider> = new Set(["jira-work", "jira-idea", "jira-project"]);
+
+/**
+ * FACTORY-66: whether this daemon may boot given whether Atlassian
+ * credentials are configured. Fails closed, same house style as
+ * `githubIssueStaffing` (src/rules/github-issue-type.ts) — but unlike that
+ * check (which merely leaves its own rules unstaffed, quietly), a
+ * `jira-work`/`jira-idea`/`jira-project` rule enabled with no Atlassian
+ * configured can NEVER be staffed by ANY future config change short of
+ * adding the credential, so this refuses to boot at all rather than start
+ * looking healthy and never spawn anything for it. `atlassianConfigured`
+ * is a plain boolean (not `Config` itself) so this stays a pure function
+ * over `Rule[]`, independently testable with no `Config` fixture.
+ */
+export type AtlassianStaffing = { ok: true } | { ok: false; reason: string };
+export function atlassianStaffing(rules: readonly Rule[], atlassianConfigured: boolean): AtlassianStaffing {
+  if (atlassianConfigured) return { ok: true };
+  const jiraDependentRules = rules.filter((r) => r.enabled && JIRA_DEPENDENT_PROVIDERS.has(r.resourceProvider));
+  if (!jiraDependentRules.length) return { ok: true };
+  const ids = jiraDependentRules.map((r) => `${r.id} (${r.resourceProvider})`).join(", ");
+  return { ok: false, reason: `rule(s) ${ids} require Atlassian credentials, but ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN(_FILE) are not configured — set them, or disable/remove the rule(s)` };
+}
+
 export {
   decodeAgentKey, encodeAgentKey, isResourceId, type AgentKeyParts,
   decodeQueryAgentKey, encodeQueryAgentKey, type QueryAgentKeyParts,

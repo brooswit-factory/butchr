@@ -202,7 +202,15 @@ export function formatTable(plan: Plan): string {
   return rows.map((r) => r.map((c, i) => c.padEnd(widths[i]!)).join("  ")).join("\n");
 }
 
-const basicAuth = (cfg: Config) => "Basic " + Buffer.from(`${cfg.atlassian.email}:${cfg.atlassian.token}`).toString("base64");
+// FACTORY-66: Atlassian credentials are now optional on `Config` (a
+// managed-sessions-only daemon may have none) — this script inherently
+// migrates Jira issue links and cannot run without them regardless, so `main`
+// below refuses with a clear error before ever calling into this or the two
+// functions after it. The `!` here and at their own `cfg.atlassian` reads is
+// that already-checked invariant, not a fresh assumption — every caller
+// (`main`, and every test in scripts__migrate-links.test.ts) always supplies
+// a fully-configured `cfg`.
+const basicAuth = (cfg: Config) => "Basic " + Buffer.from(`${cfg.atlassian!.email}:${cfg.atlassian!.token}`).toString("base64");
 
 function mapIssue(raw: any): MigrateIssue {
   const f = raw.fields ?? {};
@@ -243,7 +251,7 @@ export async function fetchAllIssues(cfg: Config, fetchImpl: FetchLike): Promise
       maxResults: "100",
     });
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
-    const res = await fetchImpl(`${cfg.atlassian.site}/rest/api/3/search/jql?${params}`, {
+    const res = await fetchImpl(`${cfg.atlassian!.site}/rest/api/3/search/jql?${params}`, {
       headers: { authorization: auth, accept: "application/json" },
     });
     if (!res.ok) throw new Error(`Atlassian ${res.status} on search: ${(await res.text()).slice(0, 200)}`);
@@ -285,7 +293,7 @@ export async function applyPlan(plan: Plan, cfg: Config, fetchImpl: FetchLike): 
   for (const a of plan.actions) {
     if (a.action !== "add-implements") continue;
     try {
-      await createImplements(cfg.atlassian.site, auth, fetchImpl, a.ticket, a.otherEnd);
+      await createImplements(cfg.atlassian!.site, auth, fetchImpl, a.ticket, a.otherEnd);
       outcomes.push({ ticket: a.ticket, action: a.action, otherEnd: a.otherEnd, ok: true });
     } catch (err) {
       failedAdds.add(`${a.ticket}->${a.otherEnd}`);
@@ -300,7 +308,7 @@ export async function applyPlan(plan: Plan, cfg: Config, fetchImpl: FetchLike): 
       continue;
     }
     try {
-      await deleteLink(cfg.atlassian.site, auth, fetchImpl, d.linkId);
+      await deleteLink(cfg.atlassian!.site, auth, fetchImpl, d.linkId);
       outcomes.push({ ticket: d.ticket, action: d.action, otherEnd: d.otherEnd, ok: true });
     } catch (err) {
       outcomes.push({ ticket: d.ticket, action: d.action, otherEnd: d.otherEnd, ok: false, error: (err as Error).message });
@@ -315,6 +323,13 @@ async function main(): Promise<void> {
   console.log(apply ? "=== APPLY MODE — this WILL modify Jira ===" : "=== DRY RUN (default) — no changes will be made; pass --apply to execute ===");
 
   const cfg = loadConfig(process.env as ConfigEnv, (p) => readFileSync(p, "utf8"));
+  // FACTORY-66: Atlassian is now optional on `Config`, but this script has no
+  // purpose without it — fail loudly and by name rather than let a later
+  // "Cannot read properties of undefined" stand in for a missing credential.
+  if (!cfg.atlassian) {
+    console.error("migrate-links: ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN(_FILE) are not configured — this script migrates Jira issue links and cannot run without them.");
+    process.exit(1);
+  }
   const issues = await fetchAllIssues(cfg, globalThis.fetch as FetchLike);
   const plan = computePlan(issues);
 
