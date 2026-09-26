@@ -37,6 +37,7 @@ import type { AdmissionView, DashboardResponse, AgentDashboardRow, WithheldDashb
 import type { StatusFloor } from "../agents/status-floor.js";
 import { humanDuration } from "../agents/status-floor.js";
 import type { CurrencyReport } from "../daemon/currency.js";
+import { agentRowAnchorId, configAnchorForResourceKey } from "../agents/config-inventory-links.js";
 
 /** The subset of `BuildReport` (src/agents/build-identity.ts) this header actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardBuildInfo {
@@ -60,6 +61,17 @@ export interface RenderDashboardOpts {
   terminalLinkHref: (pane: string) => string;
   /** Builds the resource-link redirect's `href` for a given resource key — the route itself (GET /resource/:key/open) resolves Jira-vs-Confluence per tier; this module never picks the target itself (mutation 7 is a route-level concern, not a template one — see that route's own tests). */
   resourceLinkHref: (resourceKey: string) => string;
+  /**
+   * FACTORY-81: builds the Configurations-view href for an agent row's
+   * additive back-link, given the anchor `../agents/config-inventory-links.js`'s
+   * `configAnchorForResourceKey` computed for that row — a pure URL builder,
+   * same pattern as `terminalLinkHref`/`resourceLinkHref` above, so adding
+   * this back-link adds NO I/O to `/`'s existing no-fetch-of-its-own request
+   * path (see that link function's own top comment for why it needs no
+   * inventory in hand to do this). Defaults to `/configurations#<anchor>` —
+   * existing tests that never pass this keep working unchanged.
+   */
+  configLinkHref?: (anchor: string) => string;
   /** Auto-refresh interval in seconds for the `<meta http-equiv="refresh">` tag. Defaults to 5. */
   refreshSeconds?: number;
 }
@@ -134,10 +146,28 @@ function renderFreshness(iso: string, now: number, stale: boolean, verb: string,
   return `<span class="conf known"${extraAttrs} title="${esc(iso)}">${esc(verb)} ${esc(age)} ago</span>`;
 }
 
+/**
+ * FACTORY-81: the additive back-link this ticket's requirement 3 asks for —
+ * `null` (nothing rendered) only when `resourceKey` fails to decode at all,
+ * which nothing in this daemon produces today (see `configAnchorForResourceKey`'s
+ * own doc comment). The link always POINTS somewhere real even for a rule
+ * this daemon's current config no longer has an entry for (e.g. a rule
+ * removed from `rules.json` after this agent was spawned) — the anchor is
+ * built from the resourceKey's own decoded parts, not a lookup against a
+ * live inventory, so a stale link simply lands on a Configurations page with
+ * no matching row, never a broken href.
+ */
+function renderConfigBackLink(resourceKey: string, opts: RenderDashboardOpts): string {
+  const anchor = configAnchorForResourceKey(resourceKey);
+  if (anchor === null) return "";
+  const href = opts.configLinkHref ? opts.configLinkHref(anchor) : `/configurations#${anchor}`;
+  return `<a class="link" href="${esc(href)}">config</a>`;
+}
+
 function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDashboardOpts): string {
   const tier = renderTier(row.tier);
   return (
-    `<div class="row agent">` +
+    `<div class="row agent" id="${esc(agentRowAnchorId(row.resourceKey))}">` +
     `<span class="key">${esc(row.resourceKey)}</span>` +
     `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
     `<span class="st ${safeClass(row.agentStatus)}">${esc(row.agentStatus)}</span>` +
@@ -146,6 +176,7 @@ function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDash
     renderFreshness(row.confirmedAt, opts.now, stale, "confirmed") +
     `<a class="link" href="${esc(opts.terminalLinkHref(row.pane))}">open terminal</a>` +
     `<a class="link" href="${esc(opts.resourceLinkHref(row.resourceKey))}">resource</a>` +
+    renderConfigBackLink(row.resourceKey, opts) +
     `</div>`
   );
 }
@@ -321,6 +352,13 @@ const STYLE = `
  * itself. The route (`src/web/view.ts`) calls this and returns the string
  * as-is; the browser re-fetches the whole page on the `<meta refresh>`
  * interval rather than any client-side re-rendering logic existing to test.
+ *
+ * FACTORY-81 review fix: the page's own `.hint` line ALWAYS carries a link to
+ * `/configurations`, regardless of `rows` — a config entry with no live
+ * agent (a disabled rule, an unstaffed rule, an archived session) has no
+ * per-row back-link at all, and the whole point of the Configurations view
+ * is to show exactly those, so an operator on an empty (or all-withheld)
+ * `/` must still have a way in that isn't typing the URL by hand.
  */
 export function renderDashboard(response: DashboardResponse, opts: RenderDashboardOpts): string {
   const stale = !response.checked;
@@ -340,6 +378,6 @@ ${renderBuildHeader(opts.header, opts.now)}
 ${renderPageBanner(response, opts.now)}
 ${renderAdmission(response.admission, opts.now)}
 <div id="rows">${rowsHtml}</div>
-<div class="hint">"open terminal" attaches a terminal to that agent (fire-and-forget — a launch is not a confirmation a window appeared) · "resource" opens its Jira issue or Confluence project doc · refreshes every ${refresh}s</div>
+<div class="hint">"open terminal" attaches a terminal to that agent (fire-and-forget — a launch is not a confirmation a window appeared) · "resource" opens its Jira issue or Confluence project doc · refreshes every ${refresh}s · <a class="link" href="/configurations">configurations</a></div>
 </body></html>`;
 }
