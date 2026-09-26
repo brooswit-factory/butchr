@@ -340,6 +340,61 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     expect(linkedEvents(notified[1]!.reason).map((e) => e.target)).toEqual(["BUTCHR-2"]); // BUTCHR-1 already baselined and unchanged since — only BUTCHR-2 is new
   });
 
+  test("review round 2 regression: reviewer's own persistent-cap repro — maxLinkedItems stays fixed at 1 across many ticks (never relieved); both members eventually reported exactly once each, then the watermark resumes advancing once the backlog drains", async () => {
+    // Round 1's fix (hold the watermark whenever ANY member is capped away)
+    // still starved this exact case: with `ORDER BY updated ASC` alone, an
+    // already-delivered member (now baselined, unchanged) kept re-matching
+    // the deliberately over-inclusive held window and sorting right back to
+    // the front, re-consuming the one scarce slot forever — B-2 in this
+    // repro was never delivered even after 6 ticks. Round 2's fix ranks a
+    // genuinely fresh-or-changed member ahead of an already-known,
+    // unchanged one for the cap, so the already-delivered member falls out
+    // of contention as soon as it is (whether or not it still re-matches
+    // the window).
+    const state = createLinkedEventingState();
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-1": issue("BUTCHR-1", { status: "Done" }), // each changed once, then never again
+      "BUTCHR-2": issue("BUTCHR-2", { status: "Done" }),
+    };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const now = { value: 0 };
+    const { deps, notified, logs, searchCalls } = fakeProjectDeps(world, membersByProject, { now });
+    const m = projectMatch("jira-project:mgrs:BUTCHR", rule({ maxLinkedItems: 1 }), "BUTCHR");
+
+    await state.runTick([], deps, [m]); // seed watermark at now=0
+
+    // Both changed once, in the SAME window, and — because a held watermark
+    // widens the window rather than narrowing it — keep re-appearing in
+    // every subsequent tick until the backlog actually drains, exactly like
+    // a real Jira window search that has not advanced yet would.
+    membersByProject.BUTCHR = ["BUTCHR-1", "BUTCHR-2"];
+    for (let i = 0; i < 6 && notified.length < 2; i++) {
+      now.value += 5 * 60_000; // +5 real minutes between ticks
+      await state.runTick([], deps, [m]);
+    }
+
+    expect(notified).toHaveLength(2); // each reported EXACTLY once — not zero (starved), not more than once (duplicated)
+    expect(notified.map((n) => linkedEvents(n.reason).map((e) => e.target)).flat().sort()).toEqual(["BUTCHR-1", "BUTCHR-2"]);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] project-member cap"))).toBe(true);
+    // Converged within 2 ticks of the cap actually biting (round 1's own
+    // fix alone never converged at all under this exact scenario).
+    expect(searchCalls.filter((q) => PROJECT_JQL_RE.test(q)).length).toBeLessThanOrEqual(3);
+
+    // Backlog now fully drained (both baselined, both unchanged) — the
+    // watermark must resume advancing rather than staying held forever.
+    // Proven by the search window itself shrinking back down to roughly the
+    // real elapsed time (a handful of minutes) instead of staying anchored
+    // at tick 1's watermark (which would show as an ever-growing window,
+    // ~20+ minutes by this point).
+    membersByProject.BUTCHR = []; // nothing new — ages out for real now that the watermark can move past it
+    now.value += 5 * 60_000;
+    await state.runTick([], deps, [m]);
+    const lastProjectSearch = [...searchCalls].reverse().find((q) => PROJECT_JQL_RE.test(q))!;
+    const lastMinutes = Number(PROJECT_JQL_RE.exec(lastProjectSearch)![2]);
+    expect(lastMinutes).toBeLessThanOrEqual(6); // a fresh ~5-minute window, not a stale, ever-widening one
+    expect(notified).toHaveLength(2); // no further, spurious notification
+  });
+
   test("a failed member search fails open: logged, skips member discovery for that owner only, managed links and other owners unaffected", async () => {
     const state = createLinkedEventingState();
     const store = fakeLinkStore();

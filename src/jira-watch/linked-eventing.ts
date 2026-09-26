@@ -213,13 +213,21 @@ export interface LinkedEventingMatch {
  *    CAPPING: a MANAGED link `maxLinkedItems` capped away is safe to drop
  *    for just this tick (the full managed-link collection is re-listed
  *    every tick regardless of any cap, so a capped one is simply a
- *    candidate again next tick). A MEMBER capped away is NOT: it only
- *    appeared because it fell inside this tick's watermark window, and once
- *    the watermark advances past that window it may never reappear. So a
- *    capped member holds this owner's ENTIRE watermark advance for the
+ *    candidate again next tick). A MEMBER capped away is NOT, unless it is
+ *    already stale (baselined, nothing new): it only appeared because it
+ *    fell inside this tick's watermark window, and once the watermark
+ *    advances past that window it may never reappear. So a FRESH-OR-CHANGED
+ *    member capped away holds this owner's ENTIRE watermark advance for the
  *    tick (not merely its own item) — the next tick re-runs the identical
- *    window, `ORDER BY updated ASC` biasing the retry toward draining the
- *    oldest backlog first.
+ *    window. `ORDER BY updated ASC` alone does NOT prevent starvation here
+ *    (an already-delivered member's own `updated` never moves, so it keeps
+ *    sorting right back to the front of the still-over-inclusive held
+ *    window) — every member candidate is additionally RANKED by whether it
+ *    already has a matching baseline, so a genuinely fresh-or-changed
+ *    member always wins a scarce slot over an already-known, unchanged one.
+ *    This makes the backlog drain monotonically under sustained cap
+ *    pressure, never starve a tail forever. See `runTick`'s own
+ *    `freshOrChangedMembers`/`freshOrChangedTargets`.
  * 2. MANAGED LINKS: `brooswit.butchr.links` (FACTORY-8's project-property
  *    link store), reconciled via the SAME `managedLinkedItems` FACTORY-9
  *    already built for an issue owner, with `nativeRefs: []` (a project has
@@ -646,6 +654,13 @@ export function createLinkedEventingState(): LinkedEventingState {
       for (const m of projectOpted) {
         const priorWatermark = projectWatermarks.get(m.agentKey);
         let memberItems: LinkedItem[] = [];
+        // BUTCHR-469 (review round 2 fix): the targets among THIS tick's
+        // member candidates that genuinely need a slot — no baseline yet, or
+        // a real field change against their existing one. Populated below;
+        // used both to rank the cap (fresh/changed first) and to decide
+        // whether a capped-away member actually costs anything (see
+        // `freshOrChangedTargets` at the bottom of this loop iteration).
+        let freshOrChangedMembers: LinkedItem[] = [];
         if (priorWatermark === undefined) {
           // First sighting (true on the very first tick, and again after
           // every daemon restart, since this state is in-memory only): seed
@@ -657,22 +672,44 @@ export function createLinkedEventingState(): LinkedEventingState {
           const searchStartedAt = now();
           try {
             const minutes = jqlRelativeMinutesSince(priorWatermark, searchStartedAt);
-            // `ORDER BY updated ASC` (review round 1): when `maxLinkedItems`
-            // caps this owner's combined item list below, the OLDEST
-            // outstanding changes are the ones kept — so a busy project that
-            // keeps exceeding the cap still drains its backlog over
-            // successive ticks (the newest, least-urgent changes are the
-            // ones held back each time) rather than starving the same tail
-            // forever (the accepted risk this shares with `FOREIGN_FETCH_LIMIT`,
-            // src/rules/resource-type.ts).
+            // `ORDER BY updated ASC`: a REQUEST for the oldest-first order,
+            // but NOT what actually protects a capped tail from starvation —
+            // see the fresh/stale partition just below for that (review
+            // round 2 found that ordering ALONE still starves the tail,
+            // since an already-delivered member that keeps re-matching this
+            // deliberately over-inclusive window sorts right back to the
+            // front next tick).
             const members = await deps.search(`project = ${m.projectKey} AND updated >= "-${minutes}m" ORDER BY updated ASC`);
+            // BUTCHR-469 (review round 2 fix): partition into "genuinely
+            // needs a slot" vs. "already known, nothing new" — a stale
+            // member only reappears here because the window is deliberately
+            // over-inclusive (`jqlRelativeMinutesSince`'s own doc comment),
+            // never because anything changed. Without this split, a
+            // persistently-at-cap project would let an already-delivered
+            // member re-consume the one scarce slot every tick forever
+            // (ORDER BY updated ASC sorts it right back to the front, since
+            // its own `updated` never moves) while a genuinely still-pending
+            // member starves — exactly review round 2's own reproduction.
+            // `updated` alone (not the full snapshot) is the freshness
+            // check: comment-only changes always bump `updated` too (see
+            // `JiraSnapshot.commentCursor`'s own doc comment), so this needs
+            // no separate comment lookup to stay a reasonable proxy — this
+            // is a RANKING heuristic, not a correctness gate; the real diff
+            // (including comment-cursor) still runs unconditionally on
+            // whatever wins a slot below.
+            const staleMembers: LinkedItem[] = [];
             for (const issue of members) {
-              memberItems.push({ kind: "jira-key", target: issue.key });
+              const item: LinkedItem = { kind: "jira-key", target: issue.key };
               // Reused directly by the shared batched fetch below instead of
               // a second `key in (...)` call for the same key (review round
               // 1) — this search already returned full issue data.
               memberFetchedByKey.set(issue.key, issue);
+              const beforeRaw = baselines.get(baselineKey(m.agentKey, issue.key));
+              const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
+              const looksUnchanged = before !== undefined && before.updated === issue.updated;
+              (looksUnchanged ? staleMembers : freshOrChangedMembers).push(item);
             }
+            memberItems = [...freshOrChangedMembers, ...staleMembers];
             usedWatermarkByOwner.set(m.agentKey, priorWatermark);
             // Captured BEFORE the search ran, not after: a member updated
             // WHILE the search was in flight still has `updated` at or after
@@ -704,13 +741,15 @@ export function createLinkedEventingState(): LinkedEventingState {
         }
         managedTargetsByOwner.set(m.agentKey, new Set(managedItems.map((i) => i.target)));
 
-        // De-duplicated by target, first occurrence wins (member beats a
-        // managed link to the same issue — arbitrary, since both produce an
-        // identical `{kind:"jira-key", target}` shape for this target
-        // anyway) — an issue that is both a member and a managed-link
-        // target must yield ONE item, never two (DoD: no duplicate event
-        // lines). Combined BEFORE `maxLinkedItems` caps, same uniform-cap
-        // convention the issue-owner loop above already uses.
+        // De-duplicated by target, first occurrence wins — an issue that is
+        // both a member and a managed-link target must yield ONE item,
+        // never two (DoD: no duplicate event lines). BUTCHR-469 (review
+        // round 2 fix): genuinely fresh/changed members rank FIRST (ahead of
+        // managed links, which are never starved by a cap — see below),
+        // stale/already-known members rank LAST, so a persistently-at-cap
+        // project's scarce slots always go to whatever still needs one.
+        // Combined BEFORE `maxLinkedItems` caps, same uniform-cap convention
+        // the issue-owner loop above already uses.
         const seen = new Set<string>();
         const combinedProjectItems: LinkedItem[] = [];
         for (const item of [...memberItems, ...managedItems]) {
@@ -720,24 +759,31 @@ export function createLinkedEventingState(): LinkedEventingState {
         }
         const { kept: projectKept, skipped: projectSkipped } = capLinkedItems(combinedProjectItems, m.rule.maxLinkedItems);
         perOwnerItems.set(m.agentKey, projectKept);
-        const memberTargetSet = new Set(memberItems.map((i) => i.target));
-        memberTargetsByOwner.set(m.agentKey, memberTargetSet);
+        memberTargetsByOwner.set(m.agentKey, new Set(memberItems.map((i) => i.target)));
 
-        // BUTCHR-469 (review round 1 fix): a MANAGED link skipped by the cap
-        // is safe to lose just this tick — `managedLinkedItems` re-lists the
-        // FULL managed-link collection every tick regardless of any cap, so
-        // a skipped one is simply a candidate again next tick, no different
-        // from how an issue owner's own capped-away link already behaves. A
-        // MEMBER skipped by the cap is NOT safe the same way: it only
-        // appeared because it fell inside THIS tick's watermark window, and
-        // once the watermark advances past that window, a member that never
-        // changes again would never reappear in a future search — silently
-        // losing it, not merely delaying it (the DoD's own "delayed, not
-        // lost" bar). Holding the watermark (never committing this tick's
-        // `nextProjectWatermark` entry) means the NEXT tick re-runs the SAME
-        // window, giving every capped member another chance — until the
-        // backlog drains under `ORDER BY updated ASC` above.
-        if (projectSkipped.some((i) => memberTargetSet.has(i.target))) {
+        // BUTCHR-469 (review round 1 fix, refined in round 2): a MANAGED
+        // link skipped by the cap is safe to lose just this tick —
+        // `managedLinkedItems` re-lists the FULL managed-link collection
+        // every tick regardless of any cap, so a skipped one is simply a
+        // candidate again next tick, no different from how an issue owner's
+        // own capped-away link already behaves. A member skipped by the cap
+        // is NOT safe the same way UNLESS it is already stale (baselined,
+        // nothing new): a fresh-or-changed member skipped this tick only
+        // appeared because it fell inside the current watermark window, and
+        // once the watermark advances past that window it may never
+        // reappear — silently losing it, not merely delaying it. Round 2's
+        // own finding: checking ANY member (not just fresh/changed ones)
+        // held the watermark forever once at least one member existed at
+        // all, which is exactly what let an already-delivered member
+        // re-consume the scarce slot every tick — so this checks
+        // `freshOrChangedMembers` specifically, never the full member set.
+        // Holding the watermark (never committing this tick's
+        // `nextProjectWatermark` entry) means the next tick re-runs the SAME
+        // window; as soon as no fresh-or-changed member is skipped (either
+        // none are, or the backlog has fully drained), the watermark
+        // resumes advancing normally.
+        const freshOrChangedTargets = new Set(freshOrChangedMembers.map((i) => i.target));
+        if (projectSkipped.some((i) => freshOrChangedTargets.has(i.target))) {
           nextProjectWatermark.delete(m.agentKey);
           deps.log?.(`  WARNING: [linked-eventing] project-member cap: ${m.agentKey} (${m.projectKey}) has more changed members than maxLinkedItems (${m.rule.maxLinkedItems}) allows this tick; watermark held so the skipped member(s) are retried next tick, not lost`);
         }

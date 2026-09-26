@@ -611,19 +611,33 @@ that simply falls outside the current watermark window is NOT a removal (it
 is still a project member, just not recently touched); only a genuine
 removal from `brooswit.butchr.links` fires that event.
 
-**Capping (review round 1 fix).** A MANAGED link `maxLinkedItems` capped
-away is safe to lose just for one tick — the full managed-link collection
-is re-listed every tick regardless of any cap, so a capped one is simply a
-candidate again next tick, unchanged from the issue-owner behaviour above.
-A MEMBER capped away is not safe the same way: it only appeared because it
-fell inside this tick's watermark window, and once the watermark advances
-past that window it may never reappear — silently losing it, not merely
-delaying it. So a capped member holds this owner's ENTIRE watermark advance
-for the tick (not merely its own item); the next tick re-runs the identical
-window, with `ORDER BY updated ASC` biasing a busy project's retry toward
-draining its oldest backlog first rather than starving the same tail
-forever (the same accepted risk `FOREIGN_FETCH_LIMIT`, `src/rules/
-resource-type.ts`, already documents for a different overflow).
+**Capping (review round 1 fix, refined in round 2).** A MANAGED link
+`maxLinkedItems` capped away is safe to lose just for one tick — the full
+managed-link collection is re-listed every tick regardless of any cap, so a
+capped one is simply a candidate again next tick, unchanged from the
+issue-owner behaviour above. A MEMBER capped away is not safe the same way
+unless it is already stale: it only appeared because it fell inside this
+tick's watermark window, and once the watermark advances past that window
+it may never reappear — silently losing it, not merely delaying it.
+
+Round 1's fix held the owner's ENTIRE watermark advance whenever ANY member
+was capped away — but round 2 found this alone still starves a persistently
+busy project: `ORDER BY updated ASC` ranks by an issue's own `updated`
+timestamp, which never moves once a member is delivered, so an
+already-delivered, unchanged member kept re-matching the deliberately
+over-inclusive held window (`jqlRelativeMinutesSince`'s own "over-inclusive,
+never under-inclusive" doc comment) and sorting right back to the front
+next tick, re-consuming the one scarce slot forever while a genuinely
+still-pending member never got a turn. Fixed by ranking, not just ordering:
+every member candidate is partitioned by whether it already has a matching
+baseline (`updated` unchanged) — genuinely fresh-or-changed members always
+rank ahead of already-known, unchanged ones for the cap, and the
+watermark-hold check only fires when a FRESH-OR-CHANGED member is skipped,
+never for a stale one. This makes an already-delivered member fall out of
+contention on the very next tick (whether or not it still re-matches the
+window), so the backlog drains monotonically: each tick either delivers at
+least one still-pending member, or (once none remain) resumes advancing the
+watermark normally.
 
 **Comment events.** A "comment event" for a project owner reuses the exact
 same per-target comment-cursor diff FACTORY-9 built for any Jira-kind
