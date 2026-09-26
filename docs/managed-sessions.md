@@ -105,18 +105,27 @@ owning the other's shape.
 #387's own hardened review finding, ported here verbatim):** a bound
 server's `headersEnvVar` value is resolved and written **ONLY** into a
 Claude workspace's `mcp.json` (chmod `0600` whenever it carries a resolved
-header — `buildWorkspace`). A **Codex** agent gets a bound server's TOOLS
-with **NO headers at all**, regardless of `headersEnvVar` — Codex's launch
-argv is a real process command line any other local user can read via
-`ps`/`/proc`, and Drovr renders a Codex header as literal argv text.
+header — `buildWorkspace`). A **Codex** agent NEVER gets `headersEnvVar`'s
+resolved value, regardless of the binding — Codex's launch argv is a real
+process command line any other local user can read via `ps`/`/proc`, and
+Drovr renders a Codex header as literal argv text. **BUTCHR-413 narrows
+this one specific case**: a binding's `accountHeader` (a non-secret
+per-agent account NAME, never a credential) IS resolved for Codex the same
+way it is for Claude — see `docs/mcp-server-bindings.md`'s "Codex" section
+for the shipped mechanism.
 **This is why BUTCHR-408's own Codex staged example (scenario (c)) never
-depends on an authenticated bound server** — an authenticated bridge is
-simply not usable from a Codex managed-session agent yet. The per-MCP
+depends on an authenticated bound server** — at the time S2 shipped, no
+bound server was reachable with any header at all from Codex; a bridge that
+only sets `headersEnvVar` (a secret) still is not, but one that sets
+`accountHeader` (like rocketr) now is (BUTCHR-413). The per-MCP
 "notification flag" the ticket's own text names is `channel`, exactly as
 S4 designed it; nothing else was added on top.
 
-Channel **delivery** to a non-Claude vendor (Codex push notifications) is
-still out of scope — see "Not in this version".
+Channel **delivery** to a non-Claude vendor through Codex's OWN connection
+is still out of scope for this ticket — see "Not in this version"
+(BUTCHR-413 later added a daemon-side relay that delivers `channel: true`
+push as a `herd.nudge` prompt instead, without Codex's own connection ever
+receiving it — see `docs/codex-channel-relay.md`).
 
 ## Tier -> model mapping
 
@@ -890,11 +899,18 @@ permission wiring is out of scope for this ticket.
 
 ## Not in this version
 
-- **S4's own channel DELIVERY to a non-Claude vendor** (Codex push
-  notifications) — the `mcpServers`/`channel` FIELD and its Claude-side
-  wiring are real (see "`mcpServers`: additional MCP server bindings"
-  above); a Codex agent still only ever gets a bound server's tools, never
-  push, matching S4's own "Codex steering is a later story" scoping.
+- ~~S4's own channel DELIVERY to a non-Claude vendor~~ **BUTCHR-413: Codex's
+  own connection still gets no push, but the agent isn't left with
+  nothing.** The `mcpServers`/`channel` field and its Claude-side wiring are
+  real (see "`mcpServers`: additional MCP server bindings" above); a Codex
+  agent's own MCP connection to a bound server still only ever gets tools,
+  never push — that much of S4's original scoping holds. What no longer
+  holds is reading "Codex steering is a later story" as "nothing exists
+  yet": BUTCHR-413's daemon-side relay (`src/notify/codex-channel-relay.ts`,
+  `docs/codex-channel-relay.md`) holds a `channel: true` bound server's
+  notification stream open on the agent's behalf and delivers each push as
+  a `herd.nudge` prompt instead — a deliberate stopgap BUTCHR-359 (still out
+  of scope here) is meant to subsume.
 - ~~The Rocket.Chat account lifecycle (`account: "temporary"|"permanent"`)~~
   **BUTCHR-460: now wired**, same as every other provider — see the
   `account` field's own table row above and `docs/rocketchat-accounts.md`'s
