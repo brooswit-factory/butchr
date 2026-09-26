@@ -55,6 +55,7 @@ takes effect on restart, not live), like every other provider's query.
 | `vendor` | yes | `"claude"` or `"codex"` — narrower than `Rule.agentPreferences[].harness` (`agy` is not a Bakr/Candlestix vendor). |
 | `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
+| `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
@@ -845,10 +846,16 @@ see direction 2.
 
 **Direction 2 (the actual guarantee): no `.mcp.json` in ANY ancestor of the
 launched cwd.** Claude's own `--mcp-config` flag is ADDITIVE to its ordinary
-project-level `.mcp.json` auto-discovery, never exclusive of it — this
-codebase (and `@brooswit/drovr`, its launch layer) never passes
-`--strict-mcp-config` anywhere, verified by grepping drovr's own built argv
-builder. Claude Code's own discovery is understood to walk UP from the
+project-level `.mcp.json` auto-discovery, never exclusive of it — and, prior
+to BUTCHR-453/BUTCHR-463, this codebase (and `@brooswit/drovr`, its launch
+layer) never passed `--strict-mcp-config` anywhere at all, so this direction
+was the ONLY mitigation for the project-level case. That is no longer true:
+a definition can now set `strictMcpConfig: true` (see "Auto + strict MCP"
+below) to ask Claude Code for real exclusive discovery — but direction 2
+remains load-bearing on its own, because `strictMcpConfig` is opt-in per
+definition, while `assertNoInheritedMcpConfig` below is unconditional for
+every managed-session spawn regardless of that field. Claude Code's own
+discovery is understood to walk UP from the
 launched process's OS `cwd` through ancestor directories (an assumption
 about a third party's undocumented behaviour, not verified against its
 source here) — and since that OS `cwd` is *always*
@@ -881,6 +888,46 @@ a directory outside this git repo entirely, never tracked or committed — a
 definition file under `sessionDefinitionsPath()` likewise never carries a
 credential value, only `headersEnvVar` names.
 
+## Auto + strict MCP: the Candlestix directors' shape (BUTCHR-453/BUTCHR-463)
+
+The 3 Candlestix directors run with `permissionMode: "auto"` and a strict MCP
+config today. Migrating them to managed-session definitions faithfully means
+expressing BOTH properties in one manifest:
+
+```json
+{
+  "workingDirectory": "~/candlestix/factory-director",
+  "brief": "Direct the factory channel.",
+  "vendor": "claude",
+  "tier": "tier2",
+  "permissionMode": "auto",
+  "strictMcpConfig": true,
+  "role": "sentinel"
+}
+```
+
+`permissionMode: "auto"` reaches Claude's launch exactly as any other
+`permissionMode` value does (see "Per-vendor launch differences" below).
+`strictMcpConfig: true` additionally emits `--strict-mcp-config` alongside
+`--mcp-config`, so Claude Code loads ONLY the servers in this agent's own
+`mcp.json` (butchr's own server plus any `mcpServers` this definition binds)
+— no project- or user-level `.mcp.json` discovered on top of it. `role:
+"sentinel"` is unrelated to either field but part of the directors' real
+shape (fleet-cap-exempt) — included here so the example is the complete
+faithful migration, not just the MCP/permission slice of it.
+
+**How this relates to `assertNoInheritedMcpConfig` (direction 2, above):**
+the two are complementary, not redundant. `assertNoInheritedMcpConfig` is
+unconditional and PROJECT-level only — it refuses the spawn outright if any
+ancestor of the launched workspace directory carries a `.mcp.json`, for
+EVERY managed-session agent regardless of `strictMcpConfig`. `strictMcpConfig`
+is opt-in and covers the wider case direction 2 explicitly does not: Claude
+Code's own USER-level MCP config (outside any project directory), which no
+amount of ancestor-walking can exclude — only `--strict-mcp-config` itself
+does. A director definition wants both: `assertNoInheritedMcpConfig` closes
+the project-level gap unconditionally, `strictMcpConfig: true` closes the
+user-level one this definition explicitly asks for.
+
 ## Per-vendor launch differences
 
 `permissionMode` reaches a **Claude** launch's `ClaudeAgentLaunch.permissionMode`
@@ -896,6 +943,22 @@ concept in `CodexAgentLaunch` (its own `trustWorkspace`/
 definition's `permissionMode` is validated and stored like any other, but
 is simply not forwarded to a Codex launch. Building Codex-specific
 permission wiring is out of scope for this ticket.
+
+`strictMcpConfig` reaches a **Claude** launch's `ClaudeAgentLaunch.strictMcpConfig`
+verbatim (Drovr >= 0.14.0, `@brooswit/drovr`; also validated at our layer —
+a non-boolean value fails at manifest-load time). **Codex** has no
+strict-MCP-config concept either, but is treated DIFFERENTLY from
+`permissionMode` above: a `vendor: "codex"` definition setting
+`strictMcpConfig` (to any value, including `false`) is **REJECTED at
+manifest load** (`sessionDefinitionProblems`,
+`src/resources/session-definition.ts`) rather than silently validated,
+stored, and dropped. This is a deliberate departure from `permissionMode`'s
+own precedent, not an oversight: a silently-ignored `permissionMode` leaves
+a Codex operator with a cosmetic surprise (their manifest's wish is a
+no-op), but a silently-ignored `strictMcpConfig` would leave them believing
+they have an MCP-isolation security property they do not — the exact
+silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
+first place. `test/unit/session-definition.test.ts` proves the rejection.
 
 ## Not in this version
 

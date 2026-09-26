@@ -205,6 +205,7 @@ export function specForSessionDefinition({ agentKey, resource, definition }: Ses
     agents: [{ harness: definition.vendor, model: tierToModel(definition.vendor, definition.tier) }],
     cwd: definition.workingDirectory,
     permissionMode: definition.permissionMode,
+    ...(definition.strictMcpConfig !== undefined ? { strictMcpConfig: definition.strictMcpConfig } : {}),
     ...(definition.mcpServers ? { mcpServers: definition.mcpServers } : {}),
   };
 }

@@ -124,6 +124,8 @@ export interface SpawnSpec {
   cwd?: string;
   /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */
   permissionMode?: string;
+  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
+  strictMcpConfig?: boolean;
   /**
    * BUTCHR-408: additional MCP servers this agent may connect to, beyond
    * butchr's own — a managed-session definition's own `mcpServers`

@@ -190,6 +190,7 @@ export function agentLaunchConfig(
     // multiple channel servers just work.
     developmentChannels: ["server:butchr", ...boundChannels(spec)],
     ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
+    ...(spec.strictMcpConfig ? { strictMcpConfig: true } : {}),
   };
 }
 
