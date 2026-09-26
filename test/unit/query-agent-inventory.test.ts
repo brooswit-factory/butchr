@@ -161,10 +161,10 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
     expect(byId.get("my-ideas")).toMatchObject({ enabled: true, staffed: true, reason: null });
   });
 
-  test("harnesses, linkedEventing and mcpServerNames are copied field-by-field, never a spread of the raw Rule", async () => {
+  test("agentPreferences (harness/model/effort — the rule-level tier stand-in), linkedEventing and mcpServerNames are copied field-by-field, never a spread of the raw Rule", async () => {
     const r = rule({
       id: "triage", resourceProvider: "jira-work",
-      agentPreferences: [{ harness: "claude", model: "opus" }, { harness: "codex" }],
+      agentPreferences: [{ harness: "claude", model: "opus", effort: "high" }, { harness: "codex" }],
       linkedEventing: true,
       mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/rocketr", headersEnvVar: "ROCKETR_SECRET_ENV", accountHeader: "x-rocketr-account", channel: true }],
     });
@@ -175,7 +175,8 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       sessionDefinitions: fakeSessionDefinitions({}),
     });
     const entry = inventory.rules[0]!;
-    expect(entry.harnesses).toEqual(["claude", "codex"]);
+    // Ranked order preserved; model/effort survive per-entry, absent where the rule never set one.
+    expect(entry.agentPreferences).toEqual([{ harness: "claude", model: "opus", effort: "high" }, { harness: "codex" }]);
     expect(entry.linkedEventing).toBe(true);
     expect(entry.mcpServerNames).toEqual(["rocketr"]);
     expect(JSON.stringify(entry)).not.toContain("ROCKETR_SECRET_ENV");

@@ -72,7 +72,7 @@
  * (path)`, byte-identical to the `resourceKey` a managed-session's own
  * `AgentDashboardRow` carries. Neither is a new format this ticket invented.
  */
-import type { AgentHarness, AgentRole, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
+import type { AgentEffort, AgentHarness, AgentPreference, AgentRole, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
 import { loadRules, rulesPath } from "../rules/rules.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { DashboardResponse, DashboardRow } from "./dashboard.js";
@@ -100,8 +100,18 @@ export interface RuleInventoryEntry {
   execution: ExecutionMode;
   account: AccountPolicy;
   role: AgentRole;
-  /** `rule.agentPreferences`' own `harness` values, ranked-order preserved; `[]` when the rule sets no preference (uses butchr's global agent config). */
-  harnesses: AgentHarness[];
+  /**
+   * `rule.agentPreferences`, ranked-order preserved, each copied field-by-field
+   * (`harness`/`model`/`effort` — none secret) rather than reused as-is. This
+   * is the ticket's own "harness/provider list, tier" ask: `AgentPreference`'s
+   * `model`/`effort` are the only rule-level analogue of "tier" — a `Rule` has
+   * no `tier` field at all (that name belongs to `SessionDefinition` instead;
+   * see `SessionDefinitionInventoryEntry.tier`) — so a `RuleInventoryEntry`
+   * deliberately has no separate `tier` field either; a reader who needs a
+   * per-rule model/effort reads it here. `[]` when the rule sets no
+   * preference (uses butchr's global agent config).
+   */
+  agentPreferences: { harness: AgentHarness; model?: string; effort?: AgentEffort }[];
   /** `rule.linkedEventing === true`; `false` for absent/false alike (see that field's own doc comment on `Rule` — absent and false are the same no-op). */
   linkedEventing: boolean;
   /** `rule.mcpServers`' own `name`s ONLY — see this module's own top comment on why nothing else from a binding is ever copied here. `[]` when the rule binds none. */
@@ -191,6 +201,13 @@ export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffe
   };
 }
 
+/** Field-by-field copy of one `AgentPreference` — never a spread of the raw object (same discipline as every other field on this module's entries), even though none of the three fields is secret. */
+const copyAgentPreference = (p: AgentPreference): { harness: AgentHarness; model?: string; effort?: AgentEffort } => ({
+  harness: p.harness,
+  ...(p.model !== undefined ? { model: p.model } : {}),
+  ...(p.effort !== undefined ? { effort: p.effort } : {}),
+});
+
 function buildRuleInventoryEntry(rule: Rule, deps: RuleStaffingDeps): RuleInventoryEntry {
   const { staffed, reason } = ruleStaffingReason(rule, deps);
   return {
@@ -202,7 +219,7 @@ function buildRuleInventoryEntry(rule: Rule, deps: RuleStaffingDeps): RuleInvent
     execution: rule.execution,
     account: rule.account,
     role: rule.role,
-    harnesses: (rule.agentPreferences ?? []).map((p) => p.harness),
+    agentPreferences: (rule.agentPreferences ?? []).map(copyAgentPreference),
     linkedEventing: rule.linkedEventing === true,
     mcpServerNames: (rule.mcpServers ?? []).map((s) => s.name),
     staffed,

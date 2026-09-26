@@ -376,7 +376,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 // query-agent-inventory.test.ts; this just proves the route is wired.
 describe("GET /config-inventory (FACTORY-72): every configured rule and managed-session definition", () => {
   test("smoke: the route serves deps.configInventory() verbatim", async () => {
-    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, harnesses: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
     const { app } = buildApp({ ...view, configInventory: async () => inventory });
     app.listen(0);
     try {
