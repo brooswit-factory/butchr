@@ -26,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -193,6 +193,16 @@ const managedSessionRoles = new Map<string, AgentRole>();
  */
 const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
 /**
+ * FACTORY-75 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` above, one field over: this poll's
+ * eligible definitions' resolved `(model, effort)` pair (`effectiveAgent`,
+ * src/resources/session-definition.ts), keyed identically. `resolvedAgentOf`
+ * below consults this map for a managed-session id before falling back to
+ * `rules`' own `agentPreferences` for a rule-engine id — see that
+ * function's own comment for the full shape.
+ */
+const managedSessionResolvedAgents = new Map<string, { model: string; effort?: AgentEffort }>();
+/**
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
  * an eligible managed-session definition opted into "lizard mode"
@@ -278,6 +288,33 @@ const mcpBindingsOf = (id: string) => {
   if (!decoded) return undefined;
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.mcpServers;
+};
+
+/**
+ * FACTORY-75 — `HerdrHerd.staleIssues()`'s own `resolvedAgentOf` seam (see
+ * that constructor param's doc comment, src/agents/herd.ts): this issue's
+ * CURRENTLY resolved `(model, effort)` pair for the given provider, from
+ * the two-axis `modelPower`/`effort` mechanism (src/resources/power-scale.ts).
+ * Same decode-then-look-up-by-ruleId shape as `mcpBindingsOf` immediately
+ * above, for the SAME reason (HerdrHerd holds no rule state of its own) —
+ * a managed-session id is checked FIRST against `managedSessionResolvedAgents`
+ * (rebuilt every managed-sessions poll from that poll's eligible
+ * definitions — see that map's own comment above), since a managed-session
+ * definition has no entry in `rules` at all; a rule-engine id then falls
+ * through to that rule's own `agentPreferences` entry for this provider —
+ * ALREADY resolved at `loadRules()` time (`AgentPreference`'s own doc
+ * comment, src/rules/rules.ts), so this is a plain lookup, not a second
+ * resolution. `undefined` for anything neither map/lookup can answer — the
+ * same "nothing to compare, so nothing reads stale" fail-safe `mcpBindingsOf`
+ * already has.
+ */
+const resolvedAgentOf = (id: string, provider: string): { model?: string; effort?: AgentEffort } | undefined => {
+  if (ownsManagedSessionAgent(id)) return managedSessionResolvedAgents.get(id);
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
+  return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
 
 /**
@@ -400,7 +437,7 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf, resolvedAgentOf);
 // FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): relabel every
 // currently-running, butchr-owned herdr workspace to its short display label
 // on every daemon startup — no agent restart. Idempotent (see
@@ -1534,6 +1571,7 @@ console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
   accountPolicies: managedSessionAccountPolicies,
+  resolvedAgents: managedSessionResolvedAgents,
   lizardModes: managedSessionLizardModes,
   account: accountLifecycle,
   herd,
