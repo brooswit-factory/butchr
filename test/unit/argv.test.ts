@@ -224,6 +224,45 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS; }
   });
 
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): unlike headersEnvVar's
+  // secret value, a binding's non-secret `accountHeader` reaches Codex argv
+  // — this is what lets a Codex agent's own mcp.json tool calls to a bridge
+  // like rocketr identify which account is replying at all, after the
+  // BUTCHR-411 fix above (still true, still tested immediately above) struck
+  // every OTHER header from a Codex launch.
+  test("a binding's accountHeader reaches Codex argv when this launch carries an rocketchatAccount — a non-secret account name, not a credential", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount], rocketchatAccount: "butchr_jira-work-triage-kan-9_deadbeef00" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).toContain("http_headers");
+    expect(mudArg).toContain("x-rocketr-account");
+    expect(mudArg).toContain("butchr_jira-work-triage-kan-9_deadbeef00");
+  });
+
+  test("accountHeader configured but no rocketchatAccount on this launch (an account:\"none\" rule, or a provisioning refusal) — no headers at all, same as before this field existed", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).not.toContain("http_headers");
+  });
+
+  test("both headersEnvVar (secret) and accountHeader (non-secret) configured together: Codex argv carries the account name but never the secret", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS_2 = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE-2" });
+    try {
+      const both = { ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS_2", accountHeader: "x-rocketr-account" };
+      const args = spawnArgs({ ...spec, mcpServers: [both], rocketchatAccount: "butchr_acct" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+      expect(mudArg).toBeDefined();
+      expect(mudArg).toContain("x-rocketr-account");
+      expect(mudArg).toContain("butchr_acct");
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE-2");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE-2");
+    } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS_2; }
+  });
+
   test("agy's launch is unaffected by mcpServers — bindings must not break it", () => {
     const launch = agentStartParams({ ...spec, mcpServers: [mud] }, "/w/KAN-783", "pane", "worker", { provider: "agy" });
     expect(launch).toEqual(agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy" }));

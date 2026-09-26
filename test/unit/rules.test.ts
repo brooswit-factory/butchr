@@ -301,6 +301,8 @@ describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a r
   // BUTCHR-412 (BUTCHR-391 comment 24007): the per-AGENT, non-secret literal
   // header extension — a Rocket.Chat/rocketr binding names the header the
   // agent's own account name is injected into, never the value itself.
+  // BUTCHR-413 (review finding 1) is what reuses this same field/value on
+  // the Codex argv path — see argv.test.ts for that half.
   describe("accountHeader (BUTCHR-412)", () => {
     test("accepted and normalised (trimmed)", () => {
       const [r] = parseRules({ rules: [{ ...minimal, mcpServers: [{ ...mud, accountHeader: " x-rocketr-account " }] }] });

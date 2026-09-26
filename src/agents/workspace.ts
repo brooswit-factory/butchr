@@ -54,6 +54,19 @@ export interface SpawnSpec {
    * a dedicated 0600 file (`RC_ACCOUNT_FILE`) that the agent itself read —
    * removed per the corrected design, which forbids a token ever reaching an
    * agent's workspace at all.
+   *
+   * BUTCHR-413's own consumers of this SAME field, outside any one launch's
+   * spec: `HerdrHerd.spawn`/`HerdrHerd.staleIssues` (src/agents/herd.ts) fill
+   * this in ONLY when `ensure()` above never ran for a launch at all (no
+   * accountLifecycle wired — RC not configured for any rule), and never
+   * overwrite an already-set value; `createCodexChannelRelayPool`'s own
+   * daemon-side connection (src/notify/codex-channel-relay.ts) has no live
+   * spec to read at all and always derives it. Both use the exact same
+   * `rcUsernameFor(agentKey, prefix)` this field's own real producer
+   * (`ensureAccount`) uses internally, with the SAME configured
+   * `Config.rocketchat.managedPrefix` — one function, one prefix, so a
+   * derived answer can never name a different account than the one actually
+   * provisioned.
    */
   rocketchatAccount?: string;
   /** Operator-owned MCP config path (jira-project rules only); `{{KEY}}` expands to the resource key. */
@@ -557,6 +570,14 @@ const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
  * (this agent has an account) or it is not (no `accountHeader` on the
  * binding, or no account for this launch), so there is no failure mode to
  * log, unlike `resolveMcpServerHeaders`'s own unset/malformed-env case.
+ *
+ * BUTCHR-413 reuses this SAME function, unmodified, for Codex's own
+ * bound-server config (`boundCodexServers`, src/agents/argv.ts) — safe
+ * there in a way `resolveMcpServerHeaders`'s own resolved value never is,
+ * because an account name grants no capability by itself (see
+ * `McpServerBinding.accountHeader`'s own doc comment for why). One function,
+ * two callers (Claude's mcp.json here, Codex's argv there), never a second
+ * copy of the same one-line lookup.
  */
 export function resolveAccountHeader(binding: McpServerBinding, account: string | undefined): Record<string, string> | undefined {
   return binding.accountHeader && account ? { [binding.accountHeader]: account } : undefined;

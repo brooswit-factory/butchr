@@ -133,9 +133,12 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * env, while an account name is per-AGENT (this rule's every agent gets a
  * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
  * value, which is deliberately kept out of Codex argv entirely — see that
- * field's own doc comment; `accountHeader`'s value has no such restriction
- * in principle, but no caller resolves it for Codex today either — narrowing
- * that is S6's, BUTCHR-419/420). Set to the literal header NAME (e.g.
+ * field's own doc comment; `accountHeader`'s value has no such restriction,
+ * and BUTCHR-413 does resolve it for Codex, via `resolveAccountHeader`
+ * reused directly in `boundCodexServers`, src/agents/argv.ts — the small,
+ * explicit extension that review's finding 1 needed, proven by a test that
+ * a Codex agent's own bound `rocketr` server carries its account name with
+ * no secret ever alongside it). Set to the literal header NAME (e.g.
  * `"x-rocketr-account"`); the VALUE is resolved at launch time from
  * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
  * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
