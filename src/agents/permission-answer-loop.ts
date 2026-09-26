@@ -41,10 +41,69 @@
  * drovr's escalation watcher (see managed-session-escalation-watcher.ts's own
  * doc comment) — nothing else on this fleet presses that dialog's keys.
  */
+import { basename } from "node:path";
 import { autoAnswerPermissions, type AutoAnswerPermissionResult, type DrovrClient } from "@brooswit/drovr";
+import { decodeAnyAgentKey } from "../rules/agent-key.js";
+import type { Rule } from "../rules/rules.js";
 
 /** The slice of `DrovrClient` `autoAnswerPermissions` actually needs — same shape drovr's own `ApprovalClient` type declares, restated here so this module doesn't need a `DrovrClient` import just to read the pick out of it. */
 export type PermissionAnswerClient = { agent: Pick<DrovrClient["agent"], "list" | "get" | "read" | "sendKeys"> };
+
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the pane-
+ * eligibility DECISION itself, extracted out of `src/daemon/index.ts`
+ * (`lizardModeLabel`) so it is importable by a test rather than only
+ * exercisable through the whole daemon module (which has no exports and
+ * runs real startup side effects on import). Every input is injected —
+ * this module still knows nothing about herdr, `agentIdOfWorkspacePath`, or
+ * any daemon-side polling cadence; the caller resolves a pane's `cwd` down
+ * to an agent id first (see `ruleLizardModeOf`'s own doc comment) and hands
+ * everything else in here.
+ */
+export interface RuleLizardModeDeps {
+  /** Every currently-loaded rule (`src/rules/rules.ts`), read once at daemon startup — matched by `ruleId` + `resourceProvider`, the SAME "rule-level fallback" lookup `ruleRoleOfAgent` (src/daemon/index.ts) already uses for `Rule.role`. */
+  rules: readonly Rule[];
+  /** Whether `id` belongs to the managed-sessions built-in rule (`ownsManagedSessionAgent`, src/rules/session-definition-type.ts) — injected rather than imported, so this module stays decoupled from that one. */
+  isManagedSessionAgent: (id: string) => boolean;
+  /** The live, rebuilt-every-poll opt-in map for managed-session agents (`managedSessionLizardModes`, src/daemon/index.ts) — consulted only when `isManagedSessionAgent(id)` is true; a managed-session definition has no static `Rule` of its own to read `lizardMode` off (see `ManagedSessionResourceDeps.lizardModes`'s own doc comment, src/rules/session-definition-type.ts). */
+  managedSessionLizardModes: ReadonlyMap<string, boolean>;
+}
+
+/**
+ * True iff `id`'s agent has opted into "lizard mode". A managed-session id
+ * (`deps.isManagedSessionAgent`) resolves from the live
+ * `deps.managedSessionLizardModes` map exactly as before FACTORY-87; every
+ * OTHER rule-engine agent id (`jira-work`/`jira-project`/`github-issue`/
+ * `github-pr`/plain `filesystem`) resolves from that id's own `Rule.lizardMode`,
+ * looked up against `deps.rules` — a rule is loaded once at daemon startup
+ * (no per-rule live poll the way a managed-session definition file gets
+ * one), so there is nothing to rebuild here. `id` decoding to nothing (a
+ * legacy/bare-issue agent, or garbage) resolves `false`, matching
+ * `lizardMode`'s own "absent means never touched" contract.
+ */
+export function ruleLizardModeOf(id: string, deps: RuleLizardModeDeps): boolean {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return false;
+  if (deps.isManagedSessionAgent(id)) return deps.managedSessionLizardModes.get(id) === true;
+  const rule = deps.rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  return rule?.lizardMode === true;
+}
+
+/**
+ * `id`'s own human label for a `[permission-answer]` journal line (FACTORY-67:
+ * name WHICH AGENT, not just an opaque pane id) when it is lizard-mode
+ * eligible, else `undefined` — the exact shape `PermissionAnswerLoopDeps.eligiblePanes`
+ * needs per pane. A per-resource agent key is labelled by its resource id's
+ * basename (an issue key, a GitHub ref, a project key, or a file path,
+ * whichever the rule kind uses); a query-level agent (no single resource) or
+ * anything `decodeAnyAgentKey` can't split into a resource is labelled by
+ * the id itself.
+ */
+export function lizardModeLabelFor(id: string | null, deps: RuleLizardModeDeps): string | undefined {
+  if (!id || !ruleLizardModeOf(id, deps)) return undefined;
+  const decoded = decodeAnyAgentKey(id);
+  return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
+}
 
 /** The one shape this module needs out of a herdr `agent.list()` row — narrow, so `eligiblePanes` below never needs the full `DrovrClient` agent type. */
 export interface PermissionAnswerPane {

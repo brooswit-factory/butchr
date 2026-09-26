@@ -1,16 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { ApiError } from "confluence.js/core";
-import { getDoc, setDoc, ensureDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET } from "../../src/tools/docs.js";
+import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
  * A small stateful Jira+Confluence world implementing the full `AtlassianOps`
- * surface, used only by this file. docs.ts's logic (recursive nested
- * creation, exhaustive child pagination, a race-guard retry) is genuinely
- * stateful across calls in a way the simple call-recording `rig()` in
- * tools.test.ts isn't built for — this fake exists for that reason, not as a
- * second version of that one. Everything docs.ts doesn't touch (search,
- * addComment, …) is stubbed since it's never called.
+ * surface, used only by this file. docs.ts's logic is genuinely stateful
+ * across calls in a way the simple call-recording `rig()` in tools.test.ts
+ * isn't built for — this fake exists for that reason, not as a second
+ * version of that one. Everything docs.ts doesn't touch (search, addComment,
+ * …) is stubbed since it's never called. `createPageWithLabel`/
+ * `getChildPages`/`getPageLabels` remain on this fake even though nothing in
+ * docs.ts calls them anymore post-FACTORY-86 (they backed `ensureDoc`'s
+ * retired creation path) — kept only because they're still part of the
+ * `AtlassianOps` interface every fake must implement in full.
  */
 function makeWorld(opts: { childPageSize?: number } = {}) {
   const childPageSize = opts.childPageSize ?? 50;
@@ -116,11 +119,11 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
 
   /**
    * Directly wires an issue's remote link to a page with an arbitrary
-   * id/title/body/version, bypassing `ensureDoc`'s creation path entirely —
-   * for `get_doc`-only tests (BUTCHR-270's range-read arms) that need
-   * control over the stored body's exact content (e.g. empty, or built for
-   * a specific character/byte length) rather than whatever `ensureDoc`
-   * would provision.
+   * id/title/body/version — the ONLY way to give a test issue a doc now
+   * that nothing in docs.ts ever creates one (FACTORY-84/FACTORY-86). Used
+   * both by `get_doc`-only tests (BUTCHR-270's range-read arms) that need
+   * control over the stored body's exact content, and by any `set_doc` test
+   * that needs a pre-existing doc to write into.
    */
   function seedIssueDoc(key: string, id: string, title: string, body: string, version = 1) {
     pages.set(id, { parentId: "", title, body, labels: [], version });
@@ -154,20 +157,19 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
   });
 
   test("a ticket with a doc returns its body/id/url — fits entirely (complete: true)", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, pages, seedIssueDoc } = makeWorld();
     addIssue("BUTCHR-2", "already has a doc");
-    const created = await ensureDoc(ops, "BUTCHR-2");
+    seedIssueDoc("BUTCHR-2", "800", "an existing doc", "<p>hello</p>");
     const result = await getDoc(ops, "BUTCHR-2");
     expect(result).toEqual({
       found: true,
       complete: true,
-      id: created.id,
-      url: created.url,
-      title: created.title,
+      id: "800",
+      url: expect.any(String),
+      title: "an existing doc",
       version: 1,
-      size: { chars: created.body.length, bytes: Buffer.byteLength(created.body, "utf8") },
-      body: created.body,
+      size: { chars: "<p>hello</p>".length, bytes: Buffer.byteLength("<p>hello</p>", "utf8") },
+      body: "<p>hello</p>",
     });
     expect(pages.size).toBe(1);
   });
@@ -422,149 +424,93 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
 
 });
 
-describe("docs.ts: ensureDoc — lazy nested creation", () => {
-  test("bottoms out at the project root doc when the ticket has no boss", async () => {
+describe("docs.ts: findDoc — never creates, links, or infers a space/parent (FACTORY-84/FACTORY-86)", () => {
+  test("a ticket with no doc -> null, and touches no write op at all", async () => {
+    const { ops, addIssue, pages, issues, upsertCalls } = makeWorld();
+    addIssue("BUTCHR-25", "never asked for a doc");
+    const doc = await findDoc(ops, "BUTCHR-25");
+    expect(doc).toBeNull();
+    expect(pages.size).toBe(0); // no page created
+    expect(issues.get("BUTCHR-25")!.remoteLink).toBeUndefined(); // no link written
+    expect(upsertCalls()).toBe(0);
+  });
+
+  test("a ticket that never asked for a doc STAYS that way across repeated calls — no page ever appears", async () => {
+    const { ops, addIssue, pages } = makeWorld();
+    addIssue("BUTCHR-40", "repeated reads");
+    await findDoc(ops, "BUTCHR-40");
+    await findDoc(ops, "BUTCHR-40");
+    const doc = await findDoc(ops, "BUTCHR-40");
+    expect(doc).toBeNull();
+    expect(pages.size).toBe(0);
+  });
+
+  test("an existing (pre-existing, or manually linked) doc is returned as-is — reads are unaffected by this change", async () => {
+    const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
+    addIssue("BUTCHR-41", "already has a doc from before this change");
+    seedIssueDoc("BUTCHR-41", "500", "[unwritten] BUTCHR-41 — orphaned page, no link yet", "<p/>");
+    const doc = await findDoc(ops, "BUTCHR-41");
+    expect(doc?.id).toBe("500");
+    expect(pages.size).toBe(1); // nothing extra created
+  });
+
+  test("a bossless ticket's doc is STILL just 'none' — this function never bottoms out at the project root doc, unlike the retired ensureDoc", async () => {
     const { ops, addIssue, pages, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-25", "epic with no boss");
-    const doc = await ensureDoc(ops, "BUTCHR-25");
-    expect(pages.get(doc.id)?.parentId).toBe(ROOT_DOC_ID);
-    expect(pages.get(doc.id)?.labels).toEqual([labelForKey("BUTCHR-25")]);
-    expect(doc.title).toBe("[unwritten] BUTCHR-25 — epic with no boss");
+    addIssue("BUTCHR-26", "epic with no boss, no doc");
+    const doc = await findDoc(ops, "BUTCHR-26");
+    expect(doc).toBeNull();
+    expect(pages.size).toBe(0);
   });
 
-  test("the full lazy boss chain: task -> story -> epic -> root, each nested under the last, each linked and labelled", async () => {
-    const { ops, addIssue, pages, issues, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-25", "epic, no boss");
-    addIssue("BUTCHR-27", "story", "BUTCHR-25");
-    addIssue("BUTCHR-33", "task", "BUTCHR-27");
-
-    const taskDoc = await ensureDoc(ops, "BUTCHR-33");
-    expect(pages.size).toBe(3); // task + story + epic, none extra
-
-    const storyPageId = pages.get(taskDoc.id)!.parentId;
-    const storyDoc = pages.get(storyPageId)!;
-    expect(storyDoc.labels).toEqual([labelForKey("BUTCHR-27")]);
-
-    const epicPageId = storyDoc.parentId;
-    const epicDoc = pages.get(epicPageId)!;
-    expect(epicDoc.labels).toEqual([labelForKey("BUTCHR-25")]);
-    expect(epicDoc.parentId).toBe(ROOT_DOC_ID); // bottoms out correctly
-
-    // both directions of the binding, for every ticket in the chain
-    for (const key of ["BUTCHR-33", "BUTCHR-27", "BUTCHR-25"]) {
-      expect(issues.get(key)?.remoteLink?.url).toBeTruthy();
-    }
-  });
-
-  test("a re-run is a no-op: same page, same link, nothing duplicated (the idempotent-upsert path)", async () => {
-    const { ops, addIssue, pages, issues, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-40", "idempotency check");
-    const first = await ensureDoc(ops, "BUTCHR-40");
-    const linkAfterFirst = issues.get("BUTCHR-40")!.remoteLink;
-    const second = await ensureDoc(ops, "BUTCHR-40");
-    expect(second.id).toBe(first.id);
-    expect(pages.size).toBe(1);
-    expect(issues.get("BUTCHR-40")!.remoteLink).toEqual(linkAfterFirst);
-  });
-
-  test("fail-at-5 recovery: a page already exists and is labelled, but the ticket's remote link was never written — adopts it, makes NO second page", async () => {
-    const { ops, addIssue, pages, issues, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-41", "orphaned page, no link yet");
-    // Simulate the fail-at-5 partial state directly: the page exists and is
-    // labelled, but nothing ever ran step 5 to link it back.
-    pages.set("500", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-41 — orphaned page, no link yet", body: "<p/>", labels: [labelForKey("BUTCHR-41")], version: 1 });
-    expect(issues.get("BUTCHR-41")!.remoteLink).toBeUndefined();
-
-    const doc = await ensureDoc(ops, "BUTCHR-41");
-    expect(doc.id).toBe("500");
-    expect(pages.size).toBe(1); // no second page created
-    expect(issues.get("BUTCHR-41")!.remoteLink?.url).toContain("/pages/500");
-  });
-
-  test("exhaustive pagination: a labelled page past the first page of children is still found (not a false 'no doc')", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld({ childPageSize: 1 });
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    // Three unrelated siblings already under the root doc before the target's label...
-    pages.set("601", { parentId: ROOT_DOC_ID, title: "sibling one", body: "", labels: [], version: 1 });
-    pages.set("602", { parentId: ROOT_DOC_ID, title: "sibling two", body: "", labels: [], version: 1 });
-    pages.set("603", { parentId: ROOT_DOC_ID, title: "[unwritten] BUTCHR-42 — target, three pages in", body: "", labels: [labelForKey("BUTCHR-42")], version: 1 });
-    addIssue("BUTCHR-42", "target, three pages in");
-
-    const doc = await ensureDoc(ops, "BUTCHR-42");
-    expect(doc.id).toBe("603"); // adopted the existing page...
-    expect(pages.size).toBe(3); // ...instead of creating a 4th
-  });
-
-  test("race guard: a title collision (400) on create triggers exactly one re-scan, adopting the winner instead of failing or looping", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-43", "raced by a concurrent caller");
-
-    // Step 3's initial scan must find NOTHING (that's the whole point of a
-    // race), so the "concurrent winner" page is inserted from INSIDE
-    // createPageWithLabel itself — i.e. exactly between our own step-3 scan
-    // and our own step-4 create, which is when a real race would land it.
-    let raced = false;
-    const racedOps: AtlassianOps = {
-      ...ops,
-      createPageWithLabel: async (p) => {
-        if (!raced) {
-          raced = true;
-          pages.set("700", { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-        }
-        throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
-      },
-    };
-
-    const doc = await ensureDoc(racedOps, "BUTCHR-43");
-    expect(doc.id).toBe("700");
-    expect(pages.size).toBe(1); // never created a second page after the 400
-  });
-
-  test("a non-collision error from createPageWithLabel is NOT swallowed as a race", async () => {
-    const { ops, addIssue, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-44", "genuine failure, not a race");
-    const failingOps: AtlassianOps = { ...ops, createPageWithLabel: async () => { throw new ApiError("nope", 500, "Server Error", {}); } };
-    await expect(ensureDoc(failingOps, "BUTCHR-44")).rejects.toThrow(/nope/);
-  });
-
-  test("refuses when the project entity property is missing, naming the property and project", async () => {
-    const { ops, addIssue } = makeWorld();
-    addIssue("KAN-1", "no butchr property configured for this project");
-    await expect(ensureDoc(ops, "KAN-1")).rejects.toThrow(/butchr.*KAN/s);
-  });
-
-  test("refuses on a malformed key rather than emitting an uninvertible label", async () => {
+  test("refuses on a malformed key rather than trying to read anything", async () => {
     const { ops } = makeWorld();
-    await expect(ensureDoc(ops, "not-a-key")).rejects.toThrow(/not a valid Jira key/);
+    await expect(findDoc(ops, "not-a-key")).rejects.toThrow(/not a valid Jira key/);
   });
 
-  test("cycle guard: an Implements cycle refuses instead of recursing forever", async () => {
-    const { ops, addIssue, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-50", "cycle a", "BUTCHR-51");
-    addIssue("BUTCHR-51", "cycle b", "BUTCHR-50");
-    await expect(ensureDoc(ops, "BUTCHR-50")).rejects.toThrow(/boss chain/);
+  test("never calls createPageWithLabel/getChildPages/getPageLabels/upsertRemoteLink — the retired creation machinery is never reached", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-51", "instrumented");
+    let createCalled = false;
+    let childPagesCalled = false;
+    let pageLabelsCalled = false;
+    let upsertCalled = false;
+    const instrumentedOps: AtlassianOps = {
+      ...ops,
+      createPageWithLabel: async (p) => { createCalled = true; return ops.createPageWithLabel(p); },
+      getChildPages: async (id, cursor) => { childPagesCalled = true; return ops.getChildPages(id, cursor); },
+      getPageLabels: async (id) => { pageLabelsCalled = true; return ops.getPageLabels(id); },
+      upsertRemoteLink: async (key, globalId, relationship, object) => { upsertCalled = true; return ops.upsertRemoteLink(key, globalId, relationship, object); },
+    };
+    await findDoc(instrumentedOps, "BUTCHR-51");
+    expect(createCalled).toBe(false);
+    expect(childPagesCalled).toBe(false);
+    expect(pageLabelsCalled).toBe(false);
+    expect(upsertCalled).toBe(false);
   });
 });
 
-describe("docs.ts: set_doc — full replace, provisional-title refusal", () => {
-  test("while the title is still provisional, set_doc REQUIRES a title", async () => {
-    const { ops, addIssue, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-60", "still provisional");
+describe("docs.ts: set_doc — never creates; refuses a ticket with no doc (FACTORY-84/FACTORY-86)", () => {
+  test("a ticket with NO doc is REFUSED — names the situation, points at the on-request path, and creates nothing", async () => {
+    const { ops, addIssue, pages, issues } = makeWorld();
+    addIssue("BUTCHR-64", "brand new, never asked for a doc");
+    await expect(setDoc(ops, "BUTCHR-64", "<p>x</p>", "T")).rejects.toThrow(/no Confluence doc/);
+    await expect(setDoc(ops, "BUTCHR-64", "<p>x</p>", "T")).rejects.toThrow(/confluence_create_page/);
+    expect(pages.size).toBe(0); // no page created
+    expect(issues.get("BUTCHR-64")!.remoteLink).toBeUndefined(); // no link written
+  });
+
+  test("while an EXISTING (pre-change) doc's title is still provisional, set_doc REQUIRES a title", async () => {
+    const { ops, addIssue, seedIssueDoc } = makeWorld();
+    addIssue("BUTCHR-60", "still provisional, from before this change");
+    seedIssueDoc("BUTCHR-60", "800", "[unwritten] BUTCHR-60 — still provisional, from before this change", "<p/>");
     await expect(setDoc(ops, "BUTCHR-60", "<p>real content</p>")).rejects.toThrow(/provisional/);
   });
 
   test("supplying a title while provisional succeeds and replaces the body and title", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
     addIssue("BUTCHR-61", "about to be titled");
+    seedIssueDoc("BUTCHR-61", "801", "[unwritten] BUTCHR-61 — about to be titled", "<p/>");
     const result = await setDoc(ops, "BUTCHR-61", "<p>real content</p>", "A real outcome-shaped title");
     expect(result.title).toBe("A real outcome-shaped title");
     expect(pages.get(result.id)?.title).toBe("A real outcome-shaped title");
@@ -572,45 +518,42 @@ describe("docs.ts: set_doc — full replace, provisional-title refusal", () => {
   });
 
   test("once titled, omitting `title` keeps the current title (no longer required)", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
     addIssue("BUTCHR-62", "already titled");
-    const first = await setDoc(ops, "BUTCHR-62", "<p>v1</p>", "Outcome title");
+    seedIssueDoc("BUTCHR-62", "802", "Outcome title", "<p>v0</p>");
+    const first = await setDoc(ops, "BUTCHR-62", "<p>v1</p>");
     const second = await setDoc(ops, "BUTCHR-62", "<p>v2</p>");
     expect(second.title).toBe("Outcome title");
     expect(pages.get(first.id)?.body).toBe("<p>v2</p>");
   });
 
   test("is a FULL replace, not an append — the old body is gone", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, seedIssueDoc, pages } = makeWorld();
     addIssue("BUTCHR-63", "replace check");
-    const first = await setDoc(ops, "BUTCHR-63", "<p>first</p>", "T");
-    await setDoc(ops, "BUTCHR-63", "<p>second only</p>");
+    seedIssueDoc("BUTCHR-63", "803", "T", "<p>first</p>");
+    const first = await setDoc(ops, "BUTCHR-63", "<p>second only</p>");
     expect(pages.get(first.id)?.body).toBe("<p>second only</p>");
   });
 
-  test("ensures the doc exists first (creates it lazily) when the ticket had none", async () => {
-    const { ops, addIssue, pages, issues, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-64", "brand new");
-    expect(issues.get("BUTCHR-64")!.remoteLink).toBeUndefined();
-    await setDoc(ops, "BUTCHR-64", "<p>x</p>", "T");
-    expect(pages.size).toBe(1);
-    expect(issues.get("BUTCHR-64")!.remoteLink).toBeTruthy();
+  // set_doc on an ALREADY-LINKED doc must keep working exactly as before —
+  // this is the item 1 definition-of-done arm this whole file leans on.
+  test("set_doc on a ticket that already has a linked doc keeps working unchanged", async () => {
+    const { ops, addIssue, seedIssueDoc, pages, issues } = makeWorld();
+    addIssue("BUTCHR-67", "already linked");
+    seedIssueDoc("BUTCHR-67", "804", "Existing doc", "<p>old</p>");
+    const result = await setDoc(ops, "BUTCHR-67", "<p>new</p>");
+    expect(result.title).toBe("Existing doc");
+    expect(pages.get("804")!.body).toBe("<p>new</p>");
+    expect(issues.get("BUTCHR-67")!.remoteLink).toBeTruthy();
   });
 
   // PR #112 review: retitling via set_doc must refresh the remote link's own
   // title too, not just the page's — the link is what a human actually sees
-  // on the Jira ticket, and it was upserted once already (by ensureDoc, on
-  // first write) carrying whatever title the page had at THAT moment.
+  // on the Jira ticket.
   test("retitling via set_doc refreshes the remote link's title, not just the page's", async () => {
-    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, seedIssueDoc, issues } = makeWorld();
     addIssue("BUTCHR-65", "link must not go stale");
-    // Lazily create the doc first (ensureDoc's own step-5 upsert carries
-    // whatever title the page has AT THAT MOMENT — the provisional one).
-    await ensureDoc(ops, "BUTCHR-65");
+    seedIssueDoc("BUTCHR-65", "805", "[unwritten] BUTCHR-65 — link must not go stale", "<p/>");
     expect(issues.get("BUTCHR-65")!.remoteLink!.title).toBe("[unwritten] BUTCHR-65 — link must not go stale");
     // Retitling write: the link must now read the REAL title, not the stale provisional one.
     const result = await setDoc(ops, "BUTCHR-65", "<p>real content</p>", "A real outcome-shaped title");
@@ -619,46 +562,13 @@ describe("docs.ts: set_doc — full replace, provisional-title refusal", () => {
   });
 
   test("a body-only write (title omitted) does NOT re-upsert the link — no title changed, nothing to refresh", async () => {
-    const { ops, addIssue, upsertCalls, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    const { ops, addIssue, seedIssueDoc, upsertCalls } = makeWorld();
     addIssue("BUTCHR-66", "no spurious link writes");
-    await setDoc(ops, "BUTCHR-66", "<p>v1</p>", "Outcome title"); // ensureDoc's upsert (1) + this retitle's refresh (2)
+    seedIssueDoc("BUTCHR-66", "806", "Outcome title", "<p>v0</p>");
+    await setDoc(ops, "BUTCHR-66", "<p>v1</p>"); // body-only — title unchanged
     const callsAfterFirstWrite = upsertCalls();
     await setDoc(ops, "BUTCHR-66", "<p>v2</p>"); // body-only — title unchanged
     expect(upsertCalls()).toBe(callsAfterFirstWrite); // no additional upsert
-  });
-});
-
-describe("docs.ts: the provisional body's ASSIST pointer", () => {
-  // BUTCHR-25 (operator, late addition): the assistant documents this estate in a
-  // Confluence space nothing routed an agent to. The provisional body is the ONLY
-  // text the tool itself authors and the one thing a newly-born agent is certain
-  // to read, so it carries the pointer. These tests exist so the pointer cannot be
-  // dropped silently by someone tidying the body text — the reason it is here is
-  // not visible from the string itself.
-  test("a freshly created doc points at the ASSIST space and its entry points", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-70", "a newborn agent reads this once");
-    const doc = await ensureDoc(ops, "BUTCHR-70");
-    const body = pages.get(doc.id)!.body;
-    expect(body).toContain("/wiki/spaces/ASSIST/overview");
-    expect(body).toContain("/wiki/spaces/ASSIST/pages/12714016"); // the factory, end to end
-    expect(body).toContain("/wiki/spaces/ASSIST/pages/12386388"); // working agreements with agents
-    // still carries the ticket affordance it always did
-    expect(body).toContain("BUTCHR-70");
-  });
-
-  test("the pointer is transient by design — the first set_doc replaces it", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-71", "pointer is scaffolding, not content");
-    const doc = await ensureDoc(ops, "BUTCHR-71");
-    expect(pages.get(doc.id)!.body).toContain("ASSIST");
-    await setDoc(ops, "BUTCHR-71", "<p>what actually happened</p>", "A real outcome title");
-    // Replaced wholesale, pointer included. That is correct: by now the agent has
-    // read it, and the doc's job has changed from orienting its author to recording.
-    expect(pages.get(doc.id)!.body).toBe("<p>what actually happened</p>");
   });
 });
 
@@ -1208,9 +1118,9 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
 
   describe("issue caller (setDoc)", () => {
     test('ordinary small write — receipt correct, landed: "confirmed"', async () => {
-      const { ops, addIssue, setProjectProperty } = makeWorld();
-      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-910", "ordinary write");
+      seedIssueDoc("BUTCHR-910", "9100", "pre-existing doc", "<p>v0</p>");
       const body = "<p>hello</p>";
       const result = await setDoc(ops, "BUTCHR-910", body, "Ordinary write");
       // Would fail if: the receipt ever carries the body itself, in any field.
@@ -1224,21 +1134,18 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
     });
 
     test("the oversize arm, named as such — a body far past the field-observed 81,019-char boundary", async () => {
-      const { ops, addIssue, pages, setProjectProperty } = makeWorld();
-      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      const { ops, addIssue, pages, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-911", "oversize write");
       const body = `<p>${"x".repeat(200_000)}</p>`;
       // Would fail if: a later edit shrinks this fixture back under the boundary that actually broke — loudly, not as silent decoration.
       expect(body.length).toBeGreaterThan(FIELD_OBSERVED_OVERSIZE_CHARS * 2);
       // Pre-seed an already-larger stored body (BUTCHR-250's doc-write budget
       // guard, merged into this same file/verb, refuses a GROWING over-budget
-      // write — a brand-new doc's first write is unconditionally "growing"
-      // from empty). This test is about the receipt staying bounded for a
-      // huge WRITE, not about growth direction, so seed the pre-write state
-      // directly (bypassing setDoc) to make this write a non-growing update —
-      // still far past the 81,019-char boundary either way.
-      const created = await ensureDoc(ops, "BUTCHR-911");
-      pages.get(created.id)!.body = "y".repeat(body.length + 10_000);
+      // write). This test is about the receipt staying bounded for a huge
+      // WRITE, not about growth direction, so seed the pre-write state
+      // directly to make this write a non-growing update — still far past
+      // the 81,019-char boundary either way.
+      seedIssueDoc("BUTCHR-911", "9110", "pre-existing doc", "y".repeat(body.length + 10_000));
       const result = await setDoc(ops, "BUTCHR-911", body, "Oversize write");
       // (a) the serialised RECEIPT stays small regardless of document size —
       // would fail if the old echo-the-body shape ever came back.
@@ -1252,9 +1159,9 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
     });
 
     test('entity-normalised read-back — landed stays "confirmed", no throw, both digests and sizes still reported', async () => {
-      const { ops, addIssue, setProjectProperty } = makeWorld();
-      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-912", "normalised write");
+      seedIssueDoc("BUTCHR-912", "9120", "pre-existing doc", "<p>v0</p>");
       // Simulates the MEASURED Confluence behaviour (this ticket): storage
       // XHTML is normalised on write, on ordinary prose — a literal em dash
       // and quotation mark read back as `&mdash;`/`&quot;`. Forced here at
@@ -1280,21 +1187,18 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
     });
 
     test('"unconfirmed" (read-back throws) — the call resolves, does not throw, identical/stored are null', async () => {
-      const { ops, addIssue, setProjectProperty } = makeWorld();
-      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-913", "unconfirmable write");
-      // Pre-create + title the doc with working ops first, so the call under
-      // test starts from an already-ensured doc — isolating the failure to
-      // the CONFIRMATION read (buildReceipt's own getPage), not ensureDoc's
-      // unrelated one.
-      await setDoc(ops, "BUTCHR-913", "<p>v1</p>", "Unconfirmable write");
+      // Pre-existing doc, titled already, so the call under test isolates the
+      // failure to the CONFIRMATION read (buildReceipt's own getPage).
+      seedIssueDoc("BUTCHR-913", "9130", "Unconfirmable write", "<p>v1</p>");
       let getPageCalls = 0;
       const flakyOps: AtlassianOps = {
         ...ops,
         getPage: async (id: string) => {
           getPageCalls++;
           if (getPageCalls > 1) throw new Error("simulated Confluence read-back outage");
-          return ops.getPage(id); // ensureDoc's own getPage call (step 5) — must still succeed
+          return ops.getPage(id); // findDoc's own resolve-current-doc read — must still succeed
         },
       };
       const result = await setDoc(flakyOps, "BUTCHR-913", "<p>v2</p>");
@@ -1305,10 +1209,9 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
     });
 
     test('"unconfirmed" (read-back resolves with no body) — the call resolves, does not throw, identical/stored are null', async () => {
-      const { ops, addIssue, setProjectProperty } = makeWorld();
-      setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+      const { ops, addIssue, seedIssueDoc } = makeWorld();
       addIssue("BUTCHR-914", "malformed read-back");
-      await setDoc(ops, "BUTCHR-914", "<p>v1</p>", "Malformed read-back");
+      seedIssueDoc("BUTCHR-914", "9140", "Malformed read-back", "<p>v1</p>");
       let getPageCalls = 0;
       const malformedOps: AtlassianOps = {
         ...ops,

@@ -199,6 +199,17 @@ then relaunch — per the "8 second rule" in the same wsl-config page), and
 this kernel switch (takes effect immediately, no restart, but only for the
 current session).
 
+A **different** failure mode — `Invalid argument` rather than "not
+found" — shows up specifically for anything **systemd started** (herdr,
+and so every agent pane on a systemd-based WSL host): systemd-started
+processes get no `WSL_INTEROP` env var and a `PATH` missing the Windows
+dirs, neither of which the `[interop]`/kernel-switch settings above
+address. This doc's own scope is what an agent does inside a WSL shell,
+not host/systemd setup — see
+["Windows interop under systemd" in `docs/windows-wsl-host.md`](windows-wsl-host.md#windows-interop-under-systemd-wsl_interop-path)
+(its Troubleshooting section) for the symptom, root cause, and reported fix
+pattern.
+
 ## 2. Managed-session cwd choice on a Windows host
 
 A [managed session](managed-sessions.md) definition's `workingDirectory`
@@ -378,6 +389,9 @@ directly rather than this example.
 
 - [`docs/managed-sessions.md`](managed-sessions.md) — the managed-session
   definition schema this doc's section 2 and section 4 build on.
+- [`docs/windows-wsl-host.md`](windows-wsl-host.md) — host install/systemd
+  setup, including the systemd-specific `WSL_INTEROP`/`PATH` gotcha this
+  doc's section 1 points at.
 - [WSL interop — Windows and Linux integration](https://learn.microsoft.com/en-us/windows/dev-environment/wsl-interop)
 - [Working across file systems](https://learn.microsoft.com/en-us/windows/wsl/filesystems)
 - [Advanced settings configuration in WSL](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) (`wsl.conf`'s `[interop]`/`[automount]` sections)

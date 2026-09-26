@@ -30,13 +30,41 @@ import { githubPrQueryProblems } from "../resources/github-pr.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
+import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /** Agent harnesses Drovr can launch. */
 export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];
-export const AGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
-export type AgentEffort = (typeof AGENT_EFFORTS)[number];
+/**
+ * FACTORY-75: moved to src/resources/power-scale.ts (that module's own top
+ * comment explains why — it needs this type for its shared effort table,
+ * and must not import it back from here) and re-exported here unchanged
+ * for every existing importer of `rules.js`.
+ */
+export { AGENT_EFFORTS, type AgentEffort };
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
+ * Claude permission-mode values `SessionDefinition.permissionMode` accepts
+ * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
+ * an INDEPENDENT copy here rather than imported: that module already imports
+ * `ExecutionMode`/`AccountPolicy`/`AgentRole`/`McpServerBinding` FROM this
+ * file, so importing its `SESSION_PERMISSION_MODES` back would cycle this
+ * file with it. Claude-only, like `SessionDefinition.permissionMode` —
+ * silently never forwarded to a Codex or Agy launch (`agentLaunchConfig`,
+ * src/agents/argv.ts, only ever reads `spec.permissionMode` on its Claude
+ * branch). Unlike `SessionDefinition`, a `Rule` has no single fixed `vendor`
+ * to validate this against — `agentPreferences` is a ranked FALLBACK list,
+ * not one committed choice, and the harness an individual agent actually
+ * gets is a runtime decision (`src/agents/herd.ts`) no validator here can
+ * see — so there is deliberately no Codex-vendor rejection for this field or
+ * for `Rule.lizardMode` below, unlike `SessionDefinition`'s hard rejection of
+ * both for `vendor: "codex"`: a rule that falls back to Codex/Agy for one
+ * launch simply gets the same silent no-op an absent `permissionMode`
+ * already gives that branch today.
+ */
+export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
 
 /**
  * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
@@ -77,7 +105,28 @@ export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
 export const AGENT_ROLES = ["worker", "sentinel"] as const;
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
-export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort }
+/**
+ * FACTORY-75: `modelPower`/`effortPower` are the SAME 0-100 two-axis
+ * mechanism `SessionDefinition` uses (src/resources/power-scale.ts's own
+ * top comment) resolved to `model`/`effort` at RULE-PARSE time (`loadRules`,
+ * once at daemon startup) — by the time any of this codebase's existing
+ * `agentPreferences`-consuming code (every `specFor*` in src/rules/*-type.ts,
+ * `src/agents/herd.ts`'s `prepare()`) ever looks at a preference, `model`/
+ * `effort` are already filled in exactly as if written by hand, so NONE of
+ * that code needed to change. Named `modelPower`, never `capability` (the
+ * ticket's own suggestion) — `capability` already names an unrelated
+ * concept in this codebase (src/resources/capabilities.ts's per-provider
+ * capability declarations) and reusing the word here would read as related
+ * when it isn't. Named `effortPower`, never reusing `effort`'s own name —
+ * `effort` is this field's pre-existing explicit override (a literal
+ * `AgentEffort` string), and the two coexisting under one name would be
+ * ambiguous; setting BOTH `effort` and `effortPower` (or both `model` and
+ * `modelPower`) on the same preference is rejected at load time
+ * (`parsePreferences` below) rather than silently letting one win.
+ * Absent (every rule before this ticket) means today's behaviour exactly —
+ * an explicit `model`/`effort`, or neither, same as always.
+ */
+export interface AgentPreference { harness: AgentHarness; model?: string; effort?: AgentEffort; modelPower?: number; effortPower?: number }
 
 /** MCP server binding shapes a rule/definition can bind to, beyond butchr's own. Only `http` today. */
 export const MCP_SERVER_BINDING_TYPES = ["http"] as const;
@@ -270,13 +319,69 @@ export interface Rule {
    * `parent`/description-derived Jira keys already are).
    */
   linkedDescriptionLinks?: boolean;
+  /**
+   * FACTORY-87 — Claude `--permission-mode` for agents THIS rule launches,
+   * forwarded to `SpawnSpec.permissionMode` by every `specFor*` builder
+   * (`specForMatch`/`specForRuleQuery`, `specForProject`,
+   * `specForGithubIssue*`, `specForGithubPr*`, `specForFilesystem*`).
+   * `src/agents/workspace.ts`'s persist-at-spawn/read-back stale-argv pair
+   * (FACTORY-43) already reads `spec.permissionMode` generically for every
+   * provider, not just managed sessions, so no new wiring is needed there —
+   * only threading this field into each builder's own `SpawnSpec` output.
+   * Absent means today's behaviour exactly: no flag is sent, so Drovr's own
+   * default (`bypassPermissions`, `agentLaunchConfig`, src/agents/argv.ts)
+   * applies unchanged — INCLUDING for a `jira-project` rule, whose own
+   * unconditional `permissionMode: "auto"` default there is set BEFORE
+   * `spec.permissionMode`'s spread and so is overridden by this field only
+   * when present. See `lizardMode` immediately below: the two fields are
+   * independent (either may be set without the other), but pairing this with
+   * `"default"` and `lizardMode: true` is the combination FACTORY-76 exists
+   * for. See `RULE_PERMISSION_MODES`'s own doc comment for why there is no
+   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
+   */
+  permissionMode?: RulePermissionMode;
+  /**
+   * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42's
+   * `SessionDefinition.lizardMode`) — opts every agent THIS rule launches
+   * into the daemon's standalone permission-answer timer
+   * (`src/agents/permission-answer-loop.ts`, wired in `src/daemon/index.ts`):
+   * drovr's `autoAnswerPermissions` answers an unambiguous Claude
+   * tool-permission dialog on that agent's pane — see that module's own doc
+   * comment / `docs/permission-answer-loop.md` for exactly which option it
+   * presses and how it is logged, deliberately not restated here since that
+   * is drovr's own answering policy, not this field's concern (and is a
+   * moving target — FACTORY-93/FACTORY-67) — so a rule kept in
+   * `permissionMode: "default"` is never left frozen on that dialog for
+   * hours. Absent/false means today's behaviour exactly: this rule's panes
+   * are never scanned or touched by that timer, matching every rule that
+   * does not set this field. Resolved live from the loaded `rules` list
+   * (`ruleLizardModeOf`, an exported pure function in
+   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
+   * it to its own live state) — deliberately NEVER reaches `SpawnSpec`/argv,
+   * same as `SessionDefinition.lizardMode`: a daemon-side behaviour toggle
+   * only, so there is no stale-argv concern to get wrong. See
+   * `RULE_PERMISSION_MODES`'s own doc comment for why there is no
+   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
+   * FACTORY-87 wires this (and `permissionMode` above) for exactly the four
+   * rule kinds FACTORY-76 scopes — `jira-work`/`jira-project`/`github-issue`/
+   * `github-pr`/`filesystem` (every `specFor*` builder forwards
+   * `permissionMode`; `ruleLizardModeOf` covers every rule-engine agent id).
+   * Both fields validate for `jira-idea`/`zendesk-ticket` rules too — same
+   * "every provider accepts every value" house style `execution`/`account`/
+   * `role` already use above — but neither is wired into
+   * `specForJiraIdea`/`specForZendeskTicket` yet, so setting them on one of
+   * those two rule kinds is accepted at load and silently has no effect: a
+   * deliberate, documented scope boundary, not an oversight.
+   */
+  lizardMode?: boolean;
 }
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
+  "permissionMode", "lizardMode",
 ]);
-const PREFERENCE_FIELDS = new Set(["harness", "model", "effort"]);
+const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
 const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
@@ -303,10 +408,43 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     if (!oneOf(AGENT_HARNESSES, p.harness)) errors.push(`${pat}.harness must be one of ${AGENT_HARNESSES.join(", ")}`);
     if (p.model !== undefined && !nonEmpty(p.model)) errors.push(`${pat}.model must be a non-empty string`);
     if (p.effort !== undefined && !oneOf(AGENT_EFFORTS, p.effort)) errors.push(`${pat}.effort must be one of ${AGENT_EFFORTS.join(", ")}`);
+    // FACTORY-75: modelPower/effortPower are the new 0-100 two-axis
+    // mechanism (src/resources/power-scale.ts) — reject combining either
+    // with its own explicit sibling (ambiguous precedence), and reject
+    // either for "agy" (no power table exists for that harness — Drovr's
+    // own AgyAgentLaunch has no effort concept at all, see agentLaunchConfig,
+    // src/agents/argv.ts). Valid only when `p.harness` is already known-good
+    // (claude/codex) AND the raw value itself passes `powerValueProblems` —
+    // an invalid harness or an invalid power value both already pushed
+    // their own error above/below, so resolution is skipped rather than
+    // resolving against garbage input.
+    const powerVendor: "claude" | "codex" | undefined = p.harness === "claude" || p.harness === "codex" ? p.harness : undefined;
+    let modelPowerResolved: string | undefined;
+    if (p.modelPower !== undefined) {
+      if (p.model !== undefined) errors.push(`${pat} must not set both "model" and "modelPower"`);
+      else if (p.harness === "agy") errors.push(`${pat}.modelPower is not supported for harness "agy" — agy has no model-power table`);
+      else {
+        const problems = powerValueProblems(p.modelPower, `${pat}.modelPower`);
+        errors.push(...problems);
+        if (problems.length === 0 && powerVendor) modelPowerResolved = resolveModelPower(powerVendor, p.modelPower as number);
+      }
+    }
+    let effortPowerResolved: AgentEffort | undefined;
+    if (p.effortPower !== undefined) {
+      if (p.effort !== undefined) errors.push(`${pat} must not set both "effort" and "effortPower"`);
+      else if (p.harness === "agy") errors.push(`${pat}.effortPower is not supported for harness "agy" — agy has no effort concept`);
+      else {
+        const problems = powerValueProblems(p.effortPower, `${pat}.effortPower`);
+        errors.push(...problems);
+        if (problems.length === 0) effortPowerResolved = resolveEffortPower(p.effortPower as number);
+      }
+    }
+    const resolvedModel = typeof p.model === "string" ? p.model.trim() : modelPowerResolved;
+    const resolvedEffort = p.effort !== undefined ? (p.effort as AgentEffort) : effortPowerResolved;
     const pref: AgentPreference = {
       harness: p.harness as AgentHarness,
-      ...(typeof p.model === "string" ? { model: p.model.trim() } : {}),
-      ...(p.effort !== undefined ? { effort: p.effort as AgentEffort } : {}),
+      ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+      ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
     };
     const identity = JSON.stringify([pref.harness, pref.model ?? null, pref.effort ?? null]);
     if (seen.has(identity)) errors.push(`${pat} repeats an earlier preference`);
@@ -428,6 +566,12 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
     const { linkedDescriptionLinks } = raw;
     if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
+    // FACTORY-87: independent of resourceProvider/execution/account/role/linked-eventing, same
+    // house style — see RULE_PERMISSION_MODES's own doc comment for why there is no Codex-vendor
+    // rejection here, unlike SessionDefinition's own permissionMode/lizardMode fields.
+    const { permissionMode, lizardMode } = raw;
+    if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
+    if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
@@ -452,6 +596,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
       ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
+      ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
+      ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

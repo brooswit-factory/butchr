@@ -339,20 +339,17 @@ describe("newWorker: disposition", () => {
   });
 });
 
-describe("newWorker: the doc, LAST — a doc-step failure does not roll back the ticket", () => {
-  test("doc creation failing leaves the ticket, link and disposition all in place; throws naming why, not claiming self-healing", async () => {
-    const { ops, addIssue, issues } = makeWorld();
-    // no project property registered -> ensureDoc's step 0 throws.
+describe("newWorker: NO Confluence doc step (FACTORY-84/FACTORY-86) — a freshly created ticket gets no page", () => {
+  test("a normal create touches no Confluence op at all — no page, no property read, no remote link", async () => {
+    const { ops, addIssue, issues, pages } = makeWorld();
+    // Deliberately NO project property registered — if newWorker still tried
+    // to resolve a space/root doc for a doc step, this would throw; it must
+    // not even try.
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
-    await expect(newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } }))
-      .rejects.toThrow(/fully declared worker.*no rollback/s);
-    // exactly one child ticket was created and SURVIVES, linked and running.
-    const children = [...issues.entries()].filter(([k]) => k !== "BUTCHR-1");
-    expect(children.length).toBe(1);
-    const [key, child] = children[0]!;
-    expect(child.bossKey).toBe("BUTCHR-1");
-    expect(child.status).toBe("In Progress");
-    void key;
+    const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
+    expect(result).not.toHaveProperty("doc");
+    expect(pages.size).toBe(0);
+    expect(issues.get(result.key)!.remoteLink).toBeUndefined();
   });
 });
 
@@ -383,7 +380,7 @@ describe("newWorker: THE LOAD-BEARING ATOMICITY TEST — each step fails in turn
     await expect(newWorker(broken, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } }))
       .rejects.toThrow(/rolled back \(deleted\); nothing survives/);
     expect(issues.size).toBe(before);
-    expect(pages.size).toBe(0); // doc step never even reached
+    expect(pages.size).toBe(0); // no doc step exists anymore (FACTORY-84/FACTORY-86) — nothing ever creates a page here
   });
 
   test("step 3 (disposition, shelve) fails: the ticket IS rolled back even though the label had already been set at creation", async () => {
@@ -394,14 +391,6 @@ describe("newWorker: THE LOAD-BEARING ATOMICITY TEST — each step fails in turn
     await expect(newWorker(broken, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "shelve", reason: "later" } }))
       .rejects.toThrow(/rolled back \(deleted\); nothing survives/);
     expect(issues.size).toBe(before);
-  });
-
-  test("step 4 (doc) fails: NOTHING is rolled back — the ticket, link and disposition all survive (this is the designed, non-atomic step)", async () => {
-    const { ops, addIssue, issues } = makeWorld();
-    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no project property -> ensureDoc throws
-    const before = issues.size;
-    await expect(newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } })).rejects.toThrow();
-    expect(issues.size).toBe(before + 1); // the child SURVIVES
   });
 
   test("rollback itself failing (deleteIssue refused) reports a NAMED PARTIAL STATE — the surviving ticket key — rather than pretending nothing survives", async () => {
@@ -1606,14 +1595,15 @@ describe("fileWhereItBelongs: case A — destination is an existing epic key", (
     expect(issues.get("BUTCHR-1")!.bossKey).toBeUndefined(); // the epic never became this ticket's boss either
   });
 
-  test("the doc is ensured and bottoms out under the project root (no boss)", async () => {
-    const { ops, addIssue, pages, setProjectProperty } = makeWorld();
+  test("NO Confluence doc is created for the filed orphan (FACTORY-84/FACTORY-86), even with a boss-free destination", async () => {
+    const { ops, addIssue, pages, issues, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
     addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
     const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
-    expect(result.doc).toBeDefined();
-    expect(pages.get(result.doc.id)!.parentId).toBe(ROOT_DOC_ID);
+    expect(result).not.toHaveProperty("doc");
+    expect(pages.size).toBe(0);
+    expect(issues.get(result.key)!.remoteLink).toBeUndefined();
   });
 });
 
@@ -1683,21 +1673,16 @@ describe("fileWhereItBelongs: partial-failure honesty — the ticket, once creat
     expect(issues.size).toBe(before + 1);
   });
 
-  test("doc failing: the ticket, destination and notice all survive; the throw names the doc failure and how it self-heals", async () => {
-    const { ops, addIssue, issues } = makeWorld();
-    // no project property registered -> ensureDoc's step 0 throws.
+  test("NO Confluence doc step exists anymore (FACTORY-84/FACTORY-86) — a missing project property (which used to fail the old doc step) does not affect this call at all", async () => {
+    const { ops, addIssue, issues, pages } = makeWorld();
+    // Deliberately NO project property registered — the old doc step would
+    // have thrown resolving a space/root doc; this call must not even try.
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
     addIssue("BUTCHR-7", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
-    let thrown: Error | undefined;
-    try {
-      await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
-    } catch (e) {
-      thrown = e as Error;
-    }
-    expect(thrown?.message).toMatch(/Confluence doc failed to create/);
-    expect(thrown?.message).toMatch(/own first set_doc call/);
-    // the notice still fired despite the doc failure — independent steps.
-    expect(issues.get("BUTCHR-1")!.comments.length).toBe(1);
+    const result = await fileWhereItBelongs(ops, ROLES, "BUTCHR-7", { summary: "s", issuetype: "Task", destination: "BUTCHR-1" });
+    expect(result).not.toHaveProperty("doc");
+    expect(pages.size).toBe(0);
+    expect(issues.get("BUTCHR-1")!.comments.length).toBe(1); // the notice still fired
   });
 });
 
@@ -2308,11 +2293,12 @@ describe("newWorker: PROJECT caller creates an EPIC (BUTCHR-71 Contract 2)", () 
     expect(child.comments.some((c) => c.startsWith("[BUTCHR]"))).toBe(true); // identity-tagged with the PROJECT key
   });
 
-  test("the epic's doc nests under the PROJECT's own root doc — verified via ensureDoc's existing bossless-bottoms-out-at-root path, no second code path", async () => {
+  test("NO Confluence doc is created for the new epic (FACTORY-84/FACTORY-86)", async () => {
     const { ops, pages, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     const result = await newWorker(ops, ROLES, "BUTCHR", { summary: "s", disposition: { kind: "start" } });
-    expect(pages.get(result.doc!.id)!.parentId).toBe(ROOT_DOC_ID);
+    expect(result).not.toHaveProperty("doc");
+    expect(pages.size).toBe(0);
   });
 
   test("disposition failure rolls back (deletes) the created epic — same reasoning as the issue-caller path, minus the link step", async () => {
@@ -2701,9 +2687,9 @@ describe("adoptWorker: tier-identity collision (BUTCHR-110/S1, issue caller)", (
     const broken: AtlassianOps = {
       ...ops,
       // Only the FIRST getIssue(BUTCHR-1) — the collision check's own read —
-      // fails; ensureDoc's later boss-chain walk also reads BUTCHR-1 and
-      // must succeed, or this test would be exercising a doc failure, not
-      // the collision-check-read failure it's meant to isolate.
+      // fails. findDoc (FACTORY-84/FACTORY-86) never calls getIssue at all
+      // (it's a pure remote-link lookup), so there is no second read of
+      // BUTCHR-1 to worry about isolating this from anymore.
       getIssue: async (key: string) => {
         if (key === "BUTCHR-1" && callerReads === 0) { callerReads++; throw new Error("transient 503"); }
         return ops.getIssue(key);

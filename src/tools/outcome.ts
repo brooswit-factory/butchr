@@ -24,17 +24,16 @@ import { JOURNALD_PREFIX_SRC } from "./journald-prefix.js";
  * not in what butchr's own guard decided, and blurring the two would mix
  * two very different failure populations back together. So does a
  * "we already committed to this action and a LATER step in it failed"
- * narration — new_worker's post-create doc/link failure, correct_worker's
- * archive-comment failure, file_where_it_belongs' post-create notice/doc
- * failure, ensureDoc's give-up-after-a-failed-create case (docs.ts) — these
- * read like guards in prose ("refusing", "giving up") but the ticket this
- * call represents was NOT rejected: something was already written, and a
- * required follow-up step broke. That is an unexpected outcome needing
- * attention, not a deliberate no. The one line that DOES stay `refused`
- * despite wrapping a caught failure is a guard that refuses to act on an
- * UNRELIABLE READ (projectRootDoc/ensureDoc's "'butchr' entity property is
- * unreadable — refusing rather than guessing") — nothing was attempted or
- * committed there; the guard chose not to proceed without trustworthy
+ * narration — new_worker's post-create link failure, correct_worker's
+ * archive-comment failure, file_where_it_belongs' post-create notice
+ * failure — these read like guards in prose ("refusing", "giving up") but
+ * the ticket this call represents was NOT rejected: something was already
+ * written, and a required follow-up step broke. That is an unexpected
+ * outcome needing attention, not a deliberate no. The one line that DOES
+ * stay `refused` despite wrapping a caught failure is a guard that refuses
+ * to act on an UNRELIABLE READ (projectRootDoc's "'butchr' entity property
+ * is unreadable — refusing rather than guessing") — nothing was attempted
+ * or committed there; the guard chose not to proceed without trustworthy
  * information, the same shape as every other precondition guard.
  *
  * WHAT A MISCLASSIFICATION WOULD LOOK LIKE: a genuine bug wrapped in

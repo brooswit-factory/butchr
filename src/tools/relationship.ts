@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, findWorkers, ensureDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
+import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
@@ -504,8 +504,6 @@ export interface NewWorkerResult {
   implements?: string;
   /** Present ONLY for a PROJECT caller — the Jira PROJECT key the new Epic is a MEMBER of. There is no Implements link for a project/epic relationship (a Jira project is not an issue), so this is a DIFFERENT field, not `implements` set to the project key — reporting `implements` here would claim a link that does not exist. The field's presence/absence, not its value, is what tells an agent reading the result which relationship it's looking at. */
   member?: string;
-  /** Absent ONLY when `created` is `false` (see below) — an idempotent duplicate return makes no doc write of its own and reports no fresh doc state; use `get_doc(key)` against the returned `key` if you need it. Present on every normal create. */
-  doc?: DocResult;
   /** Absent ONLY when `created` is `false` — an idempotent duplicate return applied no disposition this call (the existing worker's own disposition, whatever it is, was already declared by whichever call actually created it). Present on every normal create. */
   disposition?: Disposition["kind"];
   /** BUTCHR-244: what this call's own disposition write establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Absent ONLY when `created` is `false`, for the same reason `disposition` is: no disposition was applied this call. Present on every normal create. Never present alongside `created: false`. */
@@ -524,8 +522,8 @@ export interface NewWorkerResult {
    * `true`) on a normal create — its absence is what "a real create
    * happened" means here, the same present-only-when-true idiom
    * `identityCollision` above already uses. When present, `key` is the
-   * EXISTING worker's key, never a freshly created one, and `doc`/
-   * `disposition`/`staffing` are all absent (see each field's own comment).
+   * EXISTING worker's key, never a freshly created one, and
+   * `disposition`/`staffing` are both absent (see each field's own comment).
    * DELIBERATE LIMITATION, stated here rather than left implied: there is no
    * bypass in this increment — a caller that genuinely wants a second
    * worker with an identical summary must differentiate the summary.
@@ -537,8 +535,15 @@ export interface NewWorkerResult {
 
 /**
  * Creates a worker one tier below `callerKey`: infers the child's issue type
- * from the caller's own type, the assignee from `roles`, the project from
- * the caller's, and the doc's parent from the caller's own doc.
+ * from the caller's own type, the assignee from `roles`, and the project
+ * from the caller's own.
+ *
+ * NO CONFLUENCE DOC STEP (FACTORY-84/FACTORY-86): this used to end with a
+ * fourth step that lazily created a Confluence page for the new ticket,
+ * nested under the caller's own doc. That step is gone — Butchr no longer
+ * creates a per-ticket doc for anyone, ever, including a ticket it just
+ * created itself. An agent that wants a page for this ticket creates one
+ * explicitly with `confluence_create_page`.
  *
  * WRITE ORDER, AND WHY IT IS NOT THE ORDER THE VERBS ARE LISTED IN: the
  * ticket create is irreversible and first — everything else needs its key.
@@ -553,47 +558,28 @@ export interface NewWorkerResult {
  *      "shelve" the label is already on from step 1, so this is just the
  *      reason comment. AFTER THIS STEP the ticket is a fully declared
  *      worker: it has a boss and it is RUNNING or SHELVED, never undeclared
- *      — which is the invariant this whole epic exists to hold.
- *   4. The doc — page, label, remote link. Deliberately LAST: a failure
- *      here is harmless, NOT because anything "heals" it — nothing retries,
- *      there is no sweeper — but because `ensureDoc` (BUTCHR-33) is
- *      CONVERGENT: it can never produce a duplicate, so the ticket's own
- *      first `set_doc` call (whenever the agent working it makes one) safely
- *      completes the binding. If that call never happens, the ticket simply
- *      has no doc until something calls for that key — worse than nothing,
- *      but strictly better than an orphan or a duplicate page, and
- *      recoverable by anyone at any time. No rollback is attempted for step
- *      4; there is nothing to roll back FROM, because nothing downstream
- *      depends on it.
+ *      — which is the invariant this whole epic exists to hold, and this
+ *      is now the LAST step this function takes.
  *
- * ROLLBACK covers only steps 2 and 3, via `ops.deleteIssue` — the
- * genuinely damaging window, where the ticket exists but is not yet a
- * declared worker. MEASURED (BUTCHR-35): this daemon's credential does NOT
- * currently hold Jira's `DELETE_ISSUES` permission on this project (a
- * `mypermissions` read reports `havePermission: false`, and a live
- * create-then-delete round trip 403s). The delete is attempted anyway,
- * because the refusal is a PROJECT PERMISSION, not an API limitation:
- * granting `Delete Issues` to this daemon's Atlassian account upgrades this
- * path to fully working with no code change. Every caller must already
- * handle it failing, and on failure this reports a NAMED PARTIAL STATE (the
- * surviving ticket key) rather than pretending the write undid itself.
+ * ROLLBACK covers steps 2 and 3, via `ops.deleteIssue` — the genuinely
+ * damaging window, where the ticket exists but is not yet a declared
+ * worker. MEASURED (BUTCHR-35): this daemon's credential does NOT currently
+ * hold Jira's `DELETE_ISSUES` permission on this project (a `mypermissions`
+ * read reports `havePermission: false`, and a live create-then-delete round
+ * trip 403s). The delete is attempted anyway, because the refusal is a
+ * PROJECT PERMISSION, not an API limitation: granting `Delete Issues` to
+ * this daemon's Atlassian account upgrades this path to fully working with
+ * no code change. Every caller must already handle it failing, and on
+ * failure this reports a NAMED PARTIAL STATE (the surviving ticket key)
+ * rather than pretending the write undid itself.
  *
- * WHAT A NORMAL RETURN MEANS, AND WHAT A THROW MEANS, HONESTLY: rule (a) as
- * originally stated — "creates the ticket, the doc, links both directions,
- * or it fails and leaves nothing" — is not what this delivers, and this
- * comment does not claim it. A NORMAL RETURN always means a ticket that has
- * a boss (step 2), a declared disposition (step 3) — never undeclared — AND
- * a doc (step 4 also succeeded). A THROW after step 1 means exactly one of
- * three things, distinguishable from the error text: (1) the link or
+ * WHAT A NORMAL RETURN MEANS, AND WHAT A THROW MEANS, HONESTLY: a NORMAL
+ * RETURN always means a ticket that has a boss (step 2) and a declared
+ * disposition (step 3) — never undeclared. A THROW after step 1 means one
+ * of two things, distinguishable from the error text: (1) the link or
  * disposition write failed and the rollback delete SUCCEEDED — nothing
- * survives; (2) that same failure happened and the rollback delete ALSO
- * FAILED — the error names exactly which ticket key needs manual cleanup;
- * or (3) the link and disposition both succeeded and ONLY the doc step
- * failed — the ticket, its boss link and its disposition all survive
- * (correctly, undamaged, never rolled back), and its doc is completed by
- * that ticket's own first `set_doc` call, whenever the agent working it
- * makes one. Case (3) is the one easiest to misread as case (2): both throw,
- * but only (2) means something needs to be cleaned up — read the message.
+ * survives; or (2) that same failure happened and the rollback delete ALSO
+ * FAILED — the error names exactly which ticket key needs manual cleanup.
  */
 export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   if (isProjectId(callerKey)) return newProjectWorker(ops, roles, callerKey, input);
@@ -610,9 +596,9 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // BUTCHR-244: idempotency, BEFORE anything else this call would do — a
   // retry (cause unestablished; see this ticket) must be safe and quiet, not
   // a twin. See `findDuplicateWorker`'s own doc comment for the match rule
-  // and cost. No write happens on this path — not even `ensureDoc` — so a
-  // caller that needs the existing worker's doc/status/staffing reads them
-  // separately (get_doc / check_worker) against the returned `key`.
+  // and cost. No write happens on this path at all, so a caller that needs
+  // the existing worker's doc/status/staffing reads them separately
+  // (get_doc / check_worker) against the returned `key`.
   const dup = findDuplicateWorker(callerIssue, input.summary);
   if (dup) {
     return {
@@ -694,58 +680,39 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   );
   const identityCollision = collisionMsg ? await traceCollision(ops, key, callerKey, collisionMsg) : undefined;
 
-  // (4) doc — last, on purpose. `ensureDoc` is convergent (BUTCHR-33), so a
-  // failure here is reported but NOT rolled back: the ticket is already a
-  // fully declared worker (steps 2/3 succeeded), and nothing downstream
-  // depends on the doc existing yet. Convergent means "the next call for
-  // this key cannot make a duplicate", NOT "something retries automatically"
-  // — nothing here does. The doc is completed by that ticket's own first
-  // `set_doc` call, whenever the agent working it makes one.
-  let doc: DocResult;
-  try {
-    doc = await ensureDoc(ops, key);
-  } catch (e) {
-    throw new Error(
-      `new_worker: ticket ${key} was created, linked to ${callerKey}, and its disposition (${disposition.kind}) applied — it is a fully declared worker; no rollback was attempted or is needed. ` +
-        `Only its Confluence doc failed to create (${(e as Error).message}); it will be completed by ${key}'s own first set_doc call, whenever that agent makes one (ensureDoc is convergent — it will never create a duplicate — but nothing here retries automatically).`,
-    );
-  }
-
-  return { key, implements: callerKey, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind), ...(identityCollision ? { identityCollision } : {}) };
+  // NO DOC STEP (FACTORY-84/FACTORY-86): Butchr no longer creates a
+  // Confluence doc for a freshly created ticket — a brand-new ticket has no
+  // existing doc to find, so there is nothing to report here. An agent that
+  // wants a page creates one explicitly with confluence_create_page.
+  return { key, implements: callerKey, disposition: disposition.kind, staffing: staffingFor(disposition.kind), ...(identityCollision ? { identityCollision } : {}) };
 }
 
 /**
  * PROJECT caller -> creates an EPIC, one tier below. See `newWorker`'s own
- * doc comment for the general shape (disposition validation, the four-step
- * ordering) — this differs from it in exactly the ways BUTCHR-71's Contract
+ * doc comment for the general shape (disposition validation, no Confluence
+ * doc step) — this differs from it in exactly the ways BUTCHR-71's Contract
  * 2 calls out, both DELIBERATE, not oversights:
  *
- *  1. NO IMPLEMENTS LINK, SO THE WRITE ORDER COLLAPSES FROM FOUR STEPS TO
- *     THREE. A Jira PROJECT is not an issue, so none of the issue-link
+ *  1. NO IMPLEMENTS LINK, SO THE WRITE ORDER COLLAPSES FROM THREE STEPS TO
+ *     TWO. A Jira PROJECT is not an issue, so none of the issue-link
  *     machinery (`ops.linkIssues`) reaches it — confirmed by this file: no
  *     call below ever links a project key to anything. The boss/worker
  *     relationship here is MEMBERSHIP IN THE PROJECT, which is already true
  *     the INSTANT `ops.createIssue` lands the ticket in `projectKey` — there
  *     is no separate "link" write establishing it afterward, unlike the
  *     issue-caller path's step 2. So the order here is: (1) create, (2)
- *     disposition, (3) doc.
+ *     disposition.
  *  2. ROLLBACK STILL COVERS THE DISPOSITION STEP, mirroring `newWorker`'s
  *     own reasoning even with one fewer step to protect: between create and
  *     disposition, the ticket exists but is not yet a DECLARED worker (no
  *     RUNNING/SHELVED state on record) — the same genuinely damaging window
  *     `newWorker`'s rollback exists for, just without a link step ahead of
- *     it. There is no rollback for step 3 (the doc), same reasoning as
- *     `newWorker`'s own step 4: convergent (`ensureDoc`), nothing downstream
- *     depends on it, so a failure there is reported, never rolled back.
+ *     it.
  *  3. `member`, NOT `implements`, IN THE RESULT. Reporting `implements:
  *     projectKey` would be a LIE — no such link exists (see 1 above) — so
  *     the result carries `member` instead (see `NewWorkerResult`'s own doc
  *     comment); `implements` is simply omitted rather than set to a value
  *     that would read as true and isn't.
- *
- * DOC NESTING — VERIFIED, NOT ASSUMED: see the comment on `ensureDoc`'s own
- * boss-resolution step (src/tools/docs.ts) for why the new Epic's doc
- * already nests under `projectKey`'s root doc with no second code path.
  *
  * BUTCHR-244: DELIBERATELY DOES NOT GET THE ISSUE-CALLER PATH'S IDEMPOTENCY
  * CHECK (`findDuplicateWorker`) — said explicitly here, not left implied,
@@ -823,19 +790,10 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   const collisionMsg = me.value ? collisionBetween(callerProjectSide(me.value.accountId), childSide("Epic", role)) : undefined;
   const identityCollision = collisionMsg ? await traceCollision(ops, key, projectKey, collisionMsg) : undefined;
 
-  // (3) doc — last, on purpose; see newWorker's own step-4 comment (same reasoning).
-  let doc: DocResult;
-  try {
-    doc = await ensureDoc(ops, key);
-  } catch (e) {
-    throw new Error(
-      `new_worker: epic ${key} was created in project ${projectKey} and its disposition (${disposition.kind}) applied — it is a fully declared worker (membership, not a link); no rollback was attempted or is needed. ` +
-        `Only its Confluence doc failed to create (${(e as Error).message}); it will be completed by ${key}'s own first set_doc call, whenever that agent makes one.`,
-    );
-  }
-
+  // NO DOC STEP (FACTORY-84/FACTORY-86) — see newWorker's own comment
+  // (same reasoning): a freshly created epic has no existing doc to find.
   return {
-    key, member: projectKey, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key, member: projectKey, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
   };
@@ -1214,7 +1172,8 @@ export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerK
 export interface AdoptWorkerResult {
   key: string;
   alreadyAdopted: boolean;
-  doc: DocResult;
+  /** Present ONLY if the adopted ticket already had a Confluence doc linked to it BEFORE this call — adopting one never creates one (FACTORY-84/FACTORY-86). Absent is the ordinary case for a ticket adopted after this change. */
+  doc?: DocResult;
   disposition: Disposition["kind"];
   /** BUTCHR-244: what THIS call's disposition establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Reported even on a fully idempotent re-adoption (`alreadyAdopted`): it states a fact about the worker's CURRENT declared state, not only about a write this call made. */
   staffing: string;
@@ -1230,8 +1189,8 @@ export interface AdoptWorkerResult {
 
 /**
  * Takes ownership of an existing ticket: infers the assignee from the
- * ADOPTED ticket's own type, links it (Implements, outward) to `callerKey`,
- * and ensures its doc. IDEMPOTENT on the FULL adopted state — link, assignee
+ * ADOPTED ticket's own type and links it (Implements, outward) to
+ * `callerKey`. IDEMPOTENT on the FULL adopted state — link, assignee
  * AND disposition — not on the link alone: `alreadyAdopted` is true only
  * when the ticket is already linked to `callerKey`, already assigned by
  * role, and already sitting in the state its disposition names (In Progress
@@ -1252,9 +1211,11 @@ export interface AdoptWorkerResult {
  * from the full state closes that: a linked-but-undeclared ticket is NOT
  * "already adopted", so the disposition is applied for real.
  *
- * `ensureDoc` still runs unconditionally as a no-op-when-already-present
- * safety net, regardless of `alreadyAdopted`. Refuses a ticket already
- * linked to a DIFFERENT boss.
+ * `findDoc` still runs unconditionally, regardless of `alreadyAdopted`, but
+ * ONLY TO READ (FACTORY-84/FACTORY-86) — it reports the adopted ticket's
+ * doc on the result IF ONE ALREADY EXISTS, and never creates one for a
+ * ticket that has none. Refuses a ticket already linked to a DIFFERENT
+ * boss.
  *
  * A `disposition: "start"` ALSO CLEARS `EXEMPT_LABEL` (`butchr:shelved`)
  * whenever the adopted ticket carries it, whether or not this call is
@@ -1356,7 +1317,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
       : await traceCollision(ops, workerKey, callerKey, collisionMsg)
     : undefined;
 
-  const doc = await ensureDoc(ops, workerKey);
+  const doc = (await findDoc(ops, workerKey)) ?? undefined;
 
   // CLEARS ORPHAN_LABEL WHENEVER IT'S PRESENT — REGARDLESS OF DISPOSITION,
   // AND NOT GATED ON `alreadyAdopted` EITHER (BUTCHR-108/BUTCHR-137). The
@@ -1440,7 +1401,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   }
 
   return {
-    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
@@ -1520,7 +1481,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
       : await traceCollision(ops, workerKey, projectKey, collisionMsg)
     : undefined;
 
-  const doc = await ensureDoc(ops, workerKey);
+  const doc = (await findDoc(ops, workerKey)) ?? undefined;
 
   // Same BUTCHR-108/BUTCHR-137 fix as the issue-caller path: clear a stale
   // ORPHAN_LABEL whenever it's present, for BOTH dispositions and not gated
@@ -1562,7 +1523,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   }
 
   return {
-    key: workerKey, alreadyAdopted, doc, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: staffingFor(disposition.kind),
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
@@ -2998,7 +2959,7 @@ function orphanNotice(filerKey: string, key: string, summary: string, destinatio
   return [`Filed ${key} ("${summary}"), outside ${filerKey}'s own scope.`, belongs, `${key} has no boss and is linked to nothing — nobody owns it until someone adopts it.`].join("\n");
 }
 
-/** Depth cap for walking a caller's OWN Implements chain in case B — same reasoning as ensureDoc's MAX_BOSS_DEPTH: a real boss chain is a handful of hops, and only a genuine Implements cycle would recurse forever without one. */
+/** Depth cap for walking a caller's OWN Implements chain in case B — a real boss chain is a handful of hops, and only a genuine Implements cycle would recurse forever without one. */
 const MAX_ORPHAN_CHAIN_DEPTH = 20;
 
 /** Walks UP `startKey`'s own Implements chain (never the new orphan's — it has none) to the topmost ticket, reusing `startIssue` (already fetched by the caller) to avoid re-reading `startKey` itself. */
@@ -3025,7 +2986,6 @@ export interface FileWhereItBelongsResult {
   key: string;
   destination: OrphanDestination;
   noticeTarget: string;
-  doc: DocResult;
 }
 
 /**
@@ -3076,20 +3036,16 @@ export interface FileWhereItBelongsResult {
  *      case B in particular must never re-parent the ticket onto whatever it
  *      lands on, or this verb becomes the exact suppression-by-quiet-
  *      adoption it exists to prevent.
- *   3. DOC — ensureDoc, last, same reasoning as new_worker: convergent
- *      (BUTCHR-33), so a failure here is reported but not rolled back, and
- *      is completed by this ticket's own first set_doc call whenever its
- *      eventual owner makes one. `ensureDoc` already bottoms a bossless
- *      ticket out under the project root doc, so this needs no new logic —
- *      the orphan surfaces in the doc tree at the top level, next to the
- *      epics.
+ *
+ * NO DOC STEP (FACTORY-84/FACTORY-86): this used to end with a third step
+ * that lazily created a Confluence doc for the new orphan, nested under the
+ * project root doc. That step is gone — Butchr no longer creates a
+ * per-ticket doc for anyone, including a ticket it just created itself.
  *
  * WHAT A THROW AFTER STEP 1 MEANS, HONESTLY: the ticket, its destination and
  * ORPHAN_LABEL all survive untouched — there is nothing to roll back, and
- * nothing here ever attempts to. The error names exactly which of the notice
- * and the doc failed (either, or both) and what a caller can do about each:
- * re-post the notice by hand with jira_add_comment, or wait for the ticket's
- * own first set_doc call.
+ * nothing here ever attempts to. The error names the notice failure and what
+ * a caller can do about it: re-post it by hand with jira_add_comment.
  *
  * A KNOWN NARROWING IN CASE B, RECORDED RATHER THAN FIXED (found in review of
  * BUTCHR-37, after that branch had already merged — a defect in the original
@@ -3161,31 +3117,19 @@ export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, caller
   const key = created.key;
   if (!key) throw new Refusal("file_where_it_belongs: create response carried no issue key — refusing to notify or document against nothing");
 
-  // (2) notice — best-effort, never a link.
+  // (2) notice — best-effort, never a link. Last step: no doc step follows
+  // it anymore (FACTORY-84/FACTORY-86) — Butchr never creates a per-ticket
+  // Confluence doc, including for a ticket it just created itself.
   const noticeTarget = destination.kind === "epic" ? destination.key : await topmostBoss(ops, callerKey, callerIssue);
   const noticeText = tagComment(callerKey, orphanNotice(callerKey, key, input.summary, destination, noticeTarget));
-  let noticeError: string | undefined;
   try {
     await ops.addComment(noticeTarget, noticeText);
   } catch (e) {
-    noticeError = (e as Error).message;
+    throw new Error(
+      `file_where_it_belongs: ticket ${key} was created with its destination recorded and ${ORPHAN_LABEL} applied — nothing there needs cleanup. ` +
+        `The notice comment on ${noticeTarget} failed (${(e as Error).message}); post it by hand with jira_add_comment(${noticeTarget}, ...) if it still matters.`,
+    );
   }
 
-  // (3) doc — last, on purpose (see the function comment).
-  let doc: DocResult | undefined;
-  let docError: string | undefined;
-  try {
-    doc = await ensureDoc(ops, key);
-  } catch (e) {
-    docError = (e as Error).message;
-  }
-
-  if (noticeError || docError) {
-    const parts: string[] = [`file_where_it_belongs: ticket ${key} was created with its destination recorded and ${ORPHAN_LABEL} applied — nothing there needs cleanup.`];
-    if (noticeError) parts.push(`The notice comment on ${noticeTarget} failed (${noticeError}); post it by hand with jira_add_comment(${noticeTarget}, ...) if it still matters.`);
-    if (docError) parts.push(`Its Confluence doc failed to create (${docError}); it will be completed by ${key}'s own first set_doc call, whenever the agent working it makes one.`);
-    throw new Error(parts.join(" "));
-  }
-
-  return { key, destination, noticeTarget, doc: doc! };
+  return { key, destination, noticeTarget };
 }

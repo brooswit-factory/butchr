@@ -395,7 +395,7 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
       {
         grade: "structural",
         mechanism:
-          "set_doc (ensureDoc + the set_doc handler, src/tools/docs.ts) THROWS if a caller tries to write real content while the doc's title still starts with PROVISIONAL_MARKER ('[unwritten]') and no new title is supplied — the falsifying act itself (writing real content while the page still reads as unwritten) is refused outright, never merely detected after the fact. There is no runtime path in this codebase that can leave a doc holding both real content and a provisional title.",
+          "set_doc (findDoc + the set_doc handler, src/tools/docs.ts) THROWS if a caller tries to write real content while the doc's title still starts with PROVISIONAL_MARKER ('[unwritten]') and no new title is supplied — the falsifying act itself (writing real content while the page still reads as unwritten) is refused outright, never merely detected after the fact. There is no runtime path in this codebase that can leave a doc holding both real content and a provisional title. (FACTORY-84/FACTORY-86: this guard now only ever matters for a PRE-EXISTING provisional doc — nothing can produce a fresh one anymore.)",
       },
     ],
     detector: null,

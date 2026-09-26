@@ -5,7 +5,7 @@ import { join } from "node:path";
 import {
   ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
   EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS,
-  RULE_ID_MAX, rulesPath, unresolvedRelationships, type Rule,
+  RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
@@ -130,6 +130,53 @@ describe("parseRules", () => {
     for (const id of ["a", "triage-2", "x".repeat(RULE_ID_MAX)]) expect(parseRules({ rules: [{ ...minimal, id }] })).toHaveLength(1);
     for (const id of ["", "-a", "a-", "a--b", "A", "a.b", "a_b", "a:b", "x".repeat(RULE_ID_MAX + 1), 7])
       expect(() => parseRules({ rules: [{ ...minimal, id }] })).toThrow(".id must be");
+  });
+
+  // FACTORY-75 — the two-axis (modelPower/effortPower) mechanism on
+  // agentPreferences, resolved to plain model/effort at parse time (see
+  // AgentPreference's own doc comment, src/rules/rules.ts, for why nothing
+  // downstream needed to change).
+  describe("agentPreferences: modelPower/effortPower (FACTORY-75)", () => {
+    test("modelPower alone resolves to a model, through the SAME power-scale.ts table session definitions use", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 100 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "fable" }]);
+    });
+    test("effortPower alone resolves to an AgentEffort", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effortPower: 70 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", effort: "xhigh" }]);
+    });
+    test("modelPower+effortPower together resolve both", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 75, effortPower: 90 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "opus", effort: "max" }]);
+    });
+    test("codex gets its own model-power table", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "codex", modelPower: 0 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "codex", model: "gpt-5.6-luna" }]);
+    });
+    test("setting both model and modelPower (or effort and effortPower) is rejected — ambiguous precedence, never silently resolved", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", model: "opus", modelPower: 50 }] }] }))
+        .toThrow('must not set both "model" and "modelPower"');
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effort: "high", effortPower: 50 }] }] }))
+        .toThrow('must not set both "effort" and "effortPower"');
+    });
+    test("modelPower/effortPower are rejected for harness agy — no power table exists for it", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "agy", modelPower: 50 }] }] }))
+        .toThrow('modelPower is not supported for harness "agy"');
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "agy", effortPower: 50 }] }] }))
+        .toThrow('effortPower is not supported for harness "agy"');
+    });
+    test("out-of-range/non-integer modelPower/effortPower are rejected, same message shape as session-definition.ts's own fields", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 101 }] }] }))
+        .toThrow("modelPower must be between 0 and 100");
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", effortPower: -1 }] }] }))
+        .toThrow("effortPower must be between 0 and 100");
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 50.5 }] }] }))
+        .toThrow("modelPower must be an integer");
+    });
+    test("absent modelPower/effortPower: today's behaviour exactly — an explicit model/effort, or neither", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude" }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "claude" }]);
+    });
   });
 });
 
@@ -262,6 +309,51 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
     expect(() => parseRules({ rules: [{ ...minimal, role: "manager" }] }, "f.json")).toThrow("f.json: rules[0].role must be one of worker, sentinel");
   });
   test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
+describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side companion to DROVR-42's lizard mode)", () => {
+  test("both absent when omitted — no default the way execution/account/role get one", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.permissionMode).toBeUndefined();
+    expect(r!.lizardMode).toBeUndefined();
+  });
+
+  test("every permissionMode value and both lizardMode values are accepted for every provider, independent of execution/account/role/each other", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      for (const permissionMode of RULE_PERMISSION_MODES) for (const lizardMode of [true, false]) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, permissionMode, lizardMode }] });
+        expect(r).toMatchObject({ resourceProvider, permissionMode, lizardMode });
+      }
+    }
+  });
+
+  test("lizardMode may be set without permissionMode, and vice versa — the two fields are independent", () => {
+    const [onlyLizard] = parseRules({ rules: [{ ...minimal, lizardMode: true }] });
+    expect(onlyLizard!.lizardMode).toBe(true);
+    expect(onlyLizard!.permissionMode).toBeUndefined();
+    const [onlyMode] = parseRules({ rules: [{ ...minimal, permissionMode: "default" }] });
+    expect(onlyMode!.permissionMode).toBe("default");
+    expect(onlyMode!.lizardMode).toBeUndefined();
+  });
+
+  test("rejects a bad permissionMode value, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, permissionMode: "yolo" }] }, "f.json"))
+      .toThrow("f.json: rules[0].permissionMode must be one of default, acceptEdits, bypassPermissions, plan, auto");
+  });
+
+  test("rejects a non-boolean lizardMode, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, lizardMode: "true" }] }, "f.json"))
+      .toThrow("f.json: rules[0].lizardMode must be a boolean");
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
