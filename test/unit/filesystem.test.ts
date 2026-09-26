@@ -21,6 +21,7 @@ import {
   createFilesystemEventRules, createFilesystemResourceType, onceOversized, ownsFilesystemAgent, searchFilesystemRules,
   specForFilesystem, specForFilesystemQuery, specForFilesystemUnit, type FilesystemMatch,
 } from "../../src/rules/filesystem-type.js";
+import { ownsManagedSessionAgent } from "../../src/rules/session-definition-type.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
@@ -411,6 +412,15 @@ describe("ownsFilesystemAgent", () => {
     expect(ownsFilesystemAgent(encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "docs" }))).toBe(true);
     expect(ownsFilesystemAgent(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "docs", resourceId: "BUTCHR-1" }))).toBe(false);
     expect(ownsFilesystemAgent("not a key")).toBe(false);
+  });
+
+  test("does not claim managed-session agents, which the managed-sessions loop owns (FACTORY-47)", () => {
+    const managed = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/u/.config/butchr/session-definitions/nexus.json" });
+    expect(ownsFilesystemAgent(managed)).toBe(false);
+    expect(ownsManagedSessionAgent(managed)).toBe(true);
+    const ordinary = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
+    expect(ownsFilesystemAgent(ordinary)).toBe(true);
+    expect(ownsManagedSessionAgent(ordinary)).toBe(false);
   });
 });
 
