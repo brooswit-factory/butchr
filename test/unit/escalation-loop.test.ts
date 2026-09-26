@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createEscalator, UNRESPONSIVE_MARKER, FOLLOWUP_STAGE, type CommentRow } from "../../src/agents/escalation-loop.js";
+import { createEscalator, UNRESPONSIVE_MARKER, FOLLOWUP_STAGE, MANAGED_ESCALATION_MARKER, type CommentRow, type ManagedSessionTarget } from "../../src/agents/escalation-loop.js";
 import type { CoverageRecorder } from "../../src/daemon/coverage.js";
 import { parsePrompt, chooseStartupAnswer, keysToSelect } from "../../src/agents/prompt.js";
 import { watchPrompts } from "../../src/agents/prompt-watch.js";
@@ -66,7 +66,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null> } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -103,6 +103,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     log: (line) => logs.push(line),
     ...(opts.captures ? { captures: opts.captures } : {}),
     ...(opts.coverage ? { coverage: opts.coverage } : {}),
+    ...(opts.managedSessionOf ? { managedSessionOf: opts.managedSessionOf } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -552,6 +553,102 @@ describe("createEscalator — no resolvable issue", () => {
     expect(h.posted).toEqual([]);
     expect(h.sent).toEqual([]);
     expect(h.logs.filter((l) => /no issue key — cannot escalate/.test(l)).length).toBe(3);
+  });
+
+  test("a non-managed keyless pane keeps today's log-only behavior even when managedSessionOf is wired", async () => {
+    // `managedSessionOf` is present but resolves null for THIS pane — e.g. an
+    // unowned/legacy workspace, or a query-level agent (FACTORY-45 item 5:
+    // "do not widen the change" for anything but a genuine managed session).
+    const h = harness({ managedSessionOf: async () => null });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]);
+    expect(h.logs.filter((l) => /no issue key — cannot escalate/.test(l)).length).toBe(1);
+    expect(h.logs.some((l) => l.includes(MANAGED_ESCALATION_MARKER))).toBe(false);
+    expect(h.escalator.managedSessionEscalations()).toEqual([]);
+  });
+});
+
+describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+
+  test("logs a distinctive [managed-escalation] line once per fingerprint and marks the session stalled", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+
+    // Never posts/sends anything — there is no issue, no pane keystrokes for this path.
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]);
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1); // once per (pane, fingerprint), not on every poll
+    expect(lines[0]).toContain(target.agentKey);
+    expect(lines[0]).toContain(target.definitionPath);
+    expect(lines[0]).toContain("p1");
+    expect(lines[0]).toContain(prompt.question);
+    for (const [i, o] of prompt.options.entries()) expect(lines[0]).toContain(`${i + 1}. ${o}`);
+    expect(lines[0]).toContain(`fingerprint: ${fingerprint(prompt)}`);
+
+    const stalled = h.escalator.managedSessionEscalations();
+    expect(stalled.length).toBe(1);
+    expect(stalled[0]).toMatchObject({ agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: fingerprint(prompt) });
+  });
+
+  test("a new fingerprint on the same pane escalates again", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt1 = parsePrompt(REAL)!;
+    const prompt2 = parsePrompt(TRUST)!;
+
+    await h.poll("p1", null, prompt1);
+    await h.poll("p1", null, prompt1);
+    await h.poll("p1", null, prompt2);
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(2);
+    expect(h.escalator.managedSessionEscalations()).toEqual([
+      { agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: fingerprint(prompt2), since: expect.any(String) },
+    ]);
+  });
+
+  test("clearing (pane no longer blocked) clears the stalled mark", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+
+    await h.poll("p1", null, prompt);
+    expect(h.escalator.managedSessionEscalations().length).toBe(1);
+
+    h.notBlocked([]); // the herd no longer reports p1 blocked at all
+    expect(h.escalator.managedSessionEscalations()).toEqual([]);
+    expect(h.logs.some((l) => l.includes(MANAGED_ESCALATION_MARKER) && l.includes("no longer blocked"))).toBe(true);
+
+    // The SAME fingerprint reappearing after a genuine clear is a fresh
+    // episode — it escalates (and logs) again, not silently adopted.
+    await h.poll("p1", null, prompt);
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && !l.includes("no longer blocked"));
+    expect(lines.length).toBe(2);
+  });
+
+  test("overlapping polls for the same keyless pane never double-log (inFlight guard)", async () => {
+    const calls: Array<() => void> = [];
+    const h = harness({
+      managedSessionOf: () => new Promise<ManagedSessionTarget | null>((resolve) => { calls.push(() => resolve(target)); }),
+    });
+    const prompt = parsePrompt(REAL)!;
+    const p1 = h.poll("p1", null, prompt);
+    const p2 = h.poll("p1", null, prompt);
+    expect(calls.length).toBe(1); // the second overlapping call never even reaches managedSessionOf
+    calls[0]!();
+    await Promise.all([p1, p2]);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+    expect(h.logs.some((l) => /previous poll is still in flight/.test(l))).toBe(true);
   });
 });
 

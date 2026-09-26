@@ -3,6 +3,7 @@ import type { DetectorCoverage } from "./coverage.js";
 import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
+import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -143,6 +144,23 @@ export interface HealthStatus {
    * `"unresolvedRelationships" in health` instead of checking a length.
    */
   unresolvedRelationships?: UnresolvedRelationship[];
+  /**
+   * FACTORY-45: every KEYLESS managed-session pane currently marked
+   * "stalled" — an escalated (logged), not-yet-resolved unanswerable dialog
+   * on a filesystem-provider `managed-sessions` agent (see
+   * docs/managed-sessions.md). A SIBLING field, same "additive, never flips
+   * `ok`" pattern `admission`/`coverage`/`unresolvedRelationships` above
+   * already use: a stalled managed session is a real problem for an
+   * OPERATOR to act on, but it is not a liveness failure of THIS daemon's
+   * own poll loops, so it must never trip the 503 contract `ok` drives.
+   * This is the status SURFACE an operator finds a blocked managed session
+   * on (alongside the `[managed-escalation]` journal line every entry here
+   * is paired with) — see `Escalator.managedSessionEscalations`'s own doc
+   * comment for the in-memory tracking this reads. ABSENT (no key, never an
+   * empty array) when nothing is stalled — same "absent means nothing to
+   * report" convention `unresolvedRelationships` above already uses.
+   */
+  managedSessionEscalations?: ManagedSessionEscalation[];
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -203,6 +221,7 @@ export const combineHealth = (
   currency?: CurrencyReport,
   resourceLoops?: readonly ResourceLoopHealth[],
   unresolvedRelationships?: readonly UnresolvedRelationship[],
+  managedSessionEscalations?: readonly ManagedSessionEscalation[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -214,6 +233,7 @@ export const combineHealth = (
     ...(currency ? { currency } : {}),
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
+    ...(managedSessionEscalations && managedSessionEscalations.length ? { managedSessionEscalations: [...managedSessionEscalations] } : {}),
   };
 };
 

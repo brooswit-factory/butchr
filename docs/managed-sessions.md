@@ -1003,3 +1003,89 @@ managed-session agent does its own Jira/Confluence work (if any) directly
 through an operator-configured Atlassian MCP connection, never through
 butchr's `jira_*`/`confluence_*` tools or the boss verbs — butchr's
 hierarchy verbs are for jira-work ticket agents (Epic/Story/Task) only.
+
+## Escalating an unanswerable startup dialog (FACTORY-45)
+
+The daemon's existing prompt-escalation machinery (`onBlocked`,
+`src/agents/escalation-loop.ts`) posts an unanswerable Claude Code dialog as
+a comment on the blocked agent's own Jira/GitHub/Zendesk issue. A
+managed-session agent has no such issue — it is identified only by its
+definition file's own path — so `onBlocked` is called with `issue === null`
+for it, same as for any other keyless pane. This section is about what
+happens THEN, for a managed session specifically; every other keyless pane
+(an unowned/legacy workspace, a query-level agent, …) is unaffected and
+keeps the plain `"... blocked with an unanswerable prompt but no issue key —
+cannot escalate"` log line it always had.
+
+**Dialog recognition and auto-answering are deliberately NOT this daemon's
+job.** Per the director's own steering on this ticket's story (FACTORY-44):
+"any blocking dialog is drovr's job to detect and handle" — `@brooswit/drovr`
+(this repo's own dependency) owns blocking-prompt detection and safe
+auto-answering (the dev-channels prompt today; the "fullscreen renderer
+didn't finish starting last time" startup dialog once FACTORY-46 ships it),
+and is expected to grow a host-neutral escalation hook for whatever it still
+can't recognize. Butchr keeps no dialog list of its own. What follows is
+deliberately the SMALL remainder: react to a dialog `watchPrompts`
+(`src/agents/prompt.ts`/`src/agents/prompt-watch.ts`) already decided it
+cannot auto-answer, for the one case (a managed session) that had no
+escalation target at all before this ticket.
+
+**What happens.** `createEscalator`'s `EscalatorDeps.managedSessionOf`
+(injected in production as `managedSessionOfPane`, `src/daemon/index.ts`)
+resolves a keyless pane's cwd back to its herd id
+(`agentIdOfWorkspacePath`) and checks it against the built-in
+`managed-sessions` rule (`ownsManagedSessionAgent`,
+`src/rules/session-definition-type.ts`). Only when that resolves — i.e. the
+pane is genuinely a filesystem-provider managed-session agent — does
+anything beyond the plain log line happen:
+
+1. **A greppable journal line**, logged once per (pane, dialog fingerprint)
+   episode, prefixed `[managed-escalation]` (`MANAGED_ESCALATION_MARKER`,
+   distinct from this module's ordinary `[prompts]` line so it survives a
+   `journalctl --user -u <unit> | grep managed-escalation` regardless of how
+   noisy the ordinary prompt log is — the unit name is in your own
+   workspace's `ENVIRONMENT.md`, never hand-copied from someone else's). It
+   names the agent key, the definition file's own path, the pane id, the
+   dialog's question and numbered options VERBATIM, and its fingerprint —
+   everything an operator needs to find the pane and decide what to do,
+   without a second lookup.
+2. **A "stalled" mark on `/health`**: every currently-stalled managed
+   session appears in a `managedSessionEscalations` array (a SIBLING field
+   on the `/health` response, the same "additive, never flips `ok`" pattern
+   `admission`/`coverage`/`unresolvedRelationships` already use —
+   `src/daemon/health.ts`) — `{ agentKey, definitionPath, paneId,
+   fingerprint, since }` per entry. This is the status SURFACE an operator
+   finds a blocked managed session on without grepping the journal first;
+   `Escalator.managedSessionEscalations()` (the in-memory tracker this
+   reads) is the single source of truth for it — no separate storage was
+   invented for this ticket.
+3. **Dedupe**: once logged/marked for a given (pane, fingerprint), a later
+   poll with the SAME fingerprint is a no-op — neither re-logs nor
+   re-marks. A NEW fingerprint on the same pane (the dialog changed while
+   still blocked) escalates again, overwriting the stale entry. Unlike the
+   keyed-issue flow's own restart-safe adoption (which re-reads its Jira
+   comment to recognize its own prior escalation), this dedupe is in-memory
+   only: a daemon restart mid-episode re-logs once for a dialog that is
+   still up. Accepted deliberately, given this ticket's reduced scope — a
+   duplicate journal line costs nothing a Jira rate cap would need to guard
+   against.
+4. **Resolution**: when the herd no longer reports the pane blocked AT ALL
+   (`Escalator.onPoll`'s existing per-tick reset, which already ends every
+   other debounce/episode tracker in this module the same way), the entry is
+   removed from `managedSessionEscalations()` and one more
+   `[managed-escalation] ... no longer blocked — clearing stalled mark` line
+   is logged. The SAME fingerprint reappearing after a genuine clear is
+   treated as a fresh episode (it escalates and logs again), never silently
+   suppressed.
+
+**How an operator finds and answers a blocked managed session.** Check
+`/health`'s `managedSessionEscalations` field, or grep the journal for
+`[managed-escalation]` — either names the pane id and the definition's own
+path. From there: `herdr agent attach` (via butchr's own live-view web app)
+onto the named pane to see the dialog directly, decide the answer, and send
+it — butchr's escalation here is deliberately observational, never
+answerable through Jira the way a keyed issue's `ANSWER <n> <fingerprint>`
+reply is (there is no ticket to reply on). If the SAME definition keeps
+re-blocking on the SAME dialog shape, that is exactly the signal to file it
+against FACTORY-46 (or whatever succeeds it) for drovr to learn to
+recognize.

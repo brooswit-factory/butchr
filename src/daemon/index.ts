@@ -640,7 +640,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1446,6 +1446,11 @@ const escalator = createEscalator({
   // only its own filename shape, so neither ever evicts the other's files.
   captures: createCaptureStore(config.captureDir),
   coverage,
+  // FACTORY-45: called only when `issueForPane` already resolved null for
+  // this pane (see the wiring below) — a real managed-session identity
+  // widens the keyless path to a loud journal line + a `/health` stalled
+  // mark; anything else keeps today's log-only behavior.
+  managedSessionOf: managedSessionOfPane,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
@@ -1453,6 +1458,36 @@ const escalator = createEscalator({
 async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
   return escalationTargetOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
+}
+
+/**
+ * FACTORY-45: `escalator`'s own `managedSessionOf` dep — resolves a pane's
+ * managed-session identity, called ONLY when `issueForPane` already
+ * returned null for it (see the escalator wiring below). `agentIdOfWorkspacePath`
+ * decodes the pane's cwd back to its herd id regardless of provider;
+ * `ownsManagedSessionAgent` narrows that to exactly the filesystem-provider
+ * `managed-sessions` built-in rule (src/rules/session-definition-type.ts) —
+ * every OTHER keyless pane (an unowned/legacy workspace, a query-level
+ * agent, a plain `filesystem` agent under some OTHER rule, ...) resolves
+ * `null` here, which keeps today's log-only behavior for them exactly (see
+ * `EscalatorDeps.managedSessionOf`'s own doc comment). A second
+ * `herdr.agent.list()` call, separate from `issueForPane`'s own: only paid
+ * for a keyless pane, which is the uncommon case, and keeps this a small,
+ * independent seam rather than reshaping `issueForPane`'s existing contract.
+ */
+async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string; definitionPath: string } | null> {
+  const { agents } = await herdr.agent.list();
+  const cwd = agents.find((a) => a.pane_id === paneId)?.cwd;
+  const id = agentIdOfWorkspacePath(cwd);
+  if (!id || !ownsManagedSessionAgent(id)) return null;
+  const decoded = decodeAnyAgentKey(id);
+  // The built-in managed-sessions rule always runs `swarm` execution (one
+  // agent per definition file — see builtinManagedSessionsRule's own doc
+  // comment, src/rules/session-definition-type.ts), so it never produces a
+  // query-level ("@query") agent key; this is defensive, not expected to be
+  // exercised.
+  if (!decoded || decoded.kind !== "resource") return null;
+  return { agentKey: id, definitionPath: decoded.resourceId };
 }
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
