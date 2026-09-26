@@ -56,32 +56,36 @@ export interface EffortBand { min: number; max: number; effort: AgentEffort }
 
 /**
  * 0 = Haiku, 100 = Fable — the director's own framing (FACTORY-73 comment,
- * [director], ~18:16Z), ordered by capability/cost. Four equal 25-wide
- * bands cover 0-100 with no gaps or overlaps by construction (swept in
- * power-scale.test.ts). Model strings here are the same short aliases the
- * pre-existing `tierToModel` (src/resources/session-definition.ts) already
- * used ("sonnet"/"opus"), not full model ids, so a resolved value reaches
- * `--model` exactly like a hand-written alias would.
+ * [director], ~18:16Z), ordered by capability/cost. Bands are the
+ * operator's FINAL split (FACTORY-73 comments 25036 and 25085, relayed by
+ * the director): Haiku is the bottom 10%, Fable is the top 15%, Opus is the
+ * 25% below Fable, and Sonnet fills the rest — asymmetric widths, not four
+ * equal quarters. They cover 0-100 with no gaps or overlaps by construction
+ * (swept in power-scale.test.ts). Model strings here are the same short
+ * aliases the pre-existing `tierToModel`
+ * (src/resources/session-definition.ts) already used ("sonnet"/"opus"),
+ * not full model ids, so a resolved value reaches `--model` exactly like a
+ * hand-written alias would.
  */
 export const CLAUDE_MODEL_POWER_TABLE: readonly ModelPowerBand[] = [
-  { min: 0, max: 24, model: "haiku" },
-  { min: 25, max: 49, model: "sonnet" },
-  { min: 50, max: 74, model: "opus" },
-  { min: 75, max: 100, model: "fable" },
+  { min: 0, max: 10, model: "haiku" },
+  { min: 11, max: 59, model: "sonnet" },
+  { min: 60, max: 84, model: "opus" },
+  { min: 85, max: 100, model: "fable" },
 ];
 
 /**
- * Same 4-way, 25-wide shape as Claude's table, over Codex's own 4 model
+ * Same asymmetric-band shape as Claude's table, over Codex's own 4 model
  * tiers — the same ascending models the pre-existing `tierToModel`
  * (src/resources/session-definition.ts) already named for
  * tier1/tier2/tier3/tier4-5 (gpt-5.6-luna / gpt-5.6-terra / gpt-5.6-sol /
  * gpt-6-astra), in the same order.
  */
 export const CODEX_MODEL_POWER_TABLE: readonly ModelPowerBand[] = [
-  { min: 0, max: 24, model: "gpt-5.6-luna" },
-  { min: 25, max: 49, model: "gpt-5.6-terra" },
-  { min: 50, max: 74, model: "gpt-5.6-sol" },
-  { min: 75, max: 100, model: "gpt-6-astra" },
+  { min: 0, max: 10, model: "gpt-5.6-luna" },
+  { min: 11, max: 59, model: "gpt-5.6-terra" },
+  { min: 60, max: 84, model: "gpt-5.6-sol" },
+  { min: 85, max: 100, model: "gpt-6-astra" },
 ];
 
 export const MODEL_POWER_TABLES: Readonly<Record<PowerVendor, readonly ModelPowerBand[]>> = {

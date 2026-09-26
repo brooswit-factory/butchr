@@ -147,7 +147,7 @@ describe("parseRules", () => {
     });
     test("modelPower+effortPower together resolve both", () => {
       const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 75, effortPower: 90 }] }] });
-      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "fable", effort: "max" }]);
+      expect(r!.agentPreferences).toEqual([{ harness: "claude", model: "opus", effort: "max" }]);
     });
     test("codex gets its own model-power table", () => {
       const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "codex", modelPower: 0 }] }] });

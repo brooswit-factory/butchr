@@ -46,6 +46,22 @@ describe("resolveModelPower", () => {
     expect(resolveModelPower("codex", 0)).toBe("gpt-5.6-luna");
     expect(resolveModelPower("codex", 100)).toBe("gpt-6-astra");
   });
+  test("claude: band boundaries land exactly where the operator's final split puts them (10/11, 59/60, 84/85)", () => {
+    expect(resolveModelPower("claude", 10)).toBe("haiku");
+    expect(resolveModelPower("claude", 11)).toBe("sonnet");
+    expect(resolveModelPower("claude", 59)).toBe("sonnet");
+    expect(resolveModelPower("claude", 60)).toBe("opus");
+    expect(resolveModelPower("claude", 84)).toBe("opus");
+    expect(resolveModelPower("claude", 85)).toBe("fable");
+  });
+  test("codex: band boundaries follow the same split as claude (10/11, 59/60, 84/85)", () => {
+    expect(resolveModelPower("codex", 10)).toBe("gpt-5.6-luna");
+    expect(resolveModelPower("codex", 11)).toBe("gpt-5.6-terra");
+    expect(resolveModelPower("codex", 59)).toBe("gpt-5.6-terra");
+    expect(resolveModelPower("codex", 60)).toBe("gpt-5.6-sol");
+    expect(resolveModelPower("codex", 84)).toBe("gpt-5.6-sol");
+    expect(resolveModelPower("codex", 85)).toBe("gpt-6-astra");
+  });
   test("resolves consistently across an entire band, not just its boundary", () => {
     for (const v of sweepIntegers(0, 100)) {
       const band = CLAUDE_MODEL_POWER_TABLE.find((b) => v >= b.min && v <= b.max)!;
@@ -77,8 +93,8 @@ describe("the four FACTORY-73/74/75 canonical target pairs resolve as documented
     expect(resolveModelPower("claude", CANONICAL_SONNET_MODEL_POWER)).toBe("sonnet");
     expect(resolveEffortPower(CANONICAL_MEDIUM_EFFORT)).toBe("medium");
   });
-  test("Servy Epic/Bug: modelPower=75, effort=90 -> Fable at max effort", () => {
-    expect(resolveModelPower("claude", 75)).toBe("fable");
+  test("Servy Epic/Bug: modelPower=75, effort=90 -> Opus at max effort", () => {
+    expect(resolveModelPower("claude", 75)).toBe("opus");
     expect(resolveEffortPower(90)).toBe("max");
   });
   test("Servy task-level: modelPower=<the Sonnet value>, effort=90 -> Sonnet at max effort", () => {
