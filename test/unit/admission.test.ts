@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
+import type { AgentCapacityRole } from "../../src/agents/admission.js";
 import { reconcileNow, scopedHerd } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -332,6 +333,92 @@ describe("createAdmissionController", () => {
       await ctrl.admit([], []); // 2/2
       expect(ctrl.snapshot().residency).toBe(1); // still not accepted — bound not yet exceeded
     });
+  });
+});
+
+// BUTCHR-449: the implausible-zero guard (Trap 2 above) couldn't tell a
+// worker→sentinel RECLASSIFICATION apart from a real census miss — an id
+// whose role resolves late (`roleOf` fails safe to "worker" until the
+// daemon's async `issueMeta` fills in, see AdmissionControllerDeps.roleOf)
+// can be trusted as a worker on one poll and legitimately read back as a
+// sentinel on the next, which used to withhold every worker candidate for
+// up to MAX_IMPLAUSIBLE_POLLS even though nothing was actually wrong.
+describe("BUTCHR-449 — reclassification explains a worker→sentinel drop in the implausible-zero guard", () => {
+  test("1) a trusted worker reclassified to sentinel while still resident is EXPLAINED — no implausible-zero warning, no withholding", async () => {
+    const sentinelIds = new Set<string>();
+    const roleOf = (id: string): AgentCapacityRole => (sentinelIds.has(id) ? "sentinel" : "worker");
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => ["X"], roleOf, log: (l) => lines.push(l) });
+    expect(await ctrl.admit([], [])).toEqual([]); // poll 1: X resident as a worker — trusted at 1
+    expect(ctrl.snapshot().residency).toBe(1);
+
+    sentinelIds.add("X"); // poll 2: X reclassifies to sentinel, but is STILL resident
+    lines.length = 0;
+    expect(await ctrl.admit(["NEW"], [])).toEqual(["NEW"]); // worker residency reads 0, but it's explained — admitted within cap
+    expect(ctrl.snapshot().residency).toBe(0); // the zero IS trusted (explained, not implausible)
+    expect(lines.some((l) => l.includes("untrustworthy read"))).toBe(false);
+    expect(lines.some((l) => l.includes("fail-safe="))).toBe(false);
+    // the ordinary (non-fail-safe) admission line still fires and now reports the sentinel
+    const admLine = lines.find((l) => l.startsWith(ADMISSION2_TAG));
+    expect(admLine).toContain("residency(workers)=0 sentinels=1");
+  });
+
+  test("2) regression: a trusted worker that simply vanishes (no stop, no reclassification) still trips the guard exactly as before", async () => {
+    let reads = ["X"];
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, log: (l) => lines.push(l) });
+    await ctrl.admit([], []); // lastTrusted = 1
+    reads = [];
+    expect(await ctrl.admit(["NEW"], [])).toEqual([]); // withheld — nothing explains the drop
+    expect(ctrl.snapshot().residency).toBe(1); // unchanged — the implausible read was never trusted
+    expect(lines.some((l) => l.includes("untrustworthy read"))).toBe(true);
+    const admLine = lines.find((l) => l.startsWith(ADMISSION2_TAG));
+    expect(admLine).toBe(admissionFailSafeLine(5, "implausible-zero", ["NEW"]));
+  });
+
+  test("3) an unrelated resident sentinel that was never a trusted worker does NOT explain a real drop — still withholds (no blanket suppression)", async () => {
+    const roleOf = (id: string): AgentCapacityRole => (id === "S" ? "sentinel" : "worker");
+    let reads = ["X"];
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, roleOf, log: (l) => lines.push(l) });
+    await ctrl.admit([], []); // lastTrusted = 1, trusted worker ids = {X}
+    expect(ctrl.snapshot().residency).toBe(1);
+
+    reads = ["S"]; // X vanishes entirely; S is a resident sentinel that was NEVER a trusted worker
+    expect(await ctrl.admit(["NEW"], [])).toEqual([]); // S explains nothing about X's disappearance — still withheld
+    expect(ctrl.snapshot().residency).toBe(1); // unchanged, untrusted
+    expect(lines.some((l) => l.includes("untrustworthy read"))).toBe(true);
+  });
+
+  test("4) partial case: two trusted workers, one reclassified and one simply vanishes with no stop — still implausible (only the reclassified id is explained)", async () => {
+    const sentinelIds = new Set<string>();
+    const roleOf = (id: string): AgentCapacityRole => (sentinelIds.has(id) ? "sentinel" : "worker");
+    let reads = ["X", "Y"];
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, roleOf, log: (l) => lines.push(l) });
+    await ctrl.admit([], []); // lastTrusted = 2, trusted worker ids = {X, Y}
+    expect(ctrl.snapshot().residency).toBe(2);
+
+    sentinelIds.add("X"); // X reclassifies to sentinel, still resident
+    reads = ["X"]; // Y vanishes entirely — no stop, no reclassification
+    expect(await ctrl.admit(["NEW"], [])).toEqual([]); // only X (1) is explained; Y is not — 1 < lastTrusted (2), still implausible
+    expect(ctrl.snapshot().residency).toBe(2); // unchanged, untrusted
+    expect(lines.some((l) => l.includes("untrustworthy read"))).toBe(true);
+  });
+
+  test("5) an id that is both named in this poll's own `stopping` plan AND reclassified to sentinel is counted once, not twice — combined with a genuinely-stopped sibling this together fully explains the drop", async () => {
+    const sentinelIds = new Set<string>();
+    const roleOf = (id: string): AgentCapacityRole => (sentinelIds.has(id) ? "sentinel" : "worker");
+    let reads = ["X", "Y"];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => reads, roleOf });
+    await ctrl.admit([], []); // lastTrusted = 2, trusted worker ids = {X, Y}
+
+    sentinelIds.add("X"); // X reclassifies to sentinel but is ALSO (redundantly) named in this poll's own stop plan
+    reads = ["X"]; // X still resident (now as a sentinel); Y is genuinely stopped and gone
+    // stopping names BOTH X (now a sentinel — excluded from workerStopping, explained via reclassification
+    // instead) and Y (a genuine worker stop) — X must not be counted toward the explained total twice.
+    expect(await ctrl.admit(["NEW"], ["X", "Y"])).toEqual(["NEW"]); // reclassified X (1) + stopped Y (1) == lastTrusted (2) — fully explained
+    expect(ctrl.snapshot().residency).toBe(0);
   });
 });
 

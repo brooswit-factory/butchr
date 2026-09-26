@@ -65,7 +65,7 @@ import { JOURNALD_PREFIX_SRC } from "../tools/journald-prefix.js";
 /** The one tag every line this module emits carries — a NEW class, never previously written, so no existing reader can be confused by it (see AC4's own reasoning in the PR for why no *separate* tag per arm is warranted here either). */
 export const SUPPRESSED_TAG = "[notify-suppressed]";
 
-export type SuppressedArm = "agent-fold" | "stand-down";
+export type SuppressedArm = "agent-fold" | "stand-down" | "rate-capped";
 
 /**
  * (B): the own-write ledger's AGENT arm (KAN-838) suppressed `key`'s own
@@ -112,6 +112,28 @@ export function standDownSuppressedLine(key: string, watcher: string, totalComme
   return (
     `${SUPPRESSED_TAG} key=${key} watcher=${watcher} arm=stand-down total_comments=${totalComments}` +
     ` msg=sleeping watcher has no unseen comment ids for this non-structural change`
+  );
+}
+
+/**
+ * BUTCHR-436 (epic BUTCHR-421, story 2/4): the linked-change eventing rate
+ * cap (`maxLinkedTurnsPerHour`, src/jira-watch/linked-eventing.ts) dropped a
+ * coalesced tick for `watcher` — its sliding window already held `count`
+ * turns against a `max`-per-hour budget. Unconditional on its own trigger
+ * (every capped tick logs exactly one line), same discipline as
+ * `standDownSuppressedLine` above — this arm has no lossy-fold blind spot
+ * to caveat: the tick that would have fired is fully known to the caller,
+ * never partially observed. DROPS the tick rather than queuing it — the
+ * next allowed tick re-detects whatever is still outstanding (the
+ * coalescer's own per-target baseline is left unadvanced on a capped tick;
+ * see linked-eventing.ts), so this is a DELAY, not a loss. `key` is the
+ * owning resource's own Jira key (there is no single "changed" key to name
+ * here — a capped tick may cover several).
+ */
+export function rateCappedSuppressedLine(key: string, watcher: string, count: number, max: number): string {
+  return (
+    `${SUPPRESSED_TAG} key=${key} watcher=${watcher} arm=rate-capped count=${count} max=${max}` +
+    ` msg=linked-change notify dropped this tick — sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick`
   );
 }
 

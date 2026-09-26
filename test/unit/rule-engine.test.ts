@@ -12,7 +12,7 @@ import { strandedCandidates } from "../../src/agents/reap.js";
 import { desiredFrom, reconcileNow, runResourceLoop, scopedHerd } from "../../src/daemon/loop.js";
 import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
-import { parseRules, type Rule } from "../../src/rules/rules.js";
+import { EXECUTION_MODES, parseRules, type Rule } from "../../src/rules/rules.js";
 import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
@@ -86,6 +86,125 @@ describe("rule discovery", () => {
       key: "jira-work:task:BUTCHR-7", resource: "BUTCHR-7", issuetype: "Task", summary: "summary of BUTCHR-7", parent: "BUTCHR-1",
       brief: "do it", agents: [{ harness: "codex", model: "gpt-5" }, { harness: "claude", effort: "max" }],
     });
+  });
+});
+
+// BUTCHR-429 (epic BUTCHR-421, story 1/4): `createRuleResourceType`'s own
+// wiring of link discovery + `[linked-discovery]` logging, over data
+// `searchRules` already fetched (`issuelinks`/`parent`, part of
+// `SEARCH_FIELDS`, src/atlassian/client.ts) — see `logLinkedDiscovery`'s own
+// doc comment (src/rules/resource-type.ts).
+describe("BUTCHR-429: linked-change discovery logging", () => {
+  test("discovery.search() logs each match's discovered link set (issuelinks + parent, already-fetched data)", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=parent target=BUTCHR-421 skipped=false");
+  });
+
+  test("an unchanged link set across polls logs only once, not every poll", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    await type.discovery.search();
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toHaveLength(1);
+  });
+
+  test("a genuine change (a new link appears) logs again", async () => {
+    const lines: string[] = [];
+    let withImplements = false;
+    const search = async () => [issue("BUTCHR-1", { issuelinks: (withImplements ? [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] : []) as never })];
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search, log: (l) => lines.push(l) });
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toHaveLength(0); // no links yet -> nothing to log
+    withImplements = true;
+    await type.discovery.search();
+    expect(lines.filter((l) => l.startsWith("[linked-discovery]"))).toEqual(["[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false"]);
+  });
+
+  test("rule.maxLinkedItems caps discovery AND logs the skipped extras — never a silent truncation", async () => {
+    const lines: string[] = [];
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-3" },
+      ] as never,
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q", maxLinkedItems: 1 }), search: async () => [withLinks], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-3 skipped=true");
+  });
+
+  test("with linkedEventing absent/false, discovery still runs and logs (cost-free), but adds ZERO new Jira calls beyond the rule's own JQL search — no fetch this story didn't already make", async () => {
+    let searchCalls = 0;
+    const withLinks = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+      description: "Also see https://example.com/docs and BUTCHR-1 itself.",
+    });
+    const lines: string[] = [];
+    // linkedEventing is absent here — the whole point of this test.
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q" }),
+      search: async () => { searchCalls++; return [withLinks]; },
+      log: (l) => lines.push(l),
+    });
+    await type.discovery.search();
+    expect(searchCalls).toBe(1); // exactly the rule's own JQL search — the same count as before this story existed (description rides the same SEARCH_FIELDS payload, BUTCHR-431)
+    expect(lines.some((l) => l.startsWith("[linked-discovery]"))).toBe(true); // discovery+logging ran anyway — it's a cost-free pure parse, not gated on linkedEventing
+    expect(lines.some((l) => l.startsWith("[notify]"))).toBe(false); // and drove no notification — this story adds no eventing
+  });
+
+  // BUTCHR-431: `description` is now fed to discovery too — every kind
+  // `descriptionItems` can produce shows up as its own `[linked-discovery]`
+  // line, the match's own key is excluded, and `maxLinkedItems` still caps
+  // (and logs skipped) across the combined issuelinks+parent+description set.
+  test("a description containing a Confluence URL, a GitHub issue URL, a GitHub PR URL, a generic URL, and a bare Jira key produces a [linked-discovery] line per kind; the resource's own key is excluded", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      description: [
+        "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
+        "Issue: https://github.com/brooswit-factory/butchr/issues/42",
+        "PR: https://github.com/brooswit-factory/butchr/pull/395",
+        "Docs: https://example.com/some/docs",
+        "Also see BUTCHR-9 and, for context, this very ticket BUTCHR-1.",
+      ].join(" "),
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-issue target=brooswit-factory/butchr#42 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-pr target=brooswit-factory/butchr#395 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=webpage target=https://example.com/some/docs skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=false");
+    expect(linked.some((l) => l.includes("target=BUTCHR-1 "))).toBe(false); // own key excluded, never reported as a link to itself
+    expect(linked).toHaveLength(5);
+  });
+
+  test("maxLinkedItems still caps and logs skipped across the combined issuelinks+parent+description set", async () => {
+    const lines: string[] = [];
+    const withDescription = issue("BUTCHR-1", {
+      issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
+      parent: "BUTCHR-421",
+      description: "See BUTCHR-9 too.",
+    });
+    const type = createRuleResourceType({ rules: rules({ id: "task", query: "q", maxLinkedItems: 2 }), search: async () => [withDescription], log: (l) => lines.push(l) });
+    await type.discovery.search();
+    const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=issuelink target=BUTCHR-2 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=parent target=BUTCHR-421 skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=jira-key target=BUTCHR-9 skipped=true");
   });
 });
 
@@ -496,6 +615,257 @@ describe("rule relationships", () => {
   });
 });
 
+// BUTCHR-406 — SCOPE NOTE: the epic (BUTCHR-365, comment 23746 on BUTCHR-402)
+// decided the PR into BUTCHR-402 should be a REGRESSION TEST ONLY, proving
+// the cross-daemon boss wake already works on main's existing mechanism (PR
+// #372, BUTCHR-388) once combined with BUTCHR-397/398's execution modes — no
+// staffed:false observer rule involved; that code stays parked on
+// origin/BUTCHR-402-observer-parked. This describe block is that test.
+describe("BUTCHR-406: cross-daemon boss wake regression (two disjoint daemon views, BUTCHR-388 x execution modes)", () => {
+  // The exact incident shape (BUTCHR-392/398): daemon A's rules match the
+  // CHILD (a Task) and daemon B's rules match the BOSS (a Story) — neither
+  // daemon's rules match the other's ticket, so the only thing that can wake
+  // the boss on B is #372's by-key foreign fetch (`foreignImplementerKeys` +
+  // `key in (...)`), read through the REAL discovery.related() and the real
+  // loop's own change detection (runResourceLoop) — not relatedForRules
+  // called directly as a unit, which every other test in this file does.
+  const childKey = "BUTCHR-398", bossKey = "BUTCHR-392";
+  const childIssue = (over: Partial<JiraIssue> = {}): JiraIssue =>
+    issue(childKey, { issuetype: "Task", issuelinks: [{ type: "Implements", otherEnd: "inward", key: bossKey }], ...over });
+  const bossIssue: JiraIssue = issue(bossKey, { issuetype: "Story", issuelinks: [{ type: "Implements", otherEnd: "outward", key: childKey }] });
+
+  /**
+   * Runs daemon A (staffs the child) and daemon B (staffs the boss, and ONLY
+   * the boss — its own search never returns the child) against a single
+   * shared mutable "Jira" (`world.child`), each through its own real
+   * `runResourceLoop`, across one polling window before and after the child
+   * changes. `bossExecution` is `undefined` for "no execution field declared
+   * at all" (the plain, pre-BUTCHR-397 shape) and one of `EXECUTION_MODES`
+   * otherwise — only the BOSS's rule varies; the child-side daemon is
+   * ordinary swarm throughout, since this test is about whether the BOSS
+   * hears, not how the child itself runs.
+   */
+  async function runTwoDaemons(bossExecution?: Rule["execution"]) {
+    const world = { child: childIssue() };
+    const rulesA = rules({ id: "task", query: "qa" });
+    const herdA = fakeHerd();
+    const typeA = createRuleResourceType({ rules: rulesA, search: async (jql) => (jql === "qa" ? [world.child] : []) });
+
+    const rulesB = parseRules({ rules: [{
+      id: "story", resourceProvider: "jira-work", query: "qb", brief: "hear your implementer",
+      ...(bossExecution ? { execution: bossExecution } : {}),
+    }] });
+    const herdB = fakeHerd();
+    const notifiedB: string[] = [];
+    const searchB = async (jql: string): Promise<JiraIssue[]> => {
+      if (jql === "qb") return [bossIssue];
+      // The cross-daemon by-key fetch (#372): the ONLY way daemon B can ever
+      // see the child, since daemon B's own rules never match it.
+      if (jql.startsWith("key in (")) return jql.includes(childKey) ? [world.child] : [];
+      return [];
+    };
+    const typeB = createRuleResourceType({ rules: rulesB, search: searchB });
+
+    const stopA = runResourceLoop(typeA, { herd: herdA, ownsId: ownsRuleAgent, notify: async () => {}, intervalMs: 15 });
+    const stopB = runResourceLoop(typeB, { herd: herdB, ownsId: ownsRuleAgent, notify: async (agent, about) => { notifiedB.push(`${agent} <- ${about}`); }, intervalMs: 15 });
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+      expect(notifiedB).toEqual([]); // nothing changed yet
+      // Daemon A's worker's report_to_boss/submit_to_boss: the child ticket changes.
+      world.child = childIssue({ status: "In Review", updated: "later" });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally { stopA(); stopB(); }
+    return { notifiedB, herdA, herdB };
+  }
+
+  for (const bossExecution of [undefined, ...EXECUTION_MODES]) {
+    const label = bossExecution ?? "undeclared (defaults to swarm)";
+    test(`the boss on daemon B is woken by the child's change on daemon A, with no agent spawned for the child on B — boss rule execution=${label}`, async () => {
+      const { notifiedB, herdB } = await runTwoDaemons(bossExecution);
+      // Exactly one notify for the child's change — not merely "at least
+      // one" — so a double-delivery (e.g. the by-key Implements edge and
+      // `scopeRelatedResources` both addressing the same query-level agent)
+      // would fail this test even though `.some(...)` alone would not.
+      expect(notifiedB.filter((n) => n.includes(childKey))).toHaveLength(1);
+      // No agent is ever spawned for the child on daemon B — its own rules
+      // never match the child, in every execution mode. (A singleton/
+      // persistent boss's OWN spawned key is the query-level marker, e.g.
+      // "jira-work:story:%40query" — it contains neither the boss's nor the
+      // child's ticket key, so this only asserts the child never appears,
+      // not that every spawned key names the boss.)
+      expect(herdB.spawned.some((k) => k.includes(childKey))).toBe(false);
+      expect(herdB.spawned.length).toBeGreaterThan(0);
+    });
+  }
+});
+
+// BUTCHR-416 — SCOPE NOTE (BUTCHR-402 comments 23851/23855): BUTCHR-406 above
+// proves the generic direction (two disjoint daemon views over one linked
+// pair) but does not shape either daemon's rules/search by ISSUE TYPE and
+// does not cover Story -> Epic. This block extends the same harness — real
+// `createRuleResourceType` + `runResourceLoop`, no unit called directly — so
+// each simulated daemon's rule and search are shaped like the real fleet
+// split: a wroosbit-like rule matches only Story/Sub-task, a booswrit-like
+// rule matches only Epic/Task/Bug. These queries are REPRESENTATIVE, not
+// read from or copied out of any live rules file (forbidden for this task —
+// see brief.md); "issuetype = X" is a generic JQL shape, not live content.
+// NO observer rules and no `staffed:false` anywhere below: every match here
+// is an ordinary staffed rule match, and the only mechanism under test is
+// main's existing #372 by-key foreign fetch (`foreignImplementerKeys`) plus
+// the BUTCHR-406 live-key fix — both already on main, unmodified by this PR.
+describe("BUTCHR-416: cross-daemon upward wake under the real issue-type split (no observer rules)", () => {
+  type SplitType = "Epic" | "Task" | "Bug" | "Story" | "Sub-task";
+  // The split itself, stated once. Matches the ticket's own example
+  // (booswrit: Epic/Task/Bug; wroosbit: Story/Sub-task) — verified against no
+  // live file, per the scope note above.
+  const daemonFor = (t: SplitType): "wroosbit" | "booswrit" => (t === "Story" || t === "Sub-task" ? "wroosbit" : "booswrit");
+  // One representative rule per issue type, each with its own rule id — so
+  // an execution mode set on one type's rule never entangles another type's
+  // rule, even when both are staffed by the same daemon (Story/Sub-task).
+  const RULE_FOR: Record<SplitType, { id: string; query: string }> = {
+    Epic: { id: "epics", query: "issuetype = Epic" },
+    Task: { id: "tasks", query: "issuetype = Task" },
+    Bug: { id: "bugs", query: "issuetype = Bug" },
+    Story: { id: "story", query: "issuetype = Story" },
+    "Sub-task": { id: "subtask", query: "issuetype = Sub-task" },
+  };
+  const agentKeyOf = (t: SplitType, key: string) => `jira-work:${RULE_FOR[t].id}:${key}`;
+
+  const ruleDoc = (t: SplitType, execution?: Rule["execution"]) => ({
+    ...RULE_FOR[t], resourceProvider: "jira-work" as const, brief: "hear your implementer",
+    ...(execution ? { execution } : {}),
+  });
+
+  /** This daemon's simulated JQL: each rule's own query returns only its own type; a by-key fetch (#372) returns any ticket by key, exactly as a real Jira credential would (key lookup is not type-scoped). */
+  const searchOver = (world: () => JiraIssue[]) => async (jql: string): Promise<JiraIssue[]> => {
+    if (jql.startsWith("key in (")) return world().filter((i) => jql.includes(i.key));
+    const type = (Object.keys(RULE_FOR) as SplitType[]).find((t) => RULE_FOR[t].query === jql);
+    return type ? world().filter((i) => i.issuetype === type) : [];
+  };
+
+  const childOf = (childKey: string, childType: SplitType, bossKey: string) => (over: Partial<JiraIssue> = {}): JiraIssue =>
+    issue(childKey, { issuetype: childType, issuelinks: [{ type: "Implements", otherEnd: "inward", key: bossKey }], ...over });
+  const bossOf = (bossKey: string, bossType: SplitType, childKey: string): JiraIssue =>
+    issue(bossKey, { issuetype: bossType, issuelinks: [{ type: "Implements", otherEnd: "outward", key: childKey }] });
+
+  /**
+   * Two REAL daemons — one rule each, shaped by issue type — each run
+   * through its own real `runResourceLoop`, against a single shared mutable
+   * "Jira". Only valid for a pair that IS cross-daemon under `daemonFor`;
+   * asserts that itself so a future direction can't silently reuse this
+   * harness for a same-daemon pair (see the Sub-task -> Story block below,
+   * which deliberately does NOT use this harness).
+   */
+  async function runCrossDaemon(childKey: string, childType: SplitType, bossKey: string, bossType: SplitType, bossExecution?: Rule["execution"]) {
+    expect(daemonFor(childType)).not.toBe(daemonFor(bossType)); // this harness is for genuinely cross-daemon pairs only
+    const makeChild = childOf(childKey, childType, bossKey);
+    const boss = bossOf(bossKey, bossType, childKey);
+    const world = { child: makeChild() };
+    const tickets = () => [world.child, boss];
+
+    const herdChild = fakeHerd();
+    const notifiedChild: string[] = [];
+    const typeChild = createRuleResourceType({ rules: parseRules({ rules: [ruleDoc(childType)] }), search: searchOver(tickets) });
+
+    const herdBoss = fakeHerd();
+    const notifiedBoss: string[] = [];
+    const typeBoss = createRuleResourceType({ rules: parseRules({ rules: [ruleDoc(bossType, bossExecution)] }), search: searchOver(tickets) });
+
+    const stopChild = runResourceLoop(typeChild, { herd: herdChild, ownsId: ownsRuleAgent, notify: async (a, b) => { notifiedChild.push(`${a} <- ${b}`); }, intervalMs: 15 });
+    const stopBoss = runResourceLoop(typeBoss, { herd: herdBoss, ownsId: ownsRuleAgent, notify: async (a, b) => { notifiedBoss.push(`${a} <- ${b}`); }, intervalMs: 15 });
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+      expect(notifiedBoss).toEqual([]); // (4) nothing changed yet: no spurious notify
+      expect(notifiedChild).toEqual([]);
+      // The child worker's own report_to_boss/submit_to_boss: the child ticket changes.
+      world.child = makeChild({ status: "In Review", updated: "later" });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally { stopChild(); stopBoss(); }
+    return { notifiedBoss, notifiedChild, herdBoss, herdChild };
+  }
+
+  const CROSS_DAEMON_DIRECTIONS: Array<{ label: string; childType: SplitType; bossType: SplitType; childKey: string; bossKey: string }> = [
+    // The exact incident shape named in BUTCHR-402's description (BUTCHR-398 implements BUTCHR-392).
+    { label: "Task -> Story", childType: "Task", bossType: "Story", childKey: "BUTCHR-398", bossKey: "BUTCHR-392" },
+    // The boss is now on the OTHER daemon (booswrit) than in Task -> Story above — a
+    // genuinely different direction, not a relabelling. Reuses this fleet's own real
+    // pair (BUTCHR-402 Implements BUTCHR-365 — verified live via jira_get_issue).
+    { label: "Story -> Epic", childType: "Story", bossType: "Epic", childKey: "BUTCHR-402", bossKey: "BUTCHR-365" },
+  ];
+
+  for (const { label, childType, bossType, childKey, bossKey } of CROSS_DAEMON_DIRECTIONS) {
+    describe(`${label} (cross-daemon: ${daemonFor(childType)} child, ${daemonFor(bossType)} boss)`, () => {
+      for (const bossExecution of [undefined, ...EXECUTION_MODES]) {
+        const execLabel = bossExecution ?? "undeclared (defaults to swarm)";
+        test(`the boss is woken by the child's change exactly once, no agent spawns for the child on the boss's daemon, and the child never hears about its boss — boss execution=${execLabel}`, async () => {
+          const { notifiedBoss, notifiedChild, herdBoss } = await runCrossDaemon(childKey, childType, bossKey, bossType, bossExecution);
+          // (1) exactly one notify to the boss for the child's change — not "at least
+          // one", so a double-delivery would fail this even though `.some()` would not.
+          expect(notifiedBoss.filter((n) => n.includes(childKey))).toHaveLength(1);
+          // (2) no agent is ever spawned for the foreign child on the boss's own daemon.
+          expect(herdBoss.spawned.some((k) => k.includes(childKey))).toBe(false);
+          expect(herdBoss.spawned.length).toBeGreaterThan(0); // the boss's own agent DID spawn
+          // (3) the implementer (child) never hears about its boss — routes.ts (and
+          // `relatedForRules`'s `implementsEdge`) route only boss-hears-child, never back.
+          expect(notifiedChild.some((n) => n.includes(bossKey))).toBe(false);
+        });
+      }
+    });
+  }
+
+  // Per the ticket: "check whether that pair is even cross-daemon" for
+  // Sub-task -> Story. Under `daemonFor` above, both are wroosbit — SAME
+  // daemon, not cross-daemon — so this proves the same-daemon wake instead,
+  // and proves the "same-daemon" claim directly rather than asserting it:
+  // no `key in (...)` (the cross-daemon-only foreign fetch) is ever issued
+  // for this pair. Synthetic keys (no real fleet incident named this pair).
+  describe("Sub-task -> Story: NOT cross-daemon under the real split (both staffed by wroosbit)", () => {
+    const childKey = "BUTCHR-500", bossKey = "BUTCHR-501";
+    const makeChild = childOf(childKey, "Sub-task", bossKey);
+    const boss = bossOf(bossKey, "Story", childKey);
+
+    for (const bossExecution of [undefined, "singleton"] as const) {
+      const execLabel = bossExecution ?? "undeclared (defaults to swarm)";
+      test(`the Story boss is woken by the Sub-task child's change on the SAME daemon, exactly once, with no cross-daemon fetch — boss execution=${execLabel}`, async () => {
+        const world = { child: makeChild() };
+        let sawKeyInFetch = false;
+        const search = async (jql: string): Promise<JiraIssue[]> => {
+          if (jql.startsWith("key in (")) { sawKeyInFetch = true; return [world.child, boss].filter((i) => jql.includes(i.key)); }
+          return searchOver(() => [world.child, boss])(jql);
+        };
+        const herd = fakeHerd();
+        const notified: string[] = [];
+        // TWO rules, one per type (as on the real wroosbit daemon) — only the
+        // "story" rule (the boss's) varies execution; "subtask" stays swarm.
+        const rules = parseRules({ rules: [ruleDoc("Sub-task"), ruleDoc("Story", bossExecution)] });
+        const type = createRuleResourceType({ rules, search });
+        const stop = runResourceLoop(type, { herd, ownsId: ownsRuleAgent, notify: async (a, b) => { notified.push(`${a} <- ${b}`); }, intervalMs: 15 });
+        try {
+          await new Promise((r) => setTimeout(r, 60));
+          expect(notified).toEqual([]); // (4) nothing changed yet: no spurious notify
+          world.child = makeChild({ status: "In Review", updated: "later" });
+          await new Promise((r) => setTimeout(r, 80));
+        } finally { stop(); }
+        // The child's own primary self-notify (its own agent hearing its own
+        // status change) also mentions childKey — exclude it by its exact,
+        // known shape so the assertion below isolates the BOSS's notify only.
+        const childSelfNotify = `${agentKeyOf("Sub-task", childKey)} <- ${agentKeyOf("Sub-task", childKey)}`;
+        const toBoss = notified.filter((n) => n.includes(childKey) && n !== childSelfNotify);
+        // (1) exactly one notify to the boss for the child's change.
+        expect(toBoss).toHaveLength(1);
+        // (3) the child (implementer) never hears about its boss — no notify
+        // line where the child's own agent is the LISTENER and the boss is
+        // (part of) the source.
+        expect(notified.some((n) => n.startsWith(`${agentKeyOf("Sub-task", childKey)} <-`) && n.includes(bossKey))).toBe(false);
+        // Proves "same daemon" rather than asserting it: the boss heard its
+        // implementer through this daemon's OWN search results alone — #372's
+        // cross-daemon by-key fetch was never exercised for this pair.
+        expect(sawKeyInFetch).toBe(false);
+      });
+    }
+  });
+});
+
 describe("rule workspaces", () => {
   let root: string;
   let previous: string | undefined;
@@ -577,6 +947,16 @@ describe("rule workspaces", () => {
     expect(claude.provider === "claude" && [claude.model, claude.effort]).toEqual(["opus", "max"]);
   });
 
+  test("BUTCHR-408: spec.permissionMode reaches a claude launch's permissionMode; absent means today's behaviour exactly (no field at all)", () => {
+    const withMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "claude" });
+    expect(withMode.provider === "claude" && withMode.permissionMode).toBe("auto");
+    const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
+    expect(without.provider === "claude" && "permissionMode" in without).toBe(false);
+    // Codex has no permissionMode concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
+    const codexWithMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
+    expect(codexWithMode.provider === "codex" && "permissionMode" in codexWithMode).toBe(false);
+  });
+
   test("the herd reports rule agents by key, legacy agents by bare key, and only rule agents survive ownership scoping", async () => {
     const ruleCwd = buildWorkspace(ruleSpec, "http://localhost:7717/mcp", "codex", []);
     const legacyCwd = join(root, "BUTCHR-12");
@@ -656,5 +1036,168 @@ describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind a non-Rocket.C
       else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// BUTCHR-436 (epic BUTCHR-421, story 2/4): `createRuleResourceType`'s own
+// wiring of linked-change eventing — that `discovery.related()` actually
+// calls `deps.notify` for an owning resource's coalesced linked-change tick,
+// runs AFTER `search()` has this poll's fresh matches, and stays inert
+// (no `deps.search` calls beyond the rule's own JQL, no `deps.notify` calls)
+// when `deps.notify` is simply never wired — every existing caller/test
+// before this ticket. The coalescer/rate-cap/diff logic itself is unit-
+// tested directly against `createLinkedEventingState` in
+// test/unit/linked-eventing.test.ts; this block only proves the SEAM.
+describe("BUTCHR-436: linked-change eventing wiring", () => {
+  test("omitting deps.notify leaves linked-change eventing fully inert — no extra search calls, discovery/logging unaffected", async () => {
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    let searchCalls = 0;
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => { searchCalls++; return jql === "q" ? [withLinks] : []; },
+    });
+    await type.discovery.search();
+    await type.discovery.related!([]);
+    expect(searchCalls).toBe(1); // only the rule's own JQL — no batched linked-item fetch without deps.notify
+  });
+
+  test("a real change to a linked Jira ticket, discovered via the rule engine's own search(), reaches deps.notify through discovery.related()", async () => {
+    let linkedStatus = "To Do";
+    const withLinks = () => issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const notified: Array<{ agent: string; reason?: unknown }> = [];
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => {
+        if (jql === "q") return [withLinks()];
+        if (jql.startsWith("key in (")) return jql.includes("BUTCHR-2") ? [issue("BUTCHR-2", { status: linkedStatus })] : [];
+        return [];
+      },
+      notify: async (agent, _about, reason) => { notified.push({ agent, reason }); },
+    });
+
+    await type.discovery.search();
+    await type.discovery.related!([]); // poll 1: seeds the baseline
+    expect(notified).toHaveLength(0);
+
+    linkedStatus = "In Progress";
+    await type.discovery.search();
+    await type.discovery.related!([]); // poll 2: the linked ticket genuinely changed
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-1");
+  });
+
+  test("a linked-eventing tick failure never breaks discovery.related()'s own return value", async () => {
+    const withLinks = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const boss = issue("BUTCHR-9", { issuelinks: [{ type: "Implements", otherEnd: "outward", key: "BUTCHR-1" }] as never });
+    const lines: string[] = [];
+    const type = createRuleResourceType({
+      rules: rules({ id: "task", query: "q", linkedEventing: true }),
+      search: async (jql) => (jql === "q" ? [withLinks, boss] : []),
+      notify: async () => { throw new Error("channel down"); },
+      log: (l) => lines.push(l),
+    });
+    await type.discovery.search();
+    const related = await type.discovery.related!(["jira-work:task:BUTCHR-9"]);
+    // The Implements-chain related entry for BUTCHR-1 (heard by BUTCHR-9) is still produced, unaffected by the linked-eventing tick throwing inside notify().
+    expect(related.some((r) => (r.issue.kind === "resource" ? r.issue.match.issue.key : null) === "BUTCHR-1")).toBe(true);
+    expect(lines.some((l) => l.includes("WARNING: [linked-eventing] tick threw"))).toBe(true);
+  });
+});
+
+// FACTORY-1: investigated a reported regression — "after linked eventing was
+// enabled, a cross-daemon Story→Epic submit_to_boss no longer wakes the
+// boss", hypothesised as the new `linked:` rate cap (`maxLinkedTurnsPerHour`)
+// superseding or sharing a budget with the pre-existing `related:` (Implements
+// chain) boss-wake mechanism. NOT REPRODUCIBLE: the two mechanisms are
+// architecturally independent — `discovery.related()`'s return value (which
+// `related:` events are computed from) is built from `relatedForRules` BEFORE
+// `linkedEventingState.runTick` ever runs, and `runTick` only ever performs
+// `deps.notify` side effects under its own `turns` budget, keyed by the
+// OWNING resource's agent key — it never touches the related-resource array
+// or any state `createRuleEventRules`'s "related" space reads. This test
+// pins that independence for the epic/story case the ticket asked for: a
+// cross-daemon boss (whose OWN rule matches no local Story at all — the
+// worker is fetched only through the foreign-implementer path, exactly
+// BUTCHR-388's own documented live-fleet shape) whose OWN linked-eventing
+// budget is already exhausted by unrelated linked churn (reproducing the
+// live `[notify-suppressed] ... arm=rate-capped count=2 max=2` evidence)
+// still gets exactly one `related:` notify the moment its real child moves to
+// In Review. (Investigation record, incl. why the live incident actually
+// happened — a missing Implements issuelink, not this hypothesis — is on the
+// FACTORY-1 ticket and its linked doc.)
+describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker related: wake", () => {
+  test("cross-daemon epic hears its story's move to In Review via related:, even with its own linkedEventing budget exhausted", async () => {
+    const bossKey = "DROVR-37";
+    const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it
+    const siblingKeys = ["DROVR-30", "DROVR-31"]; // other Implements targets of the boss, used to genuinely exhaust its linked-eventing budget first
+
+    let storyStatus = "In Progress";
+    let siblingRound = 0;
+    const boss = () => issue(bossKey, {
+      issuetype: "Epic",
+      issuelinks: [
+        { type: "Implements", otherEnd: "outward", key: workerKey },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[0]! },
+        { type: "Implements", otherEnd: "outward", key: siblingKeys[1]! },
+      ] as never,
+    });
+    const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
+    const worker = () => issue(workerKey, { issuetype: "Story", status: storyStatus, issuelinks: implementsBoss(bossKey) });
+    const sibling = (key: string, round: number) =>
+      issue(key, { issuetype: "Story", status: round % 2 === 0 ? "In Progress" : "In Review", issuelinks: implementsBoss(bossKey) });
+
+    const logs: string[] = [];
+    // This daemon's own rules match ONLY Epics — BUTCHR-388's own documented
+    // live-fleet shape ("booswrit's ... rules are issuetype = Epic|Task|Bug").
+    const ruleSet = rules({ id: "epics", query: "issuetype = Epic", linkedEventing: true, maxLinkedTurnsPerHour: 2 });
+    const search = async (jql: string) => {
+      if (jql === "issuetype = Epic") return [boss()];
+      if (jql.startsWith("key in (")) {
+        const out: JiraIssue[] = [];
+        if (jql.includes(bossKey)) out.push(boss());
+        if (jql.includes(workerKey)) out.push(worker());
+        if (jql.includes(siblingKeys[0]!)) out.push(sibling(siblingKeys[0]!, siblingRound));
+        if (jql.includes(siblingKeys[1]!)) out.push(sibling(siblingKeys[1]!, siblingRound));
+        return out;
+      }
+      return [];
+    };
+    const type = createRuleResourceType({ rules: ruleSet, search, notify: async () => {}, log: (l) => logs.push(l) });
+    const active = ["jira-work:epics:" + bossKey];
+
+    await type.discovery.search();
+    let related = await type.discovery.related!(active);
+    // Two genuine sibling status flips spend the epic's own maxLinkedTurnsPerHour: 2 budget.
+    for (let i = 0; i < 2; i++) {
+      siblingRound++;
+      await type.discovery.search();
+      related = await type.discovery.related!(active);
+    }
+    logs.length = 0; // ignore the warm-up churn's own logging
+
+    // The real boss-wake event: the story moves to In Review while the budget is exhausted.
+    storyStatus = "In Review";
+    await type.discovery.search();
+    const relatedAfter = await type.discovery.related!(active);
+
+    // Confirm the rate cap genuinely bit this tick (matching the live
+    // `arm=rate-capped count=2 max=2` evidence) — a vacuously-passing test
+    // that never actually exhausted the budget would prove nothing.
+    expect(logs.some((l) => l.includes("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(bossKey))).toBe(true);
+
+    // The SAME mechanism `runResourceLoop`'s own onChange stage (src/daemon/loop.ts)
+    // uses: diff the two related snapshots, then decide+deliver per watcher.
+    const evPoll = await type.eventRules.poll({ primary: [], related }, { primary: [], related: relatedAfter });
+    const watchersOf = (k: string) =>
+      relatedAfter.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? related.find((r) => type.discovery.idOf(r.issue) === k)?.watchers
+      ?? [];
+    const delivered: string[] = [];
+    for (const key of evPoll.changedRelated) {
+      for (const w of watchersOf(key)) {
+        if ((await evPoll.decide(key, w, "related")).deliver) delivered.push(w);
+      }
+    }
+    expect(delivered).toEqual(["jira-work:epics:" + bossKey]); // exactly one related: notify to the boss, never dropped by the exhausted linked-eventing cap
   });
 });

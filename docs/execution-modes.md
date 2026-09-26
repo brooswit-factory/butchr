@@ -30,8 +30,11 @@ rules[2].execution must be one of swarm, singleton, persistent
 rules[2].role must be one of worker, sentinel
 ```
 
-**Provider scope.** All three fields are accepted for all four resource
-providers (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`).
+**Provider scope.** All three fields are accepted for every resource
+provider (`jira-work`, `github-issue`, `jira-idea`, `zendesk-ticket`,
+`jira-project`, and — BUTCHR-407 — `filesystem`) — though `jira-project`'s
+own capacity role is always `"sentinel"` regardless of what `role` says; see
+that field's own note below.
 
 ## What `execution` means
 
@@ -328,6 +331,15 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
   fails, or its rule has since been removed) is always a WORKER — an
   unrecognised agent silently escaping the cap would be the opposite of
   safe.
+- **`jira-project` is always a sentinel** (BUTCHR-425), unconditionally —
+  `capacityRoleFor` (`src/agents/capacity-role.ts`) checks the resource
+  provider before ever consulting the rule's own `role` field, the same
+  precedence its Epic/Story-issue-type check already uses. Free-form project
+  managers are operator-directed, not admission-capped workers: Codey runs
+  dozens of them, and none may consume `BUTCHR_MAX_AGENTS`. This is a
+  DIFFERENT mechanism from the `role` field's own default — a `jira-project`
+  rule that never sets `role` at all (every live rule today) still gets
+  `"sentinel"`, not the field's own `"worker"` default.
 - **Reporting**: the `[admission2]` log line and the `/dashboard` admission
   panel report `residency(workers)=<n> sentinels=<m>` — a deliberate format
   change from the old bare `residency=<n>` (same convention `ADMISSION2_TAG`

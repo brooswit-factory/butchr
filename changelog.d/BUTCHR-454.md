@@ -1,0 +1,6 @@
+bump: minor
+
+### Added
+- `butchr session list|show|create|freeze|unfreeze`, a credential-free, daemon-free CLI over managed-session definitions (S2/BUTCHR-393), following `butchr link`'s own dispatch precedent. `list`/`show` surface invalid and oversized definitions too, with their problems, never hidden. `create` validates through the exact same validator the daemon's own poll uses and writes atomically (temp file + rename), refusing to overwrite an existing definition.
+- `freeze`/`unfreeze` reuse Butchr's existing `instanceFreezeStore`-backed freeze mechanism (`HerdrHerd.frozen()`, `src/agents/herd.ts`) rather than a second freeze implementation, and additionally flip the manifest's own `frozen` field — both gates, in a decided order, so an explicit freeze survives a manifest file rename even though the store's own key does not. Reusable core functions (`src/resources/session-freeze.ts`), no argv/stdout, for a later task's delegated `freeze_session`/`unfreeze_session` MCP tools to call directly.
+- Proved at the reconcile level (not just by asserting the store's value): a `frozen`, `execution: "persistent"`, `role: "sentinel"` definition is excluded from the desired set and a running agent for it is stopped by `reconcileNow`; unfreezing makes it eligible again next poll.
