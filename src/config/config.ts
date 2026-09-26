@@ -267,23 +267,34 @@ export interface Config {
    */
   permissionAuditPath: string;
   /**
-   * FACTORY-100/FACTORY-103: OPTIONAL, OFF by default (absent = disabled,
-   * today's behaviour exactly) — same all-or-nothing shape as `github`
-   * above, one field deep. Present only when `BUTCHR_LIZARD_APPROVAL_SOUND`
-   * is set to a non-empty value: a local file path (`~` expanded) or an
-   * `http(s)://` URL, played on THIS DAEMON'S OWN HOST every time lizard
-   * mode (`src/agents/permission-answer-loop.ts`) auto-approves a
+   * FACTORY-100/FACTORY-103: OPTIONAL, OFF by default (absent =
+   * `BUTCHR_LIZARD_APPROVAL_SOUND` unset/empty, today's behaviour exactly).
+   * Present whenever that flag is set to any non-empty value, played on THIS
+   * DAEMON'S OWN HOST every time lizard mode
+   * (`src/agents/permission-answer-loop.ts`) auto-approves a
    * tool-permission prompt. Daemon/host level, not per-managed-session: the
    * sound plays on the host's own speakers regardless of which agent's pane
-   * triggered it, so a single knob here is the natural fit — see
-   * `src/agents/approval-sound.ts`'s own doc comment for the player
-   * selection, caching, coalescing, and fail-silent behaviour this value
-   * feeds into. Validated only for non-emptiness here — a bad local path or
-   * an unreachable URL is a RUNTIME degrade-to-silence (logged once), never
-   * a startup crash, same "don't let an optional feature's misconfiguration
+   * triggered it, so a single knob here is the natural fit.
+   *
+   * `overridePath` (`BUTCHR_LIZARD_APPROVAL_SOUND_PATH`, `~` expanded) is a
+   * SEPARATE, optional local-file-path override — a DIFFERENT env var from
+   * the enable flag above, deliberately: the default source needs no path at
+   * all (see below), so the common case is the enable flag alone. When
+   * `overridePath` is absent, the source is `@brooswit/drovr`'s OWN BUNDLED
+   * asset (`assets/sounds/lizard-button.mp3` at that package's root,
+   * FACTORY-122) — the operator's original URL
+   * (`https://www.myinstants.com/...`) 403s to non-browser clients on this
+   * fleet's hosts, and a later operator redirect asked for the asset to ship
+   * inside drovr itself rather than as a URL or a Butchr-side download; see
+   * `src/agents/approval-sound.ts`'s own doc comment for the resolution,
+   * player selection, coalescing, and fail-silent behaviour this feeds into.
+   * URL sources are OUT OF SCOPE (cut; do not reintroduce). Validated only
+   * for non-emptiness here — an unresolvable package or an unreadable
+   * override path is a RUNTIME degrade-to-silence (logged once), never a
+   * startup crash, same "don't let an optional feature's misconfiguration
    * take down an unrelated daemon" contract as `github`/`rocketchat` above.
    */
-  lizardApprovalSound?: { source: string };
+  lizardApprovalSound?: { overridePath?: string };
   /**
    * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
    * project key must appear here to ever be staffed (see
@@ -400,6 +411,7 @@ export interface ConfigEnv {
   BUTCHR_CAPTURE_DIR?: string | undefined;
   BUTCHR_PERMISSION_AUDIT_PATH?: string | undefined;
   BUTCHR_LIZARD_APPROVAL_SOUND?: string | undefined;
+  BUTCHR_LIZARD_APPROVAL_SOUND_PATH?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
 }
@@ -505,8 +517,11 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
   const permissionAuditPath = env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(workspaceRoot(), ".permission-audit.jsonl");
 
-  const lizardApprovalSoundSource = env.BUTCHR_LIZARD_APPROVAL_SOUND?.trim();
-  const lizardApprovalSound = lizardApprovalSoundSource ? { source: lizardApprovalSoundSource } : undefined;
+  const lizardApprovalSoundEnabled = !!env.BUTCHR_LIZARD_APPROVAL_SOUND?.trim();
+  const lizardApprovalSoundOverridePath = env.BUTCHR_LIZARD_APPROVAL_SOUND_PATH?.trim();
+  const lizardApprovalSound = lizardApprovalSoundEnabled
+    ? { ...(lizardApprovalSoundOverridePath ? { overridePath: lizardApprovalSoundOverridePath } : {}) }
+    : undefined;
 
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
@@ -654,6 +669,6 @@ export const describeConfig = (c: Config): string =>
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
-  `lizardApprovalSound=${c.lizardApprovalSound ? `source=${c.lizardApprovalSound.source}` : "disabled"} ` +
+  `lizardApprovalSound=${c.lizardApprovalSound ? `enabled overridePath=${c.lizardApprovalSound.overridePath ?? "(default: drovr's bundled asset)"}` : "disabled"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents}`;

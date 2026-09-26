@@ -1715,15 +1715,16 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
 // FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
-// (see Config.lizardApprovalSound's own doc comment) — `source: undefined`
-// makes `createApprovalSoundNotifier` return a no-op `notifyApproved`
-// before touching PATH, spawn, or the filesystem at all. `has`/`spawn` mirror
-// `terminalPrefix`'s own detection wiring above (`Bun.which`/`Bun.spawn`);
-// the cache dir follows `captureDir`/`permissionAuditPath`'s own
-// dot-prefixed-under-workspaceRoot convention.
+// (see Config.lizardApprovalSound's own doc comment) — `enabled: false`
+// makes `createApprovalSoundNotifier` return a no-op `notifyApproved` before
+// touching PATH, spawn, or the filesystem at all. `has`/`spawn` mirror
+// `terminalPrefix`'s own detection wiring above (`Bun.which`/`Bun.spawn`).
+// No cache dir: the only source left (URL support was cut) is either an
+// override file already on disk, or drovr's own bundled asset resolved
+// straight out of node_modules — nothing here is ever downloaded.
 const approvalSoundNotifier = createApprovalSoundNotifier({
-  source: config.lizardApprovalSound?.source,
-  cacheDir: join(workspaceRoot(), ".lizard-sound-cache"),
+  enabled: config.lizardApprovalSound !== undefined,
+  ...(config.lizardApprovalSound?.overridePath ? { overridePath: config.lizardApprovalSound.overridePath } : {}),
   has: (c) => Bun.which(c) != null,
   spawn: (argv) => Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"] }),
   log: (line) => console.error(`  ${line}`),

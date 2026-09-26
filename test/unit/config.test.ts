@@ -236,15 +236,23 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig({ ...base, BUTCHR_CAPTURE_DIR: "/tmp/captures" }, noRead))).toContain("captureDir=/tmp/captures");
   });
 
-  // FACTORY-100/FACTORY-103: OFF by default, same all-or-nothing optional-object shape as `github` — absent BUTCHR_LIZARD_APPROVAL_SOUND means the field is undefined, not merely empty.
-  test("lizardApprovalSound is absent by default; BUTCHR_LIZARD_APPROVAL_SOUND (trimmed) populates it", () => {
+  // FACTORY-100/FACTORY-103: OFF by default, same all-or-nothing optional-object shape as `github` — absent BUTCHR_LIZARD_APPROVAL_SOUND means the field is undefined, not merely empty. The enable flag and the override path are TWO SEPARATE env vars: the common case (drovr's bundled default) needs only the flag.
+  test("lizardApprovalSound is absent unless BUTCHR_LIZARD_APPROVAL_SOUND is set to a non-empty value", () => {
     expect(loadConfig(base, noRead).lizardApprovalSound).toBeUndefined();
     expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "   " }, noRead).lizardApprovalSound).toBeUndefined();
-    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "  ~/.local/share/butchr/sounds/lizard-button.mp3  " }, noRead).lizardApprovalSound).toEqual({ source: "~/.local/share/butchr/sounds/lizard-button.mp3" });
+    // A path alone, with the flag unset, must NOT enable the feature.
+    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND_PATH: "/x/lizard.mp3" }, noRead).lizardApprovalSound).toBeUndefined();
   });
-  test("describeConfig reports lizardApprovalSound as disabled or its source", () => {
+  test("BUTCHR_LIZARD_APPROVAL_SOUND alone enables it with no override (drovr's bundled default)", () => {
+    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1" }, noRead).lizardApprovalSound).toEqual({});
+  });
+  test("BUTCHR_LIZARD_APPROVAL_SOUND_PATH (trimmed), alongside the flag, sets overridePath", () => {
+    expect(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1", BUTCHR_LIZARD_APPROVAL_SOUND_PATH: "  ~/.local/share/butchr/sounds/lizard-button.mp3  " }, noRead).lizardApprovalSound).toEqual({ overridePath: "~/.local/share/butchr/sounds/lizard-button.mp3" });
+  });
+  test("describeConfig reports lizardApprovalSound as disabled, enabled with the default, or enabled with its override path", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("lizardApprovalSound=disabled");
-    expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "/x/lizard.mp3" }, noRead))).toContain("lizardApprovalSound=source=/x/lizard.mp3");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1" }, noRead))).toContain("lizardApprovalSound=enabled overridePath=(default: drovr's bundled asset)");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1", BUTCHR_LIZARD_APPROVAL_SOUND_PATH: "/x/lizard.mp3" }, noRead))).toContain("lizardApprovalSound=enabled overridePath=/x/lizard.mp3");
   });
 
   // BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope, default
