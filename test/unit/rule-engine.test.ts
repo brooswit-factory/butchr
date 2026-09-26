@@ -996,7 +996,7 @@ describe("rule workspaces", () => {
     expect(panesFor("jira-work:task:BUTCHR-12", panes, root).map((p: { pane_id: string }) => p.pane_id)).toEqual(["p1"]);
     expect([...groupOwnedPanes(panes, root).keys()].sort()).toEqual(["BUTCHR-12", "jira-work:task:BUTCHR-12"]);
     const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-12" }] as never[];
-    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
+    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-12", agentKey: "jira-work:task:BUTCHR-12", paneIds: ["p1"] }]);
   });
 });
 
