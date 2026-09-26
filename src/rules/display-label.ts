@@ -103,8 +103,18 @@ export function baseDisplayLabel(agentKey: string): string {
  * "must be stable" requirement). Same "hash the exact key" mechanism
  * `nameFor` (src/agents/herd.ts) already uses for herdr's 32-char agent name
  * limit — a different consumer, the same reasoning.
+ *
+ * FACTORY-118 reuses this SAME function (not a second copy) for the
+ * on-disk workspace DIRECTORY name's own collision suffix
+ * (`src/agents/workspace.ts`'s `workspaceDirFor`) — the ticket's own
+ * instruction is "reuse FACTORY-90's ... deterministic, logged collision
+ * handling", and a directory's suffix and a label's suffix for the SAME key
+ * are thus always byte-identical, which is a feature (an operator who
+ * memorizes one recognizes the other) not a requirement this ticket had to
+ * add. Exported for that reuse; still never a second, independent id source
+ * — see this module's own top comment.
  */
-function collisionSuffix(agentKey: string): string {
+export function collisionSuffix(agentKey: string): string {
   return createHash("sha256").update(agentKey).digest("hex").slice(0, 6);
 }
 
