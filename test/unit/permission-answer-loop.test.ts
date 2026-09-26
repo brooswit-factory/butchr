@@ -86,7 +86,7 @@ describe("runPermissionAnswerTick", () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ paneId: "p1", outcome: "answered", tool: "Bash command" });
-    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["down", "enter"] }]);
+    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]); // FACTORY-93: option 1 "Yes", once
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(audit).toHaveLength(2); // "approving" then "approved" — approvePermission's own two-record contract
     expect(audit.every((r) => r.operator === "test-op")).toBe(true);
@@ -120,11 +120,11 @@ describe("runPermissionAnswerTick", () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]?.paneId).toBe("p1");
-    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["down", "enter"] }]); // p2 never touched
+    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]); // FACTORY-93: option 1 "Yes", once // p2 never touched
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("a prompt with no always-allow option is skipped — sendKeys is never called, no audit record is written", async () => {
+  test("FACTORY-93: a prompt with no always-allow option (Yes / No) is still answered — option 1 'Yes', once, never 'No'", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
     const { client, sendKeysCalls } = fakeClient({ p1: NO_ALWAYS_SCREEN });
@@ -132,8 +132,10 @@ describe("runPermissionAnswerTick", () => {
     const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath });
 
     expect(results).toHaveLength(1);
-    expect(results[0]?.outcome).toBe("skipped");
-    expect(sendKeysCalls).toEqual([]);
+    expect(results[0]?.outcome).toBe("answered");
+    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]);
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(audit.at(-1)).toMatchObject({ outcome: "approved", scope: "once", option: "Yes" });
 
     rmSync(dir, { recursive: true, force: true });
   });

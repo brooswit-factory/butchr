@@ -14,12 +14,12 @@ interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 // 1/2/5/7: strandedCandidates — pure ownership+agentless join
 // ---------------------------------------------------------------------------
 describe("strandedCandidates", () => {
-  test("an agent that exited without going through stop() — workspace survives with no matching agent, owned by cwd/label — is a candidate", () => {
+  test("an agent that exited without going through stop() — workspace survives with no matching agent, owned by cwd — is a candidate", () => {
     const workspaces = [{ workspace_id: "w1", label: "BUTCHR-9" }] as any[];
     const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "BUTCHR-9") }] as any[];
     const agents = [] as any[]; // nothing in agent.list() names w1 — the exact "vanished from agent.list()" shape
     const out = strandedCandidates(workspaces, panes, agents, root);
-    expect(out).toEqual([{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }]);
+    expect(out).toEqual([{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }]);
   });
 
   test("a workspace with a live herdr-known agent is never a candidate, even though its pane cwd is owned", () => {
@@ -29,21 +29,53 @@ describe("strandedCandidates", () => {
     expect(strandedCandidates(workspaces, panes, agents, root)).toEqual([]);
   });
 
-  test("label matches an issue key but the pane's cwd is somewhere else entirely — never a candidate (a workspace butchr did not create)", () => {
+  test("the pane's cwd is somewhere else entirely, not under root at all — never a candidate (a workspace butchr did not create), whatever the label says", () => {
     const workspaces = [{ workspace_id: "w1", label: "BUTCHR-9" }] as any[];
     const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([]);
   });
 
-  test("mirror case: the pane cwd has the right <root>/<label> SHAPE, but for a DIFFERENT label than this workspace's own — never a candidate", () => {
-    // The workspace's OWN label is "foo"; its pane's cwd looks like a
-    // perfectly legitimate butchr workspace path — just for BUTCHR-9, not
-    // "foo". join(root, "foo") != join(root, "BUTCHR-9"), so ownership
-    // correctly fails: the pair must agree on THIS workspace, not merely
-    // resemble butchr's convention in the abstract.
-    const workspaces = [{ workspace_id: "w1", label: "foo" }] as any[];
-    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "BUTCHR-9") }] as any[];
+  test("FACTORY-92: label is a human-readable string DIFFERENT from the real agent key, but the pane cwd IS a real butchr workspace dir — still recognized as stranded/butchr-owned, keyed on the REAL agent key from cwd, never the label", () => {
+    // herdr reports a human-readable label ("admin-assembly"), not the raw
+    // percent-encoded agent key — this is FACTORY-83's eventual behaviour,
+    // simulated early. Ownership must still be proven, and the derived
+    // agentKey must be the REAL key (from cwd), not the pretty label.
+    const workspaces = [{ workspace_id: "w1", label: "admin-assembly" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "jira-work", "task", "BUTCHR-9") }] as any[];
+    const out = strandedCandidates(workspaces, panes, [], root);
+    expect(out).toEqual([{ workspaceId: "w1", label: "admin-assembly", agentKey: "jira-work:task:BUTCHR-9", paneIds: ["w1:p1"] }]);
+  });
+
+  test("FACTORY-92: label LOOKS like a valid agent key, but the pane cwd is OUTSIDE the workspace root — never a candidate; a label alone must never grant ownership", () => {
+    const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-9" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([]);
+  });
+
+  test("FACTORY-92: label LOOKS like a valid agent key, but the pane cwd belongs to a DIFFERENT key entirely — never a candidate under the label's key; ownership follows the cwd, not the label", () => {
+    const workspaces = [{ workspace_id: "w1", label: "jira-work:task:BUTCHR-9" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "jira-work", "task", "BUTCHR-99") }] as any[];
+    const out = strandedCandidates(workspaces, panes, [], root);
+    expect(out).toEqual([{ workspaceId: "w1", label: "jira-work:task:BUTCHR-9", agentKey: "jira-work:task:BUTCHR-99", paneIds: ["w1:p1"] }]);
+  });
+
+  test("FACTORY-92: label is human-readable AND the pane cwd is a foreign (non-butchr) directory — never a candidate", () => {
+    const workspaces = [{ workspace_id: "w1", label: "FACTORY-51 · jira-work" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
+    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([]);
+  });
+
+  test("FACTORY-92: a bare project-tier label (a bare project key) never grants ownership by itself — the pane cwd, not the label, decides", () => {
+    const workspaces = [{ workspace_id: "w1", label: "FACTORY" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
+    expect(strandedCandidates(workspaces, panes, [], root)).toEqual([]);
+  });
+
+  test("agent-known workspaces stay excluded even with a human-readable label and a genuinely-owned cwd", () => {
+    const workspaces = [{ workspace_id: "w1", label: "admin-assembly" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "jira-work", "task", "BUTCHR-9") }] as any[];
+    const agents = [{ workspace_id: "w1" }] as any[];
+    expect(strandedCandidates(workspaces, panes, agents, root)).toEqual([]);
   });
 
   test("duplicate label case: two workspaces share a label, one live and one stranded — exactly the stranded one is a candidate", () => {
@@ -57,7 +89,7 @@ describe("strandedCandidates", () => {
     ] as any[];
     const agents = [{ workspace_id: "w-live" }] as any[]; // only the live one is in agent.list()
     const out = strandedCandidates(workspaces, panes, agents, root);
-    expect(out).toEqual([{ workspaceId: "w-stranded", label: "BUTCHR-9", paneIds: ["wstranded:p1"] }]);
+    expect(out).toEqual([{ workspaceId: "w-stranded", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["wstranded:p1"] }]);
   });
 
   test("a workspace with no panes reported is never a candidate (ownership unprovable)", () => {
@@ -124,7 +156,7 @@ describe("HerdrHerd.closeStranded", () => {
     return { client: client as any, closed };
   }
   const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
-  const candidate = (paneIds: string[]): StrandedCandidate => ({ workspaceId: "w1", label: "BUTCHR-9", paneIds });
+  const candidate = (paneIds: string[]): StrandedCandidate => ({ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds });
 
   test("a live-but-unlisted agent (processInfo reports a claude in the foreground) is never reaped", async () => {
     const f = fakeHerdrForClose(ok([{ pid: 1, name: "claude", argv: ["claude", "hi"] }]));
@@ -205,7 +237,17 @@ describe("HerdrHerd.strandedCandidates", () => {
     // A BRAND NEW instance — spawn() was never called on it for BUTCHR-9 (or
     // anything else) in this process's lifetime.
     const herd = new HerdrHerd(client, "u");
-    expect(await herd.strandedCandidates()).toEqual([{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }]);
+    expect(await herd.strandedCandidates()).toEqual([{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }]);
+  });
+
+  test("FACTORY-92: a human-readable herdr label does not stop a pre-existing stranded workspace from being found and keyed on its REAL agent key", async () => {
+    const client = {
+      workspace: { list: async () => ({ workspaces: [{ workspace_id: "w1", label: "admin-assembly" }] }) },
+      pane: { list: async () => ({ panes: [{ pane_id: "w1:p1", workspace_id: "w1", cwd: join(root, "jira-work", "task", "BUTCHR-9") }] }) },
+      agent: { list: async () => ({ agents: [] }) },
+    } as any;
+    const herd = new HerdrHerd(client, "u");
+    expect(await herd.strandedCandidates()).toEqual([{ workspaceId: "w1", label: "admin-assembly", agentKey: "jira-work:task:BUTCHR-9", paneIds: ["w1:p1"] }]);
   });
 });
 
@@ -224,7 +266,7 @@ describe("createReaper", () => {
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async (c) => { closes.push(c.workspaceId); return true; },
     });
     await reaper.check();
@@ -240,7 +282,7 @@ describe("createReaper", () => {
     let hasAgent = false;
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => (hasAgent ? [] : [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }]),
+      candidates: async () => (hasAgent ? [] : [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }]),
       close: async (c) => { closes.push(c.workspaceId); return true; },
     });
     await reaper.check(); // observation 1
@@ -261,7 +303,7 @@ describe("createReaper", () => {
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => false, // stands in for closeStranded()'s verdict: live, never reaped
     });
     await reaper.check();
@@ -279,8 +321,8 @@ describe("createReaper", () => {
     const reaper = createReaper({
       now: clock.now,
       candidates: async () => [
-        { workspaceId: "w1", label: "BUTCHR-1", paneIds: ["w1:p1"] },
-        { workspaceId: "w2", label: "BUTCHR-2", paneIds: ["w2:p1"] },
+        { workspaceId: "w1", label: "BUTCHR-1", agentKey: "BUTCHR-1", paneIds: ["w1:p1"] },
+        { workspaceId: "w2", label: "BUTCHR-2", agentKey: "BUTCHR-2", paneIds: ["w2:p1"] },
       ],
       close: async (c) => {
         if (c.workspaceId === "w1") throw new Error("herdr hiccup closing w1");
@@ -310,20 +352,20 @@ describe("createReaper", () => {
     let calls = 0;
     const reaper = createReaper({
       now: () => 0,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => { calls++; return true; },
     });
     await reaper.check(); // first observation only — not eligible yet
     expect(calls).toBe(0);
   });
 
-  // BUTCHR-412: the self-exit path's own account teardown.
-  test("release is called with the closed workspace's OWN label (the agent key) after a successful close", async () => {
+  // BUTCHR-412, re-grounded by FACTORY-92.
+  test("release is called with the candidate's REAL agentKey after a successful close", async () => {
     const released: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "jira-work:triage:BUTCHR-9", agentKey: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => true,
       release: async (agentKey) => { released.push(agentKey); },
     });
@@ -333,12 +375,32 @@ describe("createReaper", () => {
     expect(released).toEqual(["jira-work:triage:BUTCHR-9"]);
   });
 
+  // FACTORY-92: this is the release call site's own regression test for the
+  // ticket's core fix — release must key off `agentKey`, never `label`, so a
+  // human-readable/renamed label (FACTORY-83's eventual change) never routes
+  // release at the wrong Rocket.Chat account.
+  test("FACTORY-92: release is called with the REAL agent key even when the herdr label is a different, human-readable string", async () => {
+    const released: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "admin-assembly", agentKey: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      release: async (agentKey) => { released.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(released).toEqual(["jira-work:triage:BUTCHR-9"]);
+    expect(released).not.toContain("admin-assembly");
+  });
+
   test("release is never called for a candidate that was NOT actually closed (verified live/unknown)", async () => {
     const released: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => false,
       release: async (agentKey) => { released.push(agentKey); },
     });
@@ -353,7 +415,7 @@ describe("createReaper", () => {
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => true,
       release: async () => { throw new Error("RC unreachable"); },
       log: (l) => logs.push(l),
@@ -370,7 +432,7 @@ describe("createReaper", () => {
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
-      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", paneIds: ["w1:p1"] }],
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async (c) => { closes.push(c.workspaceId); return true; },
     });
     await reaper.check();
