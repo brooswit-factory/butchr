@@ -156,9 +156,9 @@ tools or boss verbs.
 | `brooswit-factory` (@5vvhmskvc5bawvvnwq), `brooswit-minecraft` (@n53w2n4srwx2g1pgzz) | BAKR-63 c23524/23530, CNDLX-45 c23528 | **No new definition** — superseded by `director-brooswit-factory`/`director-brooswit-minecraft` per the Candlestix `migration-source.json` files (confirmed on CNDLX-45 c23528). Retire in Bakr with no replacement of their own. |
 | `brooswit` (@r9h9dpyxmwkyrjv00q) | BAKR-63 c23530 | **Retire, no Butchr definition** — Brooswit's explicit decision (relayed, msg `GqCACWixC7c4KkoQi`). |
 | `yappr-3`, and 4 archived (`rocketchat`, `drovr-2`, `drovr-3`, `yappr-2`) | BAKR-63 c23524/23530 | **Retire.** `yappr-3`'s slot was the real, already-retired yappr messaging service — never carry `yappr` into a Butchr definition (this is DIFFERENT from the MUD players' `yappr`-named channel slot below, which is the mud-mcp bridge, not the yappr service — do not conflate the two). Old Bakr `"off"` → Butchr `frozen: true`; old `"archived"` → Butchr's own archive directory (`butchr session archive`), never a live definition at all. None of these 5 had a live process (all `off`/`archived` already), so there is no live handshake step for them beyond marking them retired/archived in Bakr's own record (§4.2). |
-| `director-brooswit-factory` (@01m32mcw3vjzfaa19j) | CNDLX-45 c23525/description | **Managed-session definition**, `execution: persistent`, `account: permanent`, `role: sentinel`, rocketr (channel) + Atlassian MCP, `permissionMode: auto`. **BLOCKED ON S7/BUTCHR-453** for the `--strict-mcp-config` property — see §4.4's explicit gate. Migrates **LAST**, with the other 2 directors. See `docs/codey-session-definitions.example/director-brooswit-factory.json`. |
-| `director-brooswit-minecraft` (@01m32mcw3yj20qnw0c) | CNDLX-45 c23525/description | Same shape as `director-brooswit-factory`, same BLOCKED-ON-S7 gate. See `.../director-brooswit-minecraft.json`. |
-| `director-brooswit-mud` (@01m32mxkxg1ejzz995) | CNDLX-45 c23525/description | Same shape, same BLOCKED-ON-S7 gate. Also the sole `freezeControllers` grantee on every MUD-player definition below — keep its own workspace subtrees (`infrastructure/`, `mud-mcp/`, `nexus-mud/`, `roleplayers/`, `candlestix-attach`) intact; nothing here deletes or restructures them. See `.../director-brooswit-mud.json`. |
+| `director-brooswit-factory` (@01m32mcw3vjzfaa19j) | CNDLX-45 c23525/description | **Managed-session definition**, `execution: persistent`, `account: permanent`, `role: sentinel`, rocketr (channel) + Atlassian MCP, `permissionMode: auto`, `strictMcpConfig: true`. **S7/BUTCHR-453 has landed** (`strictMcpConfig` exists in `src/resources/session-definition.ts`) — the field is staged in this definition now; what remains is a DEPLOY dependency, not a code one — see §4.4. Migrates **LAST**, with the other 2 directors. See `docs/codey-session-definitions.example/director-brooswit-factory.json`. |
+| `director-brooswit-minecraft` (@01m32mcw3yj20qnw0c) | CNDLX-45 c23525/description | Same shape as `director-brooswit-factory`, same deploy-first dependency. See `.../director-brooswit-minecraft.json`. |
+| `director-brooswit-mud` (@01m32mxkxg1ejzz995) | CNDLX-45 c23525/description | Same shape, same deploy-first dependency. Also the sole `freezeControllers` grantee on every MUD-player definition below — keep its own workspace subtrees (`infrastructure/`, `mud-mcp/`, `nexus-mud/`, `roleplayers/`, `candlestix-attach`) intact; nothing here deletes or restructures them. See `.../director-brooswit-mud.json`. |
 | 10 `mud-player-{aelric,bressa,corvin,della,edrin,fenna,garrick,hestia,ivor,junia}` | CNDLX-45 c23525/23532/23534 | **Managed-session definitions**, `execution: persistent`, `frozen: true` (kept frozen — old Bakr/Candlestix `"off"` maps to Butchr `frozen`), `account: none`, `role: sentinel` (exempts them from the fleet cap once/if ever unfrozen — see `docs/managed-sessions.md` "role → fleet-capacity admission"; frozen definitions are never in the eligible set regardless, per "Eligible = valid, not frozen"), `tier: tier1`. Channel server is the **mud-mcp bridge** — the slot historically named `yappr` in their old config **is the bridge itself, never the retired yappr service, and must NEVER become a `rocketr` binding** (CNDLX-45 c23532/23534 — this reversed an earlier rocketr+permanent proposal the director explicitly rejected). `freezeControllers: ["director-brooswit-mud"]`; **no `unfreezeControllers`** — CNDLX-45's own decision defers whether the director may also unfreeze them to a separate, later judgment call (`docs/managed-sessions.md` "Delegated freeze/unfreeze": "whether it may also UNFREEZE them is a separate, explicit judgment call... not a byproduct of this ticket"). See `docs/codey-session-definitions.example/mud-player-*.json`. |
 
 Every row above accounts for all 22 Bakr + 13 Candlestix = 35 old agents:
@@ -214,13 +214,27 @@ directory (§0), replace every placeholder:**
   reference, never inline" discipline; never a literal header value in the
   definition file.
 
-**None of the 3 director definitions sets a strict-MCP-config field** — no
-such field exists in `src/resources/session-definition.ts` today (verified
-live against `origin/main` while writing this runbook; BUTCHR-453/S7, which
-adds it, is still In Progress — see §4.4). `permissionMode: "auto"` alone is
-staged and stageable today; the strict-MCP half of "permission mode auto with
-strict MCP config" is not, and this is exactly why §4.4 gates the directors'
-cutover, not their staging.
+**All 3 director definitions now set `strictMcpConfig: true`** alongside
+`permissionMode: "auto"` — S7/BUTCHR-453 landed on main
+(`SessionDefinition.strictMcpConfig`, `src/resources/session-definition.ts`;
+validated through the real loader in
+`test/unit/codey-session-definitions-example.test.ts`, which now asserts the
+3 directors DO claim it and every other staged definition does not). This
+closes the code-level half of "permission mode auto with strict MCP config."
+**It does not by itself close the deploy-level half — see §4.4**, which gates
+on the running Codey daemon actually being restarted onto a build that
+includes S7, not on the field existing in source. `sessionDefinitionProblems`
+(`src/resources/session-definition.ts`) rejects a document carrying ANY key
+outside its own `DEFINITION_FIELDS` set with `"<file> has unknown field
+\"<key>\""` — a HARD REJECTION of the whole file, not a silent ignore of just
+that field — so if a director's definition (with `strictMcpConfig` set) is
+placed under an old daemon's session-definitions directory before that
+daemon is restarted onto a build that recognizes the field, the daemon
+refuses to load the file at all: the director is simply never staffed
+(a loud, visible failure — "no definition named ... in &lt;dir&gt;" /
+absent from `butchr session list` — never a silent loss of the MCP-isolation
+property). §4.4 exists to sequence around this deploy-first dependency
+deliberately, not to work around a code gap that no longer exists.
 
 **Rollback**: nothing is live yet — these are files in a git repo, not a
 Codey artifact. Rollback for the actual `butchr session create` step is in
@@ -312,34 +326,96 @@ tool call succeeding through it.
   narrow exception, then re-frozen) or an equivalent disposable
   `mud-mcp`-bound test definition, and reference its evidence output here.
 
-### 4.4 The 3 Candlestix directors — BLOCKED ON S7/BUTCHR-453, do not execute yet
+### 4.4 The 3 Candlestix directors — gated on the Codey deploy-and-restart, not on source
 
-**Do not stage these for cutover, and do not run §5's handshake for them,
-until BOTH of the following are true:**
+S7/BUTCHR-453 has landed on main: `strictMcpConfig` is a real field in
+`src/resources/session-definition.ts`, the 3 staged director definitions
+(§3) already set it, and the code-level half of "permission mode auto with
+strict MCP config" is done. **What remains is a DEPLOY dependency, not a
+code one, and it governs ORDERING, not whether to proceed:**
 
-1. **BUTCHR-453 (S7) has landed** — as of this runbook being written,
-   BUTCHR-453 is **In Progress** (its own Task, BUTCHR-463, is investigating
-   the Drovr-side change; verify current status yourself with
-   `jira_get_issue` before relying on this line, since it will go stale).
-   S7's own DoD is: a Drovr-side `--strict-mcp-config` launch option, a new
-   managed-session manifest field that reaches it (name TBD — check
-   `src/resources/session-definition.ts` at the time S7 lands; it does not
-   exist as of this runbook), a test proving a Claude launch with it set
-   emits the flag, and a documented Codex behavior (S7's own working plan:
-   reject-at-manifest-load, not silent-ignore).
+**Do not stage these 3 definitions into Codey's live session-definitions
+directory, and do not run §5.4's cutover handshake for them, until BOTH of
+the following are true:**
+
+1. **The Codey deploy-and-restart has already happened** —
+   `docs/codey-deploy-runbook.md` (this Story's own Codey deploy/restart
+   runbook; cross-referenced here by file name, not by section number, since
+   its internal numbering can drift independently of this document) has been
+   executed and its own health check confirms the running `butchr.service`
+   is on a build that includes S7/BUTCHR-453. This is not a new ordering
+   requirement invented here — Part B's own step sequence (BUTCHR-396) already
+   runs the Codey deploy before any agent cutover — this section exists so
+   that dependency is stated EXPLICITLY for the director step specifically,
+   since staging a director's definition against an old daemon fails
+   differently than every other definition in this runbook (see the failure
+   mode below).
 2. **The strict-MCP property is verified REAL on the actual staged director
-   definition, not merely that `permissionMode` reads `"auto"`.** `"auto"`
-   alone is already stageable today (§3) and says nothing about whether MCP
-   discovery is strict — confirm the new field is set AND that a live
-   director agent launched with it actually receives
-   `--strict-mcp-config` in its own argv (`ps -o pid,args=` for that pane),
-   not just that the manifest field parses.
+   process, not merely that the manifest field is set or that
+   `permissionMode` reads `"auto"`.** `"auto"` alone says nothing about
+   whether MCP discovery is strict, and a manifest field parsing cleanly says
+   nothing about what the RUNNING daemon's build actually does with it —
+   confirm the live director agent's own launch argv contains
+   `--strict-mcp-config`, not just that `butchr session show <name>` prints
+   `strictMcpConfig: true` back (that only proves the manifest was accepted,
+   which §3's hard-rejection behavior below means could be a false positive
+   from a NEW-enough daemon read from an OLD one's still-stale directory —
+   read the argv itself). On Codey, as the `butchr.service` user, once the
+   director's definition is staged and the daemon has picked it up:
 
-**If this step is somehow reached before S7 lands, STOP and flag it on
-BUTCHR-391** — do not improvise a workaround (e.g. shipping the directors
-with `auto` alone and treating strict-MCP as "close enough"); the whole
-point of gating here is that a director without it has silently lost a
-security property relative to its old Candlestix configuration.
+   ```
+   $ ps -eo pid,args= | grep -F -- '<director's workingDirectory value from §3, e.g. /home/<codey-user>/.local/state/candlestix/agents/01m32mcw3vjzfaa19j>'
+   ```
+
+   **Why this string, not a pane id or agent name**: this repo's own argv
+   builder (`kickoffFor`, `src/agents/argv.ts`, and `buildAgentStartParams`
+   in `@brooswit/drovr`) puts the definition's `workingDirectory` value
+   verbatim into the FIRST positional argument of the launched `claude`
+   process — the literal text `"Your working directory for this task is
+   <workingDirectory> — cd there before doing anything else. Then:
+   <brief>"` — so the expanded `workingDirectory` string is a substring of
+   that agent's own live argv, independent of any internal key-encoding
+   detail. **Verify this against your own daemon's actual behavior before
+   relying on it** — this is this document's own read of the source, not a
+   fact observed on a live Codey process (this document's author has no
+   Codey/live-daemon access, per the epic's Execution model). If it doesn't
+   match, fall back to correlating `butchr session show <name>`'s own
+   `agentKey:` output against `herdr agent list`'s pane/workspace field for
+   that daemon, then `ps -o pid,args= -p <pid>` for that pane's pid.
+
+   **Expected**: exactly one matching process line, and that same line
+   contains the literal token `--strict-mcp-config` (a standalone flag, no
+   value follows it — `checkManagedAgentArgv`'s own convention in
+   `@brooswit/drovr`, "valueless, like `--dangerously-bypass-approvals-and-
+   sandbox`"). **Fails as**: zero matching lines (the agent isn't running —
+   don't conclude anything about strict-MCP until it is), more than one
+   matching line (investigate a possible duplicate before doing anything
+   else — see §7), or a matching line with no `--strict-mcp-config` token
+   (the daemon accepted the manifest but did not honor the field — STOP, do
+   not treat `"auto"` alone as sufficient, and flag it on BUTCHR-391 per
+   below).
+
+**Why an old daemon fails LOUDLY, not silently, if this order is
+reversed**: `sessionDefinitionProblems` (`src/resources/session-
+definition.ts`) rejects a document carrying any field outside its own
+compiled-in `DEFINITION_FIELDS` set with `"<file> has unknown field
+\"strictMcpConfig\""` — the WHOLE file is invalid, not just that field. So
+staging a director's definition (which now sets `strictMcpConfig`) against
+a daemon whose own build predates S7 does not silently drop the isolation
+property — it makes the daemon refuse to load the definition AT ALL: the
+director is simply never staffed (absent from `butchr session list`, and
+`butchr session show <name>` reports "no definition named ... in &lt;dir&gt;").
+That is a visible, safe failure, not the silent security regression the
+old gate in this section used to worry about — but it still means "stage
+first, deploy later" wastes a cutover attempt rather than saving one, which
+is the real reason to keep deploy-and-restart first in the order.
+
+**If the strict-MCP property still isn't real on the running daemon after
+its own deploy-and-restart has completed, STOP and flag it on BUTCHR-391**
+— do not improvise a workaround (e.g. shipping the directors with `auto`
+alone and treating strict-MCP as "close enough"); the whole point of gating
+here is that a director without it has silently lost a security property
+relative to its old Candlestix configuration.
 
 ### 4.5 A note on verifying a FROZEN MUD-player definition
 
@@ -574,10 +650,14 @@ suffices — no live-agent state changed.
    everything else" without a strict internal order. Confirm no stricter
    internal ordering was decided elsewhere before treating "any order within
    the group" as settled.
-6. **The exact new manifest field name for strict-MCP-config** (§4.4) —
-   BUTCHR-453/S7 had not landed as of this runbook being written; re-verify
-   the field's real name and shape against `src/resources/session-
-   definition.ts` once it does, rather than assuming a name.
+6. **RESOLVED — the manifest field name for strict-MCP-config** (§4.4):
+   `strictMcpConfig` (optional boolean, Claude only, rejected at manifest
+   load for `vendor: "codex"`) — confirmed live in `src/resources/session-
+   definition.ts` now that BUTCHR-453/S7 has landed. Kept here, rather than
+   deleted, only as a record that this was once open — re-verify the field's
+   name and shape against that same file yourself before staging, the same
+   working agreement every other citation in this runbook carries, rather
+   than trusting this line as settled fact once it too can go stale.
 7. **`permissionMode: "auto"` on Nexus and the 10 MUD players is this
    runbook's own inference, not a value the ticket/epic pins.** The ticket's
    mapping only explicitly pins `auto` for the 3 directors ("permission mode
