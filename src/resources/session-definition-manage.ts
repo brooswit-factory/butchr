@@ -52,6 +52,9 @@ export interface SessionDefinitionListEntry {
   problems: readonly string[];
   vendor?: SessionDefinitionVendor;
   tier?: SessionTier;
+  /** FACTORY-75 — the new two-axis mechanism's own fields (src/resources/power-scale.ts), set together, never alongside `tier` (see `SessionDefinition.tier`'s own doc comment). */
+  modelPower?: number;
+  effort?: number;
   role?: AgentRole;
   execution?: ExecutionMode;
   /** FACTORY-72: reused verbatim from `Rule`/`SessionDefinition` — see those types' own doc comments. `undefined` for an invalid definition, same reasoning as `vendor`/`tier`/`role`/`execution` above. */
@@ -139,7 +142,11 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
       const definition = parseSessionDefinitionFile(await read(resource.path), resource.path);
       out.push({
         name: resource.name, path: resource.path, agentKey, valid: true, problems: [],
-        vendor: definition.vendor, tier: definition.tier, role: definition.role, execution: definition.execution,
+        vendor: definition.vendor,
+        ...(definition.tier !== undefined ? { tier: definition.tier } : {}),
+        ...(definition.modelPower !== undefined ? { modelPower: definition.modelPower } : {}),
+        ...(definition.effort !== undefined ? { effort: definition.effort } : {}),
+        role: definition.role, execution: definition.execution,
         account: definition.account, permissionMode: definition.permissionMode, workingDirectory: definition.workingDirectory,
         mcpServerNames: (definition.mcpServers ?? []).map((s) => s.name),
         manifestFrozen: definition.frozen, storeFrozen,
@@ -165,7 +172,10 @@ export interface CreateSessionDefinitionInput {
   workingDirectory: string;
   brief: string;
   vendor: string;
-  tier: string;
+  /** DEPRECATED — set this OR both `modelPower`/`effort`, never both (see `SessionDefinition.tier`'s own doc comment, src/resources/session-definition.ts). */
+  tier?: string;
+  modelPower?: number;
+  effort?: number;
   permissionMode: string;
   execution?: string;
   account?: string;
@@ -238,7 +248,9 @@ export async function createSessionDefinition(deps: CreateSessionDefinitionDeps,
     workingDirectory: input.workingDirectory,
     brief: input.brief,
     vendor: input.vendor,
-    tier: input.tier,
+    ...(input.tier !== undefined ? { tier: input.tier } : {}),
+    ...(input.modelPower !== undefined ? { modelPower: input.modelPower } : {}),
+    ...(input.effort !== undefined ? { effort: input.effort } : {}),
     permissionMode: input.permissionMode,
     ...(input.execution !== undefined ? { execution: input.execution } : {}),
     ...(input.account !== undefined ? { account: input.account } : {}),

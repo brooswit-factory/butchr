@@ -151,3 +151,16 @@ test('free-form project workspace has no ticket workflow, preserves review and c
  expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');expect(args.join(' ')).toContain('resource_chat');
  buildWorkspace(spec,'http://localhost/mcp','claude');expect(JSON.parse(readFileSync(join(cwd,'mcp.json'),'utf8')).mcpServers.resource_chat.url).toBe('http://localhost/chat');
 });
+
+// FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
+// reaches the spawn spec when the rule sets it (overriding agentLaunchConfig's
+// own unconditional jira-project "auto" default, src/agents/argv.ts, since
+// spec.permissionMode's spread there runs after it); lizardMode never does.
+test('permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is', () => {
+ const [lizardRule] = parseRules({ rules: [{ ...rule, permissionMode: 'default', lizardMode: true }] });
+ const spec = specForProject({ agentKey: 'jira-project:managers:PROJ', rule: lizardRule!, project: { id: '1', key: 'PROJ', name: 'Project' } });
+ expect(spec.permissionMode).toBe('default');
+ expect(spec).not.toHaveProperty('lizardMode');
+ const [plain] = parseRules({ rules: [rule] });
+ expect(specForProject({ agentKey: 'jira-project:managers:PROJ', rule: plain!, project: { id: '1', key: 'PROJ', name: 'Project' } }).permissionMode).toBeUndefined();
+});

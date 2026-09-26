@@ -2,11 +2,12 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
+import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
 import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
-import type { McpServerBinding } from "../rules/rules.js";
+import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
@@ -180,6 +181,22 @@ export const PANE_BUSY_MAX_RETRIES = 4;
 export const SPAWN_TAG = "[spawn]";
 
 /**
+ * FACTORY-75 (PR #473 review fix) — `staleIssues()`'s own argv fallback for
+ * `--model`/`--effort`, used ONLY when `workspaceModel`/`workspaceEffort`
+ * (src/agents/workspace.ts) find no persisted file: a workspace spawned by
+ * a build before this ticket never wrote one, so this recovers what the
+ * ALREADY-RUNNING process was actually launched with directly from its own
+ * argv, rather than treating "no persisted file" as "no model/effort at
+ * all" — see `staleIssues()`'s own doc comment on this exact seam for the
+ * mass-restart-on-deploy bug this closes. Same `argv.indexOf(flag)` shape
+ * Drovr's own internal (unexported) `flagValue` uses.
+ */
+const argvFlagValue = (argv: readonly string[], flag: string): string | undefined => {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] : undefined;
+};
+
+/**
  * BUTCHR-334: which reconcile loop produced a given `spawn()` attempt — see
  * `SPAWN_TAG`'s own doc comment for the cross-instrument rule this exists to
  * close. `spawn()` itself cannot know this (both loops call the same
@@ -254,6 +271,26 @@ export class HerdrHerd implements Herd {
      * this field existed.
      */
     private readonly accountNameOf?: (issue: string) => string | undefined,
+    /**
+     * FACTORY-75 — this issue's CURRENTLY resolved `(model, effort)` pair
+     * for the given provider, from the `modelPower`/`effort` two-axis
+     * mechanism (src/resources/power-scale.ts): a managed-session
+     * definition's own field, or a rule's `agentPreferences` entry
+     * (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
+     * own doc comment, src/rules/rules.ts, for why nothing downstream of
+     * that needed to change). `undefined` for anything this daemon cannot
+     * resolve (a legacy/bare-issue id, a rule/definition since removed, or
+     * one that sets neither `model`/`modelPower` nor `effort`/`effortPower`
+     * for this provider) — `staleIssues()` below then skips the
+     * comparison entirely, the same fail-safe "nothing to compare, so
+     * nothing is stale" shape `mcpBindingsOf`'s own absence already has.
+     * Called ONLY from `staleIssues()`, never from `spawn()` — a real
+     * launch already gets its resolved agent straight from `spec.agents`
+     * (`specForSessionDefinition`/`rule.agentPreferences`), so this seam
+     * exists purely for the comparison side, unlike `mcpBindingsOf`/
+     * `accountNameOf` above (which augment a real spawn too).
+     */
+    private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
   ) {}
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
@@ -468,7 +505,76 @@ export class HerdrHerd implements Herd {
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
-      if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
+      if (!check.ok) { out.push({ issue, reason: check.reason, observedArgv: proc.argv }); continue; }
+      // FACTORY-75: `--model`/`--effort` are deliberately excluded from
+      // `checkArgv`/`checkManagedAgentArgv`'s own comparison just above
+      // (this method's own top comment: "issuetype/summary/parent don't
+      // matter here" — Drovr never diffs those two flags at all, for ANY
+      // spec), so the two-axis (`modelPower`/`effort`) mechanism's own
+      // auto-reconcile-on-change requirement needs its OWN comparison here:
+      // whatever this workspace was ACTUALLY spawned with
+      // (`workspaceModel`/`workspaceEffort`, read back from what
+      // `buildWorkspace` persisted at spawn time) against what the
+      // definition/rule CURRENTLY resolves to (`resolvedAgentOf`, live —
+      // not persisted, so a definition/rule edit OR a table edit shipped in
+      // a new daemon build is caught on the very next poll after whichever
+      // of those actually took effect). `resolvedAgentOf` returning
+      // `undefined` (nothing this daemon can resolve for this issue), or a
+      // model/effort of `undefined` (this provider's own preference sets
+      // neither), means nothing to compare — never flagged, the same
+      // fail-safe shape `mcpBindingsOf`'s own absence already has.
+      //
+      // REVIEW FIX (PR #473, first review): a workspace spawned by a build
+      // BEFORE this ticket never wrote `.butchr-model.json`/`.butchr-effort.json`
+      // at all — `workspaceModel`/`workspaceEffort` return `undefined` for
+      // every already-running managed session (tier-based, so `liveResolved.model`
+      // is always defined) and every already-running rule agent whose
+      // `agentPreferences` already set an explicit `model`/`effort` (unrelated
+      // to `modelPower`/`effortPower`). Comparing that `undefined` directly
+      // against `liveResolved.model` (always defined for those cases) would
+      // flag EVERY one of them stale on the very first poll after deploy — a
+      // fleet-wide mass restart, exactly the "unexpected behaviour change on
+      // deploy" this ticket's own back-compat requirement forbids, and the
+      // same bug SHAPE FACTORY-43 fixed (a stale-check expectation that does
+      // not match what the previous launch actually persisted).
+      //
+      // Fixed by falling back to what `proc.argv` shows the process was
+      // ACTUALLY launched with, when the persisted file is absent — Claude
+      // always emits both `--model` and `--effort` unconditionally
+      // (`agentLaunchConfig`'s claude branch: both fields are non-optional,
+      // always resolved via a default), so `argvFlagValue` recovers the
+      // real value with no `buildWorkspace` change needed for THIS build to
+      // read back a PREVIOUS build's launch. Codex has no `--effort` flag at
+      // all (its reasoning effort lives in `.codex/config.toml`, never
+      // argv — see `codexReasoningEffortFlag`'s own doc comment,
+      // src/resources/power-scale.ts) and `--model` only when explicitly
+      // set; with NO persisted file and NO argv signal for Codex effort,
+      // there is nothing to compare against, so `?? liveResolved.effort`
+      // makes that comparison trivially equal (never flagged) rather than
+      // guessing a value — the same "unknown, not stale" fail-safe this
+      // file's own `staleIssues()` already uses for a pane that reports
+      // nothing (see "no cwd reported" / "pane.process_info rejects" tests).
+      // Once a respawn actually happens (this comparison flags a REAL
+      // change, or any other reason), the NEW build's `buildWorkspace`
+      // persists real values and every later poll compares persisted-vs-live
+      // exactly as designed, with no more argv fallback needed.
+      const liveResolved = this.resolvedAgentOf?.(issue, provider);
+      if (liveResolved) {
+        const persistedModel = workspaceModel(cwd) ?? argvFlagValue(proc.argv, "--model");
+        // Claude's `--effort` value is always one of AgentEffort's own literals (agentLaunchConfig
+        // never emits anything else) — safe to widen back to that type here.
+        const observedClaudeEffort = provider === "claude" ? argvFlagValue(proc.argv, "--effort") as AgentEffort | undefined : undefined;
+        const persistedEffort = workspaceEffort(cwd) ?? (provider === "claude" ? observedClaudeEffort : liveResolved.effort);
+        const modelChanged = liveResolved.model !== undefined && liveResolved.model !== persistedModel;
+        const effortChanged = liveResolved.effort !== undefined && liveResolved.effort !== persistedEffort;
+        if (modelChanged || effortChanged) {
+          out.push({
+            issue,
+            reason: `argv lacks --model/--effort matching the current definition/rule (model: ${persistedModel ?? "(default)"} -> ${liveResolved.model ?? persistedModel ?? "(default)"}, effort: ${persistedEffort ?? "(default)"} -> ${liveResolved.effort ?? persistedEffort ?? "(default)"})`,
+            observedArgv: proc.argv,
+          });
+        }
+      }
     }
     return out;
   }
@@ -568,19 +674,71 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
         return;
       }
-      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}`);
+      // FACTORY-75 visibility requirement: the resolved (model, effort)
+      // pair this spawn intended (`spec.agents`, whatever
+      // `specForSessionDefinition`/`rule.agentPreferences` resolved via the
+      // two-axis mechanism, src/resources/power-scale.ts) rides on the SAME
+      // journal line every other spawn outcome already gets — never a
+      // separate log call that could land out of order with this one.
+      const agentsNote = spec.agents?.length ? ` agents=${JSON.stringify(spec.agents)}` : "";
+      this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${result.value} origin=${origin}${agentsNote}`);
     } catch (e) {
       this.log?.(`${SPAWN_TAG} ${issue} failed origin=${origin} — ${(e as Error)?.message ?? e}`);
       throw e;
     }
   }
 
+  /**
+   * FACTORY-95 review fix (round 1): `resolveDisplayLabels`'s tie-break is
+   * the lexicographically SMALLEST key of a colliding group — a pure
+   * function of the full key set, deliberately independent of spawn order
+   * (see that function's own doc comment). That independence has a sharp
+   * consequence at THIS call site: when the key about to spawn sorts
+   * BEFORE an already-running colliding key, the incoming key is handed the
+   * bare label while the running workspace still visibly carries that same
+   * bare label from ITS OWN earlier spawn/relabel — two live workspaces
+   * sharing one label until the next `relabelOwnedWorkspaces()` pass, which
+   * only runs at daemon startup. FACTORY-90 is explicit that a collision
+   * must be disambiguated, not left to share a label, so this cannot wait
+   * for a restart.
+   *
+   * The fix: after resolving `key`'s own label against the full running
+   * set, ALSO reasserts every OTHER running member of `key`'s own
+   * collision group's own correct label — right now, via the SAME
+   * `relabelRunningAgent` path `relabelOwnedWorkspaces` uses below.
+   * Unconditional, not "only the ones that changed": both herdr calls are
+   * plain, cheap overwrites, and reasserting a sibling whose label happens
+   * to be unchanged costs nothing while never depending on trusting that
+   * herdr's own stored value already agrees (it might not, e.g. after an
+   * interrupted earlier attempt). This keeps the invariant "no two live
+   * workspaces share a label" true at every instant, not just after a
+   * restart, and keeps the spawn path and relabel-in-place path using the
+   * literal same tie-break over the literal same kind of set — the "same
+   * agent -> same label both ways" property `resolveDisplayLabels` promises
+   * is what makes recomputing safe to do here.
+   */
+  private async labelFor(key: string): Promise<string> {
+    const owned = await this.ownedWorkspaceIds();
+    const running = [...owned.keys()];
+    const keys = running.includes(key) ? running : [...running, key];
+    const labels = resolveDisplayLabels(keys, this.log);
+    const myBase = baseDisplayLabel(key);
+    for (const other of running) {
+      if (other === key || baseDisplayLabel(other) !== myBase) continue;
+      const newLabel = labels.get(other);
+      const workspaceId = owned.get(other);
+      if (newLabel && workspaceId) await this.relabelRunningAgent(other, workspaceId, newLabel);
+    }
+    return labels.get(key) ?? key;
+  }
+
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
     await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
     if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
+    const label = await this.labelFor(spec.key);
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
-      label: spec.key,
+      label,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
@@ -606,8 +764,10 @@ export class HerdrHerd implements Herd {
         return { launch, ...(home ? { env: { HOME: home }, home } : {}) };
       },
     });
-    if (result.status === "success") this.refused.delete(spec.key);
-    else {
+    if (result.status === "success") {
+      this.refused.delete(spec.key);
+      await this.reportFullAgentKey(spec.key);
+    } else {
       if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);
       const current = await this.lifecycle(spec.key).resolveCurrent();
       if ((current?.agent === "claude" || current?.agent === "codex") && (current.agent_status === "idle" || current.agent_status === "done")) {
@@ -615,6 +775,115 @@ export class HerdrHerd implements Herd {
       }
     }
     return result;
+  }
+
+  /**
+   * FACTORY-95: preserves the full agent key in herdr's own per-workspace
+   * metadata bag, keyed by `FULL_AGENT_KEY_METADATA_FIELD` — the herdr-facing
+   * label carries only the short display id (`labelFor` above), so this is
+   * the one place the FULL key is retrievable from herdr for a given
+   * workspace. `resolveCurrent()` re-resolves this agent's own live identity
+   * (pane id AND `workspace_id`) rather than trusting anything cached — the
+   * SAME re-resolution `startProviders`' own failure branch already does a
+   * few lines up. Never throws and never logged as a SPAWN_TAG outcome: a
+   * metadata-write hiccup must never read as a failed spawn (the agent is
+   * already running) — logged as its own WARNING, swallowed, exactly like
+   * `relabelOwnedWorkspaces` below treats the same two herdr calls.
+   */
+  private async reportFullAgentKey(key: string): Promise<void> {
+    try {
+      const current = await this.lifecycle(key).resolveCurrent();
+      if (!current) return; // resolved away already (e.g. immediately stopped) — nothing to tag
+      await this.herdr.workspace.reportMetadata({
+        workspace_id: current.workspace_id,
+        source: METADATA_SOURCE,
+        tokens: { [FULL_AGENT_KEY_METADATA_FIELD]: key },
+      });
+    } catch (e) {
+      this.log?.(`WARNING: [spawn] ${key} metadata report failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  /**
+   * FACTORY-95 (implementing FACTORY-90): every currently-running,
+   * butchr-owned workspace's own `workspace_id`, keyed by its REAL agent key
+   * — derived from a pane's `cwd` via the shared `agentIdOfWorkspacePath`
+   * (src/agents/workspace.ts), NEVER via herdr's own current label (that is
+   * exactly the thing `relabelOwnedWorkspaces` below is about to change, so
+   * it can never double as an identity source — the same ownership
+   * discipline `reap.ts`'s `strandedCandidates` already documents for its
+   * own, differently-scoped join). Deliberately its OWN small join over
+   * `agent.list()`, not a `byIssue()` reuse: `byIssue()`'s map feeds the
+   * public `managedAgents()`/`ManagedHerdAgent` shape, which has no
+   * `workspaceId` field — duplicating this ambiguity-safe loop here keeps
+   * that public contract unchanged. "Ambiguous" (more than one live pane at
+   * one owned cwd) is dropped rather than guessed, same rule `byIssue()`
+   * already applies for the identical reason.
+   */
+  private async ownedWorkspaceIds(): Promise<Map<string, string>> {
+    const { agents } = await this.herdr.agent.list();
+    const map = new Map<string, string>();
+    const ambiguous = new Set<string>();
+    for (const a of agents) {
+      const key = agentIdOfWorkspacePath(a.cwd ?? null);
+      if (!key || !a.workspace_id) continue;
+      if (map.has(key)) { map.delete(key); ambiguous.add(key); }
+      else if (!ambiguous.has(key)) map.set(key, a.workspace_id);
+    }
+    return map;
+  }
+
+  /**
+   * FACTORY-95: renames one ALREADY-RUNNING agent's workspace and refreshes
+   * its metadata — the one shared herdr-write path both `labelFor` above
+   * (fixing up a spawn's OWN colliding siblings, right now, not at the next
+   * restart) and `relabelOwnedWorkspaces` below (the full-fleet pass) use,
+   * so the two can never diverge in what a "relabel" actually does on the
+   * wire. Never throws: caught and logged as its own WARNING, exactly like
+   * `reap.ts`'s own per-candidate fault isolation — one workspace's failure
+   * must never block another's, or the caller that triggered it.
+   */
+  private async relabelRunningAgent(agentKey: string, workspaceId: string, label: string): Promise<void> {
+    try {
+      await this.herdr.workspace.rename({ workspace_id: workspaceId, label });
+      await this.herdr.workspace.reportMetadata({
+        workspace_id: workspaceId,
+        source: METADATA_SOURCE,
+        tokens: { [FULL_AGENT_KEY_METADATA_FIELD]: agentKey },
+      });
+    } catch (e) {
+      this.log?.(`WARNING: [relabel] ${agentKey} failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  /**
+   * FACTORY-95 (implementing FACTORY-90): relabels every currently-running,
+   * butchr-owned herdr workspace to its short display label
+   * (`resolveDisplayLabels`, src/rules/display-label.ts) and refreshes its
+   * metadata with the full agent key — no agent restart, `workspace.rename`/
+   * `workspace.reportMetadata` alone (`relabelRunningAgent` above).
+   * Idempotent: safe to call repeatedly (today's only caller runs it once at
+   * daemon startup — src/daemon/index.ts; `labelFor` above also calls
+   * `relabelRunningAgent` directly, mid-spawn, for the narrower case of a
+   * spawn's own colliding siblings) since both herdr calls are themselves
+   * plain overwrites, never additive. Never throws: an overall failure (a
+   * herdr hiccup on `agent.list()`) is logged and swallowed, and each
+   * workspace's own rename/metadata failure is isolated by
+   * `relabelRunningAgent` itself — the same fault isolation `reap.ts`'s own
+   * `Reaper.check()` gives its per-candidate work, so one bad workspace
+   * never blocks the rest.
+   */
+  async relabelOwnedWorkspaces(): Promise<void> {
+    try {
+      const owned = await this.ownedWorkspaceIds();
+      if (!owned.size) return;
+      const labels = resolveDisplayLabels([...owned.keys()], this.log);
+      for (const [agentKey, workspaceId] of owned) {
+        await this.relabelRunningAgent(agentKey, workspaceId, labels.get(agentKey) ?? agentKey);
+      }
+    } catch (e) {
+      this.log?.(`WARNING: [relabel] detector error: ${(e as Error)?.message ?? e}`);
+    }
   }
 
   private async readPane(paneId: string): Promise<string> {

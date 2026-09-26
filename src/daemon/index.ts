@@ -26,7 +26,7 @@ import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-ide
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -37,7 +37,8 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
-import { startPermissionAnswerLoop } from "../agents/permission-answer-loop.js";
+import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
+import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
@@ -194,15 +195,33 @@ const managedSessionRoles = new Map<string, AgentRole>();
  */
 const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
 /**
+ * FACTORY-75 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` above, one field over: this poll's
+ * eligible definitions' resolved `(model, effort)` pair (`effectiveAgent`,
+ * src/resources/session-definition.ts), keyed identically. `resolvedAgentOf`
+ * below consults this map for a managed-session id before falling back to
+ * `rules`' own `agentPreferences` for a rule-engine id — see that
+ * function's own comment for the full shape.
+ */
+const managedSessionResolvedAgents = new Map<string, { model: string; effort?: AgentEffort }>();
+/**
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
  * an eligible managed-session definition opted into "lizard mode"
- * (`SessionDefinition.lizardMode`). Consulted below by `lizardModeLabel`,
- * which the permission-answer timer's `eligiblePanes` hook is built from —
- * see `ManagedSessionResourceDeps.lizardModes`'s own doc comment
- * (src/rules/session-definition-type.ts) for why this is deliberately LIVE
- * rather than persisted-at-spawn the way `permissionMode`/`strictMcpConfig`
- * are (FACTORY-43): this field never reaches the launched process's argv.
+ * (`SessionDefinition.lizardMode`). Consulted below by `ruleLizardModeOf`,
+ * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
+ * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
+ * comment (src/rules/session-definition-type.ts) for why this is
+ * deliberately LIVE rather than persisted-at-spawn the way
+ * `permissionMode`/`strictMcpConfig` are (FACTORY-43): this field never
+ * reaches the launched process's argv. FACTORY-87: a RULE-launched agent
+ * (jira-work/jira-project/github/filesystem, as opposed to a managed
+ * session) has no per-file manifest of its own to rebuild a map like this
+ * from every poll — its `lizardMode` lives on its own `Rule`
+ * (src/rules/rules.ts), which is loaded once at startup, so `ruleLizardModeOf`
+ * below reads it straight from the already-loaded `rules` list instead of a
+ * second map, the same "rule-level fallback" shape `ruleRoleOfAgent` already
+ * uses for `role`.
  */
 const managedSessionLizardModes = new Map<string, boolean>();
 /**
@@ -226,6 +245,22 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
+/**
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — `lizardMode`'s
+ * own equivalent of `ruleRoleOfAgent` immediately above: true iff `id`'s
+ * agent should be scanned/answered by the permission-answer timer. The
+ * actual decision (`ruleLizardModeOf`, `src/agents/permission-answer-loop.ts`)
+ * is a pure, importable function — extracted there (PR #478 review) so it
+ * has its own unit tests independent of this module, which has no exports
+ * and cannot itself be imported by a test without running the whole
+ * daemon's startup side effects. This is just the daemon's own binding of
+ * that decision to its own live state (`rules`, `managedSessionLizardModes`,
+ * `ownsManagedSessionAgent`) — see `RuleLizardModeDeps`'s own doc comment for
+ * what each input means and why a managed session needs the live map while
+ * every other rule-launched agent reads straight off its own `Rule`.
+ */
+const ruleLizardModeOf = (id: string): boolean =>
+  sharedRuleLizardModeOf(id, { rules, isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
 // BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
 // (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
 // agents are classified "sentinel" here (see src/agents/capacity-role.ts).
@@ -255,6 +290,33 @@ const mcpBindingsOf = (id: string) => {
   if (!decoded) return undefined;
   const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.mcpServers;
+};
+
+/**
+ * FACTORY-75 — `HerdrHerd.staleIssues()`'s own `resolvedAgentOf` seam (see
+ * that constructor param's doc comment, src/agents/herd.ts): this issue's
+ * CURRENTLY resolved `(model, effort)` pair for the given provider, from
+ * the two-axis `modelPower`/`effort` mechanism (src/resources/power-scale.ts).
+ * Same decode-then-look-up-by-ruleId shape as `mcpBindingsOf` immediately
+ * above, for the SAME reason (HerdrHerd holds no rule state of its own) —
+ * a managed-session id is checked FIRST against `managedSessionResolvedAgents`
+ * (rebuilt every managed-sessions poll from that poll's eligible
+ * definitions — see that map's own comment above), since a managed-session
+ * definition has no entry in `rules` at all; a rule-engine id then falls
+ * through to that rule's own `agentPreferences` entry for this provider —
+ * ALREADY resolved at `loadRules()` time (`AgentPreference`'s own doc
+ * comment, src/rules/rules.ts), so this is a plain lookup, not a second
+ * resolution. `undefined` for anything neither map/lookup can answer — the
+ * same "nothing to compare, so nothing reads stale" fail-safe `mcpBindingsOf`
+ * already has.
+ */
+const resolvedAgentOf = (id: string, provider: string): { model?: string; effort?: AgentEffort } | undefined => {
+  if (ownsManagedSessionAgent(id)) return managedSessionResolvedAgents.get(id);
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
+  return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
 
 /**
@@ -377,7 +439,15 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf, resolvedAgentOf);
+// FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): relabel every
+// currently-running, butchr-owned herdr workspace to its short display label
+// on every daemon startup — no agent restart. Idempotent (see
+// `relabelOwnedWorkspaces`'s own doc comment, src/agents/herd.ts), so running
+// it again on the next restart is exactly as safe as running it here once.
+// Fire-and-forget: a slow or failing herdr must never delay the rest of
+// startup, and the method itself never throws.
+void herd.relabelOwnedWorkspaces();
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
 // binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the
@@ -1503,6 +1573,7 @@ console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
   accountPolicies: managedSessionAccountPolicies,
+  resolvedAgents: managedSessionResolvedAgents,
   lizardModes: managedSessionLizardModes,
   account: accountLifecycle,
   herd,
@@ -1667,19 +1738,20 @@ blockingEscalationTimer.unref?.();
 //
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
-// only when its cwd resolves to a `managed-sessions` agent id AND that id's
-// LATEST poll of `managedSessionLizardModes` (rebuilt every managed-sessions
-// poll — see that map's own comment above) says `true`. Everything else —
-// an ordinary jira-work/rule agent, a managed session that never set
-// `lizardMode`, a managed session not yet observed this daemon's lifetime —
-// resolves `undefined` and is never touched, matching `lizardMode`'s own
-// "absent means today's behaviour exactly" contract. The label itself
-// (basename of the definition file) is what lets a log line name WHICH
-// AGENT got a prompt answered (FACTORY-67's own requirement), not just an
-// opaque pane id.
+// only when its cwd resolves to SOME rule-engine agent id (managed session or
+// rule-launched alike) AND `ruleLizardModeOf` says that id's own lizard-mode
+// opt-in (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87) is `true`. Everything
+// else — a legacy/bare-issue agent, a managed session or rule that never set
+// the field, a managed session not yet observed this daemon's lifetime —
+// resolves `false` and is never touched, matching `lizardMode`'s own "absent
+// means today's behaviour exactly" contract. The label itself (basename of
+// the resource id, e.g. the definition file or the Jira/GitHub/filesystem
+// resource) is what lets a log line name WHICH AGENT got a prompt answered
+// (FACTORY-67's own requirement), not just an opaque pane id.
 function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const id = agentIdOfWorkspacePath(cwd);
-  if (!id || !ownsManagedSessionAgent(id) || managedSessionLizardModes.get(id) !== true) return undefined;
+  if (!id || !ruleLizardModeOf(id)) return undefined;
   const decoded = decodeAnyAgentKey(id);
   return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
 }
@@ -1697,14 +1769,14 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // inside DROVR-41's own 15-30s recommendation, slower than the 5s
 // `blockingEscalationTimer`/`watchPrompts` timers (a pure-read status poll,
 // cheap to run often) but close to this daemon's own ~15s Jira reconcile
-// cadence under load (BUTCHR-117) — a blocked agent is now unblocked within
-// one tick of a bound already proven acceptable elsewhere in this same
-// daemon, without adding a fourth distinct polling rhythm to reason about.
-// The lizard-mode opt-in gate above only shrinks this timer's real workload
-// (a tick with zero eligible panes costs one `agent.list()` call and
-// nothing else — see `runPermissionAnswerTick`'s own doc comment), so the
-// original cost/cadence tradeoff this value was chosen against still holds
-// even more comfortably now than when every pane was in scope.
+// cadence under load (BUTCHR-117) — a bound already proven acceptable
+// elsewhere in this same daemon, without adding a fourth distinct polling
+// rhythm to reason about. The lizard-mode opt-in gate above only shrinks
+// this timer's real workload (a tick with zero eligible panes costs one
+// `agent.list()` call and nothing else — see `runPermissionAnswerTick`'s own
+// doc comment), so the original cost/cadence tradeoff this value was chosen
+// against still holds even more comfortably now than when every pane was in
+// scope.
 // `READ_TIMEOUT_MS` (8s) sits comfortably below `INTERVAL_MS` (20s) — see
 // `AutoAnswerPermissionsOptions.readTimeoutMs`'s own doc comment
 // (`@brooswit/drovr`) for why a pane's attempt must never still be in
@@ -1712,6 +1784,17 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // approve-verify budget (5s default `verifyTimeoutMs`, measured against
 // `node_modules/@brooswit/drovr/dist/index.js`) rather than picked to
 // exactly match it.
+//
+// FACTORY-98 (FACTORY-97): 20s is no longer the ONLY thing standing between
+// a lizard-mode pane going `blocked` and getting answered — see
+// `src/agents/permission-answer-watch.ts`'s own header for why (herdr's
+// `pane.agent_status_changed` push event, real per `@brooswit/herdr-sdk`'s
+// own generated types, but filtered to a specific `pane_id` — there is no
+// "any pane" wildcard, so this stays a scan-driven sweep at its core, with
+// the push connection layered on top as a fast path for panes the sweep
+// already knows about). `INTERVAL_MS` unchanged: it is now the FALLBACK
+// cadence (a dropped or not-yet-opened subscription still gets caught within
+// one sweep, same bound as before this ticket), not the only path.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
 // FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
@@ -1729,7 +1812,27 @@ const approvalSoundNotifier = createApprovalSoundNotifier({
   spawn: (argv) => Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"] }),
   log: (line) => console.error(`  ${line}`),
 });
-startPermissionAnswerLoop(
+// Narrows herdr's own push frame down to the one shape
+// `permission-answer-watch.ts` needs (`pane_id` + `agent_status`) — real
+// `PushFrame`s carry many other event shapes (workspace/tab/pane lifecycle)
+// with neither field, so `"agent_status" in frame.data` (rather than
+// asserting the wider union structurally matches) is what lets this compile
+// without a cast: only a `pane.agent_status_changed` frame's data ever has
+// both keys, which is the only kind `subscribeAgentStatus` below ever asks
+// herdr to send.
+async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subscribe"]>>): AsyncGenerator<PermissionAnswerPushFrame> {
+  for await (const frame of sub) {
+    if ("agent_status" in frame.data && "pane_id" in frame.data) {
+      yield { event: frame.event, data: { pane_id: frame.data.pane_id, agent_status: frame.data.agent_status } };
+    }
+  }
+}
+function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
+  return herdr
+    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id })))
+    .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
+}
+startPermissionAnswerWatch(
   {
     client: herdr,
     eligiblePanes: permissionAnswerEligiblePanes,
@@ -1738,6 +1841,7 @@ startPermissionAnswerLoop(
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
     onApproved: approvalSoundNotifier.notifyApproved,
+    subscribe: subscribeAgentStatus,
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );

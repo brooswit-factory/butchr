@@ -65,10 +65,13 @@ describe("atlassianTools", () => {
     ]);
   });
 
-  test("the five permanent verbs carry NO deprecation note; the eight aliased ones do", () => {
+  test("the six permanent verbs carry NO deprecation note; the seven aliased ones do", () => {
     const { tools } = rig();
-    const permanent = ["jira_get_issue", "jira_search", "jira_add_comment", "confluence_list_spaces", "confluence_search_pages"];
-    const aliased = ["jira_link_issues", "jira_transition", "jira_create_issue", "jira_set_priority", "jira_assign", "confluence_create_page", "confluence_update_page", "confluence_get_page"];
+    // confluence_create_page moved OUT of the deprecated-aliased set (FACTORY-84/FACTORY-86):
+    // set_doc no longer creates a page at all, so there is no successor call this one could
+    // be "deprecated in favor of" anymore — every call to it is sanctioned. See alias-audit.ts.
+    const permanent = ["jira_get_issue", "jira_search", "jira_add_comment", "confluence_list_spaces", "confluence_search_pages", "confluence_create_page"];
+    const aliased = ["jira_link_issues", "jira_transition", "jira_create_issue", "jira_set_priority", "jira_assign", "confluence_update_page", "confluence_get_page"];
     for (const name of permanent) expect(tools[name]!.description).not.toMatch(/DEPRECATED/);
     for (const name of aliased) expect(tools[name]!.description).toMatch(/DEPRECATED/);
   });
@@ -740,6 +743,14 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
     expect(Object.keys(tools.set_doc!.input).sort()).toEqual(["body", "title"]);
   });
 
+  test("get_doc's description no longer sends an agent to set_doc to create a doc (FACTORY-84/FACTORY-86 review fix: set_doc refuses, it never creates)", () => {
+    const { tools } = customRig();
+    const d = tools.get_doc!.description;
+    expect(d).not.toMatch(/use set_doc to create/i);
+    expect(d).toMatch(/set_doc writes an EXISTING doc/);
+    expect(d).toMatch(/confluence_create_page/);
+  });
+
   test("get_doc() with no args resolves to the caller's OWN key from x-issue, never an argument", async () => {
     const seen: string[] = [];
     const { tools } = customRig({ getRemoteLink: async (key) => { seen.push(key); return null; } });
@@ -769,12 +780,16 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
 
   test("set_doc always writes the CALLER's own doc from x-issue — no argument can target another ticket", async () => {
     const seen: string[] = [];
-    const { tools } = customRig({ upsertRemoteLink: async (key: string) => { seen.push(key); return {}; } });
-    // Two upserts land here: ensureDoc's own (step 5, on lazy creation) plus
-    // set_doc's link-title refresh (the provisional title differs from "T") —
-    // both must still target only the caller's own key, never an argument.
+    const { tools } = customRig({
+      // set_doc never creates (FACTORY-84/FACTORY-86) — seed a PRE-EXISTING doc so the write succeeds.
+      getRemoteLink: async () => ({ object: { title: "t", url: "https://fake.atlassian.net/wiki/pages/1" } }),
+      upsertRemoteLink: async (key: string) => { seen.push(key); return {}; },
+    });
+    // One upsert lands here: set_doc's own link-title refresh (the existing
+    // title "t" differs from "T") — it must still target only the caller's
+    // own key, never an argument.
     await tools.set_doc!.handler({ body: "<p>x</p>", title: "T" }, { headers: { "x-issue": "KAN-7" } } as any);
-    expect(seen).toEqual(["KAN-7", "KAN-7"]);
+    expect(seen).toEqual(["KAN-7"]);
   });
 
   test("set_doc refuses when the connection has no x-issue", async () => {
@@ -791,7 +806,8 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
         createIssue: async () => ({}), setPriority: async () => ({}), assign: async () => ({}),
         createPage: async () => ({}), getPage: async () => ({ title: "T", body: { storage: { value: "x" } }, _links: {} }),
         updatePage: async () => ({ version: 1 }), searchPages: async () => ({}), listSpaces: async () => ({}),
-        ...fakeDocOps(),
+        // set_doc never creates (FACTORY-84/FACTORY-86) — seed a PRE-EXISTING doc so the write succeeds.
+        ...fakeDocOps({ getRemoteLink: async () => ({ object: { title: "T", url: "https://fake.atlassian.net/wiki/pages/1" } }) }),
       commentOnPage: async () => ({ ok: true }),
       getPageComments: async () => ({ results: [] }),
       searchProjects: async () => ({ values: [] }),
@@ -1097,13 +1113,13 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(audits.some((l) => l.includes("IDENTITY COLLISION"))).toBe(false);
   });
 
-  test("new_worker's description does not claim atomicity, and states the ordering guarantee / convergent-doc / rollback shape (BUTCHR-35 review criterion: judge the description, not just the code)", () => {
+  test("new_worker's description does not claim atomicity, states the ordering guarantee / rollback shape, and no longer claims a Confluence doc step (BUTCHR-35 / FACTORY-84 / FACTORY-86 review criterion: judge the description, not just the code)", () => {
     const tools = rigNoOp();
     const d = tools.new_worker!.description;
     expect(d).not.toMatch(/\batomic\b/i);
     expect(d).not.toMatch(/leaves nothing/i);
     expect(d).toMatch(/GUARANTEES/);
-    expect(d).toMatch(/set_doc/);
+    expect(d).toMatch(/confluence_create_page/); // points at the explicit on-request path instead
     expect(d).toMatch(/rolled back|ROLLED BACK|delete the ticket/i);
   });
 });

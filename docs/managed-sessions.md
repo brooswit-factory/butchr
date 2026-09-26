@@ -36,7 +36,8 @@ takes effect on restart, not live), like every other provider's query.
   "workingDirectory": "~/code/brooswit-factory/some-project",
   "brief": "Keep this repo's docs and dependency versions current.",
   "vendor": "claude",
-  "tier": "tier1",
+  "modelPower": 25,
+  "effort": 20,
   "permissionMode": "default",
   "execution": "swarm",
   "account": "none",
@@ -48,12 +49,20 @@ takes effect on restart, not live), like every other provider's query.
 }
 ```
 
+(`modelPower: 25, effort: 20` is this doc's own canonical "Sonnet at medium
+effort" pair — see `docs/power-scale.md`. A definition may instead set the
+DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
+`modelPower`/`effort` above — never both; see the `tier` row below and
+`docs/power-scale.md`'s "Back-compat" section.)
+
 | field | required | meaning |
 |---|---|---|
 | `workingDirectory` | yes | Where the managed agent actually works. Absolute, or `~`/`~/rest` (expanded against the daemon's own `$HOME`, same rule as a `filesystem` query's `root`). The agent is told to `cd` there at startup — see "Working directory wiring" below for why this is not the launched process's own OS `cwd`. |
 | `brief` | yes | The agent's prompt/role. Literal text; no `@builtin:` shorthand (that convenience is a `Rule` field's, not a definition's). |
 | `vendor` | yes | `"claude"` or `"codex"` — narrower than `Rule.agentPreferences[].harness` (`agy` is not a Bakr/Candlestix vendor). |
-| `tier` | yes | `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)` — see "Tier -> model mapping" below. |
+| `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
+| `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
+| `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, Claude only, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
@@ -203,6 +212,14 @@ reuses:
   reasoning and FACTORY-78 for the tracked gap.
 
 ## Tier -> model mapping
+
+**DEPRECATED (FACTORY-75):** `tier` is superseded by the two-axis
+`modelPower`/`effort` mechanism — see `docs/power-scale.md` for the
+current, actively-maintained tables (both vendors, both axes, the four
+operator-requested canonical target pairs, and rules-path support).
+`tierToModel` below is kept working, unchanged, purely for back-compat with
+existing `tier`-based definitions (the 8 live codey ones at the time of
+FACTORY-75) — it is no longer where new model/effort decisions get made.
 
 PORTED from Candlestix's own `~/.config/candlestix/model-tiers.json` on
 host Codey. The ticket's preserved-branch pointer
@@ -1033,17 +1050,21 @@ herdr reporting them idle/done) this whole DROVR-37 epic exists to fix:
 ```
 
 `lizardMode: true` opts this ONE definition's agent into the daemon's
-separate permission-answer timer (`src/agents/permission-answer-loop.ts`,
-20s cadence, its own `setInterval` independent of the reconcile loop and the
-blocking-escalation watcher — see `docs/permission-answer-loop.md` for the
-full cadence/audit-visibility writeup). A definition that doesn't set the
-field is untouched by that timer entirely — this is NOT a blanket sweep over
-every pane; the timer's own `eligiblePanes` hook resolves, fresh every tick,
-which panes belong to a currently-eligible `lizardMode: true` definition
-(via the SAME live `managedSessionLizardModes` map BUTCHR-408's `roles`/
-BUTCHR-460's `accountPolicies` maps already established the pattern for —
-rebuilt every managed-sessions poll from each eligible definition's own
-manifest, never persisted or acted on stale).
+separate permission-answer watch (`src/agents/permission-answer-watch.ts`,
+wrapping `src/agents/permission-answer-loop.ts`'s own 20s scan, independent
+of the reconcile loop and the blocking-escalation watcher — see
+`docs/permission-answer-loop.md` for the full cadence/audit-visibility
+writeup). Since FACTORY-98, an eligible pane is usually answered within
+about a second of going `blocked` (a herdr push subscription, not just the
+20s scan — see that doc's "Event-driven: the fast path" section); the scan
+itself, and everything below about the opt-in gate, is unchanged. A
+definition that doesn't set the field is untouched entirely — this is NOT a
+blanket sweep over every pane; the scan's own `eligiblePanes` hook resolves,
+fresh every tick, which panes belong to a currently-eligible
+`lizardMode: true` definition (via the SAME live `managedSessionLizardModes`
+map BUTCHR-408's `roles`/BUTCHR-460's `accountPolicies` maps already
+established the pattern for — rebuilt every managed-sessions poll from each
+eligible definition's own manifest, never persisted or acted on stale).
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
 field is independent and a definition may set it alongside any
@@ -1072,10 +1093,14 @@ the full detail and the reasoning for why this module never re-parses a
 pane's dialog itself to recover the exact rule text (dialog recognition
 stays drovr's job — FACTORY-49/FACTORY-67).
 
-**Rule-launched agents are a separate, dependent story.** FACTORY-76 extends
-the same field/mechanism to jira-work / jira-project / github / filesystem
-rule agents — not this ticket's scope, coordinated on field name and
-daemon-wiring shape rather than diverging.
+**Rule-launched agents get the same mechanism too (FACTORY-87/FACTORY-76).**
+`Rule.permissionMode`/`Rule.lizardMode` (`src/rules/rules.ts`) extend this
+exact field/mechanism to jira-work / jira-project / github / filesystem
+rule-launched agents — same `permissionMode`/`lizardMode` names, same daemon
+timer, no second mechanism. See `docs/execution-modes.md`'s "`permissionMode`
+and `lizardMode`" section for the rule-side field story, and
+`docs/permission-answer-loop.md` for how `ruleLizardModeOf`
+(`src/agents/permission-answer-loop.ts`) extends `eligiblePanes` to cover them.
 
 **Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
 manifest load rather than silently storing-and-dropping it — see

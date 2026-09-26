@@ -220,12 +220,16 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
       }),
     // MEASURED live: POSTing the same globalId twice returns the SAME link id
     // both times, with the second call's `object` winning — this idempotence
-    // is what makes ensureDoc's step 5 safe to retry (src/tools/docs.ts).
+    // is what makes set_doc's own re-upsert (on a retitle, src/tools/docs.ts)
+    // safe to call unconditionally.
     upsertRemoteLink: (key, globalId, relationship, object) =>
       jira.issueRemoteLinks.createOrUpdateRemoteIssueLink({ issueIdOrKey: key, globalId, relationship, object }),
 
-    // GetChildPages (v2) is a DIRECT, cursor-paginated read — never CQL (see
-    // docs.ts for why CQL is wrong here). `_links.next`, when present, is a
+    // GetChildPages (v2) is a DIRECT, cursor-paginated read — never CQL. As of
+    // FACTORY-84/FACTORY-86, nothing in production code calls this anymore
+    // (its only caller, docs.ts's `ensureDoc`, had its per-ticket
+    // auto-creation removed) — kept on this interface pending a follow-up
+    // decision on whether to remove it. `_links.next`, when present, is a
     // relative URL carrying an opaque `cursor` query param; a `new URL` needs
     // a base to parse a relative one, so an arbitrary absolute base is used
     // purely as a parsing scratchpad and discarded — MEASURED live: a
@@ -251,8 +255,11 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // of the existing op must never see a shape change.
     // MEASURED live: creating a second page with the SAME title in the SAME
     // space 400s ("A page with this title already exists") and creates
-    // nothing — ensureDoc's race guard (docs.ts) relies on this being a real,
-    // atomic, server-enforced rejection, not a client-side check.
+    // nothing — a real, atomic, server-enforced rejection, not a
+    // client-side check. As of FACTORY-84/FACTORY-86, nothing in production
+    // code calls this anymore (its only caller, docs.ts's `ensureDoc`, had
+    // its per-ticket auto-creation removed) — kept on this interface pending
+    // a follow-up decision on whether to remove it.
     createPageWithLabel: async (p) => {
       const created: any = await wikiRaw.sendRequest({
         url: "/wiki/rest/api/content",
