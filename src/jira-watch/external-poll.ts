@@ -93,10 +93,24 @@ export interface ConfluencePollDeps {
 
 const CONFLUENCE_TIMEOUT_MS = 10_000;
 
-/** `url` is the FULL Confluence page URL `discoverLinkedItems` stored as the target (see `LinkedItem.target`'s own doc comment) — resolved to a page id via the SAME `pageIdFromUrl` `get_doc`'s own read path uses, so the two can never disagree on what counts as a Confluence page URL. */
-export async function pollConfluencePage(url: string, deps: ConfluencePollDeps): Promise<PollVerdict> {
-  const pageId = pageIdFromUrl(url);
-  if (pageId === null) return { status: "unreadable" }; // not a `/pages/<id>/` URL — nothing to poll, no HTTP call made, so no status
+/** A bare Confluence page id, exactly `docs/resource-links.md`'s `confluence-page` canonical form (`isConfluencePageRef`, `src/resources/confluence-page-ref.ts`, not imported here to avoid a value/type import cycle — the two digit-only checks are kept deliberately identical). */
+const BARE_PAGE_ID_RE = /^[0-9]+$/;
+
+/**
+ * `target` is either the FULL Confluence page URL `discoverLinkedItems`
+ * stored as a description-derived target (see `LinkedItem.target`'s own doc
+ * comment), resolved via the SAME `pageIdFromUrl` `get_doc`'s own read path
+ * uses so the two can never disagree on what counts as a Confluence page
+ * URL — OR (FACTORY-9) a BARE numeric page id, the `confluence-page`
+ * ResourceRef's own canonical form, reconciled in from the FACTORY-4
+ * butchr-managed link store (`src/resources/link-reconcile.ts`), which has
+ * no URL to give (a managed link stores the canonical string, never a
+ * provider URL). The bare-id case is checked FIRST so a target that happens
+ * to be all-digits is never mistaken for a malformed URL.
+ */
+export async function pollConfluencePage(target: string, deps: ConfluencePollDeps): Promise<PollVerdict> {
+  const pageId = BARE_PAGE_ID_RE.test(target) ? target : pageIdFromUrl(target);
+  if (pageId === null) return { status: "unreadable" }; // not a `/pages/<id>/` URL and not a bare id — nothing to poll, no HTTP call made, so no status
   let r: Awaited<ReturnType<ConfluencePollDeps["getVersion"]>>;
   try {
     r = await withTimeout(deps.getVersion(pageId), deps.timeoutMs ?? CONFLUENCE_TIMEOUT_MS);
@@ -493,4 +507,45 @@ export async function pollWebpage(item: { target: string }, priorFingerprint: st
     if (body === null) return { status: "error" }; // over the size cap, past the deadline, or a mid-body failure — see readCapped's own doc comment for why this is "error", not "unreadable"
     return { status: "ok", fingerprint: `hash:${fnv1a(Buffer.from(body).toString("latin1"))}` };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem (FACTORY-9)
+// ---------------------------------------------------------------------------
+
+export interface FilesystemPollDeps {
+  /** Defaults to `node:fs/promises`' own `stat` in production wiring; injectable for a test that doesn't want a real file on disk. */
+  stat: (path: string) => Promise<{ mtimeMs: number; size: number; isDirectory(): boolean }>;
+}
+
+/**
+ * `path` is a `filesystem` ResourceRef's own canonical absolute path
+ * (`formatFilesystemRef`, `src/resources/filesystem-ref.ts`) — this kind is
+ * ONLY ever reconciled in from the FACTORY-4 butchr-managed link store
+ * (`src/resources/link-reconcile.ts`); nothing discovers a filesystem link
+ * natively (see `LinkedItemKind`'s own doc comment, src/resources/
+ * linked-discovery.ts). Fingerprint per `docs/resource-links.md`'s own
+ * `ProviderAdapter.changeToken` guidance: mtime PLUS size, not mtime alone —
+ * a same-second rewrite on a filesystem with second-granularity timestamps
+ * would otherwise be invisible. `ENOENT` is `"unreadable"` (the file is
+ * genuinely gone, mirroring a 404); any other `stat` failure (a permission
+ * error, an unexpected I/O error) is `"error"` — TRANSIENT, retried next
+ * tick, same discipline `pollWebpage`/`pollGithubLink` already apply to
+ * their own non-404/403 failures — never reported unreadable or advanced on
+ * a failure this module cannot positively attribute to "gone". A directory
+ * is reported unreadable too: this poller diffs one FILE's own content
+ * fingerprint, and a directory's mtime/size say nothing meaningful about
+ * that (no HTTP-shaped status ever applies here, so `httpStatus` is never
+ * set).
+ */
+export async function pollFilesystem(path: string, deps: FilesystemPollDeps): Promise<PollVerdict> {
+  let st: Awaited<ReturnType<FilesystemPollDeps["stat"]>>;
+  try {
+    st = await deps.stat(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return { status: "unreadable" };
+    return { status: "error" };
+  }
+  if (st.isDirectory()) return { status: "unreadable" };
+  return { status: "ok", fingerprint: `${st.mtimeMs}:${st.size}` };
 }

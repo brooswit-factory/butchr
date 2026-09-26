@@ -145,15 +145,17 @@
  * necessarily scoped to that one target already (see above), so it skips
  * just that item, not the whole tick.
  */
-import type { JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
+import type { JiraComment, JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
 import type { Rule } from "../rules/rules.js";
 import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
+import { jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
+import type { LinkStore } from "../resources/link-store.js";
 import { isDaemonLabelOnlyDiff } from "./diff.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
-  pollConfluencePage, pollGithubLink, pollWebpage,
-  type ConfluencePollDeps, type GithubConditionalDeps, type PollVerdict, type WebpagePollDeps,
+  pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
+  type ConfluencePollDeps, type FilesystemPollDeps, type GithubConditionalDeps, type PollVerdict, type WebpagePollDeps,
 } from "./external-poll.js";
 
 /** The minimal shape this module needs from one owning resource's match — structurally satisfied by `RuleMatch` (src/rules/resource-type.ts) without importing it, avoiding a value/type import cycle between that module and this one. */
@@ -166,8 +168,16 @@ export interface LinkedEventingMatch {
 /** Of every kind `discoverLinkedItems` can produce, only these are Jira-kind for THIS module's Jira-diffing path (Confluence/GitHub/webpage are BUTCHR-437's, driven by the external-poll.ts path below). */
 const JIRA_DISCOVERY_KINDS = new Set<LinkedItemKind>(["issuelink", "parent", "jira-key"]);
 
-/** BUTCHR-437: the three kinds `external-poll.ts` knows how to poll — everything `descriptionLinkedItems` below can ever return. */
-const EXTERNAL_DISCOVERY_KINDS = new Set<LinkedItemKind>(["confluence", "github-issue", "github-pr", "webpage"]);
+/**
+ * BUTCHR-437: the kinds `external-poll.ts` knows how to poll via a per-item
+ * fetch — everything `descriptionLinkedItems` below can ever return, PLUS
+ * (FACTORY-9) `"filesystem"`, which `descriptionLinkedItems` never produces
+ * (see `LinkedItemKind`'s own doc comment, src/resources/linked-discovery.ts)
+ * but which reuses this EXACT polling/cadence/baseline machinery unchanged —
+ * `pollExternalItem` below is what actually dispatches `"filesystem"` to
+ * `pollFilesystem` rather than an HTTP-shaped poller.
+ */
+const EXTERNAL_DISCOVERY_KINDS = new Set<LinkedItemKind>(["confluence", "github-issue", "github-pr", "webpage", "filesystem"]);
 
 /**
  * One match's Jira-kind linked items: issuelinks/parent/description-derived
@@ -223,16 +233,38 @@ export function descriptionLinkedItems(match: LinkedEventingMatch): LinkedItem[]
   return descriptionItems(match.issue.description ?? "").filter((i) => EXTERNAL_DISCOVERY_KINDS.has(i.kind));
 }
 
-interface JiraSnapshot { status: string; summary: string; updated: string; labels: readonly string[] }
+/**
+ * FACTORY-9: `commentCursor` is the newest comment id (`null` if the target
+ * has no comments), populated ONLY when `LinkedEventingDeps.comments` is
+ * wired — `undefined` means "not checked this tick" (the dep is omitted, or
+ * this tick's fetch for this target failed and fails OPEN, same discipline
+ * every other per-item fetch in this module already uses). A comment-count/
+ * latest-id compare therefore only ever fires between two ticks that BOTH
+ * checked (see `commentChangedBetween` below) — never a false positive from
+ * comparing "unchecked" against a real value.
+ */
+interface JiraSnapshot { status: string; summary: string; updated: string; labels: readonly string[]; commentCursor: string | null | undefined }
 /** BUTCHR-437: the discriminated union `baselines` below stores — see this module's own top comment ("ONE Map holding a discriminated union") for why this replaced the story-2-only `Snapshot` alias. */
 type Baseline = { kind: "jira"; snapshot: JiraSnapshot } | { kind: "external"; fingerprint: string };
 
-const snapshotOf = (i: JiraIssue): JiraSnapshot => ({ status: i.status, summary: i.summary, updated: i.updated, labels: i.labels });
+const snapshotOf = (i: JiraIssue, commentCursor?: string | null): JiraSnapshot => ({ status: i.status, summary: i.summary, updated: i.updated, labels: i.labels, commentCursor });
 /** A minimal fake `JiraIssue`, shaped only well enough for `isDaemonLabelOnlyDiff` (status/summary/labels) — never returned to a caller, never compared on any other field. */
 const asIssue = (key: string, s: JiraSnapshot): JiraIssue => ({ key, status: s.status, summary: s.summary, updated: s.updated, labels: [...s.labels], issuetype: "", assignee: null, parent: null });
 
+/** FACTORY-9: `true` only when BOTH snapshots actually checked comments (neither `commentCursor` is `undefined`) AND the newest comment id differs — see `JiraSnapshot.commentCursor`'s own doc comment for why "unchecked" never compares as a change. */
+function commentChangedBetween(before: JiraSnapshot, after: JiraSnapshot): boolean {
+  return before.commentCursor !== undefined && after.commentCursor !== undefined && before.commentCursor !== after.commentCursor;
+}
+
 function changeDetail(before: JiraSnapshot, after: JiraSnapshot): string {
   if (before.status !== after.status) return `status changed from "${before.status}" to "${after.status}"`;
+  // FACTORY-9: checked before the generic summary/"updated" fallback — a new
+  // (or removed) comment is a specific, actionable fact worth naming, not
+  // just folded into a bare "updated" the way it silently was before this
+  // story added comment detection to this snapshot. BUTCHR-351 precedent
+  // (`src/agents/change-nudge.ts`'s own `reasonClause`): `null` means the
+  // newest comment slot is now empty — a deletion, not an addition.
+  if (commentChangedBetween(before, after)) return after.commentCursor === null ? "had a comment removed" : "got a new comment";
   if (before.summary !== after.summary) return "summary changed";
   return "updated";
 }
@@ -241,6 +273,7 @@ function changeDetail(before: JiraSnapshot, after: JiraSnapshot): string {
 function externalChangeDetail(kind: LinkedItemKind, before: string, after: string): string {
   if (kind === "confluence") return `version changed from ${before} to ${after}`;
   if (kind === "webpage") return "changed";
+  if (kind === "filesystem") return "changed"; // FACTORY-9: an mtime+size fingerprint is opaque, same as webpage's hash fallback
   return "updated"; // github-issue / github-pr — an ETag is opaque, no meaningful before/after text to show
 }
 
@@ -270,6 +303,38 @@ export interface LinkedEventingDeps {
   github?: GithubConditionalDeps;
   /** BUTCHR-437: the webpage conditional-GET client `external-poll.ts`'s `pollWebpage` needs. Optional; omitted, every webpage-kind item resolves `"error"` the same way an omitted `confluenceVersion` does. */
   webpage?: WebpagePollDeps;
+  /** FACTORY-9: `external-poll.ts`'s `pollFilesystem` needs. Optional; omitted, every `filesystem`-kind item resolves `"error"` the same way an omitted `confluenceVersion` does — the same "omitted dep ⇒ feature silently never runs" shape every other optional dep here already has. */
+  filesystem?: FilesystemPollDeps;
+  /**
+   * FACTORY-9 (epic FACTORY-3, story 3/3): the FACTORY-4 butchr-managed link
+   * store (`src/resources/link-store.ts`) — reconciled, per opted-in owner,
+   * against that owner's own native Jira links (`nativeJiraRefs`,
+   * `src/resources/link-reconcile.ts`) via `mergeEffectiveLinks`, so a
+   * managed-only link becomes a NEW watched item this tick (see
+   * `managedLinkedItems`'s own doc comment for the full contract). Optional;
+   * omitted, no managed link is ever reconciled into a watcher — the SAME
+   * "omitted dep ⇒ feature silently never runs" shape as `remoteLinks`/
+   * `confluenceVersion`/`github`/`webpage` above, so every existing
+   * caller/test that doesn't wire this is completely unaffected.
+   */
+  linkStore?: LinkStore;
+  /**
+   * FACTORY-9: a Jira-kind target's own recent comments, newest first — the
+   * SAME shape `IssueResourceDeps.comments` (`src/resources/issue.ts`)
+   * already uses for an OWN issue's comment-based notify reason, reused here
+   * so a LINKED Jira-kind target's snapshot (`JiraSnapshot.commentCursor`)
+   * can positively distinguish "a new comment landed" from a bare `updated`
+   * bump that could be caused by any other field this module doesn't
+   * otherwise diff (priority, due date, …). ONE extra REST call per DISTINCT
+   * Jira-kind target per tick (Jira has no batched comments endpoint,
+   * unlike the shared `key in (...)` status/summary/updated/labels search
+   * above) — a genuinely new per-tick cost, same shape `remoteLinks`
+   * (BUTCHR-436) already accepted for the same reason. Optional; omitted,
+   * `commentCursor` is never populated and every Jira-kind snapshot behaves
+   * exactly as it did before this story (comment-driven changes still show
+   * as a bare "updated", same as today).
+   */
+  comments?: (key: string) => Promise<readonly JiraComment[]>;
 }
 
 export interface LinkedEventingState {
@@ -346,7 +411,11 @@ async function pollExternalItem(item: LinkedItem, priorFingerprint: string | und
       if (!deps.webpage) return { status: "error" };
       return await pollWebpage(item, priorFingerprint, deps.webpage);
     }
-    return { status: "error" }; // unreachable — EXTERNAL_DISCOVERY_KINDS only ever produces the three kinds above
+    if (item.kind === "filesystem") {
+      if (!deps.filesystem) return { status: "error" };
+      return await pollFilesystem(item.target, deps.filesystem);
+    }
+    return { status: "error" }; // unreachable — EXTERNAL_DISCOVERY_KINDS only ever produces the kinds above
   } catch (e) {
     deps.log?.(`  WARNING: [linked-eventing] external poll threw for ${item.kind} ${item.target}: ${(e as Error)?.message ?? e}`);
     return { status: "error" };
@@ -382,13 +451,29 @@ export function createLinkedEventingState(): LinkedEventingState {
             deps.log?.(`  WARNING: [linked-eventing] remote-links fetch failed for ${m.agentKey} (${m.issue.key}): ${(e as Error)?.message ?? e}`);
           }
         }
+        // FACTORY-9: this owner's butchr-MANAGED links (FACTORY-4), reconciled
+        // against its own native Jira links (`nativeJiraRefs`) so a target
+        // already covered by `jiraItems` below is never double-watched — see
+        // `managedLinkedItems`'s own doc comment (src/resources/
+        // link-reconcile.ts) for the full "managed-origin only" contract.
+        // Fails open, same discipline as `remoteLinks` immediately above: one
+        // owner's broken link store must never block any other owner's tick.
+        let managedItems: LinkedItem[] = [];
+        if (deps.linkStore) {
+          try {
+            managedItems = await managedLinkedItems(jiraWorkItemOwnerRef(m.issue), nativeJiraRefs(m.issue), deps.linkStore, deps.log);
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.issue.key}): ${(e as Error)?.message ?? e}`);
+          }
+        }
         // BUTCHR-437: description-derived Confluence/GitHub/webpage items are
         // combined with Jira-kind items BEFORE `maxLinkedItems` caps, so the
         // cap applies uniformly across every kind for this resource — never a
-        // separate per-kind budget.
+        // separate per-kind budget. FACTORY-9: managed-link items join the
+        // SAME combined array, same uniform cap.
         const jiraItems = jiraKindLinkedItems(m, remoteLinks);
         const externalItems = m.rule.linkedDescriptionLinks === true ? descriptionLinkedItems(m) : [];
-        const { kept } = capLinkedItems([...jiraItems, ...externalItems], m.rule.maxLinkedItems);
+        const { kept } = capLinkedItems([...jiraItems, ...externalItems, ...managedItems], m.rule.maxLinkedItems);
         perOwnerItems.set(m.agentKey, kept);
       }
 
@@ -418,6 +503,34 @@ export function createLinkedEventingState(): LinkedEventingState {
       // like a rate-capped tick.
       if (searchFailed) return;
       const byKey = new Map(fetched.map((i) => [i.key, i]));
+
+      // FACTORY-9: newest comment id per DISTINCT Jira-kind target actually
+      // returned by the batched search above — one extra REST call per
+      // target (Jira has no batched comments endpoint), bounded the SAME way
+      // the external pollers below already bound theirs (`mapLimit`,
+      // `EXTERNAL_POLL_CONCURRENCY`). Only wired when `deps.comments` is
+      // present; a target NOT returned by the batched search (unreadable
+      // this tick) is never queried here either — nothing to attribute a
+      // comment to. A per-target failure fails OPEN (logged, left absent
+      // from the map) rather than failing the whole tick, same discipline
+      // `pollExternalItem` already applies — `commentCursor` simply stays
+      // `undefined` ("not checked") for that one target this tick; see
+      // `JiraSnapshot.commentCursor`'s own doc comment for why that never
+      // false-positives as a change.
+      const commentCursorByTarget = new Map<string, string | null>();
+      if (deps.comments) {
+        const targets = [...byKey.keys()];
+        const cursors = await mapLimit(targets, EXTERNAL_POLL_CONCURRENCY, async (key): Promise<string | null | undefined> => {
+          try {
+            const comments = await deps.comments!(key);
+            return comments[0]?.id ?? null;
+          } catch (e) {
+            deps.log?.(`  WARNING: [linked-eventing] comment fetch failed for ${key}: ${(e as Error)?.message ?? e}`);
+            return undefined;
+          }
+        });
+        targets.forEach((key, i) => { const c = cursors[i]; if (c !== undefined) commentCursorByTarget.set(key, c); });
+      }
 
       // Removed-link candidates, against each owner's watch set as of the LAST poll this ran for it — read before anything below mutates that set.
       const removedByOwner = new Map<string, LinkedChangeEvent[]>();
@@ -481,11 +594,33 @@ export function createLinkedEventingState(): LinkedEventingState {
       for (const m of opted) {
         const kept = perOwnerItems.get(m.agentKey)!;
         const wasUnreadable = unreadableOwners.get(m.agentKey) ?? new Set<string>();
-        const triggering: LinkedChangeEvent[] = [...(removedByOwner.get(m.agentKey) ?? [])];
+        const removedThisTick = removedByOwner.get(m.agentKey) ?? [];
+        const triggering: LinkedChangeEvent[] = [...removedThisTick];
         const stillUnreadable: LinkedChangeEvent[] = [];
         const toAdvance: Array<() => void> = [];
         const nowUnreadable = new Set<string>();
         const dueForExternal = dueForExternalByOwner.get(m.agentKey) === true;
+
+        // FACTORY-9 (ticket scope item 2, "drops its cached snapshot so a
+        // later re-add does not produce a spurious change"): a removed
+        // target's baseline is deleted, not merely left stale — WITHOUT
+        // this, `baselines` (which nothing else in this module ever prunes;
+        // see this module's own top comment on unbounded growth for a
+        // DIFFERENT, still-accepted case: an owner that stops appearing in
+        // `opted` entirely) would keep the pre-removal snapshot around
+        // forever, so a LATER re-add of the same link would diff the fresh
+        // fetch against a stale, possibly long-out-of-date baseline —
+        // firing a spurious "changed" event instead of silently reseeding
+        // like any other first sighting. Gated behind the SAME `advance()`
+        // as every other per-item state change (`toAdvance`), so a
+        // rate-capped tick's removal is delayed, not lost, exactly like
+        // every other event this module coalesces.
+        for (const ev of removedThisTick) {
+          toAdvance.push(() => {
+            baselines.delete(baselineKey(m.agentKey, ev.target));
+            unreadableOwners.get(m.agentKey)?.delete(ev.target); // same leak, same fix: a re-added target must not inherit a stale unreadable/readable transition state
+          });
+        }
 
         for (const item of kept) {
           if (JIRA_DISCOVERY_KINDS.has(item.kind)) {
@@ -508,17 +643,29 @@ export function createLinkedEventingState(): LinkedEventingState {
               continue;
             }
             if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(m.agentKey)?.delete(item.target)); // became readable again
-            const snap = snapshotOf(issue);
+            const snap = snapshotOf(issue, commentCursorByTarget.get(item.target));
             const bkey = baselineKey(m.agentKey, item.target);
             const beforeRaw = baselines.get(bkey);
             const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
             if (!before) {
-              toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // first sighting: seed silently, no event
+              toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // first sighting: seed silently, no event (commentCursor included — see JiraSnapshot's own doc comment)
               continue;
             }
-            const changed = before.status !== snap.status || before.summary !== snap.summary || before.updated !== snap.updated;
+            // FACTORY-9: `commentChangedBetween` catches a comment add/removal
+            // defensively even on the (currently theoretical) chance `updated`
+            // doesn't move with it; in practice a comment write always bumps
+            // `updated` too, so this is belt-and-suspenders, not the primary trigger.
+            const commentChanged = commentChangedBetween(before, snap);
+            const changed = before.status !== snap.status || before.summary !== snap.summary || before.updated !== snap.updated || commentChanged;
             if (!changed) continue;
-            if (isDaemonLabelOnlyDiff(asIssue(item.target, before), asIssue(item.target, snap))) {
+            // FACTORY-9: `isDaemonLabelOnlyDiff` only ever inspects
+            // status/summary/labels — it has no idea a comment also
+            // changed. Gated OFF whenever `commentChanged` is true so a
+            // genuine new/removed comment landing in the SAME tick as an
+            // unrelated daemon-label move (e.g. agent:working->agent:blocked)
+            // is never silently swallowed as "just label noise" — a real
+            // comment is never daemon-label-only.
+            if (!commentChanged && isDaemonLabelOnlyDiff(asIssue(item.target, before), asIssue(item.target, snap))) {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // real move, but daemon-label-only — not a real change here either
               continue;
             }

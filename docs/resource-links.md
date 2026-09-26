@@ -321,6 +321,112 @@ implementation for `jira-project` resources — it only has to satisfy
 `LinkStore`'s interface so `listLinks`/`addLink`/`removeLink` keep working
 unchanged over whatever persistence it builds.
 
+## FACTORY-9 (implements FACTORY-6, story 3/3): effective links reconciled into watchers
+
+This section describes what actually shipped for FACTORY-6's scope — merging
+effective links, reconciling them into watchers, caching snapshots, and
+emitting change events (comments included) via the EXISTING BUTCHR-436/437
+linked-eventing notify path (`src/jira-watch/linked-eventing.ts`). No second
+notification mechanism was built; every piece below extends that module's
+existing coalescer, per-(owner,target) baseline store, and
+`maxLinkedTurnsPerHour` rate cap in place.
+
+**Scope, today: `jira-work-item` owners only.** The only live owner
+`createRuleResourceType`'s `runTick` call runs for is a `jira-work-item`
+(`RuleMatch`) — FACTORY-5's `jira-project` resource type is a separate,
+not-yet-merged resource type (its own poll loop), untouched by this story.
+The reconciliation itself (`src/resources/link-reconcile.ts`) is
+provider-agnostic on the TARGET side, so a future `jira-project` (or any
+other) owner can reuse `managedLinkedItems` unchanged once it exists.
+
+**How a managed link becomes a watcher.** Each opted-in (`linkedEventing:
+true`) owner's own native Jira links (`nativeJiraRefs`: its `issuelinks` and
+`parent`, already-fetched data, zero new API calls — deliberately NOT remote
+links or description mentions, which stay `jiraKindLinkedItems`'s/
+`descriptionLinkedItems`'s own opt-in, cost-gated features) are merged
+against its FACTORY-4 managed links (`LinkStore.list`) via
+`mergeEffectiveLinks`, honouring the merge/dedup contract above. Only a
+`"managed"`-origin link (i.e. NOT already covered by native discovery)
+becomes a NEW watched item — a managed link duplicating an existing
+issuelink produces no second watcher and no double event for the same
+target; the existing native-discovery item (`kind: "issuelink"`) still wins.
+A managed-origin link's `ResourceRef` maps onto the EXISTING `LinkedItemKind`
+taxonomy so it rides the SAME diff/poll path a natively-discovered link of
+that kind already uses:
+
+| `ResourceRefProvider` | `LinkedItemKind` | reuses |
+|---|---|---|
+| `jira-work-item` | `jira-key` | the existing Jira batched-search status/summary/updated diff, now comment-aware (below) |
+| `confluence-page` | `confluence` | `pollConfluencePage` — extended to accept the ref's own BARE page id, not only a URL |
+| `github-issue` | `github-issue` | `pollGithubLink` unchanged — the canonical `owner/repo#n` string is already the exact identity it expects |
+| `webpage` | `webpage` | `pollWebpage` unchanged — the ref's own normalized URL is already what it expects |
+| `filesystem` | `filesystem` (NEW) | a new poller, `pollFilesystem` (`src/jira-watch/external-poll.ts`) — `fs.stat`'s mtime+size, no network |
+| `jira-project` | — | **explicit, documented scope gap**: no live Jira API call exists anywhere in this codebase for a PROJECT's own change signature, and FACTORY-5 (which would give one a live agent) is not merged. Silently excluded from every owner's watch set — never a crash, logged once, the same effect as an omitted `ProviderAdapter.changeToken` |
+
+**Reconcile is idempotent, every tick.** Managed items are combined with
+native/description items BEFORE `maxLinkedItems` caps (one uniform budget
+across every kind, unchanged) and reduce, via the SAME removed-link diff
+`linked-eventing.ts` already ran, to: newly-present → new watcher (first
+sighting seeds the baseline silently, no event); no-longer-present → "no
+longer linked" (fires once); unchanged → nothing. **New in this story:** a
+removed target's baseline (and unreadable-transition state) is now actually
+DELETED, not merely left stale — `baselines`/`unreadableOwners` previously
+had no entry-eviction path at all for a single removed link (only for an
+owner leaving the matched set entirely, which stays intentionally unbounded
+— see that section's own comment), so re-adding the same link later would
+have diffed against a stale pre-removal snapshot and fired a spurious
+"changed" event instead of reseeding. Fixed for every kind, not only managed
+links (native/description-driven removals get the same fix for free) —
+covered by `test/unit/linked-eventing-managed-links.test.ts`'s own
+add→remove→re-add test.
+
+**Comment detection.** The pre-FACTORY-9 Jira-kind snapshot diffed only
+status/summary/updated/labels — a new comment WAS already visible (Jira
+bumps `updated` when a comment lands) but rendered only as a bare "updated",
+indistinguishable from any other field this diff doesn't track (priority,
+due date, …). `JiraSnapshot` now carries an optional `commentCursor` (the
+target's newest comment id, `undefined` meaning "not checked this tick") —
+populated by a NEW per-target `deps.comments` call (Jira has no batched
+comments endpoint, so this is a genuinely new per-tick REST cost, one call
+per DISTINCT Jira-kind target, bounded by the same `mapLimit` concurrency
+helper the three BUTCHR-437 pollers already use), fed into the SAME
+`changeDetail` that renders `linkedChangeNudge`'s per-event line: a comment
+add renders `"got a new comment"`, a comment deletion (BUTCHR-351 precedent)
+renders `"had a comment removed"`, taking priority over the generic
+"updated" fallback but not over an explicit status change. Omitting
+`deps.comments` reproduces the exact pre-FACTORY-9 behaviour (never wired,
+never a new call) — every existing test that doesn't set it is unaffected.
+
+**The FACTORY-1 regression class, re-proven for this new path.** FACTORY-1
+(investigated, not reproducible — see that ticket) already established that
+the `related:` (Implements-chain boss/worker) notify path is architecturally
+independent of `linked:`'s rate cap: `discovery.related()`'s return value is
+built from `relatedForRules` BEFORE `linkedEventingState.runTick` ever runs,
+and `runTick` only ever performs its OWN `deps.notify` call under its OWN
+`turns` budget. This story doesn't touch `related()`/`relatedForRules` at
+all — only `runTick`'s item-gathering — so that independence holds for the
+managed-link path unchanged, structurally, by construction. Re-proven with a
+dedicated test (`test/unit/linked-eventing-managed-links.test.ts`,
+"FACTORY-9 / FACTORY-1 regression class") that exhausts an owner's
+`maxLinkedTurnsPerHour` budget with unrelated MANAGED-link churn (not
+native/description churn, which FACTORY-1's own test already covers) and
+then shows: (a) a rate-capped managed-link change is retried on the next
+allowed tick, never silently dropped (the pre-existing "advance only on
+success" discipline, unchanged, now also covering managed items), and (b) a
+cross-daemon Epic still receives exactly one `related:` notify for its
+Story's move to In Review, the instant it happens, budget exhaustion
+notwithstanding.
+
+**Wiring.** `src/daemon/index.ts` passes `linkStore: createLinkStore(defaultLinksStorePath())`
+(the same local store `resourceLinkTools` already exposes as MCP tools — a
+second, stateless handle onto the same file) and `filesystem: { stat }` to
+`createRuleResourceType`; `comments: atlassian.comments` was already wired
+for a different purpose (an OWN issue's own notify reason) and is now also
+forwarded into `runTick`. Every one of these is optional, following this
+module's existing "omitted dep ⇒ feature silently never runs" convention —
+a daemon that doesn't wire `linkStore` reconciles no managed links at all,
+byte-for-byte the pre-FACTORY-9 behaviour.
+
 ## Verification
 
 - `bun run typecheck` — clean.

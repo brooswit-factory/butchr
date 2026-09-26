@@ -49,7 +49,16 @@ export type LinkedItemKind =
   | "confluence"
   | "github-issue"
   | "github-pr"
-  | "webpage";
+  | "webpage"
+  /**
+   * FACTORY-9 (epic FACTORY-3, story 3/3): a `filesystem` ResourceRef
+   * (`src/resources/resource-ref.ts`) reconciled in from the FACTORY-4
+   * butchr-managed link store — never discovered from Jira `issuelinks`/
+   * `parent`/description text (a local path has no such native discovery),
+   * so this kind is only ever produced by `src/resources/link-reconcile.ts`,
+   * never by anything in this module.
+   */
+  | "filesystem";
 
 /**
  * One discovered link. `target` is the stable identity `discoverLinkedItems`
