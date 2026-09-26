@@ -5,7 +5,7 @@ import { join } from "node:path";
 import {
   ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
   EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS,
-  RULE_ID_MAX, rulesPath, unresolvedRelationships, type Rule,
+  RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
@@ -262,6 +262,51 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
     expect(() => parseRules({ rules: [{ ...minimal, role: "manager" }] }, "f.json")).toThrow("f.json: rules[0].role must be one of worker, sentinel");
   });
   test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
+describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side companion to DROVR-42's lizard mode)", () => {
+  test("both absent when omitted — no default the way execution/account/role get one", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.permissionMode).toBeUndefined();
+    expect(r!.lizardMode).toBeUndefined();
+  });
+
+  test("every permissionMode value and both lizardMode values are accepted for every provider, independent of execution/account/role/each other", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      for (const permissionMode of RULE_PERMISSION_MODES) for (const lizardMode of [true, false]) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, permissionMode, lizardMode }] });
+        expect(r).toMatchObject({ resourceProvider, permissionMode, lizardMode });
+      }
+    }
+  });
+
+  test("lizardMode may be set without permissionMode, and vice versa — the two fields are independent", () => {
+    const [onlyLizard] = parseRules({ rules: [{ ...minimal, lizardMode: true }] });
+    expect(onlyLizard!.lizardMode).toBe(true);
+    expect(onlyLizard!.permissionMode).toBeUndefined();
+    const [onlyMode] = parseRules({ rules: [{ ...minimal, permissionMode: "default" }] });
+    expect(onlyMode!.permissionMode).toBe("default");
+    expect(onlyMode!.lizardMode).toBeUndefined();
+  });
+
+  test("rejects a bad permissionMode value, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, permissionMode: "yolo" }] }, "f.json"))
+      .toThrow("f.json: rules[0].permissionMode must be one of default, acceptEdits, bypassPermissions, plan, auto");
+  });
+
+  test("rejects a non-boolean lizardMode, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, lizardMode: "true" }] }, "f.json"))
+      .toThrow("f.json: rules[0].lizardMode must be a boolean");
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },

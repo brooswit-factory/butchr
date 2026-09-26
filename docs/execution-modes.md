@@ -95,6 +95,80 @@ the full field, launch-argv, and staleness story. Noted here only because a
 reader of this page's `account` section is likely to ask exactly the
 question the previous paragraph answers.
 
+## `permissionMode` and `lizardMode`: rule-side lizard mode (FACTORY-87/FACTORY-76, companion to DROVR-42)
+
+Two independently optional fields, same house style as `execution`/`account`/
+`role` above (accepted for every resource provider, independent of each
+other and of every other field):
+
+| field | values | default | reaches argv? |
+|---|---|---|---|
+| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent (Drovr's own default, `bypassPermissions`, applies) | yes — `SpawnSpec.permissionMode` |
+| `lizardMode` | boolean | absent/`false` | no — daemon-side only |
+
+**What they do.** The operator's own name (FACTORY-67) for pairing
+`permissionMode: "default"` (Claude's manual/ask mode — a prompt before every
+tool call) with `lizardMode: true`: the daemon's standalone permission-answer
+timer (`src/agents/permission-answer-loop.ts`, see
+`docs/permission-answer-loop.md` for exactly which option it presses and how
+that is logged — deliberately not restated here, since it is drovr's own
+answering policy, not this field's concern) then answers an unambiguous
+tool-permission dialog for every agent this rule launches, so manual mode's
+own safety never means an agent frozen on that one dialog for hours. Either
+field may be set without the other — they are independent — but this pairing
+is the combination the mechanism exists for.
+DROVR-42 shipped the identical pair of concepts (`SessionDefinition.permissionMode`/
+`.lizardMode`) for managed-session definitions first; this is the rule-side
+extension, reusing the SAME daemon timer rather than a second one.
+
+**`permissionMode` reaches argv; it needed no new plumbing.** Every
+`specFor*` builder (`specForMatch`/`specForRuleQuery`, `specForProject`,
+`specForGithubIssue*`, `specForGithubPr*`, `specForFilesystem*`) forwards
+`rule.permissionMode` onto its `SpawnSpec.permissionMode` when set. The
+persist-at-spawn/read-back stale-argv pair FACTORY-43 built for this field
+(`buildWorkspace()`'s `.butchr-permission-mode.json`, read back by
+`HerdrHerd.staleIssues()`) was never managed-session-specific — it already
+operates on `spec.permissionMode` for any spawn, so a rule-launched agent's
+`permissionMode` gets the same stale-argv safety with zero changes to that
+layer. Absent means today's behaviour exactly, for every provider — including
+`jira-project`, whose own unconditional `permissionMode: "auto"` default
+(`agentLaunchConfig`, src/agents/argv.ts) is set BEFORE `spec.permissionMode`'s
+own spread and so is overridden by this field only when a `jira-project` rule
+sets it.
+
+**`lizardMode` never reaches argv — same design as `SessionDefinition.lizardMode`,
+and mostly plumbing to reuse.** It is resolved live, not persisted: the
+permission-answer timer's `eligiblePanes` hook (`lizardModeLabel` in
+`src/daemon/index.ts`) already resolved a managed-session pane's opt-in from a
+live map; `ruleLizardModeOf`/`lizardModeLabelFor` (exported, pure functions in
+`src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds them
+to its own live state) extend the SAME hook to every OTHER rule-engine agent
+id by looking its owning `Rule` up in the already-loaded `rules` list (no live
+poll needed — unlike a managed-session definition, which is its own file
+discovered fresh every poll, a rule's `lizardMode` is fixed for the daemon's
+process lifetime, the same as every other `Rule` field) and reading
+`Rule.lizardMode` straight off it — the same "rule-level fallback" shape
+`ruleRoleOfAgent` already uses for `role`. No second timer, no second prompt
+parser: dialog recognition stays drovr's job (FACTORY-49) end to end.
+
+**No Codex-vendor rejection, unlike `SessionDefinition`'s fields.** A managed
+session has one fixed `vendor`, known at manifest-load time, so DROVR-42 could
+hard-reject `lizardMode: true`/an explicit `permissionMode` for `vendor:
+"codex"` outright. A `Rule` has no such fixed vendor — `agentPreferences` is a
+ranked FALLBACK list (see "The vendor selector" below), and which harness an
+individual launch actually gets is a runtime decision no validator here can
+see. Both fields are therefore accepted unconditionally at the schema level;
+for a launch that happens to land on Codex or Agy, `permissionMode` is
+silently never forwarded (`agentLaunchConfig` only reads it on the Claude
+branch, the same silent-ignore precedent an absent `permissionMode` already
+has today) and `lizardMode` is silently inert (drovr's Claude-specific dialog
+recognition never matches a non-Claude pane) — never a validation error.
+
+**Absent means unchanged, verified.** A rules document that sets neither
+field loads and behaves byte-for-byte as before this ticket — no new key on
+any parsed `Rule`, no new `SpawnSpec` field on any `specFor*` output, no
+change to which panes the permission-answer timer scans.
+
 ## The vendor selector: already there, not duplicated
 
 `agentPreferences[].harness` (`"claude" | "codex" | "agy"`, `src/rules/rules.ts`)
