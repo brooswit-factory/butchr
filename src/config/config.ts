@@ -19,10 +19,15 @@ export interface Config {
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
   terminalPrefix?: string[];
   /**
-   * GitHub PR discovery (pr:* labels). Both a token and at least one org are
-   * required — an unscoped GitHub search spans all of GitHub, not just ours —
-   * so this is present only when BOTH GITHUB_TOKEN_FILE and
-   * BUTCHR_GITHUB_ORGS are set; otherwise pr:* discovery is skipped entirely.
+   * GitHub PR discovery (pr:* labels), AND (FACTORY-57) the `github-issue`
+   * and `github-pr` rule providers — all THREE share this one field; there
+   * is no separate token/org config for `github-pr` (see `.env.example`'s
+   * own `GITHUB_TOKEN_FILE` comment block for the scope finding behind that
+   * decision). Both a token and at least one org are required — an
+   * unscoped GitHub search spans all of GitHub, not just ours — so this is
+   * present only when BOTH GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS are
+   * set; otherwise pr:* discovery AND both rule providers are skipped
+   * entirely.
    */
   github?: { token: string; orgs: string[] };
   /**

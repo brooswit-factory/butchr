@@ -26,6 +26,7 @@ import { isAbsolute, join } from "node:path";
 import { builtinBriefProblem } from "../agents/workspace.js";
 import { filesystemQueryProblems } from "../resources/filesystem-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
+import { githubPrQueryProblems } from "../resources/github-pr.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
@@ -187,7 +188,9 @@ export interface Rule {
    * (proven work items only) and `jira-idea` (proven Product Discovery ideas
    * only — see src/resources/jira-idea.ts); GitHub issue search syntax for
    * `github-issue` (scoped to `BUTCHR_GITHUB_ORGS`, never pull requests — see
-   * src/resources/github-issue.ts); Zendesk search syntax for `zendesk-ticket`
+   * src/resources/github-issue.ts); GitHub pull-request search syntax for
+   * `github-pr` (same org scoping, never plain issues — see
+   * src/resources/github-pr.ts); Zendesk search syntax for `zendesk-ticket`
    * (tickets only, in `ZENDESK_SUBDOMAIN` — see src/resources/zendesk-ticket.ts);
    * a JSON object (not JQL) for `jira-project` — `{ leadAccountId?, keys?,
    * query? }`, see `parseProjectQuery` (src/resources/jira-project.ts); a
@@ -399,6 +402,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!oneOf(RESOURCE_PROVIDERS, resourceProvider)) errors.push(`${at}.resourceProvider must be one of ${RESOURCE_PROVIDERS.join(", ")}`);
     if (!nonEmpty(query)) errors.push(`${at}.query must be a non-empty string`);
     else if (resourceProvider === "github-issue") for (const p of githubIssueQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "github-pr") for (const p of githubPrQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
     else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
@@ -428,7 +432,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
