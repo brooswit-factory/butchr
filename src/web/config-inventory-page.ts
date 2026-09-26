@@ -21,6 +21,18 @@
  *   - KNOWN: the field has a real value — rendered plainly (or, for a
  *     notable state like "DISABLED"/"INVALID"/"UNSTAFFED", with the `cnc`
  *     class for visual weight — still a KNOWN fact, just a loud one).
+ *   - COULD NOT CHECK (`cnc` class, the literal words "COULD NOT CHECK"):
+ *     something this daemon would need to look at could not be read —
+ *     originally only a failed fetch of `/config-inventory` itself (the
+ *     whole-page banner below); FACTORY-132 extends this to TWO per-row
+ *     cases that share the identical cause (the agent census is
+ *     unavailable — `RenderConfigInventoryOpts.agentCensusChecked === false`,
+ *     the SAME `DashboardResponse.checked` flag `dashboard-page.ts`'s own
+ *     page banner keys on): a rule's own staffing cell (`renderRuleRow`) and
+ *     the cross-link area of EITHER row kind (`renderAgentLinks`, shared by
+ *     `renderRuleRow` and `renderSessionRow` alike). Never rendered as
+ *     `UNSTAFFED` or "no running agent" — both of those are claims this
+ *     daemon cannot back up while the census is unavailable.
  *   - NOT APPLICABLE (`na` class, an em-dash): an INVALID session
  *     definition's content fields (`vendor`, `tier`, `permissionMode`, …)
  *     structurally do not exist — the file's own content cannot be trusted,
@@ -28,6 +40,8 @@
  *     doc comments for exactly which fields this applies to).
  *   - A rule or session definition with NO running agent (`na` class,
  *     "no running agent") — nothing failed; there is simply no row to link.
+ *     Only rendered when the agent census IS available; see COULD NOT CHECK
+ *     above for the case where it is not.
  *
  * CROSS-LINKS (`../agents/config-inventory-links.ts`): each rule/session row
  * carries an `id` a running agent row's own back-link points at, and lists
@@ -55,6 +69,21 @@ function boolOr(value: boolean | undefined): string {
 export interface RenderConfigInventoryOpts {
   /** Builds the href for a matched agent row's link back to `/` (`dashboard-page.ts`'s own `agentRowAnchorId`, applied by the caller) — a pure URL builder, same pattern as `RenderDashboardOpts.terminalLinkHref`. */
   dashboardLinkHref: (resourceKey: string) => string;
+  /**
+   * FACTORY-132: `DashboardResponse.checked` verbatim, from the SAME
+   * poll-fed snapshot the caller already passes as this function's own
+   * `rows` parameter — never a second, independently-sourced flag, so the
+   * matches and the reason an empty match list means what it means always
+   * come from one snapshot (see `renderAgentLinks`). REQUIRED, not
+   * optional-with-a-default: a caller that forgets to wire this is a
+   * compile error, not a silent, wrong "no running agent" while the census
+   * is actually unavailable — precisely the defect this ticket fixes. The
+   * one existing test helper that builds this type (`config-inventory-
+   * page.test.ts`'s own `opts()`) defaults it to `true` (the checked state),
+   * which is why every pre-existing "no running agent" / "UNSTAFFED:
+   * disabled" assertion in that file still holds unmodified.
+   */
+  agentCensusChecked: boolean;
   /** Auto-refresh interval in seconds, same convention as `dashboard-page.ts`. Defaults to 5. */
   refreshSeconds?: number;
 }
@@ -62,9 +91,42 @@ export interface RenderConfigInventoryOpts {
 /** The result of the caller's own attempt to read `QueryAgentInventory` — mirrors `ViewDeps.resourceLink`'s `{ok:true,...} | {ok:false,error}` shape rather than throwing through this pure render function. `ok:false` is DoD requirement 4's "also make it visible when a fetch of `/config-inventory` itself fails" — rendered as a loud banner with NO tables below it (an empty table here would read as "no config", which is never the right claim about a failed read). */
 export type ConfigInventoryFetchResult = { ok: true; inventory: QueryAgentInventory } | { ok: false; error: string };
 
+/**
+ * FACTORY-132: three cases, only the third changed by this ticket — see the
+ * module header's COULD NOT CHECK entry. A live match always links,
+ * regardless of census state (a stale carry-forward row still links, same
+ * as before this ticket). An empty match list means two different things
+ * depending on `opts.agentCensusChecked`: with the census available, a
+ * genuine "nothing to link to" (`na` class, unchanged from before this
+ * ticket); with it unavailable, this daemon cannot say whether a running
+ * agent exists at all — rendered `cnc`, and deliberately NOT containing the
+ * substring "no running agent", since that specific claim is exactly what
+ * is unavailable. Shared verbatim by `renderRuleRow` AND `renderSessionRow`
+ * (both call this with the same `opts`), so a disabled rule or an invalid
+ * session definition gets the identical could-not-check cross-link
+ * treatment as any other row — the flat rule the ticket asks for.
+ */
 function renderAgentLinks(matches: readonly AgentDashboardRow[], opts: RenderConfigInventoryOpts): string {
-  if (matches.length === 0) return `<span class="na">no running agent</span>`;
-  return matches.map((r) => `<a class="link" href="${esc(opts.dashboardLinkHref(r.resourceKey))}">${esc(r.resourceKey)}</a>`).join(" ");
+  if (matches.length > 0) return matches.map((r) => `<a class="link" href="${esc(opts.dashboardLinkHref(r.resourceKey))}">${esc(r.resourceKey)}</a>`).join(" ");
+  if (!opts.agentCensusChecked) return `<span class="cnc">COULD NOT CHECK — the running-agent set could not be checked (agent census unavailable)</span>`;
+  return `<span class="na">no running agent</span>`;
+}
+
+/**
+ * FACTORY-132: `rule.staffed`'s three states, rendered exhaustively —
+ * `=== true` / `=== false` / `=== null`, deliberately never a truthiness
+ * test on `staffed` (see that field's own doc comment for why: a falsy
+ * check would silently render `null` exactly like `false`, i.e. `UNSTAFFED`,
+ * recreating this ticket's own defect). `null` renders in the SAME COULD NOT
+ * CHECK idiom `renderAgentLinks` uses for the cross-link area — the `cnc`
+ * class, and the literal words "COULD NOT CHECK" — and never the word
+ * "UNSTAFFED" in any casing.
+ */
+function renderStaffed(rule: RuleInventoryEntry): { text: string; cls: string } {
+  if (rule.staffed === true) return { text: "staffed", cls: "known" };
+  const reasonSuffix = rule.reason ? `: ${esc(rule.reason)}` : "";
+  if (rule.staffed === false) return { text: `UNSTAFFED${reasonSuffix}`, cls: "cnc" };
+  return { text: `COULD NOT CHECK${reasonSuffix}`, cls: "cnc" };
 }
 
 /**
@@ -82,6 +144,7 @@ function renderRuleRow(rule: RuleInventoryEntry, rows: readonly DashboardRow[], 
     rule.agentPreferences.length === 0
       ? "—"
       : rule.agentPreferences.map((p) => `${p.harness}${p.model ? `/${p.model}` : ""}${p.effort ? `/${p.effort}` : ""} (model/effort stand in for tier)`).join(", ");
+  const staffed = renderStaffed(rule);
   return (
     `<div class="row rule${rule.enabled ? "" : " disabled"}" id="${esc(ruleAnchorId(rule.resourceProvider, rule.id))}">` +
     `<span class="key">${esc(rule.id)}</span>` +
@@ -91,7 +154,7 @@ function renderRuleRow(rule: RuleInventoryEntry, rows: readonly DashboardRow[], 
     `<span class="exec">${esc(rule.execution)}</span>` +
     `<span class="prefs">${esc(prefs)}</span>` +
     `<span class="linked">linked-eventing: ${rule.linkedEventing ? "on" : "off"}</span>` +
-    `<span class="staffed ${rule.staffed ? "known" : "cnc"}">${rule.staffed ? "staffed" : `UNSTAFFED${rule.reason ? `: ${esc(rule.reason)}` : ""}`}</span>` +
+    `<span class="staffed ${staffed.cls}">${staffed.text}</span>` +
     `<div class="agentlinks">${renderAgentLinks(agentRows, opts)}</div>` +
     `</div>`
   );
