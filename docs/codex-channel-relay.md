@@ -155,11 +155,11 @@ the agent's behalf. An account NAME is not the thing BUTCHR-411's fix was
 protecting — a bearer token is. So `McpServerBinding` gained a small,
 explicit extension, `accountHeader` (`src/rules/rules.ts`): the NAME of a
 header (`"x-rocketr-account"` for `rocketr`) that should carry THIS AGENT'S
-OWN account name, `spec.mcpAccountName` — and `boundCodexServers`
+OWN account name, `spec.rocketchatAccount` — and `boundCodexServers`
 (src/agents/argv.ts) reaches for exactly that value, and ONLY that value,
 when building Codex's own bound-server config: `headersEnvVar`'s resolved
 value still never reaches Codex argv, unweakened, but `accountHeader`'s
-non-secret account name now does. `spec.mcpAccountName` itself is injected
+non-secret account name now does. `spec.rocketchatAccount` itself is injected
 by `HerdrHerd.spawn` (never by a `specFor*` function) from an
 `accountNameOf(issue)` callback that is nothing more than
 `rcUsernameFor(issue)` gated on this issue's rule granting it an account —

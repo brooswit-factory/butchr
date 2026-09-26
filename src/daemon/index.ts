@@ -239,7 +239,7 @@ const accountPolicyOf = (id: string): AccountPolicy => {
 
 /**
  * BUTCHR-413 — this id's own non-secret Rocket.Chat account name
- * (`spec.mcpAccountName`'s source, see that field's own doc comment,
+ * (`spec.rocketchatAccount`'s source, see that field's own doc comment,
  * src/agents/workspace.ts), or `undefined` for an id whose rule grants it
  * none (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
  * `accountLifecycle` itself is gated on immediately below). Deliberately

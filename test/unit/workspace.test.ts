@@ -905,13 +905,13 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): spec.mcpAccountName +
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): spec.rocketchatAccount +
   // a binding's accountHeader reach Claude's mcp.json too, not just Codex's
   // argv — the SAME non-secret value on both surfaces (boundCodexServers,
   // src/agents/argv.ts, and argv.test.ts's own coverage for that half).
-  test("spec.mcpAccountName + a binding's accountHeader land in Claude's mcp.json", () => {
+  test("spec.rocketchatAccount + a binding's accountHeader land in Claude's mcp.json", () => {
     withRoot(() => {
-      const dir = buildWorkspace({ key: "KAN-29", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], mcpAccountName: "butchr_acct_1" }, "http://x/mcp");
+      const dir = buildWorkspace({ key: "KAN-29", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
       const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
       expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp", headers: { "x-rocketr-account": "butchr_acct_1" } });
     });
@@ -919,7 +919,7 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
 
   test("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
     withRoot(() => {
-      const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], mcpAccountName: "butchr_acct_1" }, "http://x/mcp");
+      const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
       expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
     });
   });

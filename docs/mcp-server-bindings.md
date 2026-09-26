@@ -42,7 +42,7 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
 | `type` | yes | `"http"` only, today |
 | `url` | yes | absolute `http:`/`https:` URL |
 | `headersEnvVar` | no | the NAME of an env var on **this daemon's own process** holding a JSON object of extra HTTP headers — see "Headers are by reference, never inline" below. **Never reaches Codex argv.** |
-| `accountHeader` | no | (BUTCHR-413) an HTTP header NAME that should carry this agent's own non-secret Rocket.Chat account name (`spec.mcpAccountName`) — e.g. `"x-rocketr-account"`. Unlike `headersEnvVar`, this one **does** reach Codex argv/mcp.json — see "Codex" below |
+| `accountHeader` | no | (BUTCHR-413) an HTTP header NAME that should carry this agent's own non-secret Rocket.Chat account name (`spec.rocketchatAccount`) — e.g. `"x-rocketr-account"`. Unlike `headersEnvVar`, this one **does** reach Codex argv/mcp.json — see "Codex" below |
 | `channel` | yes | `true`: Claude also receives this server's push notifications (one more `--dangerously-load-development-channels=server:<name>`); `false`: MCP tool access only |
 
 Validation (`parseRules`, same house style as every other rule field —
@@ -143,7 +143,7 @@ for it. This is unweakened by the paragraph below — it is still true today.
 finding 1)** — the one exception to the paragraph above, and a different
 field entirely from `headersEnvVar`: it names a header (Rocket.Chat's
 `rocketr` uses `"x-rocketr-account"`) that carries this agent's own
-non-secret account NAME, `spec.mcpAccountName` (`rcUsernameFor(agentKey)`,
+non-secret account NAME, `spec.rocketchatAccount` (`rcUsernameFor(agentKey)`,
 `src/accounts/identity.ts` — a deterministic public identifier, never a
 credential). `boundCodexServers` calls `resolveCodexSafeMcpServerHeaders`
 (`src/agents/workspace.ts`) for exactly this value and only this value — it

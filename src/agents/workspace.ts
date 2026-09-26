@@ -127,18 +127,26 @@ export interface SpawnSpec {
    * credential — merged into a binding's headers under
    * `McpServerBinding.accountHeader` (see that field's own doc comment,
    * src/rules/rules.ts) by `resolveMcpServerHeaders`/
-   * `resolveCodexSafeMcpServerHeaders` below. Set by `HerdrHerd.spawn`/
-   * `HerdrHerd.staleIssues` from the SAME injected `accountNameOf` callback
-   * (src/agents/herd.ts) — never by a `specFor*` function directly — so a
-   * value that is deterministic in its source can never drift between what
-   * an agent launched with and what a later poll expects. Deliberately a
-   * separate field from `rocketchat` above: unlike that bundle (a
-   * credential, one file, Claude-workspace-only, BUTCHR-412's to reshape),
-   * this is a bare name, safe on every launch surface Codex argv included —
-   * see `boundCodexServers` (src/agents/argv.ts) for exactly where that
-   * distinction is spent.
+   * `resolveCodexSafeMcpServerHeaders` below. Deliberately a separate field
+   * from `rocketchat` above: unlike that bundle (a credential, one file,
+   * Claude-workspace-only, BUTCHR-412's to own), this is a bare name, safe
+   * on every launch surface Codex argv included — see `boundCodexServers`
+   * (src/agents/argv.ts) for exactly where that distinction is spent.
+   *
+   * TWO PRODUCERS, always in agreement because both derive from the same
+   * `rcUsernameFor(agentKey)`: (1) BUTCHR-412's `account-lifecycle.ts`
+   * `ensure()`, from the REAL `ensureAccount` outcome for THIS launch
+   * (absent on a refusal — but a refusal withholds the spawn entirely, so
+   * `HerdrHerd.spawn` is never reached for that case anyway); (2)
+   * `HerdrHerd.spawn`/`HerdrHerd.staleIssues`' own injected `accountNameOf`
+   * callback (src/agents/herd.ts), which fills this field ONLY when (1)
+   * left it unset (a launch path with no accountLifecycle wired at all) and
+   * NEVER overwrites an already-present value — see `spawn`'s own comment.
+   * `staleIssues()` has no producer (1) to defer to, so its own
+   * reconstruction always uses (2) — the same callback `spawn` used
+   * originally, so the two can never drift apart.
    */
-  mcpAccountName?: string;
+  rocketchatAccount?: string;
 }
 
 
@@ -415,7 +423,7 @@ Await direction if your brief does not assign work. Preserve sandbox and approva
     // to before (Object.fromEntries([]) spreads nothing).
     let hasSecretHeaders = false;
     const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const headers = resolveMcpServerHeaders(b, undefined, undefined, spec.mcpAccountName);
+      const headers = resolveMcpServerHeaders(b, undefined, undefined, spec.rocketchatAccount);
       // Conservative on `b.headersEnvVar` being DECLARED, not on it having
       // actually resolved: a binding whose ONLY resolved header ends up
       // being the non-secret account name (headersEnvVar absent/malformed)
@@ -563,7 +571,7 @@ export function mcpIdentityHeaders(spec: SpawnSpec): Record<string, string> {
  * value, never the raw env content — whenever `headersEnvVar` was named but
  * produced no usable headers.
  *
- * `accountName` (BUTCHR-413): this launch's own `spec.mcpAccountName`, or
+ * `accountName` (BUTCHR-413): this launch's own `spec.rocketchatAccount`, or
  * undefined for none. When `binding.accountHeader` names a header AND an
  * account name is available, it is merged into the result under that
  * header — on top of, never instead of, whatever `headersEnvVar` resolved

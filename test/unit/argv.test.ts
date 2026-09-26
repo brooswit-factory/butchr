@@ -230,9 +230,9 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
   // like rocketr identify which account is replying at all, after the
   // BUTCHR-411 fix above (still true, still tested immediately above) struck
   // every OTHER header from a Codex launch.
-  test("a binding's accountHeader reaches Codex argv when this launch carries an mcpAccountName — a non-secret account name, not a credential", () => {
+  test("a binding's accountHeader reaches Codex argv when this launch carries an rocketchatAccount — a non-secret account name, not a credential", () => {
     const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
-    const args = spawnArgs({ ...spec, mcpServers: [withAccount], mcpAccountName: "butchr_jira-work-triage-kan-9_deadbeef00" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount], rocketchatAccount: "butchr_jira-work-triage-kan-9_deadbeef00" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
     const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
     expect(mudArg).toBeDefined();
     expect(mudArg).toContain("http_headers");
@@ -240,7 +240,7 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     expect(mudArg).toContain("butchr_jira-work-triage-kan-9_deadbeef00");
   });
 
-  test("accountHeader configured but no mcpAccountName on this launch (an account:\"none\" rule, or a provisioning refusal) — no headers at all, same as before this field existed", () => {
+  test("accountHeader configured but no rocketchatAccount on this launch (an account:\"none\" rule, or a provisioning refusal) — no headers at all, same as before this field existed", () => {
     const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
     const args = spawnArgs({ ...spec, mcpServers: [withAccount] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
     const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
@@ -252,7 +252,7 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     process.env.BUTCHR_TEST_MUD_HEADERS_2 = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE-2" });
     try {
       const both = { ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS_2", accountHeader: "x-rocketr-account" };
-      const args = spawnArgs({ ...spec, mcpServers: [both], mcpAccountName: "butchr_acct" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const args = spawnArgs({ ...spec, mcpServers: [both], rocketchatAccount: "butchr_acct" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
       const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
       expect(mudArg).toBeDefined();
       expect(mudArg).toContain("x-rocketr-account");

@@ -49,6 +49,13 @@ bump: minor
   first review round is resolved by the above: the reason it couldn't reply
   (BUTCHR-411 strips secret header values from Codex argv) never applied to
   a non-secret account name in the first place.
+- The account-name field is `SpawnSpec.rocketchatAccount` (not a second,
+  independently-named field) — the sibling BUTCHR-412 task landed the same
+  `accountHeader` concept independently and converged on this name first
+  (via `account-lifecycle.ts`'s `ensure()`, from the real `ensureAccount`
+  outcome); `HerdrHerd`'s own `accountNameOf` fills it only when `ensure()`
+  never ran for a launch (no accountLifecycle wired at all), never
+  overwriting an already-set value.
 
 ### Fixed
 

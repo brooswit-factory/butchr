@@ -239,7 +239,7 @@ export class HerdrHerd implements Herd {
     /**
      * BUTCHR-413 — same shape and same reason as `mcpBindingsOf` immediately
      * above, one field over: this issue's own non-secret account-identifying
-     * name for `McpServerBinding.accountHeader` (`spec.mcpAccountName`, see
+     * name for `McpServerBinding.accountHeader` (`spec.rocketchatAccount`, see
      * that field's own doc comment, src/agents/workspace.ts), or `undefined`
      * for none (an `account: "none"` rule, or no Rocket.Chat configured at
      * all). Called from BOTH `spawnExclusive` (augments the real spec before
@@ -455,7 +455,7 @@ export class HerdrHerd implements Herd {
       // fresh here, rather than caching the original spawn's spec, is what
       // keeps this comparison from drifting.
       const accountName = this.accountNameOf?.(issue);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { mcpAccountName: accountName } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) out.push({ issue, reason: check.reason, observedArgv: proc.argv });
     }
@@ -515,12 +515,20 @@ export class HerdrHerd implements Herd {
    * pre-fix shape, before this fix landed.
    */
   async spawn(specIn: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
-    // BUTCHR-413: freshly computed here, on every spawn, from the SAME
-    // `accountNameOf` callback `staleIssues()` uses to reconstruct its own
-    // comparison spec — see that constructor param's own doc comment for why
-    // this can never drift out of sync with what a later poll expects.
-    const accountName = this.accountNameOf?.(specIn.key);
-    const spec: SpawnSpec = accountName ? { ...specIn, mcpAccountName: accountName } : specIn;
+    // BUTCHR-413: a fallback fill only, never an overwrite — BUTCHR-412's
+    // own `account-lifecycle.ts` `ensure()` already sets `rocketchatAccount`
+    // on `desired`/`toSpawn` BEFORE `herd.spawn` is ever called, from the
+    // REAL `ensureAccount` outcome for this launch (respecting a cap
+    // refusal, a not-managed collision, etc. — cases where `ensure` instead
+    // returns `null` and this method is never reached at all). Both
+    // producers derive the identical value from the same agent key
+    // (`rcUsernameFor`, src/accounts/identity.ts), so this is never a
+    // disagreement — only a fallback for a launch path that never went
+    // through `ensure` at all (no accountLifecycle wired, e.g. RC not
+    // configured for any rule). See `staleIssues()` below for the SAME
+    // callback used to keep its own reconstruction in sync.
+    const accountName = specIn.rocketchatAccount ?? this.accountNameOf?.(specIn.key);
+    const spec: SpawnSpec = accountName ? { ...specIn, rocketchatAccount: accountName } : specIn;
     return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
   }
 

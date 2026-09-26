@@ -101,13 +101,13 @@ describe("HerdrHerd", () => {
     expect(workspaceDirFor(key)).toBe(join(workspaceRoot(), "jira-work", "triage", "BUTCHR-364")); // workspace identity keeps the exact key
   });
   // BUTCHR-413 (CHANGES_REQUESTED review finding 1): `spawn()` itself injects
-  // this issue's own `accountNameOf()` value as `spec.mcpAccountName` — the
+  // this issue's own `accountNameOf()` value as `spec.rocketchatAccount` — the
   // caller never sets it directly (mirrors how `mcpBindingsOf` is looked up
   // fresh rather than cached) — and a binding's `accountHeader` turns that
   // into a real header in Codex's own launch argv, unlike `headersEnvVar`
   // (see argv.test.ts's "a bound server's headersEnvVar is NEVER resolved
   // for Codex" for that half, unweakened by this).
-  test("spawn injects accountNameOf()'s value into mcpAccountName, and a bound accountHeader reaches Codex argv", async () => {
+  test("spawn injects accountNameOf()'s value into rocketchatAccount, and a bound accountHeader reaches Codex argv", async () => {
     const f = fakeHerdr([]);
     const binding = { name: "rocketr", type: "http" as const, url: "https://rocketr.example/mcp", channel: false, accountHeader: "x-rocketr-account" };
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant, undefined, { provider: "codex" }, undefined, undefined, undefined, () => [binding], () => "butchr_acct_1");
@@ -126,6 +126,24 @@ describe("HerdrHerd", () => {
     const rocketrArg = f.started[0].args.find((a: string) => a.includes("mcp_servers.rocketr="));
     expect(rocketrArg).toBeDefined();
     expect(rocketrArg).not.toContain("http_headers");
+  });
+
+  // BUTCHR-412's own account-lifecycle.ts `ensure()` sets `rocketchatAccount`
+  // on the spec BEFORE `herd.spawn` is ever called, from the REAL
+  // ensureAccount outcome for this launch — a value `spawn()` must never
+  // clobber with its own independent `accountNameOf()` recomputation (both
+  // derive the identical value in the ordinary case, but only `ensure()`'s
+  // is the one that actually reflects THIS launch's real provisioning
+  // outcome). `accountNameOf` is a fallback for a launch that never went
+  // through `ensure` at all, not a second source of truth.
+  test("spawn NEVER overwrites an already-set spec.rocketchatAccount (BUTCHR-412's account-lifecycle.ts sets it first) with its own accountNameOf() value", async () => {
+    const f = fakeHerdr([]);
+    const binding = { name: "rocketr", type: "http" as const, url: "https://rocketr.example/mcp", channel: false, accountHeader: "x-rocketr-account" };
+    const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant, undefined, { provider: "codex" }, undefined, undefined, undefined, () => [binding], () => "computed-by-accountNameOf");
+    await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null, mcpServers: [binding], rocketchatAccount: "set-by-ensure-already" });
+    const rocketrArg = f.started[0].args.find((a: string) => a.includes("mcp_servers.rocketr="));
+    expect(rocketrArg).toContain("set-by-ensure-already");
+    expect(rocketrArg).not.toContain("computed-by-accountNameOf");
   });
 
   test("runningIssues lists only butchr-managed agents, mapped to their issue", async () => {
@@ -992,7 +1010,7 @@ describe("staleIssues — mcpBindingsOf / MCP server bindings (BUTCHR-411)", () 
   // original spawn's spec) is what keeps them from ever disagreeing.
   test("accountNameOf: an agent launched WITH its account header is NOT flagged stale — the fleet-wide-respawn hazard this ticket must not reintroduce", async () => {
     const acctBinding = { name: "rocketr", type: "http" as const, url: "https://rocketr.example/mcp", channel: false, accountHeader: "x-rocketr-account" };
-    const argv = ["codex", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1", mcpServers: [acctBinding], mcpAccountName: "butchr_acct_1" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+    const argv = ["codex", ...spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-1", mcpServers: [acctBinding], rocketchatAccount: "butchr_acct_1" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
     const client = fakeHerdrWithCwd([{ name: "n", pane_id: "p1", cwd }], argv);
     client.pane.processInfo = async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv, name: "codex" }] } });
     const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] }, undefined, undefined, undefined, () => [acctBinding], () => "butchr_acct_1");

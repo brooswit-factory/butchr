@@ -103,7 +103,7 @@ const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).fil
  *
  * BUTCHR-413 (review finding 1) IS an exception, deliberately: a binding's
  * `accountHeader` (see that field's own doc comment, src/rules/rules.ts)
- * carries only an account NAME, `spec.rocketchat.username` — never a
+ * carries only an account NAME, `spec.rocketchatAccount` — never a
  * bearer token — so `resolveCodexSafeMcpServerHeaders` (the codex-safe
  * subset of `resolveMcpServerHeaders`, src/agents/workspace.ts) reaches
  * Codex argv here where `headersEnvVar`'s own resolved value never does.
@@ -115,7 +115,7 @@ const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).fil
  */
 const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string; headers?: Record<string, string> }> =>
   (spec.mcpServers ?? []).map((s) => {
-    const headers = resolveCodexSafeMcpServerHeaders(s, spec.mcpAccountName);
+    const headers = resolveCodexSafeMcpServerHeaders(s, spec.rocketchatAccount);
     return { name: s.name, url: s.url, ...(headers ? { headers } : {}) };
   });
 
