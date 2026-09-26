@@ -568,30 +568,62 @@ EXACT SAME `runTick` (coalescer, per-(owner,target) baseline, rate cap,
 notify) FACTORY-9 describes above — no forked delivery path, no second
 notification mechanism:
 
-1. **Member discovery**: `project = <key> AND updated >= "-<N>m"`, one
-   watermark per project owner. The watermark is a JQL RELATIVE date literal
-   (minutes elapsed since the last successful search, rounded up), never an
-   absolute timestamp — Jira resolves a relative literal itself, so this
-   avoids reproducing (or skewing) the requesting account's own timezone
-   computation. A project owner's first sighting (first tick, or after any
-   daemon restart — this state is in-memory only) seeds the watermark to
-   "now" and searches nothing that tick, so there is no historical flood.
-   The watermark only advances once a tick's events are genuinely delivered
-   or safely consumed, never on a rate-capped tick or a failed search
+1. **Member discovery**: `project = <key> AND updated >= "-<N>m" ORDER BY
+   updated ASC`, one watermark per project owner. The watermark is a JQL
+   RELATIVE date literal (minutes elapsed since the last successful search,
+   rounded up), never an absolute timestamp — Jira resolves a relative
+   literal itself, so this avoids reproducing (or skewing) the requesting
+   account's own timezone computation. A project owner's first sighting
+   (first tick, or after any daemon restart — this state is in-memory only)
+   seeds the watermark to "now" and searches nothing that tick, so there is
+   no historical flood. The watermark only advances once a tick's events are
+   genuinely delivered or safely consumed, never on a rate-capped tick, a
+   failed search, or a tick where `maxLinkedItems` capped a member away
    (fails open, logged, this owner's managed-link source unaffected).
+   **A member's first appearance IS the change** (review round 1 fix): this
+   window search only ever returns a target whose `updated` is at or after
+   the watermark, so — unlike a managed/native link, which is silently
+   seeded on first sighting — a member target with no existing
+   per-(owner,target) baseline is reported as a genuine event (`"updated
+   since <watermark>"`, or a real field diff once a later re-appearance has
+   a baseline to diff against), never seeded silently. Silently seeding it
+   would swallow the very change that made it appear in the search at all,
+   permanently, since it may never reappear in a later window if nothing
+   further changes it.
 2. **Managed links**: `brooswit.butchr.links` (Decision 9's project-property
    store), reconciled via the SAME `managedLinkedItems` this section
    describes, called with `nativeRefs: []` — a project has no structural
    native links of its own (no `issuelinks`/`parent`) — so every managed
-   link on a project is `"managed"`-origin.
+   link on a project is `"managed"`-origin. A managed link's own first
+   sighting IS still seeded silently, unchanged from the issue-owner
+   behaviour above — only a MEMBER's first appearance gets the special
+   treatment in (1), since only member discovery is defined as "recently
+   changed" by construction.
 
 **Dedup and removal-tracking scope.** A target that is both a member and a
 managed-link target is de-duplicated to ONE `LinkedItem`/ONE event line, the
-same "first occurrence wins" convention `discoverLinkedItems` already uses.
-Removal detection (`"no longer linked"`) is scoped to MANAGED links only —
-a member issue that simply falls outside the current watermark window is
-NOT a removal (it is still a project member, just not recently touched);
-only a genuine removal from `brooswit.butchr.links` fires that event.
+same "first occurrence wins" convention `discoverLinkedItems` already uses
+(if the managed-link side already seeded a baseline on an earlier tick, the
+member's later appearance diffs normally against it — a real field-change
+detail, not the generic first-appearance phrasing). Removal detection
+(`"no longer linked"`) is scoped to MANAGED links only — a member issue
+that simply falls outside the current watermark window is NOT a removal (it
+is still a project member, just not recently touched); only a genuine
+removal from `brooswit.butchr.links` fires that event.
+
+**Capping (review round 1 fix).** A MANAGED link `maxLinkedItems` capped
+away is safe to lose just for one tick — the full managed-link collection
+is re-listed every tick regardless of any cap, so a capped one is simply a
+candidate again next tick, unchanged from the issue-owner behaviour above.
+A MEMBER capped away is not safe the same way: it only appeared because it
+fell inside this tick's watermark window, and once the watermark advances
+past that window it may never reappear — silently losing it, not merely
+delaying it. So a capped member holds this owner's ENTIRE watermark advance
+for the tick (not merely its own item); the next tick re-runs the identical
+window, with `ORDER BY updated ASC` biasing a busy project's retry toward
+draining its oldest backlog first rather than starving the same tail
+forever (the same accepted risk `FOREIGN_FETCH_LIMIT`, `src/rules/
+resource-type.ts`, already documents for a different overflow).
 
 **Comment events.** A "comment event" for a project owner reuses the exact
 same per-target comment-cursor diff FACTORY-9 built for any Jira-kind
@@ -619,7 +651,12 @@ related-resource concept of its own, unchanged.
 `createJiraProjectResourceType` share one instance, and passes
 `searchIssues: atlassian.searchAll`, `comments: atlassian.comments`,
 `notify: notifyRuleAgent` — the SAME seams the jira-work rule loop's own
-linked-eventing wiring already uses.
+linked-eventing wiring already uses. `AtlassianClient.searchAll`'s existing
+1000-issue cap (`maxIssues`, `src/atlassian/client.ts`) applies to the
+member-discovery query too — it throws rather than silently truncating,
+same as every other JQL search in this codebase (the shared `key in (...)`
+batch included); accepted as-is for a project's own window search, no
+different from any other `searchAll` caller.
 
 ## Verification
 

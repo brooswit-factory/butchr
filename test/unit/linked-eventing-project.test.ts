@@ -8,17 +8,24 @@ import { parseResourceRef, type ResourceRef } from "../../src/resources/resource
 
 /**
  * BUTCHR-469: linked-eventing for `jira-project` owners — one member-
- * discovery watch (`project = <key> AND updated >= "-<N>m"`, a per-project
- * watermark) plus this project's own managed links
+ * discovery watch (`project = <key> AND updated >= "-<N>m" ORDER BY updated
+ * ASC`, a per-project watermark) plus this project's own managed links
  * (`brooswit.butchr.links`, reused via FACTORY-9's `managedLinkedItems`),
  * both delivered through the EXACT SAME coalescer/rate-cap/notify
  * `test/unit/linked-eventing.test.ts` and
  * `test/unit/linked-eventing-managed-links.test.ts` already cover for an
  * issue owner — that machinery is reused UNCHANGED here, never re-tested.
- * This file covers what is NEW for a project owner specifically: the
- * watermark's own no-flood/delayed-not-lost contract, member/managed-link
- * dedup, and why a member aging out of the watermark window must never read
- * as a removal.
+ * This file covers what is NEW for a project owner specifically.
+ *
+ * `membersByProject` in `fakeProjectDeps` models REAL Jira window-search
+ * semantics: a key is listed for a project on exactly the tick(s) Jira
+ * would actually return it — i.e., the tick(s) its `updated` genuinely
+ * falls at or after the then-current watermark. A member is NEVER returned
+ * on a tick where it did not change (review round 1 finding: an earlier
+ * draft of these tests had the fake return the SAME unchanged member on
+ * every tick, which hid a real bug — see "the first real change to a
+ * project member" tests below for the fixed behaviour and its regression
+ * coverage).
  */
 
 const ref = (s: string): ResourceRef => parseResourceRef(s);
@@ -53,7 +60,7 @@ const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
 const projectMatch = (agentKey: string, r: Rule, projectKey: string): ProjectLinkedEventingMatch => ({ agentKey, rule: r, projectKey });
 const linkedEvents = (n: NotifyReason) => (n as { linked: { events: readonly { target: string; kind: string; detail: string }[] } }).linked.events;
 
-const PROJECT_JQL_RE = /^project = (\S+) AND updated >= "-(\d+)m"$/;
+const PROJECT_JQL_RE = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updated ASC$/;
 const KEY_IN_RE = /^key in \((.*)\)$/;
 
 function fakeProjectDeps(world: Record<string, JiraIssue>, membersByProject: Record<string, string[]>, opts: {
@@ -101,59 +108,127 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
   test("first sighting seeds the watermark and issues NO member search at all — no historical flood on first tick or daemon restart", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1") };
-    const { deps, notified, searchCalls } = fakeProjectDeps(world, { BUTCHR: ["BUTCHR-1"] });
+    const { deps, notified, searchCalls } = fakeProjectDeps(world, {}); // BUTCHR-1 did NOT just change — not in the window on any tick yet
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
     await state.runTick([], deps, [m]);
     expect(searchCalls).toHaveLength(0); // not even the shared batched fetch — nothing was discovered to fetch
     expect(notified).toHaveLength(0);
   });
 
-  test("opt-in yields one watch per project: from the second tick on, the member search runs, a first-sighting member seeds silently, and a later real change delivers exactly one event", async () => {
+  describe("review round 1 regression: a member's first real change must be reported, never swallowed as a silent baseline", () => {
+    test("reviewer's own repro: tick 1 seeds the watermark, tick 2's window is empty (nothing touched yet), tick 3's window returns the member that just changed — exactly one notification, not zero", async () => {
+      const state = createLinkedEventingState();
+      const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
+      const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+      const { deps, notified } = fakeProjectDeps(world, membersByProject);
+      const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
+
+      await state.runTick([], deps, [m]); // tick 1: seeds the owner's watermark, searches nothing
+      await state.runTick([], deps, [m]); // tick 2: window search runs, returns nothing — BUTCHR-1 not yet touched
+      expect(notified).toHaveLength(0);
+
+      world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" }); // the real change
+      membersByProject.BUTCHR = ["BUTCHR-1"]; // ...which is exactly why Jira's own window search would now return it
+      await state.runTick([], deps, [m]); // tick 3
+      expect(notified).toHaveLength(1); // NOT zero — this is the bug review round 1 found
+      expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: expect.stringMatching(/^updated since /) }]);
+    });
+
+    test("a member's SECOND appearance, once it already has a baseline, diffs normally (a real status-change detail, not the generic first-appearance phrasing)", async () => {
+      const state = createLinkedEventingState();
+      const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
+      const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+      const { deps, notified } = fakeProjectDeps(world, membersByProject);
+      const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
+
+      await state.runTick([], deps, [m]); // seed watermark
+      membersByProject.BUTCHR = ["BUTCHR-1"];
+      await state.runTick([], deps, [m]); // first appearance — reported, baseline now set to status "To Do"
+      expect(notified).toHaveLength(1);
+
+      membersByProject.BUTCHR = []; // ages out of the window — no further change yet
+      await state.runTick([], deps, [m]);
+      expect(notified).toHaveLength(1); // unchanged
+
+      world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" });
+      membersByProject.BUTCHR = ["BUTCHR-1"]; // changed again — back in the window
+      await state.runTick([], deps, [m]);
+      expect(notified).toHaveLength(2);
+      expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // a real diff, not the generic first-appearance phrasing
+    });
+
+    test("survives a daemon restart: a fresh state (no baselines, no watermark) still reports the member's next real change instead of re-swallowing it", async () => {
+      const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
+      const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+      const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
+
+      // Before the "restart": some prior state existed and even reported once — irrelevant to what follows, included only to make clear this is a genuine restart, not a first-ever run.
+      const before = createLinkedEventingState();
+      const { deps: depsBefore } = fakeProjectDeps(world, membersByProject);
+      await before.runTick([], depsBefore, [m]);
+      membersByProject.BUTCHR = ["BUTCHR-1"];
+      await before.runTick([], depsBefore, [m]);
+
+      // Restart: brand-new state, in-memory maps empty — the exact shape a real daemon restart produces.
+      const after = createLinkedEventingState();
+      const { deps: depsAfter, notified: notifiedAfter } = fakeProjectDeps(world, membersByProject);
+      await after.runTick([], depsAfter, [m]); // first sighting under the NEW state: seeds a fresh watermark, searches nothing
+      expect(notifiedAfter).toHaveLength(0);
+
+      world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" }); // a genuine post-restart change
+      membersByProject.BUTCHR = ["BUTCHR-1"];
+      await after.runTick([], depsAfter, [m]);
+      expect(notifiedAfter).toHaveLength(1); // reported — NOT lost because the restart wiped the old baseline
+    });
+  });
+
+  test("opt-in yields one watch per project", async () => {
     const state = createLinkedEventingState();
-    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
-    const { deps, notified, searchCalls } = fakeProjectDeps(world, { BUTCHR: ["BUTCHR-1"] });
+    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1") };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const { deps, searchCalls } = fakeProjectDeps(world, membersByProject);
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
-    await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // member search runs now; first sighting of BUTCHR-1 seeds silently
-    expect(searchCalls.some((q) => PROJECT_JQL_RE.test(q))).toBe(true);
-    expect(notified).toHaveLength(0);
-
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" });
+    await state.runTick([], deps, [m]); // seed
     await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]);
+    const projectSearches = searchCalls.filter((q) => PROJECT_JQL_RE.test(q));
+    expect(projectSearches).toHaveLength(1); // exactly one member-discovery search this tick, for this one project
+    expect(projectSearches[0]).toMatch(/^project = BUTCHR AND updated >= "-\d+m" ORDER BY updated ASC$/);
   });
 
   test("two projects have independent watermarks and independent notify streams", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "AAA-1": issue("AAA-1"), "BBB-1": issue("BBB-1") };
-    const membersByProject = { AAA: ["AAA-1"], BBB: ["BBB-1"] };
+    const membersByProject: Record<string, string[]> = { AAA: [], BBB: [] };
     const { deps, notified } = fakeProjectDeps(world, membersByProject);
     const mA = projectMatch("jira-project:mgrs:AAA", rule(), "AAA");
     const mB = projectMatch("jira-project:mgrs:BBB", rule(), "BBB");
 
     await state.runTick([], deps, [mA, mB]); // both seed
-    await state.runTick([], deps, [mA, mB]); // both search, both seed silently
+    await state.runTick([], deps, [mA, mB]); // both search, both windows empty
     expect(notified).toHaveLength(0);
 
-    world["AAA-1"] = issue("AAA-1", { status: "Done" });
+    membersByProject.AAA = ["AAA-1"]; // only AAA's project changed
     await state.runTick([], deps, [mA, mB]);
     expect(notified.map((n) => n.agent)).toEqual(["jira-project:mgrs:AAA"]); // BBB unaffected by AAA's own change
   });
 
-  test("a member that ages out of the watermark window is NOT reported as removed — it is still a project member, just not recently touched", async () => {
+  test("a member that ages out of the watermark window without ever having a baseline is silently forgotten — NOT reported as removed, and NOT reported at all (it never appeared as a change to begin with)", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1") };
-    const membersByProject: Record<string, string[]> = { BUTCHR: ["BUTCHR-1"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const { deps, notified } = fakeProjectDeps(world, membersByProject);
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // BUTCHR-1 seen, seeded silently
-    membersByProject.BUTCHR = []; // BUTCHR-1 no longer recently touched — simulates aging out of the JQL window
+    await state.runTick([], deps, [m]); // empty window
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [m]); // appears, reported once, baseline seeded to its current snapshot
+    expect(notified).toHaveLength(1);
+
+    membersByProject.BUTCHR = []; // ages out — still a project member, just not recently touched
     await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(0); // must NOT read as "no longer linked"
+    expect(notified).toHaveLength(1); // must NOT read as "no longer linked" (there is no removal event kind for a member at all)
   });
 
   test("a managed link on a project owner IS removal-tracked: 'no longer linked' fires once on genuine removal", async () => {
@@ -181,18 +256,18 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     const store = fakeLinkStore();
     await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-9"));
     const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9", { status: "To Do" }) };
-    const membersByProject = { BUTCHR: ["BUTCHR-9"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const { deps, notified } = fakeProjectDeps(world, membersByProject, { linkStore: store });
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
-    await state.runTick([], deps, [m]); // seed watermark + managed-link baseline
-    await state.runTick([], deps, [m]); // member search runs; BUTCHR-9 already baselined via the managed link — no duplicate seeding event either
+    await state.runTick([], deps, [m]); // seed watermark + managed-link baseline (silent — managed links always seed silently)
     expect(notified).toHaveLength(0);
 
-    world["BUTCHR-9"] = issue("BUTCHR-9", { status: "In Progress" });
+    world["BUTCHR-9"] = issue("BUTCHR-9", { status: "In Progress" }); // the real change that also makes it a member this tick
+    membersByProject.BUTCHR = ["BUTCHR-9"];
     await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // ONE line, not two
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
   });
 
   test("coalescing: many members changing in one tick produce ONE nudge for the project owner", async () => {
@@ -202,60 +277,81 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
       "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }),
       "BUTCHR-3": issue("BUTCHR-3", { status: "To Do" }),
     };
-    const membersByProject = { BUTCHR: ["BUTCHR-1", "BUTCHR-2", "BUTCHR-3"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const { deps, notified } = fakeProjectDeps(world, membersByProject);
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // all three seed silently
-    expect(notified).toHaveLength(0);
 
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" });
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Review" });
-    world["BUTCHR-3"] = issue("BUTCHR-3", { status: "Done" });
+    membersByProject.BUTCHR = ["BUTCHR-1", "BUTCHR-2", "BUTCHR-3"]; // all three just changed, in the SAME tick's window
     await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
+    expect(notified).toHaveLength(1); // one nudge, not three
     expect(linkedEvents(notified[0]!.reason).map((e) => e.target).sort()).toEqual(["BUTCHR-1", "BUTCHR-2", "BUTCHR-3"]);
   });
 
   test("rate cap: a capped project-owner tick is retried (delayed, not lost) on the next allowed tick", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
-    const membersByProject = { BUTCHR: ["BUTCHR-1"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const now = { value: 0 };
     const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { now });
     const r = rule({ maxLinkedTurnsPerHour: 1 });
     const m = projectMatch("jira-project:mgrs:BUTCHR", r, "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // seed BUTCHR-1 baseline
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" });
-    await state.runTick([], deps, [m]); // uses the one allowed turn
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [m]); // first appearance — uses the one allowed turn
     expect(notified).toHaveLength(1);
 
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" });
-    await state.runTick([], deps, [m]); // capped — dropped this tick, not lost
+    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" }); // BUTCHR-1 already has a baseline now, so this is a normal diff
+    await state.runTick([], deps, [m]); // capped — dropped this tick, not lost; watermark held (advance() never runs on a capped tick)
     expect(notified).toHaveLength(1);
     expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes("BUTCHR"))).toBe(true);
 
     now.value += 61 * 60_000;
-    await state.runTick([], deps, [m]); // the same outstanding change is re-detected and delivered
+    await state.runTick([], deps, [m]); // the same outstanding change is re-detected (BUTCHR-1 still in the held window) and delivered
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done"' }]);
   });
 
-  test("a failed member search fails open: logged, skips member discovery for that owner only, watermark not advanced, managed links and other owners unaffected", async () => {
+  test("review round 1 regression: a member dropped by maxLinkedItems holds this owner's ENTIRE watermark — the capped member is retried, not lost, once room exists", async () => {
+    const state = createLinkedEventingState();
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }),
+      "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }),
+    };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject);
+    const capped = projectMatch("jira-project:mgrs:BUTCHR", rule({ maxLinkedItems: 1 }), "BUTCHR");
+
+    await state.runTick([], deps, [capped]); // seed watermark
+
+    membersByProject.BUTCHR = ["BUTCHR-1", "BUTCHR-2"]; // both just changed in the SAME window
+    await state.runTick([], deps, [capped]); // maxLinkedItems: 1 keeps BUTCHR-1, drops BUTCHR-2
+    expect(notified).toHaveLength(1);
+    expect(linkedEvents(notified[0]!.reason).map((e) => e.target)).toEqual(["BUTCHR-1"]);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] project-member cap") && l.includes("BUTCHR"))).toBe(true);
+
+    // Still in the SAME held window on the next tick (watermark did not advance) — with the cap
+    // relieved, BUTCHR-2 (never lost) is now discoverable rather than having silently vanished.
+    const relieved = projectMatch("jira-project:mgrs:BUTCHR", rule({ maxLinkedItems: 5 }), "BUTCHR");
+    await state.runTick([], deps, [relieved]);
+    expect(notified).toHaveLength(2);
+    expect(linkedEvents(notified[1]!.reason).map((e) => e.target)).toEqual(["BUTCHR-2"]); // BUTCHR-1 already baselined and unchanged since — only BUTCHR-2 is new
+  });
+
+  test("a failed member search fails open: logged, skips member discovery for that owner only, managed links and other owners unaffected", async () => {
     const state = createLinkedEventingState();
     const store = fakeLinkStore();
     await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-2"));
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1"), "BUTCHR-2": issue("BUTCHR-2"), "OTHER-1": issue("OTHER-1") };
-    const membersByProject = { BUTCHR: ["BUTCHR-1"], OTHER: ["OTHER-1"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [], OTHER: [] };
     const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: store, failProjectSearchFor: new Set(["BUTCHR"]) });
     const bad = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
     const good = projectMatch("jira-project:mgrs:OTHER", rule({ id: "other" }), "OTHER");
 
     await state.runTick([], deps, [bad, good]); // seed both watermarks
-    await state.runTick([], deps, [bad, good]); // BUTCHR's member search fails; OTHER's succeeds; BUTCHR's managed link still seeds
+    await state.runTick([], deps, [bad, good]); // BUTCHR's member search fails; OTHER's succeeds (empty window); BUTCHR's managed link still seeds
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] project-member search failed") && l.includes("BUTCHR"))).toBe(true);
     expect(notified).toHaveLength(0); // pure seeding tick either way
 
@@ -274,53 +370,51 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     };
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
-    const membersByProject = { BUTCHR: ["BUTCHR-1"] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: badStore });
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // link-store fails (logged), member discovery still runs and seeds BUTCHR-1
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [m]); // link-store fails (logged); member discovery still runs and reports BUTCHR-1's first appearance
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR"))).toBe(true);
-
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress" });
-    await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(1); // member discovery kept working despite the broken link store
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: expect.stringMatching(/^updated since /) }]);
   });
 
-  test("comment events: a new comment on a project member is reported as 'got a new comment', the same mechanism an issue owner's linked target already uses", async () => {
+  test("comment events: a new comment on a project member (already baselined) is reported as 'got a new comment', the same mechanism an issue owner's linked target already uses", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { updated: "t1" }) };
-    const membersByProject = { BUTCHR: ["BUTCHR-1"] };
-    const commentsByKey = { "BUTCHR-1": [{ id: "c1", body: "first", created: "t1", authorEmail: null }] };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const commentsByKey: Record<string, JiraComment[]> = { "BUTCHR-1": [] };
     const { deps, notified } = fakeProjectDeps(world, membersByProject, { commentsByKey });
     const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]); // seeds BUTCHR-1's snapshot, including commentCursor "c1"
-    expect(notified).toHaveLength(0);
+
+    commentsByKey["BUTCHR-1"] = [{ id: "c1", body: "first", created: "t1", authorEmail: null }];
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [m]); // first appearance — reported (generic "updated since"), baseline (incl. commentCursor "c1") now set
+    expect(notified).toHaveLength(1);
 
     world["BUTCHR-1"] = issue("BUTCHR-1", { updated: "t2" });
     commentsByKey["BUTCHR-1"] = [{ id: "c2", body: "second", created: "t2", authorEmail: null }, { id: "c1", body: "first", created: "t1", authorEmail: null }];
+    membersByProject.BUTCHR = ["BUTCHR-1"]; // the new comment bumped `updated`, so it's back in the window
     await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment" }]);
+    expect(notified).toHaveLength(2);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment" }]);
   });
 
-  test("maxLinkedItems caps the combined member+managed-link set uniformly", async () => {
+  test("the member-discovery search's own already-fetched issue data is reused directly, without a second 'key in (...)' call for the same key", async () => {
     const state = createLinkedEventingState();
-    const store = fakeLinkStore();
-    await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-9"));
-    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1"), "BUTCHR-9": issue("BUTCHR-9") };
-    const membersByProject = { BUTCHR: ["BUTCHR-1"] };
-    const { deps, searchCalls } = fakeProjectDeps(world, membersByProject, { linkStore: store });
-    const m = projectMatch("jira-project:mgrs:BUTCHR", rule({ maxLinkedItems: 1 }), "BUTCHR");
+    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1") };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const { deps, searchCalls } = fakeProjectDeps(world, membersByProject);
+    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
-    await state.runTick([], deps, [m]);
-    // Only ONE of the two candidate targets is ever fetched in the shared batch — the cap bit.
-    const batched = searchCalls.filter((q) => KEY_IN_RE.test(q));
-    expect(batched.length).toBeGreaterThan(0);
-    for (const q of batched) expect(q.split(",").length).toBeLessThanOrEqual(1);
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [m]); // BUTCHR-1's only Jira-kind target this tick is the member itself
+    expect(searchCalls.some((q) => KEY_IN_RE.test(q))).toBe(false); // no redundant re-fetch — the member search already had the data
   });
 });
