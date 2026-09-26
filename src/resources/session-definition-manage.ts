@@ -19,11 +19,11 @@
  */
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentRole, ExecutionMode } from "../rules/rules.js";
+import type { AccountPolicy, AgentRole, ExecutionMode } from "../rules/rules.js";
 import { builtinManagedSessionsRule } from "../rules/session-definition-type.js";
 import {
   isHiddenDefinitionFile, parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems,
-  type SessionDefinitionVendor, type SessionTier,
+  type SessionDefinitionVendor, type SessionPermissionMode, type SessionTier,
 } from "./session-definition.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "./filesystem-ref.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "./filesystem.js";
@@ -54,6 +54,22 @@ export interface SessionDefinitionListEntry {
   tier?: SessionTier;
   role?: AgentRole;
   execution?: ExecutionMode;
+  /** FACTORY-72: reused verbatim from `Rule`/`SessionDefinition` — see those types' own doc comments. `undefined` for an invalid definition, same reasoning as `vendor`/`tier`/`role`/`execution` above. */
+  account?: AccountPolicy;
+  /** FACTORY-72: `SessionDefinition.permissionMode` — `undefined` for an invalid definition, same reasoning as the other content fields above. */
+  permissionMode?: SessionPermissionMode;
+  /** FACTORY-72: `SessionDefinition.workingDirectory`, already `~`-expanded — `undefined` for an invalid definition, same reasoning as the other content fields above. */
+  workingDirectory?: string;
+  /**
+   * FACTORY-72: `SessionDefinition.mcpServers`' own `name`s ONLY — never the
+   * full `McpServerBinding` (no `url`, `headersEnvVar`, `accountHeader`):
+   * this list exists for a config inventory to show which MCP servers a
+   * managed session may reach without ever exposing where a header value
+   * would be resolved from. `[]` when the definition binds none; `undefined`
+   * for an invalid definition, same reasoning as the other content fields
+   * above.
+   */
+  mcpServerNames?: string[];
   /** `undefined` for an invalid definition — the raw `frozen` field cannot be trusted to mean anything once the document itself doesn't validate. */
   manifestFrozen?: boolean;
   /** BUTCHR-456: this definition's own delegated-freeze grants (`undefined` for an invalid definition, same reasoning as `manifestFrozen`). `[]` means nobody may freeze/unfreeze it via the MCP tools. */
@@ -124,6 +140,8 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
       out.push({
         name: resource.name, path: resource.path, agentKey, valid: true, problems: [],
         vendor: definition.vendor, tier: definition.tier, role: definition.role, execution: definition.execution,
+        account: definition.account, permissionMode: definition.permissionMode, workingDirectory: definition.workingDirectory,
+        mcpServerNames: (definition.mcpServers ?? []).map((s) => s.name),
         manifestFrozen: definition.frozen, storeFrozen,
         freezeControllers: definition.freezeControllers ?? [], unfreezeControllers: definition.unfreezeControllers ?? [],
       });
