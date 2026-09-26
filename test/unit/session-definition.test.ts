@@ -57,6 +57,23 @@ describe("sessionDefinitionProblems", () => {
     for (const permissionMode of SESSION_PERMISSION_MODES) expect(sessionDefinitionProblems({ ...good(), permissionMode }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), permissionMode: "yolo" }, "def")[0]).toContain("permissionMode must be one of");
   });
+  test("strictMcpConfig: optional boolean, absent means today's behaviour exactly", () => {
+    expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), strictMcpConfig: true }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), strictMcpConfig: false }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), strictMcpConfig: "true" }, "def")).toEqual(["def.strictMcpConfig must be a boolean"]);
+    expect(parseSessionDefinition(good(), "def", HOME).strictMcpConfig).toBeUndefined();
+    expect(parseSessionDefinition({ ...good(), strictMcpConfig: true }, "def", HOME).strictMcpConfig).toBe(true);
+  });
+  test("BUTCHR-453/BUTCHR-463: strictMcpConfig is rejected at manifest load for vendor codex — Codex has no equivalent concept", () => {
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", strictMcpConfig: true }, "def"))
+      .toEqual(['def.strictMcpConfig is not supported for vendor "codex" — Codex has no strict-MCP-config concept; omit this field for a Codex definition']);
+    // Even an explicit false is rejected — the field itself is unsupported for Codex, not just a truthy value.
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex", strictMcpConfig: false }, "def")[0])
+      .toContain('not supported for vendor "codex"');
+    // Unlike permissionMode, which is silently stored-but-unforwarded for Codex (docs/managed-sessions.md), this is a hard rejection.
+    expect(sessionDefinitionProblems({ ...good(), vendor: "codex" }, "def")).toEqual([]);
+  });
   test("execution: reuses Rule's ExecutionMode enum verbatim, invalid value rejected", () => {
     for (const execution of ["swarm", "singleton", "persistent"]) expect(sessionDefinitionProblems({ ...good(), execution }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), execution: "bogus" }, "def")[0]).toContain("execution must be one of");
