@@ -652,6 +652,77 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
   });
 });
 
+describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+  const escalation = { paneId: "p1", question: "Some dialog only drovr recognised", options: ["Opt A", "Opt B"], fingerprint: "drovrfp1" };
+
+  test("a drovr onUnknownDialog event for a managed-session pane reaches the same minimal escalation as Butchr's own detection", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    await h.escalator.onDrovrUnknownDialog(escalation);
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain(target.agentKey);
+    expect(lines[0]).toContain(target.definitionPath);
+    expect(lines[0]).toContain(escalation.question);
+    expect(lines[0]).toContain("1. Opt A | 2. Opt B");
+    expect(lines[0]).toContain(`fingerprint: ${escalation.fingerprint}`);
+    expect(h.escalator.managedSessionEscalations()).toEqual([
+      { agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: escalation.fingerprint, since: expect.any(String) },
+    ]);
+
+    // Never posts/sends anything, same as the Butchr-detected path.
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  test("a second onUnknownDialog for the SAME (pane, fingerprint) does not re-log", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+  });
+
+  test("onDialogResolved clears the mark, and a later onUnknownDialog re-escalates", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    expect(h.escalator.managedSessionEscalations().length).toBe(1);
+
+    h.escalator.onDrovrDialogResolved({ paneId: escalation.paneId, fingerprint: escalation.fingerprint });
+    expect(h.escalator.managedSessionEscalations()).toEqual([]);
+    expect(h.logs.some((l) => l.includes(MANAGED_ESCALATION_MARKER) && l.includes("no longer blocked"))).toBe(true);
+
+    await h.escalator.onDrovrUnknownDialog({ ...escalation, fingerprint: "drovrfp2" });
+    expect(h.escalator.managedSessionEscalations()).toEqual([
+      { agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: "drovrfp2", since: expect.any(String) },
+    ]);
+  });
+
+  test("onDialogResolved for a stale/foreign fingerprint never clears a live mark", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    h.escalator.onDrovrDialogResolved({ paneId: escalation.paneId, fingerprint: "not-the-tracked-fp" });
+    expect(h.escalator.managedSessionEscalations().length).toBe(1); // untouched
+  });
+
+  test("a keyed pane's unknown dialog is a no-op here — Butchr's own Jira escalation stays authoritative, unaffected", async () => {
+    const h = harness({ managedSessionOf: async () => null }); // not a managed session (e.g. a keyed jira-work pane)
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(0);
+    expect(h.escalator.managedSessionEscalations()).toEqual([]);
+    expect(h.posted).toEqual([]);
+  });
+
+  test("no managedSessionOf dep wired at all — the hook is a total no-op, never throws", async () => {
+    const h = harness();
+    await h.escalator.onDrovrUnknownDialog(escalation);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(0);
+  });
+});
+
 // Regression coverage for the KAN-732 review of PR #27 (blocking findings 1 & 2).
 describe("createEscalator — an answer is consumed exactly once", () => {
   test("a delivered directive is never replayed while the pane stays blocked on the same dialog", async () => {

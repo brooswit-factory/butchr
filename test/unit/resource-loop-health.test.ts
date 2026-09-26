@@ -46,4 +46,18 @@ describe("resource loop health", () => {
     expect("unresolvedRelationships" in combineHealth([poll])).toBe(false);
     poll.stop();
   });
+
+  test("FACTORY-45: managedSessionEscalations rides beside the liveness components, absent when empty, and never flips ok", () => {
+    let t = 0;
+    const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    t = 5_000; poll.recordSuccess();
+    const escalations = [{ agentKey: "filesystem:managed-sessions:%2Ffoo.json", definitionPath: "/foo.json", paneId: "p1", fingerprint: "abc12345", since: new Date(5_000).toISOString() }];
+
+    const withEscalations = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, escalations);
+    expect(withEscalations.managedSessionEscalations).toEqual(escalations);
+    expect(withEscalations.ok).toBe(true); // a stalled managed session is a real problem, never a liveness failure
+    expect("managedSessionEscalations" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
+    expect("managedSessionEscalations" in combineHealth([poll])).toBe(false);
+    poll.stop();
+  });
 });

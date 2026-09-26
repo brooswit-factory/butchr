@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, createBlockingEscalationWatcher } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -1489,6 +1489,35 @@ async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string;
   if (!decoded || decoded.kind !== "resource") return null;
   return { agentKey: id, definitionPath: decoded.resourceId };
 }
+
+// FACTORY-45 Part B: drovr's own host-neutral escalation hook
+// (`createBlockingEscalationWatcher`, `@brooswit/drovr` >= 0.15.0) —
+// deliberately a SEPARATE poll loop, own timer, own read of the fleet: the
+// watcher's own contract ("never call poll concurrently on the same
+// instance") is exactly the same "no overlapping polls" discipline
+// watchBlocked already gives its own caller, so this loop earns it the
+// same way rather than borrowing that one's cadence. Feeds ONLY the
+// managed-session minimal escalation (`escalator.onDrovrUnknownDialog`/
+// `onDrovrDialogResolved`) — a keyed pane, or a keyless pane that is not a
+// managed session, is a no-op there (see that method's own doc comment,
+// src/agents/escalation-loop.ts): Butchr's EXISTING `watchPrompts` pipeline
+// below stays the authoritative detector/escalator for both, unchanged by
+// this ticket. `herdr` itself already satisfies drovr's own
+// `{ agent: Pick<DrovrClient["agent"], "list" | "read" | "sendKeys"> }`
+// client shape — it IS a `DrovrClient`.
+const blockingEscalationWatcher = createBlockingEscalationWatcher({
+  onUnknownDialog: (escalation) => escalator.onDrovrUnknownDialog(escalation),
+  onDialogResolved: (resolved) => escalator.onDrovrDialogResolved(resolved),
+});
+let blockingEscalationPollInFlight = false;
+const blockingEscalationTimer = setInterval(() => {
+  if (blockingEscalationPollInFlight) return;
+  blockingEscalationPollInFlight = true;
+  blockingEscalationWatcher.poll(herdr)
+    .catch((e) => console.error(`  [blocking-escalation] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { blockingEscalationPollInFlight = false; });
+}, 5_000);
+blockingEscalationTimer.unref?.();
 
 // BUTCHR-5/16: a pane herdr reports idle/done for >= config.idleDialogMinutes
 // whose text parses as a dialog, and whose trailing region isn't a recognized
