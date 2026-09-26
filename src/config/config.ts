@@ -19,10 +19,15 @@ export interface Config {
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
   terminalPrefix?: string[];
   /**
-   * GitHub PR discovery (pr:* labels). Both a token and at least one org are
-   * required — an unscoped GitHub search spans all of GitHub, not just ours —
-   * so this is present only when BOTH GITHUB_TOKEN_FILE and
-   * BUTCHR_GITHUB_ORGS are set; otherwise pr:* discovery is skipped entirely.
+   * GitHub PR discovery (pr:* labels), AND (FACTORY-57) the `github-issue`
+   * and `github-pr` rule providers — all THREE share this one field; there
+   * is no separate token/org config for `github-pr` (see `.env.example`'s
+   * own `GITHUB_TOKEN_FILE` comment block for the scope finding behind that
+   * decision). Both a token and at least one org are required — an
+   * unscoped GitHub search spans all of GitHub, not just ours — so this is
+   * present only when BOTH GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS are
+   * set; otherwise pr:* discovery AND both rule providers are skipped
+   * entirely.
    */
   github?: { token: string; orgs: string[] };
   /**
@@ -250,6 +255,18 @@ export interface Config {
    */
   captureDir: string;
   /**
+   * DROVR-42: JSONL audit file `autoAnswerPermissions` (`@brooswit/drovr`)
+   * appends one record to per approval attempt, on the daemon's own standalone
+   * permission-answer timer (src/agents/permission-answer-loop.ts). Default
+   * `.permission-audit.jsonl` under the workspace root — dot-prefixed, same
+   * reasoning as `captureDir` above, and distinct from `captureDir` itself so
+   * this write activity is never mixed into the session-limit watcher's
+   * captures. Deliberately under BUTCHR's own state directory, not drovr's
+   * package default, so an operator inspecting butchr's own write activity
+   * finds it there.
+   */
+  permissionAuditPath: string;
+  /**
    * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
    * project key must appear here to ever be staffed (see
    * `src/resources/project.ts`'s `ProjectResourceDeps.allowlist`, the one
@@ -363,6 +380,7 @@ export interface ConfigEnv {
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
   BUTCHR_CAPTURE_DIR?: string | undefined;
+  BUTCHR_PERMISSION_AUDIT_PATH?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
 }
@@ -466,6 +484,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const assigneeEpic = env.BUTCHR_ASSIGNEE_EPIC?.trim();
 
   const captureDir = env.BUTCHR_CAPTURE_DIR?.trim() || join(workspaceRoot(), ".captures");
+  const permissionAuditPath = env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(workspaceRoot(), ".permission-audit.jsonl");
 
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
@@ -501,6 +520,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
       ...(assigneeEpic ? { epic: assigneeEpic } : {}),
     },
     captureDir,
+    permissionAuditPath,
     projectAllowlist,
     maxAgents,
   };
@@ -610,6 +630,6 @@ export const describeConfig = (c: Config): string =>
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
-  `captureDir=${c.captureDir} ` +
+  `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents}`;

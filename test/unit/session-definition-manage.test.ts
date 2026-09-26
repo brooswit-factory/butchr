@@ -45,9 +45,27 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
     expect(entries).toEqual([{
       name: "a.json", path: "/defs/a.json", agentKey, valid: true, problems: [],
       vendor: "claude", tier: "tier1", role: "sentinel", execution: "persistent",
+      account: "none", permissionMode: "default", workingDirectory: "/repo/project", mcpServerNames: [],
       manifestFrozen: false, storeFrozen: true,
       freezeControllers: [], unfreezeControllers: [],
     }]);
+  });
+
+  test("FACTORY-72: account, permissionMode, workingDirectory and mcpServerNames (names only, never the full binding) are surfaced", async () => {
+    const { list, read } = fakeFiles({
+      "/defs/b.json": JSON.stringify(goodDef({
+        account: "temporary",
+        permissionMode: "bypassPermissions",
+        workingDirectory: "/repo/other",
+        mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/rocketr", headersEnvVar: "ROCKETR_HEADERS", channel: true }],
+      })),
+    });
+    const entries = await listSessionDefinitions({ dir: "/defs", list, read, store: fakeStore() });
+    expect(entries[0]!.account).toBe("temporary");
+    expect(entries[0]!.permissionMode).toBe("bypassPermissions");
+    expect(entries[0]!.workingDirectory).toBe("/repo/other");
+    expect(entries[0]!.mcpServerNames).toEqual(["rocketr"]);
+    expect(JSON.stringify(entries[0]!)).not.toContain("ROCKETR_HEADERS");
   });
 
   test("a definition's own freeze/unfreeze grant fields are surfaced verbatim", async () => {

@@ -203,4 +203,10 @@ describe("MCP stdio bridge", () => {
     await expect(startBridge(new URL("file:///tmp/mcp"), "TEST-1")).rejects.toThrow("HTTP URL");
     await expect(startBridge(new URL("http://127.0.0.1:1/mcp"), "TEST-1", { cleanupTimeoutMs: Infinity })).rejects.toThrow("timeouts");
   });
+
+  test("FACTORY-57: no `identity` is accepted for a github-pr agent key too (the whitelist's newest member), same as github-issue/jira-idea/zendesk-ticket — proven by getting PAST the identity check to the next validation (an invalid timeout), never rejecting on 'identity'; a stray other-provider prefix (or none) still refuses on 'issue identity'", async () => {
+    await expect(startBridge(new URL("http://127.0.0.1:1/mcp"), undefined, { agent: "github-pr:prs:acme%2Fw%231", cleanupTimeoutMs: Infinity })).rejects.toThrow("timeouts");
+    await expect(startBridge(new URL("http://127.0.0.1:1/mcp"), undefined, {})).rejects.toThrow("issue identity");
+    await expect(startBridge(new URL("http://127.0.0.1:1/mcp"), undefined, { agent: "filesystem:cfg:%2Ftmp" })).rejects.toThrow("issue identity");
+  });
 });

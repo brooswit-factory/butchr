@@ -81,6 +81,10 @@ describe("resourceRefToLinkedItem", () => {
     expect(resourceRefToLinkedItem(ref("github-issue:brooswit-factory/butchr#42"))).toEqual({ kind: "github-issue", target: "brooswit-factory/butchr#42" });
   });
 
+  test("FACTORY-57: github-pr -> github-pr, target is the canonical owner/repo#n string unchanged (pollGithubLink already reads /pulls/<n> for this kind)", () => {
+    expect(resourceRefToLinkedItem(ref("github-pr:brooswit-factory/butchr#42"))).toEqual({ kind: "github-pr", target: "brooswit-factory/butchr#42" });
+  });
+
   test("webpage -> webpage, target is the ref's own normalized URL", () => {
     expect(resourceRefToLinkedItem(ref("webpage:https://example.com/status"))).toEqual({ kind: "webpage", target: "https://example.com/status" });
   });
@@ -94,7 +98,7 @@ describe("resourceRefToLinkedItem", () => {
   });
 
   test("MANAGED_LINK_KINDS names exactly the kinds this function can produce", () => {
-    expect([...MANAGED_LINK_KINDS].sort()).toEqual(["confluence", "filesystem", "github-issue", "jira-key", "webpage"]);
+    expect([...MANAGED_LINK_KINDS].sort()).toEqual(["confluence", "filesystem", "github-issue", "github-pr", "jira-key", "webpage"]);
   });
 });
 

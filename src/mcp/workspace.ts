@@ -11,7 +11,7 @@ import { KEY_ONLY_PROVIDERS } from "./identity.js";
  * percent-escaped directory name; see `encodeQueryAgentKey`'s own doc
  * comment, src/rules/agent-key.ts), whose metadata
  * must also name the agent key the path encodes. A `github-issue`,
- * `jira-idea` or `zendesk-ticket` workspace's metadata names its agent and
+ * `github-pr`, `jira-idea` or `zendesk-ticket` workspace's metadata names its agent and
  * resource instead of an `issue`, and the bridge sends the agent key alone
  * (src/mcp/identity.ts).
  *

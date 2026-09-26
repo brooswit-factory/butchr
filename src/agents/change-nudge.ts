@@ -157,6 +157,23 @@ export function githubIssueNudge(resource: string, reason: NotifyReason | undefi
 }
 
 /**
+ * FACTORY-57: the agent-facing push for a `github-pr` agent's own pull
+ * request — `githubIssueNudge`'s twin, naming `github_get_pr` (the PR
+ * provider's own re-read tool, src/tools/github-pr.ts) since a `github-pr`
+ * agent has no `github_get_issue`/Jira tools either. Carries no
+ * GitHub-authored text (see src/rules/github-pr-type.ts). `reasonClause`'s
+ * `"status"` clause already reads naturally for a PR (`changed status from
+ * "open" to "closed"`); merged-vs-closed-without-merging is the caller's
+ * own `decideGithubPr` (src/rules/github-pr-type.ts) choice of `from`/`to`
+ * strings ("merged" or the raw state), not something this renderer needs to
+ * know about.
+ */
+export function githubPrNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "summary" in reason ? "had its title edited" : reasonClause(reason);
+  return `[butchr] GitHub pull request ${resource} ${clause} — re-read it with github_get_pr.`;
+}
+
+/**
  * The agent-facing push for a `zendesk-ticket` agent's own ticket. Names the
  * tool to re-read with; carries no customer-authored text (see
  * src/rules/zendesk-ticket-type.ts).

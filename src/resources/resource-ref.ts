@@ -4,6 +4,12 @@
  * kinds the epic scopes (authoritative over the handoff doc's longer example
  * list, which also names `jira-idea` and `zendesk-ticket`): `jira-work-item`,
  * `jira-project`, `confluence-page`, `github-issue`, `filesystem`, `webpage`.
+ * FACTORY-57 (implementing FACTORY-56, epic FACTORY-55) adds a SEVENTH kind,
+ * `github-pr`, outside that original epic's scope but requested by a later
+ * story — see `github-pr-ref.ts`'s own header for how it shares GitHub's
+ * owner/repo#number identity shape with `github-issue` without colliding
+ * (the canonical `github-issue:`/`github-pr:` PROVIDER PREFIX carries the
+ * distinction; the payload after the colon never needs to).
  *
  * NAMING TRAP RECORDED HERE ON PURPOSE: this codebase already has a type
  * named `ResourceProvider` (`src/rules/agent-key.ts`), covering a DIFFERENT,
@@ -38,13 +44,14 @@
  * exactly the string dedup/idempotency compare against.
  */
 import { formatGithubIssueRef, githubIssueRefFromUrl, parseGithubIssueRef, type GithubIssueRef } from "./github-issue-ref.js";
+import { formatGithubPrRef, githubPrRefFromUrl, parseGithubPrRef, type GithubPrRef } from "./github-pr-ref.js";
 import { formatJiraWorkItemRef, parseJiraWorkItemRef, type JiraWorkItemRef } from "./jira-work-item-ref.js";
 import { formatJiraProjectRef, parseJiraProjectRef, type JiraProjectRef } from "./jira-project-ref.js";
 import { formatConfluencePageRef, parseConfluencePageRef, type ConfluencePageRef } from "./confluence-page-ref.js";
 import { formatFilesystemRef, parseFilesystemRef, type FilesystemRef } from "./filesystem-ref.js";
 import { formatWebpageRef, parseWebpageRef, type WebpageRef } from "./webpage-ref.js";
 
-export const RESOURCE_REF_PROVIDERS = ["jira-work-item", "jira-project", "confluence-page", "github-issue", "filesystem", "webpage"] as const;
+export const RESOURCE_REF_PROVIDERS = ["jira-work-item", "jira-project", "confluence-page", "github-issue", "github-pr", "filesystem", "webpage"] as const;
 export type ResourceRefProvider = (typeof RESOURCE_REF_PROVIDERS)[number];
 
 export type ResourceRef =
@@ -52,6 +59,7 @@ export type ResourceRef =
   | ({ provider: "jira-project" } & JiraProjectRef)
   | ({ provider: "confluence-page" } & ConfluencePageRef)
   | ({ provider: "github-issue" } & GithubIssueRef)
+  | ({ provider: "github-pr" } & GithubPrRef)
   | ({ provider: "filesystem" } & FilesystemRef)
   | ({ provider: "webpage" } & WebpageRef);
 
@@ -104,6 +112,16 @@ export function parseResourceRef(input: string): ResourceRef {
       if (!ref) throw new Error(`invalid github-issue reference ${JSON.stringify(rest)}: expected "<owner>/<repo>#<number>" or a GitHub issue URL, e.g. "github-issue:brooswit-factory/butchr#42"`);
       return { provider, ...ref };
     }
+    case "github-pr": {
+      // FACTORY-57: same "bare id or URL" ergonomic as github-issue above,
+      // with `githubPrRefFromUrl` requiring a `/pull/<n>` path rather than
+      // `/issues/<n>` — see `github-pr-ref.ts`'s header for why the bare
+      // form alone is genuinely ambiguous with a github-issue ref, and why
+      // that's fine (the `provider` prefix here is what disambiguates it).
+      const ref = parseGithubPrRef(rest) ?? githubPrRefFromUrl(rest);
+      if (!ref) throw new Error(`invalid github-pr reference ${JSON.stringify(rest)}: expected "<owner>/<repo>#<number>" or a GitHub pull-request URL, e.g. "github-pr:brooswit-factory/butchr#42"`);
+      return { provider, ...ref };
+    }
     case "filesystem": {
       const ref = parseFilesystemRef(rest);
       if (!ref) throw new Error(`invalid filesystem reference ${JSON.stringify(rest)}: expected an absolute path, e.g. "filesystem:/srv/factory/butchr"`);
@@ -131,6 +149,7 @@ export function formatResourceRef(ref: ResourceRef): string {
     case "jira-project": return `jira-project:${formatJiraProjectRef(ref)}`;
     case "confluence-page": return `confluence-page:${formatConfluencePageRef(ref)}`;
     case "github-issue": return `github-issue:${formatGithubIssueRef(ref)}`;
+    case "github-pr": return `github-pr:${formatGithubPrRef(ref)}`;
     case "filesystem": return `filesystem:${formatFilesystemRef(ref)}`;
     case "webpage": return `webpage:${formatWebpageRef(ref)}`;
     default: {

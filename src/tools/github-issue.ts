@@ -11,6 +11,12 @@
  * per-connection tool lists), so the separation is enforced at call time:
  * `forJiraCallers` refuses a GitHub agent on every Jira/Confluence tool
  * before the tool runs. A Jira caller passes through it untouched.
+ *
+ * FACTORY-57: `github-pr`'s own tools (`github_get_pr`/`github_pr_add_comment`)
+ * live in `./github-pr.ts`, a sibling module — never here — but its provider
+ * shares this file's `forJiraCallers` gate and `OWN_TOOLS` table below, the
+ * same way `jira-idea`/`zendesk-ticket` already do, so the gate has exactly
+ * ONE list of "every non-Jira provider" to stay in sync with.
  */
 import { z, type ToolDef } from "@brooswit/thatch";
 import { callerIdentity, type CallerIdentity } from "../mcp/identity.js";
@@ -85,6 +91,7 @@ export function githubIssueTools(deps: GithubIssueToolDeps): Record<string, Tool
 const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work">, string>> = {
   "jira-project": "operator-configured MCP tools (free-form project agent)",
   "github-issue": "github_get_issue, github_add_comment and github_link_jira_idea",
+  "github-pr": "github_get_pr and github_pr_add_comment",
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
   "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
   "filesystem": "your own file tools (Read/Write/Edit/Bash) directly — there is no butchr MCP tool for a filesystem resource",

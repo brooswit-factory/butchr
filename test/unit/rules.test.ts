@@ -9,6 +9,7 @@ import {
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
+import { ownsGithubPrAgent } from "../../src/rules/github-pr-type.js";
 import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
 import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
@@ -582,7 +583,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -605,6 +606,7 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
   switch (provider) {
     case "jira-work": case "jira-idea": return "BUTCHR-12";
     case "github-issue": return "owner/repo#12";
+    case "github-pr": return "owner/repo#12";
     case "zendesk-ticket": return "acme#12";
     case "jira-project": return "BUTCHR";
     case "filesystem": return "/tmp/example.txt";

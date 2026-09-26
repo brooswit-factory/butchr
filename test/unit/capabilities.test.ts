@@ -16,6 +16,7 @@ const REF_OF: Record<(typeof CAPABILITY_PROVIDERS)[number], CapabilityRef> = {
   "jira-idea": { provider: "jira-idea", key: "IDEA-1" },
   "confluence-page": { provider: "confluence-page", pageId: "123456" },
   "github-issue": { provider: "github-issue", owner: "brooswit-factory", repo: "butchr", number: 1 },
+  "github-pr": { provider: "github-pr", owner: "brooswit-factory", repo: "butchr", number: 1 },
   "zendesk-ticket": { provider: "zendesk-ticket", subdomain: "acme", id: 1 },
   filesystem: { provider: "filesystem", path: "/srv/factory/butchr" },
   webpage: { provider: "webpage", url: "https://example.com/resource" },
@@ -37,6 +38,9 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   test("github-issue: query, read, links and comments (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — no snapshot/diff wiring", () => {
     expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links"]);
   });
+  test("github-pr: query, read, links and comments (FACTORY-57: mirrors github-issue's own capability row exactly) — no snapshot/diff wiring", () => {
+    expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "links"]);
+  });
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
     expect(capabilitiesOf(REF_OF["zendesk-ticket"])).toEqual(["query", "read", "comments"]);
   });
@@ -52,14 +56,14 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
 });
 
 /**
- * The full 8x6 inventory (docs/provider-capabilities.md), pinned in one
- * place so any future accidental drift in MATRIX (src/resources/
- * capabilities.ts) — a cell flipped, added, or removed without an
- * accompanying doc/test update — fails loudly here rather than only
- * shifting the per-provider `capabilitiesOf` assertions above one at a
- * time. Every `true` cell below must be backed by real, wired-in code (see
- * the per-provider tests above and comments.test.ts); every `false` cell's
- * reasoning is in the doc.
+ * The full 9x6 inventory (docs/provider-capabilities.md; 8x6 before
+ * FACTORY-57 added `github-pr`), pinned in one place so any future
+ * accidental drift in MATRIX (src/resources/capabilities.ts) — a cell
+ * flipped, added, or removed without an accompanying doc/test update —
+ * fails loudly here rather than only shifting the per-provider
+ * `capabilitiesOf` assertions above one at a time. Every `true` cell below
+ * must be backed by real, wired-in code (see the per-provider tests above
+ * and comments.test.ts); every `false` cell's reasoning is in the doc.
  */
 const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typeof CAPABILITIES)[number], boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
@@ -67,6 +71,7 @@ const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typ
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },

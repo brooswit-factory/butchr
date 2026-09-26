@@ -249,6 +249,18 @@ describe("specForSessionDefinition", () => {
     expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
 
+  test("DROVR-42/FACTORY-67: lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const match: SessionDefinitionMatch = {
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"),
+      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false, lizardMode: true },
+    };
+    const spec = specForSessionDefinition(match);
+    expect(spec).not.toHaveProperty("lizardMode");
+    expect(Object.keys(spec)).not.toContain("lizardMode");
+  });
+
   test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {
     const rule = builtinManagedSessionsRule("/defs");
     const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
@@ -363,6 +375,27 @@ describe("createManagedSessionResourceType", () => {
     await type.discovery.search();
     expect(resolvedAgents.get(keyTier)).toEqual({ model: "sonnet" });
     expect(resolvedAgents.has(keyPower)).toBe(false);
+  });
+
+  test("DROVR-42/FACTORY-67: `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key, defaulting to false when absent — a frozen/removed definition's entry does not linger", async () => {
+    let files: Record<string, string> = {
+      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: true, permissionMode: "default" })),
+      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent — defaults to false
+    };
+    const { list } = fakeFiles(files);
+    const rule = builtinManagedSessionsRule("/defs");
+    const lizardModes = new Map<string, boolean>();
+    const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, lizardModes });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    await type.discovery.search();
+    expect(lizardModes.get(keyA)).toBe(true);
+    expect(lizardModes.get(keyB)).toBe(false);
+    // b.json goes frozen (still valid, but ineligible) — its entry must not linger.
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })) };
+    await type.discovery.search();
+    expect(lizardModes.get(keyA)).toBe(true);
+    expect(lizardModes.has(keyB)).toBe(false);
   });
 
   test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {

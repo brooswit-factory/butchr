@@ -70,7 +70,7 @@ describe("workspace identity", () => {
   });
 
   test("BUTCHR-398 (review finding 1): singleResourceOf is null for a query-level id — a caller that needs a real single resource to write to (e.g. an escalation comment) must never fall back to the bogus whole key resourceKeyOf itself falls back to", () => {
-    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+    for (const resourceProvider of ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket"] as const) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
       expect(singleResourceOf(key)).toBeNull();
       // Never equal to resourceKeyOf's own fallback (the bogus whole key) — this is the actual bug being closed.
@@ -83,7 +83,7 @@ describe("workspace identity", () => {
     expect(singleResourceOf(key)).toBe(resourceKeyOf(key));
   });
   test("BUTCHR-398: mcpIdentityHeaders for a query-level spec sends x-butchr-agent alone, never x-issue, for every provider including jira-work", () => {
-    for (const resourceProvider of ["jira-work", "github-issue", "jira-idea", "zendesk-ticket"] as const) {
+    for (const resourceProvider of ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket"] as const) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
       const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "b" };
       expect(mcpIdentityHeaders(spec)).toEqual({ "x-butchr-agent": key });

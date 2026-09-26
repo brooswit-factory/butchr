@@ -488,11 +488,15 @@ const providerOf = (spec: SpawnSpec) => decodeAnyAgentKey(spec.key)?.resourcePro
 /** A query-level spec (`singleton`/`persistent`, BUTCHR-398): no single resource, of ANY provider — see `mcpIdentityHeaders`/`buildWorkspace`'s own use. */
 const isQuerySpec = (spec: SpawnSpec): boolean => decodeQueryAgentKey(spec.key) !== null;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"].includes(providerOf(spec) ?? "");
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
   "Your resource is a GitHub issue, not a Jira ticket. Read it (title, body, type, comments) with the butchr `github_get_issue` tool and comment on it with `github_add_comment`; both act only on your own issue. When your rule is allowed to, `github_link_jira_idea` links your issue to an existing Jira Product Discovery idea. Jira and Confluence tools refuse you. You are told when the issue changes — re-read it then.";
+
+/** FACTORY-57: what a `github-pr` agent is told about its tools; a Jira brief carries no such section. */
+export const GITHUB_PR_TOOLS_NOTE =
+  "Your resource is a GitHub pull request, not a Jira ticket. Read it (title, body, state, merged/draft, labels, comments) with the butchr `github_get_pr` tool and comment on it with `github_pr_add_comment`; both act only on your own pull request. Jira and Confluence tools refuse you. Your agent is stopped when this PR is merged or closed and your rule's own query no longer matches it. You are told when the PR changes — re-read it then.";
 
 /** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
 export const JIRA_IDEA_TOOLS_NOTE =
@@ -520,7 +524,7 @@ export const FILESYSTEM_TOOLS_NOTE =
 export const MANAGED_SESSION_TOOLS_NOTE =
   "Your resource is a managed-session definition file, not a Jira ticket. Read and edit YOUR OWN definition directly with your own file tools — there is no general-purpose butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. The ONE exception: if ANOTHER definition's own `freezeControllers`/`unfreezeControllers` grant names your definition's file, you may call the butchr `freeze_session`/`unfreeze_session` tool (argument: that OTHER definition's name) to flip its freeze state. You have no other butchr MCP tool, and you can never edit any grant, or create, archive, or delete a definition — see docs/managed-sessions.md's \"Delegated freeze/unfreeze\" section. You are told when your own file changes (created, modified, or removed) — re-read it from disk then.";
 
-const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "github-pr": GITHUB_PR_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 
 /**
  * A rule-engine brief: the rule's own text under a header naming the ticket.
@@ -543,7 +547,7 @@ const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
  * the resource (every tool resolves the caller's ticket from it);
  * `x-butchr-agent` is added for rule-engine agents so events and own-write
  * echoes are scoped to the one agent, not every agent on the same ticket.
- * A `github-issue`, `jira-idea` or `zendesk-ticket` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
+ * A `github-issue`, `github-pr`, `jira-idea` or `zendesk-ticket` agent sends only `x-butchr-agent` (src/mcp/identity.ts).
  *
  * BUTCHR-398: a query-level agent (`singleton`/`persistent`, ANY provider —
  * checked BEFORE `isKeyOnly`) sends only `x-butchr-agent` too, for the same

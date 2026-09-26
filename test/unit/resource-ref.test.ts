@@ -14,6 +14,9 @@ describe("parseResourceRef: valid, one per provider", () => {
   test("github-issue", () => {
     expect(parseResourceRef("github-issue:brooswit-factory/butchr#42")).toEqual({ provider: "github-issue", owner: "brooswit-factory", repo: "butchr", number: 42 });
   });
+  test("github-pr (FACTORY-57)", () => {
+    expect(parseResourceRef("github-pr:brooswit-factory/butchr#42")).toEqual({ provider: "github-pr", owner: "brooswit-factory", repo: "butchr", number: 42 });
+  });
   test("filesystem", () => {
     expect(parseResourceRef("filesystem:/srv/factory/butchr")).toEqual({ provider: "filesystem", path: "/srv/factory/butchr" });
   });
@@ -55,6 +58,7 @@ describe("formatResourceRef: round-trips every provider's canonical form", () =>
     "jira-project:BUTCHR",
     "confluence-page:123456",
     "github-issue:brooswit-factory/butchr#42",
+    "github-pr:brooswit-factory/butchr#42",
     "filesystem:/srv/factory/butchr",
     "webpage:https://example.com/resource",
   ]) {
@@ -78,6 +82,19 @@ describe("canonicalKey: dedup equivalence and non-equivalence, across the whole 
     expect(canonicalKey(parseResourceRef("github-issue:https://github.com/Owner/Repo/issues/1"))).toBe(canonicalKey(parseResourceRef("github-issue:owner/repo#1")));
   });
 
+  test("FACTORY-57: a github-pr URL (mixed case) and the bare canonical form for the same PR are equivalent", () => {
+    expect(canonicalKey(parseResourceRef("github-pr:https://github.com/Owner/Repo/pull/1"))).toBe(canonicalKey(parseResourceRef("github-pr:owner/repo#1")));
+  });
+
+  test("FACTORY-57: github-issue:owner/repo#1 and github-pr:owner/repo#1 are NEVER equivalent, despite sharing the same bare payload shape — the provider prefix is the whole distinction", () => {
+    expect(canonicalKey(parseResourceRef("github-issue:owner/repo#1"))).not.toBe(canonicalKey(parseResourceRef("github-pr:owner/repo#1")));
+  });
+
+  test("FACTORY-57: a github-issue URL and a github-pr URL for the SAME number are refused by the OTHER provider's parser — /issues/ vs /pull/ never cross-parses", () => {
+    expect(() => parseResourceRef("github-pr:https://github.com/owner/repo/issues/1")).toThrow(/invalid github-pr reference/);
+    expect(() => parseResourceRef("github-issue:https://github.com/owner/repo/pull/1")).toThrow(/invalid github-issue reference/);
+  });
+
   test("a webpage ref and a confluence-page ref for the SAME real page are NOT equivalent — known, deliberately unresolved aliasing (docs/resource-links.md)", () => {
     const confluence = canonicalKey(parseResourceRef("confluence-page:39518269"));
     const webpage = canonicalKey(parseResourceRef("webpage:https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title"));
@@ -93,6 +110,6 @@ describe("canonicalKey: dedup equivalence and non-equivalence, across the whole 
   });
 });
 
-test("RESOURCE_REF_PROVIDERS names exactly the epic's six scoped kinds", () => {
-  expect(([...RESOURCE_REF_PROVIDERS] as string[]).sort()).toEqual(["confluence-page", "filesystem", "github-issue", "jira-project", "jira-work-item", "webpage"].sort());
+test("RESOURCE_REF_PROVIDERS names exactly the epic's six scoped kinds, plus FACTORY-57's later github-pr addition", () => {
+  expect(([...RESOURCE_REF_PROVIDERS] as string[]).sort()).toEqual(["confluence-page", "filesystem", "github-issue", "github-pr", "jira-project", "jira-work-item", "webpage"].sort());
 });
