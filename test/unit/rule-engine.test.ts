@@ -957,6 +957,16 @@ describe("rule workspaces", () => {
     expect(codexWithMode.provider === "codex" && "permissionMode" in codexWithMode).toBe(false);
   });
 
+  test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig reaches a claude launch's strictMcpConfig; absent means today's behaviour exactly (no field at all)", () => {
+    const withFlag = agentLaunchConfig({ ...ruleSpec, strictMcpConfig: true }, "/d", "p", "n", { provider: "claude" });
+    expect(withFlag.provider === "claude" && withFlag.strictMcpConfig).toBe(true);
+    const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
+    expect(without.provider === "claude" && "strictMcpConfig" in without).toBe(false);
+    // Codex has no strict-MCP-config concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
+    const codexWithFlag = agentLaunchConfig({ ...ruleSpec, strictMcpConfig: true }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
+    expect(codexWithFlag.provider === "codex" && "strictMcpConfig" in codexWithFlag).toBe(false);
+  });
+
   test("the herd reports rule agents by key, legacy agents by bare key, and only rule agents survive ownership scoping", async () => {
     const ruleCwd = buildWorkspace(ruleSpec, "http://localhost:7717/mcp", "codex", []);
     const legacyCwd = join(root, "BUTCHR-12");

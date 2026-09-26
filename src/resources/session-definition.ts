@@ -89,6 +89,29 @@ export interface SessionDefinition {
   vendor: SessionDefinitionVendor;
   tier: SessionTier;
   permissionMode: SessionPermissionMode;
+  /**
+   * BUTCHR-453/BUTCHR-463 — reaches a Claude launch's
+   * `ClaudeAgentLaunch.strictMcpConfig` verbatim (`@brooswit/drovr`; emits
+   * `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads
+   * ONLY the servers named in this agent's own `mcp.json` — no project- or
+   * user-level `.mcp.json` discovery on top of it). This is what lets a
+   * definition express the Candlestix directors' "permission mode auto with
+   * a strict MCP config" faithfully; `assertNoInheritedMcpConfig`
+   * (src/agents/workspace.ts) is a related but narrower guarantee (no
+   * PROJECT-level `.mcp.json` inherited from an ancestor directory) that
+   * does not exclude user-level config the way this field does — see
+   * docs/managed-sessions.md's "Nexus's MCP isolation constraint" for both.
+   * `"codex"` has no equivalent concept — REJECTED at manifest load for a
+   * `vendor: "codex"` definition (see `sessionDefinitionProblems`), a
+   * deliberate departure from `permissionMode`'s own precedent (which is
+   * validated/stored but silently never forwarded to a Codex launch): a
+   * silently-ignored `permissionMode` is cosmetic, but a silently-ignored
+   * `strictMcpConfig` would leave an operator believing they have an
+   * MCP-isolation property they don't — the exact silent-loss failure mode
+   * this field exists to close. Absent/`false` means today's behaviour
+   * exactly — no flag, ordinary discovery.
+   */
+  strictMcpConfig?: boolean;
   /** Reused verbatim from `Rule` (src/rules/rules.ts) — same type, same validation, same "independent of every other field" semantics. Stored and surfaced; execution-mode RECONCILIATION for an individual definition is not implemented by this ticket (see docs/managed-sessions.md) — the built-in query itself always runs `swarm` (one agent per eligible definition file), which is already "one agent" for every mode at the file granularity this ticket covers. */
   execution: ExecutionMode;
   /** Reused verbatim from `Rule`. BUTCHR-460: wired, same as every other provider's rule-level `account` — see docs/rocketchat-accounts.md's "Wiring" section (`managedSessionAccountPolicies`, src/daemon/index.ts). */
@@ -135,7 +158,7 @@ export interface SessionDefinition {
 }
 
 const DEFINITION_FIELDS = new Set([
-  "workingDirectory", "brief", "vendor", "tier", "permissionMode", "execution", "account", "role", "frozen",
+  "workingDirectory", "brief", "vendor", "tier", "permissionMode", "strictMcpConfig", "execution", "account", "role", "frozen",
   "mcpServers", "freezeControllers", "unfreezeControllers",
 ]);
 
@@ -199,6 +222,10 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (!oneOf(SESSION_DEFINITION_VENDORS, doc.vendor)) problems.push(`${at}.vendor must be one of ${SESSION_DEFINITION_VENDORS.join(", ")}`);
   if (!oneOf(SESSION_TIERS, doc.tier)) problems.push(`${at}.tier must be one of ${SESSION_TIERS.join(", ")}`);
   if (!oneOf(SESSION_PERMISSION_MODES, doc.permissionMode)) problems.push(`${at}.permissionMode must be one of ${SESSION_PERMISSION_MODES.join(", ")}`);
+  if (doc.strictMcpConfig !== undefined) {
+    if (typeof doc.strictMcpConfig !== "boolean") problems.push(`${at}.strictMcpConfig must be a boolean`);
+    else if (doc.vendor === "codex") problems.push(`${at}.strictMcpConfig is not supported for vendor "codex" — Codex has no strict-MCP-config concept; omit this field for a Codex definition`);
+  }
   if (doc.execution !== undefined && !oneOf(EXECUTION_MODES, doc.execution)) problems.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
   if (doc.account !== undefined && !oneOf(ACCOUNT_POLICIES, doc.account)) problems.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
   if (doc.role !== undefined && !oneOf(AGENT_ROLES, doc.role)) problems.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
@@ -220,6 +247,7 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     vendor: d.vendor as SessionDefinitionVendor,
     tier: d.tier as SessionTier,
     permissionMode: d.permissionMode as SessionPermissionMode,
+    ...(d.strictMcpConfig !== undefined ? { strictMcpConfig: d.strictMcpConfig as boolean } : {}),
     execution: (d.execution as ExecutionMode | undefined) ?? "swarm",
     account: (d.account as AccountPolicy | undefined) ?? "none",
     role: (d.role as AgentRole | undefined) ?? "worker",

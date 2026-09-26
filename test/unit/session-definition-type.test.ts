@@ -196,6 +196,17 @@ describe("specForSessionDefinition", () => {
     expect(spec.agents).toEqual([{ harness: "codex", model: "gpt-5.6-terra" }]);
     expect(spec.parent).toBeNull();
     expect(spec.mcpServers).toBeUndefined();
+    expect(spec.strictMcpConfig).toBeUndefined();
+  });
+
+  test("BUTCHR-453/BUTCHR-463: carries the definition's own strictMcpConfig through to the SpawnSpec", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const match: SessionDefinitionMatch = {
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"),
+      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, strictMcpConfig: true },
+    };
+    expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
 
   test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {
