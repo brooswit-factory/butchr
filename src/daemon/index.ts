@@ -1043,6 +1043,29 @@ const issueCrashLoopDetector = createCrashLoopDetector({
   comments: (id) => (isQueryLevelAgent(id) ? Promise.resolve([]) : ownChannelComments(resourceKeyOf(id))),
   log: (line) => console.error(`  ${line}`),
 });
+// FACTORY-47: a managed-session agent (built-in `managed-sessions` rule,
+// BUTCHR-408) has NO Jira ticket to comment on at all — unlike
+// `issueCrashLoopDetector` above, every id this instance ever sees IS one of
+// these filesystem-provider ids (this is wired ONLY into
+// `startManagedSessionsLoop` below), never conditionally, so there is no
+// `isQueryLevelAgent`-style branch here: `addComment`/`comments` always
+// bypass Jira and log instead. Before this, a managed session whose agent
+// kept dying and being respawned (a startup crash, an MCP config that
+// failed to load, a session-limit refusal that never cleared, ...) had
+// NOTHING recording why — see `createCrashLoopDetector`'s own top comment
+// ("nothing to stop it and NOTHING TO SAY SO"), which this ticket found
+// applied to managed sessions exactly as much as to an ordinary rule agent,
+// just never wired up for them. Its own instance (never shared with
+// `issueCrashLoopDetector`), same reasoning as that detector's own doc
+// comment on why each `runResourceLoop` call needs its own tracker.
+const managedSessionCrashLoopDetector = createCrashLoopDetector({
+  now: () => Date.now(),
+  count: config.crashLoopCount,
+  windowMinutes: config.crashLoopWindowMinutes,
+  addComment: async (id, text) => { console.error(`  [managed-sessions:crash-loop] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
+  comments: () => Promise.resolve([]),
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
 // see src/agents/reconcile-failure.ts for the full mechanism, and that
 // module's own top comment for why this is independent of (not a
@@ -1408,6 +1431,7 @@ startManagedSessionsLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  checkCrashLoop: managedSessionCrashLoopDetector.check,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
