@@ -94,7 +94,12 @@ export function classifyWslHealth(input: WslHealthInput): WslHealthResult {
     return { state: "daemon-down", exitCode: WSL_HEALTH_EXIT_CODES["daemon-down"], headline: "WSL: UP, daemon: DOWN (systemd is not active inside the distro)", detail: [] };
   }
   if (input.systemdActive === null) {
-    return { state: "daemon-down", exitCode: WSL_HEALTH_EXIT_CODES["daemon-down"], headline: "WSL: UP, daemon: DOWN (could not determine whether systemd is active — exec into the distro failed)", detail: [] };
+    return {
+      state: "daemon-down",
+      exitCode: WSL_HEALTH_EXIT_CODES["daemon-down"],
+      headline: "WSL: UP, daemon: DOWN (could not determine whether systemd is active — most likely systemd is not enabled inside the distro; less commonly, the exec into it failed)",
+      detail: [],
+    };
   }
 
   if (input.daemonUnitActive !== true) {

@@ -70,7 +70,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${opts.herdrBin} serve
+ExecStart=${opts.herdrBin} server
 Restart=on-failure
 RestartSec=5
 

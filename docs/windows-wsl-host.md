@@ -189,18 +189,37 @@ WantedBy=default.target
 no-op for systemd, never a reason the unit refuses to start — deliberate,
 since `install` writes the unit before the operator has necessarily filled
 in real credentials into the (already-created, empty, `0600`) env files.
-`ExecStart` uses the **absolute** `bun` path this process itself ran under
-(the same PATH trap `scripts/deploy/watchdog.ts`'s own doc comment names for
-its `systemd-run` command — a systemd user unit's own environment is not
-guaranteed to include `~/.bun/bin` on `PATH`).
+`ExecStart` uses an **absolute** `bun` path — by default, the exact binary
+`cli.ts` itself is running under (`process.execPath`, same as
+`scripts/deploy/watchdog.ts`'s own `bunExecPath`), never a bare `bun`.
+This is not cosmetic: `systemd-analyze --user verify` on a unit with a bare
+`ExecStart=bun ...` fails outright (`Command bun is not executable: No such
+file or directory`) even when `bun` is genuinely on the *operator's own*
+shell `PATH` — a systemd unit's `ExecStart=` resolves a bare command name
+against systemd's own fixed search path, never the invoking shell's `PATH`
+(the same trap `scripts/deploy/watchdog.ts`'s own doc comment names for its
+`systemd-run` command). Override with `--bun-bin <path>` if you need a
+different `bun` than the one running `install` itself.
 
-`herdr.service` (`renderHerdrUnit`) plus a `LimitNOFILE` drop-in
-(`renderHerdrLimitNofileDropin`, `~/.config/systemd/user/herdr.service.d/
-limit-nofile.conf`, raised to 65536 by default) — matching the zippy
-report's own "`herdr.service` user unit plus a `LimitNOFILE` drop-in"
-shape. herdr holds one pane/pty per running agent, so the default
-per-process file-descriptor limit (often 1024) is worth raising explicitly
-up front rather than discovering the ceiling live during a busy fleet.
+`herdr.service` (`renderHerdrUnit`, `ExecStart=<herdr binary> server` — the
+subcommand herdr's own `--help` actually lists, not `serve`) plus a
+`LimitNOFILE` drop-in (`renderHerdrLimitNofileDropin`,
+`~/.config/systemd/user/herdr.service.d/limit-nofile.conf`, raised to 65536
+by default) — matching the zippy report's own "`herdr.service` user unit
+plus a `LimitNOFILE` drop-in" shape. herdr holds one pane/pty per running
+agent, so the default per-process file-descriptor limit (often 1024) is
+worth raising explicitly up front rather than discovering the ceiling live
+during a busy fleet.
+
+**`/etc/wsl.conf` is root-owned.** `install` tries a direct write first
+(works if it's already running as root); if that's refused (an ordinary
+user, the common case), it automatically falls back to `sudo tee
+/etc/wsl.conf` rather than crashing the run halfway through — you may see a
+`sudo` password prompt. If BOTH fail (no direct write permission and no
+usable sudo), that step reports as a `[next-step]` with the exact fix,
+and — this matters — **the rest of `install` still runs to completion**
+(linger, herdr, env files, both units) rather than dying on this one step;
+re-run `install` after fixing `/etc/wsl.conf` yourself.
 
 ## The Windows autostart task, and why it looks like this
 
@@ -216,30 +235,47 @@ should own the task:
 
 It registers one scheduled task (default name `Butchr-WSL`, generic and
 overridable via `-TaskName` — **never** `Candlestix-Zippy`/`USRR-Zippy`, per
-the hard constraint above), whose action is:
+the hard constraint above), whose action is a SINGLE, HELD invocation:
 
 ```
-wsl.exe -d <DistroName> -u <User> -- bash -lc "systemctl --user start butchr.service herdr.service"
+wsl.exe -d <DistroName> -u <User> -- bash -lc "systemctl --user start butchr.service herdr.service; exec sleep infinity"
 ```
 
-**Trigger: `AtLogOn` for `-User`, plus (by default) a repeating trigger
-every 30 minutes (`-RepeatMinutes`, 0 to disable) — not `AtStartup`.** This
-is a deliberate choice: a true boot-time (before any interactive logon)
-trigger needs a **stored password** (or a gMSA) for the task's run-as
-account, which is a materially bigger secret-handling surface than this
-story's own "secrets stay in 0600 token files" rule is scoped to cover.
-`AtLogOn` needs no stored credential at all — it runs as the
-already-authenticated logged-on user — at the cost of "the WSL VM only
-comes up once someone logs on," which matches the zippy report's own
-framing ("keep the WSL VM up") rather than "start before any login exists."
-WSL2 does not keep its VM running on its own once nothing is using it (see
-"WSL idle shutdown" below) — the repeating trigger is what actually counters
-that between logons, not the one-shot logon trigger alone, since every firing
-of the same `wsl.exe` action both wakes the VM (a side effect of any
-`wsl.exe` invocation reaching it) and re-confirms the two units are started.
-If your host genuinely needs a true no-logon boot start, that's a
-deliberately different, higher-privilege setup this script does not attempt
-— see "Troubleshooting" below.
+**`exec sleep infinity` is the part that actually keeps the VM up, not a
+periodic re-kick.** An earlier version of this script instead re-ran a
+short `wsl.exe ... systemctl start` on a repeating timer — a fire-and-forget
+`wsl.exe` invocation that starts the units and then RETURNS does not hold
+WSL2's VM open by itself (it shuts down once nothing is actively using it —
+see "WSL idle shutdown" below), and a periodic re-invocation does not
+reliably counter that either, since the VM can still idle out in the gap
+between runs. Replacing the shell with `sleep infinity` (`exec`, not a
+second process) makes the `wsl.exe` process itself long-lived: as long as
+it's alive, WSL has an active client. The task's own settings
+(`-RestartCount 999 -RestartInterval 1min`) restart it — re-running the
+whole line, including `systemctl --user start`, which is a harmless no-op
+on an already-active unit — if that held process is ever killed for any
+reason; `-ExecutionTimeLimit 0` disables Task Scheduler's own default 3-day
+execution limit, which would otherwise kill this intentionally-forever
+process on its own schedule regardless of anything WSL does.
+
+**Trigger: `AtLogOn` for `-User`, not `AtStartup`.** This is a deliberate
+choice: a true boot-time (before any interactive logon) trigger needs a
+**stored password** (or a gMSA) for the task's run-as account, which is a
+materially bigger secret-handling surface than this story's own "secrets
+stay in 0600 token files" rule is scoped to cover. `AtLogOn` needs no
+stored credential at all — it runs as the already-authenticated logged-on
+user — at the cost of "the WSL VM only comes up once someone logs on,"
+which matches the zippy report's own framing ("keep the WSL VM up") rather
+than "start before any login exists." If your host genuinely needs a true
+no-logon boot start, that's a deliberately different, higher-privilege
+setup this script does not attempt — see "Troubleshooting" below.
+
+**This keep-alive design is unverified off-Windows** (see "what was and
+wasn't tested" below) — the *logic* (hold a process, restart it on death,
+disable the time limit) is sound reasoning about how Task Scheduler and
+WSL2 are documented to behave, not something observed working end-to-end
+on a real host. If it turns out wrong once run for real, that observation
+wins — see this doc's own closing note.
 
 `Register-WslHostTask.ps1` is idempotent: re-running it against an
 already-registered `-TaskName` unregisters and replaces it with a fresh
@@ -369,10 +405,12 @@ default to) belong.
 - **`WSL idle shutdown`** — symptom: the daemon was healthy, then
   `Verify-WslHost.ps1` reports `WSL: DOWN` with nobody having touched
   anything — WSL2 shuts its VM down once nothing is actively using it.
-  This is exactly what the Windows scheduled task's repeating trigger
-  (`-RepeatMinutes`, default 30) exists to counter; if it's disabled
-  (`-RepeatMinutes 0`) or the task isn't registered at all, the VM will idle
-  out between logons.
+  `Register-WslHostTask.ps1`'s own held `wsl.exe ... sleep infinity` process
+  exists to counter this (see "The Windows autostart task" above); check
+  `Get-ScheduledTaskInfo -TaskName Butchr-WSL` and Task Manager for a
+  still-running `wsl.exe` process. If the held process died and the task's
+  restart count (999, 1 min apart) has been exhausted, or the task was never
+  registered at all, the VM will idle out between logons.
 - **`distro not found`** — symptom: `wsl.exe -d <name>` (or
   `Verify-WslHost.ps1 -DistroName <name>`) fails immediately. Check the
   exact registered name with `wsl -l -q` from Windows — it must match
@@ -406,18 +444,31 @@ tested, under plain `bun test` on Linux:
   already-correct step as `skipped` and — critically — never overwrites an
   env file that already has real-looking credentials in it; `--dry-run`
   makes zero writes; a missing prerequisite is a `next-step`, never a
-  failure; `verify` correctly classifies systemd-not-running,
+  failure; the default invocation (no `--bun-bin`) renders an ABSOLUTE
+  `ExecStart=` path, and an explicit `--bun-bin` overrides it; a refused
+  direct write to `/etc/wsl.conf` falls back to `sudo tee` and, if that
+  ALSO fails, reports a `next-step` rather than crashing the rest of the
+  run (proven by continuing to write every later step's files in the same
+  test); `verify` correctly classifies systemd-not-running,
   unit-inactive-with-journal-tail, and healthy, and honours `--port`/
   `--unit`.
 
 What was **not**, and cannot be, tested here: `install.sh`'s own bun
 bootstrap (the `curl | bash` line itself), any real `apt-get`/`loginctl`/
-`systemctl` invocation, any real WSL distro state transition, and both
-PowerShell scripts end-to-end (`Register-WslHostTask.ps1`,
+`systemctl`/`sudo` invocation, any real WSL distro state transition, and
+both PowerShell scripts end-to-end (`Register-WslHostTask.ps1`,
 `Verify-WslHost.ps1`) — neither can run at all outside a real Windows host.
-Treat every claim in this doc about what happens ON a Windows/WSL host as a
-design intent proven correct at the *logic* level, not as something
-observed working end-to-end. If you run this install for real and something
-in this doc turns out wrong, that observation wins — update this doc, don't
-trust it over what you just measured (same rule this factory's own ASSIST
-space documents for every other doc like it).
+**In particular, the Windows scheduled task's keep-alive mechanism (a held
+`wsl.exe ... sleep infinity` process, restarted on failure, with Task
+Scheduler's own execution-time limit disabled) is reasoning about
+documented Task Scheduler/WSL2 behavior, not an observed result** — an
+earlier version of this script relied on a periodic re-invocation instead,
+which a review correctly identified as not actually holding the VM up; the
+current design is believed correct but is exactly the kind of claim this
+section exists to flag as unverified. Treat every claim in this doc about
+what happens ON a Windows/WSL host as a design intent proven correct at the
+*logic* level, not as something observed working end-to-end. If you run
+this install for real and something in this doc turns out wrong, that
+observation wins — update this doc, don't trust it over what you just
+measured (same rule this factory's own ASSIST space documents for every
+other doc like it).

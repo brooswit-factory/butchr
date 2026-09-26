@@ -25,7 +25,7 @@ describe("renderButchrUnit", () => {
 describe("renderHerdrUnit", () => {
   test("includes ExecStart with the given herdr path", () => {
     const unit = renderHerdrUnit({ herdrBin: "/home/broos/.local/bin/herdr" });
-    expect(unit).toContain("ExecStart=/home/broos/.local/bin/herdr serve");
+    expect(unit).toContain("ExecStart=/home/broos/.local/bin/herdr server");
   });
 });
 

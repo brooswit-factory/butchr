@@ -6,6 +6,9 @@ interface FakeIoOpts {
   execResults?: Map<string, ExecResult>; // "cmd arg1 arg2" -> result
   files?: Map<string, string>;
   health?: { ok: boolean } | null;
+  /** Paths whose `writeFile` call throws (simulating EACCES on a root-owned path) instead of succeeding. */
+  writeFileThrows?: Set<string>;
+  bunExecPath?: string;
 }
 
 function fakeIo(opts: FakeIoOpts = {}) {
@@ -13,6 +16,7 @@ function fakeIo(opts: FakeIoOpts = {}) {
   const chmods: Array<[string, number]> = [];
   const copies: Array<[string, string]> = [];
   const execCalls: string[] = [];
+  const stdinInputs: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
 
@@ -20,15 +24,21 @@ function fakeIo(opts: FakeIoOpts = {}) {
     commandExists(cmd) {
       return (opts.commands ?? new Set()).has(cmd);
     },
-    execFile(cmd, args) {
+    execFile(cmd, args, input) {
       const key = [cmd, ...args].join(" ");
       execCalls.push(key);
-      return opts.execResults?.get(key) ?? { code: 0, stdout: "", stderr: "" };
+      const result = opts.execResults?.get(key) ?? { code: 0, stdout: "", stderr: "" };
+      if (input !== undefined) {
+        stdinInputs.push(input);
+        if (result.code === 0 && cmd === "sudo" && args[0] === "tee" && typeof args[1] === "string") files.set(args[1], input);
+      }
+      return result;
     },
     readFile(path) {
       return files.has(path) ? files.get(path)! : null;
     },
     writeFile(path, contents) {
+      if (opts.writeFileThrows?.has(path)) throw new Error(`EACCES: permission denied, open '${path}'`);
       files.set(path, contents);
     },
     fileExists(path) {
@@ -43,13 +53,14 @@ function fakeIo(opts: FakeIoOpts = {}) {
     },
     whoami: () => "broos",
     homeDir: () => "/home/broos",
+    bunExecPath: () => opts.bunExecPath ?? "/fake/.bun/bin/bun",
     async fetchHealth() {
       return opts.health ?? null;
     },
     stdout: (line) => stdout.push(line),
     stderr: (line) => stderr.push(line),
   };
-  return { io, files, chmods, copies, execCalls, stdout, stderr };
+  return { io, files, chmods, copies, execCalls, stdinInputs, stdout, stderr };
 }
 
 describe("wsl-host CLI: install", () => {
@@ -122,6 +133,49 @@ describe("wsl-host CLI: install", () => {
     expect(code).toBe(0);
     expect(stdout.some((l) => l.includes("[next-step] prereq: claude"))).toBe(true);
   });
+
+  test("default invocation (no --bun-bin) renders an ABSOLUTE ExecStart, never a bare 'bun' a systemd unit would refuse to start", async () => {
+    const { io, files } = fakeIo({ commands: new Set(["bun", "git", "claude", "codex"]), bunExecPath: "/home/broos/.bun/bin/bun" });
+    const code = await runWslHostCli(["install", "--repo-dir", "/home/broos/butchr"], io);
+    expect(code).toBe(0);
+    const unit = files.get("/home/broos/.config/systemd/user/butchr.service")!;
+    expect(unit).toContain("ExecStart=/home/broos/.bun/bin/bun run src/daemon/index.ts");
+    expect(unit).not.toContain("ExecStart=bun ");
+  });
+
+  test("an explicit --bun-bin overrides the resolved default", async () => {
+    const { io, files } = fakeIo({ commands: new Set(["bun", "git", "claude", "codex"]), bunExecPath: "/home/broos/.bun/bin/bun" });
+    const code = await runWslHostCli(["install", "--repo-dir", "/home/broos/butchr", "--bun-bin", "/opt/custom/bun"], io);
+    expect(code).toBe(0);
+    expect(files.get("/home/broos/.config/systemd/user/butchr.service")).toContain("ExecStart=/opt/custom/bun run src/daemon/index.ts");
+  });
+
+  test("/etc/wsl.conf: a direct write refused (EACCES) falls back to `sudo tee` and still succeeds, run continues to completion", async () => {
+    const { io, files, execCalls, stdout } = fakeIo({
+      commands: new Set(["bun", "git", "claude", "codex"]),
+      writeFileThrows: new Set(["/etc/wsl.conf"]),
+    });
+    const code = await runWslHostCli(["install", "--repo-dir", "/home/broos/butchr"], io);
+    expect(code).toBe(0);
+    expect(execCalls).toContain("sudo tee /etc/wsl.conf");
+    expect(files.get("/etc/wsl.conf")).toContain("systemd=true");
+    expect(stdout.some((l) => l.startsWith("[ok] wsl.conf") && l.includes("sudo tee"))).toBe(true);
+    // the run didn't die halfway — steps after wsl.conf still ran.
+    expect(files.has("/home/broos/.config/systemd/user/butchr.service")).toBe(true);
+  });
+
+  test("/etc/wsl.conf: direct write AND sudo tee both fail -> next-step (not a crash), run still continues to completion", async () => {
+    const { io, files, stdout } = fakeIo({
+      commands: new Set(["bun", "git", "claude", "codex"]),
+      writeFileThrows: new Set(["/etc/wsl.conf"]),
+      execResults: new Map([["sudo tee /etc/wsl.conf", { code: 1, stdout: "", stderr: "sudo: a password is required" }]]),
+    });
+    const code = await runWslHostCli(["install", "--repo-dir", "/home/broos/butchr"], io);
+    expect(code).toBe(0); // a next-step, not an "error" — never crashes the whole run
+    expect(files.has("/etc/wsl.conf")).toBe(false);
+    expect(stdout.some((l) => l.startsWith("[next-step] wsl.conf") && l.includes("sudo tee") && l.includes("also failed"))).toBe(true);
+    expect(files.has("/home/broos/.config/systemd/user/butchr.service")).toBe(true);
+  });
 });
 
 describe("wsl-host CLI: verify", () => {
@@ -168,7 +222,7 @@ describe("wsl-host CLI: verify", () => {
       ]),
       health: { ok: true },
     });
-    const wrapped: WslHostIo = { ...io, execFile: (cmd, args) => { calls.push([cmd, ...args].join(" ")); return io.execFile(cmd, args); } };
+    const wrapped: WslHostIo = { ...io, execFile: (cmd, args, input) => { calls.push([cmd, ...args].join(" ")); return io.execFile(cmd, args, input); } };
     const code = await runWslHostCli(["verify", "--unit", "custom.service"], wrapped);
     expect(code).toBe(0);
     expect(calls).toContain("systemctl --user is-active custom.service");

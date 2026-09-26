@@ -59,15 +59,18 @@ export interface ExecResult {
 
 export interface WslHostIo {
   commandExists: (cmd: string) => boolean;
-  /** Synchronous, like `watchdog.ts`'s own exec calls — never throws; a non-zero exit is a normal `ExecResult`, not an exception. */
-  execFile: (cmd: string, args: string[]) => ExecResult;
+  /** Synchronous, like `watchdog.ts`'s own exec calls — never throws; a non-zero exit is a normal `ExecResult`, not an exception. `input`, when given, is piped to the child's stdin (used for `sudo tee <path>`, below). */
+  execFile: (cmd: string, args: string[], input?: string) => ExecResult;
   readFile: (path: string) => string | null; // null on ENOENT
+  /** Throws on failure (e.g. EACCES writing a root-owned path like `/etc/wsl.conf` as a non-root user) — callers that can recover (see `stepWslConf`'s `sudo tee` fallback) must catch it themselves; this is deliberately NOT swallowed into a return value the way `execFile` is, so a plain `install` run on files it DOES own (units, env files) still fails loudly on a real unexpected error instead of silently no-op'ing. */
   writeFile: (path: string, contents: string, mode?: number) => void;
   fileExists: (path: string) => boolean;
   chmod: (path: string, mode: number) => void;
   copyFile: (from: string, to: string) => void;
   whoami: () => string;
   homeDir: () => string;
+  /** Absolute path to the `bun` binary this process is running under (`process.execPath`) — the default for `--bun-bin` when the flag is omitted. A systemd unit's `ExecStart=` resolves a bare command name against its own fixed search path, not the invoking shell's `PATH` (`systemd-analyze --user verify` on a unit with a bare `ExecStart=bun ...` fails with "Command bun is not executable" even when `bun` is genuinely on the operator's own PATH) — so the rendered unit must always get an absolute path, never a bare name, unless the caller explicitly overrides it with one via `--bun-bin`. Mirrors `scripts/deploy/watchdog.ts`'s own `bunExecPath`. */
+  bunExecPath: () => string;
   fetchHealth: (port: number) => Promise<{ ok: boolean } | null>;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
@@ -76,9 +79,9 @@ export interface WslHostIo {
 const HEALTH_FETCH_TIMEOUT_MS = 5_000;
 
 export function defaultIo(): WslHostIo {
-  function run(cmd: string, args: string[]): ExecResult {
+  function run(cmd: string, args: string[], input?: string): ExecResult {
     try {
-      const stdout = execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const stdout = execFileSync(cmd, args, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], ...(input !== undefined ? { input } : {}) });
       return { code: 0, stdout, stderr: "" };
     } catch (e) {
       const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -115,6 +118,7 @@ export function defaultIo(): WslHostIo {
     },
     whoami: () => userInfo().username,
     homeDir: () => homedir(),
+    bunExecPath: () => process.execPath,
     async fetchHealth(port) {
       try {
         const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(HEALTH_FETCH_TIMEOUT_MS) });
@@ -187,9 +191,22 @@ function stepWslConf(io: WslHostIo, opts: InstallOptions): StepResult {
   const { content, changed } = ensureWslConf(existing, { systemd: true, ...(opts.defaultUser !== undefined ? { defaultUser: opts.defaultUser } : {}) });
   if (!changed) return { name: "wsl.conf", status: "skipped", message: `${path} already has [boot] systemd=true${opts.defaultUser ? ` and [user] default=${opts.defaultUser}` : ""}` };
   if (opts.dryRun) return { name: "wsl.conf", status: "next-step", message: `would update ${path} (skipped: --dry-run) — requires root; restart WSL (\`wsl --shutdown\` from Windows) for it to take effect` };
-  // /etc/wsl.conf is root-owned — install.sh must be run as (or via sudo as) a user able to write it; see docs/windows-wsl-host.md.
-  io.writeFile(path, content);
-  return { name: "wsl.conf", status: "ok", message: `updated ${path} — restart WSL (\`wsl --shutdown\` from Windows) for systemd to take effect on first install` };
+
+  // /etc/wsl.conf is root-owned. Try a direct write first (works if this process already runs as root); on any failure (typically EACCES for an ordinary user), fall back to `sudo tee` rather than crashing the whole run halfway through — a normal user with passwordless (or interactively-prompted) sudo still completes the install.
+  try {
+    io.writeFile(path, content);
+    return { name: "wsl.conf", status: "ok", message: `updated ${path} directly — restart WSL (\`wsl --shutdown\` from Windows) for systemd to take effect on first install` };
+  } catch (e) {
+    const sudoResult = io.execFile("sudo", ["tee", path], content);
+    if (sudoResult.code !== 0) {
+      return {
+        name: "wsl.conf",
+        status: "next-step",
+        message: `could not write ${path} directly (${(e as Error).message ?? e}) and \`sudo tee ${path}\` also failed (exit ${sudoResult.code}): ${sudoResult.stderr.trim() || "(no stderr captured)"} — edit it yourself: ensure [boot]\\nsystemd=true${opts.defaultUser ? ` and [user]\\ndefault=${opts.defaultUser}` : ""}, then \`wsl --shutdown\` from Windows`,
+      };
+    }
+    return { name: "wsl.conf", status: "ok", message: `updated ${path} via \`sudo tee\` (direct write was not permitted) — restart WSL (\`wsl --shutdown\` from Windows) for systemd to take effect on first install` };
+  }
 }
 
 function stepLinger(io: WslHostIo, opts: InstallOptions): StepResult {
@@ -358,7 +375,7 @@ export async function runWslHostCli(argv: string[], io: WslHostIo = defaultIo())
     const defaultUserFlag = flags.get("default-user");
     const opts: InstallOptions = {
       repoDir,
-      bunBin: typeof flags.get("bun-bin") === "string" ? (flags.get("bun-bin") as string) : "bun",
+      bunBin: typeof flags.get("bun-bin") === "string" ? (flags.get("bun-bin") as string) : io.bunExecPath(),
       ...(typeof herdrBinFlag === "string" ? { herdrBin: herdrBinFlag } : {}),
       ...(typeof defaultUserFlag === "string" ? { defaultUser: defaultUserFlag } : {}),
       port: typeof flags.get("port") === "string" ? Number(flags.get("port")) : 7717,
