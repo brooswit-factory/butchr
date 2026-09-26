@@ -2,7 +2,7 @@ import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { DrovrClient } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
@@ -1223,6 +1223,16 @@ const ruleResourceType = createRuleResourceType({
   confluenceVersion: (id) => atlassian.confluencePageVersion(id),
   ...(config.github ? { github: { fetchImpl: fetch, token: config.github.token } } : {}),
   webpage: { fetchImpl: fetch },
+  // FACTORY-9: `pollFilesystem`'s own dep — plain `node:fs/promises` `stat`,
+  // no config gate (mirrors `webpage` immediately above: no credentials, no
+  // per-daemon opt-in needed).
+  filesystem: { stat },
+  // FACTORY-9: the SAME FACTORY-4 local link store `resourceLinkTools`
+  // above is registered with (a fresh `LinkStore` handle onto the same
+  // underlying file — this implementation is stateless per call, so a
+  // second handle is equivalent to sharing one instance; see
+  // `createLinkStore`'s own doc comment, src/resources/link-store.ts).
+  linkStore: createLinkStore(defaultLinksStorePath()),
   notify: notifyRuleAgent,
 });
 
