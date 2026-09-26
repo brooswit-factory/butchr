@@ -168,6 +168,14 @@ export interface EscalatorDeps {
    * behavior as before this ticket.
    */
   managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>;
+  /**
+   * PR #455 review: overrides `MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS` for
+   * `captureManagedSessionEscalationText` — exists so a test can inject a
+   * short value (milliseconds) to exercise a hung read/write without an
+   * actual multi-second wait or fake timers. Absent means the real,
+   * production default.
+   */
+  managedSessionCaptureTimeoutMs?: number;
 }
 
 interface PaneState {
@@ -392,52 +400,91 @@ const MANAGED_ESCALATION_CAPTURE_MAX_FILES = 50;
 const MANAGED_ESCALATION_CAPTURE_NAME = /^filesystem:[a-z0-9-]+:[A-Za-z0-9%._~-]+-managed-escalation-.+-(\d{8}T\d{6}Z)\.txt$/;
 
 /**
+ * PR #455 review: a capture that ERRORS is handled (logged, `null`
+ * returned), but a capture that HANGS is not — `deps.read` (herdr's own
+ * pane read) carries no deadline of its own (see drovr's DROVR-33, raised
+ * for the exact same reason), and an unbounded `list`/`write` on the
+ * injected sink is no safer. A few seconds, not milliseconds: a real pane
+ * read is fast, and the failure mode this guards is a genuinely stuck
+ * call, not ordinary latency.
+ */
+const MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS = 5_000;
+
+/**
  * FACTORY-50 (Part C): durably capture a keyless managed-session pane's
  * full, UNREDACTED text the moment `markManagedSessionStalled` marks a
  * genuinely NEW (pane, fingerprint) episode. Mirrors `captureEscalationText`
  * above: local disk only (never Jira — a managed session has no ticket to
- * post to), no redaction, fails open (a warning, never a throw — a failed
- * capture must never block the `[managed-escalation]` journal line), and
- * only the returned PATH — never the content — ever reaches that line.
+ * post to), no redaction, and only the returned PATH — never the content —
+ * ever reaches the `[managed-escalation]` journal line.
+ *
+ * PR #455 review: bounded by `MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS` (or
+ * `deps.managedSessionCaptureTimeoutMs`, for a test's short injected value)
+ * via `Promise.race` against the real work below — a capture that ERRORS
+ * OR HANGS must fail open the same way, since either would otherwise delay
+ * or suppress the alarm line itself, hold `onBlocked`'s `inFlight` guard
+ * open for that pane, and — through `onDrovrUnknownDialog` — stall drovr's
+ * own serialized poll for every pane. The timer is cleared the instant
+ * EITHER side settles, so a genuinely slow (not hung) capture that finishes
+ * just after losing the race still completes its own write on local disk —
+ * this only bounds how long `markManagedSessionStalled` itself waits, it
+ * never cancels the underlying read/list/write — but its result is
+ * discarded: a late resolution must never retroactively change the journal
+ * line or any state already committed to.
  */
 async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: string, target: ManagedSessionTarget, fp: string): Promise<string | null> {
   const sink = deps.captures;
   if (!sink) return null;
-  try {
-    const text = await deps.read(paneId);
-    const capturedAt = deps.now();
-    const name = `${target.agentKey}-managed-escalation-${paneId}-${compactUtc(capturedAt)}.txt`;
-    const header =
-      `# butchr managed-session escalation capture\n` +
-      `# agent-key: ${target.agentKey}\n` +
-      `# definition: ${target.definitionPath}\n` +
-      `# pane: ${paneId}\n` +
-      `# fingerprint: ${fp}\n` +
-      `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
-      `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
-      `\n`;
-    const all = await sink.list();
-    const ours = all
-      .map((n) => ({ n, m: MANAGED_ESCALATION_CAPTURE_NAME.exec(n) }))
-      .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
-      .map((x) => ({ name: x.n, ts: x.m[1]! }))
-      .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-    while (ours.length >= MANAGED_ESCALATION_CAPTURE_MAX_FILES) {
-      const oldest = ours.shift()!;
-      await sink.remove(oldest.name);
+  let timedOut = false;
+  const work = (async (): Promise<string | null> => {
+    try {
+      const text = await deps.read(paneId);
+      const capturedAt = deps.now();
+      const name = `${target.agentKey}-managed-escalation-${paneId}-${compactUtc(capturedAt)}.txt`;
+      const header =
+        `# butchr managed-session escalation capture\n` +
+        `# agent-key: ${target.agentKey}\n` +
+        `# definition: ${target.definitionPath}\n` +
+        `# pane: ${paneId}\n` +
+        `# fingerprint: ${fp}\n` +
+        `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
+        `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
+        `\n`;
+      const all = await sink.list();
+      const ours = all
+        .map((n) => ({ n, m: MANAGED_ESCALATION_CAPTURE_NAME.exec(n) }))
+        .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
+        .map((x) => ({ name: x.n, ts: x.m[1]! }))
+        .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+      while (ours.length >= MANAGED_ESCALATION_CAPTURE_MAX_FILES) {
+        const oldest = ours.shift()!;
+        await sink.remove(oldest.name);
+      }
+      return await sink.write(name, header + text);
+    } catch (e) {
+      // "WARNING: [managed-escalation] ..." — NOT bare
+      // `${MANAGED_ESCALATION_MARKER} ...` (matching `onDrovrUnknownDialog`'s
+      // own resolve-failure log just below): a bare
+      // `${MANAGED_ESCALATION_MARKER}`-prefixed line here would be
+      // indistinguishable, to any `startsWith(MANAGED_ESCALATION_MARKER)`
+      // reader (including this file's own tests), from the real
+      // stalled-mark line this same poll already logs — turning one
+      // escalation into two apparent ones. Suppressed entirely once this
+      // capture has already lost the race below: a late-arriving error must
+      // never log anything either, same as a late-arriving success.
+      if (!timedOut) deps.log(`WARNING: [managed-escalation] capture failed for pane ${paneId} (${target.agentKey}): ${(e as Error)?.message ?? e}`);
+      return null;
     }
-    return await sink.write(name, header + text);
-  } catch (e) {
-    // "WARNING: [managed-escalation] ..." — NOT bare `${MANAGED_ESCALATION_MARKER}
-    // ...` (matching `onDrovrUnknownDialog`'s own resolve-failure log just
-    // below): a bare `${MANAGED_ESCALATION_MARKER}`-prefixed line here would
-    // be indistinguishable, to any `startsWith(MANAGED_ESCALATION_MARKER)`
-    // reader (including this file's own tests), from the real stalled-mark
-    // line this same poll already logs — turning one escalation into two
-    // apparent ones.
-    deps.log(`WARNING: [managed-escalation] capture failed for pane ${paneId} (${target.agentKey}): ${(e as Error)?.message ?? e}`);
-    return null;
-  }
+  })();
+  const timeoutMs = deps.managedSessionCaptureTimeoutMs ?? MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<string | null>((resolve) => {
+    timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs);
+  });
+  const result = await Promise.race([work, timeout]);
+  clearTimeout(timer!);
+  if (timedOut) deps.log(`WARNING: [managed-escalation] capture timed out after ${timeoutMs}ms for pane ${paneId} (${target.agentKey}) — logging the escalation without a capture path`);
+  return result;
 }
 
 /**

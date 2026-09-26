@@ -66,7 +66,7 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null> } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -80,7 +80,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
   const delay = () => (opts.delayMs ? new Promise((r) => setTimeout(r, opts.delayMs)) : Promise.resolve());
 
   const escalator = createEscalator({
-    read: async () => { readCalls++; return paneText; },
+    read: opts.readOverride ?? (async () => { readCalls++; return paneText; }),
     send: async (pane, text) => { sent.push({ pane, text }); },
     addComment: async (issue, text) => {
       await delay();
@@ -104,6 +104,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     ...(opts.captures ? { captures: opts.captures } : {}),
     ...(opts.coverage ? { coverage: opts.coverage } : {}),
     ...(opts.managedSessionOf ? { managedSessionOf: opts.managedSessionOf } : {}),
+    ...(opts.managedSessionCaptureTimeoutMs !== undefined ? { managedSessionCaptureTimeoutMs: opts.managedSessionCaptureTimeoutMs } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -1919,6 +1920,67 @@ describe("createEscalator — managed-session escalation captures the full pane 
     expect(lines.length).toBe(1); // still marked stalled and logged
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture failed"))).toBe(true);
+  });
+
+  // PR #455 review: a capture that ERRORS is one thing, but a capture that
+  // HANGS (a pane read with no deadline of its own — the same reason drovr
+  // has DROVR-33) must not delay or suppress the alarm line, and must not
+  // leave the pane's inFlight guard held open forever.
+  test("a hung pane read still logs the [managed-escalation] line within the timeout, with no capture path, and releases the pane's inFlight state", async () => {
+    const cap = fakeCaptureSink();
+    const hungRead = () => new Promise<string>(() => {}); // never resolves
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target, readOverride: hungRead, managedSessionCaptureTimeoutMs: 20 });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines[0]).not.toContain("capture:");
+    expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
+    expect(cap.files.size).toBe(0); // the read never even produced text to write
+
+    // inFlight released: a second poll for the SAME pane must not skip as
+    // "a previous poll is still in flight" — proof the timed-out capture
+    // did not hold onBlocked's guard open forever.
+    await h.poll("p1", null, prompt);
+    expect(h.logs.some((l) => /previous poll is still in flight/.test(l))).toBe(false);
+  });
+
+  test("a hung capture-store write also times out — the journal line still logs, with no capture path, and inFlight is released", async () => {
+    const hungSink = {
+      write: (): Promise<string> => new Promise(() => {}), // never resolves
+      list: async () => [] as string[],
+      remove: async () => {},
+    };
+    const h = harness({ captures: hungSink, managedSessionOf: async () => target, managedSessionCaptureTimeoutMs: 20 });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+
+    const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).not.toContain("capture:");
+    expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
+
+    await h.poll("p1", null, prompt);
+    expect(h.logs.some((l) => /previous poll is still in flight/.test(l))).toBe(false);
+  });
+
+  test("a capture that resolves AFTER its timeout has already fired never retroactively logs or changes anything", async () => {
+    const cap = fakeCaptureSink();
+    let resolveRead: ((t: string) => void) | undefined;
+    const slowRead = () => new Promise<string>((resolve) => { resolveRead = resolve; });
+    const h = harness({ captures: cap.sink, managedSessionOf: async () => target, readOverride: slowRead, managedSessionCaptureTimeoutMs: 20 });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt); // times out at 20ms — logs once, no capture path
+
+    const linesAfterTimeout = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
+    expect(linesAfterTimeout.length).toBe(1);
+    expect(linesAfterTimeout[0]).not.toContain("capture:");
+
+    // Let the read finally resolve, well after the race was already lost.
+    resolveRead!(REAL);
+    await new Promise((r) => setTimeout(r, 30)); // give the late write a chance to land
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1); // no second/late line
   });
 
   test("evicts the oldest managed-session capture, by timestamp, once at the file cap — never touching the sibling issue-keyed shape", async () => {

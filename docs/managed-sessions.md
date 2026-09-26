@@ -1137,7 +1137,10 @@ the daemon at startup and readable from your own workspace's
   session-limit-watch's own captures (`<ISSUE>-unrecognised-<ts>.txt` /
   `<ISSUE>-no-reset-time-<ts>.txt`) — there is no issue/project key here at
   all — so none of the three ever lists, evicts, or is evicted by, either
-  of the others.
+  of the others. A definition path deep/long enough to push the full
+  filename past the filesystem's own 255-byte name limit fails the write —
+  handled the same as any other write failure (see "Failure handling"
+  below), never a crash.
 - **Contents**: a short `#`-commented header (agent key, definition path,
   pane id, dialog fingerprint, capture time) followed by the pane's full
   text verbatim, UNREDACTED — local disk only, never posted anywhere (there
@@ -1148,17 +1151,31 @@ the daemon at startup and readable from your own workspace's
   files matching this exact shape count toward the cap — a shared capture
   directory holding the other two kinds' files, or anything else, is never
   touched by this eviction.
-- **Failure handling**: a capture failure (disk full, permission error, …)
-  is logged once (`WARNING: [managed-escalation] capture failed for pane
-  ... `) and never blocks or delays the `[managed-escalation]` journal
-  line itself — the escalation is observational either way, so losing the
-  capture must never mean losing the alarm.
+- **Failure handling, and the timeout that bounds it**: a capture that
+  ERRORS (disk full, permission error, …) is logged once (`WARNING:
+  [managed-escalation] capture failed for pane ...`) and never blocks or
+  delays the `[managed-escalation]` journal line itself. A capture that
+  instead HANGS — the pane read this reuses (`herdr.pane.read`) carries no
+  deadline of its own, the same reason drovr's own escalation watcher has
+  DROVR-33 — is bounded by a separate timeout (`MANAGED_ESCALATION_CAPTURE_TIMEOUT_MS`,
+  a few seconds): past it, the capture is treated as failed (a distinct
+  `WARNING: ... capture timed out after ...` line) and the escalation
+  proceeds with no capture path, exactly like an outright error. The
+  underlying read/list/write is not cancelled — if it eventually completes
+  after losing the race, its file may still land on disk, but that
+  resolution is discarded and never changes the journal line or any state
+  already committed to. Either way — error or timeout — the escalation is
+  observational regardless, so losing the capture must never mean losing
+  the alarm.
 - **How an operator uses it**: the `[managed-escalation]` journal line
   names the capture's path directly (`... fingerprint: <fp> capture:
   <path>`) whenever a capture was written; read that file to see exactly
   what was on screen at the moment of escalation, instead of relying on the
   journal line's own (necessarily shorter) question/options summary or
-  attaching to a pane that may have already moved on.
+  attaching to a pane that may have already moved on. No path in the line
+  means either no `captures` dep configured, or the capture errored/timed
+  out — check the journal around that same line for a `WARNING:
+  [managed-escalation]` line either way.
 
 ### Two detectors, one mark
 
