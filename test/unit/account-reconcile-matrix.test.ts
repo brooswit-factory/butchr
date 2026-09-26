@@ -135,4 +135,50 @@ describe("BUTCHR-412: the 3x3 execution x account matrix, through the real recon
       expect(calls.filter((c) => c.method === "createUser")).toHaveLength(1); // only the ORIGINAL ensureAccount call above — the respawn adopted
     }
   });
+
+  // BUTCHR-412 review round 3, blocking finding, required test 2: the
+  // 12-concurrent/cap-8 race, through the REAL reconciler (reconcileNow runs
+  // every admitted agent's `ensure` under one `Promise.all` — exactly the
+  // shape that exposed the bug).
+  test("N agents admitted in ONE poll, temporary cap below N: exactly the cap is spawned, the rest withheld and logged, and a later poll picks up the withheld ones once a slot frees", async () => {
+    const store = fakeStore();
+    const { client } = fakeRcClient();
+    const manager = createAccountManager(baseAccountManagerDeps({ client, store, tempAccountCapThreshold: 8 }));
+    const logs: string[] = [];
+    const account = createAccountLifecycle({ manager, policyOf: () => "temporary", manifestPublisher: fakeManifestPublisher(), log: (l) => logs.push(l) });
+    const running = new Set<string>();
+    const herd: Herd = {
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return []; },
+      async spawn(spec) { running.add(spec.key); },
+      async stop(id) { running.delete(id); },
+      async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
+      async nudge() { return { delivered: true }; },
+    };
+    const ids = Array.from({ length: 12 }, (_, i) => `jira-work:triage:T-${i}`);
+    const desired = new Map(ids.map((id) => [id, { key: id, issuetype: "task", summary: "s", parent: null }]));
+
+    await reconcileNow(herd, desired, { account });
+    expect(running.size).toBe(8);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("temporary-cap-reached"))).toBe(true);
+    const spawnedFirstPoll = [...running];
+    const toFree = spawnedFirstPoll[0]!;
+
+    // Poll 2: `toFree`'s rule no longer desires it (dropped out of `desired`)
+    // — a genuine plan.stop. `reconcileNow`'s own spawn loop runs BEFORE its
+    // stop loop within one poll, so THIS poll's spawn attempts still see the
+    // cap exactly as full (toFree's account is not released until after);
+    // its release lands at the very end of this poll.
+    const desired2 = new Map(desired);
+    desired2.delete(toFree);
+    await reconcileNow(herd, desired2, { account });
+    expect(running.has(toFree)).toBe(false);
+    expect(running.size).toBe(7); // toFree stopped; nothing new admitted yet this same poll
+
+    // Poll 3, same desired2: NOW the freed slot is visible to the spawn
+    // loop, and exactly ONE of the still-withheld ids is admitted into it.
+    await reconcileNow(herd, desired2, { account });
+    expect(running.size).toBe(8); // still exactly at the cap: 7 originals + 1 newly admitted
+    for (const id of spawnedFirstPoll.slice(1)) expect(running.has(id)).toBe(true); // the other 7 originals were never disturbed
+  });
 });

@@ -183,7 +183,16 @@ function tokenFileValid(path: string): boolean {
 
 /** Write-then-chmod, same belt-and-suspenders as `buildWorkspace`'s own credential-file writes (`src/agents/workspace.ts`): `writeFileSync`'s `mode` option only applies when the underlying `open()` call CREATES the file, so an explicit `chmodSync` covers the "this token file already existed" case too (a stale, invalid file being freshly re-minted). */
 function writeTokenFile(path: string, token: string): void {
-  mkdirSync(dirname(path), { recursive: true });
+  // BUTCHR-412 review, non-blocking finding: `mode: 0o700` on the directory
+  // itself (not just 0600 on each file inside it) — every token FILE was
+  // already owner-only, but the directory's default umask mode (0755) let
+  // any other local user list which accounts have token files, i.e. every
+  // managed username, even though its contents stayed unreadable. Applied
+  // only when this call actually CREATES the directory (mkdirSync's own
+  // `mode` option, like writeFileSync's, is ignored for one that already
+  // exists) — a pre-existing directory's mode is left alone, same
+  // "chmod only what we just wrote" discipline this file's other writes use.
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, token, { mode: 0o600 });
   chmodSync(path, 0o600);
 }
@@ -195,6 +204,50 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
   const now = deps.now ?? defaultNow;
   const randomPassword = deps.randomPassword ?? defaultPassword;
   const withLock = makeKeyedLock();
+  /**
+   * BUTCHR-412 review round 3, blocking finding: `reconcileNow` runs
+   * `ensure` for every admitted agent under one `Promise.all` — DIFFERENT
+   * agent keys, so `withLock`'s per-key serialization does nothing to
+   * protect a cap check shared ACROSS keys. Reading `client.countUsers()`/
+   * `deps.store.list()` and comparing against a threshold is not atomic
+   * with the `createUser` call that follows it: every concurrent caller can
+   * observe the SAME pre-creation count and all decide to proceed,
+   * overshooting either cap (reproduced: 12 concurrent temporary ensures
+   * against a cap of 8 created all 12).
+   *
+   * Fixed with an in-memory reservation, held only for the window between
+   * "decided to create" and "the new record is actually persisted" (or the
+   * attempt fails) — the exact gap a bare count-then-create misses.
+   * `reservedTotal` guards the RC-wide `userCapThreshold`; `reservedTemporary`
+   * guards the separate temporary-account cap. `reserveCapacitySlot` below
+   * reads the current count PLUS the in-flight reservations and increments
+   * atomically, serialized by `withLock`'s own `CAP_LOCK_KEY` chain (a
+   * reserved key no real agent key can ever collide with — agent keys are
+   * `provider:rule:resource`, never containing U+0000) — the same `withLock`
+   * instance used for per-agent serialization, just a different chain.
+   */
+  let reservedTotal = 0;
+  let reservedTemporary = 0;
+  const CAP_LOCK_KEY = "\u0000cap";
+
+  /** Atomically checks BOTH caps against (persisted count + in-flight reservations) and reserves a slot on success. `null` means reserved; anything else is the refusal to return verbatim. The caller MUST release the reservation exactly once (success or failure) via `releaseCapacitySlot`. */
+  function reserveCapacitySlot(client: RocketChatClient, policy: AccountPolicy): Promise<AccountRefusal | null> {
+    return withLock(CAP_LOCK_KEY, async (): Promise<AccountRefusal | null> => {
+      const count = await client.countUsers();
+      if (count + reservedTotal >= deps.userCapThreshold) {
+        return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users${reservedTotal ? ` (plus ${reservedTotal} creation(s) already in flight)` : ""}, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
+      }
+      if (policy === "temporary") {
+        const tempCount = (await deps.store.list()).filter((r) => r.policy === "temporary").length;
+        if (tempCount + reservedTemporary >= deps.tempAccountCapThreshold) {
+          return { ok: false, reason: "temporary-cap-reached", message: `${tempCount} temporary Rocket.Chat accounts already exist${reservedTemporary ? ` (plus ${reservedTemporary} creation(s) already in flight)` : ""}, at or over the configured limit (${deps.tempAccountCapThreshold}) — withholding this one; it will be retried next poll rather than exceeding the limit or starving a permanent account's seat` };
+        }
+        reservedTemporary++;
+      }
+      reservedTotal++;
+      return null;
+    });
+  }
 
   return {
     ensureAccount(agentKey, policy) {
@@ -219,85 +272,90 @@ export function createAccountManager(deps: AccountManagerDeps): AccountManager {
           const existingRecord = trustRecord ? await deps.store.get(agentKey) : null;
           let user = existingRecord ? { id: existingRecord.rcUserId, username: existingRecord.username } : await client.getUserByUsername(username);
           let created = false;
-
-          if (!user) {
-            const count = await client.countUsers();
-            if (count >= deps.userCapThreshold) {
-              return { ok: false, reason: "cap-reached", message: `Rocket.Chat has ${count} users, at or over the configured guardrail threshold (${deps.userCapThreshold}) — refusing to create another; raise the threshold (below the real 50-user allowance) or free up accounts first` };
-            }
-            // BUTCHR-412 (BUTCHR-391 comment 23999): the seat cap above is
-            // the whole-fleet guardrail; this is a SEPARATE, tighter limit
-            // on concurrently-existing TEMPORARY accounts alone (never
-            // permanent — see this method's own refusal reasons), checked
-            // only on this same "about to create" path, never on an
-            // adopt/reuse.
-            if (policy === "temporary") {
-              const tempCount = (await deps.store.list()).filter((r) => r.policy === "temporary").length;
-              if (tempCount >= deps.tempAccountCapThreshold) {
-                return { ok: false, reason: "temporary-cap-reached", message: `${tempCount} temporary Rocket.Chat accounts already exist, at or over the configured limit (${deps.tempAccountCapThreshold}) — withholding this one; it will be retried next poll rather than exceeding the limit or starving a permanent account's seat` };
-              }
-            }
-            try {
-              const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
-              user = { id: created_.id, username: created_.username };
-              created = true;
-            } catch (e) {
-              if (!isUsernameTakenError(e)) throw e;
-              // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
-              const found = await client.getUserByUsername(username);
-              if (!found) throw e;
-              user = { id: found.id, username: found.username };
-            }
-          }
-
-          if (!isManagedUsername(user.username, deps.managedPrefix)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
-
-          const tokenFile = tokenFilePath(deps.tokenDir, user.username);
-          // BUTCHR-412: reuse a still-valid recorded token untouched — no RC
-          // TOKEN api call at all (no revoke, no regenerate) — rather than
-          // the original contract's unconditional revoke-then-reissue, which
-          // would silently invalidate whatever Nexus/rocketr already
-          // registered for a routine re-ensure (respawn, permanent
-          // adopt-on-every-start, daemon restart). Only ever attempted when
-          // this SAME agent already had a record AND that record's own
-          // token file still reads back non-empty.
-          //
-          // STILL calls `getUserByUsername` — a READ, never a write — before
-          // trusting it: the ORIGINAL contract's unconditional revoke call
-          // was ALSO this module's only signal that the recorded RC user had
-          // been deleted out-of-band (revoke against a gone user fails with
-          // RC's "not found"), and removing that call without a replacement
-          // would silently break stale-record recovery (a KEEP behaviour —
-          // see docs/rocketchat-accounts.md) for exactly the "token file
-          // still present, but RC user is gone" case. A read-only lookup
-          // preserves the detection without ever touching (or risking
-          // invalidating) the token itself.
-          if (existingRecord?.tokenFile && tokenFileValid(existingRecord.tokenFile)) {
-            const stillThere = await client.getUserByUsername(user.username);
-            if (!stillThere) {
-              try { unlinkSync(existingRecord.tokenFile); } catch { /* already gone, or never existed — either way, nothing to clean up */ }
-              await deps.store.delete(agentKey);
-              return attempt(false);
-            }
-            const record: AccountRecord = { agentKey, rcUserId: stillThere.id, username: stillThere.username, policy, createdAt: existingRecord.createdAt, tokenFile: existingRecord.tokenFile };
-            await deps.store.set(record); // keeps `policy` in sync if the rule's own account policy changed since the last ensure (temporary <-> permanent)
-            return { ok: true, policy, rcUserId: stillThere.id, username: stillThere.username, tokenFile: existingRecord.tokenFile, created, rotated: false };
-          }
+          // Set true only once `reserveCapacitySlot` actually reserved a
+          // slot for THIS call — released exactly once, in `finally` below,
+          // whether this call succeeds (after the new record is persisted),
+          // fails outright, or recurses into a fresh `attempt(false)` (whose
+          // OWN reservation, if any, is that call's own to release).
+          let reserved = false;
 
           try {
-            // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
-            await client.revokeManagedToken(user.id);
-            const token = await client.generateManagedToken(user.id);
-            writeTokenFile(tokenFile, token);
-            const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now(), tokenFile };
-            await deps.store.set(record);
-            return { ok: true, policy, rcUserId: user.id, username: user.username, tokenFile, created, rotated: true };
-          } catch (e) {
-            if (existingRecord && isRcUserNotFoundError(e)) {
-              await deps.store.delete(agentKey);
-              return attempt(false);
+            if (!user) {
+              const refusal = await reserveCapacitySlot(client, policy);
+              if (refusal) return refusal;
+              reserved = true;
+              try {
+                const created_ = await client.createUser({ username, name: username, email: `${username}@${MANAGED_EMAIL_DOMAIN}`, password: randomPassword() });
+                user = { id: created_.id, username: created_.username };
+                created = true;
+              } catch (e) {
+                if (!isUsernameTakenError(e)) throw e;
+                // Lost the create race to a concurrent ensureAccount (this process or another) — adopt what it made rather than erroring or duplicating.
+                const found = await client.getUserByUsername(username);
+                if (!found) throw e;
+                user = { id: found.id, username: found.username };
+              }
             }
-            throw e;
+
+            if (!isManagedUsername(user.username, deps.managedPrefix)) return { ok: false, reason: "not-managed", message: `Rocket.Chat username ${JSON.stringify(user.username)} for ${agentKey} carries no butchr-managed marker; refusing to adopt it` };
+
+            const tokenFile = tokenFilePath(deps.tokenDir, user.username);
+            // BUTCHR-412: reuse a still-valid recorded token untouched — no RC
+            // TOKEN api call at all (no revoke, no regenerate) — rather than
+            // the original contract's unconditional revoke-then-reissue, which
+            // would silently invalidate whatever Nexus/rocketr already
+            // registered for a routine re-ensure (respawn, permanent
+            // adopt-on-every-start, daemon restart). Only ever attempted when
+            // this SAME agent already had a record AND that record's own
+            // token file still reads back non-empty.
+            //
+            // STILL calls `getUserByUsername` — a READ, never a write — before
+            // trusting it: the ORIGINAL contract's unconditional revoke call
+            // was ALSO this module's only signal that the recorded RC user had
+            // been deleted out-of-band (revoke against a gone user fails with
+            // RC's "not found"), and removing that call without a replacement
+            // would silently break stale-record recovery (a KEEP behaviour —
+            // see docs/rocketchat-accounts.md) for exactly the "token file
+            // still present, but RC user is gone" case. A read-only lookup
+            // preserves the detection without ever touching (or risking
+            // invalidating) the token itself.
+            if (existingRecord?.tokenFile && tokenFileValid(existingRecord.tokenFile)) {
+              const stillThere = await client.getUserByUsername(user.username);
+              if (!stillThere) {
+                try { unlinkSync(existingRecord.tokenFile); } catch { /* already gone, or never existed — either way, nothing to clean up */ }
+                await deps.store.delete(agentKey);
+                return attempt(false);
+              }
+              const record: AccountRecord = { agentKey, rcUserId: stillThere.id, username: stillThere.username, policy, createdAt: existingRecord.createdAt, tokenFile: existingRecord.tokenFile };
+              await deps.store.set(record); // keeps `policy` in sync if the rule's own account policy changed since the last ensure (temporary <-> permanent)
+              return { ok: true, policy, rcUserId: stillThere.id, username: stillThere.username, tokenFile: existingRecord.tokenFile, created, rotated: false };
+            }
+
+            try {
+              // Best-effort revoke before issuing a fresh one: a fresh user has nothing to revoke (revokeManagedToken already treats "no such token" as success, not an error).
+              await client.revokeManagedToken(user.id);
+              const token = await client.generateManagedToken(user.id);
+              writeTokenFile(tokenFile, token);
+              const record: AccountRecord = { agentKey, rcUserId: user.id, username: user.username, policy, createdAt: existingRecord?.createdAt ?? now(), tokenFile };
+              await deps.store.set(record);
+              return { ok: true, policy, rcUserId: user.id, username: user.username, tokenFile, created, rotated: true };
+            } catch (e) {
+              if (existingRecord && isRcUserNotFoundError(e)) {
+                await deps.store.delete(agentKey);
+                return attempt(false);
+              }
+              throw e;
+            }
+          } finally {
+            // Released only AFTER the record above is persisted (a plain
+            // `return` inside a `try` still awaits every prior `await` in
+            // that block before `finally` runs) — never sooner, so a
+            // concurrent `reserveCapacitySlot` call can never observe a
+            // window where this slot is counted by neither the persisted
+            // store NOR the reservation. A call that never reserved (an
+            // adopt/reuse path, `existingRecord` truthy) leaves `reserved`
+            // false, making this a no-op.
+            if (reserved) { reservedTotal--; if (policy === "temporary") reservedTemporary--; }
           }
         };
 

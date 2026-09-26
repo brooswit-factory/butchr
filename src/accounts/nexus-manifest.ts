@@ -42,7 +42,12 @@ export interface NexusManifestPublisher {
 export function createFileNexusManifestPublisher(path: string): NexusManifestPublisher {
   return {
     async publish(entries) {
-      mkdirSync(dirname(path), { recursive: true });
+      // BUTCHR-412 review, non-blocking finding: 0700 on the directory
+      // itself, same reasoning as manager.ts's writeTokenFile — the manifest
+      // file is already 0600, but a default-umask directory would still let
+      // another local user see that a manifest exists (though not its
+      // content). Only applied when this call creates the directory.
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const body = JSON.stringify([...entries].sort((a, b) => a.account.localeCompare(b.account)), null, 2);
       writeFileSync(tmp, body, { mode: 0o600 });

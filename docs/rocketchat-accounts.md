@@ -700,6 +700,74 @@ credential design (agent never holds a token) does not change this either —
 rocketr, not the agent's own MCP connection, is what a human's DM actually
 reaches.
 
+## Concurrency: both caps are check-and-reserve, not check-then-create (BUTCHR-412 review round 3, blocking)
+
+`reconcileNow` runs `ensure` for every admitted agent under ONE `Promise.all`
+(`src/daemon/loop.ts`) — DIFFERENT agent keys, so `ensureAccount`'s own
+per-agent-key lock (`makeKeyedLock`) does nothing to protect a cap check
+shared ACROSS keys. A bare "read the count, compare to the threshold, then
+create" is not atomic with respect to a concurrent caller doing the exact
+same read before either has created anything: every concurrent call can
+observe the SAME pre-creation count and all decide to proceed, overshooting
+the cap (reproduced in review: 12 concurrent temporary ensures against a cap
+of 8 created all 12).
+
+Fixed with an in-memory reservation (`reservedTotal` for the RC-wide
+`userCapThreshold`, `reservedTemporary` for the temporary-account cap),
+serialized by the SAME `withLock` helper already used for per-agent-key
+locking, keyed under a reserved constant (`\u0000cap`, a string no
+real agent key — always `provider:rule:resource` — can ever collide with).
+`reserveCapacitySlot` reads the current count PLUS the in-flight
+reservations and increments atomically; the reservation is released — in a
+`finally`, exactly once — only AFTER the new record is actually persisted
+(the success path) or once the attempt has definitively failed (nothing will
+ever be persisted for it). This closes the exact gap a bare count-then-create
+misses: at every instant, either the STORE (temporary cap) or the live
+`countUsers()` PLUS the reservation (RC-wide cap) — never neither — accounts
+for a slot from the moment a caller decides to create it.
+
+**Why the two caps needed different persisted-count sources, and why that's
+fine.** The temporary cap's "already exists" count is `deps.store.list()` —
+a purely local, immediately-consistent read this module fully controls, so
+each successive concurrent call's fresh read already reflects every prior
+call's now-persisted record on its own, and the reservation only needs to
+cover the brief pre-persistence window. The RC-wide cap's count is
+`client.countUsers()` — Rocket.Chat's own live count — assumed to be
+read-after-write consistent for a create this SAME admin credential just
+made (a reasonable assumption for a REST API against one server); the
+reservation covers the same pre-persistence window for THAT source instead.
+Neither cap's fix depends on the other ever becoming stale or unreliable —
+each is provably correct on its own terms. (A permanently non-advancing
+`countUsers()` — e.g. an RC deployment with truly eventual-consistent reads —
+is not a scenario this fix (or the original design) claims to cover; the
+reservation only ever bridges REAL concurrent in-flight creates, not a
+source of truth that has stopped advancing at all.)
+
+## Residual gaps in reuse-not-rotate (BUTCHR-412 review round 3, non-blocking)
+
+Stated honestly per the review's own ask, rather than left implicit:
+
+- **A token revoked on the RC side (an admin removes the PAT out-of-band) is
+  never noticed and never re-minted.** "Valid" token reuse
+  (`tokenFileValid`) means only "the recorded file reads back non-empty"
+  plus a read-only `getUserByUsername` existence check — neither actually
+  calls RC to confirm the TOKEN itself still works. An agent (or Nexus, via
+  rocketr) would only discover this the same way any expired-credential
+  failure surfaces today — this module has no active token-liveness probe,
+  by design (adding one would mean either a live RC call on every
+  `ensureAccount`, defeating the whole point of "reuse without touching RC,"
+  or a separate polling mechanism nothing here currently has a seam for).
+- **A released `temporary` account simply disappears from the manifest with
+  no explicit signal that Nexus should unregister it from rocketr.**
+  `publishBatch` republishes the full, current `manifestEntries()` snapshot
+  whenever a release marks the batch dirty, so the released account's entry
+  is genuinely gone from the next manifest Nexus reads — but nothing tells
+  Nexus WHY an entry vanished (released vs. some other cause), and nothing
+  confirms Nexus actually unregistered it from rocketr in response. Both are
+  accepted, documented gaps for this ticket's scope — closing either is a
+  Nexus-side or S5-side follow-up, not a `reconcileNow`/`account-lifecycle.ts`
+  change.
+
 **Tests.** `test/fixtures/rocketchat-fakes.ts` is the reusable fake-RC
 harness (a fake `AccountStore`, a fake `RocketChatClient`, a fake
 `NexusManifestPublisher`, and `baseAccountManagerDeps`/`freshTokenDir` —

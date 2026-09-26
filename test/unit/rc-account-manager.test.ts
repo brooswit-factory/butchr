@@ -79,6 +79,21 @@ describe("ensureAccount", () => {
     expect(await store.get(AGENT)).toMatchObject({ agentKey: AGENT, rcUserId: r.rcUserId, username: r.username, policy: "temporary", tokenFile: r.tokenFile });
   });
 
+  // BUTCHR-412 review round 3, non-blocking finding: the token directory
+  // itself (not just each file inside it) should be 0700 — otherwise every
+  // managed account NAME is listable by another local user even though each
+  // token's contents stay unreadable.
+  test("the token directory is created at 0700 when this call actually creates it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rc-tokendir-"));
+    try {
+      const tokenDir = join(dir, "nested", "tokens");
+      const { client } = fakeRcClient();
+      const manager = createAccountManager(baseDeps({ client, store: fakeStore(), tokenDir }));
+      await manager.ensureAccount(AGENT, "temporary");
+      expect(statSync(tokenDir).mode & 0o777).toBe(0o700);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test("second and concurrent ensure calls for the same agent create no duplicate", async () => {
     const { client, calls } = fakeRcClient();
     const store = fakeStore();
@@ -333,6 +348,87 @@ describe("ensureAccount", () => {
       // Cap is now "reached" (1 of 1), but re-ensuring the SAME agent adopts its own existing record — never refused.
       const second = await manager.ensureAccount(AGENT, "temporary");
       expect(second).toMatchObject({ ok: true, created: false });
+    });
+
+    // BUTCHR-412 review round 3, blocking finding: `reconcileNow` runs
+    // `ensure` for every admitted agent under one `Promise.all` — DIFFERENT
+    // agent keys, so `ensureAccount`'s own per-key lock does nothing here.
+    // The cap check must be atomic across concurrent calls for different
+    // keys, not merely correct for one call at a time.
+    describe("concurrency (BUTCHR-412 review round 3)", () => {
+      test("12 concurrent NEW temporary ensures against a cap of 8 create exactly 8, refuse exactly 4 — never overshoots", async () => {
+        const { client, calls } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 8 }));
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => manager.ensureAccount(`jira-work:triage:T-${i}`, "temporary")),
+        );
+        const created = results.filter((r) => r.ok && r.policy !== "none" && r.created);
+        const refused = results.filter((r) => !r.ok && r.reason === "temporary-cap-reached");
+        expect(created).toHaveLength(8);
+        expect(refused).toHaveLength(4);
+        expect(calls.filter((c) => c.method === "createUser")).toHaveLength(8);
+        expect((await store.list()).filter((r) => r.policy === "temporary")).toHaveLength(8); // never more than the cap, even transiently
+      });
+
+      test("a failed create/mint releases its reservation — a throw never leaks a slot", async () => {
+        const store = fakeStore();
+        let failNext = true;
+        const flaky: RocketChatClient = {
+          async getUserByUsername() { return null; },
+          async countUsers() { return 0; },
+          async createUser(input) {
+            if (failNext) { failNext = false; throw new RocketChatHttpError(503, "user create"); }
+            return { id: `id-${input.username}`, username: input.username, active: true };
+          },
+          async deleteUser() {},
+          async generateManagedToken() { return "tok"; },
+          async revokeManagedToken() {},
+        };
+        const manager = createAccountManager(baseDeps({ client: flaky, store, tempAccountCapThreshold: 1 }));
+        await expect(manager.ensureAccount("jira-work:triage:FAIL", "temporary")).rejects.toBeInstanceOf(RocketChatHttpError);
+        // The failed attempt's reservation must have been released — a
+        // second call (still under the SAME cap of 1) succeeds.
+        const second = await manager.ensureAccount("jira-work:triage:OK", "temporary");
+        expect(second).toMatchObject({ ok: true, created: true });
+      });
+
+      test("concurrent PERMANENT ensures are never refused by the temporary limit, even while temporary ensures are simultaneously at their own cap", async () => {
+        const { client } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, tempAccountCapThreshold: 2 }));
+        const results = await Promise.all([
+          ...Array.from({ length: 4 }, (_, i) => manager.ensureAccount(`jira-work:triage:TMP-${i}`, "temporary")),
+          ...Array.from({ length: 4 }, (_, i) => manager.ensureAccount(`jira-work:triage:PERM-${i}`, "permanent")),
+        ]);
+        const permanentResults = results.slice(4);
+        expect(permanentResults.every((r) => r.ok && r.policy !== "none" && r.created)).toBe(true);
+        const temporaryCreated = results.slice(0, 4).filter((r) => r.ok && r.policy !== "none" && r.created);
+        expect(temporaryCreated).toHaveLength(2); // the temporary cap still holds, independently
+      });
+
+      // BUTCHR-412 review round 3: "the same window exists for the RC-wide
+      // userCapThreshold check ... cover both."
+      test("12 concurrent ensures (mixed temporary/permanent) against the RC-WIDE cap of 8 create exactly 8 total, never overshoot", async () => {
+        // `countUsers()` here reflects `byUsername.size` LIVE (no override) —
+        // same as a real RC server, whose own user count is immediately
+        // consistent with a `createUser` that already completed on it. The
+        // race this guards against is concurrent READS racing each other
+        // BEFORE any of them has created anything yet (every concurrent
+        // caller seeing the SAME pre-creation count) — not RC itself being
+        // stale, which no in-process reservation could fix anyway.
+        const { client, calls } = fakeRcClient();
+        const store = fakeStore();
+        const manager = createAccountManager(baseDeps({ client, store, userCapThreshold: 8, tempAccountCapThreshold: 100 }));
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => manager.ensureAccount(`jira-work:triage:U-${i}`, i % 2 === 0 ? "temporary" : "permanent")),
+        );
+        const created = results.filter((r) => r.ok && r.policy !== "none" && r.created);
+        const refused = results.filter((r) => !r.ok && r.reason === "cap-reached");
+        expect(created).toHaveLength(8);
+        expect(refused).toHaveLength(4);
+        expect(calls.filter((c) => c.method === "createUser")).toHaveLength(8);
+      });
     });
   });
 });
