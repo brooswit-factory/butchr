@@ -67,8 +67,21 @@ import type { NexusManifestPublisher } from "../accounts/nexus-manifest.js";
 import type { AccountPolicy } from "../rules/rules.js";
 import type { SpawnSpec } from "./workspace.js";
 
-/** `reconcileNow` only ever needs these two of `ReleaseReason` — see that type's own doc comment for `archive`/`daemon-restart`, neither of which any reconcile call site produces. */
-export type ReconcileReleaseReason = Extract<ReleaseReason, "stop" | "respawn">;
+/**
+ * `reconcileNow` itself only ever produces `"stop"`/`"respawn"` — see
+ * `ReleaseReason`'s own doc comment for `"daemon-restart"`, which no call
+ * site in this codebase produces at all. `"archive"` is the third member:
+ * BUTCHR-460 wires it, NOT from `reconcileNow`'s own generic `plan.stop`
+ * diff (which has no way to know a stop was specifically an archive, as
+ * opposed to a deletion/frozen/invalidated definition — deliberately, per
+ * this module's own "one hook, not a per-mechanism special case" doctrine),
+ * but from `../agents/managed-session-account-release.ts`'s wrapper, which
+ * sits in FRONT of `release` for the managed-sessions loop only and
+ * upgrades a `"stop"` to `"archive"` the moment it can positively confirm
+ * (a same-basename file now present in the archive directory) that this
+ * specific stop was one.
+ */
+export type ReconcileReleaseReason = Extract<ReleaseReason, "stop" | "respawn" | "archive">;
 
 export interface AccountLifecycleHooks {
   /**

@@ -91,7 +91,7 @@ export interface SessionDefinition {
   permissionMode: SessionPermissionMode;
   /** Reused verbatim from `Rule` (src/rules/rules.ts) — same type, same validation, same "independent of every other field" semantics. Stored and surfaced; execution-mode RECONCILIATION for an individual definition is not implemented by this ticket (see docs/managed-sessions.md) — the built-in query itself always runs `swarm` (one agent per eligible definition file), which is already "one agent" for every mode at the file granularity this ticket covers. */
   execution: ExecutionMode;
-  /** Reused verbatim from `Rule`. Stored only — the Rocket.Chat account lifecycle itself is unimplemented for EVERY provider today (rules.ts's own doc comment), managed sessions included. */
+  /** Reused verbatim from `Rule`. BUTCHR-460: wired, same as every other provider's rule-level `account` — see docs/rocketchat-accounts.md's "Wiring" section (`managedSessionAccountPolicies`, src/daemon/index.ts). */
   account: AccountPolicy;
   /** Reused verbatim from `Rule`. Default `"worker"` — same default as `Rule.role`. */
   role: AgentRole;
