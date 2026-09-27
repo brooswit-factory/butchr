@@ -10,4 +10,4 @@ bump: minor
 
 ### Changed
 
-- `@brooswit/drovr` pinned to v0.16.0 (Codex lizard support) — a later combined release will replace this pin once announced on FACTORY-106/FACTORY-128.
+- `@brooswit/drovr` initially pinned to v0.16.0 (Codex lizard support); superseded by the v0.16.1 combined release (see `changelog.d/FACTORY-321.md`).
