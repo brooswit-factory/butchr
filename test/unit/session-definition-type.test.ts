@@ -389,10 +389,11 @@ describe("createManagedSessionResourceType", () => {
     expect(resolvedAgents.has(keyPower)).toBe(false);
   });
 
-  test("DROVR-42/FACTORY-67: `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key, defaulting to false when absent — a frozen/removed definition's entry does not linger", async () => {
+  test("FACTORY-138 (DROVR-42/FACTORY-67 lineage): `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key — a vendor:claude definition defaults to ELIGIBLE (true) when absent (only explicit false opts out), a vendor:codex definition stays at false when absent since it cannot set the field at all — a frozen/removed definition's entry does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: true, permissionMode: "default" })),
-      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent — defaults to false
+      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: false, permissionMode: "default" })),
+      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — now defaults to true
+      "/defs/c.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: undefined })), // lizardMode absent, vendor codex — stays false
     };
     const { list } = fakeFiles(files);
     const rule = builtinManagedSessionsRule("/defs");
@@ -400,13 +401,15 @@ describe("createManagedSessionResourceType", () => {
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, lizardModes });
     const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
     const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
     await type.discovery.search();
-    expect(lizardModes.get(keyA)).toBe(true);
-    expect(lizardModes.get(keyB)).toBe(false);
+    expect(lizardModes.get(keyA)).toBe(false);
+    expect(lizardModes.get(keyB)).toBe(true);
+    expect(lizardModes.get(keyC)).toBe(false);
     // b.json goes frozen (still valid, but ineligible) — its entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })) };
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })), "/defs/c.json": files["/defs/c.json"]! };
     await type.discovery.search();
-    expect(lizardModes.get(keyA)).toBe(true);
+    expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.has(keyB)).toBe(false);
   });
 

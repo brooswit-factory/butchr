@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { IssueLink, JiraIssue } from "../../src/atlassian/types.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
-import { spawnArgs, agentLaunchConfig, checkArgv } from "../../src/agents/argv.js";
+import { spawnArgs, agentLaunchConfig, checkArgv, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
 import { agentIdOfWorkspacePath, briefFor, buildWorkspace, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { panesFor, groupOwnedPanes } from "../../src/agents/residency-census.js";
 import { strandedCandidates } from "../../src/agents/reap.js";
@@ -975,11 +975,11 @@ describe("rule workspaces", () => {
     expect(claude.provider === "claude" && [claude.model, claude.effort]).toEqual(["opus", "max"]);
   });
 
-  test("BUTCHR-408: spec.permissionMode reaches a claude launch's permissionMode; absent means today's behaviour exactly (no field at all)", () => {
+  test("BUTCHR-408/FACTORY-138: spec.permissionMode reaches a claude launch's permissionMode; absent now means butchr's own default (acceptEdits), not \"no field at all\"", () => {
     const withMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "claude" });
     expect(withMode.provider === "claude" && withMode.permissionMode).toBe("auto");
     const without = agentLaunchConfig(ruleSpec, "/d", "p", "n", { provider: "claude" });
-    expect(without.provider === "claude" && "permissionMode" in without).toBe(false);
+    expect(without.provider === "claude" && without.permissionMode).toBe(DEFAULT_PERMISSION_MODE);
     // Codex has no permissionMode concept (CodexAgentLaunch carries none) — the field is simply not forwarded.
     const codexWithMode = agentLaunchConfig({ ...ruleSpec, permissionMode: "auto" }, "/d", "p", "n", { provider: "codex", disabledMcpServers: [] });
     expect(codexWithMode.provider === "codex" && "permissionMode" in codexWithMode).toBe(false);

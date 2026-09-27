@@ -18,21 +18,27 @@
  * DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
  * under the DROVR-37 epic): a standalone interval timer that calls
  * `@brooswit/drovr`'s `autoAnswerPermissions` once per tick — but ONLY
- * across panes whose managed-session definition opted in with
- * `lizardMode: true` (`SessionDefinition.lizardMode`,
- * src/resources/session-definition.ts), never every Claude pane butchr
- * hosts. The operator's own name for the combination ("lizard mode") is
- * `permissionMode: "default"` (Claude's manual/ask mode, prompting before
- * every tool call) plus this field: it presses the "always allow"
- * stored-rule option on an unambiguous tool-permission dialog ("Do you want
- * to proceed?"), so an agent blocked on one is cleared within one tick
- * instead of sitting frozen for hours until a human happens to notice (the
- * frozen-agent incident this whole epic exists to fix, observed on butchr's
- * own fleet) — without abandoning manual mode's own safety property for
- * every OTHER tool call. A pane whose agent never opted in is never scanned
- * or touched, by construction (see `runPermissionAnswerTick`'s own doc
- * comment) — matching `lizardMode`'s "absent means today's behaviour
- * exactly" contract.
+ * across panes eligible for `lizardMode` (`SessionDefinition.lizardMode`/
+ * `Rule.lizardMode`, see `ruleLizardModeOf` below for exactly how each
+ * resolves), never every pane butchr hosts. The operator's own name for the
+ * pairing ("lizard mode") was originally `permissionMode: "default"`
+ * (Claude's manual/ask mode, prompting before every tool call) plus this
+ * field; FACTORY-138 (operator decision, FACTORY-67 director comment
+ * 2026-09-26 22:24Z) made butchr's own launch DEFAULT `acceptEdits` +
+ * lizard-eligible together instead, since accept-edits still leaves
+ * Bash/MCP tool-permission prompts unanswered — the pairing this field
+ * exists for is "any mode that still prompts, plus this field", not manual
+ * mode specifically. It presses option 1, "Yes" (allow once — FACTORY-93
+ * changed this away from a stored "always allow" rule) on an unambiguous
+ * tool-permission dialog ("Do you want to proceed?"), so an agent blocked
+ * on one is cleared within one tick instead of sitting frozen for hours
+ * until a human happens to notice (the frozen-agent incident this whole
+ * epic exists to fix, observed on butchr's own fleet) — without abandoning
+ * manual mode's own safety property for every OTHER tool call, for a
+ * definition/rule that still chooses manual mode explicitly. A pane whose
+ * agent is not eligible (an explicit `lizardMode: false`, since FACTORY-138)
+ * is never scanned or touched, by construction (see
+ * `runPermissionAnswerTick`'s own doc comment).
  *
  * (An earlier version of this ticket, before FACTORY-67 narrowed the ask,
  * built a blanket sweep over every pane — corrected before merge; see
@@ -132,23 +138,45 @@ export interface RuleLizardModeDeps {
 }
 
 /**
- * True iff `id`'s agent has opted into "lizard mode". A managed-session id
- * (`deps.isManagedSessionAgent`) resolves from the live
- * `deps.managedSessionLizardModes` map exactly as before FACTORY-87; every
- * OTHER rule-engine agent id (`jira-work`/`jira-project`/`github-issue`/
+ * True iff `id`'s agent should be scanned/answered by the permission-answer
+ * timer. A managed-session id (`deps.isManagedSessionAgent`) resolves
+ * straight from the live `deps.managedSessionLizardModes` map — that map's
+ * own fill site (`ManagedSessionResourceDeps.lizardModes`,
+ * src/rules/session-definition-type.ts) already folds in FACTORY-138's
+ * default (eligible unless explicitly `false`, `vendor: "claude"` only), so
+ * this function does no `?? true`/`=== true` translation of its own for that
+ * branch — the map's stored value IS the resolved answer. Every OTHER
+ * rule-engine agent id (`jira-work`/`jira-project`/`github-issue`/
  * `github-pr`/plain `filesystem`) resolves from that id's own `Rule.lizardMode`,
  * looked up against `deps.rules` — a rule is loaded once at daemon startup
  * (no per-rule live poll the way a managed-session definition file gets
- * one), so there is nothing to rebuild here. `id` decoding to nothing (a
- * legacy/bare-issue agent, or garbage) resolves `false`, matching
- * `lizardMode`'s own "absent means never touched" contract.
+ * one), so there is nothing to rebuild here. FACTORY-138 (operator
+ * decision, FACTORY-67 director comment 2026-09-26 22:24Z): a rule that IS
+ * found and never sets `lizardMode` is now eligible too — only an explicit
+ * `false` opts out — the `!== false` shape below (rather than the old
+ * `=== true`) is what flips that default while leaving `id` decoding to
+ * nothing, or a rule not found at all (a legacy/bare-issue agent, garbage,
+ * or a rule since removed), at `false`: those cases mean "butchr does not
+ * own this agent" and must never become eligible no matter which way the
+ * field's own default points. A `Rule` has no single fixed vendor (ranked
+ * `agentPreferences`, resolved per launch — see `RULE_PERMISSION_MODES`'s
+ * own doc comment, src/rules/rules.ts) so this cannot special-case Codex/agy
+ * the way the managed-session map above does; unlike `SessionDefinition`'s
+ * hard rejection of `lizardMode` for `vendor: "codex"`, `Rule.lizardMode`
+ * already applies uniformly to whichever vendor a rule resolves to for an
+ * EXPLICIT value (silently inert on a non-Claude pane, since
+ * `autoAnswerPermissions`'s dialog recognition is Claude-specific and never
+ * matches one — see `docs/permission-answer-loop.md`), so the new default
+ * follows that same existing precedent rather than introducing a
+ * vendor-awareness this type has never had.
  */
 export function ruleLizardModeOf(id: string, deps: RuleLizardModeDeps): boolean {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return false;
   if (deps.isManagedSessionAgent(id)) return deps.managedSessionLizardModes.get(id) === true;
   const rule = deps.rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
-  return rule?.lizardMode === true;
+  if (!rule) return false;
+  return rule.lizardMode !== false;
 }
 
 /**
@@ -176,17 +204,26 @@ export interface PermissionAnswerPane {
 export interface PermissionAnswerLoopDeps {
   client: PermissionAnswerClient;
   /**
-   * The opt-in gate (DROVR-42/FACTORY-67 "lizard mode") — called once per
-   * tick with every Claude pane herdr currently reports. Return a Map of
+   * The eligibility gate (DROVR-42/FACTORY-67 "lizard mode") — called once
+   * per tick with every pane herdr currently reports, REGARDLESS of vendor
+   * (verified against the daemon's own wiring, src/daemon/index.ts: nothing
+   * upstream of this call filters `agent.list()`'s result to Claude panes —
+   * a stale claim this doc comment used to make). A Codex/agy pane can
+   * therefore end up in the returned map same as a Claude one; scanning one
+   * is harmless (`autoAnswerPermissions`'s dialog recognition is
+   * Claude-specific and simply never matches its screen, so it is read and
+   * ignored, never pressed) — see `ruleLizardModeOf`'s own doc comment
+   * (this file) for where FACTORY-138's default deliberately does, or does
+   * not, extend to a non-Claude pane's eligibility itself. Return a Map of
    * `pane_id -> a human label` (e.g. the managed-session definition's file
    * name) for exactly the panes eligible this tick; a pane your caller
    * leaves out of the returned map is never scanned or answered by
-   * `autoAnswerPermissions` — that is the ENTIRE enforcement point for
-   * "absent field means today's behaviour exactly" (`lizardMode`'s own
-   * contract): it happens once, here, rather than being re-derived
-   * downstream. The label exists so a log line can say WHICH AGENT
-   * (FACTORY-67's own requirement), not just an opaque pane id — see
-   * `runPermissionAnswerTick`'s own doc comment for how it's used.
+   * `autoAnswerPermissions` at all — that is the ENTIRE enforcement point
+   * for `lizardMode`'s own eligibility contract: it happens once, here,
+   * rather than being re-derived downstream. The label exists so a log line
+   * can say WHICH AGENT (FACTORY-67's own requirement), not just an opaque
+   * pane id — see `runPermissionAnswerTick`'s own doc comment for how it's
+   * used.
    */
   eligiblePanes: (agents: readonly PermissionAnswerPane[]) => ReadonlyMap<string, string>;
   /** JSONL audit file — see `Config.permissionAuditPath` (src/config/config.ts) for why this lives under butchr's own state directory rather than drovr's package default. */
@@ -265,12 +302,13 @@ export interface PermissionAnswerLoopDeps {
 }
 
 /**
- * One pass over the CURRENTLY-eligible Claude panes only — never a blanket
+ * One pass over the CURRENTLY-eligible panes only — never a blanket
  * fleet sweep (see this module's own header): reads the live pane list
- * once, asks `deps.eligiblePanes` which of them opted in this tick, and (if
- * any did) hands `autoAnswerPermissions` a client scoped to exactly that
+ * once, asks `deps.eligiblePanes` which of them are eligible this tick, and
+ * (if any are) hands `autoAnswerPermissions` a client scoped to exactly that
  * fixed set — scan for a pending tool-permission dialog, press the
- * unambiguous "always allow" option, log one line per pane touched plus a
+ * unambiguous option 1, "Yes" (allow once — FACTORY-93; NOT a stored
+ * "always allow" rule), log one line per pane touched plus a
  * one-line summary naming each answered/failed pane's `eligiblePanes` label
  * (FACTORY-67: "logged with agent, tool, ... visible somewhere an operator
  * actually looks" — the exact stored-rule text pressed is not returned by
@@ -279,9 +317,9 @@ export interface PermissionAnswerLoopDeps {
  * deliberately never re-parses a pane's screen itself to recover it, since
  * dialog recognition is drovr's job, not butchr's, per FACTORY-49/FACTORY-67).
  * A tick with nothing eligible costs exactly one `agent.list()` call and
- * nothing else — no scan, no read, no log line — which is what makes
- * "absent field means today's behaviour exactly" true down to the herdr
- * call count, not merely the observable outcome.
+ * nothing else — no scan, no read, no log line — which is what makes an
+ * explicit `lizardMode: false` cost nothing beyond that one call, down to
+ * the herdr call count, not merely the observable outcome.
  *
  * Never throws — a rejecting `agent.list()` or `autoAnswerPermissions` call
  * (the scan itself failing, not a single pane's attempt, which

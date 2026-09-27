@@ -183,20 +183,28 @@ export interface SessionDefinition {
    * DROVR-42/FACTORY-67 — the operator's own "lizard mode": turns on
    * `@brooswit/drovr`'s `autoAnswerPermissions` (DROVR-37) for THIS agent's
    * pane, on the daemon's own standalone permission-answer timer
-   * (`src/agents/permission-answer-loop.ts`) — pressing the "Yes, and
-   * always allow …" stored-rule option on an unambiguous Claude
-   * tool-permission dialog, unattended. The point of the field: it lets a
-   * definition run `permissionMode: "default"` (manual/ask mode) — Claude's
-   * own safest mode, prompting before every tool call — WITHOUT an agent
-   * ever sitting frozen on one of those prompts for hours (the DROVR-37
-   * incident this whole mechanism exists to fix), instead of the
-   * alternative of raising `permissionMode` to `"auto"`/`"bypassPermissions"`
-   * to avoid prompts altogether. Nothing here requires that pairing — a
-   * definition may set this alongside any `permissionMode` — but manual
-   * mode plus this field is the combination the field exists for.
-   * Absent/`false` means today's behaviour exactly: this pane is never
-   * scanned or touched by the permission-answer timer, matching every OTHER
-   * currently-deployed definition (which does not set this field at all).
+   * (`src/agents/permission-answer-loop.ts`) — pressing option 1, "Yes"
+   * (allow once — FACTORY-93 changed the pressed option away from a
+   * stored "always allow" rule; see that timer's own doc comment) on an
+   * unambiguous Claude tool-permission dialog, unattended. Originally
+   * built so a definition could run `permissionMode: "default"` (manual/ask
+   * mode) — Claude's own safest mode, prompting before every tool call —
+   * WITHOUT an agent ever sitting frozen on one of those prompts for hours
+   * (the DROVR-37 incident this whole mechanism exists to fix). FACTORY-138
+   * (operator decision, FACTORY-67 director comment 2026-09-26 22:24Z):
+   * butchr's own launch default is now `permissionMode: "acceptEdits"` +
+   * this field TRUE together (`agentLaunchConfig`, src/agents/argv.ts) — an
+   * accept-edits agent still gets Bash/MCP tool-permission prompts, so it
+   * needs the exact same unattended-clearing this field always provided for
+   * manual mode; the DROVR-37 shape is "any mode that still prompts, with
+   * nobody answering", not manual mode specifically. Nothing here requires
+   * pairing with any particular `permissionMode` — a definition may set
+   * this alongside any value, or leave `permissionMode` at its own default
+   * too. Absent means ELIGIBLE for a `vendor: "claude"` definition (the new
+   * default, since FACTORY-138); only an EXPLICIT `false` means this pane
+   * is never scanned or touched by the permission-answer timer — that
+   * absent-vs-false distinction is still fully preserved, only which one
+   * means "on" has flipped, for `claude`.
    *
    * For a `vendor: "claude"` definition, does not reach the launched
    * process's own argv — unlike `permissionMode`/`strictMcpConfig` (see
@@ -204,28 +212,50 @@ export interface SessionDefinition {
    * `ManagedSessionResourceDeps.lizardModes` every poll
    * (src/rules/session-definition-type.ts) — so there is no persisted-at-spawn
    * value for a stale-argv check to compare against, and none is needed:
-   * toggling this field takes effect on the very next permission-answer
-   * tick, live, with no agent respawn (see that map's own doc comment for
-   * the "no second, independently-recomputed expectation" FACTORY-43 lesson
-   * this design sidesteps by construction, having nothing to duplicate in
-   * the first place).
+   * toggling this field (or its default changing, as with FACTORY-138) takes
+   * effect on the very next permission-answer tick, live, with no agent
+   * respawn (see that map's own doc comment for the "no second,
+   * independently-recomputed expectation" FACTORY-43 lesson this design
+   * sidesteps by construction, having nothing to duplicate in the first
+   * place).
    *
-   * **FACTORY-108: now accepted for `vendor: "codex"` too** — `@brooswit/drovr`
-   * >= 0.16.0 ships `autoAnswerCodexApprovals`, a Codex-specific twin of
+   * **FACTORY-108: `vendor: "codex"` CAN set this field — not rejected at
+   * manifest load.** `@brooswit/drovr` >= 0.16.0 ships
+   * `autoAnswerCodexApprovals`, a Codex-specific twin of
    * `autoAnswerPermissions` (FACTORY-107), which the daemon's permission-answer
    * timer now also calls every tick (`src/agents/permission-answer-loop.ts`).
-   * Unlike the Claude case above, this field DOES reach a Codex launch's own
-   * argv: `specForSessionDefinition` (src/rules/session-definition-type.ts)
-   * forwards it onto `SpawnSpec.lizardMode` only for `vendor: "codex"`, and
-   * `agentLaunchConfig`'s Codex branch (src/agents/argv.ts) reads it to decide
-   * whether to omit `--dangerously-bypass-approvals-and-sandbox` — Codex's
-   * own "manual approval mode" pairing, replacing the `permissionMode:
-   * "default"` pairing Claude uses (Codex has no `permissionMode` concept).
-   * This DOES need FACTORY-43's persist-at-spawn/read-back stale-argv pair,
-   * same shape as `permissionMode`/`strictMcpConfig` (`.butchr-lizard-mode.json`,
+   * A Codex definition's own default is the OPPOSITE of Claude's, though,
+   * decided by the story rather than mechanically inherited from FACTORY-138
+   * (FACTORY-106/FACTORY-324): **absent means INELIGIBLE for `vendor:
+   * "codex"`** — see `ManagedSessionResourceDeps.lizardModes`'s own fill site
+   * (`m.definition.lizardMode ?? (m.definition.vendor === "claude")`,
+   * src/rules/session-definition-type.ts) — an explicit `true` makes it
+   * ELIGIBLE, and an explicit `false` stays ineligible, same as `claude`'s
+   * own absent-vs-false handling just inverted for which default wins.
+   * Reason: default-on for Codex would change nothing about the launch
+   * itself (see the next paragraph — that stays explicit-true-only) and
+   * would only add a scan that can never find anything to press, while
+   * silently claiming a coverage guarantee nobody canaried; Claude's own
+   * FACTORY-138 default-on is safe specifically because Claude's launch
+   * already always shows the dialog this mechanism answers.
+   *
+   * Unlike the Claude case above, this field also DOES reach a Codex
+   * launch's own argv, on an EXPLICIT `true` only (never merely eligible via
+   * the default above): `specForSessionDefinition`
+   * (src/rules/session-definition-type.ts) forwards it onto
+   * `SpawnSpec.lizardMode` only for `vendor: "codex"` and only when
+   * `definition.lizardMode` is truthy, and `agentLaunchConfig`'s Codex branch
+   * (src/agents/argv.ts) reads it to decide whether to omit
+   * `--dangerously-bypass-approvals-and-sandbox` — Codex's own "manual
+   * approval mode" pairing, replacing the `permissionMode: "default"`
+   * pairing Claude uses (Codex has no `permissionMode` concept). This DOES
+   * need FACTORY-43's persist-at-spawn/read-back stale-argv pair, same shape
+   * as `permissionMode`/`strictMcpConfig` (`.butchr-lizard-mode.json`,
    * `workspaceLizardMode`, src/agents/workspace.ts) — see
    * `docs/permission-answer-loop.md`'s "Codex lizard mode" section for the
-   * full story. `vendor: "claude"` behaviour (above) is completely unchanged.
+   * full story. `vendor: "claude"` behaviour (above) is completely
+   * unchanged by any of this. See `docs/managed-sessions.md`'s "Lizard mode"
+   * section for the three-case table (absent/true/false) side by side.
    */
   lizardMode?: boolean;
   /** Reused verbatim from `Rule` (src/rules/rules.ts) — same type, same validation, same "independent of every other field" semantics. Stored and surfaced; execution-mode RECONCILIATION for an individual definition is not implemented by this ticket (see docs/managed-sessions.md) — the built-in query itself always runs `swarm` (one agent per eligible definition file), which is already "one agent" for every mode at the file granularity this ticket covers. */
