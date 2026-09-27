@@ -102,6 +102,12 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       }
       const html = renderConfigInventory(result, dashboard.rows, {
         dashboardLinkHref: (resourceKey) => `/#${agentRowAnchorId(resourceKey)}`,
+        // FACTORY-132: the SAME snapshot `dashboard.rows` above already came
+        // from — never a second, independently-timed read — so the matches
+        // and the reason an empty match list means what it means always
+        // agree (see `RenderConfigInventoryOpts.agentCensusChecked`'s own
+        // doc comment).
+        agentCensusChecked: dashboard.checked,
       });
       return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
     })

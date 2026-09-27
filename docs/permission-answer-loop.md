@@ -329,3 +329,108 @@ that is a natural, separable follow-up.
   none setting `lizardMode`) and every existing rule (none setting either new
   field) load and behave unchanged. Deploys and any live cutover go through
   admin-assembly at the operator's direction.
+
+## Approval sound (FACTORY-100/FACTORY-103)
+
+An OPT-IN, OFF-by-default sound played on **this daemon's own host** every
+time this loop's `runPermissionAnswerTick` reports a pane `answered` — the
+operator's own request: a human in earshot of the host should hear each
+unattended approval as it happens, not just find it later in
+`permissionAuditPath`'s JSONL trail. Implemented in
+`src/agents/approval-sound.ts`, wired into the `onApproved` dep shared by
+`startPermissionAnswerLoop` and `startPermissionAnswerWatch`
+(`src/daemon/index.ts`), called once per answered pane regardless of which
+of the two wires it up — `onApproved` lives on `PermissionAnswerLoopDeps`,
+and `startPermissionAnswerWatch` forwards its own deps straight through to
+`runPermissionAnswerTick` (see `permission-answer-watch.ts`), so this hook
+does not care which sits on top.
+
+**Why the hook sits here, not in drovr.** The "approval" audit record itself
+(`outcome: "approved"`) is written by `@brooswit/drovr`'s
+`approvePermission` — a separate published npm package, not this repo.
+`runPermissionAnswerTick`'s own `answered` filter is the EARLIEST point in
+BUTCHR'S OWN code that knows a prompt was just approved, and it already
+flows through this exact function on every tick, whether the tick was fired
+by the sweep timer or the event-driven watch — tailing drovr's audit file as
+an event source would be strictly later, more expensive (a file watch or
+poll on top of the poll this loop already is), and has no precedent anywhere
+in this codebase. (An operator FACTORY-100 comment briefly asked whether the
+sound asset and its playback should both move into drovr; the ruling that
+followed keeps the hook here — only the SOUND ASSET itself moved into drovr,
+see "Default sound source" below.)
+
+**Config:** `Config.lizardApprovalSound?: { overridePath?: string }` — TWO
+SEPARATE env vars (`src/config/config.ts`): `BUTCHR_LIZARD_APPROVAL_SOUND`
+(any non-empty value enables the feature; absent/empty means disabled,
+today's behaviour exactly) and `BUTCHR_LIZARD_APPROVAL_SOUND_PATH` (optional,
+`~` expanded) as a local-file-path override. A path with the enable flag
+unset does NOT enable the feature — the flag is the master switch. Daemon/host
+level, not per-managed-session: the sound plays on the HOST's own speakers
+regardless of which agent's pane triggered it, so one knob is the natural
+fit — a per-definition setting would imply a per-agent sound the host cannot
+actually produce independently.
+
+**Default sound source: drovr's own bundled asset.** With the flag on and no
+override path, the source is `@brooswit/drovr`'s own bundled
+`assets/sounds/lizard-button.mp3` (FACTORY-122 ships it there) — resolved at
+runtime (`resolveDrovrBundledAsset`) by asking `import.meta.resolve` for the
+package's main entry (the only subpath its `exports` field exposes), then
+walking up the filesystem to the ancestor directory whose OWN `package.json`
+declares `name: "@brooswit/drovr"` (that package's `exports` does NOT expose
+`./package.json` or an arbitrary asset subpath as importable specifiers, so
+this walks the filesystem after resolving only the "." export rather than
+trying to `import()` either directly). The package or asset failing to
+resolve (missing, or a pin without the asset) logs ONE warning and disables
+the sound for the daemon's remaining lifetime, same as any other unresolvable
+source — see `test/unit/approval-sound.test.ts`'s REAL-PACKAGE GUARD test for
+why this is deliberately re-checked against the actually-installed package
+rather than only against fakes. **URL sources are out of scope** (cut after
+the operator's suggested `https://www.myinstants.com/...` value turned out to
+403 non-browser clients on this fleet's hosts, and a later redirect asked for
+the asset to live inside drovr rather than as a URL or a Butchr-side
+download) — this module does not build, keep, or document any download/cache
+path.
+
+**Player selection** (`chooseSoundPlayer`/`candidateSoundPlayers`): tries, in
+this fixed order, whichever of `gst-play-1.0`, `afplay`, `mpv`, `ffplay`
+(`-nodisp -autoexit -loglevel quiet`), `paplay`, `pw-play`, `aplay` is found
+on `PATH` (`Bun.which`, same detection primitive `detectTerminalPrefix`
+already uses for terminal emulators, `src/terminal/open.ts`). `aplay` (ALSA)
+cannot decode mp3, so it is restricted to `.wav` sources; every other player
+is tried against any format. `gst-play-1.0` is tried FIRST specifically
+because a live measurement on codey found `paplay`/`pw-play` both fail on mp3
+there (its libsndfile build has no mp3 support) while `gst-play-1.0` plays it
+fine — a candidate that exits non-zero or errors is treated as "try the next
+one", not success, walking the full fallback chain rather than giving up
+after the first installed candidate. The first candidate that actually
+succeeds is REMEMBERED and tried directly (skipping the PATH-lookup probe
+entirely) on every later approval; if it ever stops working, it is forgotten
+and the full fallback chain is re-probed from scratch. No usable player at
+all logs ONE warning and disables the sound for the daemon's remaining
+lifetime — it is never re-checked.
+
+**Coalescing:** `DEFAULT_COALESCE_MS` (1500ms, `createApprovalSoundNotifier`'s
+`coalesceMs` option) — a burst of approvals inside that window plays at most
+one sound (a leading-edge throttle: the first approval in a quiet period
+plays immediately; every approval before the window elapses is coalesced
+away; the next approval after the window plays again).
+
+**Journal evidence.** Every ACTUAL play logs one concise line naming the
+player, the file, and the exit status (e.g. `played <path> via "gst-play-1.0"
+(exit 0)`) — deliberately not a once-ever message like the failure warnings
+below, so admin-assembly can confirm from the journal alone that a real
+approval played the sound, every time.
+
+**Never touches the approval path.** `notifyApproved` is synchronous, never
+awaited by its caller, and wraps everything in `try`/`catch` — a throwing
+`onApproved` (or a throwing `now`/`has`/`spawn` dependency) cannot propagate
+into `runPermissionAnswerTick`, which ALSO wraps its own call to
+`deps.onApproved?.()` defensively (belt-and-suspenders). A player that fails
+to spawn (ENOENT), reports an async `"error"` event, or exits non-zero (the
+headless-host, no-audio-device case) each log at most one warning and are
+otherwise silent — this is a **deliberately different** failure mode from
+"no player found"/"source unresolvable" above: a playback-runtime failure
+does not disable the feature forever, since the underlying condition (no
+audio sink attached to a headless host) can never be distinguished here from
+a merely transient one, and the ticket's own requirement is "degrade silently
+after one warning", not "give up permanently".
