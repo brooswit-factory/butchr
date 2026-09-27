@@ -342,6 +342,7 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -364,6 +365,7 @@ export function specForRuleQuery(rule: Rule, agentKey: string): SpawnSpec {
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 

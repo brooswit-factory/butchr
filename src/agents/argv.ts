@@ -156,7 +156,16 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-      ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {bypassApprovalsAndSandbox:false}: {}),
+      // FACTORY-108: `spec.lizardMode` is Codex's own "manual approval mode"
+      // launch signal (the Codex counterpart of Claude's `permissionMode:
+      // "default"` — Codex has no `permissionMode` concept) — omitting the
+      // bypass flag is what lets the daemon's permission-answer timer's
+      // `autoAnswerCodexApprovals` pass (src/agents/permission-answer-loop.ts)
+      // ever see a pending dialog to answer at all (a bypassed launch shows
+      // none). ORed with the pre-existing unconditional jira-project case
+      // (a freeform project manager's own always-manual review mode,
+      // unrelated to lizardMode).
+      ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode ? {bypassApprovalsAndSandbox:false}: {}),
       mcpServers: [
         {
           name: "butchr",

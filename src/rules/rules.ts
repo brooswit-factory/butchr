@@ -57,11 +57,14 @@ export { AGENT_EFFORTS, type AgentEffort };
  * to validate this against — `agentPreferences` is a ranked FALLBACK list,
  * not one committed choice, and the harness an individual agent actually
  * gets is a runtime decision (`src/agents/herd.ts`) no validator here can
- * see — so there is deliberately no Codex-vendor rejection for this field or
- * for `Rule.lizardMode` below, unlike `SessionDefinition`'s hard rejection of
- * both for `vendor: "codex"`: a rule that falls back to Codex/Agy for one
- * launch simply gets the same silent no-op an absent `permissionMode`
- * already gives that branch today.
+ * see — so there is deliberately no Codex-vendor rejection for this field: a
+ * rule that falls back to Codex/Agy for one launch simply gets the same
+ * silent no-op an absent `permissionMode` already gives that branch today —
+ * the same "no rejection, validated-but-silently-unforwarded" treatment
+ * `SessionDefinition.permissionMode` itself gets for a `vendor: "codex"`
+ * definition (only `SessionDefinition.strictMcpConfig` is HARD-rejected
+ * there — see that field's own doc comment). `Rule.lizardMode` below is a
+ * DIFFERENT case as of FACTORY-108 — see its own doc comment.
  */
 export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
@@ -345,23 +348,38 @@ export interface Rule {
    * `SessionDefinition.lizardMode`) — opts every agent THIS rule launches
    * into the daemon's standalone permission-answer timer
    * (`src/agents/permission-answer-loop.ts`, wired in `src/daemon/index.ts`):
-   * drovr's `autoAnswerPermissions` answers an unambiguous Claude
-   * tool-permission dialog on that agent's pane — see that module's own doc
-   * comment / `docs/permission-answer-loop.md` for exactly which option it
-   * presses and how it is logged, deliberately not restated here since that
-   * is drovr's own answering policy, not this field's concern (and is a
-   * moving target — FACTORY-93/FACTORY-67) — so a rule kept in
-   * `permissionMode: "default"` is never left frozen on that dialog for
-   * hours. Absent/false means today's behaviour exactly: this rule's panes
-   * are never scanned or touched by that timer, matching every rule that
-   * does not set this field. Resolved live from the loaded `rules` list
-   * (`ruleLizardModeOf`, an exported pure function in
-   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
-   * it to its own live state) — deliberately NEVER reaches `SpawnSpec`/argv,
-   * same as `SessionDefinition.lizardMode`: a daemon-side behaviour toggle
-   * only, so there is no stale-argv concern to get wrong. See
+   * drovr's `autoAnswerPermissions`/(FACTORY-108) `autoAnswerCodexApprovals`
+   * answer an unambiguous tool-permission dialog on that agent's pane — see
+   * that module's own doc comment / `docs/permission-answer-loop.md` for
+   * exactly which option each presses and how it is logged, deliberately not
+   * restated here since that is drovr's own answering policy, not this
+   * field's concern (and is a moving target — FACTORY-93/FACTORY-67/
+   * FACTORY-108) — so a rule kept in `permissionMode: "default"` (Claude), or
+   * whose Codex fallback launches in manual-approval mode (FACTORY-108, see
+   * `SpawnSpec.lizardMode`), is never left frozen on that dialog for hours.
+   * Absent/false means today's behaviour exactly: this rule's panes are
+   * never scanned or touched by that timer, matching every rule that does
+   * not set this field. The timer's own eligibility gate is resolved live
+   * from the loaded `rules` list (`ruleLizardModeOf`, an exported pure
+   * function in `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts`
+   * just binds it to its own live state) regardless of vendor — that part is
+   * unchanged by FACTORY-108 and has no stale-argv concern of its own.
+   *
+   * FACTORY-108: UNLIKE `permissionMode` above, this field is ALSO forwarded
+   * onto `SpawnSpec.lizardMode` by every `specFor*` builder (the same ones
+   * `permissionMode` threads through) so a Codex-resolved launch
+   * (`agentLaunchConfig`'s Codex branch, src/agents/argv.ts) can read it and
+   * drop `--dangerously-bypass-approvals-and-sandbox` — see
+   * `SpawnSpec.lizardMode`'s own doc comment (src/agents/workspace.ts) for
+   * the full contract, including the FACTORY-43-style persist-at-spawn/
+   * read-back stale-argv pair this now rides generically (nothing
+   * rule-specific was added for it). A Claude- or Agy-resolved launch still
+   * ignores it completely (neither branch of `agentLaunchConfig` reads
+   * `spec.lizardMode`), so the paragraph above remains the whole story for
+   * those two vendors — only a Codex fallback is new territory. See
    * `RULE_PERMISSION_MODES`'s own doc comment for why there is no
-   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s.
+   * Codex-vendor validation rejection here, unlike `SessionDefinition`'s
+   * `strictMcpConfig`.
    * FACTORY-87 wires this (and `permissionMode` above) for exactly the four
    * rule kinds FACTORY-76 scopes — `jira-work`/`jira-project`/`github-issue`/
    * `github-pr`/`filesystem` (every `specFor*` builder forwards

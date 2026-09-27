@@ -65,7 +65,7 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
-| `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, Claude only, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
+| `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **For `vendor: "claude"`:** never reaches `SpawnSpec` or the launched process's argv — read live, every poll, by the daemon's separate permission-answer timer. **For `vendor: "codex"` (FACTORY-108):** accepted at manifest load (no longer rejected — see "Codex support" under "Lizard mode" below); an EXPLICIT `true` DOES reach `SpawnSpec.lizardMode` and the launch argv, dropping `--dangerously-bypass-approvals-and-sandbox` so drovr's Codex approval-answering has a dialog to see. `strictMcpConfig` is still rejected at manifest load for `vendor: "codex"` — that rejection is unrelated to this field and unchanged by FACTORY-108. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
@@ -1073,15 +1073,114 @@ field is independent and a definition may set it alongside any
 essentially never appears, so `lizardMode` there is a harmless no-op, not an
 error.
 
-**No stale-argv risk, unlike `permissionMode`/`strictMcpConfig` (FACTORY-43).**
-Those two fields DO reach the launched process's argv, which is exactly why
-FACTORY-43 had to fix `HerdrHerd.staleIssues()` to read their persisted
-spawn-time values back through the SAME builder the real launch uses,
-closing a respawn-loop bug from a second, independently-recomputed
-expectation. `lizardMode` was deliberately kept out of `SpawnSpec` entirely
-— it never becomes a CLI flag, so there is no argv for a stale-argv check to
-compare and nothing to keep in sync. Toggling it in a manifest takes effect
-on the daemon's very next poll, live, no agent respawn.
+**No stale-argv risk for CLAUDE, unlike `permissionMode`/`strictMcpConfig`
+(FACTORY-43).** Those two fields DO reach the launched process's argv, which
+is exactly why FACTORY-43 had to fix `HerdrHerd.staleIssues()` to read their
+persisted spawn-time values back through the SAME builder the real launch
+uses, closing a respawn-loop bug from a second, independently-recomputed
+expectation. For `vendor: "claude"`, `lizardMode` is deliberately kept out of
+`SpawnSpec` entirely — it never becomes a CLI flag, so there is no argv for a
+stale-argv check to compare and nothing to keep in sync. Toggling it in a
+manifest takes effect on the daemon's very next poll, live, no agent respawn.
+**This stays true for Claude only.** For `vendor: "codex"` (FACTORY-108) the
+opposite is true by necessity — see "Codex support" immediately below.
+
+### Codex support (FACTORY-108)
+
+drovr v0.16.0 added a Codex-vendor twin of the Claude auto-answerer
+(`autoAnswerCodexApprovals`, `@brooswit/drovr`) — a separate module with no
+per-agent lizard flag of its own; it only scans Codex panes, and is a no-op
+on a Codex agent launched with `--dangerously-bypass-approvals-and-sandbox`
+(Codex's own manual-approval mode has no on/off switch drovr can flip — the
+BYPASS FLAG ITSELF is the switch). So, unlike Claude, an EXPLICIT
+`lizardMode: true` on a `vendor: "codex"` definition (or `Rule.lizardMode`
+for a rule-launched Codex agent — see "Rule-launched agents get the same
+mechanism too" above) DOES reach `SpawnSpec.lizardMode` and the launch argv:
+`agentLaunchConfig`'s Codex branch (`src/agents/argv.ts`) drops ONLY
+`--dangerously-bypass-approvals-and-sandbox` — no `--ask-for-approval` /
+`--sandbox` flags are added or changed. An agent that leaves the field unset,
+or sets it explicitly `false`, launches exactly as it does today (bypass
+flag present); a rule- or eligibility-level DEFAULT resolving to `true` (see
+below) never by itself changes this — only the raw, explicit field read at
+launch-config time does.
+
+**The flag choice is coupled to the captured fixture set, not a general
+policy choice.** drovr's Codex prompt recognition was measured against
+codex-cli 0.145.0 launched with only `--cd` (no other approval/sandbox
+flags) — see `docs/codex-permission-approval.md` (shipped in the drovr
+release) and that release's own fixture-capture script. Under any OTHER
+`--ask-for-approval`/`--sandbox` policy, Codex renders prompt shapes nobody
+has captured fixtures for; drovr reports those as `unrecognised` (logged,
+never answered — see `docs/permission-answer-loop.md`), and the agent
+freezes on the prompt exactly the way this whole epic exists to stop. So "no
+`-a`/`-s` flags" is a deliberate constraint tied to the fixture set actually
+captured, not an oversight — changing the launch policy requires capturing
+new drovr fixtures FIRST, then updating this launch-flag decision function
+to match.
+
+**Recognised prompt surface (drovr v0.16.0):** a command-execution prompt
+("Would you like to run the following command?" — a network-access
+escalation, e.g. an outbound `curl`, renders the IDENTICAL shape, just with a
+network-flavoured `Reason:` line, not a separate dialog kind); a file
+edit/patch prompt ("Would you like to make the following edits?"); and an MCP
+tool-call prompt (a labelled field list, "Allow the `<server>` MCP server to
+run tool `<tool>`?"). Only the plain approve-once option is ever pressed
+("Yes, proceed" / "Allow") — never "don't ask again for …", "Allow for this
+session", or "Always allow", which store a rule beyond the one prompt. The
+directory-trust dialog Codex shows on first launch is a separate,
+pre-existing dialog this auto-answerer does not touch. Anything else that
+looks approval-shaped but matches none of these three known shapes is
+`unrecognised`: logged once per pane + distinct excerpt, left for a human,
+never guessed at — by design, not a gap to be filled later.
+
+**Toggling `lizardMode` on an ALREADY-RUNNING Codex agent — the two
+directions are NOT symmetric.** `checkManagedAgentArgv` (drovr) only flags a
+pane STALE when the EXPECTED argv has a flag the OBSERVED argv lacks — it
+never flags the reverse (an observed flag the expected argv no longer
+wants). Measured directly against `spawnArgs`/`checkArgv` for both
+directions:
+- **`false`/unset -> `true` (turning lizard mode ON while already running IN
+  bypass mode): SILENT, no respawn.** The new expected argv no longer wants
+  the bypass flag at all, so there is nothing left for `checkArgv` to check
+  its presence against — an observed argv that still HAS the bypass flag is
+  never flagged stale for it. The agent keeps running WITH the bypass flag
+  (drovr's Codex auto-answerer has nothing to do — no dialog for it to see)
+  until its next respawn for an unrelated reason.
+- **`true` -> `false`/unset (turning lizard mode OFF while already running
+  WITHOUT the bypass flag): DETECTED, respawns.** The new expected argv wants
+  the bypass flag again, the running agent's observed argv lacks it, and
+  `checkArgv` DOES flag a wanted-but-missing flag — `staleIssues()` reports
+  it, and the daemon respawns the agent back into bypass mode on its next
+  reconcile pass.
+
+So an operator flipping the field OFF gets an automatic respawn back to
+bypass mode; an operator flipping it ON does not get an automatic respawn
+into manual-approval mode — that only happens at the agent's next respawn
+for some other reason. This asymmetry is a direct, unmodified consequence of
+`checkManagedAgentArgv`'s own "missing flags only" contract (used unchanged
+from FACTORY-43) — not a gap introduced by this ticket, and not otherwise
+fixed here per this ticket's own requirement to document, not silently
+leave, whatever the existing mechanism actually does.
+
+**Why the explicit-only reading matters: FACTORY-127.** A sibling story is
+making `lizardMode` default to `true` where it is resolved for
+ELIGIBILITY — i.e. whether the daemon's answering timer scans a pane at
+all — and that default flip is promised to never reach argv, never respawn
+anything, and take effect on the daemon's very next poll (same "live,
+no-respawn" property Claude's own `lizardMode` already has). If the Codex
+LAUNCH decision above keyed off that same resolved/defaulted value instead of
+the raw explicit field, FACTORY-127's default flip would silently drop the
+bypass flag from EVERY running Codex agent at deploy — a fleet-wide sandbox
+change and respawn wave with no canary. Reading only the explicit field keeps
+Codex agents leaving bypass mode one at a time, by deliberate opt-in, after a
+canary — see this ticket's own PR/code comment on the launch-flag decision
+function (`src/agents/argv.ts`) for where this is enforced.
+
+**Host config caveat.** `~/.codex/config.toml`'s own `approval_policy`/
+`sandbox_mode` settings can change which prompt shapes Codex renders,
+independently of the launch argv discussed above. The canary host's own
+config must be checked before relying on any of this — that check is the
+epic's, not this ticket's.
 
 **Audit visibility.** Every auto-answer is recorded to a JSONL file under
 the workspace root (`Config.permissionAuditPath`, default

@@ -249,7 +249,7 @@ describe("specForSessionDefinition", () => {
     expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
 
-  test("DROVR-42/FACTORY-67: lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
+  test("DROVR-42/FACTORY-67: for vendor claude, lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
     const rule = builtinManagedSessionsRule("/defs");
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
@@ -259,6 +259,18 @@ describe("specForSessionDefinition", () => {
     const spec = specForSessionDefinition(match);
     expect(spec).not.toHaveProperty("lizardMode");
     expect(Object.keys(spec)).not.toContain("lizardMode");
+  });
+
+  test("FACTORY-108: for vendor codex, lizardMode IS carried into the SpawnSpec — the opposite of the claude case above — so agentLaunchConfig's Codex branch (src/agents/argv.ts) can drop --dangerously-bypass-approvals-and-sandbox; absent/false forwards nothing, same as every other vendor's absent field", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const base = { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const match = (definition: typeof base & { lizardMode?: boolean }): SessionDefinitionMatch => ({
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"), definition,
+    });
+    expect(specForSessionDefinition(match({ ...base, lizardMode: true })).lizardMode).toBe(true);
+    expect(specForSessionDefinition(match(base))).not.toHaveProperty("lizardMode");
+    expect(specForSessionDefinition(match({ ...base, lizardMode: false }))).not.toHaveProperty("lizardMode");
   });
 
   test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {

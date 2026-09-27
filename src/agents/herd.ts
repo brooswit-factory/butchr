@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -503,7 +503,14 @@ export class HerdrHerd implements Herd {
       // here, never a value recomputed independently of that spawn.
       const permissionMode = workspacePermissionMode(cwd);
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // FACTORY-108: same read-the-workspace-back shape as permissionMode/
+      // strictMcpConfig above, for a Codex lizard agent's own
+      // bypassApprovalsAndSandbox-dropping launch signal (SpawnSpec.lizardMode) —
+      // without this, a lizard Codex agent's real (bypass-flag-less) argv
+      // would forever mismatch a naively-recomputed "expected" argv that
+      // still assumes the bypass flag, respawn-looping it forever.
+      const lizardMode = workspaceLizardMode(cwd);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) { out.push({ issue, reason: check.reason, observedArgv: proc.argv }); continue; }
       // FACTORY-75: `--model`/`--effort` are deliberately excluded from

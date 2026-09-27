@@ -406,19 +406,24 @@ describe("spec builders", () => {
   });
 
   // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
-  // reaches both spawn-spec builders when the rule sets it; lizardMode never
-  // does — the same "no argv, no stale-argv risk" shape session-definition-type
-  // asserts for SessionDefinition.lizardMode.
-  test("permissionMode is forwarded onto both spawn specs when the rule sets it; lizardMode never is", () => {
+  // reaches both spawn-spec builders when the rule sets it. FACTORY-108:
+  // lizardMode now does too — a rule-launched Codex agent has no
+  // permissionMode concept, so lizardMode is what agentLaunchConfig's Codex
+  // branch (src/agents/argv.ts) reads to drop
+  // --dangerously-bypass-approvals-and-sandbox; see Rule.lizardMode's own
+  // doc comment (src/rules/rules.ts) for the full story.
+  test("permissionMode and lizardMode are both forwarded onto both spawn specs when the rule sets them", () => {
     const lizardRule = rule({ permissionMode: "default", lizardMode: true });
     const resSpec = specForFilesystem({ agentKey: key, rule: lizardRule, resource: res("/repo/a.md") });
     expect(resSpec.permissionMode).toBe("default");
-    expect(resSpec).not.toHaveProperty("lizardMode");
+    expect(resSpec.lizardMode).toBe(true);
     const qkey = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "docs" });
     const querySpec = specForFilesystemQuery(lizardRule, qkey);
     expect(querySpec.permissionMode).toBe("default");
-    expect(querySpec).not.toHaveProperty("lizardMode");
-    expect(specForFilesystem({ agentKey: key, rule: rule(), resource: res("/repo/a.md") }).permissionMode).toBeUndefined();
+    expect(querySpec.lizardMode).toBe(true);
+    const plainSpec = specForFilesystem({ agentKey: key, rule: rule(), resource: res("/repo/a.md") });
+    expect(plainSpec.permissionMode).toBeUndefined();
+    expect(plainSpec).not.toHaveProperty("lizardMode");
   });
 });
 

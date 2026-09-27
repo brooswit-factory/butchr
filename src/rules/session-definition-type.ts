@@ -315,7 +315,10 @@ export async function searchSessionDefinitions(
  * no such field — see that field's own doc comment). `agents` names
  * exactly one preference (the definition's own vendor/tier) — `spec.agents`,
  * not `rule.agentPreferences`, is what makes this heterogeneous per file
- * despite one shared `Rule`.
+ * despite one shared `Rule`. FACTORY-108: `lizardMode` is the Codex
+ * counterpart — forwarded only for `vendor: "codex"` (never `"claude"`,
+ * which keeps lizardMode daemon-side-only — see `SpawnSpec.lizardMode`'s own
+ * doc comment).
  */
 export function specForSessionDefinition({ agentKey, resource, definition }: SessionDefinitionMatch): SpawnSpec {
   return {
@@ -329,6 +332,11 @@ export function specForSessionDefinition({ agentKey, resource, definition }: Ses
     cwd: definition.workingDirectory,
     permissionMode: definition.permissionMode,
     ...(definition.strictMcpConfig !== undefined ? { strictMcpConfig: definition.strictMcpConfig } : {}),
+    // FACTORY-108: only for vendor "codex" — a "claude" definition's
+    // lizardMode must NEVER reach SpawnSpec (see SpawnSpec.lizardMode's own
+    // doc comment and the "lizardMode is deliberately NEVER carried into the
+    // SpawnSpec" test, which is scoped to vendor "claude" specifically).
+    ...(definition.vendor === "codex" && definition.lizardMode ? { lizardMode: true } : {}),
     ...(definition.mcpServers ? { mcpServers: definition.mcpServers } : {}),
   };
 }
