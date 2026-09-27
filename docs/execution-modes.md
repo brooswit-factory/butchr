@@ -145,11 +145,13 @@ persist-at-spawn/read-back stale-argv pair FACTORY-43 built for this field
 `HerdrHerd.staleIssues()`) was never managed-session-specific — it already
 operates on `spec.permissionMode` for any spawn, so a rule-launched agent's
 `permissionMode` gets the same stale-argv safety with zero changes to that
-layer. Absent means today's behaviour exactly, for every provider — including
-`jira-project`, whose own unconditional `permissionMode: "auto"` default
-(`agentLaunchConfig`, src/agents/argv.ts) is set BEFORE `spec.permissionMode`'s
-own spread and so is overridden by this field only when a `jira-project` rule
-sets it.
+layer. Absent means today's behaviour exactly, for every provider, `jira-project`
+included (FACTORY-129): a jira-project agent with no explicit `permissionMode`
+now gets butchr's ordinary default (`DEFAULT_PERMISSION_MODE`,
+`agentLaunchConfig`, src/agents/argv.ts) exactly like every other rule kind —
+the jira-project-only `"auto"` override this paragraph used to describe is
+gone. Safety for that change comes from lizard-mode eligibility, not a
+special-cased permission mode; see the next section.
 
 **`lizardMode` never reaches argv — same design as `SessionDefinition.lizardMode`,
 and mostly plumbing to reuse.** It is resolved live, not persisted: the

@@ -293,9 +293,9 @@ export interface Rule {
   linkedEventing?: boolean;
   /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
   linkedPollIntervalMs?: number;
-  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedItems`; an explicit value here always wins over that default, in both directions. */
   maxLinkedItems?: number;
-  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (2) via `effectiveMaxLinkedTurnsPerHour`; an explicit value here always wins over that default, in both directions. */
   maxLinkedTurnsPerHour?: number;
   /**
    * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's

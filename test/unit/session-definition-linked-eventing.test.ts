@@ -106,7 +106,7 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
     expect(matches.every((x) => x.notifyAgentKey === m.agentKey)).toBe(true);
   });
 
-  test("PR review (FACTORY-71): the produced rule carries no maxLinkedTurnsPerHour — a managed session's linked-eventing nudges are UNCAPPED BY DEFAULT today, the same 'absent means uncapped' behaviour an unconfigured jira-project rule already has. There is no per-definition or shared-constant cap value in production; a real default cap for managed-session directors is a known, deliberately-deferred gap tracked in FACTORY-78, not something this ticket invents.", () => {
+  test("PR review (FACTORY-71), corrected by BUTCHR-471: the produced rule still carries no maxLinkedTurnsPerHour/maxLinkedItems of its own — there is still no per-definition or shared-constant cap value baked into this rule, and a real per-definition override remains a known, deliberately-deferred gap (FACTORY-78). What changed is that absent no longer means UNCAPPED: BUTCHR-471 moved the default (2 turns/hour, 25 items) to the ENFORCEMENT site (`effectiveMaxLinkedTurnsPerHour`/`effectiveMaxLinkedItems`, src/jira-watch/linked-eventing.ts), which reads this same absent-field rule, so a managed session is capped by the shared default exactly like an unconfigured jira-project rule now is — see test/unit/linked-eventing-default-caps.test.ts for that enforcement proof.", () => {
     const m = match("/defs/a.json", { linkedEventingProjects: ["jira-project:BUTCHR"] });
     const [matched] = sessionDefinitionProjectMatches(m);
     expect(matched!.rule.maxLinkedTurnsPerHour).toBeUndefined();
@@ -222,14 +222,16 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
  * PR review (FACTORY-71): this describe block proves the BUTCHR-469 rate-cap
  * MECHANISM works correctly when a match's state-owning `agentKey` differs
  * from its `notifyAgentKey` — it does NOT prove managed sessions are
- * rate-capped in production. The match below hand-sets
- * `rule.maxLinkedTurnsPerHour: 1` directly, bypassing `sessionDefinitionProjectMatches`
- * entirely: that function never produces a rule with this field set (see
- * "the produced rule carries no maxLinkedTurnsPerHour" above) — in
- * production, a managed session's linked-eventing nudges are UNCAPPED BY
- * DEFAULT, same as an unconfigured `jira-project` rule owner. A real default
- * cap for managed-session directors is a known, deliberately-deferred gap —
- * see FACTORY-78 — not something this ticket invents.
+ * rate-capped in production via THIS rule shape. The match below hand-sets
+ * `rule.maxLinkedTurnsPerHour: 1` directly, bypassing
+ * `sessionDefinitionProjectMatches` entirely: that function never produces a
+ * rule with this field set (see "the produced rule still carries no
+ * maxLinkedTurnsPerHour" above). Production coverage for the case where the
+ * rule leaves it absent — closed by BUTCHR-471's enforcement-site default,
+ * `effectiveMaxLinkedTurnsPerHour` — lives in
+ * test/unit/linked-eventing-default-caps.test.ts, through the real
+ * `createManagedSessionResourceType` wiring; a per-definition override
+ * remains a known, deliberately-deferred gap (FACTORY-78).
  */
 describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window logic runTick already has still works correctly when keyed by a synthetic state-owning agentKey and delivered to a different notifyAgentKey", () => {
   test("a capped tick is suppressed and retried later, and every delivered notify still targets notifyAgentKey, never the synthetic agentKey", async () => {
