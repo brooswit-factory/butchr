@@ -1,5 +1,17 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-98 (FACTORY-97): a lizard-eligible pane is now usually answered
+> within about a second, not up to 20s.** The daemon opens a herdr push
+> subscription (`pane.agent_status_changed`) filtered to exactly the
+> currently-eligible pane ids, and answers a pane at once on a `blocked`
+> transition. The 20s scan below is unchanged and still runs as a fallback —
+> see "Event-driven: the fast path (FACTORY-98)" further down for what
+> changed, why it still needs the scan at all, and what stayed a scan-only
+> path (CPU sanity, respawn-loop safety). Text above and below that section
+> describing "the" 20s timer as the only mechanism predates this change but
+> is otherwise still accurate: the scan itself, its opt-in gate, its cadence,
+> and its audit/journal behavior are all unchanged.
+
 > **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
 > with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
 > "always allow" option.** Matching Claude's "always allow" wording was
@@ -180,6 +192,89 @@ running and may still press keys and record `approved` in the audit log
 after the tick that logged the timeout has already returned. Check the audit
 log for the pane, not just the console line.
 
+## Event-driven: the fast path (FACTORY-98)
+
+FACTORY-97 (the story this ticket implements) reported blocks up to 47s live
+on codey: every tool call needing permission waited for the next 20s tick,
+and a tool-heavy agent felt visibly slower for it. FACTORY-98 investigated
+what `@brooswit/herdr-sdk`/`@brooswit/drovr` actually offer for this —
+"pick what is real, not what is assumed" — and found a real one:
+`events.subscribe` (`HerdrClient.subscribe`, passed straight through by
+`DrovrClient.subscribe`) is a genuine long-lived push connection, and
+`pane.agent_status_changed` is one of its subscription kinds.
+
+**The catch, verified against the SDK's own generated types
+(`generated/params.d.ts`'s `Subscription` union), not assumed:**
+`pane.agent_status_changed` is one of exactly three subscription kinds that
+REQUIRE a specific `pane_id` filter — there is no "any pane" wildcard the
+way there is for, say, `pane.created`. So this cannot replace the scan
+above: something still has to read `agent.list()` and the `lizardMode` gate
+to learn WHICH panes are eligible before it can even ask herdr to push their
+status changes. What the push connection changes is WHEN an already-known
+eligible pane gets answered.
+
+**Wiring (`src/agents/permission-answer-watch.ts`,
+`startPermissionAnswerWatch`, replacing the bare
+`startPermissionAnswerLoop` call in `src/daemon/index.ts`):**
+
+- The 20s sweep keeps running exactly as described above — same
+  `eligiblePanes` gate, same `agent.list()` call, same `autoAnswerPermissions`
+  pass, same audit/journal output. It is now also the mechanism that keeps
+  the push subscription's pane-id filter in sync: `runPermissionAnswerTick`
+  gained an optional `onEligiblePaneIds` hook, called with the exact set
+  `eligiblePanes` returned THIS tick, before any screen is read. The watch
+  uses it to notice the eligible set changed and, only then, close the old
+  subscription and open a new one for the new set — no second `agent.list()`
+  call to notice topology change.
+- On a `pane.agent_status_changed` push frame reporting `blocked` for a pane
+  in the current set, the watch fires a tick immediately, the same
+  `runPermissionAnswerTick` call the sweep itself uses.
+- **One shared in-flight guard, coalescing rather than dropping.** The
+  event-triggered tick and the periodic sweep both go through the same
+  `inFlight` boolean `startPermissionAnswerLoop` already used for the
+  sweep-only case — they can never run concurrently against the same pane
+  set. A `fire()` that arrives mid-tick does NOT drop the request: it sets a
+  `pending` flag, and the running tick's own completion runs exactly one
+  more tick before going idle if it sees that flag set. This matters for the
+  exact case the story exists for — a tool-heavy agent whose own NEXT tool
+  call goes `blocked` again while the current tick is still mid-approve/
+  verify on the previous one; dropping that event would leave it to the 20s
+  fallback, missing the latency goal whenever more than one prompt is in
+  flight at a time. A burst of N such requests during one tick still costs
+  at most one trailing tick, never N — bounding the read-scan rate the same
+  way `startPermissionAnswerLoop`'s own "a slow tick just makes the next
+  firing a no-op" bound always did, just without discarding the request that
+  arrived during the busy window.
+- **A newly-eligible pane's first tick is still scan-driven.** A pane isn't
+  subscribed to until a sweep tick has seen it as eligible at least once —
+  so it gets the ≤20s bound (unchanged from before this ticket) on its first
+  tick as a lizard-mode pane, and the fast, sub-3s path from the second tick
+  onward. Not a regression: nothing before this ticket had a fast path at
+  all. This is the one latency gap the coalescing above does not close.
+- **Reconnection.** A subscription that ends on its own (herdr closed it, or
+  it errored — a real socket can drop) is reopened after `resubscribeDelayMs`
+  (default 2000ms) for the same pane-id set, unless a topology change has
+  already superseded it. A `subscribe()` call that fails outright is logged
+  (`[permission-answer] watch subscribe failed: …`) and retried the same way
+  — a dead push connection degrades to "sweep only, same as before this
+  ticket," never to "nothing answers."
+
+**CPU sanity for a large fleet (20+ panes):** the push connection is exactly
+one socket per DISTINCT pane-id SET, reopened only when that set changes —
+not a poll, not a per-second cost, and not one connection per pane. The
+`lizardMode` opt-in gate (above) is what actually bounds the set's size: an
+ordinary fleet with zero or a handful of lizard-mode panes among 20+ total
+panes pays for one small subscription and the same one `agent.list()` call
+every 20s the scan-only version always paid — nothing here scales with the
+TOTAL pane count, only with the lizard-eligible one.
+
+**Respawn-loop safety:** unchanged from the scan-only version — `lizardMode`
+still never reaches `SpawnSpec` or a launched process's argv (see "No argv,
+no stale-argv risk" above), and this ticket added no new persisted state a
+restart could see as stale. A `stop()`/restart of the watch simply closes
+whatever subscription is open and re-derives everything from the next
+`agent.list()` call, same as the scan-only version always did.
+
 ## The audit log
 
 `Config.permissionAuditPath` (`src/config/config.ts`): a JSONL file, default
@@ -234,3 +329,108 @@ that is a natural, separable follow-up.
   none setting `lizardMode`) and every existing rule (none setting either new
   field) load and behave unchanged. Deploys and any live cutover go through
   admin-assembly at the operator's direction.
+
+## Approval sound (FACTORY-100/FACTORY-103)
+
+An OPT-IN, OFF-by-default sound played on **this daemon's own host** every
+time this loop's `runPermissionAnswerTick` reports a pane `answered` — the
+operator's own request: a human in earshot of the host should hear each
+unattended approval as it happens, not just find it later in
+`permissionAuditPath`'s JSONL trail. Implemented in
+`src/agents/approval-sound.ts`, wired into the `onApproved` dep shared by
+`startPermissionAnswerLoop` and `startPermissionAnswerWatch`
+(`src/daemon/index.ts`), called once per answered pane regardless of which
+of the two wires it up — `onApproved` lives on `PermissionAnswerLoopDeps`,
+and `startPermissionAnswerWatch` forwards its own deps straight through to
+`runPermissionAnswerTick` (see `permission-answer-watch.ts`), so this hook
+does not care which sits on top.
+
+**Why the hook sits here, not in drovr.** The "approval" audit record itself
+(`outcome: "approved"`) is written by `@brooswit/drovr`'s
+`approvePermission` — a separate published npm package, not this repo.
+`runPermissionAnswerTick`'s own `answered` filter is the EARLIEST point in
+BUTCHR'S OWN code that knows a prompt was just approved, and it already
+flows through this exact function on every tick, whether the tick was fired
+by the sweep timer or the event-driven watch — tailing drovr's audit file as
+an event source would be strictly later, more expensive (a file watch or
+poll on top of the poll this loop already is), and has no precedent anywhere
+in this codebase. (An operator FACTORY-100 comment briefly asked whether the
+sound asset and its playback should both move into drovr; the ruling that
+followed keeps the hook here — only the SOUND ASSET itself moved into drovr,
+see "Default sound source" below.)
+
+**Config:** `Config.lizardApprovalSound?: { overridePath?: string }` — TWO
+SEPARATE env vars (`src/config/config.ts`): `BUTCHR_LIZARD_APPROVAL_SOUND`
+(any non-empty value enables the feature; absent/empty means disabled,
+today's behaviour exactly) and `BUTCHR_LIZARD_APPROVAL_SOUND_PATH` (optional,
+`~` expanded) as a local-file-path override. A path with the enable flag
+unset does NOT enable the feature — the flag is the master switch. Daemon/host
+level, not per-managed-session: the sound plays on the HOST's own speakers
+regardless of which agent's pane triggered it, so one knob is the natural
+fit — a per-definition setting would imply a per-agent sound the host cannot
+actually produce independently.
+
+**Default sound source: drovr's own bundled asset.** With the flag on and no
+override path, the source is `@brooswit/drovr`'s own bundled
+`assets/sounds/lizard-button.mp3` (FACTORY-122 ships it there) — resolved at
+runtime (`resolveDrovrBundledAsset`) by asking `import.meta.resolve` for the
+package's main entry (the only subpath its `exports` field exposes), then
+walking up the filesystem to the ancestor directory whose OWN `package.json`
+declares `name: "@brooswit/drovr"` (that package's `exports` does NOT expose
+`./package.json` or an arbitrary asset subpath as importable specifiers, so
+this walks the filesystem after resolving only the "." export rather than
+trying to `import()` either directly). The package or asset failing to
+resolve (missing, or a pin without the asset) logs ONE warning and disables
+the sound for the daemon's remaining lifetime, same as any other unresolvable
+source — see `test/unit/approval-sound.test.ts`'s REAL-PACKAGE GUARD test for
+why this is deliberately re-checked against the actually-installed package
+rather than only against fakes. **URL sources are out of scope** (cut after
+the operator's suggested `https://www.myinstants.com/...` value turned out to
+403 non-browser clients on this fleet's hosts, and a later redirect asked for
+the asset to live inside drovr rather than as a URL or a Butchr-side
+download) — this module does not build, keep, or document any download/cache
+path.
+
+**Player selection** (`chooseSoundPlayer`/`candidateSoundPlayers`): tries, in
+this fixed order, whichever of `gst-play-1.0`, `afplay`, `mpv`, `ffplay`
+(`-nodisp -autoexit -loglevel quiet`), `paplay`, `pw-play`, `aplay` is found
+on `PATH` (`Bun.which`, same detection primitive `detectTerminalPrefix`
+already uses for terminal emulators, `src/terminal/open.ts`). `aplay` (ALSA)
+cannot decode mp3, so it is restricted to `.wav` sources; every other player
+is tried against any format. `gst-play-1.0` is tried FIRST specifically
+because a live measurement on codey found `paplay`/`pw-play` both fail on mp3
+there (its libsndfile build has no mp3 support) while `gst-play-1.0` plays it
+fine — a candidate that exits non-zero or errors is treated as "try the next
+one", not success, walking the full fallback chain rather than giving up
+after the first installed candidate. The first candidate that actually
+succeeds is REMEMBERED and tried directly (skipping the PATH-lookup probe
+entirely) on every later approval; if it ever stops working, it is forgotten
+and the full fallback chain is re-probed from scratch. No usable player at
+all logs ONE warning and disables the sound for the daemon's remaining
+lifetime — it is never re-checked.
+
+**Coalescing:** `DEFAULT_COALESCE_MS` (1500ms, `createApprovalSoundNotifier`'s
+`coalesceMs` option) — a burst of approvals inside that window plays at most
+one sound (a leading-edge throttle: the first approval in a quiet period
+plays immediately; every approval before the window elapses is coalesced
+away; the next approval after the window plays again).
+
+**Journal evidence.** Every ACTUAL play logs one concise line naming the
+player, the file, and the exit status (e.g. `played <path> via "gst-play-1.0"
+(exit 0)`) — deliberately not a once-ever message like the failure warnings
+below, so admin-assembly can confirm from the journal alone that a real
+approval played the sound, every time.
+
+**Never touches the approval path.** `notifyApproved` is synchronous, never
+awaited by its caller, and wraps everything in `try`/`catch` — a throwing
+`onApproved` (or a throwing `now`/`has`/`spawn` dependency) cannot propagate
+into `runPermissionAnswerTick`, which ALSO wraps its own call to
+`deps.onApproved?.()` defensively (belt-and-suspenders). A player that fails
+to spawn (ENOENT), reports an async `"error"` event, or exits non-zero (the
+headless-host, no-audio-device case) each log at most one warning and are
+otherwise silent — this is a **deliberately different** failure mode from
+"no player found"/"source unresolvable" above: a playback-runtime failure
+does not disable the feature forever, since the underlying condition (no
+audio sink attached to a headless host) can never be distinguished here from
+a merely transient one, and the ticket's own requirement is "degrade silently
+after one warning", not "give up permanently".

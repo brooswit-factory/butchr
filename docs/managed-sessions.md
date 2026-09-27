@@ -1050,17 +1050,21 @@ herdr reporting them idle/done) this whole DROVR-37 epic exists to fix:
 ```
 
 `lizardMode: true` opts this ONE definition's agent into the daemon's
-separate permission-answer timer (`src/agents/permission-answer-loop.ts`,
-20s cadence, its own `setInterval` independent of the reconcile loop and the
-blocking-escalation watcher — see `docs/permission-answer-loop.md` for the
-full cadence/audit-visibility writeup). A definition that doesn't set the
-field is untouched by that timer entirely — this is NOT a blanket sweep over
-every pane; the timer's own `eligiblePanes` hook resolves, fresh every tick,
-which panes belong to a currently-eligible `lizardMode: true` definition
-(via the SAME live `managedSessionLizardModes` map BUTCHR-408's `roles`/
-BUTCHR-460's `accountPolicies` maps already established the pattern for —
-rebuilt every managed-sessions poll from each eligible definition's own
-manifest, never persisted or acted on stale).
+separate permission-answer watch (`src/agents/permission-answer-watch.ts`,
+wrapping `src/agents/permission-answer-loop.ts`'s own 20s scan, independent
+of the reconcile loop and the blocking-escalation watcher — see
+`docs/permission-answer-loop.md` for the full cadence/audit-visibility
+writeup). Since FACTORY-98, an eligible pane is usually answered within
+about a second of going `blocked` (a herdr push subscription, not just the
+20s scan — see that doc's "Event-driven: the fast path" section); the scan
+itself, and everything below about the opt-in gate, is unchanged. A
+definition that doesn't set the field is untouched entirely — this is NOT a
+blanket sweep over every pane; the scan's own `eligiblePanes` hook resolves,
+fresh every tick, which panes belong to a currently-eligible
+`lizardMode: true` definition (via the SAME live `managedSessionLizardModes`
+map BUTCHR-408's `roles`/BUTCHR-460's `accountPolicies` maps already
+established the pattern for — rebuilt every managed-sessions poll from each
+eligible definition's own manifest, never persisted or acted on stale).
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
 field is independent and a definition may set it alongside any

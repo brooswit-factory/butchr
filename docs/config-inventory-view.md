@@ -53,6 +53,12 @@ directly against real `QueryAgentInventory`/`DashboardRow[]` shapes
 - `rows: readonly DashboardRow[]` — the SAME poll-fed `/dashboard` snapshot
   the existing agent view already reads, passed in only for the cross-link
   matching below; never echoed back onto the page directly.
+- `opts.agentCensusChecked: boolean` (FACTORY-132, required) — the SAME
+  `DashboardResponse.checked` the `rows` above already came from. Drives the
+  COULD NOT CHECK vs. "no running agent" choice in the cross-link area (see
+  below); required rather than optional-with-a-default so a caller that
+  forgets to wire it is a compile error, not a silent wrong "no running
+  agent" while the census is actually unavailable.
 
 The route itself (`src/web/view.ts`'s `GET /configurations`) does the actual
 `await deps.configInventory()` call, wrapped in a `try`/`catch` so a rejected
@@ -141,14 +147,61 @@ comment), for config data rather than agent-status data:
   definition's content fields (`vendor`, `tier`, `permissionMode`, …)
   structurally do not exist — never confused with a failed read.
 - **No running agent** (`na` class): nothing failed; there is simply no row
-  to link to, for a rule or session definition this poll.
+  to link to, for a rule or session definition this poll — rendered ONLY
+  while the agent census is available (see COULD NOT CHECK below for the
+  case where it is not).
+- **COULD NOT CHECK** (`cnc` class, the literal words "COULD NOT CHECK"):
+  FACTORY-132 extends this idiom (previously only the whole-page
+  fetch-failure banner) to per-row staffing and to the cross-link area.
+  `QueryAgentInventory`'s per-rule `staffed` is `boolean | null` — `null`
+  means the agent census itself is unavailable this poll (the SAME
+  `DashboardResponse.checked === false` predicate `dashboard-page.ts`'s own
+  `/` banner keys on), so this daemon genuinely cannot say whether the rule
+  is staffed. A rule in this state renders its staffing cell as `COULD NOT
+  CHECK: <reason>`, never `UNSTAFFED`. Independently, the cross-link area
+  (`renderAgentLinks`, shared by rule rows and session-definition rows
+  alike) renders `COULD NOT CHECK` instead of "no running agent" whenever it
+  would otherwise show "no running agent" AND the census is unavailable — a
+  row WITH a matching live row still links regardless of census state (see
+  "stale carry-forward" below), and a row whose non-staffing is a config
+  fact (disabled, or a provider-config reason) still says `UNSTAFFED: ...`
+  in its staffing cell even while its own cross-link area independently
+  reads `COULD NOT CHECK` — the two axes are independent. The flag reaches
+  the render layer as `RenderConfigInventoryOpts.agentCensusChecked`
+  (required, not optional-with-a-default), supplied by `GET /configurations`
+  from the SAME `dashboard()` snapshot whose `.rows` it already passes, so
+  the matches and the flag they depend on always come from one snapshot.
+
+### Stale carry-forward: "agent wins" is unaffected
+
+If the agent census's most recent poll failed AFTER an earlier success, the
+previous snapshot's rows are carried forward (stale, but still present) —
+see `dashboard.ts`'s own `createDashboardFeed`. A rule or session definition
+that still matches one of those stale rows renders exactly as if the census
+were current: `staffed: true` and a working cross-link, never `COULD NOT
+CHECK`. Only an EMPTY match list's meaning depends on census state. This is
+deliberate, not a gap: a live (if possibly stale) row is itself a stronger
+fact than the census flag, and the agents view (`/`) already labels such a
+row STALE in its own right.
 
 ## Coping with an evolving inventory shape
 
-Per this ticket's own note (FACTORY-74 may change managed-session `tier`'s
-shape): `tier`/`vendor` are rendered as `String(value)`, never assumed to be
-one of today's known enum values — an unexpected future shape renders as
-whatever value is present rather than hard-failing.
+FACTORY-74 has since merged: a managed-session definition now carries either
+a deprecated `tier` or the two-axis `modelPower`/`effort`, and
+`SessionDefinitionInventoryEntry` additionally carries the resolved
+effective `resolvedModel`/`resolvedEffort` (via `effectiveAgent()`,
+`../resources/session-definition.ts`) — see FACTORY-120. `tier`/`vendor` are
+still rendered as `String(value)`, never assumed to be one of today's known
+enum values — an unexpected future shape renders as whatever value is
+present rather than hard-failing. A `tier`-based definition keeps rendering
+`vendor/tier` and additionally shows its resolved model plus the honest "no
+effort set — launch default applies" wording (`effectiveAgent()` deliberately
+returns no effort for a tier-based definition, by design, not a gap); a
+two-axis definition shows its resolved model/effort plus the raw
+`modelPower`/`effort` integers as secondary detail, and never the old
+`vendor/?` placeholder. An INVALID definition's resolved fields are absent
+(NOT-APPLICABLE), never computed — calling `effectiveAgent()` on one would
+throw.
 
 ## Known limit: two session definitions sharing an `agentKey`
 
