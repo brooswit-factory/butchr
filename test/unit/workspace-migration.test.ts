@@ -52,7 +52,13 @@ function populate(dir: string): void {
   writeFileSync(join(dir, ".butchr-permission-mode.json"), '"default"');
 }
 
-const KEY = (resourceId: string, ruleId = "triage") => encodeAgentKey({ resourceProvider: "jira-work", ruleId, resourceId });
+// github-issue, not jira-work: jira-work/jira-idea/jira-project are Addendum
+// A1's identity-short-id providers (their leaf never changes, so
+// migrateWorkspaceLayout would short-circuit to a same-dir no-op before ever
+// exercising a real rename — see `shortDisplayId`'s dispatch, src/rules/display-label.ts).
+// github-issue's short id drops the owner (`owner/repo#n` -> `repo#n`),
+// giving a real, non-identity leaf change every one of these tests needs.
+const KEY = (n: string, ruleId = "triage") => encodeAgentKey({ resourceProvider: "github-issue", ruleId, resourceId: `acme/proj#${n}` });
 
 describe("claudeProjectSlug — pinned to drovr's own algorithm", () => {
   test("exact literal pin: every non-alphanumeric character becomes '-'", () => {
@@ -164,6 +170,18 @@ describe("migrateClaudeProjectSlug", () => {
     expect(readFileSync(join(claudeSlugDir(home, newCwd), "session.jsonl"), "utf8")).toContain("codeword-long");
   });
 
+  test("refuses (rather than silently orphaning the transcript) when the NEW cwd's own naive slug exceeds the truncation length — confirmed live on Servy: this exact shape left a migrated transcript unreachable by `claude --continue`", () => {
+    const home = tempDir("butchr-slug-home-");
+    const oldCwd = tempDir("butchr-old-cwd-");
+    writeTranscript(home, oldCwd, "t.jsonl", "codeword-should-not-move");
+    const newCwd = "/" + "e".repeat(60) + "/" + "f".repeat(60) + "/" + "g".repeat(60) + "/" + "h".repeat(60);
+    expect(claudeProjectSlug(newCwd).length).toBeGreaterThan(200);
+
+    expect(() => migrateClaudeProjectSlug(oldCwd, newCwd, home)).toThrow(/over the 200-char threshold/);
+    // refusal leaves the source untouched — nothing was moved to a dead-end directory.
+    expect(readFileSync(join(claudeSlugDir(home, oldCwd), "t.jsonl"), "utf8")).toBe("codeword-should-not-move");
+  });
+
   test("a slug shorter than the truncation length never matches a same-prefix directory it did not itself produce", () => {
     const home = tempDir("butchr-slug-home-");
     const oldCwd = tempDir("butchr-short-cwd-");
@@ -180,7 +198,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("migrates an old-layout workspace to its short-name directory, carrying bookkeeping files for free, stamping it, and moving the Claude slug together", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-1");
+    const key = KEY("1");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     writeTranscript(home, oldDir, "t.jsonl", "codeword-abc");
@@ -203,7 +221,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("neither old nor new dir exists: no-legacy-workspace, touches nothing", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-2");
+    const key = KEY("2");
     const result = migrateWorkspaceLayout(key, root, home);
     expect(result.outcome).toBe("no-legacy-workspace");
     expect(result.oldDir).toBeNull();
@@ -220,11 +238,19 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("never overwrites a non-empty target workspace dir: refuses loudly, BOTH sides untouched", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-3");
+    const key = KEY("3");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     const newDir = newLayoutDirFor(key, root);
     mkdirSync(newDir, { recursive: true });
+    // Stamped as THIS key — a live new-layout workspace `ensureWorkspaceDir`
+    // already claimed and wrote real content into — so `newLayoutDirFor`
+    // recognises it as the rightful target (not a foreign collision) and
+    // the refuse-on-non-empty guard is what actually protects it, rather
+    // than the collision-avoidance silently rerouting around this test's
+    // own setup (an unstamped occupant here would be misread as a
+    // DIFFERENT key's directory — see workspace.ts's `newLayoutDirFor`).
+    writeBookkeptAgentKey(newDir, key);
     writeFileSync(join(newDir, "unrelated.txt"), "someone else's stuff");
 
     expect(() => migrateWorkspaceLayout(key, root, home)).toThrow(/non-empty/);
@@ -236,11 +262,12 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("an EMPTY new-layout target (already claimed by ensureWorkspaceDir but nothing written into it yet) is safe to proceed through", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-4");
+    const key = KEY("4");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     const newDir = newLayoutDirFor(key, root);
-    mkdirSync(newDir, { recursive: true }); // claimed, empty
+    mkdirSync(newDir, { recursive: true });
+    writeBookkeptAgentKey(newDir, key); // claimed (real ensureWorkspaceDir stamps immediately) and empty otherwise
 
     const result = migrateWorkspaceLayout(key, root, home);
     expect(result.outcome).toBe("migrated");
@@ -250,7 +277,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("idempotent: running again after a completed migration is a no-op — no error, no further change", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-5");
+    const key = KEY("5");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     writeTranscript(home, oldDir, "t.jsonl", "codeword");
@@ -264,23 +291,37 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
     expect(readBookkeptAgentKey(first.newDir)).toBe(key);
   });
 
-  test("partial-failure recovery: directory already renamed but not yet stamped (crash between the two) — re-running finishes the stamp instead of erroring or re-renaming", () => {
+  test("the stamp is written before the rename, atomically with it — no 'renamed but not yet stamped' crash window exists to recover from", () => {
+    // A stamp written AFTER the rename would leave a real crash window: a kill
+    // between the two leaves `newDir` existing and unstamped, and
+    // `newLayoutDirFor`'s own collision-avoidance (workspace.ts) cannot tell
+    // that apart from a genuinely DIFFERENT key's directory — a retry would
+    // reroute to a different (suffixed) candidate and never find or stamp the
+    // real content, permanently orphaning it as "no-legacy-workspace". Fixed
+    // by stamping `oldDir` — which then travels WITH the atomic rename, like
+    // every other bookkeeping file — before the rename ever runs, so the
+    // directory is correctly stamped the instant it lands at `newDir`. The
+    // "partial-failure ordering" test above (KEY 7) covers the OTHER real
+    // partial-failure window this ticket requires: dir migrated, slug not.
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-6");
-    const newDir = newLayoutDirFor(key, root);
-    populate(newDir); // simulate: the rename already happened; crash landed before the stamp write
-    expect(readBookkeptAgentKey(newDir)).toBeNull();
+    const key = KEY("6");
+    const oldDir = oldDirFor(root, key);
+    populate(oldDir);
 
     const result = migrateWorkspaceLayout(key, root, home);
-    expect(result.outcome).toBe("already-migrated");
-    expect(readBookkeptAgentKey(newDir)).toBe(key);
+    expect(result.outcome).toBe("migrated");
+    expect(readBookkeptAgentKey(result.newDir)).toBe(key);
+    // Re-deriving the target independently must land on the SAME directory —
+    // proof `newLayoutDirFor` recognises it as already, rightfully stamped
+    // rather than routing a hypothetical retry to a suffixed alternative.
+    expect(newLayoutDirFor(key, root)).toBe(result.newDir);
   });
 
   test("partial-failure ordering: the directory half completes even when the slug half then throws, and a corrected re-run finishes only the remaining slug move", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-7");
+    const key = KEY("7");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     writeTranscript(home, oldDir, "t.jsonl", "codeword-partial");
@@ -305,7 +346,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("reversible: forward then reverse restores the original old-layout directory exactly, including removing the new-layout stamp", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-8");
+    const key = KEY("8");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
     writeTranscript(home, oldDir, "t.jsonl", "codeword-roundtrip");
@@ -328,7 +369,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("reverse migration is idempotent and reports no-legacy-workspace when there is nothing to reverse", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-9");
+    const key = KEY("9");
     expect(reverseMigrateWorkspaceLayout(key, root, home).outcome).toBe("no-legacy-workspace");
 
     const oldDir = oldDirFor(root, key);
@@ -343,7 +384,7 @@ describe("migrateWorkspaceLayout / reverseMigrateWorkspaceLayout", () => {
   test("reverse migration never overwrites a non-empty old-layout target", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-10");
+    const key = KEY("10");
     const newDir = newLayoutDirFor(key, root);
     populate(newDir);
     writeBookkeptAgentKey(newDir, key);
@@ -361,7 +402,7 @@ describe("git worktree repair across a rename", () => {
   test("an atomic directory rename breaks a worktree's absolute-path back-references; migrateWorkspaceLayout repairs them so git keeps working from the new location", () => {
     const root = tempDir("butchr-root-");
     const home = tempDir("butchr-home-");
-    const key = KEY("FACTORY-11");
+    const key = KEY("11");
     const oldDir = oldDirFor(root, key);
     populate(oldDir);
 

@@ -269,10 +269,47 @@ export function migrateWorkspaceLayout(agentKey: string, root: string = workspac
   if (!oldExists && !newExists) {
     return { outcome: "no-legacy-workspace", oldDir: null, newDir, slug: { outcome: "no-old-slug", oldSlugDir: null, newSlugDir: join(home, ".claude", "projects", claudeProjectSlug(newDir)) }, repairedWorktrees: [] };
   }
-  if (oldExists && newExists && readdirSync(newDir).length > 0) {
-    throw new Error(`refusing to migrate workspace ${oldDir} -> ${newDir}: target already exists and is non-empty (left both sides untouched)`);
+  if (oldExists && newExists) {
+    const newDirEntries = readdirSync(newDir);
+    // `ensureWorkspaceDir` stamps a directory the INSTANT it claims it — so
+    // "claimed but nothing written yet" (this function's own doc comment,
+    // and the DoD's own "target-side dir already containing a fresh session
+    // created after a restart" edge case) is NEVER a literal zero-entry
+    // directory: it always has exactly the bookkeeping stamp file in it.
+    // Only entries OTHER than that stamp — and only when the stamp names
+    // this SAME key, never a foreign one — count as "real content" for the
+    // refuse check below; a foreign or mismatched stamp is real content too
+    // (never silently adopted, per Addendum A6).
+    const stampedThisKey = readBookkeptAgentKey(newDir) === agentKey;
+    const meaningfulEntries = stampedThisKey ? newDirEntries.filter((e) => e !== AGENT_KEY_BOOKKEEPING_FILE) : newDirEntries;
+    if (meaningfulEntries.length > 0) {
+      throw new Error(`refusing to migrate workspace ${oldDir} -> ${newDir}: target already exists and is non-empty (left both sides untouched)`);
+    }
+    if (newDirEntries.length > 0) {
+      // Logically empty (just this key's own claim stamp) but not LITERALLY
+      // empty — POSIX rename(2) only replaces a directory target that has
+      // zero entries. Remove the stamp so the physical rename below can
+      // proceed exactly as the doc comment above promises; the pre-rename
+      // stamp write on `oldDir` (below) restores it at the new location.
+      unlinkSync(join(newDir, AGENT_KEY_BOOKKEEPING_FILE));
+      rmdirSync(newDir);
+    }
   }
   if (oldExists) {
+    // Stamped BEFORE the rename, inside `oldDir`, so the stamp travels WITH
+    // the atomic rename like every other bookkeeping file — never a separate
+    // step after it. This closes a real crash window: `newLayoutDirFor`'s own
+    // collision-avoidance (workspace.ts) treats an EXISTING, UNSTAMPED bare
+    // leaf as a foreign occupant and reroutes to a suffixed alternative —
+    // correct for a genuine two-different-keys collision, but WRONG for this
+    // key's own not-yet-stamped rename target. A crash between a
+    // post-rename stamp write and the rename itself would therefore make a
+    // retry compute a DIFFERENT `newDir` than the one the content actually
+    // landed at, permanently orphaning it as "no-legacy-workspace" (old
+    // absent, and the fresh — now-different — new candidate also absent).
+    // Stamping pre-rename means the directory is ALREADY correctly stamped
+    // the instant it lands at `newDir`, so no such window exists.
+    writeBookkeptAgentKey(oldDir, agentKey);
     mkdirSync(dirname(newDir), { recursive: true });
     renameSync(oldDir, newDir);
   }

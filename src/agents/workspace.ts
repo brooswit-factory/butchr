@@ -509,7 +509,14 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // doc comment for why an identity-short-id provider or a query-level key
   // must see no write at all.
   const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded).changed;
-  if (leafActuallyMoved && dir === newLayoutDirFor(id, root) && !readBookkeptAgentKey(dir)) writeBookkeptAgentKey(dir, id);
+  // Compares against `target` (computed BEFORE `mkdirSync` above) — never a
+  // fresh `newLayoutDirFor(id, root)` call here, which would see this call's
+  // own just-created, not-yet-stamped directory as "occupied by someone
+  // else" and reroute to a suffixed alternative, contradicting `dir` (this
+  // exact bug is what the comment on `target`'s own declaration above
+  // describes being caught and fixed before shipping — this line had
+  // regressed back to the recomputing form).
+  if (leafActuallyMoved && dir === target && !readBookkeptAgentKey(dir)) writeBookkeptAgentKey(dir, id);
   return dir;
 }
 

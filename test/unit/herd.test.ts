@@ -1,12 +1,13 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
-import { buildWorkspace, workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
+import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
@@ -815,8 +816,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
@@ -840,8 +840,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Missing the server:mud-bridge channel flag the definition now calls for.
@@ -873,8 +872,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
       // "expected" reconstruction) uses, so the flag value is guaranteed
@@ -897,8 +895,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Missing the --permission-mode auto flag the persisted definition now calls for.
       const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
@@ -923,8 +920,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
       const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", strictMcpConfig: true }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
@@ -944,8 +940,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
       const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
@@ -981,8 +976,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
       const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
@@ -1003,8 +997,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       // Spawned a while ago at Sonnet/medium...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("medium"));
@@ -1036,8 +1029,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       // The respawn already happened: buildWorkspace persisted the NEW resolved model/effort...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
@@ -1114,8 +1106,7 @@ describe("staleIssues", () => {
       process.env.BUTCHR_WORKSPACES = root;
       try {
         const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-        const cwd = workspaceDirFor(key);
-        mkdirSync(cwd, { recursive: true }); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
+        const cwd = ensureWorkspaceDir(key); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
         // A pre-existing build's real launch: agentLaunchConfig always emits both --model and --effort for Claude, unconditionally (its own default fallback resolved to sonnet/high here).
         const argv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
@@ -1136,8 +1127,7 @@ describe("staleIssues", () => {
       process.env.BUTCHR_WORKSPACES = root;
       try {
         const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-        const cwd = workspaceDirFor(key);
-        mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file.
+        const cwd = ensureWorkspaceDir(key); // legacy: no persisted model/effort file.
         const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
         // The operator has since moved this definition to modelPower=100/effort=70 (Fable/xhigh).
@@ -1247,8 +1237,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
       const argv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
@@ -1611,36 +1600,60 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
   // be fixed up too, right now — not left to share the incoming spawn's
   // bare label until the next `relabelOwnedWorkspaces()` restart pass.
   test("spawning a colliding key that sorts AFTER an already-running one: the new workspace is suffixed, the running one keeps its bare label (reasserted, not left stale)", async () => {
-    // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
-    const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
-    expect(incoming > running).toBe(true); // pins the ordering this test relies on
-    const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
-    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-    await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-    expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
-    // `labelFor` unconditionally reasserts every OTHER member of the group's own
-    // correct label whenever the group has more than one member — cheap, idempotent,
-    // and never relies on knowing whether herdr's own stored value already agrees.
-    expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
-    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-collide-after-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      expect(incoming > running).toBe(true); // pins the ordering this test relies on
+      // `ensureWorkspaceDir`, not a bare `workspaceDirFor` string: a real
+      // already-running agent's workspace is always claimed+stamped on disk
+      // (FACTORY-118) — that stamp is what lets `agentIdOfWorkspacePath`
+      // resolve this fake pane's cwd back to `running` at all, and what lets
+      // `incoming`'s own `newLayoutDirFor` recognise the bare short name as
+      // occupied by a DIFFERENT key and correctly suffix itself.
+      const runningCwd = ensureWorkspaceDir(running);
+      const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
+      expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      // `labelFor` unconditionally reasserts every OTHER member of the group's own
+      // correct label whenever the group has more than one member — cheap, idempotent,
+      // and never relies on knowing whether herdr's own stored value already agrees.
+      expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
+      expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("spawning a colliding key that sorts BEFORE an already-running one: the new workspace gets the bare label AND the running workspace is relabeled to the suffix, so the two never share a label", async () => {
-    const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
-    const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
-    const f = fakeHerdr([{ pane_id: "p-running", cwd: workspaceDirFor(running), workspace_id: "w-running" }]);
-    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-    await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-    expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
-    // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
-    expect(f.renamed).toHaveLength(1);
-    expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
-    expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
-    expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
-    // The one invariant that matters: no two live workspaces ever share a label.
-    expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-collide-before-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+      expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
+      const runningCwd = ensureWorkspaceDir(running); // see the sibling test above for why this must be a real, stamped claim
+      const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
+      expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
+      // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
+      expect(f.renamed).toHaveLength(1);
+      expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
+      expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
+      // The one invariant that matters: no two live workspaces ever share a label.
+      expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("a successful spawn preserves the full agent key in herdr metadata, keyed by the started workspace id", async () => {
@@ -1694,19 +1707,31 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
   });
 
   test("disambiguates a collision across two owned workspaces the same way spawn-time collision resolution would (same agent -> same label both ways)", async () => {
-    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
-    const f = fakeHerdr([
-      { pane_id: "p1", cwd: workspaceDirFor(a), workspace_id: "wA" },
-      { pane_id: "p2", cwd: workspaceDirFor(b), workspace_id: "wB" },
-    ]);
-    const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-    await herd.relabelOwnedWorkspaces();
-    const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
-    const labels = [renameFor("wA"), renameFor("wB")];
-    expect(new Set(labels).size).toBe(2); // never shared
-    expect(labels).toContain("brooswit-factory:rinth · repos"); // one keeps the bare label
-    expect(labels.find((l) => l !== "brooswit-factory:rinth · repos")).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-relabel-collide-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+      const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      // Real, stamped claims (FACTORY-118) — see the spawn-time collision
+      // tests above for why a bare `workspaceDirFor` string here would leave
+      // `agentIdOfWorkspacePath` unable to resolve either fake pane's cwd
+      // back to its key at all.
+      const f = fakeHerdr([
+        { pane_id: "p1", cwd: ensureWorkspaceDir(a), workspace_id: "wA" },
+        { pane_id: "p2", cwd: ensureWorkspaceDir(b), workspace_id: "wB" },
+      ]);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.relabelOwnedWorkspaces();
+      const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
+      const labels = [renameFor("wA"), renameFor("wB")];
+      expect(new Set(labels).size).toBe(2); // never shared
+      expect(labels).toContain("brooswit-factory:rinth · repos"); // one keeps the bare label
+      expect(labels.find((l) => l !== "brooswit-factory:rinth · repos")).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("idempotent: calling it twice renames to the same labels both times", async () => {
