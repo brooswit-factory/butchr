@@ -39,6 +39,7 @@ import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
+import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
@@ -1805,6 +1806,21 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // one sweep, same bound as before this ticket), not the only path.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+// FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
+// (see Config.lizardApprovalSound's own doc comment) — `enabled: false`
+// makes `createApprovalSoundNotifier` return a no-op `notifyApproved` before
+// touching PATH, spawn, or the filesystem at all. `has`/`spawn` mirror
+// `terminalPrefix`'s own detection wiring above (`Bun.which`/`Bun.spawn`).
+// No cache dir: the only source left (URL support was cut) is either an
+// override file already on disk, or drovr's own bundled asset resolved
+// straight out of node_modules — nothing here is ever downloaded.
+const approvalSoundNotifier = createApprovalSoundNotifier({
+  enabled: config.lizardApprovalSound !== undefined,
+  ...(config.lizardApprovalSound?.overridePath ? { overridePath: config.lizardApprovalSound.overridePath } : {}),
+  has: (c) => Bun.which(c) != null,
+  spawn: (argv) => Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"] }),
+  log: (line) => console.error(`  ${line}`),
+});
 // Narrows herdr's own push frame down to the one shape
 // `permission-answer-watch.ts` needs (`pane_id` + `agent_status`) — real
 // `PushFrame`s carry many other event shapes (workspace/tab/pane lifecycle)
@@ -1833,6 +1849,7 @@ startPermissionAnswerWatch(
     operator: "butchr-daemon",
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
+    onApproved: approvalSoundNotifier.notifyApproved,
     subscribe: subscribeAgentStatus,
   },
   PERMISSION_ANSWER_INTERVAL_MS,

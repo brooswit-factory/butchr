@@ -7,6 +7,14 @@
  * route (`src/web/view.ts`) — this module builds the response; the route
  * itself does no shaping of its own.
  *
+ * FACTORY-132: a `RuleInventoryEntry`'s staffing is a THREE-state fact, not
+ * two — `staffed: true` (staffed), `staffed: false` (genuinely not staffed,
+ * `reason` says why), or `staffed: null` (COULD NOT CHECK: the agent census
+ * itself is unavailable this poll, so neither "staffed" nor "not staffed" is
+ * a fact this daemon can currently assert). See `RuleInventoryEntry.staffed`'s
+ * own doc comment for the exact contract and `ruleStaffingReason`'s own doc
+ * comment for the fixed check order that produces it.
+ *
  * REUSE, NOT RE-DERIVATION, is this module's whole design constraint:
  *
  * - "Is this rule currently staffed, and why not" is answered by reading
@@ -82,6 +90,7 @@ import {
   type SessionDefinitionListEntry,
 } from "../resources/session-definition-manage.js";
 import { assertArchiveDirDisjoint } from "../resources/session-archive.js";
+import { effectiveAgent } from "../resources/session-definition.js";
 
 /** One file (a rules file, or a session-definition file) that failed to load or parse — never swallowed, never log-only. */
 export interface FileErrorEntry {
@@ -102,23 +111,46 @@ export interface RuleInventoryEntry {
   role: AgentRole;
   /**
    * `rule.agentPreferences`, ranked-order preserved, each copied field-by-field
-   * (`harness`/`model`/`effort` — none secret) rather than reused as-is. This
-   * is the ticket's own "harness/provider list, tier" ask: `AgentPreference`'s
-   * `model`/`effort` are the only rule-level analogue of "tier" — a `Rule` has
-   * no `tier` field at all (that name belongs to `SessionDefinition` instead;
-   * see `SessionDefinitionInventoryEntry.tier`) — so a `RuleInventoryEntry`
-   * deliberately has no separate `tier` field either; a reader who needs a
-   * per-rule model/effort reads it here. `[]` when the rule sets no
-   * preference (uses butchr's global agent config).
+   * (`harness`/`model`/`effort` — none secret) rather than reused as-is.
+   * `model`/`effort` here are ALREADY the fully resolved effective values,
+   * whether the rule expressed them directly or via `modelPower`/
+   * `effortPower` — `rules.ts`'s own `parsePreferences` resolves either axis
+   * through `../resources/power-scale.ts`'s `resolveModelPower`/
+   * `resolveEffortPower` once, at rule-load time, and keeps only the
+   * resolved `{harness, model?, effort?}` shape on the parsed preference —
+   * the raw 0-100 input is not retained there (see `AgentPreference`'s own
+   * doc comment, `../rules/rules.ts`), so this module has no raw power to
+   * copy even if it wanted to, and makes no second call to those tables
+   * either way. FACTORY-120: keeping/showing the raw `modelPower`/
+   * `effortPower` for a rule preference was considered and ruled OUT of
+   * scope (it would mean changing `parsePreferences`/`AgentPreference`,
+   * which are also read to build spawn specs and the duplicate-preference
+   * identity key) — see FACTORY-120's own ticket if you're looking for that
+   * raw value; it was filed onward to FACTORY-73 instead of built here.
+   * `[]` when the rule sets no preference (uses butchr's global agent
+   * config).
    */
   agentPreferences: { harness: AgentHarness; model?: string; effort?: AgentEffort }[];
   /** `rule.linkedEventing === true`; `false` for absent/false alike (see that field's own doc comment on `Rule` — absent and false are the same no-op). */
   linkedEventing: boolean;
   /** `rule.mcpServers`' own `name`s ONLY — see this module's own top comment on why nothing else from a binding is ever copied here. `[]` when the rule binds none. */
   mcpServerNames: string[];
-  /** `true` when at least one live agent (or, for a `singleton`/`persistent` rule, its one query-level agent) is currently observed for this rule. */
-  staffed: boolean;
-  /** Why this rule is not currently staffed — `null` when `staffed` or not applicable (see `ruleStaffingReason`'s own doc comment for the exact vocabulary). */
+  /**
+   * `true` when at least one live agent (or, for a `singleton`/`persistent`
+   * rule, its one query-level agent) is currently observed for this rule;
+   * `false` when this rule is genuinely not staffed right now (`reason` says
+   * why); `null` when staffing could NOT be determined because the agent
+   * census is unavailable (FACTORY-132) — a third state, neither a truthy
+   * "staffed" nor a falsy "not staffed". `null` is NOT the same claim as
+   * `false`: `false` says this daemon looked and found nothing (or a config
+   * reason already rules it out); `null` says this daemon could not look at
+   * all this poll. Every reader in this repo compares with `=== true` /
+   * `=== false` / `=== null` (or an exhaustive branch) — never a truthiness
+   * test, which would silently collapse `null` back into "not staffed" and
+   * reintroduce the exact defect this field exists to fix.
+   */
+  staffed: boolean | null;
+  /** Why this rule is not currently staffed, or why that could not be determined — `null` iff `staffed === true`; non-null and explanatory for BOTH `staffed === false` and `staffed === null` alike (see `ruleStaffingReason`'s own doc comment for the exact vocabulary). */
   reason: string | null;
 }
 
@@ -126,6 +158,27 @@ export interface SessionDefinitionInventoryEntry extends SessionDefinitionListEn
   kind: "session-definition";
   /** `true` when this entry was read from the archive directory rather than the active one — computed from which directory actually produced it, never guessed. */
   archived: boolean;
+  /**
+   * FACTORY-120 — the resolved effective model for this definition, via
+   * `effectiveAgent()` (`../resources/session-definition.ts`): reused
+   * verbatim, never re-derived from `../resources/power-scale.ts`'s tables
+   * directly, whether this entry is a `tier`-based (deprecated) definition
+   * or a `modelPower`/`effort`-based one — see that function's own doc
+   * comment for why each path resolves differently. `undefined` for an
+   * INVALID entry (`valid: false`) — its content fields, this one included,
+   * structurally do not exist, same NOT-APPLICABLE discipline every other
+   * optional field on this interface already follows.
+   */
+  resolvedModel?: string;
+  /**
+   * Same source (`effectiveAgent()`). `undefined` for an INVALID entry
+   * (as `resolvedModel` above) AND, by design, for a valid `tier`-based
+   * (deprecated) definition: `effectiveAgent()` deliberately returns no
+   * `effort` for that path so a tier-based launch's real behaviour (no
+   * `--effort` override derived from `tier`) is reflected exactly, not
+   * approximated — see `effectiveAgent`'s own doc comment.
+   */
+  resolvedEffort?: AgentEffort;
 }
 
 export interface QueryAgentInventory {
@@ -165,7 +218,19 @@ export interface RuleStaffingDeps {
   configReason: string | null;
   live: ReadonlySet<string>;
   withheld: ReadonlySet<string>;
-  /** `DashboardResponse.checked` — whether at least one `agent.list()` poll has ever succeeded. Distinguishes a genuine "no matches" from "this daemon hasn't observed anything yet" (same discriminator `dashboard.ts` itself uses via `checked`/`declinedAt`). */
+  /**
+   * `DashboardResponse.checked` verbatim — whether the MOST RECENT
+   * `agent.list()` poll succeeded. NOT "whether at least one poll has ever
+   * succeeded": per `createDashboardFeed`'s own doc comment (`./dashboard.ts`),
+   * a poll that fails AFTER an earlier success also flips this back to
+   * `false`, carrying the previous (possibly stale) rows forward. So
+   * `dashboardChecked === false` covers TWO cases — never yet succeeded, and
+   * most-recently failed — and distinguishes both alike from a genuine "no
+   * matches" (same discriminator `dashboard.ts` itself uses via
+   * `checked`/`declinedAt`, and the same one `dashboard-page.ts`'s own page
+   * banner keys its COULD NOT CHECK rendering on). Any reason string derived
+   * from this flag being `false` must read as true under BOTH cases.
+   */
   dashboardChecked: boolean;
 }
 
@@ -174,27 +239,32 @@ export interface RuleStaffingDeps {
  * module's own top comment for the reuse this is built from. Checked in
  * this fixed order, each one a strictly narrower question than the last:
  *
- * 1. `enabled === false` → `"disabled"`. Nothing else is even asked.
+ * 1. `enabled === false` → `"disabled"`. Nothing else is even asked — a
+ *    config fact, true regardless of census state.
  * 2. A provider-wide config/credential problem (`configReason`, e.g. no
  *    `GITHUB_TOKEN_FILE`) → that exact reason string, reused verbatim from
- *    `githubIssueStaffing`/`zendeskTicketStaffing`.
+ *    `githubIssueStaffing`/`zendeskTicketStaffing` — also a config fact,
+ *    also true regardless of census state.
  * 3. A live agent already observed for this rule → staffed, `reason: null`.
  * 4. A matched-but-withheld resource observed for this rule (the fleet-wide
  *    admission cap) → `"admission cap: ..."`.
- * 5. No successful poll yet (`!dashboardChecked`) → `"not yet observed: ..."`
- *    — never a false "no matches" before this daemon has looked even once.
+ * 5. FACTORY-132: the agent census is unavailable (`!dashboardChecked` — see
+ *    that field's own doc comment: the MOST RECENT poll didn't succeed,
+ *    whether or not an earlier one did) → `staffed: null` (neither true nor
+ *    false — this daemon genuinely cannot say), `"census unavailable: ..."`.
+ *    Must never collapse into `UNSTAFFED` — that was this exact defect.
  * 6. Otherwise: a real, current zero — worded per `execution` mode, since
  *    "no matching resources" is not quite the right claim for a
  *    `singleton`/`persistent` rule's one query-level agent (see `Rule.execution`'s
  *    own doc comment, `../rules/rules.ts`).
  */
-export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffed: boolean; reason: string | null } {
+export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffed: boolean | null; reason: string | null } {
   if (!rule.enabled) return { staffed: false, reason: "disabled" };
   if (deps.configReason) return { staffed: false, reason: deps.configReason };
   const key = ruleCorrelationKey(rule.resourceProvider, rule.id);
   if (deps.live.has(key)) return { staffed: true, reason: null };
   if (deps.withheld.has(key)) return { staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" };
-  if (!deps.dashboardChecked) return { staffed: false, reason: "not yet observed: no successful agent-list poll since this daemon started" };
+  if (!deps.dashboardChecked) return { staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" };
   return {
     staffed: false,
     reason: rule.execution === "swarm" ? "no matching resources this poll" : "no live agent observed for this rule this poll",
@@ -298,8 +368,30 @@ async function buildSessionDefinitionInventory(deps: SessionDefinitionInventoryD
   };
 }
 
+/**
+ * FACTORY-120 — `resolvedModel`/`resolvedEffort` via `effectiveAgent()`
+ * (`../resources/session-definition.ts`), computed only for a `valid` entry
+ * with a `vendor` (an invalid entry's `vendor` is `undefined` by the same
+ * NOT-APPLICABLE discipline every other content field here follows — see
+ * `SessionDefinitionInventoryEntry`'s own doc comments). Safe to call
+ * unconditionally once those two hold: `sessionDefinitionProblems`
+ * (`../resources/session-definition.ts`) already rejects a valid entry that
+ * sets neither `tier` nor both `modelPower`/`effort`, so `effectiveAgent()`
+ * never hits its own "no band covers ..." throw here.
+ */
+function resolvedAgentFields(e: SessionDefinitionListEntry): { resolvedModel?: string; resolvedEffort?: AgentEffort } {
+  if (!e.valid || e.vendor === undefined) return {};
+  const { model, effort } = effectiveAgent({
+    vendor: e.vendor,
+    ...(e.tier !== undefined ? { tier: e.tier } : {}),
+    ...(e.modelPower !== undefined ? { modelPower: e.modelPower } : {}),
+    ...(e.effort !== undefined ? { effort: e.effort } : {}),
+  });
+  return { resolvedModel: model, ...(effort !== undefined ? { resolvedEffort: effort } : {}) };
+}
+
 const tagEntries = (entries: readonly SessionDefinitionListEntry[], archived: boolean): SessionDefinitionInventoryEntry[] =>
-  entries.map((e) => ({ ...e, kind: "session-definition" as const, archived }));
+  entries.map((e) => ({ ...e, kind: "session-definition" as const, archived, ...resolvedAgentFields(e) }));
 
 /** One `FileErrorEntry` per invalid definition — `problems` joined the same way `loadRulesFileState`'s own `error.message` is (a single string), never truncated to the first problem. */
 const fileErrorsOf = (entries: readonly SessionDefinitionListEntry[]): FileErrorEntry[] =>
