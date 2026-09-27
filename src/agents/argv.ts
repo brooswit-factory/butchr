@@ -1,5 +1,5 @@
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, workspaceSessionId, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -16,12 +16,14 @@ export type AgentProvider = ManagedAgentProvider;
 export interface AgentConfig {
   provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string;
   /**
-   * FACTORY-314 — set ONLY by `HerdrHerd.resumeInPlace()` (src/agents/herd.ts)
-   * for a model/effort-only change on a still-alive Claude agent: the
-   * workspace's own persisted `.butchr-session-id.json` (`workspaceSessionId`,
-   * src/agents/workspace.ts), so `agentStartParams()` below emits
-   * `--resume <id>` instead of a fresh `--session-id <id>`. Absent for every
-   * other caller (an ordinary fresh spawn, and `staleIssues()`'s own
+   * FACTORY-314 (PR #513 review fix) — set ONLY by `HerdrHerd.resumeInPlace()`
+   * (src/agents/herd.ts) for a model/effort-only change on a still-alive
+   * Claude agent: the workspace's own DISCOVERED session id (its real,
+   * Claude-assigned one — `discoverClaudeSessionId`, src/agents/workspace.ts
+   * — never a butchr-minted one; a fresh launch has no `--session-id`
+   * equivalent at all, see `agentStartParams`'s own doc comment below for
+   * why), so `agentStartParams()` below emits `--resume <id>`. Absent for
+   * every other caller (an ordinary fresh spawn, and `staleIssues()`'s own
    * expected-argv reconstruction), which is what keeps this a strict
    * addition: nothing about today's launch or staleness comparison changes
    * when this field is unset.
@@ -212,34 +214,31 @@ export function agentLaunchConfig(
  * Compatibility helper for argv inspection; lifecycle dispatches kickoff
  * separately.
  *
- * FACTORY-314: the ONE place `--session-id`/`--resume` is appended, for the
- * SAME reason `spawnArgs`' own doc comment below gives for the rest of this
- * function — Drovr's `buildAgentStartParams` (its compiled `agent-runtime.js`,
- * verified at the pinned 0.15.1) has no concept of either flag, so this is
- * butchr's own addition, made HERE so both the real launch (via this
- * function, `HerdrHerd.spawnExclusive`'s `prepare()`/`resumeInPlace`) and the
- * staleness comparison (`spawnArgs()` below, `staleIssues()`) see identical
- * argv shapes for identical inputs — the FACTORY-43 symmetry requirement,
- * satisfied by construction rather than by two builders happening to agree.
- * `agent.resumeSessionId` set means a resume: `--resume <id>`. Unset means a
- * fresh launch: `--session-id <id>` when this workspace already has one
- * persisted (`workspaceSessionId`, src/agents/workspace.ts — written by
- * `buildWorkspace()`, which always runs before this in the real launch path),
- * omitted entirely for a non-Claude provider or a workspace with no
- * persisted id yet (a build from before this ticket — a one-time gap, not a
- * bug: `buildWorkspace()` mints one on this very launch, so the NEXT launch
- * always finds it).
+ * FACTORY-314 (PR #513 review fix): the ONE place `--resume` is appended.
+ * IMPORTANT ASYMMETRY, unlike every other flag this function builds: this
+ * function is NOT in the real fresh-launch path. `HerdrHerd.spawnExclusive`'s
+ * `prepare()` hands `agentLaunchConfig(...)` straight to Drovr's
+ * `ManagedHerdrLifecycle.start()`, which builds its OWN `agent.start` params
+ * via Drovr's `buildAgentStartParams` — never this function — for a fresh
+ * spawn (verified against the pinned 0.15.1 source: `buildAgentStartParams`'s
+ * Claude branch has no `--session-id`/`--resume` concept at all, so a fresh
+ * launch runs under Claude's OWN auto-generated session id, discovered
+ * AFTERWARD from its transcript directory — see `discoverClaudeSessionId`,
+ * src/agents/workspace.ts, and `HerdrHerd.startProviders`'s own doc comment
+ * — never pre-declared here). This function IS the real launch builder for
+ * exactly one caller: `HerdrHerd.resumeInPlace()`, which bypasses
+ * `ManagedHerdrLifecycle` entirely and calls this directly — so `--resume`
+ * appended HERE is real, but do not read the rest of this function's
+ * "real launch AND staleness comparison agree" property as extending to a
+ * flag that only matters for that one caller.
  */
 export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
   const params = buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
-  if (agent.provider === "claude") {
-    const sessionFlag = agent.resumeSessionId
-      ? ["--resume", agent.resumeSessionId]
-      : (() => { const id = workspaceSessionId(dir); return id ? ["--session-id", id] : []; })();
-    if (sessionFlag.length) params.args = [...(params.args ?? []), ...sessionFlag];
+  if (agent.provider === "claude" && agent.resumeSessionId) {
+    params.args = [...(params.args ?? []), "--resume", agent.resumeSessionId];
   }
   return params;
 }

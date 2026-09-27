@@ -6,7 +6,7 @@ import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
-import { buildWorkspace, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort } from "../../src/agents/workspace.js";
+import { buildWorkspace, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
@@ -321,7 +321,15 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant, (l) => lines.push(l));
     await herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null });
-    expect(lines).toEqual([`${SPAWN_TAG} KAN-7 succeeded — pane w9:p1 origin=spawn`]);
+    // FACTORY-314 (PR #513 review fix): this fake never creates a real
+    // Claude transcript, so the post-spawn session-id discovery this ticket
+    // added correctly finds nothing and logs its own WARNING — a real,
+    // separate line from the SPAWN_TAG success line this test's own name is
+    // about, which still lands unchanged right after it.
+    expect(lines).toEqual([
+      "WARNING: [spawn] KAN-7 could not discover a native Claude session id after a successful launch — a later model/effort change will fall back to a fresh restart instead of resuming",
+      `${SPAWN_TAG} KAN-7 succeeded — pane w9:p1 origin=spawn`,
+    ]);
   });
 
   test("failure line names the issue and the rejection's own message, from the SAME tag as success", async () => {
@@ -1761,9 +1769,16 @@ describe("resumeInPlace", () => {
    * changes when `pane.sendKeys` (the `/exit`) and `agent.start` (the
    * relaunch) are called, the same way a real pane would.
    */
-  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean } = {}) {
+  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean } = {}) {
     let status: string = initialStatus;
     let foreground: "claude" | "shell" = "claude";
+    // FACTORY-314 (epic review on PR #513, point 3): the REAL argv from the
+    // most recent `agent.start`, not the fixed `CLAUDE_PROC` stub — needed
+    // by the multi-poll `staleIssues()` regression test below, which must
+    // see the ACTUAL resumed argv (carrying `--resume`, never `--session-id`)
+    // to prove the FACTORY-43 two-shape symmetry holds for real, not just
+    // in the isolated `agentStartParams` builder tests.
+    let lastArgv: string[] = CLAUDE_PROC.argv;
     const sent: Array<{ text?: string; keys?: string[] }> = [];
     const started: any[] = [];
     const client = {
@@ -1771,14 +1786,20 @@ describe("resumeInPlace", () => {
         list: async () => ({ agents: [{ agent: foreground === "claude" ? "claude" : undefined, agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] }),
         start: async (p: any) => {
           started.push(p);
+          // FACTORY-314 (PR #513 review fix, live-tested): the OLD process
+          // can still hold the agent name in herdr's own bookkeeping for a
+          // moment even after this fake's OWN foreground already reports
+          // "shell" — simulates that exact measured race.
+          if (options.nameTaken) throw HerdrError.from("agent.start", { code: "agent_name_taken", message: "agent name already used" });
           // An unavailable model (or any other immediate failure) accepts
           // the launch but exits straight back to a shell — never reaching "idle".
           if (options.crashesOnStart) { foreground = "shell"; return; }
+          lastArgv = ["claude", ...(p.args ?? [])];
           foreground = "claude"; status = "idle";
         },
       },
       pane: {
-        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? CLAUDE_PROC : SHELL_PROC] } }),
+        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
       },
@@ -1799,27 +1820,82 @@ describe("resumeInPlace", () => {
     }
   }
 
+  /**
+   * FACTORY-314 (PR #513 review fix): `resumeInPlace()` now verifies a real
+   * Claude transcript exists for the persisted session id BEFORE doing
+   * anything else — so every test past "no persisted id at all" needs a
+   * fake `~/.claude/projects/<encoded-cwd>/<id>.jsonl` under a CONTROLLED
+   * home directory, never the real one. `persistDiscoveredSessionId` writes
+   * the SAME `.butchr-session-id.json` `HerdrHerd.startProviders` itself
+   * would have written after discovering it post-launch.
+   */
+  async function withResumableSession<T>(cwd: string, id: string, fn: (home: string) => Promise<T>): Promise<T> {
+    const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { resolve } = require("node:path") as typeof import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "claude-home-"));
+    try {
+      const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, `${id}.jsonl`), "{}");
+      persistDiscoveredSessionId(cwd, id);
+      return await fn(home);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  /** `prepareWorkspace` override (7th HerdrHerd constructor arg) so `resumeInPlace()`'s transcript check looks under the CONTROLLED test home. */
+  const homeOf = (home: string) => async () => ({ HOME: home });
+
   test("resumed: an idle agent exits, relaunches on the SAME pane with --resume, the new model/effort, and the full flag set; the persisted session id is unchanged", async () => {
     await withTempWorkspaces(async () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-900" });
       const cwd = workspaceDirFor(key);
       const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
-      buildWorkspace(spec, "http://x/mcp", "claude"); // fresh spawn: mints & persists .butchr-session-id.json
-      const originalId = workspaceSessionId(cwd);
-      expect(originalId).toBeTruthy();
-      const f = statefulHerdr("w1:p1", cwd);
-      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-      const outcome = await herd.resumeInPlace(spec);
-      expect(outcome).toBe("resumed");
-      expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
-      expect(f.started).toHaveLength(1);
-      const args: string[] = f.started[0]!.args;
-      expect(args[args.indexOf("--resume") + 1]).toBe(originalId);
-      expect(args).toEqual(expect.arrayContaining(["--model", "claude-opus-5", "--effort", "medium", "--permission-mode", "bypassPermissions"]));
-      expect(f.started[0]!.pane_id).toBe("w1:p1"); // SAME pane — never a new one
-      expect(workspaceSessionId(cwd)).toBe(originalId); // idempotent re-persist, not a new id
-      expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
-      expect(workspaceEffort(cwd)).toBe("medium");
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
+        expect(f.started).toHaveLength(1);
+        const args: string[] = f.started[0]!.args;
+        expect(args[args.indexOf("--resume") + 1]).toBe("original-session");
+        expect(args).toEqual(expect.arrayContaining(["--model", "claude-opus-5", "--effort", "medium", "--permission-mode", "bypassPermissions"]));
+        expect(f.started[0]!.pane_id).toBe("w1:p1"); // SAME pane — never a new one
+        expect(workspaceSessionId(cwd)).toBe("original-session"); // a --resume relaunch keeps the SAME id, never rediscovered
+        expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
+        expect(workspaceEffort(cwd)).toBe("medium");
+      });
+    });
+  });
+
+  // FACTORY-73 epic review (26188/26208, point 3) — "FACTORY-43 symmetry
+  // stands: a fresh launch now carries no session flag, a resumed launch
+  // carries --resume <id>; one module builds AND judges both; test across
+  // SEVERAL consecutive polls." This drives `staleIssues()` itself (not
+  // just the isolated `agentStartParams` builder) against the pane's REAL
+  // post-resume argv (`--resume`, the NEW model/effort, no `--session-id`)
+  // and proves it is never flagged, on the first poll or any of several
+  // after it — a checker that only knew the FRESH shape would respawn a
+  // resumed agent forever.
+  test("no loop: a resumed agent's REAL argv (--resume, not --session-id) is never flagged stale by staleIssues() across SEVERAL consecutive polls, once resolvedAgentOf matches the new model/effort", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-909" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const herd = new HerdrHerd(
+          f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home), undefined, undefined, undefined,
+          () => ({ model: "claude-opus-5", effort: "medium" }), // the definition/rule NOW resolves to exactly what we're about to resume to
+        );
+        expect(await herd.resumeInPlace(spec)).toBe("resumed");
+        for (let poll = 0; poll < 5; poll++) {
+          expect(await herd.staleIssues()).toEqual([]);
+        }
+      });
     });
   });
 
@@ -1836,16 +1912,40 @@ describe("resumeInPlace", () => {
       const cwd = workspaceDirFor(key);
       const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-nonexistent-model", effort: "medium" as const }] };
       buildWorkspace({ ...spec, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "high" as const }] }, "http://x/mcp", "claude");
-      const originalId = workspaceSessionId(cwd);
-      const f = statefulHerdr("w1:p1", cwd, "idle", { crashesOnStart: true });
-      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-      const outcome = await herd.resumeInPlace(spec);
-      expect(outcome).toBe("failed");
-      expect(f.started).toHaveLength(1); // the attempt WAS made
-      // Old values stand — never overwritten by a relaunch that didn't take.
-      expect(workspaceModel(cwd)).toBe("claude-opus-5");
-      expect(workspaceEffort(cwd)).toBe("high");
-      expect(workspaceSessionId(cwd)).toBe(originalId);
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { crashesOnStart: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(f.started).toHaveLength(1); // the attempt WAS made
+        // Old values stand — never overwritten by a relaunch that didn't take.
+        expect(workspaceModel(cwd)).toBe("claude-opus-5");
+        expect(workspaceEffort(cwd)).toBe("high");
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
+    });
+  });
+
+  // FACTORY-314 (PR #513 review fix) — MEASURED LIVE against a real herdr
+  // (throwaway workspace, real HerdrHerd.spawn/resumeInPlace): the old
+  // process can still hold this pane's agent name in herdr's own
+  // bookkeeping for a moment even after every check above (idle, `/exit`,
+  // "back to a shell") has passed — `agent.start` itself then rejects with
+  // `agent_name_taken`. This must resolve to the SAME safe, non-destructive
+  // "stuck" outcome a pane that never left claude's foreground gets, not a
+  // raw thrown failure.
+  test("stuck (via agent_name_taken): the relaunch is rejected because the old process still holds the pane's agent name — resolves to 'stuck', never throws, never persists", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-908" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { nameTaken: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("stuck");
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
     });
   });
 
@@ -1854,13 +1954,14 @@ describe("resumeInPlace", () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-901" });
       const cwd = workspaceDirFor(key);
       const spec = { key, issuetype: "Task", summary: "s", parent: null };
-      buildWorkspace(spec, "http://x/mcp", "claude");
-      const f = statefulHerdr("w1:p1", cwd, "working");
-      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-      const outcome = await herd.resumeInPlace(spec);
-      expect(outcome).toBe("deferred");
-      expect(f.sent).toEqual([]);
-      expect(f.started).toEqual([]);
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "working");
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("deferred");
+        expect(f.sent).toEqual([]);
+        expect(f.started).toEqual([]);
+      });
     });
   });
 
@@ -1869,15 +1970,16 @@ describe("resumeInPlace", () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-902" });
       const cwd = workspaceDirFor(key);
       const spec = { key, issuetype: "Task", summary: "s", parent: null };
-      buildWorkspace(spec, "http://x/mcp", "claude");
-      const f = statefulHerdr("w1:p1", cwd);
-      // Override sendKeys so the pane STAYS on claude (a stuck dialog), unlike the happy-path fake above.
-      f.client.pane.sendKeys = async (p: any) => { f.sent.push({ keys: p.keys }); };
-      let now = 0;
-      const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, () => (now += 5_000));
-      const outcome = await herd.resumeInPlace(spec);
-      expect(outcome).toBe("stuck");
-      expect(f.started).toEqual([]);
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // Override sendKeys so the pane STAYS on claude (a stuck dialog), unlike the happy-path fake above.
+        f.client.pane.sendKeys = async (p: any) => { f.sent.push({ keys: p.keys }); };
+        let now = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home), () => (now += 5_000));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("stuck");
+        expect(f.started).toEqual([]);
+      });
     });
   });
 
@@ -1886,13 +1988,37 @@ describe("resumeInPlace", () => {
       const { mkdirSync } = require("node:fs") as typeof import("node:fs");
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });
       const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true }); // workspace exists, but no .butchr-session-id.json was ever minted
+      mkdirSync(cwd, { recursive: true }); // workspace exists, but session id was never discovered/persisted
       const spec = { key, issuetype: "Task", summary: "s", parent: null };
       const f = statefulHerdr("w1:p1", cwd);
       const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
       const outcome = await herd.resumeInPlace(spec);
       expect(outcome).toBe("unresumable");
       expect(f.sent).toEqual([]);
+    });
+  });
+
+  // FACTORY-312 review (26137, point 1, via the formal PR review): a
+  // persisted id whose transcript no longer exists (corrupted state, or a
+  // discovery bug) must fail safe — never attempt `--resume` against a
+  // conversation that isn't there.
+  test("unresumable: a persisted session id whose transcript is missing — never attempts /exit", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-906" });
+      const cwd = workspaceDirFor(key);
+      persistDiscoveredSessionId(cwd, "ghost-session"); // persisted, but no transcript file exists anywhere
+      const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
+      try {
+        const f = statefulHerdr("w1:p1", cwd);
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace({ key, issuetype: "Task", summary: "s", parent: null });
+        expect(outcome).toBe("unresumable");
+        expect(f.sent).toEqual([]);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 
@@ -1911,16 +2037,63 @@ describe("resumeInPlace", () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-904" });
       const cwd = workspaceDirFor(key);
       const spec = { key, issuetype: "Task", summary: "s", parent: null };
-      buildWorkspace(spec, "http://x/mcp", "claude");
-      const f = statefulHerdr("w1:p1", cwd);
-      // workspace.create is ONLY ever reached if the ordinary spawn path
-      // falls through to ManagedHerdrLifecycle.start() — make it throw if
-      // called at all, so a wrong (non-serialized) implementation fails loud.
-      (f.client as any).workspace = { create: async () => { throw new Error("spawn() must never create a new workspace during a resumeInPlace window"); } };
-      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
-      const [resumeOutcome] = await Promise.all([herd.resumeInPlace(spec), herd.spawn(spec)]);
-      expect(resumeOutcome).toBe("resumed");
-      expect(f.started).toHaveLength(1); // only resumeInPlace's own relaunch — spawn() found it already running and no-opped
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // workspace.create is ONLY ever reached if the ordinary spawn path
+        // falls through to ManagedHerdrLifecycle.start() — make it throw if
+        // called at all, so a wrong (non-serialized) implementation fails loud.
+        (f.client as any).workspace = { create: async () => { throw new Error("spawn() must never create a new workspace during a resumeInPlace window"); } };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const [resumeOutcome] = await Promise.all([herd.resumeInPlace(spec), herd.spawn(spec)]);
+        expect(resumeOutcome).toBe("resumed");
+        expect(f.started).toHaveLength(1); // only resumeInPlace's own relaunch — spawn() found it already running and no-opped
+      });
+    });
+  });
+
+  // FACTORY-312 review (formal PR review on #513): the isolated builder tests
+  // above prove `agentStartParams()` appends `--resume` correctly, but a REAL
+  // fresh spawn never goes through that function at all — `HerdrHerd.spawnExclusive`'s
+  // `prepare()` hands `agentLaunchConfig(...)` straight to Drovr's REAL
+  // `ManagedHerdrLifecycle.start()`, which builds its OWN `agent.start` args
+  // via Drovr's OWN `buildAgentStartParams` (verified against the pinned
+  // 0.15.1 source: no `--session-id`/`--resume` concept for Claude at all).
+  // This test drives THAT production path — `HerdrHerd.spawn()`, the real
+  // `ManagedHerdrLifecycle`, a fake herdr client only at the RPC boundary —
+  // and would have FAILED against this PR's original head, where the
+  // launch's real argv never carried the persisted id at all (it could not:
+  // nothing wired it there), so `resumeInPlace()` would have resumed a
+  // uuid Claude never used.
+  test("FACTORY-314 (PR #513 review): a REAL fresh spawn (HerdrHerd.spawn -> the real ManagedHerdrLifecycle.start -> Drovr's own buildAgentStartParams) discovers and persists the session id Claude ACTUALLY used, never a butchr-guessed one", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-907" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-real-spawn-"));
+      try {
+        const f = fakeHerdr([]);
+        const realStart = f.client.agent.start;
+        const claudeChosenId = "claude-picked-this-id-itself";
+        // Simulates the ONE thing real Claude Code does that this whole fix
+        // depends on: it names its OWN transcript file, independent of
+        // anything in the launch argv (`p.args`) — never influenced by butchr.
+        f.client.agent.start = async (p: any) => {
+          await realStart(p);
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `${claudeChosenId}.jsonl`), "{}");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).not.toContain("--session-id"); // confirms the real launch path carries no butchr-chosen id at all
+        expect(f.started[0]!.args).not.toContain("--resume");
+        expect(workspaceSessionId(cwd)).toBe(claudeChosenId); // discovered from Claude's OWN transcript, not guessed
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 });

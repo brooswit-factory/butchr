@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -797,63 +797,109 @@ describe("buildWorkspace", () => {
     }
   });
 
-  // FACTORY-314: a Claude launch mints and persists its OWN session id,
-  // never re-derived from herdr or Claude's own transcript directory — see
-  // this field's own doc comment (src/agents/workspace.ts) for why.
-  test("buildWorkspace mints a fresh Claude session id on first launch, and workspaceSessionId reads it back", () => {
-    const previous = process.env.BUTCHR_WORKSPACES;
-    const root = mkdtempSync(join(tmpdir(), "bw-session-id-"));
-    process.env.BUTCHR_WORKSPACES = root;
-    try {
-      const dir = buildWorkspace({ key: "KAN-10", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "claude");
-      const id = workspaceSessionId(dir);
-      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    } finally {
-      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
-      else process.env.BUTCHR_WORKSPACES = previous;
-      rmSync(root, { recursive: true, force: true });
+  // FACTORY-314 (PR #513 review fix): `buildWorkspace()` no longer touches
+  // session id AT ALL — a fresh Claude launch runs under Claude's OWN
+  // auto-generated session id (nothing butchr passes reaches the real
+  // launch's argv; see `agentStartParams`'s own doc comment,
+  // src/agents/argv.ts), so the real id is DISCOVERED afterward from its
+  // transcript directory (`discoverClaudeSessionId`/`persistDiscoveredSessionId`
+  // below), never pre-minted here.
+  describe("FACTORY-314: discoverClaudeSessionId / persistDiscoveredSessionId / claudeTranscriptExists", () => {
+    // Real creation (birth) time, NOT a faked mtime: `discoverClaudeSessionId`
+    // (PR #513 epic review, "trap 2") deliberately prefers `birthtimeMs` —
+    // effectively immutable once a file exists on most filesystems, unlike
+    // mtime — so these tests create files in real, separately-timestamped
+    // order rather than back-dating `utimesSync` (which cannot move
+    // birthtime at all, and would make these tests assert nothing).
+    function fakeTranscript(home: string, dir: string, id: string) {
+      const projectDir = join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, `${id}.jsonl`), "{}");
     }
+    const tick = () => new Promise((r) => setTimeout(r, 20));
+
+    test("discoverClaudeSessionId returns the NEWEST transcript's id for this cwd, ignoring non-.jsonl files", async () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-"));
+      const dir = "/some/workspace/KAN-20";
+      try {
+        fakeTranscript(home, dir, "older-session");
+        await tick();
+        fakeTranscript(home, dir, "newer-session");
+        const projectDir = join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+        writeFileSync(join(projectDir, "not-a-transcript.txt"), "ignore me");
+        expect(discoverClaudeSessionId(dir, home)).toBe("newer-session");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    test("discoverClaudeSessionId returns undefined when the project folder doesn't exist (no launch has happened yet, or discovery is checked against the wrong home)", () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
+      try {
+        expect(discoverClaudeSessionId("/some/workspace/KAN-21", home)).toBeUndefined();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    // PR #513 epic review ("trap 2"): the load-bearing case. A workspace
+    // directory holding an OLDER transcript from a PRIOR respawn of the
+    // SAME issue must never be silently mistaken for a brand-new launch's
+    // own transcript — that would resume the WRONG conversation, validate
+    // cleanly, and report success. `after` (the launch's own start instant)
+    // is what makes that structurally impossible: nothing can be created
+    // before the launch that produces it.
+    test("discoverClaudeSessionId with `after` set NEVER returns a transcript created before that instant, even when it is the newest (or ONLY) one present — falls through to undefined instead of a wrong-but-real id", async () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-after-"));
+      const dir = "/some/workspace/KAN-24";
+      try {
+        fakeTranscript(home, dir, "prior-respawns-old-session"); // a real, older transcript from BEFORE this launch
+        await tick();
+        const after = Date.now(); // "this launch" starts here — nothing created before this instant is a candidate
+        // No new transcript has been written yet (simulates the discovery race this ticket measured live: the launch is confirmed, but its own file has not appeared yet).
+        expect(discoverClaudeSessionId(dir, home, after)).toBeUndefined();
+        await tick();
+        fakeTranscript(home, dir, "this-launchs-real-session"); // now the REAL one for this launch appears
+        expect(discoverClaudeSessionId(dir, home, after)).toBe("this-launchs-real-session");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    test("persistDiscoveredSessionId writes what workspaceSessionId reads back", () => {
+      const root = mkdtempSync(join(tmpdir(), "bw-persist-discovered-"));
+      try {
+        persistDiscoveredSessionId(root, "abc-123");
+        expect(workspaceSessionId(root)).toBe("abc-123");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("claudeTranscriptExists is true only for a REAL transcript, false for a missing one or the wrong home", () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-exists-"));
+      const otherHome = mkdtempSync(join(tmpdir(), "claude-home-other-"));
+      const dir = "/some/workspace/KAN-22";
+      try {
+        fakeTranscript(home, dir, "real-session");
+        expect(claudeTranscriptExists(dir, "real-session", home)).toBe(true);
+        expect(claudeTranscriptExists(dir, "no-such-session", home)).toBe(false);
+        expect(claudeTranscriptExists(dir, "real-session", otherHome)).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(otherHome, { recursive: true, force: true });
+      }
+    });
   });
 
-  // FACTORY-312 review (26137, point 3): every ORDINARY (fresh) call always
-  // mints and OVERWRITES with a brand-new session id — a fresh Claude Code
-  // session must never be launched with `--session-id` pointing at a
-  // PREVIOUS, now-abandoned conversation's id. `keepSessionId: true` is the
-  // one, narrow exception (`HerdrHerd.resumeInPlace()`'s own post-success
-  // re-persist, never called for an ordinary spawn).
-  test("buildWorkspace mints a FRESH session id on every ordinary (default keepSessionId) call — a stale id from a previous session is never resumed after a fresh restart", () => {
+  test("buildWorkspace never creates a session id file itself — session id persistence is a separate, explicit step (discoverClaudeSessionId/persistDiscoveredSessionId)", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
-    const root = mkdtempSync(join(tmpdir(), "bw-session-id-fresh-"));
+    const root = mkdtempSync(join(tmpdir(), "bw-no-session-id-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const spec: SpawnSpec = { key: "KAN-11", issuetype: "Task", summary: "s", parent: null };
-      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
-      const first = workspaceSessionId(dir);
-      // Simulates: agent stopped (a non-resumable stale reason, or any
-      // ordinary stop), then a fresh spawn — the ordinary path, no
-      // keepSessionId — for the SAME issue/workspace.
-      buildWorkspace(spec, "http://x/mcp", "claude");
-      const second = workspaceSessionId(dir);
-      expect(second).toBeTruthy();
-      expect(second).not.toBe(first); // never the old, now-abandoned conversation's id
-    } finally {
-      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
-      else process.env.BUTCHR_WORKSPACES = previous;
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("buildWorkspace with keepSessionId:true preserves an existing session id across repeated calls — the ONE exception, used only by resumeInPlace's own post-success re-persist", () => {
-    const previous = process.env.BUTCHR_WORKSPACES;
-    const root = mkdtempSync(join(tmpdir(), "bw-session-id-keep-"));
-    process.env.BUTCHR_WORKSPACES = root;
-    try {
-      const spec: SpawnSpec = { key: "KAN-11", issuetype: "Task", summary: "s", parent: null };
-      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
-      const first = workspaceSessionId(dir);
-      buildWorkspace(spec, "http://x/mcp", "claude", [], true);
-      buildWorkspace(spec, "http://x/mcp", "claude", [], true);
-      expect(workspaceSessionId(dir)).toBe(first);
+      const dir = buildWorkspace({ key: "KAN-23", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "claude");
+      expect(workspaceSessionId(dir)).toBeUndefined();
+      expect(existsSync(join(dir, ".butchr-session-id.json"))).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

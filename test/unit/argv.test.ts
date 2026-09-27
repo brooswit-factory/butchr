@@ -297,11 +297,15 @@ describe("project-manager Claude permissions", () => {
   });
 });
 
-// FACTORY-314: `--session-id`/`--resume` — the ONE shared builder
-// (agentStartParams, spawnArgs, agentLaunchConfig) both a real launch and
-// staleIssues()'s own expected-argv comparison use — appends whichever flag
-// applies, since Drovr's own buildAgentStartParams (verified at the pinned
-// 0.15.1) has no concept of either.
+// FACTORY-314 (PR #513 review fix): `--resume` — appended ONLY by
+// `agentStartParams()`/`spawnArgs()`, and ONLY when `agent.resumeSessionId`
+// is set (`HerdrHerd.resumeInPlace()`'s own caller). A fresh Claude launch
+// NEVER gets `--session-id` from butchr at all: it runs under Claude's own
+// auto-generated session id, discovered afterward from its transcript
+// directory (`discoverClaudeSessionId`, src/agents/workspace.ts) — nothing
+// this function builds reaches the real fresh-launch path anyway (Drovr's
+// `ManagedHerdrLifecycle.start()` uses its OWN `buildAgentStartParams`, never
+// this one, for a fresh spawn; see `agentStartParams`'s own doc comment).
 describe("agentStartParams — FACTORY-314 session id / resume", () => {
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs");
   const { tmpdir } = require("node:os") as typeof import("node:os");
@@ -312,16 +316,16 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
     try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
   }
 
-  test("a fresh Claude launch appends --session-id when the workspace has one persisted", () => {
+  test("a fresh Claude launch NEVER gets --session-id, even when the workspace happens to have a discovered id persisted from an earlier launch", () => {
     withDir((dir) => {
       writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("11111111-1111-1111-1111-111111111111"));
       const args = spawnArgs(spec, dir);
-      expect(args).toEqual(expect.arrayContaining(["--session-id", "11111111-1111-1111-1111-111111111111"]));
+      expect(args).not.toContain("--session-id");
       expect(args).not.toContain("--resume");
     });
   });
 
-  test("a fresh Claude launch omits the flag entirely when no session id is persisted yet (a workspace from before this ticket, or the very first spawn before buildWorkspace has run)", () => {
+  test("a fresh Claude launch omits the flag entirely with no persisted id either (a workspace from before this ticket, or the very first spawn)", () => {
     withDir((dir) => {
       mkdirSync(dir, { recursive: true });
       const args = spawnArgs(spec, dir);
