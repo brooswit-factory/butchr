@@ -68,20 +68,35 @@ function renderAgentLinks(matches: readonly AgentDashboardRow[], opts: RenderCon
 }
 
 /**
- * Requirement 1's exact field list. `agentPreferences`' `harness`/`model`/
- * `effort` is rendered as the ticket's own explicitly-required "model/effort
- * is the stand-in [for tier], label accordingly" — never a bare `tier` field,
- * which `RuleInventoryEntry` structurally does not have (see that type's own
+ * FACTORY-120: one preference, labeled by its actual RESOLVED value — never
+ * a bare `harness/model/effort` slug a reader has to parse, and never the
+ * old "(model/effort stand in for tier)" caption (stale since FACTORY-74
+ * replaced `tier` with the two-axis scale). `model`/`effort` here are
+ * ALREADY resolved (see `RuleInventoryEntry.agentPreferences`'s own doc
+ * comment, `../agents/query-agent-inventory.ts`) — this function never
+ * touches `../resources/power-scale.ts` itself, and never renders the raw
+ * `modelPower`/`effortPower` a rule preference was expressed with: that raw
+ * value is dropped at rules-load time and is out of scope for this ticket
+ * (see that same doc comment). `"default"` for an absent axis — never
+ * blank, never a made-up value: the rule set no preference on that axis, so
+ * butchr's global agent config decides at launch time (`agentLaunchConfig`,
+ * `../agents/argv.ts`).
+ */
+function formatPreference(p: RuleInventoryEntry["agentPreferences"][number]): string {
+  return `${p.harness} — Model: ${p.model ?? "default"} · Effort: ${p.effort ?? "default"}`;
+}
+
+/**
+ * Requirement 1's exact field list. `agentPreferences` is rendered via
+ * `formatPreference` above — never a bare `tier` field, which
+ * `RuleInventoryEntry` structurally does not have (see that type's own
  * doc comment). Disabled rules render with the SAME row shape as enabled
  * ones, just the `disabled` class and `DISABLED` text — never hidden,
  * per requirement 1's own "disabled rules must be visible".
  */
 function renderRuleRow(rule: RuleInventoryEntry, rows: readonly DashboardRow[], opts: RenderConfigInventoryOpts): string {
   const agentRows = agentRowsForRule(rule, rows);
-  const prefs =
-    rule.agentPreferences.length === 0
-      ? "—"
-      : rule.agentPreferences.map((p) => `${p.harness}${p.model ? `/${p.model}` : ""}${p.effort ? `/${p.effort}` : ""} (model/effort stand in for tier)`).join(", ");
+  const prefs = rule.agentPreferences.length === 0 ? "—" : rule.agentPreferences.map(formatPreference).join(", ");
   return (
     `<div class="row rule${rule.enabled ? "" : " disabled"}" id="${esc(ruleAnchorId(rule.resourceProvider, rule.id))}">` +
     `<span class="key">${esc(rule.id)}</span>` +
@@ -108,7 +123,31 @@ function renderRuleRow(rule: RuleInventoryEntry, rows: readonly DashboardRow[], 
 function renderSessionRow(entry: SessionDefinitionInventoryEntry, rows: readonly DashboardRow[], opts: RenderConfigInventoryOpts): string {
   const agentRows = agentRowsForSessionDefinition(entry, rows);
   const idAttr = entry.agentKey !== undefined ? ` id="${esc(sessionAnchorId(entry.agentKey))}"` : "";
-  const vendorTier = entry.vendor === undefined && entry.tier === undefined ? undefined : `${entry.vendor ?? "?"}/${entry.tier !== undefined ? String(entry.tier) : "?"}`;
+  // FACTORY-120: a `tier`-based (deprecated) entry keeps rendering
+  // `vendor/tier` (e.g. "claude/tier1") exactly as before. A modelPower/effort
+  // (two-axis) entry has no `tier` to show here — rendering `vendor/?` was
+  // the visible defect this ticket fixes, so that case shows the vendor
+  // alone instead of inventing a "?" placeholder; the new `resolvedagent`
+  // span below is where its axis information actually lives now.
+  const vendorTier = entry.vendor === undefined ? undefined : entry.tier !== undefined ? `${entry.vendor}/${entry.tier}` : entry.vendor;
+  // Labeled as the actual resolved value — never a bare model string a
+  // reader has to guess the meaning of. `undefined` (renders NOT-APPLICABLE,
+  // `naOr`) exactly when `resolvedModel` itself is absent (an INVALID entry) —
+  // see `SessionDefinitionInventoryEntry.resolvedModel`'s own doc comment.
+  // A `tier`-based entry resolves to no effort BY DESIGN (`effectiveAgent`'s
+  // own doc comment, `../resources/session-definition.ts`) — that is a KNOWN
+  // fact (the daemon's own launch default applies), not a not-applicable
+  // em-dash, so it gets its own honest wording rather than falling through
+  // to `naOr`.
+  const resolvedAgent =
+    entry.resolvedModel !== undefined ? `Model: ${entry.resolvedModel} · Effort: ${entry.resolvedEffort ?? "no effort set — launch default applies"}` : undefined;
+  // The raw 0-100 input, shown as SECONDARY detail alongside the resolved
+  // value above, never in place of it. Absent for a `tier`-based (deprecated)
+  // definition, which has no `modelPower`/`effort` axis at all.
+  const rawPowerParts: string[] = [];
+  if (entry.modelPower !== undefined) rawPowerParts.push(`modelPower ${entry.modelPower}`);
+  if (entry.effort !== undefined) rawPowerParts.push(`effort ${entry.effort}`);
+  const rawPower = rawPowerParts.length > 0 ? rawPowerParts.join(", ") : undefined;
   const mcp = entry.mcpServerNames === undefined ? undefined : entry.mcpServerNames.length === 0 ? "none" : entry.mcpServerNames.join(", ");
   const freezeCtl = entry.freezeControllers === undefined ? undefined : entry.freezeControllers.length === 0 ? "none" : entry.freezeControllers.join(", ");
   const unfreezeCtl = entry.unfreezeControllers === undefined ? undefined : entry.unfreezeControllers.length === 0 ? "none" : entry.unfreezeControllers.join(", ");
@@ -119,6 +158,8 @@ function renderSessionRow(entry: SessionDefinitionInventoryEntry, rows: readonly
     `<span class="archived ${entry.archived ? "known" : "na"}">${entry.archived ? "ARCHIVED" : "active"}</span>` +
     `<span class="validity ${entry.valid ? "known" : "cnc"}">${entry.valid ? "valid" : "INVALID"}</span>` +
     `<span class="vendortier">${naOr(vendorTier)}</span>` +
+    `<span class="resolvedagent">${naOr(resolvedAgent)}</span>` +
+    `<span class="rawpower">raw: ${naOr(rawPower)}</span>` +
     `<span class="permmode">${naOr(entry.permissionMode)}</span>` +
     `<span class="exec">${naOr(entry.execution)}</span>` +
     `<span class="account">${naOr(entry.account)}</span>` +
