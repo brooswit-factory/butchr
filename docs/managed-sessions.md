@@ -1025,18 +1025,20 @@ does. A director definition wants both: `assertNoInheritedMcpConfig` closes
 the project-level gap unconditionally, `strictMcpConfig: true` closes the
 user-level one this definition explicitly asks for.
 
-## Lizard mode: manual permission mode without the freeze risk (DROVR-42/FACTORY-67)
+## Lizard mode: auto-answering the tool-permission dialog without a stored rule (DROVR-42/FACTORY-67)
 
 DROVR-37 shipped `@brooswit/drovr`'s `autoAnswerPermissions`: an unattended
-pass over Claude panes that presses the "Yes, and always allow … from this
-project" stored-rule option on an unambiguous tool-permission dialog, only
-when it is unambiguous, auditing every attempt. The operator's own name for
-running a managed session in Claude's manual/ask mode (`permissionMode:
-"default"`) with that auto-answer switched on is **"lizard mode"** — the
-point is to keep manual mode's own safety property for every tool call
-while never letting the agent sit frozen on the ONE dialog drovr already
-answers safely, which is exactly the incident (agents frozen for hours,
-herdr reporting them idle/done) this whole DROVR-37 epic exists to fix:
+pass over Claude panes that presses the plain "Yes" (allow once) option on
+an unambiguous tool-permission dialog, only when it is unambiguous, auditing
+every attempt. Since FACTORY-93, it never presses the "Yes, and always
+allow …" stored-rule option, and no rule persists past that one answer. The
+operator's own name for a managed session that opts into that auto-answer is
+**"lizard mode"** — it is a SEPARATE toggle that pairs with any
+`permissionMode` that still prompts (manual/`"default"` included, but not
+only that one), so the agent never sits frozen on the ONE dialog drovr
+already answers safely, which is exactly the incident (agents frozen for
+hours, herdr reporting them idle/done) this whole DROVR-37 epic exists to
+fix:
 
 ```json
 {
@@ -1067,11 +1069,16 @@ established the pattern for — rebuilt every managed-sessions poll from each
 eligible definition's own manifest, never persisted or acted on stale).
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
-field is independent and a definition may set it alongside any
-`permissionMode` — but manual mode is the combination it exists for; in
-`"auto"`/`"bypassPermissions"` mode the tool-permission dialog this targets
-essentially never appears, so `lizardMode` there is a harmless no-op, not an
-error.
+field is independent, and a definition may set it alongside any
+`permissionMode` that still prompts before a tool call; `permissionMode:
+"acceptEdits"` plus `lizardMode: true` and `permissionMode: "default"` plus
+`lizardMode: true` are both valid, ordinary combinations, not a headline
+plus an afterthought. `acceptEdits` auto-accepts file EDITS only — Bash and
+MCP tool prompts still appear there, and those are what lizard mode answers.
+`"bypassPermissions"` skips permission prompts by design, so `lizardMode`
+there has nothing to answer. What `"auto"` does is version-dependent and
+UNVERIFIED here — don't assume it behaves like `bypassPermissions`, and
+don't assume `lizardMode` is therefore a no-op under it.
 
 **No stale-argv risk for CLAUDE, unlike `permissionMode`/`strictMcpConfig`
 (FACTORY-43).** Those two fields DO reach the launched process's argv, which
@@ -1184,13 +1191,13 @@ epic's, not this ticket's.
 
 **Audit visibility.** Every auto-answer is recorded to a JSONL file under
 the workspace root (`Config.permissionAuditPath`, default
-`.permission-audit.jsonl`) with the exact stored-rule text pressed, and the
-daemon's own journal logs a line per answered/failed pane naming the
-DEFINITION FILE (not just an opaque pane id) and the tool — see
-`docs/permission-answer-loop.md`'s "Seeing recent auto-answers" section for
-the full detail and the reasoning for why this module never re-parses a
-pane's dialog itself to recover the exact rule text (dialog recognition
-stays drovr's job — FACTORY-49/FACTORY-67).
+`.permission-audit.jsonl`) with the exact option text pressed — always
+"Yes" (allow once) today, never a stored-rule option — and the daemon's own
+journal logs a line per answered/failed pane naming the DEFINITION FILE (not
+just an opaque pane id) and the tool — see `docs/permission-answer-loop.md`'s
+"Seeing recent auto-answers" section for the full detail and the reasoning
+for why this module never re-parses a pane's dialog itself to recover that
+text (dialog recognition stays drovr's job — FACTORY-49/FACTORY-67).
 
 **Rule-launched agents get the same mechanism too (FACTORY-87/FACTORY-76).**
 `Rule.permissionMode`/`Rule.lizardMode` (`src/rules/rules.ts`) extend this
