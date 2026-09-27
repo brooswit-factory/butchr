@@ -731,28 +731,31 @@ project in `linkedEventingProjects` already IS the per-project opt-in — so
 never-user-editable `Rule`-shaped value (`MANAGED_SESSION_LINKED_EVENTING_RULE`)
 that always carries `linkedEventing: true`. Every other linked-eventing knob
 on it (`maxLinkedItems`, `maxLinkedTurnsPerHour`, `linkedRemoteLinks`,
-`linkedDescriptionLinks`) is left absent — the same "absent means
-uncapped/off" default an unconfigured `jira-project` rule already has.
+`linkedDescriptionLinks`) is left absent.
 
-**Known, deliberately-deferred gap: no default rate cap (FACTORY-78).**
-Stated plainly, not implied: because `MANAGED_SESSION_LINKED_EVENTING_RULE`
-never sets `maxLinkedTurnsPerHour`, a managed session's linked-eventing
-nudges are **UNCAPPED BY DEFAULT in production today**, and a managed-session
-definition has no schema field to configure one — this is the exact same
-"absent means uncapped" behaviour an unconfigured `jira-project` rule owner
-already has, not a regression, but also not a real cap. FACTORY-51 (epic
-FACTORY-51, reviewing this ticket) accepted shipping this parity rather than
-inventing a cap-value decision unilaterally; a real default (or a
-per-definition setting, and whether the budget should be per-session or
-per-project given the N-independent-buckets note above) is an open operator
-decision tracked on FACTORY-78, filed as a deliberate orphan pending an
-epic/owner. `test/unit/session-definition-linked-eventing.test.ts`'s own
+**BUTCHR-471: no longer uncapped.** Previously, because
+`MANAGED_SESSION_LINKED_EVENTING_RULE` never set `maxLinkedTurnsPerHour` or
+`maxLinkedItems`, a managed session's linked-eventing nudges were uncapped by
+default in production, and a managed-session definition had no schema field
+to configure one (tracked as a deliberately-deferred gap, FACTORY-78). That
+gap is closed at the ENFORCEMENT site, not by adding a field: `runTick`
+(`src/jira-watch/linked-eventing.ts`) now applies `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`
+(2) / `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedTurnsPerHour`/
+`effectiveMaxLinkedItems` whenever a rule leaves either field absent — this
+rule included, no owner kind exempted. A managed session still has no
+per-definition override (that remains FACTORY-78's residue and is now its
+own tracked follow-up — see the BUTCHR-471 section below), so today every
+opted-in session gets exactly the shared default, per (session, project)
+bucket. `test/unit/session-definition-linked-eventing.test.ts`'s own
 "rate-cap MECHANISM" tests prove the underlying BUTCHR-469 cap logic still
 works correctly once a match's state-owning `agentKey` differs from its
-`notifyAgentKey` — they do NOT claim managed sessions are capped in
-production (that test hand-sets `maxLinkedTurnsPerHour` on its own fixture,
-bypassing `sessionDefinitionProjectMatches` entirely); a separate test in
-the same file pins that the function's real output carries no such field.
+`notifyAgentKey` (that test hand-sets `maxLinkedTurnsPerHour` on its own
+fixture, bypassing `sessionDefinitionProjectMatches` entirely, deliberately —
+see BUTCHR-471's own test for the REAL, end-to-end wiring instead); a
+separate test in the same file pins that `sessionDefinitionProjectMatches`'
+own output still carries no cap field — that assertion stays true (the
+default lives at enforcement, not on the produced rule), only its title
+changed to stop claiming production is uncapped.
 
 **Frozen sessions.** `herd.nudge`'s own `assertRunnable` freeze check
 (`instanceFreezeStore`, `src/resources/session-freeze.ts`) is the ONLY
@@ -803,3 +806,165 @@ wherever it is left unset, which every `jira-project` caller does.
   tests, 0 failures.
 - `bun run scripts/coverage/gate.ts` — project-wide coverage stayed above the
   90% line/function minimum.
+
+## Linked-change eventing: defaults, caps and known behaviour (BUTCHR-471)
+
+**The two defaults, where they live.** `runTick`
+(`src/jira-watch/linked-eventing.ts`) is the ONE place both defaults are
+defined — `DEFAULT_MAX_LINKED_TURNS_PER_HOUR = 2` and
+`DEFAULT_MAX_LINKED_ITEMS = 25`, each exported alongside a doc comment
+naming where the numbers come from (below). Every enforcement site reads
+them through `effectiveMaxLinkedTurnsPerHour(rule)` /
+`effectiveMaxLinkedItems(rule)` (same module) rather than reading
+`rule.maxLinkedTurnsPerHour`/`rule.maxLinkedItems` directly: the turn-cap
+check at the end of `runTick`, both `capLinkedItems` call sites inside
+`runTick` (the issue-owner loop and the project-owner loop), the
+project-member-cap WARNING log (which now always prints the EFFECTIVE
+value, never `undefined`), and `logLinkedDiscovery`
+(`src/rules/resource-type.ts`, for a rule with `linkedEventing: true` only —
+a rule that is NOT opted in still logs `rule.maxLinkedItems` exactly as
+written, absent meaning uncapped, since `runTick` never enforces anything
+for it either). No owner kind is exempt: a `jira-work` rule, a
+`jira-project` rule, and a managed session opted in via
+`linkedEventingProjects` (whose fixed, shared
+`MANAGED_SESSION_LINKED_EVENTING_RULE` — `src/rules/session-definition-type.ts`
+— deliberately never sets either field) all resolve through the SAME two
+functions.
+
+**Overriding per rule.** An explicit `maxLinkedTurnsPerHour`/`maxLinkedItems`
+on a rule always wins over the default, in both directions — a rule may set
+5 (looser) or 1 (tighter). There is deliberately **no value that means
+"uncapped"**: both fields still validate as positive integers only
+(`src/rules/rules.ts`), unchanged by this ticket. A managed session has
+**no per-definition override yet** — only the shared default applies to
+every session naming a project via `linkedEventingProjects`; a
+per-definition cap is a known limit, tracked as a follow-up (the residue of
+FACTORY-78 — see "Not done here" below).
+
+**The decision and its evidence.** Linked-change eventing itself stays
+**opt-in**: `linkedEventing` absent still means off, unchanged. The default
+caps ship regardless of that decision. Phase-2 inputs (BUTCHR-450/BUTCHR-468
+findings, window 2026-09-25T18:39:27Z to ~2026-09-26T18:44Z, both Servy
+daemons, cap 2/hr and `maxLinkedItems` 25 on every enabled `jira-work` rule):
+1. Delivered volume stayed inside the cap in organic operation: per-agent-
+   per-hour median 2, p95 2, max 4. Both buckets above 2 are daemon-restart
+   artifacts (a restart resets every agent's window), observed
+   independently on both daemons.
+2. Demand far exceeds the cap on busy agents: booswrit 181 delivered vs.
+   2154 rate-capped; wroosbit 105 vs. 1933. Capped changes are deferred
+   (re-detected on the next allowed tick), not lost, at up to the rest of
+   the hour in latency.
+3. Duplicate wakes concentrate in boss-type agents: booswrit epics 82%,
+   wroosbit stories 70% of delivered linked turns fall within 20 minutes of
+   a same-watcher `related:` notify; leaf task/bug agents 0%. The fix (an
+   Implements de-duplication) ships as a separate, later change to this same
+   module — its effect is projected, not yet measured.
+4. Usefulness: 21 hand-classified booswrit turns (convenience sample, not
+   stratified) — 12 duplicate, 9 useful/likely-useful, 0 noise. wroosbit
+   turns were not classified.
+5. Spend: **not obtained** — admin-agentcost never answered two requests.
+   An open unknown, not "checked and clean." The cap bounds the worst case
+   (at most `cap` extra turns per agent per hour, plus restart bursts);
+   typical spend is unmeasured.
+
+Why not default-on now: the de-dup that would make default-on defensible
+has not been deployed and re-measured; spend is unmeasured; phase 2 only
+observed `jira-work` rules on the two Servy daemons, while a default flip
+would also newly enable member discovery (extra Jira searches) for every
+`jira-project` rule, a path with no fleet observation; and waiting costs
+almost nothing, because every enabled `jira-work` rule on both Servy
+daemons already sets `linkedEventing: true` explicitly and managed sessions
+opt in through `linkedEventingProjects`, so a flip would change behaviour
+only for future, unconfigured rules.
+
+**Conditions to revisit default-on** — proposed by this story, confirmed
+as the right *shape* by the epic (BUTCHR-451 comment 25776), but **not yet
+agreed operator policy**: there is no verb that reaches the director or the
+operator from an In-Progress epic, so these are recorded as conditions
+PROPOSED by this story and CONFIRMED-AS-SHAPE by the epic, awaiting
+operator sign-off — not as settled policy.
+1. The Implements de-duplication (evidence point 3 above) deployed on both
+   Servy daemons for at least 24h, and the phase-2 duplicate measurement
+   re-run by the same method, with the boss-tier duplicate share materially
+   below 82%/70%. A `<= 20%` bar was proposed on this ticket; the epic
+   explicitly declined to ratify that number — it is **a proposed bar, not
+   a measured threshold**, since phase 2 never established what a healthy
+   share looks like.
+2. A spend delta obtained from admin-agentcost, or an explicit operator
+   waiver. Two requests to admin-agentcost have gone unanswered (BUTCHR-446
+   comment 24922 and via the boss chain) — this stays an **open unknown**,
+   not something to treat as satisfied by silence or waived by default.
+3. Leaf-agent linked turns classified by link direction: a worker hearing
+   its own boss's ticket through an Implements link is a route
+   `src/jira-watch/routes.ts` deliberately excludes from the pre-existing
+   `related:` path, but `issuelinkItems()` does not exclude it from the
+   `linked:` path — phase 2 did not measure whether those particular wakes
+   are worth having, and the epic called this the most valuable of the
+   three conditions because it could change the answer, not just confirm it.
+
+**Known behaviour, stated plainly:**
+1. The sliding window is in-memory only and resets on every daemon restart
+   — observed on both daemons, the only source of above-cap delivery in
+   phase 2. A restart lets each agent have up to `cap` more turns before the
+   window starts constraining it again. Fixing this needs persistence, not
+   done in this ticket.
+2. Demand exceeds the cap on busy agents (see evidence point 2 above), so a
+   capped tick is deferred, not lost, at up to the rest of the hour in
+   latency.
+3. The cap does not gate the pre-existing `related:` notify path — only the
+   `linked:` coalesced-nudge path this module owns.
+4. Buckets are per-(session, project), not per-session:
+   `sessionDefinitionProjectMatches` gives each (session, project) pair its
+   own synthetic state-owning key
+   (`<session key>\0linked:<project ref>` —
+   `managedSessionProjectWatchKey`, `src/rules/session-definition-type.ts`)
+   deliberately (FACTORY-71: sharing one key let a second project's per-tick
+   state overwrite the first's), and `runTick`'s `turns` window is keyed by
+   it — so a session opted into N projects gets up to **N × the cap**, never
+   one shared per-session budget.
+5. The worst case is bounded (at most `cap` extra turns per agent per hour,
+   per bucket, plus a restart burst); typical spend remains unmeasured.
+
+**The NUL-byte log line (fixed by this ticket).** The synthetic
+per-(session, project) key above contains a literal NUL byte. Once a
+managed-session bucket can actually be capped, `runTick` emits a
+`[notify-suppressed] ... arm=rate-capped` line for it for the first time —
+confirmed live (a `systemd-cat`/`journalctl -o json` round-trip) that a NUL
+byte in a journal write **splits the write into two separate journal
+entries**, exactly the "forged second physical line" hazard
+`src/daemon/log-sink.ts`'s own flatten already closes for `\r`/`\n` but not
+for NUL. Fixed by never emitting the synthetic key on this line at all: the
+rate-capped log call now passes `entry.notifyAgentKey` (always the real
+agent — the state-owning `agentKey` only for an owner with no synthetic
+key) as `watcher=`, while `key=` keeps naming the project/issue as before.
+Round-tripped through `parseSuppressedLine` in
+`test/unit/suppressed-log.test.ts`, asserting the emitted line contains no
+control characters. Other pre-existing log lines that interpolate the
+synthetic key (the project-member-search-failure and managed-link-fetch
+WARNING lines inside `runTick`'s `projectOpted` loop) are OUT OF SCOPE for
+this ticket — left as is; a future ticket should apply the same
+`notifyAgentKey`-not-`agentKey` fix to them.
+
+**Not done here (follow-ups):**
+- A per-definition cap override for managed sessions (the residue of
+  FACTORY-78) — needs its own story: a new session-definition field carries
+  its own deploy/rollback hazard, deliberately not introduced by this
+  ticket (see the MUST-NOT below).
+- The Implements de-duplication (evidence point 3 above) — a sibling change
+  to `src/jira-watch/linked-eventing.ts`, started after this ticket merges.
+
+**Deploy note.** No new rule field, session-definition field, or
+`RULE_FIELDS` allowlist entry — an older build still loads every rule file
+and definition this build loads, so rollback is a plain redeploy of the
+previous build, no config edit needed. Behaviour change on deploy: every
+linked-eventing owner WITHOUT explicit caps, managed sessions naming
+`linkedEventingProjects` included, becomes capped at 2 turns/hour (per
+(session, project) bucket) and 25 items; explicit values are unaffected.
+The fleet rules on both Servy daemons already set exactly 2 and 25, so they
+see no change. A managed-session director that today gets every linked
+nudge will get at most 2 per project per hour going forward; changes beyond
+that are deferred, not lost — intended by the epic's operator constraint,
+but it visibly trades against "a director is woken when anything in its
+project changes." The knob to loosen this for a managed session does not
+exist yet (see follow-ups above). Once deployed, rate-capped lines appear
+in the journal for managed sessions for the first time.
