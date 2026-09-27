@@ -206,21 +206,41 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     notify(resyncListeners, reason);
   }
 
-  function clearWatchdog(): void {
+  // Raw mechanics, unconditional — used ONLY by the public `stop()`, which by the time it runs
+  // has already bumped `generation` and must clear whatever is currently armed regardless of
+  // which (now-stale) generation armed it.
+  function clearWatchdogRaw(): void {
     if (watchdogHandle !== undefined) {
       deps.clearTimeout(watchdogHandle);
       watchdogHandle = undefined;
     }
   }
-
-  function armWatchdog(): void {
-    clearWatchdog();
+  function armWatchdogRaw(): void {
+    clearWatchdogRaw();
     watchdogHandle = deps.setTimeout(() => {
       // No bytes (event OR heartbeat) within the window: presume dead and
       // reconnect. Aborting the in-flight request is what actually frees
       // the stalled connection; connectOnce's own catch handles the abort.
       abortController?.abort();
     }, watchdogMs);
+  }
+
+  // Generation-guarded wrappers for everything INSIDE a connect attempt. `watchdogHandle` is one
+  // variable shared by the whole client, and a stale attempt's own `catch`/`finally` still runs
+  // (and, before this fix, still called the raw clear/arm) even after its generation has moved
+  // on — which could cancel the timer a NEWER attempt had just armed, or arm one on the new
+  // attempt's behalf using a delay computed for the stale one. Gen-guarding here, not just at
+  // each call SITE, means a stale continuation's clear/arm calls are unconditionally inert rather
+  // than relying on every call site remembering to check first (a review-caught bug: the
+  // generation check existed at the top of `connectOnce` and inside `scheduleReconnect`, but not
+  // here, so a stale attempt could still reach clearWatchdog() before its own generation check).
+  function clearWatchdog(myGen: number): void {
+    if (myGen !== generation) return;
+    clearWatchdogRaw();
+  }
+  function armWatchdog(myGen: number): void {
+    if (myGen !== generation) return;
+    armWatchdogRaw();
   }
 
   function clearReconnectTimer(): void {
@@ -263,41 +283,41 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     // connection but never sends response headers (or hangs before a body arrives) is just as
     // "dead" per this ticket's own "no bytes for a window" rule as a silent already-live stream —
     // nothing before this point exempted the connecting/reconnecting phase from that rule.
-    armWatchdog();
+    armWatchdog(myGen);
 
     let res: Awaited<ReturnType<FetchLike>>;
     try {
       res = await deps.fetch(buildEventsUrl(baseUrl, filters), { headers, signal: controller.signal });
     } catch {
-      clearWatchdog();
+      clearWatchdog(myGen);
       if (myGen !== generation) return;
       scheduleReconnect(myGen);
       return;
     }
     if (myGen !== generation) {
-      clearWatchdog();
+      clearWatchdog(myGen);
       return;
     }
 
     if (res.status === 401) {
-      clearWatchdog();
+      clearWatchdog(myGen);
       setState("unauthorized");
       return;
     }
     if (res.status === 503) {
-      clearWatchdog();
+      clearWatchdog(myGen);
       setState("unavailable");
       return;
     }
     if (res.status === 400) {
-      clearWatchdog();
+      clearWatchdog(myGen);
       lastSeq = null; // drop the cursor — next attempt is live-only
       emitResync("cursor-dropped");
       scheduleReconnect(myGen);
       return;
     }
     if (!res.ok || !res.body) {
-      clearWatchdog();
+      clearWatchdog(myGen);
       scheduleReconnect(myGen);
       return;
     }
@@ -305,7 +325,7 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     everLive = true;
     setState("live");
     liveSince = deps.now();
-    armWatchdog(); // fresh window for the live phase, independent of whatever remained from connecting
+    armWatchdog(myGen); // fresh window for the live phase, independent of whatever remained from connecting
 
     let resyncCheckedThisConnection = false;
     const parser = createSseParser({
@@ -351,14 +371,14 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
           return;
         }
         if (done) break;
-        armWatchdog();
+        armWatchdog(myGen);
         parser.push(value);
       }
       parser.end();
     } catch {
       // Read failed (network error, or our own watchdog-triggered abort) — fall through to reconnect below.
     } finally {
-      clearWatchdog();
+      clearWatchdog(myGen);
     }
     if (myGen !== generation) return;
     scheduleReconnect(myGen);
@@ -377,7 +397,7 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     stop(): void {
       stopped = true;
       generation += 1; // invalidates any in-flight connectOnce/scheduleReconnect chain, however far along
-      clearWatchdog();
+      clearWatchdogRaw(); // unconditional: generation has already moved past whatever armed this
       clearReconnectTimer();
       abortController?.abort();
       setState("idle");

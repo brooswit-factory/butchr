@@ -133,6 +133,24 @@ running two connect chains at once — a review-caught bug, fixed before this
 merged, with its own regression test (`client.test.ts`: "stop() then a
 fresh start() WHILE a connect attempt is still awaiting fetch").
 
+**The generation check covers control flow, not shared mutable state on its
+own — a second round of the same bug, also caught at review.** `armWatchdog`/
+`clearWatchdog` first only gen-guarded at each CALL SITE (e.g. `if (myGen
+!== generation) return;` before calling a plain `clearWatchdog()`), but
+`watchdogHandle` itself is one variable for the whole client, and a stale
+attempt's own `catch`/`finally` still ran its (ungated) `clearWatchdog()`
+call — cancelling the timer a NEWER attempt had just armed, in exactly the
+same `stop()`-then-`start()`-during-a-pending-connect scenario the first
+round fixed. Fixed by moving the generation check INTO `armWatchdog`/
+`clearWatchdog` themselves (taking `myGen`, no-op when stale), so a stale
+continuation's clear/arm calls are unconditionally inert rather than
+depending on every call site remembering to check first. The one exception
+is the public `stop()`, which calls an unconditional `clearWatchdogRaw()` —
+by the time it runs, `generation` has already moved past whatever it needs
+to clear, so a gen-guarded call would wrongly no-op. Regression test:
+`client.test.ts`: "stop() then start() during a pending fetch leaves the
+NEW attempt's watchdog intact".
+
 **Listener isolation**: every `onStateChange`/`onEvent`/`onResyncRequired`
 listener call is wrapped so a throwing consumer can never unwind into this
 module's own control flow. Before this was added, a throwing `onEvent`
