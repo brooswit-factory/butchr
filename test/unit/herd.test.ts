@@ -1144,12 +1144,6 @@ describe("staleIssues", () => {
     }
   });
 
-    } finally {
-      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   // FACTORY-75: `--model`/`--effort` are deliberately excluded from
   // `checkArgv`/`checkManagedAgentArgv`'s own comparison (this method's own
   // top comment, and every FACTORY-43 test pair above never asserts on

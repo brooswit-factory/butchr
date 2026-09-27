@@ -1169,19 +1169,57 @@ from FACTORY-43) — not a gap introduced by this ticket, and not otherwise
 fixed here per this ticket's own requirement to document, not silently
 leave, whatever the existing mechanism actually does.
 
-**Why the explicit-only reading matters: FACTORY-127.** A sibling story is
-making `lizardMode` default to `true` where it is resolved for
-ELIGIBILITY — i.e. whether the daemon's answering timer scans a pane at
-all — and that default flip is promised to never reach argv, never respawn
-anything, and take effect on the daemon's very next poll (same "live,
-no-respawn" property Claude's own `lizardMode` already has). If the Codex
-LAUNCH decision above keyed off that same resolved/defaulted value instead of
-the raw explicit field, FACTORY-127's default flip would silently drop the
-bypass flag from EVERY running Codex agent at deploy — a fleet-wide sandbox
-change and respawn wave with no canary. Reading only the explicit field keeps
-Codex agents leaving bypass mode one at a time, by deliberate opt-in, after a
-canary — see this ticket's own PR/code comment on the launch-flag decision
-function (`src/agents/argv.ts`) for where this is enforced.
+**Why the explicit-only reading matters: FACTORY-127/FACTORY-138.** A sibling
+story (FACTORY-127, shipped with FACTORY-138) made `lizardMode` default to
+`true` where it is resolved for ELIGIBILITY — i.e. whether the daemon's
+answering timer scans a pane at all — for a `vendor: "claude"` definition;
+that default flip never reaches argv, never respawns anything, and takes
+effect on the daemon's very next poll (a live, no-respawn property, since
+Claude's own `lizardMode` never reaches argv at all — see above). **For
+`vendor: "codex"`, the story explicitly decided (FACTORY-106/FACTORY-324)
+NOT to extend that default-eligible flip** — a `codex` definition that never
+sets `lizardMode` stays not-eligible for scanning too (see the "Codex
+eligibility for SCANNING vs. LAUNCH — two separate defaults" note below for
+the full three-case table). If the Codex LAUNCH decision above keyed off the
+resolved/defaulted ELIGIBILITY value instead of the raw explicit field,
+either default (today's not-eligible-when-absent, or a future eligible-when-
+absent) would risk changing argv/respawn behaviour purely from an eligibility
+default flip with no canary. Reading only the explicit field keeps Codex
+agents leaving bypass mode one at a time, by deliberate opt-in, after a
+canary, independent of whatever the eligibility default happens to be — see
+this ticket's own PR/code comment on the launch-flag decision function
+(`src/agents/argv.ts`) for where this is enforced.
+
+**Codex eligibility for SCANNING vs. LAUNCH — two separate defaults
+(FACTORY-106/FACTORY-324 story decision).** These are two different
+questions with two different defaults for a `vendor: "codex"` definition,
+and conflating them is the mistake this note exists to prevent:
+
+| `lizardMode` on the definition | eligible for SCANNING (daemon answers a dialog if it appears) | LAUNCHED without the bypass flag (a dialog can appear at all) |
+| --- | --- | --- |
+| absent | **NOT eligible** (opposite of `vendor: "claude"`'s FACTORY-138 default) | bypass flag present — no dialog ever shows |
+| explicit `true` | eligible | bypass flag dropped — dialog can show, and gets answered |
+| explicit `false` | not eligible | bypass flag present — no dialog ever shows |
+
+Absent and explicit-`false` are outcome-identical for Codex today (both:
+not-eligible, bypass flag present, no dialog, nothing to answer) — the
+absent case is called out separately only because it is the one place Codex
+deliberately does NOT mirror Claude's FACTORY-138 "absent means eligible"
+default. Reason: for Claude, "eligible but nothing to press" cannot happen —
+a Claude launch always risks showing this dialog, so default-eligible is
+real coverage. For Codex, a definition's launch shows the dialog ONLY when
+the SAME field is explicitly `true`; defaulting eligibility on for Codex
+would only add a scan that can never find anything to press (a harmless
+no-op, not a bug — see the rule-side asymmetry note immediately below for
+the one place this exact shape is deliberately still allowed to occur), while
+silently implying a coverage guarantee nobody canaried. `Rule.lizardMode`
+(the rule-engine, non-managed-session path — src/rules/rules.ts) resolves
+scanning eligibility differently — `!== false`, i.e. absent IS eligible,
+regardless of vendor, unchanged by this decision — creating a deliberate,
+documented asymmetry with this table for a rule-launched (as opposed to
+managed-session) Codex agent: see `Rule.lizardMode`'s own doc comment for
+why that asymmetry was judged harmless rather than worth a matching vendor
+check.
 
 **Host config caveat.** `~/.codex/config.toml`'s own `approval_policy`/
 `sandbox_mode` settings can change which prompt shapes Codex renders,

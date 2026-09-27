@@ -159,15 +159,38 @@ recomputed "expected" argv that still assumes the bypass flag, respawn-looping
 it forever, the exact bug FACTORY-43 closed for the other two fields.
 
 **Explicit only — never a resolved/defaulted value — and why that matters.**
-A sibling story, FACTORY-127, makes `lizardMode` default to `true` where it
-is resolved for ELIGIBILITY (the `eligiblePanes` gate above), and promises
-that default flip never reaches argv or respawns anything. Reading the raw
-field, not the resolved one, at Codex launch-config time is what keeps that
-promise true here too: if the launch decision instead keyed off the
-resolved/defaulted value, FACTORY-127's rollout would silently drop the
-bypass flag from every running Codex agent at once, with no canary. The
-launch-flag decision lives in one small function in `src/agents/argv.ts`
-carrying this reasoning as its own comment.
+FACTORY-127 (shipped with FACTORY-138) made `lizardMode` default to `true`
+where it is resolved for ELIGIBILITY (the `eligiblePanes` gate above) for a
+`vendor: "claude"` managed-session definition, and promises that default
+flip never reaches argv or respawns anything. Reading the raw field, not the
+resolved one, at Codex launch-config time is what keeps a parallel promise
+true for Codex: if the launch decision instead keyed off a resolved/defaulted
+eligibility value, a default flip (present or future, for either vendor)
+could silently drop the bypass flag from every running Codex agent at once,
+with no canary. The launch-flag decision lives in one small function in
+`src/agents/argv.ts` carrying this reasoning as its own comment.
+
+**Codex's own ELIGIBILITY default stayed `false` — a deliberate, separate
+decision (FACTORY-106/FACTORY-324), not an oversight inherited from
+FACTORY-127.** FACTORY-127/FACTORY-138's default-eligible flip is scoped to
+`vendor: "claude"` only: a `vendor: "codex"` managed-session definition that
+never sets `lizardMode` resolves NOT eligible for scanning
+(`m.definition.lizardMode ?? (m.definition.vendor === "claude")`,
+`src/rules/session-definition-type.ts`) — only an explicit `true` makes it
+eligible, and that same explicit `true` is also what the paragraph above
+requires for the LAUNCH to drop the bypass flag, so eligible-for-scanning and
+capable-of-showing-a-dialog move together for Codex, by construction. Making
+Codex default-eligible too (mirroring Claude) would have decoupled them: a
+newly-eligible-by-default Codex pane would be scanned every tick for a dialog
+its still-bypassed launch can never show — a harmless no-op, but one that
+silently claims coverage nobody canaried, which is exactly the failure shape
+this whole epic exists to avoid elsewhere. See `docs/managed-sessions.md`'s
+"Codex eligibility for SCANNING vs. LAUNCH" table for the full three-case
+breakdown, including the deliberate, documented asymmetry on the
+`Rule.lizardMode` (non-managed-session) path, which resolves scanning
+eligibility as `!== false` (absent IS eligible) regardless of vendor and was
+left unchanged — see `Rule.lizardMode`'s own doc comment
+(`src/rules/rules.ts`) for why.
 
 **Fixture coupling — "no `-a`/`-s` flags" is deliberate, not an oversight.**
 drovr's Codex prompt recognition was captured against codex-cli 0.145.0
