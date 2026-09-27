@@ -1413,14 +1413,14 @@ describe("staleIssues", () => {
       const oldKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/legacy#7" });
       const oldCwd = join(root, ...oldKey.split(":"));
       mkdirSync(oldCwd, { recursive: true });
-      const oldArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const oldArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       // New-layout: a different github-issue key, already migrated (a real,
       // stamped ensureWorkspaceDir claim at its short leaf).
       const newKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/shiny#9" });
       const newCwd = ensureWorkspaceDir(newKey);
       expect(newCwd.endsWith("/github-issue/bugs/shiny#9")).toBe(true);
-      const newArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const newArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       const { client } = fakeHerdrWithCwd(
         [{ pane_id: "w-old:p1", cwd: oldCwd }, { pane_id: "w-new:p1", cwd: newCwd }],
