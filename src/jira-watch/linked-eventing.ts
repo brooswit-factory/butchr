@@ -173,6 +173,7 @@ import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, t
 import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
 import type { LinkStore } from "../resources/link-store.js";
 import { isDaemonLabelOnlyDiff } from "./diff.js";
+import { watchedKeys } from "./routes.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
   pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
@@ -335,8 +336,25 @@ const EXTERNAL_DISCOVERY_KINDS = new Set<LinkedItemKind>(["confluence", "github-
  * target, first occurrence wins (issuelink/parent/description-derived beats
  * a remote link resolving to the same key) — the same convention
  * `discoverLinkedItems` itself already uses.
+ *
+ * BUTCHR-472: a target `watchedKeys(match.issue.issuelinks)`
+ * (`src/jira-watch/routes.ts`) already routes for THIS SAME owning key via
+ * the pre-existing `related:` notify path — an Implements link with the
+ * other end on the IMPLEMENTER side (`otherEnd === "outward"`), i.e. a boss
+ * hearing what implements it — is excluded here, of whatever `LinkedItem`
+ * kind it happens to surface as (issuelink/parent/jira-key/remote-link),
+ * so this module never re-derives and re-notifies the SAME (owner, target)
+ * pair `related:` already delivers independently. Both paths read off the
+ * SAME `watchedKeys` function (never a second, possibly-drifting
+ * definition of "already routed"). This is deliberately NOT symmetric:
+ * `watchedKeys` only ever returns the outward/implementer side, so a
+ * worker's own Implements link to ITS boss (`otherEnd === "inward"`, the
+ * reverse direction `routes.ts` itself documents as excluded from
+ * `related:`) is never in this set and is therefore untouched — see this
+ * ticket's PR for why that direction is left exactly as it was.
  */
 export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: readonly JiraRemoteLink[] | undefined): LinkedItem[] {
+  const routedByRelated = new Set(watchedKeys(match.issue.issuelinks ?? []));
   const discovered = discoverLinkedItems({
     issuelinks: match.issue.issuelinks,
     parent: match.issue.parent,
@@ -353,7 +371,7 @@ export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: rea
   const seen = new Set<string>();
   const out: LinkedItem[] = [];
   for (const item of [...discovered, ...remoteKeyItems]) {
-    if (seen.has(item.target)) continue;
+    if (seen.has(item.target) || routedByRelated.has(item.target)) continue;
     seen.add(item.target);
     out.push(item);
   }
@@ -425,6 +443,42 @@ function unreadableDetail(httpStatus: number | undefined): string {
 
 /** A sliding hour — the unit `maxLinkedTurnsPerHour` is denominated in. */
 const SLIDING_WINDOW_MS = 60 * 60_000;
+
+/**
+ * BUTCHR-471 (epic BUTCHR-446): the two default caps applied wherever a cap
+ * is READ (never at rule-parse time — see `effectiveMaxLinkedItems`/
+ * `effectiveMaxLinkedTurnsPerHour` below), so no linked-eventing owner kind
+ * (a `jira-work` rule, a `jira-project` rule, or a managed session opted in
+ * via `linkedEventingProjects`) can run uncapped. An explicit
+ * `maxLinkedTurnsPerHour`/`maxLinkedItems` on a rule always wins over the
+ * default, in both directions (looser or tighter) — these constants only
+ * fill in for a rule that leaves the field absent.
+ *
+ * Sourced from BUTCHR-450/BUTCHR-468's phase-2 measurement (window
+ * 2026-09-25T18:39:27Z to ~2026-09-26T18:44Z, both Servy daemons, every
+ * enabled `jira-work` rule already running with `maxLinkedTurnsPerHour: 2`
+ * and `maxLinkedItems: 25`): delivered linked turns per agent per hour
+ * stayed inside the cap in organic operation — median 2, p95 2, max 4, with
+ * both buckets above 2 being daemon-restart artifacts (a restart resets
+ * every agent's sliding window), observed independently on both daemons.
+ * Nothing measured supports a looser default, and spend was never obtained
+ * (admin-agentcost did not answer two requests), so there is no argument for
+ * anything looser either. An operator can still raise or lower either value
+ * per rule via the existing fields.
+ */
+export const DEFAULT_MAX_LINKED_TURNS_PER_HOUR = 2;
+/** See `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`'s own doc comment for where this number comes from. */
+export const DEFAULT_MAX_LINKED_ITEMS = 25;
+
+/** The turn-rate cap `runTick` actually enforces for one linked-eventing owner's rule — an explicit `rule.maxLinkedTurnsPerHour` always wins; absent falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (BUTCHR-471). Never `undefined`: unlike `capLinkedItems`'s own `max` parameter, there is deliberately no "uncapped" value this can resolve to. */
+export function effectiveMaxLinkedTurnsPerHour(rule: Rule): number {
+  return rule.maxLinkedTurnsPerHour ?? DEFAULT_MAX_LINKED_TURNS_PER_HOUR;
+}
+
+/** The item cap `runTick` actually enforces for one linked-eventing owner's rule — an explicit `rule.maxLinkedItems` always wins; absent falls back to `DEFAULT_MAX_LINKED_ITEMS` (BUTCHR-471). Never `undefined` for an OPTED-IN owner (every call site below only ever calls this from inside `opted`/`projectOpted`, both pre-filtered to `rule.linkedEventing === true`) — `capLinkedItems`'s own `max === undefined` ⇒ uncapped contract is unchanged; this function simply never hands it `undefined`. */
+export function effectiveMaxLinkedItems(rule: Rule): number {
+  return rule.maxLinkedItems ?? DEFAULT_MAX_LINKED_ITEMS;
+}
 
 export interface LinkedEventingDeps {
   /** The SAME batched-search seam every other Jira-kind fetch in this codebase already uses (`RuleResourceDeps.search`) — ONE `key in (...)` call per tick covers every opted-in owner's Jira-kind linked targets combined, never one call per linked item. */
@@ -685,7 +739,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         // SAME combined array, same uniform cap.
         const jiraItems = jiraKindLinkedItems(m, remoteLinks);
         const externalItems = m.rule.linkedDescriptionLinks === true ? descriptionLinkedItems(m) : [];
-        const { kept } = capLinkedItems([...jiraItems, ...externalItems, ...managedItems], m.rule.maxLinkedItems);
+        const { kept } = capLinkedItems([...jiraItems, ...externalItems, ...managedItems], effectiveMaxLinkedItems(m.rule));
         perOwnerItems.set(m.agentKey, kept);
       }
 
@@ -802,7 +856,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           seen.add(item.target);
           combinedProjectItems.push(item);
         }
-        const { kept: projectKept, skipped: projectSkipped } = capLinkedItems(combinedProjectItems, m.rule.maxLinkedItems);
+        const { kept: projectKept, skipped: projectSkipped } = capLinkedItems(combinedProjectItems, effectiveMaxLinkedItems(m.rule));
         perOwnerItems.set(m.agentKey, projectKept);
         memberTargetsByOwner.set(m.agentKey, new Set(memberItems.map((i) => i.target)));
 
@@ -830,7 +884,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         const freshOrChangedTargets = new Set(freshOrChangedMembers.map((i) => i.target));
         if (projectSkipped.some((i) => freshOrChangedTargets.has(i.target))) {
           nextProjectWatermark.delete(m.agentKey);
-          deps.log?.(`  WARNING: [linked-eventing] project-member cap: ${m.agentKey} (${m.projectKey}) has more changed members than maxLinkedItems (${m.rule.maxLinkedItems}) allows this tick; watermark held so the skipped member(s) are retried next tick, not lost`);
+          deps.log?.(`  WARNING: [linked-eventing] project-member cap: ${m.agentKey} (${m.projectKey}) has more changed members than maxLinkedItems (${effectiveMaxLinkedItems(m.rule)}) allows this tick; watermark held so the skipped member(s) are retried next tick, not lost`);
         }
       }
 
@@ -1156,17 +1210,32 @@ export function createLinkedEventingState(): LinkedEventingState {
         const advance = advanceByOwner.get(entry.agentKey)!;
         const events = eventsByOwner.get(entry.agentKey);
         if (!events?.length) { advance(); continue; }
-        const max = entry.rule.maxLinkedTurnsPerHour;
-        if (max !== undefined) {
-          const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
-          if (history.length >= max) {
-            turns.set(entry.agentKey, history);
-            deps.log?.(rateCappedSuppressedLine(entry.label, entry.agentKey, history.length, max));
-            continue; // NOT advanced — next allowed tick re-detects everything still outstanding
-          }
-          history.push(now());
+        // BUTCHR-471: never `undefined` — an explicit `rule.maxLinkedTurnsPerHour`
+        // always wins, absent falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`,
+        // so this block now always runs (no owner kind can run uncapped).
+        const max = effectiveMaxLinkedTurnsPerHour(entry.rule);
+        const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
+        if (history.length >= max) {
           turns.set(entry.agentKey, history);
+          // BUTCHR-471: `entry.notifyAgentKey`, NOT `entry.agentKey` — for a
+          // managed-session owner, `agentKey` is the synthetic per-(session,
+          // project) STATE key (`managedSessionProjectWatchKey`, src/rules/
+          // session-definition-type.ts), which embeds a literal NUL byte.
+          // Confirmed live (systemd-cat + journalctl -o json round-trip): a
+          // NUL byte in a journal write splits into TWO separate journal
+          // entries, exactly the "forged second line" hazard
+          // src/daemon/log-sink.ts's own flatten already closes for \r/\n —
+          // this line must never carry that byte at all. `notifyAgentKey` is
+          // always the real agent (defaults to `agentKey` for every owner
+          // kind that has no synthetic key), so this is a no-op for a
+          // jira-work/jira-project owner and the fix for a managed session;
+          // `entry.label` (the project/issue key, never the synthetic key)
+          // still keeps the project identifiable via `key=`.
+          deps.log?.(rateCappedSuppressedLine(entry.label, entry.notifyAgentKey, history.length, max));
+          continue; // NOT advanced — next allowed tick re-detects everything still outstanding
         }
+        history.push(now());
+        turns.set(entry.agentKey, history);
         // Advanced only AFTER a successful notify (review round 1, non-
         // blocking note): a throwing notify leaves this owner's state
         // unadvanced too, so "delayed, not lost" holds for a notify failure
