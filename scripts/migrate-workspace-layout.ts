@@ -114,4 +114,8 @@ async function main() {
   if (failed > 0) process.exit(1);
 }
 
-main().catch((e) => { console.error("FAILED:", e); process.exit(1); });
+// Guarded (unlike this repo's own reap-dry-run.ts precedent) so importing
+// this file — e.g. the generated load-test smoke check, `bun run
+// scripts/load/generate.ts`, that merely proves every source file is
+// importable — never itself connects to a real herdr as a side effect.
+if (import.meta.main) main().catch((e) => { console.error("FAILED:", e); process.exit(1); });
