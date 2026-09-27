@@ -93,7 +93,9 @@ describe("zendesk ticket identity", () => {
     expect(encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: "acme#42" })).toBe(ZD);
     expect(decodeAgentKey(ZD)).toEqual({ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: "acme#42" });
     expect(decodeAgentKey("zendesk-ticket:support:42")).toBeNull();
-    expect(workspaceDirFor(ZD, "/root")).toBe("/root/zendesk-ticket/support/acme%2342");
+    // FACTORY-118: the leaf is the provider's short id (subdomain dropped,
+    // just "#<id>"), not the full percent-encoded resource id.
+    expect(workspaceDirFor(ZD, "/root")).toBe("/root/zendesk-ticket/support/#42");
     expect([ownsZendeskTicketAgent(ZD), ownsRuleAgent(ZD), ownsGithubIssueAgent(ZD)]).toEqual([true, false, false]);
     expect(ownsZendeskTicketAgent(JIRA)).toBe(false);
   });
