@@ -47,10 +47,56 @@
  * drovr's escalation watcher (see managed-session-escalation-watcher.ts's own
  * doc comment) — nothing else on this fleet presses that dialog's keys.
  */
-import { basename } from "node:path";
+import { mkdir, appendFile } from "node:fs/promises";
+import { dirname, basename } from "node:path";
 import { autoAnswerPermissions, type AutoAnswerPermissionResult, type DrovrClient } from "@brooswit/drovr";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { Rule } from "../rules/rules.js";
+
+/**
+ * FACTORY-145: which path caused a pane's prompt to be looked at THIS tick —
+ * `"fast"` when a `pane.agent_status_changed` push frame (`permission-answer-watch.ts`)
+ * recorded a trigger instant for this pane that this tick is now consuming,
+ * `"sweep"` otherwise (the periodic `agent.list()` scan alone, or
+ * `startPermissionAnswerLoop` with no watch wired in at all — every caller
+ * with no `fastPathTriggers` map behaves exactly as before this ticket).
+ * Deliberately NOT "the fast path is fast" vs "the sweep is slow" — a
+ * sweep-triggered answer's true wait is unknowable (see `latencyMs`'s own
+ * doc comment on `AnswerLatency`), so this tag exists to let a reader
+ * EXCLUDE those answers from a latency computation, not to describe them.
+ */
+export type PermissionAnswerTrigger = "fast" | "sweep";
+
+/**
+ * FACTORY-145: elapsed time from "the fast path learned this pane was
+ * blocked" to "this tick pressed its prompt" — computed with a monotonic
+ * clock (`deps.now`, default `performance.now`), never wall-clock (which can
+ * step). Present ONLY when `trigger` is `"fast"`: a sweep discovers a pane
+ * that may have already been sitting blocked anywhere from 0 to one whole
+ * sweep interval before the scan happened to look, so "now minus when the
+ * sweep looked" is not a latency, it is an artefact that LOOKS like one —
+ * emitting it would silently drag a computed p95 downward. Measured from the
+ * instant this pane's OWN `blocked` push frame was received
+ * (`permission-answer-watch.ts`'s `fastPathTriggers` map) — NOT from
+ * whatever instant herdr itself observed the transition, which this frame's
+ * own shape (`{ pane_id, agent_status }`, no timestamp — verified against
+ * `@brooswit/herdr-sdk`'s own generated `PaneAgentStatusChangedEvent` type,
+ * FACTORY-145's own investigation) never carries. So this number excludes
+ * whatever time herdr itself took to notice the pane went blocked and get a
+ * frame to butchr, plus ordinary network/socket delay ahead of receipt — it
+ * is a lower bound on the operator-visible wait, not the whole of it.
+ */
+export interface AnswerLatency {
+  trigger: PermissionAnswerTrigger;
+  /** Only present when `trigger` is `"fast"` — see this interface's own doc comment. */
+  latencyMs?: number;
+}
+
+/** `deps.appendAudit`'s default: the same append-only-file shape `@brooswit/drovr`'s own `defaultDeps.appendAudit` uses (`node_modules/@brooswit/drovr/dist/index.js`), restated here rather than imported since drovr does not export it. */
+async function appendAuditLine(path: string, line: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(path, line, { mode: 0o600 });
+}
 
 /** The slice of `DrovrClient` `autoAnswerPermissions` actually needs — same shape drovr's own `ApprovalClient` type declares, restated here so this module doesn't need a `DrovrClient` import just to read the pick out of it. */
 export type PermissionAnswerClient = { agent: Pick<DrovrClient["agent"], "list" | "get" | "read" | "sendKeys"> };
@@ -209,6 +255,32 @@ export interface PermissionAnswerLoopDeps {
    * omitted, nothing extra happens.
    */
   onEligiblePaneIds?: (paneIds: readonly string[]) => void;
+  /**
+   * FACTORY-145: `pane_id -> the monotonic instant (per `deps.now`) its own
+   * `blocked` push frame was received` — owned and populated by
+   * `permission-answer-watch.ts`'s fast path, read (and consumed: deleted)
+   * here for every pane this tick scanned, whether or not it ended up
+   * `answered`. Absent entirely for a bare `startPermissionAnswerLoop` with
+   * no watch wired in — every such caller's answers are `trigger: "sweep"`
+   * with no `latencyMs`, unchanged from before this ticket. Consuming a
+   * pane's entry on every scan (not only on `answered`) matters: a `skipped`
+   * or `failed` outcome leaves the pane still blocked, and a STALE trigger
+   * instant left in the map would silently understate a LATER tick's real
+   * latency for the same pane once it does get answered.
+   */
+  fastPathTriggers?: Map<string, number>;
+  /**
+   * Monotonic clock (never wall-clock — see `AnswerLatency`'s own doc
+   * comment for why) used both to record a fast-path trigger instant
+   * (`permission-answer-watch.ts`) and to compute `latencyMs` here. Test
+   * seam; defaults to the real `performance.now`. The SAME function must be
+   * used by both call sites for a latency number to mean anything — sharing
+   * one `deps` object (as `PermissionAnswerWatchDeps extends
+   * PermissionAnswerLoopDeps` already does) is what guarantees that.
+   */
+  now?: () => number;
+  /** Test seam: how a latency audit line is appended. Defaults to the real filesystem (`mkdir` + `appendFile`, same shape as `@brooswit/drovr`'s own `defaultDeps.appendAudit`). */
+  appendAudit?: (path: string, line: string) => Promise<void>;
 }
 
 /**
@@ -265,12 +337,47 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
       ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
     });
     const label = (paneId: string) => labels.get(paneId) ?? paneId;
+    const now = deps.now ?? (() => performance.now());
+    // FACTORY-145: consume (read, then delete) every scanned pane's own
+    // fast-path trigger instant, whether or not it ends up `answered` — see
+    // `fastPathTriggers`'s own doc comment on `PermissionAnswerLoopDeps` for
+    // why a `skipped`/`failed` outcome must not leave a stale one behind.
+    const triggeredAt = new Map<string, number>();
+    if (deps.fastPathTriggers) {
+      for (const id of labels.keys()) {
+        const t = deps.fastPathTriggers.get(id);
+        if (t !== undefined) {
+          triggeredAt.set(id, t);
+          deps.fastPathTriggers.delete(id);
+        }
+      }
+    }
+    const latencyOf = (paneId: string): AnswerLatency => {
+      const t = triggeredAt.get(paneId);
+      return t === undefined ? { trigger: "sweep" } : { trigger: "fast", latencyMs: Math.max(0, Math.round(now() - t)) };
+    };
     const answered = results.filter((r) => r.outcome === "answered");
     const failed = results.filter((r) => r.outcome === "failed");
     if (answered.length || failed.length) {
       log(`[permission-answer] ${answered.length} answered, ${results.length - answered.length - failed.length} skipped, ${failed.length} failed`);
       for (const a of answered) {
-        log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}" (see ${deps.auditPath})`);
+        const { trigger, latencyMs } = latencyOf(a.paneId);
+        const latencySuffix = latencyMs !== undefined ? `, ${trigger}, ${latencyMs}ms` : `, ${trigger}`;
+        log(`[permission-answer] ${label(a.paneId)} (${a.paneId}) answered: ${a.tool} — "${a.request.replace(/\n/g, " ").slice(0, 120)}"${latencySuffix} (see ${deps.auditPath})`);
+        const auditLine = JSON.stringify({
+          ts: new Date().toISOString(),
+          paneId: a.paneId,
+          label: label(a.paneId),
+          tool: a.tool,
+          request: a.request.slice(0, 500),
+          trigger,
+          ...(latencyMs !== undefined ? { latencyMs } : {}),
+        }) + "\n";
+        try {
+          await (deps.appendAudit ?? appendAuditLine)(deps.auditPath, auditLine);
+        } catch (e) {
+          log(`[permission-answer] latency audit write failed for ${a.paneId}: ${(e as Error)?.message ?? e}`);
+        }
         try { deps.onApproved?.(); } catch { /* FACTORY-100/FACTORY-103: a sound-notification failure must never affect this tick's own outcome */ }
       }
       for (const f of failed) log(`[permission-answer] ${label(f.paneId)} (${f.paneId}) failed: ${f.reason} — ${f.detail}`);
