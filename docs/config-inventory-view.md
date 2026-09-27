@@ -244,10 +244,22 @@ row STALE in its own right.
 
 ## Coping with an evolving inventory shape
 
-Per this ticket's own note (FACTORY-74 may change managed-session `tier`'s
-shape): `tier`/`vendor` are rendered as `String(value)`, never assumed to be
-one of today's known enum values — an unexpected future shape renders as
-whatever value is present rather than hard-failing.
+FACTORY-74 has since merged: a managed-session definition now carries either
+a deprecated `tier` or the two-axis `modelPower`/`effort`, and
+`SessionDefinitionInventoryEntry` additionally carries the resolved
+effective `resolvedModel`/`resolvedEffort` (via `effectiveAgent()`,
+`../resources/session-definition.ts`) — see FACTORY-120. `tier`/`vendor` are
+still rendered as `String(value)`, never assumed to be one of today's known
+enum values — an unexpected future shape renders as whatever value is
+present rather than hard-failing. A `tier`-based definition keeps rendering
+`vendor/tier` and additionally shows its resolved model plus the honest "no
+effort set — launch default applies" wording (`effectiveAgent()` deliberately
+returns no effort for a tier-based definition, by design, not a gap); a
+two-axis definition shows its resolved model/effort plus the raw
+`modelPower`/`effort` integers as secondary detail, and never the old
+`vendor/?` placeholder. An INVALID definition's resolved fields are absent
+(NOT-APPLICABLE), never computed — calling `effectiveAgent()` on one would
+throw.
 
 ## Known limit: two session definitions sharing an `agentKey`
 

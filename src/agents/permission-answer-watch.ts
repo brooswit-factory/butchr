@@ -132,9 +132,19 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
   // reads, and never schedules its own reconnect.
   let generation = 0;
 
+  // FACTORY-145: `pane_id -> the monotonic instant its own `blocked` push
+  // frame was received`, consumed (deleted) by `runPermissionAnswerTick`
+  // itself once it scans that pane — see `PermissionAnswerLoopDeps.fastPathTriggers`'s
+  // own doc comment. Own map per watch instance, sharing `deps.now` with the
+  // tick so both sides of a latency measurement use the same clock.
+  const fastPathTriggers = deps.fastPathTriggers ?? new Map<string, number>();
+  const now = deps.now ?? (() => performance.now());
+
   const tickDeps: PermissionAnswerLoopDeps = {
     ...deps,
     loggedSkips: deps.loggedSkips ?? new Set<string>(),
+    fastPathTriggers,
+    now,
     onEligiblePaneIds: (paneIds) => {
       deps.onEligiblePaneIds?.(paneIds);
       if (!sameIds(paneIds, currentPaneIds)) resubscribe(paneIds);
@@ -167,7 +177,18 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
     try {
       for await (const frame of sub) {
         if (gen !== generation) break;
-        if (frame.data.agent_status === "blocked") fire();
+        if (frame.data.agent_status === "blocked") {
+          // FACTORY-145: the trigger instant IS frame receipt, not whatever
+          // instant herdr itself observed the transition — see
+          // `AnswerLatency`'s own doc comment (permission-answer-loop.ts) for
+          // why that's the honest thing to name it. Set only if absent: a
+          // pane already carrying an unconsumed trigger (a second `blocked`
+          // frame before the tick it caused has even run) keeps its
+          // EARLIER instant, so latency is never understated by a later
+          // frame overwriting it.
+          if (!fastPathTriggers.has(frame.data.pane_id)) fastPathTriggers.set(frame.data.pane_id, now());
+          fire();
+        }
       }
     } catch (e) {
       if (gen === generation) log(`[permission-answer] watch subscription errored: ${(e as Error)?.message ?? e}`);

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder } from "../../src/agents/argv.js";
+import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
+import { SESSION_PERMISSION_MODES } from "../../src/resources/session-definition.js";
+import { RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
 
 const spec = { key: "KAN-783", issuetype: "Task", summary: "s", parent: null };
@@ -15,19 +17,31 @@ describe("spawnArgs", () => {
     expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
     expect(providerOrder({ provider: "agy", providers: ["claude", "agy"], roleProviders: { task: ["agy", "codex"] } }, "Task")).toEqual(["agy", "codex"]);
   });
-  test("builds the full flag set, kickoff positional first", () => {
+  test("FACTORY-138: a spec with no permissionMode gets butchr's own default, acceptEdits, in the built argv — not Drovr's bypassPermissions fallback", () => {
     const args = spawnArgs(spec, "/w/KAN-783");
     expect(args[0]).toBe("follow your CLAUDE.md");
     expect(args).toEqual([
       "follow your CLAUDE.md",
       "--model", "sonnet",
       "--effort", "high",
-      "--permission-mode", "bypassPermissions",
+      "--permission-mode", DEFAULT_PERMISSION_MODE,
       "--mcp-config", "/w/KAN-783/mcp.json",
       // drovr >= 0.10 joins each channel onto its flag with "=": a separate
       // "server:x" value could be swallowed as a user turn.
       "--dangerously-load-development-channels=server:butchr",
     ]);
+    expect(DEFAULT_PERMISSION_MODE).toBe("acceptEdits");
+  });
+
+  test("FACTORY-138 (AC3): every explicit value in BOTH exported permission-mode unions still wins over the new default", () => {
+    for (const mode of SESSION_PERMISSION_MODES) {
+      const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783");
+      expect(args[args.indexOf("--permission-mode") + 1]).toBe(mode);
+    }
+    for (const mode of RULE_PERMISSION_MODES) {
+      const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783");
+      expect(args[args.indexOf("--permission-mode") + 1]).toBe(mode);
+    }
   });
 
   test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig produces --strict-mcp-config in a Claude launch's argv; absent produces no such flag", () => {
@@ -36,7 +50,7 @@ describe("spawnArgs", () => {
       "follow your CLAUDE.md",
       "--model", "sonnet",
       "--effort", "high",
-      "--permission-mode", "bypassPermissions",
+      "--permission-mode", DEFAULT_PERMISSION_MODE,
       "--mcp-config", "/w/KAN-783/mcp.json",
       "--strict-mcp-config",
       "--dangerously-load-development-channels=server:butchr",
@@ -128,10 +142,28 @@ describe("checkArgv", () => {
     const check = checkArgv(expected, observed);
     expect(check.ok).toBe(false);
     if (!check.ok) {
-      expect(check.reason).toContain("--permission-mode bypassPermissions");
+      expect(check.reason).toContain(`--permission-mode ${DEFAULT_PERMISSION_MODE}`);
       expect(check.reason).toContain("--mcp-config /w/KAN-783/mcp.json");
       expect(check.reason).toContain("--dangerously-load-development-channels server:butchr");
     }
+  });
+
+  // FACTORY-138 (AC4, the respawn-loop guard, part 2): the fleet as it
+  // existed BEFORE this ticket — every currently-running agent's argv
+  // carries Drovr's own bypassPermissions fallback, since butchr sent no
+  // --permission-mode flag at all. That value is now a real mismatch
+  // against a freshly-rebuilt expectation (acceptEdits), so it IS flagged
+  // stale exactly once — a deliberate one-time respawn at deploy, not a
+  // loop (see herd.test.ts's own AC4 pair, which proves a FRESH launch
+  // never re-reads as stale on a second poll).
+  test("FACTORY-138: a pre-change argv (--permission-mode bypassPermissions, no persisted mode) reads as stale against the new default", () => {
+    const expected = spawnArgs(spec, "/w/KAN-783");
+    const observed = spawnArgs(spec, "/w/KAN-783");
+    const i = observed.indexOf("--permission-mode");
+    observed[i + 1] = "bypassPermissions";
+    const check = checkArgv(expected, observed);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.reason).toContain(`--permission-mode ${DEFAULT_PERMISSION_MODE}`);
   });
 
   test("argv differing only in --model (and the kickoff positional) -> ok", () => {
@@ -288,11 +320,21 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
 });
 
 describe("project-manager Claude permissions", () => {
-  // No human answers a project manager's prompts; Claude's auto mode is the
-  // counterpart of the Codex launch's on-request + auto_review policy.
-  test("a jira-project Claude agent launches in auto permission mode", () => {
+  // FACTORY-129: the jira-project-only "auto" override is gone — a
+  // jira-project Claude agent with no explicit spec.permissionMode now gets
+  // butchr's ordinary default, acceptEdits, exactly like every other rule
+  // kind (safety for the dropped "auto" behaviour comes from lizard-mode
+  // eligibility, pinned separately in test/unit/permission-answer-loop.test.ts's
+  // parameterized "jira-project" case).
+  test("a jira-project Claude agent with no explicit permissionMode gets the ordinary acceptEdits default, not a jira-project-specific override", () => {
     const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
     const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe(DEFAULT_PERMISSION_MODE);
+  });
+
+  test("a jira-project rule's own explicit permissionMode still wins (FACTORY-87 no regression)", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "bypassPermissions" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
   });
 });

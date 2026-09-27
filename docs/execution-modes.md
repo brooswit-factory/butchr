@@ -106,17 +106,18 @@ other and of every other field):
 | `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent (Drovr's own default, `bypassPermissions`, applies) | yes — `SpawnSpec.permissionMode` |
 | `lizardMode` | boolean | absent/`false` | no — daemon-side only |
 
-**What they do.** The operator's own name (FACTORY-67) for pairing
-`permissionMode: "default"` (Claude's manual/ask mode — a prompt before every
-tool call) with `lizardMode: true`: the daemon's standalone permission-answer
-timer (`src/agents/permission-answer-loop.ts`, see
-`docs/permission-answer-loop.md` for exactly which option it presses and how
-that is logged — deliberately not restated here, since it is drovr's own
-answering policy, not this field's concern) then answers an unambiguous
-tool-permission dialog for every agent this rule launches, so manual mode's
-own safety never means an agent frozen on that one dialog for hours. Either
-field may be set without the other — they are independent — but this pairing
-is the combination the mechanism exists for.
+**What they do.** `lizardMode: true` is the operator's own name (FACTORY-67)
+for turning on the daemon's standalone permission-answer timer
+(`src/agents/permission-answer-loop.ts`, see `docs/permission-answer-loop.md`
+for exactly which option it presses and how that is logged — deliberately
+not restated here, since it is drovr's own answering policy, not this
+field's concern) for every agent this rule launches: it answers an
+unambiguous tool-permission dialog so that agent never sits frozen on that
+one dialog for hours. It is a separate toggle from `permissionMode`, not
+tied to one value of it — it pairs with any `permissionMode` that still
+prompts before a tool call (`"default"` included, but not only that one),
+so the paired mode's own safety holds for every OTHER prompt it still
+shows. Either field may be set without the other — they are independent.
 DROVR-42 shipped the identical pair of concepts (`SessionDefinition.permissionMode`/
 `.lizardMode`) for managed-session definitions first; this is the rule-side
 extension, reusing the SAME daemon timer rather than a second one.
@@ -130,11 +131,13 @@ persist-at-spawn/read-back stale-argv pair FACTORY-43 built for this field
 `HerdrHerd.staleIssues()`) was never managed-session-specific — it already
 operates on `spec.permissionMode` for any spawn, so a rule-launched agent's
 `permissionMode` gets the same stale-argv safety with zero changes to that
-layer. Absent means today's behaviour exactly, for every provider — including
-`jira-project`, whose own unconditional `permissionMode: "auto"` default
-(`agentLaunchConfig`, src/agents/argv.ts) is set BEFORE `spec.permissionMode`'s
-own spread and so is overridden by this field only when a `jira-project` rule
-sets it.
+layer. Absent means today's behaviour exactly, for every provider, `jira-project`
+included (FACTORY-129): a jira-project agent with no explicit `permissionMode`
+now gets butchr's ordinary default (`DEFAULT_PERMISSION_MODE`,
+`agentLaunchConfig`, src/agents/argv.ts) exactly like every other rule kind —
+the jira-project-only `"auto"` override this paragraph used to describe is
+gone. Safety for that change comes from lizard-mode eligibility, not a
+special-cased permission mode; see the next section.
 
 **`lizardMode` never reaches argv — same design as `SessionDefinition.lizardMode`,
 and mostly plumbing to reuse.** It is resolved live, not persisted: the

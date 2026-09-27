@@ -15,6 +15,7 @@ import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 import { sessionAgentKey } from "../../src/resources/session-freeze.js";
+import { effectiveAgent } from "../../src/resources/session-definition.js";
 
 // ---- fixtures --------------------------------------------------------
 
@@ -342,6 +343,99 @@ describe("buildQueryAgentInventory — session-definitions section (FACTORY-72)"
     expect(inventory.errors.some((e) => e.path === "/defs/nested-archive")).toBe(true);
     // The active directory's own good entry still comes through — one bad directory must not hide it.
     expect(inventory.sessionDefinitions.some((e) => e.name === "a.json" && e.valid)).toBe(true);
+  });
+});
+
+// ---- buildQueryAgentInventory: resolved model/effort (FACTORY-120) -----
+
+describe("buildQueryAgentInventory — resolved model/effort (FACTORY-120)", () => {
+  test("a modelPower/effort (two-axis) definition's resolved model/effort equal effectiveAgent()'s own return, with a literal spot-check against power-scale.ts's own table", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({
+      [activeDir]: { "/defs/two-axis.json": goodDefinition({ tier: undefined, modelPower: 70, effort: 65 }) },
+    });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: noRulesFile,
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const entry = inventory.sessionDefinitions.find((e) => e.name === "two-axis.json")!;
+    expect(entry.valid).toBe(true);
+    // Raw fields (already shipped, pre-FACTORY-120) are untouched.
+    expect(entry.modelPower).toBe(70);
+    expect(entry.effort).toBe(65);
+    // Reuses effectiveAgent() verbatim — never a second, independently-recomputed resolution.
+    const expected = effectiveAgent({ vendor: "claude", modelPower: 70, effort: 65 });
+    expect(entry.resolvedModel).toBe(expected.model);
+    expect(entry.resolvedEffort).toBe(expected.effort);
+    // Literal spot-check taken directly from power-scale.ts's own tables on this checkout:
+    // CLAUDE_MODEL_POWER_TABLE's 60-84 band is "opus"; EFFORT_TABLE's 60-79 band is "xhigh".
+    expect(entry.resolvedModel).toBe("opus");
+    expect(entry.resolvedEffort).toBe("xhigh");
+  });
+
+  test("a tier-based (deprecated) definition's resolved model equals effectiveAgent()'s own return, with NO resolved effort — by design, not a gap", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({
+      [activeDir]: { "/defs/tier-based.json": goodDefinition({ tier: "tier4" }) },
+    });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: noRulesFile,
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const entry = inventory.sessionDefinitions.find((e) => e.name === "tier-based.json")!;
+    expect(entry.valid).toBe(true);
+    expect(entry.tier).toBe("tier4");
+    const expected = effectiveAgent({ vendor: "claude", tier: "tier4" });
+    expect(entry.resolvedModel).toBe(expected.model);
+    expect(expected.effort).toBeUndefined();
+    // Literal spot-check from session-definition.ts's own CLAUDE_TIER_MODEL table: tier4 -> opus.
+    expect(entry.resolvedModel).toBe("opus");
+    expect(entry.resolvedEffort).toBeUndefined();
+  });
+
+  test("an INVALID definition never crashes buildQueryAgentInventory, and carries no resolved model/effort — calling effectiveAgent() on it would throw, so it must never be called here", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/bad-two-axis.json": "not json at all" } });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: noRulesFile,
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const entry = inventory.sessionDefinitions.find((e) => e.name === "bad-two-axis.json")!;
+    expect(entry.valid).toBe(false);
+    expect(entry.resolvedModel).toBeUndefined();
+    expect(entry.resolvedEffort).toBeUndefined();
+  });
+
+  test("a rule agentPreferences entry expressed via modelPower/effortPower, loaded through the REAL rules-file parse path, shows the resolved model/effort in the inventory", async () => {
+    const rulesJson = JSON.stringify({
+      rules: [
+        {
+          id: "power-rule", resourceProvider: "jira-work", query: "q", brief: "A real brief sentence.",
+          agentPreferences: [{ harness: "claude", modelPower: 95, effortPower: 10 }],
+        },
+      ],
+    });
+    const rulesFile = loadRulesFileState({ BUTCHR_RULES_FILE: "/config/rules.json" }, () => rulesJson);
+    expect(rulesFile.error).toBeNull(); // sanity: the fixture itself parses cleanly.
+    const inventory = await buildQueryAgentInventory({
+      rulesFile,
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    const entry = inventory.rules.find((r) => r.id === "power-rule")!;
+    // Resolved ONCE at rules-load time (parsePreferences, src/rules/rules.ts) — this module
+    // copies the already-resolved value verbatim; the raw modelPower/effortPower are dropped
+    // there and never reach this inventory (out of scope for FACTORY-120, see the ticket).
+    // Literal spot-check from power-scale.ts's own tables: modelPower 95 -> "fable" (85-100
+    // band), effortPower 10 -> "low" (0-19 band).
+    expect(entry.agentPreferences).toEqual([{ harness: "claude", model: "fable", effort: "low" }]);
   });
 });
 

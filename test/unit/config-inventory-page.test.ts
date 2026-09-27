@@ -93,7 +93,10 @@ describe("renderConfigInventory — rules table (FACTORY-81 requirement 1)", () 
     expect(row).toContain("jira-idea");
     expect(row).toContain("project = IDEAS");
     expect(row).toContain("swarm");
-    expect(row).toContain("claude/opus/high");
+    // FACTORY-120: format changed from the old compact "claude/opus/high (model/effort
+    // stand in for tier)" slug (stale wording, predates FACTORY-74) to a resolved-value
+    // label — still pinning the same harness/model/effort values, just spelled out.
+    expect(row).toContain("claude — Model: opus · Effort: high");
     expect(row).toContain("linked-eventing: on");
     expect(row).toContain(">staffed<");
     expect(row).not.toContain("UNSTAFFED");
@@ -431,6 +434,90 @@ describe("renderConfigInventory — the epic's own verification scenario, end to
     // The one load error is shown prominently, with its real path.
     expect(html).toContain("1 configuration load/parse error(s)");
     expect(html).toContain("/defs/repo-d.json");
+  });
+});
+
+// ---- resolved model/effort (FACTORY-120) -----------------------------------
+
+describe("renderConfigInventory — resolved model/effort (FACTORY-120)", () => {
+  test("a modelPower/effort (two-axis) definition shows the resolved model/effort labels, the raw values as secondary detail, and never the old 'vendor/?' placeholder", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({
+      [activeDir]: { "/defs/two-axis.json": goodDefinition({ tier: undefined, modelPower: 70, effort: 65 }) },
+    });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [], error: null },
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    const row = rowSlice(html, "two-axis.json");
+    // Literal values: CLAUDE_MODEL_POWER_TABLE's 60-84 band is "opus", EFFORT_TABLE's 60-79 band is "xhigh" (power-scale.ts).
+    expect(row).toContain("Model: opus · Effort: xhigh");
+    expect(row).toContain("raw: modelPower 70, effort 65");
+    expect(row).not.toContain("claude/?");
+  });
+
+  test("a tier-based (deprecated) definition keeps its vendor/tier display, and additionally shows its resolved model plus the honest 'no effort set' wording — a known fact, never an em-dash", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({
+      [activeDir]: { "/defs/tier-based.json": goodDefinition({ tier: "tier4" }) },
+    });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [], error: null },
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    const row = rowSlice(html, "tier-based.json");
+    expect(row).toContain("claude/tier4"); // vendor/tier display, unchanged
+    expect(row).toContain("Model: opus"); // literal spot-check: CLAUDE_TIER_MODEL.tier4 -> opus
+    expect(row).toContain("no effort set");
+  });
+
+  test("an INVALID definition's resolved-model/effort span never shows a Model:/Effort: value — same not-applicable discipline as its other content fields, and no crash", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/bad.json": "not json at all" } });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [], error: null },
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    const row = rowSlice(html, "bad.json");
+    expect(row).toContain('<span class="resolvedagent">');
+    expect(row).not.toContain("Model:");
+    expect(row).not.toContain("Effort:");
+  });
+
+  test("a rule preference with a resolved model/effort renders labeled values, never the stale '(model/effort stand in for tier)' caption", async () => {
+    const r = rule({ id: "labeled-pref", resourceProvider: "jira-work", agentPreferences: [{ harness: "codex", model: "gpt-6-astra", effort: "max" }] });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    const row = rowSlice(html, "labeled-pref");
+    expect(row).toContain("codex — Model: gpt-6-astra · Effort: max");
+    expect(html).not.toContain("stand in for tier");
+  });
+
+  test("a rule preference with no model/effort set (uses butchr's global config) renders 'default' for both — never blank, never a made-up value", async () => {
+    const r = rule({ id: "bare-pref", resourceProvider: "jira-work", agentPreferences: [{ harness: "codex" }] });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: checkedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    const row = rowSlice(html, "bare-pref");
+    expect(row).toContain("codex — Model: default · Effort: default");
   });
 });
 
