@@ -108,11 +108,9 @@ describe("findPackageRoot / resolveDrovrBundledAsset", () => {
   // FACTORY-100 test (i), REAL-PACKAGE GUARD (deliberate): resolves the ACTUALLY installed
   // @brooswit/drovr and asserts the bundled asset exists — goes red the moment the pinned
   // version lacks assets/sounds/lizard-button.mp3 (e.g. a re-pin to a release cut without it,
-  // a live risk since FACTORY-106 also re-pins drovr). SKIPPED: the drovr release with the
-  // asset does not exist yet (FACTORY-122). The director will tell_worker the tarball URL when
-  // it publishes; do not guess it. Un-skip once package.json/bun.lock are bumped to that
-  // release — required green before this PR merges (see the ticket's own sequencing note).
-  test.skip("REAL-PACKAGE GUARD: the installed @brooswit/drovr ships assets/sounds/lizard-button.mp3", () => {
+  // a live risk since FACTORY-106 also re-pins drovr). Un-skipped now that package.json/bun.lock
+  // are bumped to drovr v0.15.2, which ships the asset (FACTORY-122).
+  test("REAL-PACKAGE GUARD: the installed @brooswit/drovr ships assets/sounds/lizard-button.mp3", () => {
     const assetPath = resolveDrovrBundledAsset();
     expect(assetPath).not.toBeNull();
     expect(existsSync(assetPath!)).toBe(true);
