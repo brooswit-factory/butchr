@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import type { AgentConfig, AgentProvider } from "./argv.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
 import CLAUDE_MD from "../../briefs/CLAUDE.md" with { type: "text" };
@@ -348,7 +349,7 @@ export function assertNoInheritedMcpConfig(dir: string): void {
   }
 }
 
-export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
+export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = [], keepSessionId = false): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
   // operator's own project directory. `spec.cwd`, when present, only ever
@@ -389,6 +390,25 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   const launchPreference = spec.agents?.find((p) => p.harness === provider);
   if (launchPreference?.model !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-model.json"),JSON.stringify(launchPreference.model)); }
   if (launchPreference?.effort !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-effort.json"),JSON.stringify(launchPreference.effort)); }
+  // FACTORY-314: Claude's own native session id, minted by BUTCHR (never
+  // read back from Claude or from herdr — herdr's `agent_session` is never
+  // populated for a butchr-launched claude pane, since nothing here calls
+  // `pane.report_agent_session`) so a later model/effort-only change can
+  // relaunch this SAME conversation with `--resume <id>` instead of losing
+  // it. `keepSessionId` is `true` for EXACTLY ONE caller —
+  // `HerdrHerd.resumeInPlace()`'s own post-success re-persist of the new
+  // model/effort — which must NOT mint a second id out from under the
+  // conversation it just resumed. EVERY OTHER caller (every ordinary fresh
+  // spawn, ordinary OR the stop-then-fresh-spawn fallback for a NON-resumable
+  // stale reason) always mints and OVERWRITES with a brand-new id: a fresh
+  // Claude Code session must never be launched with `--session-id` pointing
+  // at a PREVIOUS, now-abandoned conversation's id — see
+  // "fresh spawn never resumes a stale id" in test/unit/workspace.test.ts.
+  // Claude only — Codex/AGY have no resume mechanism this ticket touches.
+  if (provider === "claude" && !(keepSessionId && existsSync(join(dir, ".butchr-session-id.json")))) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify(randomUUID()));
+  }
   // Templates always see the RESOURCE as {{KEY}} — the agent's ticket, not its herd identity.
   const view: SpawnSpec = { ...spec, key: resource };
   mkdirSync(dir, { recursive: true });
@@ -693,5 +713,20 @@ export function workspaceModel(dir: string): string | undefined {
 /** Same shape as `workspaceModel` immediately above, for the effort this workspace was ACTUALLY launched with (`.butchr-effort.json`). */
 export function workspaceEffort(dir: string): AgentPreference["effort"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-effort.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-314 — this workspace's own butchr-minted Claude session id
+ * (`.butchr-session-id.json`, `buildWorkspace`), the SAME id a fresh launch
+ * passed as `--session-id` and a later in-place resume passes as `--resume`
+ * — never re-derived from herdr or from Claude's own transcript directory
+ * (see `buildWorkspace`'s own doc comment for why). `undefined` for a
+ * workspace spawned by a build before this ticket, or for a non-Claude
+ * provider — both mean "no known session id", the same fail-safe shape
+ * `workspaceModel`/`workspaceEffort` already use for their own missing file.
+ */
+export function workspaceSessionId(dir: string): string | undefined {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-session-id.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }

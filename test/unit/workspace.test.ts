@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } 
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 
@@ -790,6 +790,85 @@ describe("buildWorkspace", () => {
       expect(workspaceEffort(dir)).toBeUndefined();
       expect(workspaceModel("/does/not/exist")).toBeUndefined();
       expect(workspaceEffort("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-314: a Claude launch mints and persists its OWN session id,
+  // never re-derived from herdr or Claude's own transcript directory — see
+  // this field's own doc comment (src/agents/workspace.ts) for why.
+  test("buildWorkspace mints a fresh Claude session id on first launch, and workspaceSessionId reads it back", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-session-id-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-10", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "claude");
+      const id = workspaceSessionId(dir);
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-312 review (26137, point 3): every ORDINARY (fresh) call always
+  // mints and OVERWRITES with a brand-new session id — a fresh Claude Code
+  // session must never be launched with `--session-id` pointing at a
+  // PREVIOUS, now-abandoned conversation's id. `keepSessionId: true` is the
+  // one, narrow exception (`HerdrHerd.resumeInPlace()`'s own post-success
+  // re-persist, never called for an ordinary spawn).
+  test("buildWorkspace mints a FRESH session id on every ordinary (default keepSessionId) call — a stale id from a previous session is never resumed after a fresh restart", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-session-id-fresh-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const spec: SpawnSpec = { key: "KAN-11", issuetype: "Task", summary: "s", parent: null };
+      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
+      const first = workspaceSessionId(dir);
+      // Simulates: agent stopped (a non-resumable stale reason, or any
+      // ordinary stop), then a fresh spawn — the ordinary path, no
+      // keepSessionId — for the SAME issue/workspace.
+      buildWorkspace(spec, "http://x/mcp", "claude");
+      const second = workspaceSessionId(dir);
+      expect(second).toBeTruthy();
+      expect(second).not.toBe(first); // never the old, now-abandoned conversation's id
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("buildWorkspace with keepSessionId:true preserves an existing session id across repeated calls — the ONE exception, used only by resumeInPlace's own post-success re-persist", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-session-id-keep-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const spec: SpawnSpec = { key: "KAN-11", issuetype: "Task", summary: "s", parent: null };
+      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
+      const first = workspaceSessionId(dir);
+      buildWorkspace(spec, "http://x/mcp", "claude", [], true);
+      buildWorkspace(spec, "http://x/mcp", "claude", [], true);
+      expect(workspaceSessionId(dir)).toBe(first);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceSessionId is undefined for a non-Claude launch and for a workspace with no persisted id at all — never throws", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-session-id-none-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const codexDir = buildWorkspace({ key: "KAN-12", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "codex");
+      expect(workspaceSessionId(codexDir)).toBeUndefined();
+      expect(workspaceSessionId("/does/not/exist")).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

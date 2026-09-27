@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd } from "../../src/daemon/loop.js";
+import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd, ResumeDeferGuard, RESUME_WAITING_NOTICE_AT_POLLS } from "../../src/daemon/loop.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
 import { agentFoldSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
@@ -2182,5 +2182,124 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
     stop();
     expect(calls).toBeGreaterThan(1); // kept polling despite the rejection
     expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkParked's internal errors
+  });
+});
+
+describe("reconcileNow: FACTORY-314 resumeInPlace routing", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task" as const, summary: "s", parent: null });
+
+  function fakeResumableHerd(
+    initial: string[],
+    stale: Array<{ issue: string; reason: string; observedArgv: string[]; resumable?: boolean }>,
+    outcomes: Record<string, Array<"resumed" | "deferred" | "stuck" | "unresumable">>,
+  ) {
+    const running = new Set(initial);
+    const spawned: string[] = [], stopped: string[] = [], resumeCalls: string[] = [];
+    const queues = new Map<string, Array<"resumed" | "deferred" | "stuck" | "unresumable">>(Object.entries(outcomes).map(([k, v]) => [k, [...v]]));
+    const herd: Herd & { spawned: string[]; stopped: string[]; running: Set<string>; resumeCalls: string[] } = {
+      running, spawned, stopped, resumeCalls,
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
+      async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
+      async stop(i) { stopped.push(i); running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+      async resumeInPlace(sp) {
+        resumeCalls.push(sp.key);
+        const q = queues.get(sp.key);
+        if (!q || !q.length) return "unresumable";
+        return q.length > 1 ? q.shift()! : q[0]!;
+      },
+    };
+    return herd;
+  }
+
+  test("resumed: no stop, no spawn, no onRespawn — only onResumePreserved fires", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "argv lacks --model/--effort matching the current definition/rule", observedArgv: [], resumable: true }], { R: ["resumed"] });
+    const respawns: string[] = []; const preserved: string[] = [];
+    await reconcileNow(herd, new Map([["R", spec("R")]]), {
+      onRespawn: (i) => { respawns.push(i); },
+      onResumePreserved: (i) => { preserved.push(i); },
+    });
+    expect(herd.stopped).toEqual([]);
+    expect(herd.spawned).toEqual([]);
+    expect(respawns).toEqual([]);
+    expect(preserved).toEqual(["R"]);
+  });
+
+  test("unresumable: falls through to today's stop-then-fresh-spawn, with the reason overridden to an honest 'session lost' explanation — onResumePreserved never fires", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "argv lacks --model/--effort matching the current definition/rule", observedArgv: ["claude"], resumable: true }], { R: ["unresumable"] });
+    const respawns: Array<{ issue: string; reason: string }> = []; const preserved: string[] = [];
+    await reconcileNow(herd, new Map([["R", spec("R")]]), {
+      onRespawn: (issue, reason) => { respawns.push({ issue, reason }); },
+      onResumePreserved: (i) => { preserved.push(i); },
+    });
+    expect(herd.stopped).toEqual(["R"]);
+    expect(herd.spawned).toEqual(["R"]);
+    expect(preserved).toEqual([]);
+    expect(respawns).toEqual([{ issue: "R", reason: "session lost: session id could not be determined" }]);
+  });
+
+  test("deferred: never stops, never spawns, never consumes RespawnGuard admission — a resumable issue can be 'deferred' every poll indefinitely with no suppression warning ever firing", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "argv lacks --model/--effort matching the current definition/rule", observedArgv: [], resumable: true }], { R: ["deferred"] });
+    const guard = new RespawnGuard();
+    const suppressed: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      await reconcileNow(herd, new Map([["R", spec("R")]]), { guard, onSuppressed: (issue) => suppressed.push(issue) });
+    }
+    expect(herd.stopped).toEqual([]);
+    expect(herd.spawned).toEqual([]);
+    expect(suppressed).toEqual([]); // the storm guard never even gets consulted on this path
+  });
+
+  test("deferred/stuck: onResumeWaiting fires exactly ONCE, at the configured consecutive-poll threshold — not before, not on every later poll", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "x", observedArgv: [], resumable: true }], { R: ["deferred"] });
+    const waiting: Array<{ issue: string; outcome: string; count: number }> = [];
+    const resumeDeferGuard = new ResumeDeferGuard(); // persistent across polls, same as production's per-loop instance
+    for (let i = 0; i < RESUME_WAITING_NOTICE_AT_POLLS + 5; i++) {
+      await reconcileNow(herd, new Map([["R", spec("R")]]), {
+        resumeDeferGuard,
+        onResumeWaiting: (issue, outcome, count) => { waiting.push({ issue, outcome, count }); },
+      });
+    }
+    expect(waiting).toEqual([{ issue: "R", outcome: "deferred", count: RESUME_WAITING_NOTICE_AT_POLLS }]);
+  });
+
+  test("a resumeInPlace that eventually succeeds resets the waiting streak — a later stuck/deferred run starts counting from zero again", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "x", observedArgv: [], resumable: true }], { R: ["deferred", "resumed"] });
+    const waiting: number[] = []; const preserved: string[] = [];
+    const resumeDeferGuard = new ResumeDeferGuard();
+    // Poll 1: deferred (count 1, well under the notice threshold).
+    await reconcileNow(herd, new Map([["R", spec("R")]]), { resumeDeferGuard, onResumeWaiting: (_i, _o, c) => { waiting.push(c); } });
+    // Poll 2: resumed — clears the streak.
+    await reconcileNow(herd, new Map([["R", spec("R")]]), { resumeDeferGuard, onResumePreserved: (i) => { preserved.push(i); } });
+    expect(waiting).toEqual([]);
+    expect(preserved).toEqual(["R"]);
+  });
+
+  test("resumeInPlace throwing is isolated exactly like a failed herd.spawn/stop — recorded as a 'respawn'-stage failure, no onRespawn/onResumePreserved, no stop/spawn attempted", async () => {
+    const herd = fakeResumableHerd(["R"], [{ issue: "R", reason: "x", observedArgv: [], resumable: true }], {});
+    herd.resumeInPlace = async () => { throw new Error("herdr hiccup"); };
+    const failures: unknown[] = []; const respawns: string[] = []; const preserved: string[] = [];
+    await reconcileNow(herd, new Map([["R", spec("R")]]), {
+      onRespawn: (i) => { respawns.push(i); },
+      onResumePreserved: (i) => { preserved.push(i); },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(herd.stopped).toEqual([]);
+    expect(herd.spawned).toEqual([]);
+    expect(respawns).toEqual([]);
+    expect(preserved).toEqual([]);
+    expect(failures).toEqual([{ id: "R", stage: "respawn", error: expect.any(Error) }]);
+  });
+
+  test("a non-resumable stale reason (resumable absent/false) is completely unaffected — today's stop-then-fresh-spawn, resumeInPlace never even called", async () => {
+    const herd = fakeResumableHerd(["S"], [{ issue: "S", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: [] }], { S: ["resumed"] });
+    const respawns: Array<{ issue: string; reason: string }> = [];
+    await reconcileNow(herd, new Map([["S", spec("S")]]), { onRespawn: (issue, reason) => { respawns.push({ issue, reason }); } });
+    expect(herd.resumeCalls).toEqual([]); // never consulted for a non-resumable reason
+    expect(herd.stopped).toEqual(["S"]);
+    expect(herd.spawned).toEqual(["S"]);
+    expect(respawns).toEqual([{ issue: "S", reason: "argv lacks --permission-mode bypassPermissions" }]);
   });
 });

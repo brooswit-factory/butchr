@@ -53,7 +53,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment } from "../agents/respawn.js";
+import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
@@ -1414,6 +1414,29 @@ runResourceLoop(ruleResourceType, {
     const issue = resourceKeyOf(agent);
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-314: a model/effort-only change resumed the SAME session —
+  // distinct marker/wording from `onRespawn` above (never "re-read your
+  // ticket"), same query-level-agent exclusion (no single ticket to post to).
+  onResumePreserved: async (agent) => {
+    console.error(`  [reconcile] ${agent} resumed in place (session preserved)`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, resumePreservedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-314: fires once (not per-poll) after RESUME_WAITING_NOTICE_AT_POLLS
+  // consecutive deferred/stuck polls — never a trigger to force a restart,
+  // only a heads-up that a model/effort change is still waiting.
+  onResumeWaiting: async (agent, outcome, consecutivePolls) => {
+    console.error(`  [reconcile] ${agent} resume still waiting after ${consecutivePolls} polls (${outcome})`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    const why = outcome === "deferred"
+      ? "it has stayed mid-turn across every poll since"
+      : "its pane never returned to a shell prompt after being asked to exit — it may need a human to look at it";
+    await ops.addComment(issue, `[butchr:resume] A model/effort change for ${agent} is still waiting to resume (checked ${consecutivePolls} polls ago and every poll since): ${why}. Nothing was interrupted; the daemon will keep retrying rather than force a restart.`).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume-waiting notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.

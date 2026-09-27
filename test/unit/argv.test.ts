@@ -296,3 +296,68 @@ describe("project-manager Claude permissions", () => {
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
   });
 });
+
+// FACTORY-314: `--session-id`/`--resume` — the ONE shared builder
+// (agentStartParams, spawnArgs, agentLaunchConfig) both a real launch and
+// staleIssues()'s own expected-argv comparison use — appends whichever flag
+// applies, since Drovr's own buildAgentStartParams (verified at the pinned
+// 0.15.1) has no concept of either.
+describe("agentStartParams — FACTORY-314 session id / resume", () => {
+  const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs");
+  const { tmpdir } = require("node:os") as typeof import("node:os");
+  const { join } = require("node:path") as typeof import("node:path");
+
+  function withDir<T>(fn: (dir: string) => T): T {
+    const dir = mkdtempSync(join(tmpdir(), "argv-session-id-"));
+    try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test("a fresh Claude launch appends --session-id when the workspace has one persisted", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("11111111-1111-1111-1111-111111111111"));
+      const args = spawnArgs(spec, dir);
+      expect(args).toEqual(expect.arrayContaining(["--session-id", "11111111-1111-1111-1111-111111111111"]));
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("a fresh Claude launch omits the flag entirely when no session id is persisted yet (a workspace from before this ticket, or the very first spawn before buildWorkspace has run)", () => {
+    withDir((dir) => {
+      mkdirSync(dir, { recursive: true });
+      const args = spawnArgs(spec, dir);
+      expect(args).not.toContain("--session-id");
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("agent.resumeSessionId set emits --resume instead of --session-id, even when a persisted id also exists (the persisted id itself, if consistent, or a caller-chosen one)", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" });
+      expect(args).toEqual(expect.arrayContaining(["--resume", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]));
+      expect(args).not.toContain("--session-id");
+    });
+  });
+
+  test("non-Claude providers never get either flag", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+      const args = spawnArgs(spec, dir, { provider: "agy" });
+      expect(args).not.toContain("--session-id");
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("a resumed launch still carries every OTHER flag a fresh launch has — DoD 1b", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("cccccccc-cccc-cccc-cccc-cccccccccccc"));
+      const fresh = spawnArgs(spec, dir);
+      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "cccccccc-cccc-cccc-cccc-cccccccccccc" });
+      for (const flag of ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels=server:butchr"]) {
+        expect(fresh).toContain(flag);
+        expect(resumed).toContain(flag);
+      }
+      expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
+    });
+  });
+});

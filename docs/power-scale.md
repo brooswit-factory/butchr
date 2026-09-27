@@ -197,6 +197,69 @@ failure shapes have their own dedicated regression test in
 `test/unit/herd.test.ts` (search for `FACTORY-75`), mirroring FACTORY-43's
 positive/negative pair pattern exactly.
 
+### FACTORY-314: "restart" became "resume" for Claude, same-session, same session id
+
+Everything above ("exactly one restart") described the ORIGINAL behaviour:
+`stop()` the agent, then `spawn()` it fresh — a brand-new Claude Code
+session with no memory of the interrupted one. That threw away real,
+sometimes long, conversations on every effort/model change, including a
+daemon restart that changed nothing on one axis (the observed `model: opus
+-> opus, effort: max -> medium` case that motivated this ticket). FACTORY-314
+replaces that ONE case — a Claude agent, currently alive, whose ONLY
+staleness is this model/effort comparison (`StaleAgent.resumable`, set only
+by the push site above and only for `provider === "claude"`) — with a
+same-pane, same-session-id relaunch instead:
+
+1. Every fresh Claude launch mints a `--session-id <uuid>` itself
+   (`crypto.randomUUID()`, `buildWorkspace()`) and persists it
+   (`.butchr-session-id.json`, `workspaceSessionId`) — Claude's own native
+   session identity, never re-derived from herdr (`agent_session` is never
+   populated for a butchr-launched pane — no code here calls
+   `pane.report_agent_session`) or from its transcript directory.
+2. `HerdrHerd.resumeInPlace()` (src/agents/herd.ts) — reached from
+   `reconcileNow`'s respawn loop (src/daemon/loop.ts) BEFORE the ordinary
+   `stop()`+`spawn()` path, and only for a `resumable` staleness — waits for
+   the agent to be idle/done (NEVER interrupts a turn: `"deferred"` if it's
+   mid-turn, retried next poll, no stop, no spawn), asks it to `/exit`,
+   confirms the pane's foreground is back to a shell (`"stuck"` and left
+   alone if it never is — never relaunched onto a stuck pane, never killed),
+   then relaunches on the exact SAME pane with `--resume <persisted-id>`
+   plus the NEW model/effort plus every other flag a fresh launch carries
+   (`--permission-mode`, `--mcp-config`, the development-channels flag) —
+   built by the SAME `agentStartParams()`/`spawnArgs()` a fresh launch uses,
+   so the FACTORY-43 launch/stale-check symmetry requirement holds by
+   construction. `buildWorkspace()` runs again as part of this, re-persisting
+   the new model/effort (the session id file is never overwritten), so the
+   very next poll's ordinary comparison above sees the new values and does
+   not flag this agent stale again.
+3. Deliberately NOT built on `ManagedHerdrLifecycle` (`@brooswit/drovr`,
+   pinned 0.15.1): that class's only "continue after a change" path
+   (`replacePaneId`, used by `HerdrHerd.recoverQuota()` for provider
+   fallback) always creates a brand-NEW pane/workspace and re-imports the
+   old conversation by replaying its transcript as one big synthetic prompt
+   — real, already-shipped plumbing, but a different session id and a
+   token-costly reimport, not a true resume. `resumeInPlace()` instead calls
+   the raw `agent.start` (via `startManagedAgent`, `@brooswit/drovr`)
+   directly against the EXISTING pane id, which a real herdr instance
+   confirmed accepts a native `--resume` relaunch cleanly (see this ticket's
+   own comment trail for the exact commands and evidence).
+4. `resumeInPlace()`/`spawn()` share the SAME per-issue exclusive queue
+   (`HerdrHerd`'s own `exclusive()`), so a reconcile poll landing DURING the
+   brief window where the pane shows a bare shell (between the `/exit` and
+   the relaunch) never races a concurrent ordinary spawn into
+   `ManagedHerdrLifecycle.start()` — the FACTORY-300 hazard (`this.active`
+   unresolvable, `HandoffBlocked("Current worker disappeared")`) that window
+   would otherwise risk. See `test/unit/herd.test.ts`'s own
+   `"FACTORY-300: a concurrent ordinary herd.spawn()..."` test.
+
+Every OTHER stale reason (a genuine argv-flag mismatch, a non-Claude
+provider, a workspace with no persisted session id yet — one-time at
+deploy) keeps the ORIGINAL stop-then-fresh-spawn behaviour, unchanged. The
+two outcomes are told apart in the ticket comment itself: a preserved
+resume never says "re-read your ticket" (`resumePreservedComment`,
+src/agents/respawn.ts); a genuine loss still does, with an honest reason
+(`respawnComment`).
+
 ## Back-compat: the deprecated `tier` field
 
 Existing `tier1`..`tier5` managed-session definitions (the 8 live codey

@@ -1,5 +1,5 @@
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, workspaceSessionId, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -13,7 +13,21 @@ import {
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
 export type AgentProvider = ManagedAgentProvider;
-export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string }
+export interface AgentConfig {
+  provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string;
+  /**
+   * FACTORY-314 — set ONLY by `HerdrHerd.resumeInPlace()` (src/agents/herd.ts)
+   * for a model/effort-only change on a still-alive Claude agent: the
+   * workspace's own persisted `.butchr-session-id.json` (`workspaceSessionId`,
+   * src/agents/workspace.ts), so `agentStartParams()` below emits
+   * `--resume <id>` instead of a fresh `--session-id <id>`. Absent for every
+   * other caller (an ordinary fresh spawn, and `staleIssues()`'s own
+   * expected-argv reconstruction), which is what keeps this a strict
+   * addition: nothing about today's launch or staleness comparison changes
+   * when this field is unset.
+   */
+  resumeSessionId?: string;
+}
 
 export function providerOrder(agent: AgentConfig, role: string): AgentProvider[] {
   return agent.roleProviders?.[role.toLowerCase() as "project" | "epic" | "story" | "task"] ?? agent.providers ?? [agent.provider];
@@ -194,12 +208,40 @@ export function agentLaunchConfig(
   };
 }
 
-/** Compatibility helper for argv inspection; lifecycle dispatches kickoff separately. */
+/**
+ * Compatibility helper for argv inspection; lifecycle dispatches kickoff
+ * separately.
+ *
+ * FACTORY-314: the ONE place `--session-id`/`--resume` is appended, for the
+ * SAME reason `spawnArgs`' own doc comment below gives for the rest of this
+ * function — Drovr's `buildAgentStartParams` (its compiled `agent-runtime.js`,
+ * verified at the pinned 0.15.1) has no concept of either flag, so this is
+ * butchr's own addition, made HERE so both the real launch (via this
+ * function, `HerdrHerd.spawnExclusive`'s `prepare()`/`resumeInPlace`) and the
+ * staleness comparison (`spawnArgs()` below, `staleIssues()`) see identical
+ * argv shapes for identical inputs — the FACTORY-43 symmetry requirement,
+ * satisfied by construction rather than by two builders happening to agree.
+ * `agent.resumeSessionId` set means a resume: `--resume <id>`. Unset means a
+ * fresh launch: `--session-id <id>` when this workspace already has one
+ * persisted (`workspaceSessionId`, src/agents/workspace.ts — written by
+ * `buildWorkspace()`, which always runs before this in the real launch path),
+ * omitted entirely for a non-Claude provider or a workspace with no
+ * persisted id yet (a build from before this ticket — a one-time gap, not a
+ * bug: `buildWorkspace()` mints one on this very launch, so the NEXT launch
+ * always finds it).
+ */
 export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
-  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
+  const params = buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
+  if (agent.provider === "claude") {
+    const sessionFlag = agent.resumeSessionId
+      ? ["--resume", agent.resumeSessionId]
+      : (() => { const id = workspaceSessionId(dir); return id ? ["--session-id", id] : []; })();
+    if (sessionFlag.length) params.args = [...(params.args ?? []), ...sessionFlag];
+  }
+  return params;
 }
 
 /**

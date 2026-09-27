@@ -6,7 +6,7 @@ import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
-import { buildWorkspace, workspaceDirFor, workspaceRoot } from "../../src/agents/workspace.js";
+import { buildWorkspace, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort } from "../../src/agents/workspace.js";
 import { spawnArgs } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
@@ -1746,5 +1746,181 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     await herd.relabelOwnedWorkspaces();
     expect(renamed).toEqual([{ workspace_id: "w-good", label: "FACTORY-1 · jira-work" }]);
     expect(lines.some((l) => l.includes(`WARNING: [relabel] ${bad}`))).toBe(true);
+  });
+});
+
+describe("resumeInPlace", () => {
+  const instant = () => Promise.resolve();
+  const CLAUDE_PROC = { pid: 1, argv: ["claude"], name: "claude" };
+  const SHELL_PROC = { pid: 2, argv: ["/usr/bin/fish"], name: "fish" };
+
+  /**
+   * A STATEFUL fake herdr for `resumeInPlace`'s own multi-step protocol —
+   * unlike `fakeHerdrWithCwd` above (fixed canned responses), this one's
+   * `agent.list`/`pane.processInfo` reflect a foreground that actually
+   * changes when `pane.sendKeys` (the `/exit`) and `agent.start` (the
+   * relaunch) are called, the same way a real pane would.
+   */
+  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean } = {}) {
+    let status: string = initialStatus;
+    let foreground: "claude" | "shell" = "claude";
+    const sent: Array<{ text?: string; keys?: string[] }> = [];
+    const started: any[] = [];
+    const client = {
+      agent: {
+        list: async () => ({ agents: [{ agent: foreground === "claude" ? "claude" : undefined, agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] }),
+        start: async (p: any) => {
+          started.push(p);
+          // An unavailable model (or any other immediate failure) accepts
+          // the launch but exits straight back to a shell — never reaching "idle".
+          if (options.crashesOnStart) { foreground = "shell"; return; }
+          foreground = "claude"; status = "idle";
+        },
+      },
+      pane: {
+        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? CLAUDE_PROC : SHELL_PROC] } }),
+        sendText: async (p: any) => { sent.push({ text: p.text }); },
+        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
+      },
+    };
+    return { client: client as any, sent, started };
+  }
+
+  async function withTempWorkspaces<T>(fn: () => Promise<T>): Promise<T> {
+    const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-resume-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try { return await fn(); }
+    finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("resumed: an idle agent exits, relaunches on the SAME pane with --resume, the new model/effort, and the full flag set; the persisted session id is unchanged", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-900" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
+      buildWorkspace(spec, "http://x/mcp", "claude"); // fresh spawn: mints & persists .butchr-session-id.json
+      const originalId = workspaceSessionId(cwd);
+      expect(originalId).toBeTruthy();
+      const f = statefulHerdr("w1:p1", cwd);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("resumed");
+      expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
+      expect(f.started).toHaveLength(1);
+      const args: string[] = f.started[0]!.args;
+      expect(args[args.indexOf("--resume") + 1]).toBe(originalId);
+      expect(args).toEqual(expect.arrayContaining(["--model", "claude-opus-5", "--effort", "medium", "--permission-mode", "bypassPermissions"]));
+      expect(f.started[0]!.pane_id).toBe("w1:p1"); // SAME pane — never a new one
+      expect(workspaceSessionId(cwd)).toBe(originalId); // idempotent re-persist, not a new id
+      expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
+      expect(workspaceEffort(cwd)).toBe("medium");
+    });
+  });
+
+  // FACTORY-312 review (26137, point 2 + 1): herdr accepting the launch only
+  // means the process STARTED — an unavailable model exits almost
+  // immediately (Step 0.2: measured exit 1). Two things must both hold:
+  // this is reported as "failed", not "resumed", and the model/effort files
+  // are NOT overwritten (so the next poll's comparison still sees the OLD
+  // values and keeps trying, rather than "matching" a launch that never
+  // actually took).
+  test("failed: the relaunch is accepted by herdr but the pane never shows claude alive afterward — reported as 'failed', model/effort NOT persisted", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-905" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-nonexistent-model", effort: "medium" as const }] };
+      buildWorkspace({ ...spec, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "high" as const }] }, "http://x/mcp", "claude");
+      const originalId = workspaceSessionId(cwd);
+      const f = statefulHerdr("w1:p1", cwd, "idle", { crashesOnStart: true });
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("failed");
+      expect(f.started).toHaveLength(1); // the attempt WAS made
+      // Old values stand — never overwritten by a relaunch that didn't take.
+      expect(workspaceModel(cwd)).toBe("claude-opus-5");
+      expect(workspaceEffort(cwd)).toBe("high");
+      expect(workspaceSessionId(cwd)).toBe(originalId);
+    });
+  });
+
+  test("deferred: an agent mid-turn is never sent /exit and nothing is relaunched", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-901" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      buildWorkspace(spec, "http://x/mcp", "claude");
+      const f = statefulHerdr("w1:p1", cwd, "working");
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("deferred");
+      expect(f.sent).toEqual([]);
+      expect(f.started).toEqual([]);
+    });
+  });
+
+  test("stuck: /exit is sent but the pane never shows a shell in its foreground — never relaunched, never killed", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-902" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      buildWorkspace(spec, "http://x/mcp", "claude");
+      const f = statefulHerdr("w1:p1", cwd);
+      // Override sendKeys so the pane STAYS on claude (a stuck dialog), unlike the happy-path fake above.
+      f.client.pane.sendKeys = async (p: any) => { f.sent.push({ keys: p.keys }); };
+      let now = 0;
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, () => (now += 5_000));
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("stuck");
+      expect(f.started).toEqual([]);
+    });
+  });
+
+  test("unresumable: no persisted session id (a pre-FACTORY-314 workspace) — never attempts /exit", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdirSync } = require("node:fs") as typeof import("node:fs");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });
+      const cwd = workspaceDirFor(key);
+      mkdirSync(cwd, { recursive: true }); // workspace exists, but no .butchr-session-id.json was ever minted
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      const f = statefulHerdr("w1:p1", cwd);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("unresumable");
+      expect(f.sent).toEqual([]);
+    });
+  });
+
+  // FACTORY-73 (25989/25978): FACTORY-300 root-causes ManagedHerdrLifecycle.start()
+  // throwing HandoffBlocked("Current worker disappeared; refusing implicit
+  // replacement") when its remembered `this.active` can't be re-resolved — a
+  // real risk during resumeInPlace's own exit-to-relaunch window, when the
+  // pane briefly shows a bare shell. Proven safe WITHOUT touching that guard:
+  // resumeInPlace and spawn() share the SAME per-issue exclusive queue
+  // (`this.exclusive`), so a concurrent ordinary `herd.spawn()` for this
+  // exact issue simply queues behind resumeInPlace and, once it runs, finds
+  // the resumed agent already present — it never reaches
+  // `ManagedHerdrLifecycle.start()` (and so never `workspace.create`) at all.
+  test("FACTORY-300: a concurrent ordinary herd.spawn() for the SAME issue, fired while resumeInPlace's exit-to-relaunch window is open, never throws and ends as a no-op", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-904" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      buildWorkspace(spec, "http://x/mcp", "claude");
+      const f = statefulHerdr("w1:p1", cwd);
+      // workspace.create is ONLY ever reached if the ordinary spawn path
+      // falls through to ManagedHerdrLifecycle.start() — make it throw if
+      // called at all, so a wrong (non-serialized) implementation fails loud.
+      (f.client as any).workspace = { create: async () => { throw new Error("spawn() must never create a new workspace during a resumeInPlace window"); } };
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const [resumeOutcome] = await Promise.all([herd.resumeInPlace(spec), herd.spawn(spec)]);
+      expect(resumeOutcome).toBe("resumed");
+      expect(f.started).toHaveLength(1); // only resumeInPlace's own relaunch — spawn() found it already running and no-opped
+    });
   });
 });
