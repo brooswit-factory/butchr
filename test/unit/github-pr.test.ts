@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Herd } from "../../src/agents/herd.js";
 import { githubPrNudge } from "../../src/agents/change-nudge.js";
-import { agentIdOfWorkspacePath, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
+import { agentIdOfWorkspacePath, ensureWorkspaceDir, resourceKeyOf, workspaceDirFor } from "../../src/agents/workspace.js";
 import { runResourceLoop } from "../../src/daemon/loop.js";
 import type { NotifyReason } from "../../src/resources/types.js";
 import { createGithubPrClient, githubPrQueryProblems, GithubHttpError, mapGithubPr, scopedPrQuery, type GithubPr } from "../../src/resources/github-pr.js";
@@ -39,8 +42,22 @@ describe("github pr identity", () => {
     expect(key).toBe("github-pr:prs:acme%2Fwidgets%2312");
     expect(decodeAgentKey(key)).toEqual({ resourceProvider: "github-pr", ruleId: "prs", resourceId: "acme/widgets#12" });
     const dir = workspaceDirFor(key, "/root");
-    expect(dir).toBe("/root/github-pr/prs/acme%2Fwidgets%2312");
-    expect(agentIdOfWorkspacePath(dir, "/root")).toBe(key);
+    // FACTORY-118: the leaf is the provider's short id (owner dropped), not
+    // the full percent-encoded resource id — only the LEAF changes, the
+    // three-deep <provider>/<ruleId>/<leaf> shape does not.
+    expect(dir).toBe("/root/github-pr/prs/widgets#12");
+    // The short leaf is lossy, so `agentIdOfWorkspacePath` can only resolve
+    // it back via a REAL on-disk bookkeeping stamp (FACTORY-118) — a bare
+    // path string under a root that was never actually built (like "/root"
+    // above) cannot round-trip, unlike the old, fully percent-encoded leaf.
+    const root = mkdtempSync(join(tmpdir(), "gh-pr-root-"));
+    try {
+      const realDir = ensureWorkspaceDir(key, root);
+      expect(realDir.endsWith("/github-pr/prs/widgets#12")).toBe(true);
+      expect(agentIdOfWorkspacePath(realDir, root)).toBe(key);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
     expect(resourceKeyOf(key)).toBe("acme/widgets#12");
     expect(ownsGithubPrAgent(key)).toBe(true);
     expect(ownsRuleAgent(key)).toBe(false);
