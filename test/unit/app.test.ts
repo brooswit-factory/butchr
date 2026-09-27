@@ -10,11 +10,13 @@ import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, createDashboardFeed, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
+import { buildQueryAgentInventory } from "../../src/agents/query-agent-inventory.js";
+import type { Rule } from "../../src/rules/rules.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
 // DashboardResponse literal below that predates the admission view and isn't
@@ -482,6 +484,50 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
       expect(html).not.toContain("no running agent");
       expect(html).toContain("COULD NOT CHECK");
       expect(html.match(/COULD NOT CHECK/g)?.length ?? 0).toBeGreaterThanOrEqual(2); // staffing cell AND cross-link area
+    } finally {
+      app.stop();
+    }
+  });
+});
+
+// FACTORY-136: end-to-end through the REAL app/route AND a REAL
+// createDashboardFeed + createAdmissionController + buildQueryAgentInventory
+// — never a hand-built inventory literal like the block above (which only
+// pins the route's own pass-through wiring). This is the "real routes"
+// half of DoD requirement 6.
+describe("GET /configurations (FACTORY-136): the admission-source-unavailable tri-state, wired end-to-end through a real feed + admission controller", () => {
+  function ruleFixture(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
+    return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+  }
+
+  test("a never-reported admission source covering a jira-work rule serves COULD NOT CHECK (naming the source) through /configurations and /config-inventory alike, never UNSTAFFED", async () => {
+    const now = () => 0;
+    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [], sources: ["issue"], now });
+    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+    await feed.poll(async () => ({ agents: [] })); // agent.list() succeeds; the "issue" admission source never reports
+
+    const r = ruleFixture({ id: "task", resourceProvider: "jira-work" });
+    const configInventory = () =>
+      buildQueryAgentInventory({
+        rulesFile: { path: "/rules.json", rules: [r], error: null },
+        dashboard: feed.snapshot(),
+        configReasonFor: () => null,
+        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
+      });
+    const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+
+      const jsonInventory = await (await fetch(`${b}/config-inventory`)).json() as { rules: { staffed: boolean | null; reason: string | null }[] };
+      expect(jsonInventory.rules[0]!.staffed).toBeNull();
+      expect(jsonInventory.rules[0]!.reason).toContain("never-reported");
+
+      const html = await (await fetch(`${b}/configurations`)).text();
+      expect(html).toContain("task");
+      expect(html.toUpperCase()).not.toContain("UNSTAFFED");
+      expect(html).toContain("COULD NOT CHECK");
+      expect(html).toContain("never-reported");
     } finally {
       app.stop();
     }
