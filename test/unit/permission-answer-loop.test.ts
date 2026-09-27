@@ -426,19 +426,19 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
       expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
     });
 
-    test(`negative (${label}): lizardMode absent on the owning rule leaves the agent untouched`, () => {
+    test(`positive (${label}): FACTORY-138 — lizardMode absent on the owning rule (found, field unset) is now ELIGIBLE by default, labelled by its resource id's basename`, () => {
       const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
       const deps: RuleLizardModeDeps = {
         rules: [rule({ id: "lz", resourceProvider })],
         isManagedSessionAgent: noManagedSession,
         managedSessionLizardModes: emptyMap,
       };
-      expect(ruleLizardModeOf(id, deps)).toBe(false);
-      expect(lizardModeLabelFor(id, deps)).toBeUndefined();
+      expect(ruleLizardModeOf(id, deps)).toBe(true);
+      expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
     });
   }
 
-  test("negative: lizardMode: false explicitly is the same as absent", () => {
+  test("negative: FACTORY-138 — an EXPLICIT lizardMode: false on the owning rule opts out, no longer the same as absent (absent is now eligible)", () => {
     const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "lz", resourceId: "BUTCHR-7" });
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: false })],
