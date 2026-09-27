@@ -103,8 +103,22 @@ other and of every other field):
 
 | field | values | default | reaches argv? |
 |---|---|---|---|
-| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent (Drovr's own default, `bypassPermissions`, applies) | yes — `SpawnSpec.permissionMode` |
+| `permissionMode` | `default` \| `manual` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → `agentLaunchConfig`'s own default applies: `acceptEdits` (`DEFAULT_PERMISSION_MODE`, src/agents/argv.ts, FACTORY-127/138), or `auto` for a `jira-project` rule specifically — NOT Drovr's own `bypassPermissions` fallback, which butchr stopped relying on at FACTORY-138 | yes — `SpawnSpec.permissionMode` |
 | `lizardMode` | boolean | absent/`false` | no — daemon-side only |
+
+**Vocabulary (FACTORY-275).** `default` and `manual` are the SAME value at
+the launcher — Claude's own `--permission-mode` treats `manual` as an
+accepted alias for its real canonical `default` (verified against a real
+`claude` invocation, not just `--help`/`--version`; see
+`SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts,
+for the full reproduction). Both are forwarded verbatim, unchanged, so use
+whichever reads better; nothing distinguishes them at runtime. `auto` keeps
+its one existing meaning (Claude's own per-prompt model-classifier judgment)
+and is never treated as a synonym for `bypassPermissions` here, which skips
+every permission check unconditionally with no judgment involved — the
+operator-facing friendly name for `bypassPermissions` is **"unattended
+mode"** (prose/docs only; the wire value is unchanged for back-compat, and
+there is no permission-mode UI to relabel — see docs/managed-sessions.md).
 
 **What they do.** `lizardMode: true` is the operator's own name (FACTORY-67)
 for turning on the daemon's standalone permission-answer timer
@@ -131,11 +145,13 @@ persist-at-spawn/read-back stale-argv pair FACTORY-43 built for this field
 `HerdrHerd.staleIssues()`) was never managed-session-specific — it already
 operates on `spec.permissionMode` for any spawn, so a rule-launched agent's
 `permissionMode` gets the same stale-argv safety with zero changes to that
-layer. Absent means today's behaviour exactly, for every provider — including
-`jira-project`, whose own unconditional `permissionMode: "auto"` default
-(`agentLaunchConfig`, src/agents/argv.ts) is set BEFORE `spec.permissionMode`'s
-own spread and so is overridden by this field only when a `jira-project` rule
-sets it.
+layer. Absent means today's behaviour exactly, for every provider, `jira-project`
+included (FACTORY-129): a jira-project agent with no explicit `permissionMode`
+now gets butchr's ordinary default (`DEFAULT_PERMISSION_MODE`,
+`agentLaunchConfig`, src/agents/argv.ts) exactly like every other rule kind —
+the jira-project-only `"auto"` override this paragraph used to describe is
+gone. Safety for that change comes from lizard-mode eligibility, not a
+special-cased permission mode; see the next section.
 
 **`lizardMode` never reaches argv — same design as `SessionDefinition.lizardMode`,
 and mostly plumbing to reuse.** It is resolved live, not persisted: the

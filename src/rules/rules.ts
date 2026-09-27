@@ -62,8 +62,16 @@ export { AGENT_EFFORTS, type AgentEffort };
  * both for `vendor: "codex"`: a rule that falls back to Codex/Agy for one
  * launch simply gets the same silent no-op an absent `permissionMode`
  * already gives that branch today.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (src/resources/session-definition.ts) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here.
  */
-export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export const RULE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
 
 /**
@@ -285,9 +293,9 @@ export interface Rule {
   linkedEventing?: boolean;
   /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
   linkedPollIntervalMs?: number;
-  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedItems`; an explicit value here always wins over that default, in both directions. */
   maxLinkedItems?: number;
-  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (2) via `effectiveMaxLinkedTurnsPerHour`; an explicit value here always wins over that default, in both directions. */
   maxLinkedTurnsPerHour?: number;
   /**
    * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's

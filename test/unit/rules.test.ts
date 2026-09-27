@@ -345,7 +345,7 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
 
   test("rejects a bad permissionMode value, naming the rule and field", () => {
     expect(() => parseRules({ rules: [{ ...minimal, permissionMode: "yolo" }] }, "f.json"))
-      .toThrow("f.json: rules[0].permissionMode must be one of default, acceptEdits, bypassPermissions, plan, auto");
+      .toThrow("f.json: rules[0].permissionMode must be one of default, manual, acceptEdits, bypassPermissions, plan, auto");
   });
 
   test("rejects a non-boolean lizardMode, naming the rule and field", () => {

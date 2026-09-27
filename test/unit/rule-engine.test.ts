@@ -1160,7 +1160,14 @@ describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker r
   test("cross-daemon epic hears its story's move to In Review via related:, even with its own linkedEventing budget exhausted", async () => {
     const bossKey = "DROVR-37";
     const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it
-    const siblingKeys = ["DROVR-30", "DROVR-31"]; // other Implements targets of the boss, used to genuinely exhaust its linked-eventing budget first
+    // BUTCHR-472: these must NOT be Implements/outward targets of the boss —
+    // that exact pair is now de-duplicated out of the linked path entirely
+    // (already covered by related:), so it could never again exhaust
+    // `maxLinkedTurnsPerHour` the way this test needs. A "Blocks" link is
+    // pure linked-path churn, untouched by BUTCHR-472's de-dup (which only
+    // ever excludes an Implements/outward target — see `watchedKeys`,
+    // src/jira-watch/routes.ts) — so it still exhausts the budget genuinely.
+    const siblingKeys = ["DROVR-30", "DROVR-31"]; // Blocks-type links on the boss, used to genuinely exhaust its linked-eventing budget first
 
     let storyStatus = "In Progress";
     let siblingRound = 0;
@@ -1168,14 +1175,14 @@ describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker r
       issuetype: "Epic",
       issuelinks: [
         { type: "Implements", otherEnd: "outward", key: workerKey },
-        { type: "Implements", otherEnd: "outward", key: siblingKeys[0]! },
-        { type: "Implements", otherEnd: "outward", key: siblingKeys[1]! },
+        { type: "Blocks", otherEnd: "outward", key: siblingKeys[0]! },
+        { type: "Blocks", otherEnd: "outward", key: siblingKeys[1]! },
       ] as never,
     });
     const implementsBoss = (boss: string): IssueLink[] => [{ type: "Implements", otherEnd: "inward", key: boss }];
     const worker = () => issue(workerKey, { issuetype: "Story", status: storyStatus, issuelinks: implementsBoss(bossKey) });
     const sibling = (key: string, round: number) =>
-      issue(key, { issuetype: "Story", status: round % 2 === 0 ? "In Progress" : "In Review", issuelinks: implementsBoss(bossKey) });
+      issue(key, { issuetype: "Story", status: round % 2 === 0 ? "In Progress" : "In Review" });
 
     const logs: string[] = [];
     // This daemon's own rules match ONLY Epics — BUTCHR-388's own documented
@@ -1206,6 +1213,14 @@ describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker r
     }
     logs.length = 0; // ignore the warm-up churn's own logging
 
+    // BUTCHR-472: the workerKey Implements/outward pair is now de-duplicated
+    // out of the linked path entirely (already covered by related:), so its
+    // own status flip can no longer be what trips the rate cap. One more
+    // round of the SAME sibling (Blocks-type) churn used above, landing in
+    // the SAME tick as the story's move, keeps this test proving what it
+    // always proved: a genuinely exhausted linked-path cap never blocks
+    // related:.
+    siblingRound++;
     // The real boss-wake event: the story moves to In Review while the budget is exhausted.
     storyStatus = "In Review";
     await type.discovery.search();

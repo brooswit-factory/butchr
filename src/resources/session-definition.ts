@@ -36,8 +36,45 @@ export type SessionDefinitionVendor = (typeof SESSION_DEFINITION_VENDORS)[number
  * `CodexAgentLaunch` (its own `trustWorkspace`/`bypassApprovalsAndSandbox`
  * fields instead) — see docs/managed-sessions.md's "Per-vendor launch
  * differences" for what that means for a `vendor: "codex"` definition.
+ *
+ * FACTORY-275 (permission-mode vocabulary alignment, operator's "option 3"
+ * on FACTORY-131): `"manual"` was ADDED here, `"default"` was NOT removed.
+ * Reproduced live at `claude` 2.1.251/2.1.283: `claude --help`'s own
+ * `--permission-mode` choice list is `acceptEdits, auto, bypassPermissions,
+ * manual, dontAsk, plan` — it shows `manual`, not `default`. That looked
+ * like butchr sending a value the launcher rejects (this ticket's AC2), but
+ * a real invocation settles it the other way: `claude --permission-mode
+ * default -p "hi" </dev/null` reaches the SAME argument-choice validation
+ * that rejects a genuinely bogus value immediately (with the six-value
+ * list above in its error) and is NOT rejected — it proceeds exactly like
+ * a known-good value. Strings in the installed binary explain why:
+ * `"'manual' is accepted as an alias for 'default'"` — `default` IS the
+ * launcher's real canonical value; `manual` is merely the friendlier name
+ * its own `--help` advertises for the identical thing. So both are kept:
+ * `default` because every existing definition/rule that already says it
+ * must keep loading and launching byte-for-byte identically (back-compat,
+ * not optional), `manual` so a NEW definition/rule can spell it the way
+ * the launcher's own public vocabulary does. Both are forwarded verbatim,
+ * with no normalization between them — either string alone is already
+ * accepted by the launcher, so a translation layer would only add a place
+ * to get it wrong.
+ *
+ * `"auto"` keeps its ONE existing meaning here (whatever Claude's own
+ * `--permission-mode auto` does — the installed binary's own option help
+ * describes it as "Use a model classifier to approve/deny permission
+ * prompts", a real per-prompt judgment, NOT a synonym for `bypassPermissions`
+ * skipping every check unconditionally) — this union does not alias it to
+ * anything else, and this ticket does not touch `agentLaunchConfig`'s
+ * separate, pre-existing unconditional `permissionMode: "auto"` for
+ * `jira-project` agents (src/agents/argv.ts) at all; that hardcode is
+ * FACTORY-129's own ticket. `"bypassPermissions"` is the mode with no
+ * human-facing rename here either — its wire value is unchanged for
+ * back-compat — but see docs/managed-sessions.md for the friendlier
+ * operator-facing name ("unattended mode") this ticket gives it in prose,
+ * since butchr's web config page has no permission-mode UI to relabel
+ * (verified still true at this commit — read-only text, no form control).
  */
-export const SESSION_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export const SESSION_PERMISSION_MODES = ["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
 
 /**

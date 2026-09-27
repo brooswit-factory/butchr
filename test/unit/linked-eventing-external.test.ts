@@ -111,7 +111,12 @@ describe("BUTCHR-437: Confluence page poller", () => {
     const confState = { value: 1 as number | "404" | "403" | "error" };
     const conf = fakeConfluence(confState);
     const deps: LinkedEventingDeps = { ...base, confluenceVersion: conf.getVersion };
-    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+    // BUTCHR-471: this test's own intent is the Confluence poll lifecycle
+    // (seed/change/unreadable/recovery), not the rate cap — it fires 3
+    // notifies with no clock advance, which the BUTCHR-471 default
+    // (2/hour) would now legitimately start rate-capping. An explicit,
+    // generous override preserves this test's original intent.
+    const m = match("jira-work:task:BUTCHR-1", rule({ maxLinkedTurnsPerHour: 1000 }), owner);
 
     await state.runTick([m], deps); // seed, version 1
     expect(notified).toHaveLength(0);

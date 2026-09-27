@@ -416,6 +416,14 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     for (let i = 0; i < 2; i++) { siblingRound++; await type.discovery.search(); related = await type.discovery.related!(active); }
     logs.length = 0;
 
+    // BUTCHR-472: the workerKey Implements/outward pair below is now
+    // de-duplicated out of the linked path entirely (already covered by
+    // related:), so its own status flip can no longer be what trips the
+    // rate cap. One more round of the SAME unrelated managed-link churn
+    // used above, landing in the SAME tick as the story's move, keeps this
+    // test proving what it always proved: the linked path's cap being
+    // genuinely exhausted (by unrelated churn) never blocks related:.
+    siblingRound++;
     storyStatus = "In Review";
     await type.discovery.search();
     const relatedAfter = await type.discovery.related!(active);

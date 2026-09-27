@@ -63,7 +63,7 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
 | `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
-| `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
+| `permissionMode` | yes | `"default"` \| `"manual"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). `"default"`/`"manual"` are the SAME launcher value — `manual` is Claude's own `--help`-advertised alias for its real canonical `default` (FACTORY-275; see `SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts). `"bypassPermissions"`'s operator-facing friendly name is **"unattended mode"** — prose only, the wire value is unchanged. |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, Claude only, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
@@ -200,16 +200,18 @@ reuses:
   into the SAME `createLinkedEventingState`/`runTick` machinery
   (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
   already use — no second watcher, no separate rate cap.
-- **Uncapped by default (known gap, FACTORY-78):** these nudges reuse the
-  BUTCHR-469 rate-cap MECHANISM, but this definition has no field to
-  configure a cap VALUE, and the wiring's own fixed `Rule`-shaped gate never
-  sets one — so today, a managed session's linked-eventing nudges are
-  uncapped, the same "absent means uncapped" behaviour an unconfigured
-  `jira-project` rule owner already has, not a real per-session or
-  per-project budget. A real default (or a per-definition setting) is an
-  open operator decision, deliberately deferred rather than invented
-  unilaterally — see `docs/resource-links.md`'s own section for the full
-  reasoning and FACTORY-78 for the tracked gap.
+- **Capped by the shared default, not yet by any per-definition setting
+  (BUTCHR-471):** this definition still has no field to configure a cap
+  VALUE, and the wiring's own fixed `Rule`-shaped gate
+  (`MANAGED_SESSION_LINKED_EVENTING_RULE`) still never sets one — but absent
+  no longer means uncapped: `runTick` (`src/jira-watch/linked-eventing.ts`)
+  now falls back to a fixed default (2 turns/hour, 25 items) whenever a
+  rule leaves either cap absent, this fixed gate included, so no owner kind
+  — a managed session among them — can run uncapped. A per-definition
+  override remains a known limit, tracked as a follow-up (the residue of
+  FACTORY-78) — see `docs/resource-links.md`'s own BUTCHR-471 section for
+  the full reasoning, the evidence behind the default's numbers, and what
+  is and isn't done yet.
 
 ## Tier -> model mapping
 
@@ -355,7 +357,7 @@ usage: butchr session list [--archived]
        butchr session show <name>
        butchr session create <name> --working-directory <dir> --brief <text>
                              --vendor claude|codex --tier tier1..tier5
-                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
                              [--role worker|sentinel] [--frozen]
@@ -1076,9 +1078,24 @@ field is independent, and a definition may set it alongside any
 plus an afterthought. `acceptEdits` auto-accepts file EDITS only — Bash and
 MCP tool prompts still appear there, and those are what lizard mode answers.
 `"bypassPermissions"` skips permission prompts by design, so `lizardMode`
-there has nothing to answer. What `"auto"` does is version-dependent and
-UNVERIFIED here — don't assume it behaves like `bypassPermissions`, and
-don't assume `lizardMode` is therefore a no-op under it.
+there has nothing to answer.
+
+**`"auto"` is NOT an equivalent no-op pair with `"bypassPermissions"`
+(FACTORY-275).** An earlier version of this doc claimed the tool-permission
+dialog "essentially never appears" under either mode, treating them as
+interchangeable — that claim was wrong and has been removed. The installed
+`claude` binary's own `--permission-mode` option help (verified at 2.1.251)
+describes them as genuinely different: `"auto"` — *"Use a model classifier
+to approve/deny permission prompts"*, a real per-prompt judgment that can
+still deny; `"bypassPermissions"` — *"Bypass all permission checks (requires
+allowDangerouslySkipPermissions)"*, which never checks and never denies.
+Neither shows an interactive dialog to a human, which is likely why the two
+were conflated, but "no human-facing dialog" is not "the same behaviour".
+Whether `lizardMode`'s auto-answer ever actually has something to press
+under `"auto"` (i.e. whether the classifier itself ever produces the same
+kind of prompt drovr recognizes) is a separate, still-open question this
+ticket did not attempt to observe live — don't assume either answer without
+watching an `"auto"` pane yourself.
 
 **No stale-argv risk, unlike `permissionMode`/`strictMcpConfig` (FACTORY-43).**
 Those two fields DO reach the launched process's argv, which is exactly why

@@ -94,6 +94,12 @@ describe("sessionDefinitionProblems", () => {
     for (const permissionMode of SESSION_PERMISSION_MODES) expect(sessionDefinitionProblems({ ...good(), permissionMode }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), permissionMode: "yolo" }, "def")[0]).toContain("permissionMode must be one of");
   });
+  test("FACTORY-275: 'manual' is accepted alongside 'default' — the launcher's own alias for its real canonical value, not a replacement for it", () => {
+    expect(SESSION_PERMISSION_MODES).toContain("default");
+    expect(SESSION_PERMISSION_MODES).toContain("manual");
+    expect(sessionDefinitionProblems({ ...good(), permissionMode: "default" }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), permissionMode: "manual" }, "def")).toEqual([]);
+  });
   test("strictMcpConfig: optional boolean, absent means today's behaviour exactly", () => {
     expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), strictMcpConfig: true }, "def")).toEqual([]);
