@@ -4,9 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
-import { newLayoutDirFor, readBookkeptAgentKey, workspaceDirFor, writeBookkeptAgentKey } from "../../src/agents/workspace.js";
+import { claudeProjectSlug, newLayoutDirFor, readBookkeptAgentKey, workspaceDirFor, writeBookkeptAgentKey } from "../../src/agents/workspace.js";
 import {
-  claudeProjectSlug,
   migrateClaudeProjectSlug,
   migrateClaudeSettingsEntry,
   migrateWorkspaceLayout,

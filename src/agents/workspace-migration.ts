@@ -117,10 +117,33 @@ export interface SlugMigrationResult {
  * two paths sharing one slug already, is safe to proceed through: an
  * empty directory is nothing to lose, and a real Claude Code invocation
  * has not yet written a first transcript into it).
+ *
+ * REFUSES rather than guesses when `newCwd`'s own naive slug exceeds
+ * `CLAUDE_SLUG_TRUNCATION_LENGTH` (empirically confirmed live on Servy —
+ * docs/workspace-layout.md's "Empirical slug verification" section — real
+ * Claude Code truncates and appends a 6-character suffix this codebase
+ * cannot reproduce, see `claudeProjectSlug`'s own doc comment for the
+ * negative hash result). `findClaudeProjectDir` can tolerate this on the
+ * OLD side by scanning for a matching truncated-prefix directory that
+ * ALREADY exists, but there is nothing to scan for on the NEW side before
+ * a real `claude` invocation has ever run there — silently renaming into
+ * the naive (untruncated) name would move the transcript to a directory
+ * real Claude Code will never read from, cutting the agent off from its
+ * own memory exactly as silently as the hazard this whole ticket exists to
+ * close. Confirmed live: migrating a workspace whose new path's slug was
+ * over the threshold left the transcript unreachable by `claude --continue`
+ * at the new cwd (a fresh, empty conversation) even though the file itself
+ * had been moved — see the doc's Servy proof for the exact commands.
  */
 export function migrateClaudeProjectSlug(oldCwd: string, newCwd: string, home: string = homedir()): SlugMigrationResult {
   const projectsDir = join(home, ".claude", "projects");
-  const newSlugDir = join(projectsDir, claudeProjectSlug(newCwd));
+  const newSlugNaive = claudeProjectSlug(newCwd);
+  if (resolve(oldCwd) !== resolve(newCwd) && newSlugNaive.length > CLAUDE_SLUG_TRUNCATION_LENGTH) {
+    throw new Error(
+      `migrateClaudeProjectSlug: refusing to migrate — new cwd ${JSON.stringify(newCwd)}'s naive Claude Code slug is ${newSlugNaive.length} chars, over the ${CLAUDE_SLUG_TRUNCATION_LENGTH}-char threshold where real Claude Code truncates and appends an unreproducible hash suffix (see this function's own doc comment). Moving the memory slug here would silently orphan it. Shorten the workspace root or resource id so the new path's slug stays at or under the threshold, then retry.`,
+    );
+  }
+  const newSlugDir = join(projectsDir, newSlugNaive);
   if (resolve(oldCwd) === resolve(newCwd)) return { outcome: "already-migrated", oldSlugDir: existsSync(newSlugDir) ? newSlugDir : null, newSlugDir };
   const oldSlugDir = findClaudeProjectDir(projectsDir, oldCwd);
   if (!oldSlugDir) return { outcome: "no-old-slug", oldSlugDir: null, newSlugDir };

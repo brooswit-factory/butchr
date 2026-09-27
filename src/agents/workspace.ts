@@ -508,7 +508,6 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // moved (`candidateLeaf`'s own `changed` flag) — see this function's own
   // doc comment for why an identity-short-id provider or a query-level key
   // must see no write at all.
-  const decoded = decodeAnyAgentKey(id);
   const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded).changed;
   if (leafActuallyMoved && dir === newLayoutDirFor(id, root) && !readBookkeptAgentKey(dir)) writeBookkeptAgentKey(dir, id);
   return dir;
