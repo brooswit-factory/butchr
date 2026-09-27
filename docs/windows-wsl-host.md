@@ -544,6 +544,155 @@ Windows task each one manages.
 - **`daemon down with an Atlassian-credentials-shaped journal tail`** — see
   "Known limitation" above (FACTORY-65) before assuming this install is
   broken.
+- **`powershell.exe`/`cmd.exe` fail with "Invalid argument" from herdr or an
+  agent pane, but work fine from an interactive WSL shell** — a systemd/
+  interop gotcha, not a bug in this install's own scripts (which don't yet
+  handle it — see "Windows interop under systemd" below).
+- **herdr restarted and Butchr won't replace the vanished worker
+  (`"handoff blocked"`)** — see "Restarting herdr: handoff-blocked and
+  session freeze/unfreeze" below.
+
+### Windows interop under systemd (`WSL_INTEROP`, `PATH`)
+
+**Secondhand, cited to admin-assembly's comment on the epic (FACTORY-58,
+"Zippy reference implementation, part 3: live", 2026-09-26 ~21:00Z) — not
+verified against any host this repo's own scripts installed;** this
+install's own `scripts/wsl-host/*` does not currently implement the
+workaround below (checked: no `WSL_INTEROP`/`interop` handling anywhere
+under `scripts/wsl-host/`). Treat this as the shape of a known gotcha and
+a reported fix pattern, not a feature of `cli.ts install`.
+
+**Symptom:** `powershell.exe`/`cmd.exe` (or any other Windows-interop call)
+fail with `Invalid argument` when run from **anything systemd started** —
+`butchr.service`, `herdr.service`, and so every agent pane herdr owns —
+while the same command works fine from an interactive WSL shell (the
+"Ubuntu" app, or `wsl.exe -d Ubuntu`).
+
+**Root cause:** a process started by systemd gets no `WSL_INTEROP`
+environment variable, and its `PATH` lacks the Windows directories
+(`System32`, `WindowsPowerShell/v1.0`, `WINDOWS`) — both of which
+`.exe` interop depends on (see section 1, "Diagnosing 'command not found'
+for a `.exe`", in `docs/windows-wsl-agent-guide.md`, for the ordinary,
+non-systemd version of this same interop mechanism). Per the report: the
+**global** interop sockets, `/run/WSL/1_interop` and `/run/WSL/2_interop`,
+do not work from a systemd-started process either — only a **per-session**
+socket, `/run/WSL/<init-pid>_interop`, works from systemd.
+
+**Fix pattern reported (illustrative/unverified-as-written — admin-assembly's
+actual wrapper script is not itself in the report; this is a reconstruction
+of the pattern, not a transcription of their file):** a wrapper script,
+installed via a systemd user-unit drop-in that overrides `ExecStart=`, run
+in place of the daemon's normal `ExecStart=` command:
+
+```ini
+# ~/.config/systemd/user/herdr.service.d/20-wsl-interop.conf
+[Service]
+ExecStart=
+ExecStart=/home/<user>/.local/bin/herdr-wsl-start
+```
+
+The empty `ExecStart=` line before the real one is required — systemd
+**appends** to `ExecStart=` by default, so without the reset line the
+drop-in would add a second `ExecStart=`, not replace the unit's original
+one (verify this reset behavior yourself against `systemd.service(5)` /
+`systemd.unit(5)` for the systemd version on your host; it is not
+re-derived here).
+
+```bash
+#!/usr/bin/env bash
+# ~/.local/bin/herdr-wsl-start — illustrative/unverified-as-written.
+set -euo pipefail
+
+pick_interop_socket() {
+  # 1. Prefer the interop socket of the /init whose child is the
+  #    keepalive `sleep infinity` — that's the Windows logon task's own
+  #    session (see "The Windows autostart task" above: the registered
+  #    scheduled task holds `wsl.exe ... sleep infinity` open).
+  for sock in /run/WSL/*_interop; do
+    init_pid=$(basename "$sock" _interop)
+    if pgrep -P "$init_pid" -f 'sleep infinity' >/dev/null 2>&1; then
+      echo "$sock"
+      return 0
+    fi
+  done
+  # 2. Otherwise, the first socket that actually answers a Windows call.
+  for sock in /run/WSL/*_interop; do
+    if WSL_INTEROP="$sock" cmd.exe /c exit 0 >/dev/null 2>&1; then
+      echo "$sock"
+      return 0
+    fi
+  done
+  return 1
+}
+
+sock=$(pick_interop_socket) || { echo "herdr-wsl-start: no working interop socket found" >&2; exit 1; }
+export WSL_INTEROP="$sock"
+export PATH="$PATH:/mnt/c/WINDOWS/System32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0:/mnt/c/WINDOWS"
+
+exec herdr server
+```
+
+Verified (per the report, on the zippy host): with this in place, the
+launched agent process's own environment shows
+`WSL_INTEROP=/run/WSL/<keepalive-init-pid>_interop`, and `powershell.exe`
+from inside an agent pane returns the machine name instead of failing.
+
+**Caveats (both from the report, not independently reproduced here):**
+
+- **Keepalive-session death.** If the Windows logon task's held session
+  (the `sleep infinity` process — "The Windows autostart task" above) dies,
+  interop breaks again until herdr itself restarts and re-picks a socket —
+  the wrapper only picks a socket once, at herdr's own startup.
+- **Reboot ordering.** On a reboot, the wrapper's own preference order (the
+  logon task's session first, then whatever WSL's systemd itself starts)
+  is what makes it pick the *new* post-reboot socket rather than a stale
+  one — this depends on the logon task actually starting before (or at
+  least around the same time as) `herdr.service` reconnects; the report
+  does not give a stronger ordering guarantee than that.
+
+### Restarting herdr: handoff-blocked and session freeze/unfreeze
+
+**Secondhand, cited to the same FACTORY-58 report as above.** Restarting
+herdr kills its panes out from under Butchr. When Butchr next tries to
+replace a worker whose pane just vanished, the report says Butchr refused
+the replacement — a `"handoff blocked"` outcome. This matches a real,
+documented safeguard in this repo: `docs/provider-handoff.md` describes
+"missing history, changed native identity, launch failure, and
+acknowledgement failure preserve the old worker," and "a handoff blocked
+before commit closes only the candidate pane, with best-effort cleanup" —
+i.e. Butchr fails closed rather than silently discarding a worker it can't
+positively confirm the replacement for — consistent with, though not
+verified here as the exact same code path as, the `"handoff blocked"`
+log line in `src/agents/herd.ts` (`startProviders`, `status === "blocked"`).
+**The report labels this a
+"FACTORY-43 safeguard"; this project's own FACTORY-43 ticket, checked
+directly, is a different, unrelated fix (a managed-session respawn-loop
+from a stale-argv comparison, not handoff-blocking) — the underlying
+handoff-blocked behavior above is real and current in this repo, but that
+specific ticket citation could not be corroborated and should not be
+repeated as fact.**
+
+The report's own reported workaround: relaunch the affected session with
+`butchr session freeze <n>` and then `unfreeze <n>`. **Checked against this
+repo's actual CLI** (`src/cli/session-cli.ts`, and `docs/managed-sessions.md`
+directly): the real syntax is
+
+```
+butchr session freeze <name>
+butchr session unfreeze <name>
+```
+
+where `<name>` is the managed-session **definition's name** (not a number)
+— see `docs/managed-sessions.md`'s own "Two freeze gates, and why both" and
+"Delegated freeze/unfreeze" sections directly for the full session CLI and
+for what `freeze`/`unfreeze` actually do: flip both the on-disk manifest's
+`frozen` flag and the freeze store (on disk, shared with the daemon —
+`instanceFreezeStore`, rooted at `freezeStateRoot()`, honours
+`DROVR_CONTROL_HOME`; see `src/resources/session-freeze.ts`). If the
+report's `<n>` meant something else on the zippy host specifically (e.g. a
+shorthand the operator used for a name they weren't spelling out in full),
+that shorthand isn't reflected in this repo's own CLI — use the real
+`<name>` form above.
 
 ## What was and wasn't tested off-Windows
 
