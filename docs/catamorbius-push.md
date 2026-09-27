@@ -113,7 +113,37 @@ heartbeat interval (`CATAMORBIUS_HEARTBEAT_MS`, default `15000`). The true
 server-side interval is not knowable to the client (it isn't on the wire
 anywhere), so this is a margin against jitter/slow ticks against the
 *documented default*, never a guarantee the multiplier is "enough" against
-an arbitrarily-reconfigured server.
+an arbitrarily-reconfigured server. **Covers the connect phase too, not just
+an already-live stream**: the watchdog is armed before `fetch` is even
+called, so a gateway that accepts the TCP connection but never sends
+response headers is treated as dead by the same rule and on the same
+timer, not left to hang forever — a gap caught at review and closed before
+this merged.
+
+**Generation-tagged, so `stop()` immediately followed by `start()` never
+races itself**: every `start()`/`stop()` bumps an internal generation
+counter, and every async continuation of a connect attempt (after `fetch`
+resolves, after each stream read, inside a scheduled reconnect) checks its
+own captured generation against the current one before doing anything
+further. Without this, `stop()` aborting an in-flight attempt's request
+while `start()` immediately begins a new one raced: the OLD attempt's own
+`catch` block would see the client as "running again" (because `start()`
+had already flipped that flag) and schedule its own independent reconnect,
+running two connect chains at once — a review-caught bug, fixed before this
+merged, with its own regression test (`client.test.ts`: "stop() then a
+fresh start() WHILE a connect attempt is still awaiting fetch").
+
+**Listener isolation**: every `onStateChange`/`onEvent`/`onResyncRequired`
+listener call is wrapped so a throwing consumer can never unwind into this
+module's own control flow. Before this was added, a throwing `onEvent`
+listener propagated out through the SSE read loop's own `try`, which
+treated it exactly like a network failure and reconnected — but `lastSeq`
+had already advanced past the very event the listener failed on, so the
+next resume silently skipped it. Isolating each listener call (swallow, the
+same way a DOM `EventTarget` isolates one listener's throw from the
+dispatching code and from its other listeners) means a broken consumer
+loses only its own handling of one event, never the connection's own
+delivery or cursor integrity.
 
 **Parsing robustness** (`sse-parser.ts`, exercised at the client level too):
 frames split at arbitrary chunk boundaries including inside a multi-byte
