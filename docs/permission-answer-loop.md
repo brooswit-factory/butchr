@@ -50,8 +50,13 @@ prompts before a tool call (manual/`"default"` included, but also, e.g.,
 `"acceptEdits"`, which auto-accepts file edits but still prompts for Bash and
 MCP tool calls), so an agent gets that mode's own safety for every prompt it
 still shows while never sitting frozen on the ONE dialog drovr already knows
-how to answer unambiguously. A definition that doesn't set the field behaves
-exactly as before — nothing here is a blanket sweep.
+how to answer unambiguously. FACTORY-138 (operator decision, FACTORY-67
+director comment 2026-09-26 22:24Z) made a `vendor: "claude"` definition that
+doesn't set the field ELIGIBLE by default, pairing with the new
+`permissionMode: "acceptEdits"` launch default; only an explicit
+`lizardMode: false` opts a definition back out. This is still not a blanket
+sweep over every pane — see "The opt-in gate" below for exactly which panes
+are eligible now.
 
 `src/agents/permission-answer-loop.ts` is the daemon-side wiring:
 `startPermissionAnswerLoop` wraps `autoAnswerPermissions` on its own
@@ -61,13 +66,16 @@ exactly as before — nothing here is a blanket sweep.
 
 ## The opt-in gate
 
-`SessionDefinition.lizardMode?: boolean` (default `false`/absent) is
-validated at manifest load like every other definition field (rejected for
-`vendor: "codex"` — drovr's `classifyPermissionPrompt` is Claude-specific and
-never matches a Codex pane's screen, so a Codex definition setting this would
-silently do nothing; same treatment as `strictMcpConfig`'s own Codex
-rejection, not `permissionMode`'s more lenient "stored but unforwarded"
-precedent).
+`SessionDefinition.lizardMode?: boolean` is validated at manifest load like
+every other definition field (rejected for `vendor: "codex"` — drovr's
+`classifyPermissionPrompt` is Claude-specific and never matches a Codex
+pane's screen, so a Codex definition setting this would silently do nothing;
+same treatment as `strictMcpConfig`'s own Codex rejection, not
+`permissionMode`'s more lenient "stored but unforwarded" precedent). Since
+FACTORY-138, absent resolves to ELIGIBLE for a `vendor: "claude"` definition
+and stays not-eligible for `vendor: "codex"` (which cannot set the field to
+begin with); an explicit `false` always means never scanned, for either
+vendor.
 
 Unlike `permissionMode`/`strictMcpConfig` (see "No argv, no stale-argv risk"
 below), `lizardMode` never reaches `SpawnSpec` or the launched process's
@@ -93,12 +101,16 @@ rule-engine agent id (FACTORY-87/FACTORY-76 — a `jira-work`, `jira-project`,
 id's own `Rule.lizardMode`, looked up against the daemon's already-loaded
 `rules` list (see `docs/execution-modes.md`'s "`permissionMode` and
 `lizardMode`" section for why a rule needs no live poll the way a
-managed-session definition does). A pane that resolves to anything else — a
-legacy/bare-issue agent, a managed session or rule that never set the field,
-a managed session not yet observed this daemon's lifetime — is excluded,
-matching "absent field means today's behaviour exactly" down to the herdr
-call count: a tick with nothing eligible costs exactly one `agent.list()`
-call and nothing else (see `runPermissionAnswerTick`'s own doc comment).
+managed-session definition does). Since FACTORY-138, "never set the field"
+resolves ELIGIBLE for a rule (`ruleLizardModeOf`: `rule.lizardMode !== false`,
+unconditionally — no vendor gate at this layer, since a `Rule` has no fixed
+vendor) and for a `vendor: "claude"` managed session (`lizardMode ?? (vendor
+=== "claude")`); only an explicit `lizardMode: false`, a Codex/agy-resolved
+launch, a legacy/bare-issue agent, or a managed session not yet observed this
+daemon's lifetime is excluded. A tick with nothing eligible still costs
+exactly one `agent.list()` call and nothing else (see
+`runPermissionAnswerTick`'s own doc comment) — that call-count property is
+unchanged by the default flip.
 `ruleLizardModeOf`/`lizardModeLabelFor` themselves are pure, exported
 functions in `src/agents/permission-answer-loop.ts` (`src/daemon/index.ts`
 only binds them to its own live `rules`/`managedSessionLizardModes`/
@@ -152,7 +164,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only `lizardMode: true` panes | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only lizard-eligible panes (`lizardMode: true`, or absent and defaulting eligible since FACTORY-138 — see "The opt-in gate" above) | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall
@@ -431,13 +443,19 @@ that is a natural, separable follow-up.
 
 ## Not in this version
 
-- **No live definition or rule was switched over.** Per FACTORY-67's own
-  constraint, this ticket (and its rule-side companion, FACTORY-87/FACTORY-76)
-  is code + tests + docs only — no live runtime, service, definition, or rule
-  was touched. The existing codey definitions (all `permissionMode: "auto"`,
-  none setting `lizardMode`) and every existing rule (none setting either new
-  field) load and behave unchanged. Deploys and any live cutover go through
-  admin-assembly at the operator's direction.
+- **No live definition or rule was switched over (history — at FACTORY-87/FACTORY-76 time).**
+  Per FACTORY-67's own constraint, that ticket (and its rule-side companion,
+  FACTORY-87/FACTORY-76) was code + tests + docs only — no live runtime,
+  service, definition, or rule was touched, and at the time neither an unset
+  `permissionMode` nor an unset `lizardMode` changed a definition's or rule's
+  behavior. **Superseded by FACTORY-127/FACTORY-138**, which shipped the
+  `acceptEdits` + lizard-eligible-by-default launch pairing described
+  throughout this doc: an existing `vendor: "claude"` definition or rule that
+  sets neither field now gets both defaults live, no re-save needed (see "The
+  opt-in gate" above). The `jira-project` unconditional `permissionMode:
+  "auto"` override still wins over the new default until FACTORY-129 lands.
+  Deploys and any live cutover go through admin-assembly at the operator's
+  direction.
 
 ## Approval sound (FACTORY-100/FACTORY-103)
 

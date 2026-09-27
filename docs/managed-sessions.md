@@ -65,7 +65,7 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
 | `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
-| `lizardMode` | no | DROVR-42/FACTORY-67. Boolean, Claude only, default `false`. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
+| `lizardMode` | no | DROVR-42/FACTORY-67/FACTORY-138. Boolean, Claude only. Absent → ELIGIBLE for a `vendor: "claude"` definition (the FACTORY-138 default); a `vendor: "codex"` definition stays not-eligible when absent, since it cannot set this field at all. Explicit `false` always means never scanned or touched, for either vendor. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **Rejected at manifest load for `vendor: "codex"`** — drovr's dialog recognition is Claude-specific. Never reaches `SpawnSpec` or the launched process's argv (unlike `permissionMode`/`strictMcpConfig`) — read live, every poll, by the daemon's separate permission-answer timer. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
 | `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
@@ -1059,14 +1059,17 @@ of the reconcile loop and the blocking-escalation watcher — see
 writeup). Since FACTORY-98, an eligible pane is usually answered within
 about a second of going `blocked` (a herdr push subscription, not just the
 20s scan — see that doc's "Event-driven: the fast path" section); the scan
-itself, and everything below about the opt-in gate, is unchanged. A
-definition that doesn't set the field is untouched entirely — this is NOT a
-blanket sweep over every pane; the scan's own `eligiblePanes` hook resolves,
-fresh every tick, which panes belong to a currently-eligible
-`lizardMode: true` definition (via the SAME live `managedSessionLizardModes`
-map BUTCHR-408's `roles`/BUTCHR-460's `accountPolicies` maps already
-established the pattern for — rebuilt every managed-sessions poll from each
-eligible definition's own manifest, never persisted or acted on stale).
+itself, and everything below about the opt-in gate, is unchanged. The
+scan is still NOT a blanket sweep over every pane — the scan's own
+`eligiblePanes` hook resolves, fresh every tick, which panes are currently
+eligible (via the SAME live `managedSessionLizardModes` map BUTCHR-408's
+`roles`/BUTCHR-460's `accountPolicies` maps already established the pattern
+for — rebuilt every managed-sessions poll from each eligible definition's own
+manifest, never persisted or acted on stale). Since FACTORY-138, a `vendor:
+"claude"` definition that doesn't set the field at all is ELIGIBLE by default
+(the map's fill is `lizardMode ?? (vendor === "claude")`) — only an explicit
+`lizardMode: false` leaves it untouched; a `vendor: "codex"` definition stays
+not-eligible when absent, since it cannot set this field to begin with.
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
 field is independent, and a definition may set it alongside any
