@@ -62,8 +62,16 @@ export { AGENT_EFFORTS, type AgentEffort };
  * both for `vendor: "codex"`: a rule that falls back to Codex/Agy for one
  * launch simply gets the same silent no-op an absent `permissionMode`
  * already gives that branch today.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (src/resources/session-definition.ts) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here.
  */
-export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export const RULE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
 
 /**
