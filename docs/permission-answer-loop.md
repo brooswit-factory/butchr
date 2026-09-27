@@ -452,10 +452,11 @@ that is a natural, separable follow-up.
   `acceptEdits` + lizard-eligible-by-default launch pairing described
   throughout this doc: an existing `vendor: "claude"` definition or rule that
   sets neither field now gets both defaults live, no re-save needed (see "The
-  opt-in gate" above). The `jira-project` unconditional `permissionMode:
-  "auto"` override still wins over the new default until FACTORY-129 lands.
-  Deploys and any live cutover go through admin-assembly at the operator's
-  direction.
+  opt-in gate" above). FACTORY-129 later removed `jira-project`'s own
+  unconditional `permissionMode: "auto"` override, so a `jira-project` rule
+  that sets nothing now gets the same `acceptEdits` + lizard-eligible
+  default as every other rule kind. Deploys and any live cutover go through
+  admin-assembly at the operator's direction.
 
 ## Approval sound (FACTORY-100/FACTORY-103)
 
