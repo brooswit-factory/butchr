@@ -225,6 +225,25 @@ an approval dialog was not verified for this ticket (unlike Claude, where
 FACTORY-98 established it live) — until it is, treat Codex as answered by
 the 20s sweep, not the ~1s event path, even though the code path is shared.
 
+**`trigger`/`latencyMs` (FACTORY-145) are Claude-only — a Codex answer gets
+neither field.** `runPermissionAnswerTick` only consumes `fastPathTriggers`
+and computes an elapsed-ms latency for panes in the Claude-shaped `results`
+array; the Codex loop (`codexAnswered`/`codexFailed`/`codexUnrecognised`)
+never reads `fastPathTriggers` and never appends the trailing
+`.permission-audit.jsonl` latency record described above, so a Codex pane's
+own `[permission-answer] … answered (codex): …` journal line carries no
+`, fast, …ms`/`, sweep` suffix and its audit trail is exactly whatever
+`autoAnswerCodexApprovals` itself writes (`vendor: "codex"`, no `trigger` or
+`latencyMs` key). Deliberate, not an oversight: FACTORY-145 measured Claude's
+own `pane.agent_status_changed` push path (FACTORY-98) specifically; whether
+herdr's push frame is even a reliable "blocked" signal for a Codex pane is
+the open question the paragraph above already flags as unverified, so wiring
+a latency computation on top of an unverified trigger would produce a number
+that looks precise and is not. A p50/p95 computed from the audit file (see
+"Computing p50/p95 from the audit file" below) is therefore Claude-only by
+construction — every row it can select has `vendor` absent (Claude) never
+`"codex"`.
+
 `Rule.permissionMode` (FACTORY-87) is the opposite case, and needed no new
 persist/read-back logic at all: `buildWorkspace()`/`staleIssues()`'s pair
 above already reads/writes `spec.permissionMode` generically, for any spawn —
