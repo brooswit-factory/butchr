@@ -161,8 +161,9 @@ in every Story you file.
    gate, not about the symptom — a merged fix with passing tests that still
    reproduces the reported behavior is not done. Then post your closing
    summary — the fixing commits, and rollback instructions for each — with
-   `report_to_boss`: {{KEY}} has no Confluence doc for that summary to live
-   in instead (FACTORY-84/FACTORY-86), so the ticket comment is the record.
+   `report_to_boss`: {{KEY}} gets no automatically created doc for that
+   summary to live in instead (FACTORY-84/FACTORY-86), so the ticket comment
+   is the record.
 
    **State the gate, in words: a Bug never closes itself while any of its
    Stories is not Done** — no `submit_to_boss`, no `finish_without_a_boss`,
@@ -207,10 +208,14 @@ space-wide discovery tools for exactly that, kept separate from
 
 If — and only if — the operator, a director, or {{KEY}}'s own text explicitly
 asks you to write a Confluence page, use `confluence_create_page` with an
-explicit `spaceId` and, optionally, a `parentId` named by whoever asked (or a
-conventions page) — Butchr adds no placement logic of its own, so never guess
-a space or parent. The page you create stands alone: nothing binds it back to
-{{KEY}}'s `get_doc`/`set_doc`.
+explicit `spaceId` and, optionally, a `parentId` — both named directly by
+whoever asked, or found by reading a conventions page they point you at with
+`confluence_get_page`. Butchr adds no placement logic of its own, so never
+guess a space or parent. The page you create stands alone: nothing binds it
+back to {{KEY}}'s `get_doc`/`set_doc`, so revise it later with
+`confluence_update_page` (by that page's own id) — its "DEPRECATED" note is
+about using it on a ticket's OWN doc instead of `set_doc`; a page you made
+this way isn't one, so this is not the deprecated case.
 
 Ticket comments stay the event stream that wakes people, doc or no doc — a
 `[review]` verdict, an escalation, an answer to a blocked child all still go

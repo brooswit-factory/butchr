@@ -131,15 +131,17 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
       "generic reassignment superseded by adopt_worker for the adoption case, which a brief teaches instead. Its own description still sanctions a raw reassignment that isn't an adoption — a brief doesn't need to teach that narrower, rarer call.",
   },
   confluence_create_page: { taught: true },
-  confluence_update_page: {
-    taught: false,
-    reason: "raw Confluence page CRUD for a page that ISN'T a ticket's own doc; a brief teaches set_doc for the ticket-doc case, which covers what an agent actually needs.",
-  },
+  // FACTORY-112: flipped from taught:false — every issue-tier brief's
+  // on-request paragraph now names this directly, for revising a page
+  // created with confluence_create_page (that is NOT the deprecated
+  // ticket-doc case its own description warns against; set_doc still owns
+  // that case).
+  confluence_update_page: { taught: true },
   confluence_search_pages: { taught: true },
-  confluence_get_page: {
-    taught: false,
-    reason: "raw Confluence page CRUD for a page that ISN'T a ticket's own doc; a brief teaches get_doc for the ticket-doc case, which covers what an agent actually needs.",
-  },
+  // FACTORY-112: flipped from taught:false — every issue-tier brief's
+  // on-request paragraph now names this directly, for reading a
+  // conventions page the requester points an agent at.
+  confluence_get_page: { taught: true },
   confluence_list_spaces: { taught: true },
   get_doc: { taught: true },
   set_doc: { taught: true },

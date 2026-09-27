@@ -254,8 +254,10 @@ against your own key work exactly as they always have. It is NOT a model for
 tickets underneath you — an epic, story, task or bug you staff gets no
 Confluence doc of its own (FACTORY-84/FACTORY-86 retired that automatic
 per-ticket page); if one of them is explicitly asked to write a page, it
-uses `confluence_create_page` with an explicit space and parent, the same as
-you would if asked to write a page yourself.
+uses `confluence_create_page` with an explicit space and parent — the same
+as you would if asked to write a page yourself — revises it later with
+`confluence_update_page` (by that page's own id, not the deprecated case),
+and reads any conventions page it's pointed at with `confluence_get_page`.
 
 ## Sleep: your last act, every session, no exceptions
 

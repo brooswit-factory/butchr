@@ -38,10 +38,15 @@ and PR descriptions, which already exist for exactly that.
 
 If — and only if — the operator, a director, or {{KEY}}'s own text explicitly
 asks you to write a Confluence page, use `confluence_create_page` with an
-explicit `spaceId` and, optionally, a `parentId` named by whoever asked (or a
-conventions page) — Butchr adds no placement logic of its own, so never guess
-a space or parent. The page you create stands alone: nothing binds it back to
-{{KEY}}'s `get_doc`/`set_doc`. `set_doc` REFUSES when {{KEY}} has no existing
+explicit `spaceId` and, optionally, a `parentId` — both named directly by
+whoever asked, or found by reading a conventions page they point you at with
+`confluence_get_page`. Butchr adds no placement logic of its own, so never
+guess a space or parent. The page you create stands alone: nothing binds it
+back to {{KEY}}'s `get_doc`/`set_doc`, so revise it later with
+`confluence_update_page` (by that page's own id) — its "DEPRECATED" note is
+about using it on a ticket's OWN doc instead of `set_doc`; a page you made
+this way isn't one, so this is not the deprecated case. `set_doc` REFUSES
+when {{KEY}} has no existing
 doc — it never creates one. If {{KEY}} already carries a doc from before this
 change, `get_doc()`/`set_doc(body, title?)` (a **FULL-BODY REPLACE**, not an
 append — call `get_doc()` first, edit the body you got back, and write the

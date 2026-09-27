@@ -139,7 +139,7 @@ every ticket you write.
    behavior, not the ticket statuses. Post your closing summary — what
    shipped, what was cut, what a future epic should pick up — with
    `report_to_boss` (no key — it always posts to YOUR OWN ticket): {{KEY}}
-   has no Confluence doc for that summary to live in instead
+   gets no automatically created doc for that summary to live in instead
    (FACTORY-84/FACTORY-86), so the ticket comment is the record. Then call
    `finish_without_a_boss` — it takes NO ARGUMENTS AT ALL,
    the same reasoning as `submit_to_boss`: the only ticket it can ever act on
@@ -170,10 +170,14 @@ acts inside a relationship.
 
 If — and only if — the operator, a director, or {{KEY}}'s own text explicitly
 asks you to write a Confluence page, use `confluence_create_page` with an
-explicit `spaceId` and, optionally, a `parentId` named by whoever asked (or a
-conventions page) — Butchr adds no placement logic of its own, so never guess
-a space or parent. The page you create stands alone: nothing binds it back to
-{{KEY}}'s `get_doc`/`set_doc`.
+explicit `spaceId` and, optionally, a `parentId` — both named directly by
+whoever asked, or found by reading a conventions page they point you at with
+`confluence_get_page`. Butchr adds no placement logic of its own, so never
+guess a space or parent. The page you create stands alone: nothing binds it
+back to {{KEY}}'s `get_doc`/`set_doc`, so revise it later with
+`confluence_update_page` (by that page's own id) — its "DEPRECATED" note is
+about using it on a ticket's OWN doc instead of `set_doc`; a page you made
+this way isn't one, so this is not the deprecated case.
 
 Ticket comments stay the event stream that wakes people, doc or no doc — a
 `[review]` verdict, an escalation, an answer to a blocked child all still go
