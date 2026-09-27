@@ -93,8 +93,16 @@ describe("runPermissionAnswerTick", () => {
     expect(results[0]).toMatchObject({ paneId: "p1", outcome: "answered", tool: "Bash command" });
     expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]); // FACTORY-93: option 1 "Yes", once
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(audit).toHaveLength(2); // "approving" then "approved" — approvePermission's own two-record contract
-    expect(audit.every((r) => r.operator === "test-op")).toBe(true);
+    // "approving" then "approved" — approvePermission's own two-record
+    // contract — plus FACTORY-145's own trailing latency record appended
+    // right after by runPermissionAnswerTick itself.
+    expect(audit).toHaveLength(3);
+    expect(audit.slice(0, 2).every((r) => r.operator === "test-op")).toBe(true);
+    // FACTORY-145: no fastPathTriggers wired in this test, so the answer is
+    // sweep-triggered — carries a trigger tag and NO latencyMs (see
+    // AnswerLatency's own doc comment for why a sweep latency is unknowable).
+    expect(audit.at(-1)).toMatchObject({ paneId: "p1", tool: "Bash command", trigger: "sweep" });
+    expect(audit.at(-1)).not.toHaveProperty("latencyMs");
     expect(lines.some((l) => l.includes("1 answered"))).toBe(true);
     // FACTORY-67: the journal line must name which agent (the eligiblePanes label) and which tool — not just an opaque pane id.
     expect(lines.some((l) => l.includes("p1") && l.includes("answered") && l.includes("Bash command"))).toBe(true);
@@ -140,7 +148,11 @@ describe("runPermissionAnswerTick", () => {
     expect(results[0]?.outcome).toBe("answered");
     expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]);
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(audit.at(-1)).toMatchObject({ outcome: "approved", scope: "once", option: "Yes" });
+    // audit.at(-2) is drovr's own last record ("approved"); audit.at(-1) is
+    // FACTORY-145's own trailing latency record appended right after it.
+    expect(audit.at(-2)).toMatchObject({ outcome: "approved", scope: "once", option: "Yes" });
+    expect(audit.at(-1)).toMatchObject({ paneId: "p1", trigger: "sweep" });
+    expect(audit.at(-1)).not.toHaveProperty("latencyMs");
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -222,6 +234,130 @@ describe("runPermissionAnswerTick", () => {
   });
 });
 
+// FACTORY-145: fast-path latency (ms) + trigger, on both the `answered:`
+// journal line and the `.permission-audit.jsonl` record. A controlled clock
+// (`deps.now`) drives both the trigger instant and the tick's own read of
+// "now", so the elapsed-ms assertions below are exact, never a fuzzy range.
+describe("runPermissionAnswerTick — FACTORY-145 fast-path latency", () => {
+  test("a fast-path trigger produces an exact elapsed-ms latency, tagged trigger:\"fast\", on both the journal line and the audit record", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+    const lines: string[] = [];
+    const fastPathTriggers = new Map<string, number>([["p1", 1_000]]);
+    let clock = 1_000;
+    const now = () => clock;
+
+    clock = 1_247; // 247ms after the trigger instant, per the injected clock
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, log: (l) => lines.push(l), fastPathTriggers, now,
+    });
+
+    expect(results).toHaveLength(1);
+    // The trigger instant is consumed (deleted) once this tick scans the pane.
+    expect(fastPathTriggers.has("p1")).toBe(false);
+    expect(lines.some((l) => l.includes("fast") && l.includes("247ms"))).toBe(true);
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(audit.at(-1)).toMatchObject({ paneId: "p1", label: "p1", tool: "Bash command", trigger: "fast", latencyMs: 247 });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a sweep-triggered answer (no fastPathTriggers entry for this pane) reports no fast-path latency at all — omitted, not zero", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+    const lines: string[] = [];
+    // fastPathTriggers IS wired in (unlike the plain sweep-only tests above),
+    // but carries no entry for p1 — the case a pane the fast path never saw
+    // blocked still gets caught by the periodic scan.
+    const fastPathTriggers = new Map<string, number>();
+
+    await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, log: (l) => lines.push(l), fastPathTriggers, now: () => 5_000 });
+
+    expect(lines.some((l) => l.includes("answered:"))).toBe(true);
+    expect(lines.some((l) => /\bms\b/.test(l))).toBe(false); // no elapsed-ms number anywhere in the journal line
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const latencyRecord = audit.at(-1);
+    expect(latencyRecord).toMatchObject({ paneId: "p1", trigger: "sweep" });
+    expect(latencyRecord).not.toHaveProperty("latencyMs");
+    expect(Object.prototype.hasOwnProperty.call(latencyRecord, "latencyMs")).toBe(false); // not even `latencyMs: null`
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("audit record shape: exact fields + types for a fast-path answer", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+    const fastPathTriggers = new Map<string, number>([["p1", 0]]);
+
+    await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, fastPathTriggers, now: () => 42 });
+
+    const record = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1);
+    expect(typeof record.ts).toBe("string");
+    expect(() => new Date(record.ts).toISOString()).not.toThrow(); // ts is a real ISO wall-clock timestamp, not the monotonic clock
+    expect(typeof record.paneId).toBe("string");
+    expect(typeof record.label).toBe("string");
+    expect(typeof record.tool).toBe("string");
+    expect(typeof record.request).toBe("string");
+    expect(record.trigger).toBe("fast");
+    expect(typeof record.latencyMs).toBe("number");
+    expect(Number.isFinite(record.latencyMs)).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("audit record shape: exact fields + types for a sweep-triggered answer — latencyMs key absent entirely", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: NO_ALWAYS_SCREEN });
+
+    await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath });
+
+    const record = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1);
+    expect(typeof record.ts).toBe("string");
+    expect(typeof record.paneId).toBe("string");
+    expect(typeof record.label).toBe("string");
+    expect(typeof record.tool).toBe("string");
+    expect(typeof record.request).toBe("string");
+    expect(record.trigger).toBe("sweep");
+    expect(Object.keys(record).sort()).toEqual(["label", "paneId", "request", "tool", "trigger", "ts"]);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a failing appendAudit (the latency record's own write) is caught, logged, and never affects the answer itself or a later pane's audit write", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN, p2: NO_ALWAYS_SCREEN });
+    const lines: string[] = [];
+    let calls = 0;
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, log: (l) => lines.push(l),
+      appendAudit: async (path, line) => {
+        calls++;
+        if (calls === 1) throw new Error("disk full");
+        const { appendFile, mkdir } = await import("node:fs/promises");
+        const { dirname } = await import("node:path");
+        await mkdir(dirname(path), { recursive: true });
+        await appendFile(path, line);
+      },
+    });
+
+    expect(results).toHaveLength(2); // both panes still answered — the answer itself never depended on the latency-audit write
+    expect(results.every((r) => r.outcome === "answered")).toBe(true);
+    expect(sendKeysCalls).toHaveLength(2);
+    expect(lines.some((l) => l.includes("latency audit write failed") && l.includes("disk full"))).toBe(true);
+    // The second pane's own latency record still landed despite the first one's write failing.
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(audit.some((r) => r.paneId === "p2" && r.trigger === "sweep")).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("startPermissionAnswerLoop", () => {
   test("guards against overlapping ticks: a slow tick makes the next timer firing a no-op instead of running concurrently", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
@@ -290,19 +426,19 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
       expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
     });
 
-    test(`negative (${label}): lizardMode absent on the owning rule leaves the agent untouched`, () => {
+    test(`positive (${label}): FACTORY-138 — lizardMode absent on the owning rule (found, field unset) is now ELIGIBLE by default, labelled by its resource id's basename`, () => {
       const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
       const deps: RuleLizardModeDeps = {
         rules: [rule({ id: "lz", resourceProvider })],
         isManagedSessionAgent: noManagedSession,
         managedSessionLizardModes: emptyMap,
       };
-      expect(ruleLizardModeOf(id, deps)).toBe(false);
-      expect(lizardModeLabelFor(id, deps)).toBeUndefined();
+      expect(ruleLizardModeOf(id, deps)).toBe(true);
+      expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
     });
   }
 
-  test("negative: lizardMode: false explicitly is the same as absent", () => {
+  test("negative: FACTORY-138 — an EXPLICIT lizardMode: false on the owning rule opts out, no longer the same as absent (absent is now eligible)", () => {
     const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "lz", resourceId: "BUTCHR-7" });
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: false })],

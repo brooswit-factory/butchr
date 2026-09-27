@@ -417,17 +417,29 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * definition opted into "lizard mode" (`SessionDefinition.lizardMode`).
    * The permission-answer timer (`src/agents/permission-answer-loop.ts`,
    * wired in `src/daemon/index.ts`) consults this map every tick to decide
-   * which panes it may scan/answer at all — a definition absent from this
-   * map (not yet observed this daemon's lifetime, or simply never setting
-   * the field) is never touched, matching `lizardMode`'s own "absent means
-   * today's behaviour exactly" contract. Deliberately live, not
-   * persisted-at-spawn like `permissionMode`/`strictMcpConfig` (FACTORY-43)
-   * — this field never reaches the launched process's argv, so there is
-   * nothing for a stale-argv check to compare and no respawn-loop risk to
-   * guard against; toggling it in the manifest takes effect on this loop's
-   * very next poll, live, with no agent restart. Optional; omitted, no
-   * lizard-mode information is surfaced (today's behaviour — every caller
-   * before this ticket, and any direct call that does not opt in).
+   * which panes it may scan/answer at all — a definition absent from THIS
+   * MAP (not yet observed this daemon's lifetime — before its first poll
+   * completes) is never touched, the one case this field still can't cover.
+   * FACTORY-138 (operator decision, FACTORY-67 director comment 2026-09-26
+   * 22:24Z): once observed, a `vendor: "claude"` definition that never sets
+   * `lizardMode` at all is now filled in here as ELIGIBLE (see the fill
+   * site immediately below) — only an explicit `false` resolves
+   * not-eligible. This pairs with `agentLaunchConfig`'s own new
+   * `acceptEdits` default (src/agents/argv.ts): an accept-edits agent with
+   * no lizard coverage is exactly the DROVR-37 freeze shape, so the two
+   * ship together. A `vendor: "codex"` definition CANNOT set this field at
+   * all (rejected at manifest load) and stays at `false` even when absent —
+   * the new default deliberately does not reach it (see the fill site's own
+   * comment for why), inert until FACTORY-106/FACTORY-108. Deliberately
+   * live, not persisted-at-spawn like
+   * `permissionMode`/`strictMcpConfig` (FACTORY-43) — this field never
+   * reaches the launched process's argv, so there is nothing for a
+   * stale-argv check to compare and no respawn-loop risk to guard against;
+   * toggling it in the manifest (or its default changing, as here) takes
+   * effect on this loop's very next poll, live, with no agent restart.
+   * Optional; omitted entirely, no lizard-mode information is surfaced at
+   * all (a caller that opts out of this map completely, not a definition
+   * within it).
    */
   lizardModes?: Map<string, boolean>;
   /**
@@ -499,7 +511,19 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
         latest = matches;
         if (deps.lizardModes) {
           deps.lizardModes.clear();
-          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? false);
+          // FACTORY-138: absent now means eligible for a `vendor: "claude"`
+          // definition (butchr's default is accept-edits + lizard mode
+          // together) — only an EXPLICIT `false` opts one out. A `vendor:
+          // "codex"` definition can never SET this field at all (rejected
+          // at manifest load — see `sessionDefinitionProblems`,
+          // src/resources/session-definition.ts), so it always reads
+          // `undefined` here; unlike a Rule's `lizardMode` (which has no
+          // fixed vendor and already applies uniformly for an explicit
+          // `true`), this field's hard rejection for Codex is a stronger
+          // signal that the DEFAULT must not silently reach it either —
+          // kept at its pre-FACTORY-138 `false` deliberately, inert until
+          // FACTORY-106/FACTORY-108 gives Codex its own dialog recognition.
+          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? (m.definition.vendor === "claude"));
         }
         return groupExecutionUnits([deps.rule], matches);
       },
