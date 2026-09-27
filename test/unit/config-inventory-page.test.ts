@@ -5,7 +5,12 @@ import { agentRowAnchorId } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { sessionAgentKey, sessionFreezeStoreKey } from "../../src/resources/session-freeze.js";
 import type { Rule } from "../../src/rules/rules.js";
-import type { AdmissionView, AgentDashboardRow, DashboardResponse, DashboardRow, WithheldDashboardRow } from "../../src/agents/dashboard.js";
+import {
+  createDashboardFeed,
+  type AdmissionView, type AgentDashboardRow, type DashboardResponse, type DashboardRow, type WithheldDashboardRow,
+} from "../../src/agents/dashboard.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
@@ -20,6 +25,10 @@ const noAdmissionView: AdmissionView = { cap: 10, residency: 0, sentinels: 0, so
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true };
 function checkedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
   return { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+}
+/** FACTORY-132: the agent census is unavailable — `rows`, when given, models a STALE carry-forward (a poll failed after an earlier success), never a fresh one (the response-level `checked:false` is what the render layer must key on, not `rows.length`). */
+function uncheckedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
+  return { checked: false, declinedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
 }
 function agentRow(resourceKey: string): AgentDashboardRow {
   return { kind: "agent", resourceKey, tier: { kind: "project" }, agentStatus: "working", pane: "p1", timeInStatus: floor, confirmedAt: new Date(0).toISOString() };
@@ -44,8 +53,14 @@ const goodDefinition = (over: Record<string, unknown> = {}) => JSON.stringify({
   workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });
 
+// FACTORY-132: `agentCensusChecked` defaults to `true` (the checked state) —
+// every existing test in this file below models a checked census and never
+// passes this option itself, so defaulting it keeps every pre-existing
+// "no running agent" / "UNSTAFFED: disabled" assertion valid and UNMODIFIED,
+// per this ticket's own instruction. Only the NEW describe block at the
+// bottom of this file overrides it to `false`.
 function opts(over: Partial<RenderConfigInventoryOpts> = {}): RenderConfigInventoryOpts {
-  return { dashboardLinkHref: (key) => `/#${agentRowAnchorId(key)}`, ...over };
+  return { dashboardLinkHref: (key) => `/#${agentRowAnchorId(key)}`, agentCensusChecked: true, ...over };
 }
 
 function rowSlice(html: string, keyText: string, marker = 'class="key"'): string {
@@ -503,5 +518,182 @@ describe("renderConfigInventory — resolved model/effort (FACTORY-120)", () => 
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     const row = rowSlice(html, "bare-pref");
     expect(row).toContain("codex — Model: default · Effort: default");
+  });
+});
+
+// ---- FACTORY-132: agent-census-unavailable rendering (staffing + cross-links) ----
+
+describe("renderConfigInventory — agent-census-unavailable rendering (FACTORY-132)", () => {
+  test("an enabled rule with no match renders COULD NOT CHECK for BOTH the staffing cell and the cross-link area, never UNSTAFFED or 'no running agent'", async () => {
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: uncheckedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+    expect(inventory.rules[0]!.reason).not.toBeNull();
+
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts({ agentCensusChecked: false }));
+    const row = rowSlice(html, "task");
+    expect(row.toUpperCase()).not.toContain("UNSTAFFED");
+    expect(row).not.toContain("no running agent");
+    // TWO independent COULD NOT CHECK renderings on this one row — the
+    // staffing cell (`renderStaffed`) AND the cross-link area
+    // (`renderAgentLinks`) — proving both halves of this ticket fired, not
+    // just one masking the other's absence.
+    expect(row.match(/COULD NOT CHECK/g)?.length ?? 0).toBe(2);
+    expect(row).toMatch(/<span class="staffed cnc">COULD NOT CHECK/);
+  });
+
+  test("a session-definition row's cross-link area renders COULD NOT CHECK, never 'no running agent', when the census is unavailable", async () => {
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [], error: null },
+      dashboard: uncheckedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts({ agentCensusChecked: false }));
+    const row = rowSlice(html, "idle.json");
+    expect(row).toContain("COULD NOT CHECK");
+    expect(row).not.toContain("no running agent");
+    expect(row).toMatch(/class="cnc"/);
+  });
+
+  test("a DISABLED rule's staffing cell stays 'UNSTAFFED: disabled' (a config fact, AC4) while its OWN cross-link area independently renders COULD NOT CHECK (AC3's flat rule) — the two axes are independent", async () => {
+    const r = rule({ id: "project-managers", resourceProvider: "jira-work", enabled: false });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: uncheckedDashboard(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, [], opts({ agentCensusChecked: false }));
+    const row = rowSlice(html, "project-managers");
+    expect(row).toContain("UNSTAFFED: disabled");
+    expect(row).not.toContain("no running agent");
+    // Exactly ONE COULD NOT CHECK on this row — from the cross-link area
+    // only; the staffing cell stays UNSTAFFED, unaffected by census state.
+    expect(row.match(/COULD NOT CHECK/g)?.length ?? 0).toBe(1);
+  });
+
+  test("a rule whose live agent row is present (even if stale) still links and reads 'staffed', regardless of census state — AC3's first case, unaffected by this ticket", async () => {
+    const r = rule({ id: "my-ideas", resourceProvider: "jira-idea" });
+    const liveKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
+    const staleRow = agentRow(liveKey);
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: uncheckedDashboard([staleRow]),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]).toMatchObject({ staffed: true, reason: null });
+
+    const html = renderConfigInventory({ ok: true, inventory }, [staleRow], opts({ agentCensusChecked: false }));
+    const row = rowSlice(html, "my-ideas");
+    expect(row).toContain(">staffed<");
+    expect(row).toContain(liveKey);
+    expect(row).not.toContain("COULD NOT CHECK");
+  });
+});
+
+// ---- FACTORY-132: end to end through a REAL createDashboardFeed (AC5) ----
+// Never a hand-assembled DashboardResponse: a real feed's snapshot before
+// any poll, and after a poll whose list() throws (including the
+// failed-after-a-good-poll variant), fed into the real
+// buildQueryAgentInventory, then the real renderConfigInventory — and the
+// transition back to known states after a real successful poll, for BOTH a
+// rule row and a session-definition row, pinning that the discriminator is
+// the real census flag and not an always-on message.
+
+/** Same harmless admission fixture as dashboard.test.ts's own `noWithholding()` — this block only exercises the agent.list()/census axis. */
+function noWithholding() {
+  return createAdmissionController({ cap: 1_000_000, residency: async () => [] });
+}
+function realFeed(now: () => number) {
+  const admission = noWithholding();
+  return createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+}
+
+describe("renderConfigInventory — end to end through a REAL createDashboardFeed (FACTORY-132, AC5)", () => {
+  test("before any poll: a rule row AND a session-definition row both render COULD NOT CHECK, never UNSTAFFED or 'no running agent'", async () => {
+    const f = realFeed(() => 0);
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+
+    const html = renderConfigInventory({ ok: true, inventory }, f.snapshot().rows, opts({ agentCensusChecked: f.snapshot().checked }));
+    const ruleRow = rowSlice(html, "task");
+    expect(ruleRow.toUpperCase()).not.toContain("UNSTAFFED");
+    expect(ruleRow).not.toContain("no running agent");
+    expect(ruleRow).toContain("COULD NOT CHECK");
+    const sessionRow = rowSlice(html, "idle.json");
+    expect(sessionRow).toContain("COULD NOT CHECK");
+    expect(sessionRow).not.toContain("no running agent");
+  });
+
+  test("a poll that fails AFTER an earlier good poll renders the SAME COULD NOT CHECK page for a rule with no match — the stale-carry-forward case", async () => {
+    let now = 1000;
+    const f = realFeed(() => now);
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    await f.poll(async () => ({ agents: [] }));
+
+    now = 5000;
+    await expect(f.poll(async () => { throw new Error("agent.list: boom"); })).rejects.toThrow("agent.list: boom");
+    expect(f.snapshot().checked).toBe(false);
+
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+    const html = renderConfigInventory({ ok: true, inventory }, f.snapshot().rows, opts({ agentCensusChecked: f.snapshot().checked }));
+    const row = rowSlice(html, "task");
+    expect(row).toContain("COULD NOT CHECK");
+    expect(row.toUpperCase()).not.toContain("UNSTAFFED");
+    expect(row).not.toContain("no running agent");
+  });
+
+  test("after a successful poll, a rule row AND a session-definition row both transition to known states — proving the discriminator is the real census flag, not an always-on message", async () => {
+    const f = realFeed(() => 9000);
+    const r = rule({ id: "my-ideas", resourceProvider: "jira-idea" });
+    const liveKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
+    const activeDir = "/defs";
+    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
+
+    await f.poll(async () => ({ agents: [{ resource_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
+    expect(f.snapshot().checked).toBe(true);
+
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]).toMatchObject({ staffed: true, reason: null });
+
+    const html = renderConfigInventory({ ok: true, inventory }, f.snapshot().rows, opts({ agentCensusChecked: f.snapshot().checked }));
+    const ruleRow = rowSlice(html, "my-ideas");
+    expect(ruleRow).toContain(">staffed<");
+    expect(ruleRow).toContain(liveKey);
+    expect(ruleRow).not.toContain("COULD NOT CHECK");
+
+    // Genuinely no match for the session definition, but the census IS
+    // available now — the pre-existing, unchanged "no running agent" wording.
+    const sessionRow = rowSlice(html, "idle.json");
+    expect(sessionRow).toContain("no running agent");
+    expect(sessionRow).not.toContain("COULD NOT CHECK");
   });
 });

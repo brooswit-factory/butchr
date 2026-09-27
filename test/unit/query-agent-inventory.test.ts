@@ -5,7 +5,12 @@ import {
 } from "../../src/agents/query-agent-inventory.js";
 import type { Rule } from "../../src/rules/rules.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
-import type { AdmissionView, AgentDashboardRow, DashboardResponse, WithheldDashboardRow } from "../../src/agents/dashboard.js";
+import {
+  createDashboardFeed, initialDashboardSnapshot,
+  type AdmissionView, type AgentDashboardRow, type DashboardResponse, type WithheldDashboardRow,
+} from "../../src/agents/dashboard.js";
+import { createAdmissionController } from "../../src/agents/admission.js";
+import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
@@ -93,11 +98,12 @@ describe("ruleStaffingReason — the real, computed vocabulary (FACTORY-72)", ()
     expect(result.reason).toContain("admission cap");
   });
 
-  test("before the first successful poll, reports 'not yet observed' rather than a false 'no matches'", () => {
+  test("FACTORY-132: when the agent census is unavailable, reports staffed:null (could-not-check) rather than a false 'not staffed'", () => {
     const r = rule({ id: "task", resourceProvider: "jira-work" });
     const result = ruleStaffingReason(r, { configReason: null, live: new Set(), withheld: new Set(), dashboardChecked: false });
-    expect(result.staffed).toBe(false);
-    expect(result.reason).toContain("not yet observed");
+    expect(result.staffed).toBeNull();
+    expect(result.reason).toContain("census unavailable");
+    expect(result.reason).not.toBeNull();
   });
 
   test("a genuine, observed zero for a swarm rule is worded as 'no matching resources'", () => {
@@ -212,7 +218,7 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
     expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" });
   });
 
-  test("before this daemon's first successful poll, every enabled rule reports 'not yet observed' end to end", async () => {
+  test("FACTORY-132: while the agent census is unavailable, every enabled rule reports staffed:null (could-not-check) end to end", async () => {
     const r = rule({ id: "task", resourceProvider: "jira-work" });
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
@@ -220,7 +226,8 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       configReasonFor: noConfigReason,
       sessionDefinitions: fakeSessionDefinitions({}),
     });
-    expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "not yet observed: no successful agent-list poll since this daemon started" });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+    expect(inventory.rules[0]!.reason).toContain("census unavailable");
   });
 
   test("a rules-file load error surfaces in top-level errors, and rules is empty — never a daemon crash", async () => {
@@ -429,5 +436,139 @@ describe("buildQueryAgentInventory — resolved model/effort (FACTORY-120)", () 
     // Literal spot-check from power-scale.ts's own tables: modelPower 95 -> "fable" (85-100
     // band), effortPower 10 -> "low" (0-19 band).
     expect(entry.agentPreferences).toEqual([{ harness: "claude", model: "fable", effort: "low" }]);
+  });
+});
+
+// ---- FACTORY-132: the census-unavailable tri-state, through a REAL --------
+// createDashboardFeed (never a hand-assembled DashboardResponse) — AC5's own
+// "real production code paths" requirement. `checkedDashboard`/
+// `uncheckedDashboard` above stay for the OTHER describe blocks' own,
+// already-passing coverage of `ruleStaffingReason` in isolation; this block
+// additionally drives the real feed end to end.
+
+/** Same harmless admission fixture as dashboard.test.ts's own `noWithholding()` — this block only exercises the agent.list()/census axis, never admission withholding. */
+function noWithholding() {
+  return createAdmissionController({ cap: 1_000_000, residency: async () => [] });
+}
+
+function realFeed(now: () => number) {
+  const admission = noWithholding();
+  return createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+}
+
+describe("buildQueryAgentInventory — the census-unavailable tri-state through a REAL createDashboardFeed (FACTORY-132)", () => {
+  test("before any poll has ever run, an enabled rule with no match reports staffed:null, reason mentioning 'census unavailable' — never UNSTAFFED", async () => {
+    const f = realFeed(() => 0);
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+    expect(inventory.rules[0]!.reason).toContain("census unavailable");
+    expect(JSON.stringify(inventory)).not.toContain("UNSTAFFED");
+  });
+
+  test("a poll that fails AFTER an earlier good poll ALSO reports staffed:null for a rule with no match, with the IDENTICAL reason text as never-polled-at-all — the 'true in both cases' requirement", async () => {
+    let now = 1000;
+    const f = realFeed(() => now);
+    const r = rule({ id: "task", resourceProvider: "jira-work" }); // never matches any agent below
+
+    await f.poll(async () => ({ agents: [] })); // a genuine, observed zero
+    const observedZero = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(observedZero.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
+
+    now = 5000;
+    await expect(f.poll(async () => { throw new Error("agent.list: connection closed"); })).rejects.toThrow("agent.list: connection closed");
+    expect(f.snapshot().checked).toBe(false); // the most recent poll failed
+
+    const staleInventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(staleInventory.rules[0]!.staffed).toBeNull();
+    const staleReason = staleInventory.rules[0]!.reason;
+    expect(staleReason).toContain("census unavailable");
+
+    const neverPolled = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: initialDashboardSnapshot(() => 0, noWithholding().census()),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    // The exact wording this ticket's own DoD requires: identical whether
+    // this daemon has never polled at all, or its most recent poll failed
+    // after an earlier success — both are "the most recent poll did not
+    // succeed", the one true claim covering both shapes.
+    expect(neverPolled.rules[0]!.reason).toBe(staleReason);
+  });
+
+  test("a rule whose live agent row is carried forward STALE after a failed poll still reads staffed:true — 'agent wins' is unaffected by the tri-state change (the epic's own documented nuance, not a bug)", async () => {
+    let now = 1000;
+    const f = realFeed(() => now);
+    const r = rule({ id: "my-ideas", resourceProvider: "jira-idea" });
+    const liveKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
+
+    await f.poll(async () => ({ agents: [{ resource_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
+    const staffedNow = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(staffedNow.rules[0]).toMatchObject({ staffed: true, reason: null });
+
+    now = 5000;
+    await expect(f.poll(async () => { throw new Error("boom"); })).rejects.toThrow();
+    expect(f.snapshot().checked).toBe(false);
+    expect(f.snapshot().rows).toHaveLength(1); // carried forward, byte-identical
+
+    const staleButStillLinked = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: f.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    // NOT staffed:null — a matching live (if stale) row wins over an
+    // unavailable census, exactly as AC3 documents for the render layer.
+    expect(staleButStillLinked.rules[0]).toMatchObject({ staffed: true, reason: null });
+  });
+
+  test("after a successful poll following a failure, the same no-match rule transitions from staffed:null back to a known state — proving the discriminator is the real census flag, not an always-on message", async () => {
+    let now = 1000;
+    const f = realFeed(() => now);
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+
+    now = 5000;
+    await expect(f.poll(async () => { throw new Error("boom"); })).rejects.toThrow();
+    const unknown = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason, sessionDefinitions: fakeSessionDefinitions({}) });
+    expect(unknown.rules[0]!.staffed).toBeNull();
+
+    now = 9000;
+    await f.poll(async () => ({ agents: [] })); // recovers — a genuine, observed zero
+    const recovered = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason, sessionDefinitions: fakeSessionDefinitions({}) });
+    expect(recovered.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
+  });
+
+  test("AC4 control: a disabled rule stays 'disabled' even while the agent census is unavailable — a config fact, not a census fact", () => {
+    const r = rule({ id: "project-managers", resourceProvider: "jira-work", enabled: false });
+    const result = ruleStaffingReason(r, { configReason: null, live: new Set(), withheld: new Set(), dashboardChecked: false });
+    expect(result).toEqual({ staffed: false, reason: "disabled" });
+  });
+
+  test("AC4 control: a provider config-reason rule keeps that reason even while the agent census is unavailable — a config fact, not a census fact", () => {
+    const r = rule({ id: "gh-triage", resourceProvider: "github-issue" });
+    const reason = "github-issue rules not staffed (gh-triage): set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS";
+    const result = ruleStaffingReason(r, { configReason: reason, live: new Set(), withheld: new Set(), dashboardChecked: false });
+    expect(result).toEqual({ staffed: false, reason });
   });
 });
