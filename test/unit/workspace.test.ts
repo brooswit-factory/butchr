@@ -334,9 +334,16 @@ describe("briefFor / modelFor", () => {
       expect(briefFor(t)).toContain("not an append");
     }
   });
-  test("reviewing tiers' checklists reject on doc staleness", () => {
-    expect(briefFor("Epic")).toContain("doc actually reflects");
-    expect(briefFor("Story")).toContain("doc actually reflects");
+  // FACTORY-112: FACTORY-84/FACTORY-86 retired automatic per-ticket doc
+  // creation, so a boss can no longer assume its worker has a doc to check —
+  // the staleness check is now conditional on one having been explicitly
+  // requested and existing, not an unconditional part of every review.
+  test("reviewing tiers' checklists reject on doc staleness, conditionally on a doc actually existing", () => {
+    for (const brief of [briefFor("Epic"), briefFor("Story")]) {
+      const collapsed = brief.replace(/\s+/g, " ");
+      expect(collapsed).toContain("staleness there reads as authoritative, so a stale page is grounds to reject");
+      expect(collapsed).toContain("have no doc at all");
+    }
   });
   test("the captain's-log convention is fully gone — no title format, no convention link, in any brief", () => {
     for (const t of ["Epic", "Story", "Task", "Bug"]) {

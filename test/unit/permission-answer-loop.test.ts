@@ -197,6 +197,37 @@ describe("runPermissionAnswerTick", () => {
     expect(lines.some((l) => l.includes("tick failed") && l.includes("herdr socket down"))).toBe(true);
   });
 
+  test("FACTORY-100/FACTORY-103: onApproved fires once per answered pane, and a throwing onApproved never fails the tick", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN, p2: ALWAYS_ALLOW_SCREEN });
+    let onApprovedCalls = 0;
+
+    const results = await runPermissionAnswerTick({
+      client,
+      eligiblePanes: allEligible,
+      auditPath,
+      onApproved: () => { onApprovedCalls++; throw new Error("boom — must never propagate"); },
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results.every((r) => r.outcome === "answered")).toBe(true);
+    expect(onApprovedCalls).toBe(2); // once per answered pane, despite each call throwing
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("onApproved is never called for a skipped or failed pane, and is optional (omitting it changes nothing)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "some ordinary working pane, nothing pending here" });
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath });
+
+    expect(results).toEqual([]); // nothing answered, nothing to hook
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("readTimeoutMs and operator, when given, are forwarded through to autoAnswerPermissions (operator lands in the audit record)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");

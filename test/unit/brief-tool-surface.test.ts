@@ -257,3 +257,87 @@ describe("BUTCHR-257: total brief-coverage accounting of the derived tool regist
     expect(findTaughtFalseButNamedVerbs(BRIEF_COVERAGE, new Set(realTaughtFalseVerbs)).sort()).toEqual([...realTaughtFalseVerbs].sort());
   });
 });
+
+/**
+ * FACTORY-112: guards the prose contract FACTORY-84/FACTORY-86 shipped in
+ * code (Butchr never auto-creates a per-ticket Confluence doc; `set_doc`
+ * refuses when a ticket has none; the on-request path is
+ * `confluence_create_page` with an explicit space/parent). This exists so a
+ * future edit that reintroduces "your ticket already has a doc" language, or
+ * drops the on-request guidance, fails a test instead of only being caught
+ * by a human re-reading every brief.
+ *
+ * `project.md` is EXCLUDED from the "no per-ticket doc" assertions: a
+ * project's ROOT doc is a genuinely different thing (provisioned ahead of
+ * time, one per project, `get_doc`/`set_doc` behavior unchanged by
+ * FACTORY-84/FACTORY-86) and its brief is expected to keep telling the
+ * project agent to keep THAT doc current — see project.md's own "Keep your
+ * doc current" section (that is its actual, unrenamed heading — the other
+ * five tiers' equivalent section is "Confluence pages: on request only").
+ * It still gets the on-request assertions below, since a project agent can
+ * also be asked to write an ordinary Confluence page.
+ */
+describe("FACTORY-112: briefs stop teaching per-ticket doc maintenance; on-request flow is documented", () => {
+  // AGENTS.md/CLAUDE.md are generic pointer files ("read brief.md and follow
+  // it") — they carry no doc-workflow prose of their own, issue-type or
+  // otherwise, so they're excluded from both assertions below the same way
+  // project.md is excluded from the first.
+  const files = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md") && f !== "AGENTS.md" && f !== "CLAUDE.md");
+  const issueTierFiles = files.filter((f) => f !== "project.md");
+
+  test("no brief claims a ticket already has, or gets, a per-ticket Confluence doc", () => {
+    const offenders: Array<{ file: string; phrase: string }> = [];
+    const bannedPhrases = [
+      /keep your doc current/i,
+      /already has a confluence doc/i,
+      /already linked, already nested/i,
+      /created together with it/i,
+      /nests? under your (?:root|own) doc automatically/i,
+      // FACTORY-112 review round 1: Butchr DID auto-create a per-ticket doc
+      // before FACTORY-84/FACTORY-86 retired that path — "it never has" is a
+      // false historical claim, not merely stale prose, and the very same
+      // sections go on to describe a leftover doc from before this change,
+      // which directly contradicts "never". Say it stopped, not that it
+      // never happened.
+      /it never has\b/i,
+    ];
+    for (const file of issueTierFiles) {
+      const text = readFileSync(join(BRIEFS_DIR, file), "utf8");
+      for (const phrase of bannedPhrases) {
+        if (phrase.test(text)) offenders.push({ file, phrase: phrase.source });
+      }
+    }
+    expect(offenders, offenders.map((o) => `${o.file} still matches /${o.phrase}/ — FACTORY-84/FACTORY-86 retired automatic per-ticket doc creation`).join("\n")).toEqual([]);
+  });
+
+  test("every issue-tier brief documents the on-request Confluence flow (confluence_create_page, confluence_update_page, confluence_get_page, explicit space/parent) and that set_doc refuses with no doc", () => {
+    const missing: Array<{ file: string; what: string }> = [];
+    for (const file of issueTierFiles) {
+      const text = readFileSync(join(BRIEFS_DIR, file), "utf8");
+      if (!/confluence_create_page/.test(text)) missing.push({ file, what: "confluence_create_page" });
+      if (!/confluence_update_page/.test(text)) missing.push({ file, what: "confluence_update_page, for revising a page created on request" });
+      if (!/confluence_get_page/.test(text)) missing.push({ file, what: "confluence_get_page, for reading a conventions page" });
+      if (!/explicitly\s+ask/i.test(text)) missing.push({ file, what: '"explicitly ask(s/ed)" framing for the on-request trigger' });
+      // FACTORY-112 review round 2: the previous /set_doc.*refuses|refuses.*set_doc/is
+      // had the dotall flag and an unbounded `.*`, so it matched ANY "refuses" anywhere
+      // in the file (adopt_worker's, finish_without_a_boss's, tell_worker's, ...) whether
+      // or not the actual contract sentence was present — mutation-verified to still pass
+      // with the real sentence deleted from four of the five files. This anchors on the
+      // specific claim instead: case-sensitive on "REFUSES" (the briefs' own convention
+      // for a hard tool-level refusal), `\s+` absorbing hard line wraps, and requiring
+      // "when {{KEY}} has no [existing] doc" right after it.
+      if (!/REFUSES\s+(?:outright\s+)?when\s+\{\{KEY\}\}\s+has\s+no\s+(?:existing\s+)?doc/.test(text)) missing.push({ file, what: "set_doc refuses with no existing doc" });
+    }
+    expect(missing, missing.map((m) => `${m.file} is missing: ${m.what}`).join("\n")).toEqual([]);
+  });
+
+  test("project.md's root-doc guidance never implies a per-ticket doc is auto-created for one of the project's own epics", () => {
+    const text = readFileSync(join(BRIEFS_DIR, "project.md"), "utf8");
+    expect(text).not.toMatch(/unlike a freshly created per-ticket doc/i);
+    expect(text).not.toMatch(/epic'?s doc nests under your root doc automatically/i);
+    // The on-request flow still belongs here too, for when the project agent itself is asked to write a page.
+    expect(text).toMatch(/confluence_create_page/);
+    expect(text).toMatch(/confluence_update_page/);
+    expect(text).toMatch(/confluence_get_page/);
+  });
+});
