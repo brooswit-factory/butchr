@@ -6,6 +6,8 @@ import type { HealthStatus } from "../daemon/health.js";
 import type { DashboardResponse } from "../agents/dashboard.js";
 import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../agents/config-inventory-links.js";
+import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
+import { checkBearerOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "./bearer-origin-guard.js";
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -60,10 +62,34 @@ export interface ViewDeps {
    * that I/O is unavoidable and acceptable here.
    */
   configInventory: () => Promise<QueryAgentInventory>;
+  /**
+   * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the
+   * `GET /resources/for-url` body — see `../resources/resource-lookup.ts`'s
+   * own header for why this reads the staffed-agent registry
+   * (`dashboard()`'s SAME snapshot, never a second poll or a re-run query)
+   * rather than doing any I/O of its own. Optional so every pre-existing
+   * `ViewDeps` literal in this codebase's own tests keeps compiling
+   * unchanged; `extensionAuth` below defaults to disabled when either is
+   * absent, so an omitted `resourcesForUrl` is never reachable anyway.
+   */
+  resourcesForUrl?: (url: string) => Promise<ResourcesForUrlResponse>;
+  /**
+   * FACTORY-339: the bearer-token + Origin-allowlist guard config for
+   * `GET /resources/for-url` (see `./bearer-origin-guard.ts`). Optional,
+   * same reasoning as `resourcesForUrl` above — absent means disabled, the
+   * same "never silently open" default the guard itself enforces for an
+   * `undefined` token.
+   */
+  extensionAuth?: BearerOriginGuardDeps;
 }
 
 /** The live view: the page, its data (/state), the connected-agents feed (/agents), and the open action. */
 export function liveView(mcp: McpHandle, deps: ViewDeps) {
+  // FACTORY-339: `undefined` (either half omitted) means DISABLED, never
+  // open — see `ViewDeps.extensionAuth`'s own doc comment and
+  // `bearer-origin-guard.ts`'s header for why an absent token must never
+  // read as "no auth required".
+  const extensionAuth: BearerOriginGuardDeps = deps.extensionAuth ?? { token: undefined, allowedOrigins: [] };
   return new Elysia()
     // BUTCHR-339: the dashboard page itself — a pure, synchronous render
     // (src/web/dashboard-page.ts) of the SAME snapshot `/dashboard` serves,
@@ -173,5 +199,34 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       set.status = 302;
       set.headers["location"] = r.url;
       return "";
+    })
+    // FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the ONLY
+    // guarded route in this file — every other route above is deliberately
+    // unauthenticated (see `docs/resources-for-url.md`'s own "why not the
+    // others" note). Never open the same way `/dashboard`/`/agents` are:
+    // `extensionAuth` above is `{ token: undefined, allowedOrigins: [] }`
+    // whenever this daemon's config doesn't set `BUTCHR_EXTENSION_TOKEN`, and
+    // `checkBearerOrigin` turns that into a hard 503 refusal per request,
+    // never a fallback to "unauthenticated". `deps.resourcesForUrl` is only
+    // ever called once the guard has already said `ok`.
+    .options("/resources/for-url", ({ request, set }) => {
+      const preflight = preflightBearerOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      set.status = preflight.status;
+      for (const [k, v] of Object.entries(preflight.headers)) set.headers[k] = v;
+      return "";
+    })
+    .get("/resources/for-url", async ({ request, query, set }) => {
+      const guard = checkBearerOrigin({ authorization: request.headers.get("authorization"), origin: request.headers.get("origin") }, extensionAuth);
+      for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: no token configured" }; }
+      // `query.url` is the raw `?url=` value; Elysia decodes it the same way
+      // `URLSearchParams` would, so the ticket's own `url=<percent-encoded>`
+      // contract needs no extra decoding here. Absent entirely is treated as
+      // the empty string — `resolveUrlToResource("")` already resolves to
+      // `{ canonicalUrl: null, resource: null }`, the same normal "not a
+      // resource" shape as any other unparseable input, never a special error.
+      const url = typeof query["url"] === "string" ? query["url"] : "";
+      return deps.resourcesForUrl(url);
     });
 }
