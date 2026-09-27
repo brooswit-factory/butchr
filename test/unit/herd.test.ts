@@ -1323,6 +1323,55 @@ describe("staleIssues", () => {
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
   });
+
+  // FACTORY-118 Addendum A5: a rename must never happen under a live agent,
+  // and a deploy that introduces short-leaf directories must not look like a
+  // mass restart. This is the fleet-level version of the FACTORY-47/FACTORY-75
+  // bar: a MIXED fleet — one agent still at its pre-ticket old-layout
+  // (percent-encoded) directory, one already migrated to its new short-leaf
+  // one — must be recognised STABLY across repeated polls by every one of
+  // HerdrHerd's own live-agent queries. A regression here reads as "this
+  // agent vanished" or "this agent is foreign" on some but not all polls —
+  // exactly the FACTORY-47 class of bug (an infinite stop/respawn loop from a
+  // decode mismatch), just triggered by a deploy that ships this ticket
+  // instead of by a config edit.
+  test("Addendum A5: one old-layout (unmigrated) agent and one new-layout (short-leaf, stamped) agent are BOTH recognised, by BOTH runningIssues() and staleIssues(), unchanged across 5+ consecutive polls", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-mixed-fleet-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      // Old-layout: a github-issue key at its pre-FACTORY-118 fully
+      // percent-encoded three-deep leaf, built BY HAND (never through
+      // ensureWorkspaceDir, which always computes the NEW short leaf) —
+      // exactly what a real not-yet-migrated workspace looks like on disk.
+      const oldKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/legacy#7" });
+      const oldCwd = join(root, ...oldKey.split(":"));
+      mkdirSync(oldCwd, { recursive: true });
+      const oldArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+
+      // New-layout: a different github-issue key, already migrated (a real,
+      // stamped ensureWorkspaceDir claim at its short leaf).
+      const newKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/shiny#9" });
+      const newCwd = ensureWorkspaceDir(newKey);
+      expect(newCwd.endsWith("/github-issue/bugs/shiny#9")).toBe(true);
+      const newArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "bypassPermissions", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+
+      const { client } = fakeHerdrWithCwd(
+        [{ pane_id: "w-old:p1", cwd: oldCwd }, { pane_id: "w-new:p1", cwd: newCwd }],
+        { "w-old:p1": ok([{ pid: 1, argv: oldArgv, name: "claude" }]), "w-new:p1": ok([{ pid: 2, argv: newArgv, name: "claude" }]) },
+      );
+      const herd = new HerdrHerd(client, "http://x/mcp", instant);
+      for (let poll = 0; poll < 5; poll++) {
+        expect(await herd.runningIssues()).toEqual([oldKey, newKey]);
+        expect(await herd.staleIssues()).toEqual([]); // both argvs already match — no false "changed config" either
+      }
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // BUTCHR-411: staleIssues() rebuilds its expected argv from key/provider/
