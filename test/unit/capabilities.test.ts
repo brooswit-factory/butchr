@@ -24,7 +24,7 @@ const REF_OF: Record<(typeof CAPABILITY_PROVIDERS)[number], CapabilityRef> = {
 
 describe("capabilitiesOf/supports: declaration truthfulness, one row per provider", () => {
   test("jira-work-item: query, read, snapshot, comments and links — no createTask anywhere in this codebase", () => {
-    expect(capabilitiesOf(REF_OF["jira-work-item"])).toEqual(["query", "read", "snapshot", "comments", "links"]);
+    expect(capabilitiesOf(REF_OF["jira-work-item"])).toEqual(["query", "read", "snapshot", "comments", "links", "catamorbiusPush"]);
   });
   test("jira-project: query and links only — no dedicated getProject(key), no event-rules/poll wiring, no native project comments", () => {
     expect(capabilitiesOf(REF_OF["jira-project"])).toEqual(["query", "links"]);
@@ -36,10 +36,10 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
     expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["comments", "links"]);
   });
   test("github-issue: query, read, links and comments (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — no snapshot/diff wiring", () => {
-    expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links"]);
+    expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links", "catamorbiusPush"]);
   });
   test("github-pr: query, read, links and comments (FACTORY-57: mirrors github-issue's own capability row exactly) — no snapshot/diff wiring", () => {
-    expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "links"]);
+    expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "links", "catamorbiusPush"]);
   });
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
     expect(capabilitiesOf(REF_OF["zendesk-ticket"])).toEqual(["query", "read", "comments"]);
@@ -55,9 +55,30 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   });
 });
 
+describe("catamorbiusPush (FACTORY-134, implementing story FACTORY-22): true exactly for the three providers the Catamorbius gateway has an adapter for", () => {
+  test("true for jira-work-item, github-issue and github-pr", () => {
+    expect(supports(REF_OF["jira-work-item"], "catamorbiusPush")).toBe(true);
+    expect(supports(REF_OF["github-issue"], "catamorbiusPush")).toBe(true);
+    expect(supports(REF_OF["github-pr"], "catamorbiusPush")).toBe(true);
+  });
+  test("false for every other provider, including jira-project (the gateway has no jira-project subject shape)", () => {
+    for (const provider of CAPABILITY_PROVIDERS) {
+      if (provider === "jira-work-item" || provider === "github-issue" || provider === "github-pr") continue;
+      expect(supports(REF_OF[provider], "catamorbiusPush")).toBe(false);
+    }
+  });
+  test("means a mapping exists, never that a gateway is reachable — capabilitiesOf is a static declaration with no I/O", () => {
+    // capabilitiesOf/supports take no client, make no request, and cannot throw for a
+    // configured-vs-unconfigured gateway distinction — that dynamic fact lives entirely
+    // in src/catamorbius/client.ts's probe()/state machine, never in this static table.
+    expect(capabilitiesOf(REF_OF["jira-work-item"])).toContain("catamorbiusPush");
+  });
+});
+
 /**
- * The full 9x6 inventory (docs/provider-capabilities.md; 8x6 before
- * FACTORY-57 added `github-pr`), pinned in one place so any future
+ * The full 9x7 inventory (docs/provider-capabilities.md; 9x6 before
+ * FACTORY-134 added `catamorbiusPush`, 8x6 before FACTORY-57 added
+ * `github-pr`), pinned in one place so any future
  * accidental drift in MATRIX (src/resources/capabilities.ts) — a cell
  * flipped, added, or removed without an accompanying doc/test update —
  * fails loudly here rather than only shifting the per-provider
@@ -66,18 +87,18 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
  * and comments.test.ts); every `false` cell's reasoning is in the doc.
  */
 const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typeof CAPABILITIES)[number], boolean>> = {
-  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
-  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
 };
 
-describe("the entire 8x6 MATRIX, pinned so any future drift is loud", () => {
+describe("the entire 9x7 MATRIX, pinned so any future drift is loud", () => {
   for (const provider of CAPABILITY_PROVIDERS) {
     test(`${provider}: every capability cell matches the documented inventory`, () => {
       for (const capability of CAPABILITIES) expect(supports(REF_OF[provider], capability)).toBe(EXPECTED_MATRIX[provider][capability]);
