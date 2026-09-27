@@ -7,10 +7,8 @@
 > transition. The 20s scan below is unchanged and still runs as a fallback —
 > see "Event-driven: the fast path (FACTORY-98)" further down for what
 > changed, why it still needs the scan at all, and what stayed a scan-only
-> path (CPU sanity, respawn-loop safety). Text above and below that section
-> describing "the" 20s timer as the only mechanism predates this change but
-> is otherwise still accurate: the scan itself, its opt-in gate, its cadence,
-> and its audit/journal behavior are all unchanged.
+> path (CPU sanity, respawn-loop safety). The scan itself, its opt-in gate,
+> its cadence, and its audit/journal behavior are unchanged.
 
 > **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
 > with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
@@ -19,8 +17,7 @@
 > project" and was silently skipped, freezing the codey canary. No stored
 > allow rules are written any more. Every skipped pane is now logged
 > (`[permission-answer] <label> (<pane>) SKIPPED, left for a human: <reason>`),
-> once per pane+reason. Text below describing the "always allow" option
-> predates this change.
+> once per pane+reason.
 
 ## What it is
 
