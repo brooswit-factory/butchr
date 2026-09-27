@@ -54,33 +54,27 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
-import { AGENT_KEY_BOOKKEEPING_FILE, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, workspaceRoot } from "./workspace.js";
+import { AGENT_KEY_BOOKKEEPING_FILE, claudeProjectSlug, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, workspaceRoot } from "./workspace.js";
 
 /**
- * Claude Code's own project-slug algorithm — verified against
- * `@brooswit/drovr`'s own independent reimplementation
- * (`src/native-transcript.ts`'s `readClaudeTranscriptTail`/`readNativeTranscript`,
- * both `resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-")`) and, separately and
- * more importantly, EMPIRICALLY against the real `claude` CLI on this host
- * (docs/workspace-layout.md's "Empirical slug verification" section has the
- * exact commands and outputs): confirmed to match exactly for a resolved
- * absolute path containing `.`, `_`, `%`, `~`, and multi-byte Unicode
- * characters. NOT confirmed for a resolved path whose sanitized length
- * exceeds 200 characters: real Claude Code truncates the sanitized slug to
- * its first 200 characters and appends `-` plus a 6-character suffix that
- * did NOT match a plain md5/sha1/sha256 hex digest of the raw path in this
- * investigation — see that same doc section for the full negative result.
- * `migrateClaudeProjectSlug` below therefore falls back to a PREFIX match
- * against the real `~/.claude/projects` listing (see its own doc comment)
- * whenever this function's own exact-match slug is not found on disk,
- * rather than ever assuming this formula alone is authoritative for an
- * overlong path.
+ * `claudeProjectSlug` (imported from `./workspace.js`, which also needs it
+ * for Addendum A4's slug-collision check — see that function's own doc
+ * comment there for the full verification story: `@brooswit/drovr`'s
+ * independent reimplementation, and EMPIRICALLY against the real `claude`
+ * CLI on this host, docs/workspace-layout.md's "Empirical slug verification"
+ * section) is confirmed exact for a resolved absolute path containing `.`,
+ * `_`, `%`, `~`, and multi-byte Unicode characters. NOT confirmed for a
+ * resolved path whose sanitized length exceeds 200 characters: real Claude
+ * Code truncates the sanitized slug to its first 200 characters and appends
+ * `-` plus a 6-character suffix that did NOT match a plain md5/sha1/sha256
+ * hex digest of the raw path in this investigation — see that same doc
+ * section for the full negative result. `migrateClaudeProjectSlug` below
+ * therefore falls back to a PREFIX match against the real
+ * `~/.claude/projects` listing (see `findClaudeProjectDir`'s own doc
+ * comment) whenever the exact-match slug is not found on disk, rather than
+ * ever assuming the formula alone is authoritative for an overlong path.
  */
-export function claudeProjectSlug(cwd: string): string {
-  return resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
-}
-
-/** The exact-match slug length past which real Claude Code is known (empirically, not by source) to truncate-and-hash instead — see `claudeProjectSlug`'s own doc comment. */
+/** The exact-match slug length past which real Claude Code is known (empirically, not by source) to truncate-and-hash instead — see `claudeProjectSlug`'s own doc comment (src/agents/workspace.ts). */
 const CLAUDE_SLUG_TRUNCATION_LENGTH = 200;
 
 /**
@@ -239,6 +233,13 @@ export function migrateWorkspaceLayout(agentKey: string, root: string = workspac
   if (!decodeAnyAgentKey(agentKey)) throw new Error(`migrateWorkspaceLayout: not a rule-engine agent key: ${JSON.stringify(agentKey)}`);
   const oldDir = join(root, ...agentKey.split(":"));
   const newDir = newLayoutDirFor(agentKey, root);
+  // Query-level keys and identity-short-id resource keys (Addendum A1:
+  // jira-work/jira-idea/jira-project) always have `newDir === oldDir` — old
+  // dir == new dir must be a clean no-op success (Addendum A4's own
+  // requirement), never a rename-onto-itself.
+  if (resolve(oldDir) === resolve(newDir)) {
+    return { outcome: existsSync(newDir) ? "already-migrated" : "no-legacy-workspace", oldDir: null, newDir, slug: { outcome: "already-migrated", oldSlugDir: null, newSlugDir: join(home, ".claude", "projects", claudeProjectSlug(newDir)) }, repairedWorktrees: [] };
+  }
   const oldExists = existsSync(oldDir);
   const newExists = existsSync(newDir);
 
@@ -278,6 +279,9 @@ export function reverseMigrateWorkspaceLayout(agentKey: string, root: string = w
   if (!decodeAnyAgentKey(agentKey)) throw new Error(`reverseMigrateWorkspaceLayout: not a rule-engine agent key: ${JSON.stringify(agentKey)}`);
   const oldDir = join(root, ...agentKey.split(":"));
   const newDir = newLayoutDirFor(agentKey, root);
+  if (resolve(oldDir) === resolve(newDir)) {
+    return { outcome: existsSync(oldDir) ? "already-migrated" : "no-legacy-workspace", oldDir, newDir, slug: { outcome: "already-migrated", oldSlugDir: null, newSlugDir: join(home, ".claude", "projects", claudeProjectSlug(newDir)) }, repairedWorktrees: [] };
+  }
   const oldExists = existsSync(oldDir);
   const newExists = existsSync(newDir);
 

@@ -61,9 +61,15 @@ import { zendeskTicketShortDisplayId } from "./zendesk-ticket-type.js";
 
 /**
  * The one dispatch spot — see this module's own top comment for why this is
- * routing, not a second implementation of any provider's own logic.
+ * routing, not a second implementation of any provider's own logic. Exported
+ * (FACTORY-118) for `src/agents/workspace.ts`'s own leaf-naming use, which
+ * needs the BARE provider short id, never combined with the ruleId the way
+ * `baseDisplayLabel` below combines it for a herdr LABEL — a workspace path
+ * already carries the ruleId as its own separate directory segment (the
+ * `<provider>/<ruleId>/<leaf>` shape), so appending it into the leaf too
+ * would duplicate it.
  */
-function shortDisplayId(provider: ResourceProvider, ruleId: string, resourceId: string): string {
+export function shortDisplayId(provider: ResourceProvider, ruleId: string, resourceId: string): string {
   if (provider === "filesystem" && ruleId === MANAGED_SESSIONS_RULE_ID) return managedSessionShortDisplayId(resourceId);
   switch (provider) {
     case "jira-work": return jiraWorkShortDisplayId(resourceId);
