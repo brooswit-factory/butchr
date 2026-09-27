@@ -35,7 +35,7 @@ import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
-import { createEscalator } from "../agents/escalation-loop.js";
+import { createEscalator, type PaneContext } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
@@ -1664,9 +1664,23 @@ const escalator = createEscalator({
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
 // both need it, and neither can assume the caller already has it.
-async function issueForPane(paneId: string): Promise<string | null> {
+//
+// FACTORY-381: also returns `context` — `escalator.onBlocked`/`onNoPrompt`'s
+// optional `PaneContext`, whatever identifies this pane to a HUMAN on the
+// ticketless, non-managed-session capture path — derived from the SAME row,
+// never a second `herdr.agent.list()` call (the ticket's own requirement:
+// "don't add a new herdr call just for this; use what's already on the
+// row"). A row's `display_agent` (herdr's own display label for the pane) is
+// preferred over `agent_session.value` as the "session/account name": it's
+// the field herdr already means for a human to read, where `agent_session`
+// is an internal id/path.
+async function issueForPane(paneId: string): Promise<{ issue: string | null; context: PaneContext }> {
   const { agents } = await herdr.agent.list();
-  return escalationTargetOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
+  const row = agents.find((a) => a.pane_id === paneId);
+  return {
+    issue: escalationTargetOfCwd(row?.cwd),
+    context: { cwd: row?.cwd ?? null, sessionName: row?.display_agent ?? row?.agent_session?.value ?? null },
+  };
 }
 
 /**
@@ -1911,8 +1925,8 @@ watchPrompts({
   onExposed: ({ paneId, prompt, pollSeq }) => {
     void (async () => {
       try {
-        const issue = await issueForPane(paneId);
-        await escalator.onBlocked(paneId, issue, prompt, pollSeq);
+        const { issue, context } = await issueForPane(paneId);
+        await escalator.onBlocked(paneId, issue, prompt, pollSeq, context);
       } catch (e) {
         console.error(`  [prompts] onExposed error: ${(e as Error)?.message ?? e}`);
       }
@@ -1924,8 +1938,8 @@ watchPrompts({
   onUnparseable: ({ paneId, text, pollSeq }) => {
     void (async () => {
       try {
-        const issue = await issueForPane(paneId);
-        escalator.onNoPrompt(paneId, issue, text, pollSeq);
+        const { issue, context } = await issueForPane(paneId);
+        escalator.onNoPrompt(paneId, issue, text, pollSeq, context);
       } catch (e) {
         console.error(`  [prompts] onUnparseable error: ${(e as Error)?.message ?? e}`);
       }
