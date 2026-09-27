@@ -52,6 +52,21 @@ export interface ManagedSessionEscalation {
 }
 
 /**
+ * FACTORY-381: whatever identifies a pane to a HUMAN when there is neither an
+ * issue key nor a resolved managed-session identity for it — the caller's
+ * own row from its existing `herdr.agent.list()` read (see `onBlocked`'s and
+ * `onNoPrompt`'s own doc comments: NEVER a fresh herdr call made just for
+ * this). Both fields are `null` when the daemon genuinely does not know
+ * them, and the capture header says so explicitly rather than omitting the
+ * line — see `captureTicketlessText`.
+ */
+export interface PaneContext {
+  cwd: string | null;
+  /** Whatever session/account identity herdr already reports for this pane (e.g. its own display label), if any. */
+  sessionName: string | null;
+}
+
+/**
  * BUTCHR-124: marker for the sustained-blocked-and-unparseable alarm —
  * deliberately distinct from escalate.ts's `MARKER` (`[butchr:blocked]`) so a
  * reader can tell the two apart at a glance: `[butchr:blocked]` means "here
@@ -198,7 +213,15 @@ const newState = (fp: string): PaneState =>
   ({ fp, blockedPolls: 0, lastPollSeq: undefined, escalatedAt: undefined, followedUpAt: undefined });
 
 export interface Escalator {
-  onBlocked: (paneId: string, issue: string | null, prompt: Prompt, pollSeq: number) => Promise<void>;
+  /**
+   * FACTORY-381: `context`, when given, is used ONLY on the ticketless,
+   * non-managed-session branch (`issue === null` and `managedSessionOf`
+   * resolves `null` too) to head the durable capture — see
+   * `captureTicketlessText`. Optional and additive: every existing caller
+   * that omits it keeps today's byte-identical behaviour on every other
+   * branch.
+   */
+  onBlocked: (paneId: string, issue: string | null, prompt: Prompt, pollSeq: number, context?: PaneContext) => Promise<void>;
   /**
    * Called once per watchBlocked tick, synchronously, with the full set of
    * currently-blocked pane ids (see watchBlocked's onTick). Resets the
@@ -216,7 +239,7 @@ export interface Escalator {
    * — so a real dialog the parser wrongly rejects shows up instead of
    * silently sitting stuck (KAN-682, applied to the parser).
    */
-  onNoPrompt: (paneId: string, issue: string | null, text: string, pollSeq: number) => void;
+  onNoPrompt: (paneId: string, issue: string | null, text: string, pollSeq: number, context?: PaneContext) => void;
   /**
    * FACTORY-45: every managed-session pane CURRENTLY marked stalled — an
    * escalated (logged), not-yet-resolved dialog on a keyless managed-session
@@ -488,6 +511,80 @@ async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: 
 }
 
 /**
+ * FACTORY-381: global cap on ticketless capture files kept at once — same
+ * discipline as the three siblings above (`session-limit-watch`'s own
+ * `CAPTURE_MAX_FILES`, `ESCALATION_CAPTURE_MAX_FILES`,
+ * `MANAGED_ESCALATION_CAPTURE_MAX_FILES`), kept separate because this
+ * shape's own regex is disjoint from all three.
+ */
+const TICKETLESS_CAPTURE_MAX_FILES = 50;
+
+/**
+ * FACTORY-381: `ticketless-<blocked|unparseable>-<paneId>-<compact-UTC-
+ * timestamp>.txt` — a pane with NEITHER an issue key NOR a resolved
+ * managed-session identity (an unowned/legacy workspace, a query-level
+ * agent, … — everything `EscalatorDeps.managedSessionOf` doc-comments as
+ * "keeps today's log-only behavior", now durably captured instead of just
+ * logged). The literal `ticketless-` PREFIX — not a mid-string segment the
+ * way the other three shapes stay disjoint from EACH OTHER — is what keeps
+ * this pattern disjoint from all three siblings regardless of `paneId`'s own
+ * content: `ESCALATION_CAPTURE_NAME` and session-limit-watch's own
+ * `CAPTURE_NAME` both require an UPPERCASE issue/project key (or a
+ * `provider:...:` prefix) at the very start, and
+ * `MANAGED_ESCALATION_CAPTURE_NAME` always starts with `filesystem:` — none
+ * of the three can ever start with a lowercase `ticketless-`, so eviction
+ * (`ourCapturesOldestFirst`'s inline equivalent below) never lists, evicts,
+ * or is evicted by, any of them.
+ */
+const TICKETLESS_CAPTURE_NAME = /^ticketless-(?:blocked|unparseable)-.+-(\d{8}T\d{6}Z)\.txt$/;
+
+/**
+ * FACTORY-381: durably capture a genuinely ticketless, non-managed-session
+ * pane's full, UNREDACTED text — the gap `onBlocked`'s and `onNoPrompt`'s own
+ * `issue === null` early returns used to leave: no Jira comment (correct,
+ * there is no ticket), but also no evidence anywhere but one journal line,
+ * gone the moment the pane is gone. Mirrors `captureEscalationText`/
+ * `captureManagedSessionEscalationText` exactly: local disk only, no
+ * redaction, fails open (logged once, never throws), only the returned PATH
+ * — never the content — ever reaches a journal line. `context` identifies
+ * the pane to a HUMAN in place of the ticket this path doesn't have — its
+ * fields are `null`, not omitted, when the daemon genuinely doesn't know
+ * them (see `PaneContext`'s own doc comment).
+ */
+async function captureTicketlessText(deps: EscalatorDeps, paneId: string, trigger: "blocked" | "unparseable", context: PaneContext): Promise<string | null> {
+  const sink = deps.captures;
+  if (!sink) return null;
+  try {
+    const text = await deps.read(paneId);
+    const capturedAt = deps.now();
+    const name = `ticketless-${trigger}-${paneId}-${compactUtc(capturedAt)}.txt`;
+    const header =
+      `# butchr ticketless capture\n` +
+      `# pane: ${paneId}\n` +
+      `# trigger: ${trigger}\n` +
+      `# cwd: ${context.cwd ?? "unknown — not reported by herdr for this pane"}\n` +
+      `# session: ${context.sessionName ?? "unknown — no session/account identity known for this pane"}\n` +
+      `# captured-at: ${new Date(capturedAt).toISOString()}\n` +
+      `# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n` +
+      `\n`;
+    const all = await sink.list();
+    const ours = all
+      .map((n) => ({ n, m: TICKETLESS_CAPTURE_NAME.exec(n) }))
+      .filter((x): x is { n: string; m: RegExpExecArray } => x.m !== null)
+      .map((x) => ({ name: x.n, ts: x.m[1]! }))
+      .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    while (ours.length >= TICKETLESS_CAPTURE_MAX_FILES) {
+      const oldest = ours.shift()!;
+      await sink.remove(oldest.name);
+    }
+    return await sink.write(name, header + text);
+  } catch (e) {
+    deps.log(`ticketless capture failed for pane ${paneId} (${trigger}): ${(e as Error)?.message ?? e}`);
+    return null;
+  }
+}
+
+/**
  * The blocked-prompt escalation state machine: fingerprint a dialog, debounce
  * a transient block, escalate once per fingerprint to the blocked agent's own
  * ticket, watch for an `ANSWER` directive, verify it against the LIVE dialog
@@ -747,6 +844,58 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     return [...managedSessionStalled.entries()].map(([paneId, e]) => ({
       agentKey: e.target.agentKey, definitionPath: e.target.definitionPath, paneId, fingerprint: e.fp, since: e.since,
     }));
+  }
+
+  // ===========================================================================
+  // FACTORY-381: the genuinely TICKETLESS, non-managed-session path — a pane
+  // with NEITHER an issue key NOR a resolved managed-session identity (the
+  // real incident this ticket traces to: an admin session whose cwd matched
+  // neither). A fully separate tracker from `state`/`managedSessionStalled`
+  // above, same precedent as `unresponsive`/`managedSessionStalled`
+  // themselves: there is no ticket to comment on, and unlike the
+  // managed-session path there is not even an `agentKey`/`definitionPath` to
+  // name — only whatever `PaneContext` the caller already had on hand.
+  // ===========================================================================
+
+  interface TicketlessBlockedEntry {
+    fp: string;
+    /** Consecutive-poll count for THIS fp — mirrors `PaneState.blockedPolls`: the same `DEBOUNCE_POLLS` a ticketed pane must clear before it escalates. */
+    polls: number;
+    lastPollSeq: number;
+    /** Set once this (pane, fp) episode has been captured — gates every later poll of the SAME episode, mirroring `PaneState.escalatedAt`. */
+    capturedAt: number | undefined;
+  }
+  const ticketlessBlocked = new Map<string, TicketlessBlockedEntry>();
+
+  /**
+   * Debounce + dedupe + capture for a ticketless, non-managed-session
+   * blocked pane. Returns the capture path once per (pane, fingerprint)
+   * episode, after the same `DEBOUNCE_POLLS` consecutive polls
+   * `handleBlocked` itself requires — `null` on every other poll (still
+   * debouncing, already captured this episode, or a stale out-of-order
+   * pollSeq), which the caller must NOT read as failure.
+   */
+  async function maybeCaptureTicketlessBlocked(paneId: string, prompt: Prompt, pollSeq: number, context: PaneContext): Promise<string | null> {
+    const fp = fingerprint(prompt);
+    const prior = ticketlessBlocked.get(paneId);
+    if (prior && pollSeq <= prior.lastPollSeq) return null; // stale/out-of-order — a newer observation already superseded it
+    const consecutive = !!prior && prior.fp === fp && pollSeq === prior.lastPollSeq + 1;
+    const entry: TicketlessBlockedEntry = consecutive ? prior! : { fp, polls: 0, lastPollSeq: pollSeq, capturedAt: undefined };
+    entry.lastPollSeq = pollSeq;
+    entry.polls++;
+    ticketlessBlocked.set(paneId, entry);
+    if (entry.capturedAt !== undefined) return null; // already captured this episode
+    if (entry.polls < DEBOUNCE_POLLS) return null; // still debouncing, same as the ticketed path
+    // Set BEFORE the write is attempted (session-limit-watch's own decision
+    // 8, applied here too): a permanently unwritable capture dir must log
+    // once per episode, not once per poll.
+    entry.capturedAt = deps.now();
+    return await captureTicketlessText(deps, paneId, "blocked", context);
+  }
+
+  /** The clear half of `maybeCaptureTicketlessBlocked` — mirrors `clearManagedSessionStalled`/`resetDebounce`'s own "pane no longer blocked" cleanup, called from `onPoll` below. */
+  function clearTicketlessBlocked(paneId: string): void {
+    ticketlessBlocked.delete(paneId);
   }
 
   /**
@@ -1018,7 +1167,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     }
   }
 
-  async function onBlocked(paneId: string, issue: string | null, prompt: Prompt, pollSeq: number): Promise<void> {
+  async function onBlocked(paneId: string, issue: string | null, prompt: Prompt, pollSeq: number, context?: PaneContext): Promise<void> {
     if (issue === null) {
       // FACTORY-45: widen the keyless path ONLY for a pane that is
       // genuinely a filesystem-provider `managed-sessions` agent — every
@@ -1036,7 +1185,16 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       try {
         const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
         if (session) await handleManagedSessionBlocked(paneId, session, prompt);
-        else log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate`);
+        else {
+          // FACTORY-381: the actual gap this ticket closes — a pane that is
+          // NEITHER ticketed NOR a managed session used to leave nothing but
+          // this one journal line. The line itself stays byte-identical when
+          // nothing was captured this poll (still debouncing, already
+          // captured this episode, or no `captures` sink configured) — only
+          // ever gaining a suffix when a NEW capture was actually written.
+          const capturePath = await maybeCaptureTicketlessBlocked(paneId, prompt, pollSeq, context ?? { cwd: null, sessionName: null });
+          log(`${paneId} blocked with an unanswerable prompt but no issue key — cannot escalate${capturePath ? ` (captured to ${capturePath})` : ""}`);
+        }
       } catch (e) {
         log(`error handling ${paneId}: ${(e as Error)?.message ?? e}`);
       } finally {
@@ -1106,9 +1264,16 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     for (const [paneId] of managedSessionStalled) {
       if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
+    // FACTORY-381: same resolution signal, for the ticketless tracker —
+    // a pane the herd no longer reports blocked AT ALL ends its episode, so
+    // the SAME fingerprint reappearing later is a fresh episode (captures
+    // again), never silently suppressed.
+    for (const paneId of ticketlessBlocked.keys()) {
+      if (!blocked.has(paneId)) clearTicketlessBlocked(paneId);
+    }
   }
 
-  function onNoPrompt(paneId: string, issue: string | null, text: string, pollSeq: number): void {
+  function onNoPrompt(paneId: string, issue: string | null, text: string, pollSeq: number, context?: PaneContext): void {
     const s = state.get(paneId);
     // Same staleness rule as handleBlocked: don't let a late-arriving "no
     // prompt" for an already-superseded poll destroy newer state.
@@ -1117,9 +1282,32 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       resetDebounce(paneId);
     }
     const h = hashText(text);
-    if (lastUnparseableHash.get(paneId) !== h) {
+    // FACTORY-381: this hash-change IS the dedupe for the ticketless capture
+    // below too — a pane garbled on the SAME text for hours must yield ONE
+    // capture, not one per tick, exactly criterion 2's own wording ("one
+    // capture per distinct dialog, not one per tick"). Reusing this existing
+    // per-pane tracker (rather than a second one) means the capture and the
+    // log line can never drift out of step on when a "new" text starts.
+    const isNewText = lastUnparseableHash.get(paneId) !== h;
+    if (isNewText) {
       lastUnparseableHash.set(paneId, h);
       log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
+    }
+
+    // FACTORY-381: no issue AND (by construction — onBlocked is the only
+    // caller of managedSessionOf) no managed-session identity resolvable
+    // from unparseable text alone either — capture on a genuinely NEW text,
+    // fire-and-forget (onNoPrompt stays void/sync, unchanged), mirroring the
+    // sustained-unresponsive alarm's own unawaited IIFE just below. Dedupe
+    // (`isNewText`) is checked BEFORE this fires, never inside it, so a
+    // permanently failing capture logs once per distinct text, not once per
+    // poll.
+    if (issue === null && isNewText) {
+      const resolvedContext = context ?? { cwd: null, sessionName: null };
+      void (async () => {
+        const capturePath = await captureTicketlessText(deps, paneId, "unparseable", resolvedContext);
+        log(`${paneId} blocked with no parseable dialog and no issue key — cannot escalate${capturePath ? ` (captured to ${capturePath})` : ""}`);
+      })();
     }
 
     // BUTCHR-124: sustained blocked-and-unparseable alarm. No addressable
