@@ -206,8 +206,12 @@ const managedSessionResolvedAgents = new Map<string, { model: string; effort?: A
 /**
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
- * an eligible managed-session definition opted into "lizard mode"
- * (`SessionDefinition.lizardMode`). Consulted below by `ruleLizardModeOf`,
+ * an eligible managed-session definition is lizard-mode eligible
+ * (`SessionDefinition.lizardMode` — since FACTORY-138, absent now resolves
+ * eligible for a `vendor: "claude"` definition; see that field's own doc
+ * comment and the fill site, `ManagedSessionResourceDeps.lizardModes`,
+ * src/rules/session-definition-type.ts, for the full default and its
+ * Codex carve-out). Consulted below by `ruleLizardModeOf`,
  * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
  * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
  * comment (src/rules/session-definition-type.ts) for why this is
@@ -1738,13 +1742,18 @@ blockingEscalationTimer.unref?.();
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
 // only when its cwd resolves to SOME rule-engine agent id (managed session or
-// rule-launched alike) AND `ruleLizardModeOf` says that id's own lizard-mode
-// opt-in (`managedSessionLizardModes`'s live poll for a managed session,
-// `Rule.lizardMode` for everything else — FACTORY-87) is `true`. Everything
-// else — a legacy/bare-issue agent, a managed session or rule that never set
-// the field, a managed session not yet observed this daemon's lifetime —
-// resolves `false` and is never touched, matching `lizardMode`'s own "absent
-// means today's behaviour exactly" contract. The label itself (basename of
+// rule-launched alike) AND `ruleLizardModeOf` says that id is eligible
+// (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87). FACTORY-138 (operator
+// decision, FACTORY-67 director comment 2026-09-26 22:24Z): a managed
+// session (vendor "claude") or rule that never sets the field is now
+// eligible BY DEFAULT — only an explicit `lizardMode: false` resolves
+// `false`. A legacy/bare-issue agent, a managed session not yet observed
+// this daemon's lifetime, or a `vendor: "codex"` managed session (which
+// cannot set this field at all) still resolves `false` and is never
+// touched — see `ruleLizardModeOf`'s own doc comment
+// (src/agents/permission-answer-loop.ts) for the full breakdown of which
+// cases the new default does and does not reach. The label itself (basename of
 // the resource id, e.g. the definition file or the Jira/GitHub/filesystem
 // resource) is what lets a log line name WHICH AGENT got a prompt answered
 // (FACTORY-67's own requirement), not just an opaque pane id.
