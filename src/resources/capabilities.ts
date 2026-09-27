@@ -47,8 +47,17 @@ export const CAPABILITY_PROVIDERS = [
 ] as const;
 export type CapabilityProvider = (typeof CAPABILITY_PROVIDERS)[number];
 
-/** The six capability categories this ticket's inventory covers. */
-export const CAPABILITIES = ["query", "read", "snapshot", "comments", "links", "createTask"] as const;
+/**
+ * The capability categories this inventory covers. `catamorbiusPush`
+ * (FACTORY-134, implementing story FACTORY-22) is the seventh: it declares
+ * only that a Catamorbius CloudEvent → watch-key MAPPING exists for this
+ * provider (`src/catamorbius/mapping.ts`) — NEVER that a Catamorbius
+ * gateway is configured or reachable, which is a dynamic, per-deployment
+ * fact this static table cannot and does not encode. See
+ * docs/catamorbius-push.md for the mapping rules and docs/provider-
+ * capabilities.md for this cell's own row in the inventory.
+ */
+export const CAPABILITIES = ["query", "read", "snapshot", "comments", "links", "createTask", "catamorbiusPush"] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
 /**
@@ -91,15 +100,15 @@ export class UnsupportedCapabilityError extends Error {
  * this table only carries the boolean a caller can safely act on.
  */
 const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
-  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
-  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
 };
 
 /** Every capability `ref`'s provider truthfully supports today, in `CAPABILITIES` order. */
