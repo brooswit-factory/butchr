@@ -21,14 +21,24 @@ import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 function rule(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
   return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
 }
-const noAdmissionView: AdmissionView = { cap: 10, residency: 0, sentinels: 0, sources: [] };
+// FACTORY-340: declare every source a rule in THIS file's fixtures is
+// covered by (jira-work -> "issue", plus github-issue/jira-idea/filesystem
+// verbatim — see `RULE_ADMISSION_SOURCE`, ../../src/agents/query-agent-
+// inventory.ts) as reported this poll, same rationale as query-agent-
+// inventory.test.ts's own `allCoveredSourcesReported` — an empty `sources`
+// now reads as "absent from the census" -> COULD NOT CHECK for every rule
+// below, which is not what these tests are about.
+const allCoveredSourcesReported: AdmissionView = {
+  cap: 10, residency: 0, sentinels: 0,
+  sources: ["issue", "github-issue", "jira-idea", "filesystem"].map((source) => ({ source, census: { checked: true, confirmedAt: new Date(0).toISOString() } })),
+};
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true };
 function checkedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
-  return { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+  return { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: allCoveredSourcesReported };
 }
 /** FACTORY-132: the agent census is unavailable — `rows`, when given, models a STALE carry-forward (a poll failed after an earlier success), never a fresh one (the response-level `checked:false` is what the render layer must key on, not `rows.length`). */
 function uncheckedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
-  return { checked: false, declinedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+  return { checked: false, declinedAt: new Date(0).toISOString(), rows, admission: allCoveredSourcesReported };
 }
 function agentRow(resourceKey: string): AgentDashboardRow {
   return { kind: "agent", resourceKey, tier: { kind: "project" }, agentStatus: "working", pane: "p1", timeInStatus: floor, confirmedAt: new Date(0).toISOString() };

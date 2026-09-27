@@ -230,6 +230,61 @@ whose covering source reported this poll is completely unaffected — see
 case included) and `test/unit/config-inventory-page.test.ts`'s own
 FACTORY-136 render-level block.
 
+### A source ABSENT from the census, not just unchecked (FACTORY-340)
+
+FACTORY-136 (above) closed the gap for a source that IS declared this poll
+but declined or never reported. The epic reviewer found a narrower, real gap
+in that fix on the story's own PR: a source can be entirely ABSENT from
+`admission.sources[]` — never declared at all — and `admissionSourceCensusFor`
+(`src/agents/query-agent-inventory.ts`) treated that the same as "reported
+and fine" (returning `undefined`, which `ruleStaffingReason` skips), on the
+theory that a rule's own provider is always why its source is declared. That
+theory is false for exactly one provider today: `github-pr`. Unlike
+`github-issue`/`zendesk-ticket`, whose "missing token/config" reason was
+already wired into `configReasonFor` (this module's own `RuleStaffingDeps.
+configReason`), `github-pr` had NO config-reason coverage before this ticket
+— `src/daemon/index.ts` builds its `sources:` list conditionally
+(`githubPrs = githubPrStaffingResult.run && config.github`), omitting
+`ADMISSION_SOURCE_GITHUB_PR` whenever `config.github` is unset even though an
+enabled `github-pr` rule exists — so a `github-pr` rule with no GitHub
+config fell all the way through to the final "genuine zero" branch, reading
+`UNSTAFFED: no matching resources this poll`, in exactly the state where a
+withholding cannot be ruled out. "GitHub rules without a token" is named in
+epic FACTORY-68's own acceptance criteria — this was a real reachable case,
+not a theoretical one.
+
+Two independent fixes landed together:
+
+- **`admissionSourceCensusFor` now returns `{ source, absent: true }`**
+  instead of `undefined` when the rule's covering source is not present in
+  `admission.sources[]` at all. `ruleStaffingReason` treats this the same as
+  a declared-but-unchecked source (the SAME `staffed: null` tri-state, worded
+  `census unavailable: the "<source>" admission source covering this rule is
+  not present in this poll's admission census, ...`) — this closes the gap
+  for ANY current or future provider whose source can go missing from the
+  census for a reason `configReasonFor` does not (yet) cover.
+- **`configReasonFor` (`src/daemon/index.ts`) now also covers `github-pr`**,
+  mirroring the existing `github-issue`/`zendesk-ticket` lines with
+  `githubPrStaffingResult`'s own reason — this is the specific, informative
+  fix for the reachable case above: because `configReasonFor` is checked
+  BEFORE the admission-source-absent branch (see "Check order" below), a
+  `github-pr` rule with no GitHub config now reads `UNSTAFFED: github-pr
+  rules not staffed (<ids>): set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS` —
+  a real, specific config fact — rather than either the misleading old
+  "no matching resources" OR a generic COULD NOT CHECK that names no cause.
+
+Both fixes are needed for the full safety argument: the `absent` branch alone
+makes the CORRECTNESS claim true for every provider (never a false
+UNSTAFFED), while the `github-pr` `configReasonFor` line makes the
+config-reason page CONSISTENT — `github-pr` now surfaces a real reason
+exactly like `github-issue`/`zendesk-ticket` always have, instead of relying
+on the newer, less specific tri-state to paper over a gap in the older
+config-reason wiring. See `test/unit/query-agent-inventory.test.ts`'s
+"FACTORY-340" tests (both the direct `ruleStaffingReason` unit test and case
+(e) through a real `createDashboardFeed`/`createAdmissionController`) and
+`test/unit/app.test.ts`'s own FACTORY-340 end-to-end test (real routes,
+`github-pr` rule, no GitHub config).
+
 ### Stale carry-forward: "agent wins" is unaffected
 
 If the agent census's most recent poll failed AFTER an earlier success, the
