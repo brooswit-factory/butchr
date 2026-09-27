@@ -200,16 +200,18 @@ reuses:
   into the SAME `createLinkedEventingState`/`runTick` machinery
   (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
   already use — no second watcher, no separate rate cap.
-- **Uncapped by default (known gap, FACTORY-78):** these nudges reuse the
-  BUTCHR-469 rate-cap MECHANISM, but this definition has no field to
-  configure a cap VALUE, and the wiring's own fixed `Rule`-shaped gate never
-  sets one — so today, a managed session's linked-eventing nudges are
-  uncapped, the same "absent means uncapped" behaviour an unconfigured
-  `jira-project` rule owner already has, not a real per-session or
-  per-project budget. A real default (or a per-definition setting) is an
-  open operator decision, deliberately deferred rather than invented
-  unilaterally — see `docs/resource-links.md`'s own section for the full
-  reasoning and FACTORY-78 for the tracked gap.
+- **Capped by the shared default, not yet by any per-definition setting
+  (BUTCHR-471):** this definition still has no field to configure a cap
+  VALUE, and the wiring's own fixed `Rule`-shaped gate
+  (`MANAGED_SESSION_LINKED_EVENTING_RULE`) still never sets one — but absent
+  no longer means uncapped: `runTick` (`src/jira-watch/linked-eventing.ts`)
+  now falls back to a fixed default (2 turns/hour, 25 items) whenever a
+  rule leaves either cap absent, this fixed gate included, so no owner kind
+  — a managed session among them — can run uncapped. A per-definition
+  override remains a known limit, tracked as a follow-up (the residue of
+  FACTORY-78) — see `docs/resource-links.md`'s own BUTCHR-471 section for
+  the full reasoning, the evidence behind the default's numbers, and what
+  is and isn't done yet.
 
 ## Tier -> model mapping
 
