@@ -53,7 +53,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { decodeAnyAgentKey } from "../rules/agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey } from "../rules/agent-key.js";
 import { AGENT_KEY_BOOKKEEPING_FILE, claudeProjectSlug, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, workspaceRoot } from "./workspace.js";
 
 /**
@@ -433,4 +433,71 @@ export function migrateClaudeSettingsEntry(oldCwd: string, newCwd: string, claud
   delete projectsObj[oldKey];
   writeFileSync(claudeJsonPath, JSON.stringify(obj, null, 2));
   return { outcome: "moved", claudeJsonPath };
+}
+
+/**
+ * One `<root>/<provider>/<ruleId>/<leaf>` directory as found on disk by a
+ * real filesystem walk (`scripts/migrate-workspace-layout.ts`'s own job —
+ * including the `readBookkeptAgentKey` read — never done here, so this
+ * function stays pure I/O-free and exhaustively unit-testable). `stampedKey`
+ * is that read's result, or `null` for a directory with no bookkeeping
+ * stamp at all (an old-layout, not-yet-migrated workspace, or something
+ * foreign). Trusted as-is here, WITHOUT re-deriving Addendum A6's fuller
+ * "is this leaf one of the key's own legitimate forms" check
+ * (`agentIdOfWorkspacePath`'s own, src/agents/workspace.ts) — a
+ * mis-attributed plan line is still safe because `migrateWorkspaceLayout`
+ * independently re-derives and re-validates everything before touching a
+ * single file (never overwrites a non-empty target, computes its own
+ * `newLayoutDirFor` fresh); this function only decides what to PROPOSE.
+ */
+export interface DiscoveredLeaf { provider: string; ruleId: string; leaf: string; stampedKey: string | null }
+
+export interface MigrationPlanItem {
+  key: string;
+  oldDir: string;
+  newDir: string;
+  /**
+   * "migrate": oldDir differs from newDir and no live pane has oldDir as its
+   * cwd — safe to call `migrateWorkspaceLayout` now. "no-change": the leaf
+   * already computes to itself (an identity-short-id provider, per
+   * Addendum A1, or already migrated) — nothing to do, and
+   * `migrateWorkspaceLayout` would no-op anyway, but the plan says so
+   * up front so an operator isn't left wondering why a line did nothing.
+   * "skip-live": Addendum A5 — a live pane has this exact directory as its
+   * cwd right now; renaming under it is never safe, so this workspace is
+   * left at its OLD path for this run (still fully recognised there,
+   * `agentIdOfWorkspacePath`'s own step 2) and reconsidered on the NEXT run
+   * once the agent is no longer live at that path.
+   */
+  action: "migrate" | "no-change" | "skip-live";
+}
+
+/**
+ * The pure decision half of the operator-facing migration
+ * (`scripts/migrate-workspace-layout.ts`): given every leaf directory a real
+ * filesystem walk of `root` found (`leaves`) and the set of directories a
+ * REAL herdr `agent.list()` reports as a live pane's cwd right now
+ * (`livePaths`, resolved absolute paths), decides what each one needs
+ * without touching a single file. No I/O, so this is exhaustively unit
+ * tested; the script itself only walks the disk, queries herdr, prints this
+ * plan, and (only with `--execute`) calls `migrateWorkspaceLayout` for each
+ * `"migrate"` line — never for `"no-change"` or `"skip-live"`.
+ *
+ * A leaf with NO resolvable key (a foreign directory Addendum A6 says must
+ * never be adopted: neither a bookkeeping stamp, nor a legacy-encoded
+ * segment-decode) is silently absent from the plan — nothing to report,
+ * nothing to migrate.
+ */
+export function planWorkspaceMigration(root: string, leaves: readonly DiscoveredLeaf[], livePaths: ReadonlySet<string>): MigrationPlanItem[] {
+  const plan: MigrationPlanItem[] = [];
+  for (const { provider, ruleId, leaf, stampedKey } of leaves) {
+    const legacyKey = decodeAgentKey(`${provider}:${ruleId}:${leaf}`);
+    const key = stampedKey ?? (legacyKey ? `${provider}:${ruleId}:${leaf}` : null);
+    if (!key || !decodeAnyAgentKey(key)) continue; // unrecognised — never adopted (Addendum A6)
+    const oldDir = join(root, provider, ruleId, leaf);
+    const newDir = newLayoutDirFor(key, root);
+    if (resolve(oldDir) === resolve(newDir)) { plan.push({ key, oldDir, newDir, action: "no-change" }); continue; }
+    plan.push({ key, oldDir, newDir, action: livePaths.has(resolve(oldDir)) ? "skip-live" : "migrate" });
+  }
+  return plan;
 }

@@ -9,6 +9,7 @@ import {
   migrateClaudeProjectSlug,
   migrateClaudeSettingsEntry,
   migrateWorkspaceLayout,
+  planWorkspaceMigration,
   repairGitWorktrees,
   reverseMigrateWorkspaceLayout,
 } from "../../src/agents/workspace-migration.js";
@@ -522,5 +523,48 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
     const after = JSON.parse(readFileSync(path, "utf8"));
     expect(after.projects[oldCwd]).toEqual({ hasTrustDialogAccepted: true, allowedTools: ["Bash", "Read"] });
     expect(after.projects[newCwd]).toBeUndefined();
+  });
+});
+
+// The pure decision half of scripts/migrate-workspace-layout.ts — no I/O,
+// so every branch (migrate / no-change / skip-live / unrecognised-so-absent)
+// is exercised directly against hand-built DiscoveredLeaf rows.
+describe("planWorkspaceMigration — the operator migration script's pure decision function", () => {
+  test("an old-layout, not-yet-migrated leaf (no stamp, legacy percent-encoded) is planned to migrate", () => {
+    const root = "/ws";
+    const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
+    const leaf = key.split(":")[2]!; // the legacy encoded leaf, exactly as it lives on disk pre-migration
+    const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf, stampedKey: null }], new Set());
+    expect(plan).toEqual([{ key, oldDir: join(root, "github-issue", "bugs", leaf), newDir: newLayoutDirFor(key, root), action: "migrate" }]);
+  });
+
+  test("a live pane's cwd is never planned to migrate (Addendum A5) — left for the NEXT run", () => {
+    const root = "/ws";
+    const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
+    const leaf = key.split(":")[2]!;
+    const oldDir = join(root, "github-issue", "bugs", leaf);
+    const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf, stampedKey: null }], new Set([oldDir]));
+    expect(plan).toEqual([{ key, oldDir, newDir: newLayoutDirFor(key, root), action: "skip-live" }]);
+  });
+
+  test("an identity-short-id provider (jira-work) is 'no-change', never proposed as a migration", () => {
+    const root = "/ws";
+    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "KAN-1" });
+    const leaf = key.split(":")[2]!;
+    const plan = planWorkspaceMigration(root, [{ provider: "jira-work", ruleId: "triage", leaf, stampedKey: null }], new Set());
+    expect(plan).toEqual([{ key, oldDir: join(root, "jira-work", "triage", leaf), newDir: join(root, "jira-work", "triage", leaf), action: "no-change" }]);
+  });
+
+  test("an already-migrated (stamped, short-leaf) directory is 'no-change'", () => {
+    const root = "/ws";
+    const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
+    const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf: "widgets#12", stampedKey: key }], new Set());
+    expect(plan).toEqual([{ key, oldDir: join(root, "github-issue", "bugs", "widgets#12"), newDir: join(root, "github-issue", "bugs", "widgets#12"), action: "no-change" }]);
+  });
+
+  test("a foreign or unrecognisable leaf (no stamp, does not decode) is silently absent from the plan — never adopted (Addendum A6)", () => {
+    const root = "/ws";
+    const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf: "not-a-valid-encoded-anything", stampedKey: null }], new Set());
+    expect(plan).toEqual([]);
   });
 });
