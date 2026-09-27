@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../../src/agents/permission-answer-watch.js";
@@ -450,6 +450,51 @@ describe("startPermissionAnswerWatch", () => {
     subs[1]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
     await waitFor(() => sendKeysCalls.length > 0);
     expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]);
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // FACTORY-145: the trigger instant this module records on frame receipt is
+  // what runPermissionAnswerTick turns into `latencyMs` — an injected clock
+  // proves the two sides share one instant, end to end through the real
+  // fastPathTriggers map (not a fake stand-in for it).
+  test("FACTORY-145: a fast-path answer's audit record carries an exact latencyMs measured from frame receipt, using the shared injected clock", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, setScreen } = fakeClient({ p1: "ordinary idle screen, no dialog" });
+    const subs: FakeSubscription[] = [];
+    // A queue rather than a wall-clock variable: this module's own `now()`
+    // calls are exactly one per pane per frame-receipt/tick, in a known
+    // order, so a queue pins each call's return value without racing test
+    // code against microtask scheduling the way a shared mutable clock would.
+    const clockQueue = [10_180, 10_431]; // frame receipt, then the tick's own latency read — 251ms apart
+    const now = () => clockQueue.shift() ?? 999_999;
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: onlyP1,
+        auditPath,
+        now,
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      1_000_000,
+    );
+
+    await waitFor(() => subs.length > 0);
+    setScreen("p1", DIALOG_SCREEN);
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => {
+      try { return readFileSync(auditPath, "utf8").includes("latencyMs"); } catch { return false; }
+    });
+
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(audit.at(-1)).toMatchObject({ paneId: "p1", trigger: "fast", latencyMs: 251 });
 
     handle.stop();
     rmSync(dir, { recursive: true, force: true });

@@ -328,12 +328,13 @@ export interface Rule {
    * (FACTORY-43) already reads `spec.permissionMode` generically for every
    * provider, not just managed sessions, so no new wiring is needed there —
    * only threading this field into each builder's own `SpawnSpec` output.
-   * Absent means today's behaviour exactly: no flag is sent, so Drovr's own
-   * default (`bypassPermissions`, `agentLaunchConfig`, src/agents/argv.ts)
-   * applies unchanged — INCLUDING for a `jira-project` rule, whose own
+   * Absent means butchr's own default applies: `acceptEdits`
+   * (`DEFAULT_PERMISSION_MODE`, `agentLaunchConfig`, src/agents/argv.ts,
+   * since FACTORY-138 — previously Drovr's own `bypassPermissions` fallback
+   * applied instead) — INCLUDING for a `jira-project` rule, whose own
    * unconditional `permissionMode: "auto"` default there is set BEFORE
-   * `spec.permissionMode`'s spread and so is overridden by this field only
-   * when present. See `lizardMode` immediately below: the two fields are
+   * `spec.permissionMode`'s spread (but AFTER butchr's own default) and so
+   * is overridden by this field only when present. See `lizardMode` immediately below: the two fields are
    * independent (either may be set without the other), but pairing this with
    * `"default"` and `lizardMode: true` is the combination FACTORY-76 exists
    * for. See `RULE_PERMISSION_MODES`'s own doc comment for why there is no
@@ -350,11 +351,17 @@ export interface Rule {
    * comment / `docs/permission-answer-loop.md` for exactly which option it
    * presses and how it is logged, deliberately not restated here since that
    * is drovr's own answering policy, not this field's concern (and is a
-   * moving target — FACTORY-93/FACTORY-67) — so a rule kept in
-   * `permissionMode: "default"` is never left frozen on that dialog for
-   * hours. Absent/false means today's behaviour exactly: this rule's panes
-   * are never scanned or touched by that timer, matching every rule that
-   * does not set this field. Resolved live from the loaded `rules` list
+   * moving target — FACTORY-93/FACTORY-67) — originally built so a rule
+   * kept in `permissionMode: "default"` was never left frozen on that
+   * dialog for hours. FACTORY-138 (operator decision, FACTORY-67 director
+   * comment 2026-09-26 22:24Z): butchr's own launch default is now
+   * `permissionMode: "acceptEdits"` + this field eligible together — an
+   * accept-edits agent still gets Bash/MCP tool-permission prompts, so it
+   * needs the same unattended-clearing this field always provided for
+   * manual mode. Absent now means ELIGIBLE (a rule that IS found and never
+   * sets this field is scanned/touched by that timer); only an EXPLICIT
+   * `false` opts a rule's panes out — that absent-vs-false distinction is
+   * unchanged, only which one means "on" has flipped. Resolved live from the loaded `rules` list
    * (`ruleLizardModeOf`, an exported pure function in
    * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
    * it to its own live state) — deliberately NEVER reaches `SpawnSpec`/argv,

@@ -183,37 +183,51 @@ export interface SessionDefinition {
    * DROVR-42/FACTORY-67 — the operator's own "lizard mode": turns on
    * `@brooswit/drovr`'s `autoAnswerPermissions` (DROVR-37) for THIS agent's
    * pane, on the daemon's own standalone permission-answer timer
-   * (`src/agents/permission-answer-loop.ts`) — pressing the "Yes, and
-   * always allow …" stored-rule option on an unambiguous Claude
-   * tool-permission dialog, unattended. The point of the field: it lets a
-   * definition run `permissionMode: "default"` (manual/ask mode) — Claude's
-   * own safest mode, prompting before every tool call — WITHOUT an agent
-   * ever sitting frozen on one of those prompts for hours (the DROVR-37
-   * incident this whole mechanism exists to fix), instead of the
-   * alternative of raising `permissionMode` to `"auto"`/`"bypassPermissions"`
-   * to avoid prompts altogether. Nothing here requires that pairing — a
-   * definition may set this alongside any `permissionMode` — but manual
-   * mode plus this field is the combination the field exists for.
-   * Absent/`false` means today's behaviour exactly: this pane is never
-   * scanned or touched by the permission-answer timer, matching every OTHER
-   * currently-deployed definition (which does not set this field at all).
-   * Does not reach the launched process's own argv — unlike
+   * (`src/agents/permission-answer-loop.ts`) — pressing option 1, "Yes"
+   * (allow once — FACTORY-93 changed the pressed option away from a
+   * stored "always allow" rule; see that timer's own doc comment) on an
+   * unambiguous Claude tool-permission dialog, unattended. Originally
+   * built so a definition could run `permissionMode: "default"` (manual/ask
+   * mode) — Claude's own safest mode, prompting before every tool call —
+   * WITHOUT an agent ever sitting frozen on one of those prompts for hours
+   * (the DROVR-37 incident this whole mechanism exists to fix). FACTORY-138
+   * (operator decision, FACTORY-67 director comment 2026-09-26 22:24Z):
+   * butchr's own launch default is now `permissionMode: "acceptEdits"` +
+   * this field TRUE together (`agentLaunchConfig`, src/agents/argv.ts) — an
+   * accept-edits agent still gets Bash/MCP tool-permission prompts, so it
+   * needs the exact same unattended-clearing this field always provided for
+   * manual mode; the DROVR-37 shape is "any mode that still prompts, with
+   * nobody answering", not manual mode specifically. Nothing here requires
+   * pairing with any particular `permissionMode` — a definition may set
+   * this alongside any value, or leave `permissionMode` at its own default
+   * too. Absent means ELIGIBLE for a `vendor: "claude"` definition (the new
+   * default, since FACTORY-138); only an EXPLICIT `false` means this pane
+   * is never scanned or touched by the permission-answer timer — that
+   * absent-vs-false distinction is still fully preserved, only which one
+   * means "on" has flipped, for `claude`. A `vendor: "codex"` definition
+   * (the hard rejection below) stays not-eligible when absent, since it
+   * cannot set this field to begin with — see `ManagedSessionResourceDeps.lizardModes`'s
+   * own doc comment (src/rules/session-definition-type.ts) for exactly
+   * where that default is applied. Does not reach the launched process's own argv — unlike
    * `permissionMode`/`strictMcpConfig` (see FACTORY-43), this is a
    * DAEMON-side behaviour toggle only, read fresh from `ManagedSessionResourceDeps.lizardModes`
    * every poll (src/rules/session-definition-type.ts) — so there is no
    * persisted-at-spawn value for a stale-argv check to compare against, and
-   * none is needed: toggling this field takes effect on the very next
-   * permission-answer tick, live, with no agent respawn (see that map's own
-   * doc comment for the "no second, independently-recomputed expectation"
-   * FACTORY-43 lesson this design sidesteps by construction, having nothing
-   * to duplicate in the first place). **Rejected at manifest load for
-   * `vendor: "codex"`** — `autoAnswerPermissions`'s own Claude-specific
-   * dialog recognition (`classifyPermissionPrompt`, `@brooswit/drovr`) never
-   * matches a Codex pane's screen, so a Codex definition setting this to
-   * `true` would silently do nothing — the same misleading-silence failure
-   * mode `strictMcpConfig`'s own hard rejection for Codex exists to close,
-   * not `permissionMode`'s more lenient "stored but unforwarded" precedent.
-   * See `docs/managed-sessions.md`'s "Lizard mode" section.
+   * none is needed: toggling this field (or its default changing, as here)
+   * takes effect on the very next permission-answer tick, live, with no
+   * agent respawn (see that map's own doc comment for the "no second,
+   * independently-recomputed expectation" FACTORY-43 lesson this design
+   * sidesteps by construction, having nothing to duplicate in the first
+   * place). **Rejected at manifest load for `vendor: "codex"`** —
+   * `autoAnswerPermissions`'s own Claude-specific dialog recognition
+   * (`classifyPermissionPrompt`, `@brooswit/drovr`) never matches a Codex
+   * pane's screen, so a Codex definition setting this field at all would
+   * silently do nothing — the same misleading-silence failure mode
+   * `strictMcpConfig`'s own hard rejection for Codex exists to close, not
+   * `permissionMode`'s more lenient "stored but unforwarded" precedent;
+   * this new default is correspondingly INERT for a Codex definition, never
+   * applied to one (see the `lizardModes` fill site for how). See
+   * `docs/managed-sessions.md`'s "Lizard mode" section.
    */
   lizardMode?: boolean;
   /** Reused verbatim from `Rule` (src/rules/rules.ts) — same type, same validation, same "independent of every other field" semantics. Stored and surfaced; execution-mode RECONCILIATION for an individual definition is not implemented by this ticket (see docs/managed-sessions.md) — the built-in query itself always runs `swarm` (one agent per eligible definition file), which is already "one agent" for every mode at the file granularity this ticket covers. */

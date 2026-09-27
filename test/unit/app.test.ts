@@ -387,6 +387,22 @@ describe("GET /config-inventory (FACTORY-72): every configured rule and managed-
       app.stop();
     }
   });
+
+  // FACTORY-132: `staffed: null` (the census-unavailable tri-state) must
+  // round-trip through JSON as a real `null`, not dropped or coerced.
+  test("staffed: null (census unavailable) round-trips through the JSON route as a real null, with a non-null reason", async () => {
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }], sessionDefinitions: [], errors: [] };
+    const { app } = buildApp({ ...view, configInventory: async () => inventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const body = (await (await fetch(`${b}/config-inventory`)).json()) as typeof inventory;
+      expect(body.rules[0]!.staffed).toBeNull();
+      expect(body.rules[0]!.reason).not.toBeNull();
+    } finally {
+      app.stop();
+    }
+  });
 });
 
 // FACTORY-81: the Configurations VIEW — end-to-end through a real, listening
@@ -441,6 +457,31 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
       expect(html).toContain("COULD NOT CHECK");
       expect(html).toContain("disk read failed");
       expect(html).not.toContain('id="rules"');
+    } finally {
+      app.stop();
+    }
+  });
+
+  // FACTORY-132: through the REAL app and REAL route — deps.dashboard() and
+  // deps.configInventory() wired to the SAME unchecked snapshot, exactly the
+  // way src/daemon/index.ts wires them, never a hand-picked "checked" flag
+  // independent of the rows the inventory itself was built from.
+  test("when deps.dashboard() reports checked:false, the served page renders COULD NOT CHECK for staffing and cross-links — never UNSTAFFED or 'no running agent'", async () => {
+    const dashboard: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView };
+    const inventory = {
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }],
+      sessionDefinitions: [], errors: [],
+    };
+    const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+      const html = await (await fetch(`${b}/configurations`)).text();
+      expect(html).toContain("task");
+      expect(html.toUpperCase()).not.toContain("UNSTAFFED");
+      expect(html).not.toContain("no running agent");
+      expect(html).toContain("COULD NOT CHECK");
+      expect(html.match(/COULD NOT CHECK/g)?.length ?? 0).toBeGreaterThanOrEqual(2); // staffing cell AND cross-link area
     } finally {
       app.stop();
     }

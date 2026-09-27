@@ -449,7 +449,7 @@ export function atlassianTools(
     },
     confluence_update_page: {
       description:
-        "DEPRECATED for a ticket's own doc — use set_doc, a full-body replace of the CALLER's own doc with no key parameter at all. Still the general-purpose way to update a standing page (like a convention/reference page) that ISN'T a ticket's doc. " +
+        "DEPRECATED for a ticket's own doc — use set_doc, a full-body replace of the CALLER's own doc with no key parameter at all. Still the general-purpose way to update a standing page (like a convention/reference page) that ISN'T a ticket's doc, or a page you created on request with confluence_create_page. " +
         "Full-body replace of an existing Confluence page (storage/XHTML). Pass raw XHTML tags in `body`, NOT entity-escaped text — write <h2>Heading</h2>, never &lt;h2&gt;Heading&lt;/h2&gt;. Optimistic locking (Confluence's version number) is handled INTERNALLY — never pass or compute a version yourself. Omit `title` to keep the page's current title. Convention entries stay one-page-per-entry, never edited — this tool is for maintaining a standing page (like a convention/reference page), not for rewriting log entries.",
       input: { id: z.string(), body: z.string(), title: z.string().optional() },
       handler: (a, c) => {
