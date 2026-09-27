@@ -193,16 +193,13 @@ export function agentLaunchConfig(
 
   return {
     provider: "claude",
-    // FACTORY-138: butchr's own default, applied BEFORE the jira-project
-    // override immediately below so that override (and, after it, an
-    // explicit spec.permissionMode further down) both still win over it —
-    // see DEFAULT_PERMISSION_MODE's own doc comment for why this is the
-    // one place the default belongs.
+    // FACTORY-138: butchr's own default; an explicit spec.permissionMode
+    // further down still wins over it — see DEFAULT_PERMISSION_MODE's own
+    // doc comment for why this is the one place the default belongs.
+    // FACTORY-129: the jira-project-only "auto" override that used to sit
+    // here is gone — jira-project agents now inherit this default (and
+    // lizard-mode eligibility) exactly like every other rule kind.
     permissionMode: DEFAULT_PERMISSION_MODE,
-    // FACTORY-129 will remove this override once jira-project agents get
-    // their own explicit permissionMode elsewhere — a pure deletion of this
-    // one line, left otherwise untouched by FACTORY-138 on purpose.
-    ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"auto"}: {}),
     name,
     paneId,
     cwd: dir,
