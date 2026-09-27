@@ -1,5 +1,14 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-145: every `answered:` journal line and audit record now carries
+> a `trigger` (`"fast"` or `"sweep"`), plus a `latencyMs` number when
+> `trigger` is `"fast"`.** See "Fast-path latency (FACTORY-145)" further down
+> for the exact field shapes and how to compute p50/p95 from the audit file.
+> `latencyMs` is a lower bound on the operator-visible wait (it excludes
+> whatever time herdr itself took to notice the pane went blocked and get a
+> frame to butchr, plus ordinary network/socket delay before receipt) and is
+> never emitted for a sweep-triggered answer, whose true wait is unknowable.
+
 > **FACTORY-98 (FACTORY-97): a lizard-eligible pane is now usually answered
 > within about a second, not up to 20s.** The daemon opens a herdr push
 > subscription (`pane.agent_status_changed`) filtered to exactly the
@@ -276,6 +285,95 @@ restart could see as stale. A `stop()`/restart of the watch simply closes
 whatever subscription is open and re-derives everything from the next
 `agent.list()` call, same as the scan-only version always did.
 
+## Fast-path latency (FACTORY-145)
+
+FACTORY-98 made a lizard-eligible pane usually get answered within about a
+second, but the `answered:` journal line only recorded that an answer
+happened, with the journal's own 1s timestamp resolution — no number a p50/p95
+could be computed from. FACTORY-145 adds one.
+
+**What's measured, and from where.** `permission-answer-watch.ts` records a
+monotonic instant (`deps.now`, default `performance.now`, never wall-clock —
+wall-clock can step backward or forward under NTP adjustment, corrupting an
+elapsed-time subtraction) the moment a pane's own `pane.agent_status_changed`
+push frame reports `blocked` (`fastPathTriggers: Map<paneId, instant>`).
+`runPermissionAnswerTick` (`permission-answer-loop.ts`) consumes that instant
+(reads it, then deletes it) for every pane it scans this tick, whether or not
+the pane ends up answered — a `skipped`/`failed` outcome must not leave a
+stale trigger instant behind for a later tick to (wrongly) measure against.
+For a pane that ends up `answered`, the elapsed time from that trigger
+instant to "this tick pressed its prompt" is `latencyMs`.
+
+**This is a lower bound on the operator-visible wait, not the whole of it.**
+The push frame's own shape (`{ pane_id, agent_status }`, no timestamp —
+checked against `@brooswit/herdr-sdk`'s own generated
+`PaneAgentStatusChangedEvent` type, which carries none) never tells butchr
+when herdr itself observed the pane go blocked, only when butchr received the
+frame reporting it. So `latencyMs` excludes whatever time herdr took to
+notice the transition and get a frame to butchr, plus ordinary network/socket
+delay ahead of receipt. Name it "latency from frame receipt", not "latency
+from the pane going blocked", if you write about it elsewhere.
+
+**Sweep-triggered answers carry no latency number at all — never a fabricated
+one.** A pane the sweep's own `agent.list()` scan discovers (no fast-path
+frame ever recorded for it — herdr's push connection was down, or the pane
+became eligible too recently to be subscribed yet, see "A newly-eligible
+pane's first tick is still scan-driven" above) may have been sitting blocked
+anywhere from 0 to one whole sweep interval before the scan happened to look.
+"Now minus when the sweep looked" is not a latency, it is an artefact that
+LOOKS like one and would silently drag a computed p95 downward. Such an
+answer's `trigger` is `"sweep"` and it carries no `latencyMs` field at all
+(never `latencyMs: null` — the field itself is entirely absent, so any reader
+that filters on the field being present rather than merely truthy still gets
+the right answer).
+
+**Field shapes**, both on the `[permission-answer] … answered: …` journal
+line (as a trailing `, fast, 247ms` or `, sweep` suffix) and on the
+`.permission-audit.jsonl` record appended right after drovr's own two
+records (`approving`/`approved`) for that pane's attempt:
+
+| field | present | type | meaning |
+| --- | --- | --- | --- |
+| `trigger` | always | `"fast" \| "sweep"` | which path caused this pane to be looked at THIS tick |
+| `latencyMs` | only when `trigger === "fast"` | number (ms, rounded, >= 0) | elapsed time from frame receipt to this tick pressing the prompt |
+
+The rest of the appended record (`ts`, `paneId`, `label`, `tool`, `request`)
+mirrors the journal line's own fields, so `jq` can filter and join on them
+without cross-referencing drovr's own `approving`/`approved` records for the
+same attempt.
+
+**Logging never risks or delays an answer.** The audit append happens AFTER
+`autoAnswerPermissions` has already returned its outcome for the pane — a
+failing `appendAudit` (disk full, permission denied) is caught and logged
+(`latency audit write failed for <pane>: <detail>`), never thrown, and never
+prevents or retries the answer itself, which has already happened by the time
+this write is attempted.
+
+### Computing p50/p95 from the audit file
+
+Every fast-path answer's own latency record is a single JSONL line with
+`trigger: "fast"` and a numeric `latencyMs` — filter on both (not just the
+field's presence) so a future record shape with `latencyMs: null` for some
+other reason can't sneak into the computation:
+
+```sh
+jq -s '
+  [ .[] | select(.trigger == "fast" and (.latencyMs | type == "number")) | .latencyMs ]
+  | sort
+  | . as $s
+  | { n: length,
+      p50: $s[(length * 0.50 | floor)],
+      p95: $s[(length * 0.95 | floor)] }
+' .permission-audit.jsonl
+```
+
+A `trigger: "sweep"` record has no `latencyMs` at all, so `.latencyMs | type
+== "number"` alone already excludes it — the explicit `trigger == "fast"`
+check is belt-and-suspenders documentation of intent, not load-bearing on its
+own, but keep both: a filter that only checks `.latencyMs` existing would
+misread a future field with a different meaning if one is ever added under
+the same name.
+
 ## The audit log
 
 `Config.permissionAuditPath` (`src/config/config.ts`): a JSONL file, default
@@ -294,6 +392,15 @@ calls it (`scope: "once"`), never a stored-rule option. This daemon's wiring
 passes `operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
 shared audit file, or a human comparing hosts, can tell butchr's own
 unattended pass apart from any other caller.
+
+**A third record follows drovr's own two, for every answered pane
+(FACTORY-145):** `runPermissionAnswerTick` itself appends one more JSONL line
+to the SAME `auditPath` right after drovr's `approving`/`approved` pair —
+this module owns that write, not drovr, since drovr's own `approvePermission`
+has no way to accept extra fields to fold into its own records. See "Fast-path
+latency (FACTORY-145)" above for its exact shape. A reader that assumed
+exactly two records per answered attempt (drovr's own historical contract)
+now sees three; nothing about drovr's own two records changed.
 
 ## Seeing recent auto-answers (FACTORY-67: mandatory, not optional)
 
