@@ -90,6 +90,7 @@ import {
   type SessionDefinitionListEntry,
 } from "../resources/session-definition-manage.js";
 import { assertArchiveDirDisjoint } from "../resources/session-archive.js";
+import { effectiveAgent } from "../resources/session-definition.js";
 
 /** One file (a rules file, or a session-definition file) that failed to load or parse — never swallowed, never log-only. */
 export interface FileErrorEntry {
@@ -110,14 +111,24 @@ export interface RuleInventoryEntry {
   role: AgentRole;
   /**
    * `rule.agentPreferences`, ranked-order preserved, each copied field-by-field
-   * (`harness`/`model`/`effort` — none secret) rather than reused as-is. This
-   * is the ticket's own "harness/provider list, tier" ask: `AgentPreference`'s
-   * `model`/`effort` are the only rule-level analogue of "tier" — a `Rule` has
-   * no `tier` field at all (that name belongs to `SessionDefinition` instead;
-   * see `SessionDefinitionInventoryEntry.tier`) — so a `RuleInventoryEntry`
-   * deliberately has no separate `tier` field either; a reader who needs a
-   * per-rule model/effort reads it here. `[]` when the rule sets no
-   * preference (uses butchr's global agent config).
+   * (`harness`/`model`/`effort` — none secret) rather than reused as-is.
+   * `model`/`effort` here are ALREADY the fully resolved effective values,
+   * whether the rule expressed them directly or via `modelPower`/
+   * `effortPower` — `rules.ts`'s own `parsePreferences` resolves either axis
+   * through `../resources/power-scale.ts`'s `resolveModelPower`/
+   * `resolveEffortPower` once, at rule-load time, and keeps only the
+   * resolved `{harness, model?, effort?}` shape on the parsed preference —
+   * the raw 0-100 input is not retained there (see `AgentPreference`'s own
+   * doc comment, `../rules/rules.ts`), so this module has no raw power to
+   * copy even if it wanted to, and makes no second call to those tables
+   * either way. FACTORY-120: keeping/showing the raw `modelPower`/
+   * `effortPower` for a rule preference was considered and ruled OUT of
+   * scope (it would mean changing `parsePreferences`/`AgentPreference`,
+   * which are also read to build spawn specs and the duplicate-preference
+   * identity key) — see FACTORY-120's own ticket if you're looking for that
+   * raw value; it was filed onward to FACTORY-73 instead of built here.
+   * `[]` when the rule sets no preference (uses butchr's global agent
+   * config).
    */
   agentPreferences: { harness: AgentHarness; model?: string; effort?: AgentEffort }[];
   /** `rule.linkedEventing === true`; `false` for absent/false alike (see that field's own doc comment on `Rule` — absent and false are the same no-op). */
@@ -147,6 +158,27 @@ export interface SessionDefinitionInventoryEntry extends SessionDefinitionListEn
   kind: "session-definition";
   /** `true` when this entry was read from the archive directory rather than the active one — computed from which directory actually produced it, never guessed. */
   archived: boolean;
+  /**
+   * FACTORY-120 — the resolved effective model for this definition, via
+   * `effectiveAgent()` (`../resources/session-definition.ts`): reused
+   * verbatim, never re-derived from `../resources/power-scale.ts`'s tables
+   * directly, whether this entry is a `tier`-based (deprecated) definition
+   * or a `modelPower`/`effort`-based one — see that function's own doc
+   * comment for why each path resolves differently. `undefined` for an
+   * INVALID entry (`valid: false`) — its content fields, this one included,
+   * structurally do not exist, same NOT-APPLICABLE discipline every other
+   * optional field on this interface already follows.
+   */
+  resolvedModel?: string;
+  /**
+   * Same source (`effectiveAgent()`). `undefined` for an INVALID entry
+   * (as `resolvedModel` above) AND, by design, for a valid `tier`-based
+   * (deprecated) definition: `effectiveAgent()` deliberately returns no
+   * `effort` for that path so a tier-based launch's real behaviour (no
+   * `--effort` override derived from `tier`) is reflected exactly, not
+   * approximated — see `effectiveAgent`'s own doc comment.
+   */
+  resolvedEffort?: AgentEffort;
 }
 
 export interface QueryAgentInventory {
@@ -336,8 +368,30 @@ async function buildSessionDefinitionInventory(deps: SessionDefinitionInventoryD
   };
 }
 
+/**
+ * FACTORY-120 — `resolvedModel`/`resolvedEffort` via `effectiveAgent()`
+ * (`../resources/session-definition.ts`), computed only for a `valid` entry
+ * with a `vendor` (an invalid entry's `vendor` is `undefined` by the same
+ * NOT-APPLICABLE discipline every other content field here follows — see
+ * `SessionDefinitionInventoryEntry`'s own doc comments). Safe to call
+ * unconditionally once those two hold: `sessionDefinitionProblems`
+ * (`../resources/session-definition.ts`) already rejects a valid entry that
+ * sets neither `tier` nor both `modelPower`/`effort`, so `effectiveAgent()`
+ * never hits its own "no band covers ..." throw here.
+ */
+function resolvedAgentFields(e: SessionDefinitionListEntry): { resolvedModel?: string; resolvedEffort?: AgentEffort } {
+  if (!e.valid || e.vendor === undefined) return {};
+  const { model, effort } = effectiveAgent({
+    vendor: e.vendor,
+    ...(e.tier !== undefined ? { tier: e.tier } : {}),
+    ...(e.modelPower !== undefined ? { modelPower: e.modelPower } : {}),
+    ...(e.effort !== undefined ? { effort: e.effort } : {}),
+  });
+  return { resolvedModel: model, ...(effort !== undefined ? { resolvedEffort: effort } : {}) };
+}
+
 const tagEntries = (entries: readonly SessionDefinitionListEntry[], archived: boolean): SessionDefinitionInventoryEntry[] =>
-  entries.map((e) => ({ ...e, kind: "session-definition" as const, archived }));
+  entries.map((e) => ({ ...e, kind: "session-definition" as const, archived, ...resolvedAgentFields(e) }));
 
 /** One `FileErrorEntry` per invalid definition — `problems` joined the same way `loadRulesFileState`'s own `error.message` is (a single string), never truncated to the first problem. */
 const fileErrorsOf = (entries: readonly SessionDefinitionListEntry[]): FileErrorEntry[] =>
