@@ -24,24 +24,28 @@
 
 ## What it is
 
-DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs? })`
+DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs?, scope? })`
 in `@brooswit/drovr` (>= 0.15.0): an unattended pass that scans every Claude
 pane for a pending tool-permission dialog ("Do you want to proceed?") and
-presses the "Yes, and always allow … from this project" stored-rule option
-only when it is unambiguously that option — auditing every attempt. DROVR-41
-proved it live against a real herdr pane and recommended wiring it into
-butchr's own daemon.
+presses an option on it, only when it is unambiguously the right one —
+auditing every attempt. As wired here (FACTORY-93, drovr >= 0.15.1) it always
+calls with `scope: "once"`, pressing plain "Yes" (allow once) and never the
+"Yes, and always allow … from this project" stored-rule option; no stored
+rule is ever written. DROVR-41 proved the mechanism live against a real
+herdr pane and recommended wiring it into butchr's own daemon.
 
 That recommendation (DROVR-42) was originally scoped as a blanket sweep over
 every Claude pane. Before it merged, FACTORY-67's director narrowed the ask:
 the operator wants this as an **explicit, per-agent opt-in** — `lizardMode: true`
 on a managed-session definition (`SessionDefinition`, `src/resources/session-definition.ts`)
-— named "lizard mode" for the combination the field exists for: `permissionMode: "default"`
-(Claude's manual/ask mode, prompting before every tool call) plus this field,
-so an agent gets manual mode's own safety for every OTHER decision while
-never sitting frozen on the ONE dialog drovr already knows how to answer
-unambiguously. A definition that doesn't set the field behaves exactly as
-before — nothing here is a blanket sweep.
+— named "lizard mode". It is a SEPARATE toggle from `permissionMode`, not
+tied to any one value of it: it pairs with any `permissionMode` that still
+prompts before a tool call (manual/`"default"` included, but also, e.g.,
+`"acceptEdits"`, which auto-accepts file edits but still prompts for Bash and
+MCP tool calls), so an agent gets that mode's own safety for every prompt it
+still shows while never sitting frozen on the ONE dialog drovr already knows
+how to answer unambiguously. A definition that doesn't set the field behaves
+exactly as before — nothing here is a blanket sweep.
 
 `src/agents/permission-answer-loop.ts` is the daemon-side wiring:
 `startPermissionAnswerLoop` wraps `autoAnswerPermissions` on its own
@@ -142,7 +146,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s | only `lizardMode: true` panes | the tool-permission "always allow" dialog only, via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only `lizardMode: true` panes | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall
@@ -287,9 +291,10 @@ distinct file.
 Every `approvePermission` attempt appends an `approving` record before any
 key is sent, and a second record with the outcome after — see
 `approvePermission`'s own doc comment (`@brooswit/drovr`). Every record
-carries `operator` and (on an `approved` outcome) the exact stored-rule
-`option` text that was pressed. This daemon's wiring passes
-`operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
+carries `operator` and, once a prompt's option was resolved, the exact
+`option` text that was pressed — always "Yes" (allow once) as this daemon
+calls it (`scope: "once"`), never a stored-rule option. This daemon's wiring
+passes `operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
 shared audit file, or a human comparing hosts, can tell butchr's own
 unattended pass apart from any other caller.
 
@@ -298,15 +303,15 @@ unattended pass apart from any other caller.
 The daemon's own journal names WHICH AGENT and WHICH TOOL for every
 answer/failure, not just an opaque pane id: `[permission-answer] <definition
 file> (<pane id>) answered: <tool> — "<request excerpt>" (see <auditPath>
-for the exact stored-rule text)`, plus a per-tick summary line
+for the exact option text)`, plus a per-tick summary line
 (`N answered, M skipped, K failed`) whenever a tick answers or fails
 anything (an all-skipped or empty tick logs nothing, to keep the console
-quiet in normal operation). The exact "always allow" rule text pressed is
-not returned by `autoAnswerPermissions` itself — recovering it without
-re-parsing the pane's screen a second time (which this module deliberately
-never does; dialog recognition is drovr's job, not butchr's, per
-FACTORY-49/FACTORY-67) means pointing at the audit log's own `option` field
-for that literal text, which the journal line does.
+quiet in normal operation). The exact option text pressed — always "Yes"
+today — is not returned by `autoAnswerPermissions` itself — recovering it
+without re-parsing the pane's screen a second time (which this module
+deliberately never does; dialog recognition is drovr's job, not butchr's,
+per FACTORY-49/FACTORY-67) means pointing at the audit log's own `option`
+field for that literal text, which the journal line does.
 
 `tail -f <permissionAuditPath>` (or `grep`) gets the full per-attempt detail
 (promptId, scope, the exact option text, both the `approving` and `approved`/
