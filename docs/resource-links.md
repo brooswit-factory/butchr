@@ -856,9 +856,14 @@ daemons, cap 2/hr and `maxLinkedItems` 25 on every enabled `jira-work` rule):
    the hour in latency.
 3. Duplicate wakes concentrate in boss-type agents: booswrit epics 82%,
    wroosbit stories 70% of delivered linked turns fall within 20 minutes of
-   a same-watcher `related:` notify; leaf task/bug agents 0%. The fix (an
-   Implements de-duplication) ships as a separate, later change to this same
-   module — its effect is projected, not yet measured.
+   a same-watcher `related:` notify; leaf task/bug agents 0%. **BUTCHR-472
+   ships the fix** (below): a linked item whose target is already routed to
+   this same owner via `related:`'s own `watchedKeys()` (an Implements link
+   with the other end on the implementer side) is excluded from the linked
+   path entirely, so that pair is never independently re-derived and
+   re-notified here. Its effect on the duplicate-wake share is still
+   **projected, not yet measured** — re-measurement is one of the
+   "Conditions to revisit default-on" below, and needs a live deploy first.
 4. Usefulness: 21 hand-classified booswrit turns (convenience sample, not
    stratified) — 12 duplicate, 9 useful/likely-useful, 0 noise. wroosbit
    turns were not classified.
@@ -924,6 +929,17 @@ operator sign-off — not as settled policy.
    one shared per-session budget.
 5. The worst case is bounded (at most `cap` extra turns per agent per hour,
    per bucket, plus a restart burst); typical spend remains unmeasured.
+6. **A linked wake can fire for a ticket that has no issuelink to the
+   watcher at all** — confirmed in code: a bare Jira key mentioned anywhere
+   in a resource's own description text produces a `jira-key`-kind
+   `LinkedItem` (`descriptionItems`/`discoverLinkedItems`,
+   `src/resources/linked-discovery.ts`, wired into `jiraKindLinkedItems`
+   above), independent of `issuelinks`/`parent`. Comment text is NOT scanned
+   for key mentions anywhere in this codebase (a linked target's comments
+   are only diffed by cursor id — `JiraSnapshot.commentCursor` — never
+   parsed for mentions). Observed repeatedly by a single observer on one
+   unlinked peer ticket, not measured (no instrumentation, no denominator),
+   mechanism unconfirmed.
 
 **The NUL-byte log line (fixed by this ticket).** The synthetic
 per-(session, project) key above contains a literal NUL byte. Once a

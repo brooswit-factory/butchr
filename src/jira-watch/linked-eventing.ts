@@ -173,6 +173,7 @@ import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, t
 import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
 import type { LinkStore } from "../resources/link-store.js";
 import { isDaemonLabelOnlyDiff } from "./diff.js";
+import { watchedKeys } from "./routes.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
   pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
@@ -335,8 +336,25 @@ const EXTERNAL_DISCOVERY_KINDS = new Set<LinkedItemKind>(["confluence", "github-
  * target, first occurrence wins (issuelink/parent/description-derived beats
  * a remote link resolving to the same key) — the same convention
  * `discoverLinkedItems` itself already uses.
+ *
+ * BUTCHR-472: a target `watchedKeys(match.issue.issuelinks)`
+ * (`src/jira-watch/routes.ts`) already routes for THIS SAME owning key via
+ * the pre-existing `related:` notify path — an Implements link with the
+ * other end on the IMPLEMENTER side (`otherEnd === "outward"`), i.e. a boss
+ * hearing what implements it — is excluded here, of whatever `LinkedItem`
+ * kind it happens to surface as (issuelink/parent/jira-key/remote-link),
+ * so this module never re-derives and re-notifies the SAME (owner, target)
+ * pair `related:` already delivers independently. Both paths read off the
+ * SAME `watchedKeys` function (never a second, possibly-drifting
+ * definition of "already routed"). This is deliberately NOT symmetric:
+ * `watchedKeys` only ever returns the outward/implementer side, so a
+ * worker's own Implements link to ITS boss (`otherEnd === "inward"`, the
+ * reverse direction `routes.ts` itself documents as excluded from
+ * `related:`) is never in this set and is therefore untouched — see this
+ * ticket's PR for why that direction is left exactly as it was.
  */
 export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: readonly JiraRemoteLink[] | undefined): LinkedItem[] {
+  const routedByRelated = new Set(watchedKeys(match.issue.issuelinks ?? []));
   const discovered = discoverLinkedItems({
     issuelinks: match.issue.issuelinks,
     parent: match.issue.parent,
@@ -353,7 +371,7 @@ export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: rea
   const seen = new Set<string>();
   const out: LinkedItem[] = [];
   for (const item of [...discovered, ...remoteKeyItems]) {
-    if (seen.has(item.target)) continue;
+    if (seen.has(item.target) || routedByRelated.has(item.target)) continue;
     seen.add(item.target);
     out.push(item);
   }
