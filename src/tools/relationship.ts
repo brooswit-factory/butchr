@@ -1940,12 +1940,13 @@ export interface CorrectWorkerResult {
  * returned `message` names that gap explicitly.
  */
 function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace-on-disk" | "rewritten" | "failed"; error?: string } {
-  // FACTORY-118: `workspaceDirsForResource`, not a hand-rolled walk of
-  // `<root>/jira-work/*` — that fixed three-deep shape is no longer where a
-  // workspace necessarily lives (a migrated one sits flat under `root`,
-  // named by FACTORY-90's short display id). The helper already covers
-  // BOTH layouts, so this stays correct for a resource with some rules'
-  // workspaces migrated and others not yet.
+  // FACTORY-118: `workspaceDirsForResource`, not a hand-rolled walk
+  // assuming a fixed leaf name — a migrated resource's leaf is now
+  // FACTORY-90's short display id rather than its raw percent-encoded
+  // resource id, though the three-deep `<root>/<provider>/<ruleId>/<leaf>`
+  // shape itself is unchanged. The helper already covers BOTH layouts, so
+  // this stays correct for a resource with some rules' workspaces migrated
+  // and others not yet.
   let dirs: string[];
   try { dirs = workspaceDirsForResource("jira-work", spec.key); } catch { return { outcome: "no-workspace-on-disk" }; }
   let rewrote = false;

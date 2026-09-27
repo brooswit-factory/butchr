@@ -293,13 +293,18 @@ const legacyLeaf = (resourceId: string): string => encodeURIComponent(resourceId
  * `join()` is ever called on it — a leaf this rejects would otherwise make
  * `join()` return the rule directory itself (`.`/`..`), escape it (a
  * candidate containing `/`), or throw at `mkdirSync` (NUL, over-length).
+ * Exported so `test/unit/workspace.test.ts` can pin EVERY hostile shape
+ * directly — not every one is reachable through a real provider's own
+ * `shortDisplayId` method with a resourceId `encodeAgentKey` would ever have
+ * accepted (a NUL or `.`/`..` short id has no known real producer), and this
+ * function's own contract does not depend on one existing.
  * Deliberately permissive otherwise: `:`, `#`, spaces and non-ASCII are all
  * valid single-path-segment bytes on a real filesystem, so — unlike the
  * pre-Addendum herdr-LABEL sanitization this ticket's own leaf naming does
  * NOT reuse — none of those are rewritten; the leaf is either the provider's
  * real short id, verbatim, or (on failure here) `legacyLeaf` above.
  */
-function isValidLeaf(leaf: string): boolean {
+export function isValidLeaf(leaf: string): boolean {
   if (leaf.length === 0 || leaf === "." || leaf === "..") return false;
   if (leaf.includes("/") || leaf.includes("\0")) return false;
   return Buffer.byteLength(leaf, "utf8") <= MAX_ENCODED_SEGMENT_BYTES;
