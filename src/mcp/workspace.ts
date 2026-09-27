@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
+import { agentIdOfWorkspacePath } from "../agents/workspace.js";
 import { KEY_ONLY_PROVIDERS } from "./identity.js";
 
 /**
@@ -25,10 +26,18 @@ import { KEY_ONLY_PROVIDERS } from "./identity.js";
  */
 export function bridgeWorkspace(root: string, cwd: string): { url: URL; identity?: string; agent?: string } {
   const directory = realpathSync(cwd);
-  const rel = relative(realpathSync(root), directory);
+  const realRoot = realpathSync(root);
+  const rel = relative(realRoot, directory);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error("Not a factory workspace");
   const segments = rel.split(sep);
-  const agent = segments.length === 3 ? segments.join(":") : undefined;
+  // FACTORY-118: `agentIdOfWorkspacePath`, not a hand-rolled
+  // `segments.join(":")` — a resource-kind key's leaf may now be its short
+  // display id (lossy, unrecoverable by segment-decode alone), resolved
+  // instead via the bookkeeping stamp `ensureWorkspaceDir` wrote inside this
+  // very directory. A three-deep OLD-layout (fully percent-encoded) leaf
+  // still decodes exactly as before — this is a strict superset, never a
+  // behavior change for a directory this function already accepted.
+  const agent = segments.length === 3 ? (agentIdOfWorkspacePath(directory, realRoot) ?? undefined) : undefined;
   const decoded = agent === undefined ? null : decodeAnyAgentKey(agent);
   if (segments.length !== 1 && !decoded) throw new Error("Not a factory workspace");
   const value: unknown = JSON.parse(readFileSync(join(directory, ".butchr-agy.json"), "utf8"));
