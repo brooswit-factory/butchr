@@ -7,6 +7,14 @@
  * route (`src/web/view.ts`) — this module builds the response; the route
  * itself does no shaping of its own.
  *
+ * FACTORY-132: a `RuleInventoryEntry`'s staffing is a THREE-state fact, not
+ * two — `staffed: true` (staffed), `staffed: false` (genuinely not staffed,
+ * `reason` says why), or `staffed: null` (COULD NOT CHECK: the agent census
+ * itself is unavailable this poll, so neither "staffed" nor "not staffed" is
+ * a fact this daemon can currently assert). See `RuleInventoryEntry.staffed`'s
+ * own doc comment for the exact contract and `ruleStaffingReason`'s own doc
+ * comment for the fixed check order that produces it.
+ *
  * REUSE, NOT RE-DERIVATION, is this module's whole design constraint:
  *
  * - "Is this rule currently staffed, and why not" is answered by reading
@@ -116,9 +124,22 @@ export interface RuleInventoryEntry {
   linkedEventing: boolean;
   /** `rule.mcpServers`' own `name`s ONLY — see this module's own top comment on why nothing else from a binding is ever copied here. `[]` when the rule binds none. */
   mcpServerNames: string[];
-  /** `true` when at least one live agent (or, for a `singleton`/`persistent` rule, its one query-level agent) is currently observed for this rule. */
-  staffed: boolean;
-  /** Why this rule is not currently staffed — `null` when `staffed` or not applicable (see `ruleStaffingReason`'s own doc comment for the exact vocabulary). */
+  /**
+   * `true` when at least one live agent (or, for a `singleton`/`persistent`
+   * rule, its one query-level agent) is currently observed for this rule;
+   * `false` when this rule is genuinely not staffed right now (`reason` says
+   * why); `null` when staffing could NOT be determined because the agent
+   * census is unavailable (FACTORY-132) — a third state, neither a truthy
+   * "staffed" nor a falsy "not staffed". `null` is NOT the same claim as
+   * `false`: `false` says this daemon looked and found nothing (or a config
+   * reason already rules it out); `null` says this daemon could not look at
+   * all this poll. Every reader in this repo compares with `=== true` /
+   * `=== false` / `=== null` (or an exhaustive branch) — never a truthiness
+   * test, which would silently collapse `null` back into "not staffed" and
+   * reintroduce the exact defect this field exists to fix.
+   */
+  staffed: boolean | null;
+  /** Why this rule is not currently staffed, or why that could not be determined — `null` iff `staffed === true`; non-null and explanatory for BOTH `staffed === false` and `staffed === null` alike (see `ruleStaffingReason`'s own doc comment for the exact vocabulary). */
   reason: string | null;
 }
 
@@ -165,7 +186,19 @@ export interface RuleStaffingDeps {
   configReason: string | null;
   live: ReadonlySet<string>;
   withheld: ReadonlySet<string>;
-  /** `DashboardResponse.checked` — whether at least one `agent.list()` poll has ever succeeded. Distinguishes a genuine "no matches" from "this daemon hasn't observed anything yet" (same discriminator `dashboard.ts` itself uses via `checked`/`declinedAt`). */
+  /**
+   * `DashboardResponse.checked` verbatim — whether the MOST RECENT
+   * `agent.list()` poll succeeded. NOT "whether at least one poll has ever
+   * succeeded": per `createDashboardFeed`'s own doc comment (`./dashboard.ts`),
+   * a poll that fails AFTER an earlier success also flips this back to
+   * `false`, carrying the previous (possibly stale) rows forward. So
+   * `dashboardChecked === false` covers TWO cases — never yet succeeded, and
+   * most-recently failed — and distinguishes both alike from a genuine "no
+   * matches" (same discriminator `dashboard.ts` itself uses via
+   * `checked`/`declinedAt`, and the same one `dashboard-page.ts`'s own page
+   * banner keys its COULD NOT CHECK rendering on). Any reason string derived
+   * from this flag being `false` must read as true under BOTH cases.
+   */
   dashboardChecked: boolean;
 }
 
@@ -174,27 +207,32 @@ export interface RuleStaffingDeps {
  * module's own top comment for the reuse this is built from. Checked in
  * this fixed order, each one a strictly narrower question than the last:
  *
- * 1. `enabled === false` → `"disabled"`. Nothing else is even asked.
+ * 1. `enabled === false` → `"disabled"`. Nothing else is even asked — a
+ *    config fact, true regardless of census state.
  * 2. A provider-wide config/credential problem (`configReason`, e.g. no
  *    `GITHUB_TOKEN_FILE`) → that exact reason string, reused verbatim from
- *    `githubIssueStaffing`/`zendeskTicketStaffing`.
+ *    `githubIssueStaffing`/`zendeskTicketStaffing` — also a config fact,
+ *    also true regardless of census state.
  * 3. A live agent already observed for this rule → staffed, `reason: null`.
  * 4. A matched-but-withheld resource observed for this rule (the fleet-wide
  *    admission cap) → `"admission cap: ..."`.
- * 5. No successful poll yet (`!dashboardChecked`) → `"not yet observed: ..."`
- *    — never a false "no matches" before this daemon has looked even once.
+ * 5. FACTORY-132: the agent census is unavailable (`!dashboardChecked` — see
+ *    that field's own doc comment: the MOST RECENT poll didn't succeed,
+ *    whether or not an earlier one did) → `staffed: null` (neither true nor
+ *    false — this daemon genuinely cannot say), `"census unavailable: ..."`.
+ *    Must never collapse into `UNSTAFFED` — that was this exact defect.
  * 6. Otherwise: a real, current zero — worded per `execution` mode, since
  *    "no matching resources" is not quite the right claim for a
  *    `singleton`/`persistent` rule's one query-level agent (see `Rule.execution`'s
  *    own doc comment, `../rules/rules.ts`).
  */
-export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffed: boolean; reason: string | null } {
+export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffed: boolean | null; reason: string | null } {
   if (!rule.enabled) return { staffed: false, reason: "disabled" };
   if (deps.configReason) return { staffed: false, reason: deps.configReason };
   const key = ruleCorrelationKey(rule.resourceProvider, rule.id);
   if (deps.live.has(key)) return { staffed: true, reason: null };
   if (deps.withheld.has(key)) return { staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" };
-  if (!deps.dashboardChecked) return { staffed: false, reason: "not yet observed: no successful agent-list poll since this daemon started" };
+  if (!deps.dashboardChecked) return { staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" };
   return {
     staffed: false,
     reason: rule.execution === "swarm" ? "no matching resources this poll" : "no live agent observed for this rule this poll",
