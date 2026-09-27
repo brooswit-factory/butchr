@@ -48,7 +48,27 @@ const NO_ALWAYS_SCREEN = `──────────────────
 
 const AGENT_BASE = { agent: "claude" as const, focused: true, revision: 1, tab_id: "t1", terminal_id: "term1", workspace_id: "w1" };
 
-function fakeClient(screensByPaneInit: Record<string, string>): { client: PermissionAnswerClient; sendKeysCalls: unknown[] } {
+// Measured live against the REAL installed @brooswit/drovr `classifyCodexApprovalScreen`
+// — the exact "command" shape captured in codex-permission-approval.d.ts's own
+// header comment (codex-cli 0.145.0, 2026-09-26).
+const CODEX_COMMAND_SCREEN = `  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Allow creating drovr-codex-probe-home.txt in your home directory?
+
+  $ touch ~/drovr-codex-probe-home.txt
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with \`touch '~/drovr-codex-probe-home.txt'\` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel`;
+
+function fakeClient(
+  screensByPaneInit: Record<string, string>,
+  vendorByPane: Record<string, "claude" | "codex"> = {},
+): { client: PermissionAnswerClient; sendKeysCalls: unknown[] } {
   // Mutable copy: `sendKeys` below clears a pane's screen after pressing, the
   // same way a real approval clears the dialog off screen — without this,
   // `approvePermission`'s own verify loop (re-reads the pane, waits for the
@@ -60,7 +80,7 @@ function fakeClient(screensByPaneInit: Record<string, string>): { client: Permis
     agent: {
       list: async () => ({
         type: "agent_list" as const,
-        agents: Object.keys(screensByPane).map((pane_id) => ({ ...AGENT_BASE, pane_id, agent_status: "blocked" as const })),
+        agents: Object.keys(screensByPane).map((pane_id) => ({ ...AGENT_BASE, agent: vendorByPane[pane_id] ?? "claude", pane_id, agent_status: "blocked" as const })),
       }),
       get: (async () => { throw new Error("not used by autoAnswerPermissions"); }) as PermissionAnswerClient["agent"]["get"],
       read: (async (p: { target: string }) => ({
@@ -186,6 +206,141 @@ describe("runPermissionAnswerTick", () => {
 
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(audit[0]?.operator).toBe("butchr-daemon");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("FACTORY-108: Codex lizard mode wired alongside Claude in the same tick", () => {
+  test("mixed vendor: a claude pane and a codex pane are both eligible — each vendor's pass answers only its own pane, never the other's", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient(
+      { claudePane: ALWAYS_ALLOW_SCREEN, codexPane: CODEX_COMMAND_SCREEN },
+      { codexPane: "codex" },
+    );
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, operator: "test-op" });
+
+    expect(results).toHaveLength(2);
+    const claudeResult = results.find((r) => r.paneId === "claudePane");
+    const codexResult = results.find((r) => r.paneId === "codexPane");
+    expect(claudeResult).toMatchObject({ outcome: "answered", tool: "Bash command" });
+    expect(codexResult).toMatchObject({ outcome: "answered", kind: "command" });
+    // Each pane pressed exactly once — the Claude pass never touched the codex pane's screen and vice versa.
+    expect(sendKeysCalls).toHaveLength(2);
+    expect(sendKeysCalls).toContainEqual({ target: "claudePane", keys: ["enter"] });
+    expect(sendKeysCalls).toContainEqual({ target: "codexPane", keys: ["enter"] });
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(audit.some((r) => r.vendor === "codex")).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a non-lizard-eligible codex pane is left untouched alongside an eligible claude pane — the opt-in gate is not vendor-filtered, it's the SAME eligiblePanes map for both passes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient(
+      { claudePane: ALWAYS_ALLOW_SCREEN, codexPane: CODEX_COMMAND_SCREEN },
+      { codexPane: "codex" },
+    );
+    const onlyClaudePane = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.filter((a) => a.pane_id === "claudePane").map((a) => [a.pane_id, a.pane_id]));
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: onlyClaudePane, auditPath });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.paneId).toBe("claudePane");
+    expect(sendKeysCalls).toEqual([{ target: "claudePane", keys: ["enter"] }]); // codexPane never scanned
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("Codex results get their own log lines/counts, never merged into or miscounted as Claude's 'skipped' — one tick with answered + skipped + unrecognised + failed together", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "irrelevant, autoAnswerCodex is faked below" });
+    const lines: string[] = [];
+    const codexResults = [
+      { paneId: "p1", label: "p1", outcome: "answered" as const, kind: "command" as const, detail: "touch foo" },
+      { paneId: "p2", label: "p2", outcome: "skipped" as const, reason: "no approve-once option" },
+      { paneId: "p3", label: "p3", outcome: "unrecognised" as const, excerpt: "some unknown dialog" },
+      { paneId: "p4", label: "p4", outcome: "failed" as const, reason: "keys-failed", detail: "boom" },
+    ];
+    const fakeAutoAnswerCodex = (async () => codexResults) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals;
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, log: (l) => lines.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: fakeAutoAnswerCodex,
+    });
+
+    expect(results).toEqual(codexResults);
+    // Never throws inside logging (a.tool / a.request would be undefined on a Codex result) — the outer try/catch never fires.
+    expect(lines.some((l) => l.includes("tick failed"))).toBe(false);
+    // Codex gets its own summary line, distinct from Claude's "[permission-answer] N answered, ..." line.
+    expect(lines.some((l) => l.includes("codex: 1 answered, 1 skipped, 1 unrecognised, 1 failed"))).toBe(true);
+    expect(lines.some((l) => l.includes("p1") && l.includes("answered (codex)") && l.includes("command"))).toBe(true);
+    expect(lines.some((l) => l.includes("p4") && l.includes("failed (codex)") && l.includes("keys-failed"))).toBe(true);
+    // unrecognised is loud, never folded into a "skipped" count.
+    expect(lines.some((l) => l.includes("p3") && l.includes("UNRECOGNISED (codex)") && l.includes("some unknown dialog"))).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an unrecognised codex pane is logged once per distinct excerpt, not once per pane — a repeat of the SAME excerpt is suppressed, but a DIFFERENT excerpt on the same pane logs again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "irrelevant" });
+    const loggedSkips = new Set<string>();
+    const makeResult = (excerpt: string) => [{ paneId: "p1", label: "p1", outcome: "unrecognised" as const, excerpt }];
+
+    const lines1: string[] = [];
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, loggedSkips, log: (l) => lines1.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (async () => makeResult("dialog A")) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    expect(lines1.some((l) => l.includes("UNRECOGNISED") && l.includes("dialog A"))).toBe(true);
+
+    // Same excerpt again — must NOT log a second time.
+    const lines2: string[] = [];
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, loggedSkips, log: (l) => lines2.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (async () => makeResult("dialog A")) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    expect(lines2.some((l) => l.includes("UNRECOGNISED"))).toBe(false);
+
+    // A DIFFERENT excerpt on the same pane is a new, distinct thing a human hasn't seen — must log again.
+    const lines3: string[] = [];
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, loggedSkips, log: (l) => lines3.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (async () => makeResult("dialog B")) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    expect(lines3.some((l) => l.includes("UNRECOGNISED") && l.includes("dialog B"))).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("time budget: the Claude and Codex passes run CONCURRENTLY, not sequentially — one tick's total time is ~max(pass times), not their sum", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "irrelevant" });
+    const PASS_DELAY_MS = 60;
+    const delayed = async <T,>(value: T): Promise<T> => { await new Promise((r) => setTimeout(r, PASS_DELAY_MS)); return value; };
+
+    const start = Date.now();
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath,
+      autoAnswer: (() => delayed([])) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (() => delayed([])) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    const elapsed = Date.now() - start;
+
+    // Sequential would be >= 2 * PASS_DELAY_MS; concurrent stays close to one pass's own delay.
+    expect(elapsed).toBeLessThan(PASS_DELAY_MS * 2);
 
     rmSync(dir, { recursive: true, force: true });
   });

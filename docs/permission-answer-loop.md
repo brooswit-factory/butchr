@@ -52,16 +52,15 @@ before — nothing here is a blanket sweep.
 ## The opt-in gate
 
 `SessionDefinition.lizardMode?: boolean` (default `false`/absent) is
-validated at manifest load like every other definition field (rejected for
-`vendor: "codex"` — drovr's `classifyPermissionPrompt` is Claude-specific and
-never matches a Codex pane's screen, so a Codex definition setting this would
-silently do nothing; same treatment as `strictMcpConfig`'s own Codex
-rejection, not `permissionMode`'s more lenient "stored but unforwarded"
-precedent).
+validated at manifest load like every other definition field. **As of
+FACTORY-108, `vendor: "codex"` is accepted, not rejected** — see "Codex
+support (FACTORY-108)" below for what an explicit `true` does for that
+vendor. `strictMcpConfig` keeps its own, unrelated Codex rejection unchanged.
 
-Unlike `permissionMode`/`strictMcpConfig` (see "No argv, no stale-argv risk"
-below), `lizardMode` never reaches `SpawnSpec` or the launched process's
-argv. It is surfaced purely as a **live, rebuilt-every-poll map** —
+For `vendor: "claude"` — unlike `permissionMode`/`strictMcpConfig` (see "No
+argv, no stale-argv risk" below) — `lizardMode` never reaches `SpawnSpec` or
+the launched process's argv. It is surfaced purely as a **live,
+rebuilt-every-poll map** —
 `ManagedSessionResourceDeps.lizardModes` (`src/rules/session-definition-type.ts`),
 threaded through `ManagedSessionsLoopDeps.lizardModes`
 (`src/daemon/session-definitions-loop.ts`) to a module-level
@@ -115,16 +114,106 @@ persists both fields at spawn time (`buildWorkspace()`,
 them back into the SAME `spawnArgs()`/`agentLaunchConfig()`-style builder the
 real launch path uses — no second, independently-recomputed expectation.
 
-`lizardMode` was deliberately kept OUT of that shape rather than extended
-into it: it never becomes a CLI flag (`specForSessionDefinition`,
-`src/rules/session-definition-type.ts`, never puts it on the `SpawnSpec` —
-see that module's own test asserting exactly this), so there is no argv for
-a stale-argv check to compare in the first place, and no persist/read-back
-pair to keep in sync. This is checked in, not merely asserted: see
-`session-definition-type.test.ts`'s "lizardMode is deliberately NEVER
-carried into the SpawnSpec" test. `Rule.lizardMode` (FACTORY-87) keeps the
-exact same shape: no `specFor*` builder ever puts it on its `SpawnSpec`
-output either, for the same reason.
+For **Claude**, `lizardMode` was deliberately kept OUT of that shape rather
+than extended into it: it never becomes a CLI flag (`specForSessionDefinition`,
+`src/rules/session-definition-type.ts`, never puts it on the `SpawnSpec` for
+`vendor: "claude"` — see that module's own test asserting exactly this), so
+there is no argv for a stale-argv check to compare in the first place, and no
+persist/read-back pair to keep in sync. This is checked in, not merely
+asserted: see `session-definition-type.test.ts`'s "lizardMode is deliberately
+NEVER carried into the SpawnSpec" test (now scoped to `vendor: "claude"` —
+see "Codex support (FACTORY-108)" below for the Codex exception). `Rule.lizardMode`
+(FACTORY-87) keeps the exact same Claude-only shape: no `specFor*` builder
+ever puts it on a Claude `SpawnSpec` output either, for the same reason.
+
+### Codex support (FACTORY-108)
+
+**For `vendor: "codex"`, the opposite is true, by necessity.** drovr v0.16.0's
+Codex auto-answerer (`autoAnswerCodexApprovals`) is a no-op on a Codex agent
+launched with `--dangerously-bypass-approvals-and-sandbox` — there is no
+separate on/off switch for Codex the way `classifyPermissionPrompt`'s scan
+gate is for Claude; the bypass flag itself is what has to change. So an
+EXPLICIT `lizardMode: true` on a `vendor: "codex"` definition, or on a
+`Rule.lizardMode` for a rule-launched Codex agent, DOES reach `SpawnSpec.lizardMode`
+and the launch argv: `agentLaunchConfig`'s Codex branch (`src/agents/argv.ts`)
+drops ONLY `--dangerously-bypass-approvals-and-sandbox` — never adding
+`--ask-for-approval`/`--sandbox` flags. Unset or explicit `false` launches
+exactly as today. Because this DOES reach argv, it needs — and gets — the
+exact FACTORY-43 persist/read-back shape `permissionMode`/`strictMcpConfig`
+already have: `buildWorkspace()` persists the raw explicit value to
+`.butchr-lizard-mode.json`, and `HerdrHerd.staleIssues()` reads it back
+(`workspaceLizardMode`, `src/agents/workspace.ts`/`src/agents/herd.ts`) into
+the same `spawnArgs()` builder the real launch uses — without this, a lizard
+Codex agent's real (bypass-flag-less) argv would forever mismatch a naively
+recomputed "expected" argv that still assumes the bypass flag, respawn-looping
+it forever, the exact bug FACTORY-43 closed for the other two fields.
+
+**Explicit only — never a resolved/defaulted value — and why that matters.**
+A sibling story, FACTORY-127, makes `lizardMode` default to `true` where it
+is resolved for ELIGIBILITY (the `eligiblePanes` gate above), and promises
+that default flip never reaches argv or respawns anything. Reading the raw
+field, not the resolved one, at Codex launch-config time is what keeps that
+promise true here too: if the launch decision instead keyed off the
+resolved/defaulted value, FACTORY-127's rollout would silently drop the
+bypass flag from every running Codex agent at once, with no canary. The
+launch-flag decision lives in one small function in `src/agents/argv.ts`
+carrying this reasoning as its own comment.
+
+**Fixture coupling — "no `-a`/`-s` flags" is deliberate, not an oversight.**
+drovr's Codex prompt recognition was captured against codex-cli 0.145.0
+launched with only `--cd` — see `docs/codex-permission-approval.md` (shipped
+in the drovr release). A different `--ask-for-approval`/`--sandbox` policy
+renders prompt shapes nobody has captured fixtures for; drovr reports those
+as `unrecognised` (see "Codex outcomes get their own log lines" below),
+never answered — the agent freezes on the prompt, the exact failure this
+epic exists to remove. Changing the launch policy requires capturing new
+drovr fixtures first.
+
+**Recognised prompt surface:** a command-execution prompt (a network-access
+escalation renders the identical shape, just a network-flavoured `Reason:`
+line — not a distinct kind); a file edit/patch prompt; an MCP tool-call
+prompt. Only the plain approve-once option is ever pressed — never "don't ask
+again for …", "for this session", or "always allow". The pre-existing
+directory-trust dialog is untouched by this module. See
+`docs/managed-sessions.md`'s "Codex support (FACTORY-108)" section for the
+full wording table and the toggle-on-a-running-agent and host-config
+caveats — not repeated here to avoid the two docs drifting apart.
+
+**Codex outcomes get their own log lines, never merged into Claude's.**
+`autoAnswerCodexApprovals` returns a differently-shaped result
+(`{paneId,label,outcome:"answered",kind,detail}` / `{outcome:"skipped",reason}`
+/ `{outcome:"unrecognised",excerpt}` / `{outcome:"failed",reason,detail}`) —
+structurally incompatible with `autoAnswerPermissions`'s Claude-shaped
+`{tool,request}` fields. `runPermissionAnswerTick` gives the Codex pass its
+own counted summary line (`[permission-answer] codex: N answered, M skipped,
+K unrecognised, J failed`) and its own per-result log lines, rather than
+folding Codex results into the Claude counters — merging them naively would
+throw inside the Claude-shaped logging (`a.tool`/`a.request` undefined on a
+Codex result) and miscount `unrecognised` as `skipped`. `unrecognised` is
+always logged, never silently dropped, deduped per pane **and excerpt**
+(not just per pane) — a persistently unrecognised pane logs once, but a
+newly-appeared, different unrecognised dialog on that same pane is a new
+thing a human hasn't seen and logs again.
+
+**The two passes run concurrently, not sequentially.** Both the Claude and
+Codex passes are independently bounded by the same `readTimeoutMs` (8s, see
+"Cadence: 20s, and why" below); run sequentially, they could together
+approach 16s, eating most of the margin that budget exists to preserve.
+`runPermissionAnswerTick` runs them via `Promise.all` instead, keeping one
+tick's total bound at ~8s — safe because the two passes touch disjoint panes
+internally (each vendor's own classifier never matches the other vendor's
+screen) and share nothing to race over except `deps.auditPath`, which both
+drovr functions already append to safely under concurrent callers.
+
+**Wired on both loop paths.** Both `startPermissionAnswerLoop`'s 20s sweep
+and `permission-answer-watch.ts`'s event-driven fast path call the same
+`runPermissionAnswerTick`, so Codex answering is automatically wired onto
+both — there is no separate Codex-only entry point to keep in sync. The
+event path's own caveat below still applies to Codex exactly as it does to
+Claude: whether herdr reports a Codex pane as `"blocked"` while it's showing
+an approval dialog was not verified for this ticket (unlike Claude, where
+FACTORY-98 established it live) — until it is, treat Codex as answered by
+the 20s sweep, not the ~1s event path, even though the code path is shared.
 
 `Rule.permissionMode` (FACTORY-87) is the opposite case, and needed no new
 persist/read-back logic at all: `buildWorkspace()`/`staleIssues()`'s pair

@@ -264,7 +264,7 @@ describe("specForSessionDefinition", () => {
   test("FACTORY-108: for vendor codex, lizardMode IS carried into the SpawnSpec — the opposite of the claude case above — so agentLaunchConfig's Codex branch (src/agents/argv.ts) can drop --dangerously-bypass-approvals-and-sandbox; absent/false forwards nothing, same as every other vendor's absent field", () => {
     const rule = builtinManagedSessionsRule("/defs");
     const base = { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
-    const match = (definition: typeof base): SessionDefinitionMatch => ({
+    const match = (definition: typeof base & { lizardMode?: boolean }): SessionDefinitionMatch => ({
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
       rule, resource: res("/defs/a.json"), definition,
     });

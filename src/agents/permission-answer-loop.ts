@@ -227,12 +227,39 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     // FACTORY-93 (operator direction): always press option 1 "Yes" (allow
     // once). Matching Claude's "always allow" wording was fragile — the
     // read-permission dialog says "Yes, allow reading …" and was skipped.
-    const results = await (deps.autoAnswer ?? autoAnswerPermissions)(scopedClient, {
-      scope: "once",
-      auditPath: deps.auditPath,
-      ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
-      ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
-    });
+    //
+    // FACTORY-108 (review): the Claude and Codex passes run CONCURRENTLY,
+    // not sequentially — each is independently bounded by `readTimeoutMs`
+    // (8s), and `startPermissionAnswerLoop`/`startPermissionAnswerWatch`
+    // both assume one tick fits comfortably inside the 20s sweep interval
+    // (see `PermissionAnswerLoopDeps.readTimeoutMs`'s own doc comment). Two
+    // SEQUENTIAL 8s-bounded passes could together approach 16s, eating most
+    // of that margin; running them concurrently keeps one tick's total
+    // bound at ~8s, same as before this ticket, since the two passes touch
+    // disjoint panes internally (Claude's own `classifyPermissionPrompt`
+    // never matches a Codex pane's screen and vice versa — see this
+    // module's own header) and so share nothing to race over except
+    // `deps.auditPath`, which drovr's own `approvePermission`/
+    // `approveCodexApproval` already append to safely under concurrent
+    // callers (the SAME file `autoAnswerPermissions` itself already writes
+    // to from multiple panes' concurrent reads within one pass).
+    const [results, codexResults] = await Promise.all([
+      (deps.autoAnswer ?? autoAnswerPermissions)(scopedClient, {
+        scope: "once",
+        auditPath: deps.auditPath,
+        ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
+        ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
+      }),
+      // FACTORY-108: Codex lizard mode — same scoped, eligible pane set as
+      // the Claude pass; `autoAnswerCodexApprovals` internally filters to
+      // `agent.agent === "codex"` panes only, so this is a pure no-op
+      // whenever nothing eligible this tick happens to be a Codex pane.
+      (deps.autoAnswerCodex ?? autoAnswerCodexApprovals)(scopedClient, {
+        auditPath: deps.auditPath,
+        ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
+        ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
+      }),
+    ]);
     const label = (paneId: string) => labels.get(paneId) ?? paneId;
     const answered = results.filter((r) => r.outcome === "answered");
     const failed = results.filter((r) => r.outcome === "failed");
@@ -248,16 +275,6 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
       deps.loggedSkips?.add(key);
       log(`[permission-answer] ${label(r.paneId)} (${r.paneId}) SKIPPED, left for a human: ${r.reason}`);
     }
-    // FACTORY-108: Codex lizard mode — same scoped, eligible pane set as
-    // above; `autoAnswerCodexApprovals` internally filters to `agent.agent
-    // === "codex"` panes only, so this is a pure no-op whenever nothing
-    // eligible this tick happens to be a Codex pane (see this module's own
-    // header for why running both passes over one set is safe).
-    const codexResults = await (deps.autoAnswerCodex ?? autoAnswerCodexApprovals)(scopedClient, {
-      auditPath: deps.auditPath,
-      ...(deps.operator !== undefined ? { operator: deps.operator } : {}),
-      ...(deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {}),
-    });
     const codexAnswered = codexResults.filter((r) => r.outcome === "answered");
     const codexFailed = codexResults.filter((r) => r.outcome === "failed");
     const codexUnrecognised = codexResults.filter((r) => r.outcome === "unrecognised");
@@ -270,12 +287,18 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     for (const r of codexResults) {
       if (r.outcome === "answered" || r.outcome === "failed") continue;
       const unrecognised = r.outcome === "unrecognised";
-      // FACTORY-107/FACTORY-108: an approval-shaped Codex screen this module
-      // can't parse is loud, not invisible — never folded into "skipped" and
-      // never silently dropped — but still deduped per pane+reason (same
-      // FACTORY-93 discipline `skipped` already gets) so a persistently
-      // unrecognised pane doesn't flood the journal every tick.
-      const key = "codex " + r.paneId + " " + (unrecognised ? "unrecognised" : r.reason);
+      // FACTORY-107/FACTORY-108 (review): an approval-shaped Codex screen
+      // this module can't parse is loud, not invisible — never folded into
+      // "skipped" and never silently dropped — but still deduped per
+      // pane+reason (same FACTORY-93 discipline `skipped` already gets) so a
+      // persistently unrecognised pane doesn't flood the journal every tick.
+      // The dedup key for "unrecognised" includes the EXCERPT itself, not
+      // just the literal string "unrecognised": a pane stuck on the SAME
+      // unrecognised screen logs once, but a DIFFERENT unrecognised dialog
+      // appearing later on that same pane is a new, distinct thing a human
+      // has not yet seen — it must log again, not be swallowed by the first
+      // dialog's already-seen key.
+      const key = "codex " + r.paneId + " " + (unrecognised ? "unrecognised:" + r.excerpt : r.reason);
       if (deps.loggedSkips?.has(key)) continue;
       deps.loggedSkips?.add(key);
       log(unrecognised
