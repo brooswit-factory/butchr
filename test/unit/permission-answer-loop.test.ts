@@ -307,7 +307,7 @@ describe("FACTORY-108: Codex lizard mode wired alongside Claude in the same tick
     const codexResults = [
       { paneId: "p1", label: "p1", outcome: "answered" as const, kind: "command" as const, detail: "touch foo" },
       { paneId: "p2", label: "p2", outcome: "skipped" as const, reason: "no approve-once option" },
-      { paneId: "p3", label: "p3", outcome: "unrecognised" as const, excerpt: "some unknown dialog" },
+      { paneId: "p3", label: "p3", outcome: "unrecognised" as const, excerpt: "some unknown dialog", fingerprint: "fp-p3" },
       { paneId: "p4", label: "p4", outcome: "failed" as const, reason: "keys-failed", detail: "boom" },
     ];
     const fakeAutoAnswerCodex = (async () => codexResults) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals;
@@ -336,7 +336,7 @@ describe("FACTORY-108: Codex lizard mode wired alongside Claude in the same tick
     const auditPath = join(dir, "audit.jsonl");
     const { client } = fakeClient({ p1: "irrelevant" });
     const loggedSkips = new Set<string>();
-    const makeResult = (excerpt: string) => [{ paneId: "p1", label: "p1", outcome: "unrecognised" as const, excerpt }];
+    const makeResult = (excerpt: string) => [{ paneId: "p1", label: "p1", outcome: "unrecognised" as const, excerpt, fingerprint: "fp-p1" }];
 
     const lines1: string[] = [];
     await runPermissionAnswerTick({
