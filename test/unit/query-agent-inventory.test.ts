@@ -245,6 +245,28 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
     expect(inventory.rules.find((r) => r.id === "director")!.staffed).toBe(true);
   });
 
+  test("FACTORY-407 (DoD 4): two DIFFERENT swarm rules matching the SAME resource are each staffed correctly by their OWN agent — never guessed from the shared resource id, which would be genuinely ambiguous", async () => {
+    // The agent-key codec's own header: several rules may match one resource.
+    // Each rule's own agent for that resource carries a key with THAT rule's
+    // own ruleId baked in (never re-derived from the bare resource alone), so
+    // two rules matching "KAN-1" resolve to two distinct, correctly-attributed
+    // agents — no ambiguity, because correlation never goes through the bare
+    // resource id at all.
+    const ruleA = rule({ id: "triage", resourceProvider: "jira-work" });
+    const ruleB = rule({ id: "watch", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [ruleA, ruleB], error: null },
+      dashboard: checkedDashboard([
+        agentRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "KAN-1" })),
+        // "watch" has NO agent for KAN-1 this poll — only "triage" does.
+      ]),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(inventory.rules.find((r) => r.id === "triage")).toMatchObject({ staffed: true, reason: null });
+    expect(inventory.rules.find((r) => r.id === "watch")).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
+  });
+
   test("a withheld row (admission cap) reaches all the way through the full buildQueryAgentInventory path, not just ruleStaffingReason in isolation", async () => {
     const r = rule({ id: "task", resourceProvider: "jira-work" });
     const inventory = await buildQueryAgentInventory({
@@ -571,7 +593,7 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
     const r = rule({ id: "my-ideas", resourceProvider: "jira-idea" });
     const liveKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
 
-    await f.poll(async () => ({ agents: [{ resource_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
+    await f.poll(async () => ({ agents: [{ agent_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
     const staffedNow = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
@@ -611,6 +633,30 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
     await f.poll(async () => ({ agents: [] })); // recovers — a genuine, observed zero
     const recovered = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason, sessionDefinitions: fakeSessionDefinitions({}) });
     expect(recovered.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
+  });
+
+  test("FACTORY-407 (DoD 2): a matched-but-withheld resource reaches staffed:false/'admission cap' end to end through the REAL admission controller + createDashboardFeed — never just a hand-built WithheldDashboardRow", async () => {
+    // The admission census's own withheld-key shape is verified here rather
+    // than assumed: `admission.admit()` is called with the SAME full
+    // agent-key shape `unitAgentKey` (src/rules/execution.ts) produces for a
+    // real rule loop's candidates — proving `updateWithheldRows` and
+    // `liveAndWithheldRuleKeys` actually line up on that shape now, not just
+    // in a fixture that happens to typecheck.
+    const now = 1000;
+    const admission = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"], now: () => now });
+    const feed = createDashboardFeed({ now: () => now, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => now), withheldTracker: new StatusFloorTracker(() => now), admission: () => admission.census() });
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const candidate = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "KAN-9" });
+
+    await admission.admit([candidate], [], "issue"); // cap 0 -> withheld
+    await feed.poll(async () => ({ agents: [] }));
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: feed.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: fakeSessionDefinitions({}),
+    });
+    expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" });
   });
 
   test("AC4 control: a disabled rule stays 'disabled' even while the agent census is unavailable — a config fact, not a census fact", () => {
